@@ -15,7 +15,6 @@
 """CPU-only tests for loading packaged MSA artifacts."""
 
 import importlib.util
-import itertools
 import json
 import platform
 import shutil
@@ -24,6 +23,8 @@ import types
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture
@@ -50,6 +51,7 @@ def jit_package(tmp_path, monkeypatch):
         "GPU_TRACE",
         "SM_TIMING",
         "FMHA_GMEM_CHECK",
+        "TLLM_FMHA_PACKAGED",
         "TLLM_FMHA_PROXY_CORRECTION_CHAIN",
         "TLLM_FMHA_PROXY_S_DOUBLE_BUFFER",
     ):
@@ -60,32 +62,26 @@ def jit_package(tmp_path, monkeypatch):
 
     def load_module(path):
         loaded.append(Path(path))
-        return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda value: ("compiled", value)})
+        return types.SimpleNamespace(
+            **{"run_1_0_1_3_1_0_0": lambda value: ("compiled", value)},
+            plan=lambda: None,
+            sparse_topk_select=lambda: None,
+            reduction=lambda: None,
+        )
 
     ffi.load_module = load_module
     monkeypatch.setitem(sys.modules, "tvm_ffi", ffi)
     module_spec = importlib.util.spec_from_file_location("_msa_jit_under_test", package / "jit.py")
     jit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(jit)
-    monkeypatch.setattr(jit, "_aot_ffi_version", lambda: "0.1.13.post2", raising=False)
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a", raising=False)
-    monkeypatch.setattr(jit, "_device_is_sm107", lambda: False, raising=False)
-    monkeypatch.setattr(jit, "_resolve_jit_target", lambda: None, raising=False)
-    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: None, raising=False)
+    monkeypatch.setattr(jit, "_aot_ffi_version", lambda: "0.1.13.post2")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_103a"})
+    jit._aot_selection = None
+    monkeypatch.setattr(jit, "_device_is_sm107", lambda: False)
+    monkeypatch.setattr(jit, "_resolve_jit_target", lambda: None)
+    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: None)
     monkeypatch.delenv("CUTLASS_ROOT", raising=False)
     return jit, package, cache, loaded
-
-
-def _all_variant_names(jit):
-    names = []
-    dimensions = [values for _, values in jit._FMHA_SM100_DISPATCH]
-    for indices in itertools.product(*(range(len(values)) for values in dimensions)):
-        params = {}
-        for dimension, index in zip(dimensions, indices):
-            params.update(dimension[index][1])
-        if not jit._FMHA_SM100_IMPOSSIBLE(params):
-            names.append("_".join(map(str, indices)))
-    return names
 
 
 def _stage_artifacts(jit, package):
@@ -103,7 +99,7 @@ def _stage_artifacts(jit, package):
     }
     for name in files.values():
         (artifact_dir / name).write_bytes(b"fixture library")
-    names = _all_variant_names(jit)
+    names = jit._aot_variant_names()
     assert len(names) == 350
     manifest = {
         "format_version": 1,
@@ -111,7 +107,7 @@ def _stage_artifacts(jit, package):
         "source_sha256": digest,
         "tvm_ffi_version": "0.1.13.post2",
         "host_arch": platform.machine(),
-        "cuda_architectures": ["sm_100a", "sm_103a", "sm_100f"],
+        "cuda_architectures": ["sm_100a", "sm_103a"],
         "variants": names,
         "files": files,
     }
@@ -168,8 +164,9 @@ def test_broken_packaged_library_never_silently_falls_back(jit_package, monkeypa
 
     monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_broken_library)
     for _ in range(2):
-        with pytest.raises(OSError, match="bad library"):
+        with pytest.raises(RuntimeError, match="all_variants.so.*TLLM_FMHA_PACKAGED=0") as error:
             manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+        assert isinstance(error.value.__cause__, OSError)
     assert not cache.exists()
 
 
@@ -283,7 +280,8 @@ def test_packaged_gpu_compatibility_is_checked_for_each_device(jit_package, monk
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
     assert jit._aot_module_path("variants") == artifact_dir / "all_variants.so"
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_unsupported"})
+    jit._aot_selection = None
     assert jit._aot_module_path("variants") is None
 
 
@@ -311,9 +309,11 @@ def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(
     monkeypatch.setattr(manager, "_compile_only", compile_fixture)
     args = (jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert manager.get_variant(*args).run() == "packaged"
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_100a"})
+    jit._aot_selection = None
     assert manager.get_variant(*args).run() == "jit"
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_103a"})
+    jit._aot_selection = None
     assert manager.get_variant(*args).run() == "packaged"
 
 
@@ -327,7 +327,9 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
 
     def load_module(path):
         kind = "packaged" if Path(path).parent == artifact_dir else "jit"
-        return types.SimpleNamespace(kind=kind)
+        return types.SimpleNamespace(
+            kind=kind, plan=lambda: None, sparse_topk_select=lambda: None, reduction=lambda: None
+        )
 
     def compile_fixture(relative):
         path = jit.CACHE_BASE / relative
@@ -350,9 +352,11 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
     )
     helpers = (jit.get_plan_fn, jit.get_sparse_topk_module, jit.get_reduction_module)
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_100a"})
+    jit._aot_selection = None
     assert [fn().kind for fn in helpers] == ["jit"] * 3
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_103a"})
+    jit._aot_selection = None
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
 
 
@@ -362,7 +366,7 @@ def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
-    calls = iter([RuntimeError("device not ready"), "sm_103a"])
+    calls = iter([RuntimeError("device not ready"), {"sm_103a"}])
 
     def device_arch():
         value = next(calls)
@@ -379,13 +383,15 @@ def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
 
-    monkeypatch.setattr(jit, "_aot_gpu_arch", device_arch)
+    monkeypatch.setattr(jit, "_aot_device_archs", device_arch)
+    jit._aot_selection = None
     monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
     monkeypatch.setattr(manager, "_compile_only", compile_fixture)
     args = (jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert manager.get_variant(*args).run() == "jit"
     assert manager.get_variant(*args).run() == "packaged"
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_unsupported"})
+    jit._aot_selection = None
     assert manager.get_variant(*args).run() == "jit"
 
 
@@ -543,6 +549,132 @@ def test_incompatible_packaged_set_is_rejected(jit_package, monkeypatch, change)
         manifest["host_arch"] = "incompatible"
         manifest_path.write_text(json.dumps(manifest))
     else:
-        monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+        monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_unsupported"})
+    jit._aot_selection = None
 
     assert jit._aot_module_path("variants") is None
+
+
+@pytest.mark.parametrize(
+    ("devices", "manifest_archs", "accepted"),
+    [
+        (set(), ["sm_103a"], False),
+        ({"sm_100a", "sm_103a"}, ["sm_103a"], False),
+        ({"sm_100a", "sm_103a"}, ["sm_100a", "sm_103a"], True),
+    ],
+)
+def test_packaged_selection_checks_all_visible_devices_once(
+    jit_package, monkeypatch, devices, manifest_archs, accepted
+):
+    jit, package, _, _ = jit_package
+    artifact = _stage_artifacts(jit, package)
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cuda_architectures"] = manifest_archs
+    manifest_path.write_text(json.dumps(manifest))
+    calls = []
+
+    def device_archs():
+        calls.append(1)
+        return devices
+
+    monkeypatch.setattr(jit, "_aot_device_archs", device_archs)
+    for kind in ("variants", "plan", "sparse_topk", "reduction"):
+        assert (jit._aot_module_path(kind) is not None) is accepted
+    assert calls == [1]
+
+
+def test_external_cutlass_affects_jit_cache_but_not_packaged_identity(
+    jit_package, monkeypatch, tmp_path
+):
+    jit, package, _, _ = jit_package
+    artifact = _stage_artifacts(jit, package)
+    external = tmp_path / "external-cutlass"
+    shutil.copytree(package / "cutlass", external)
+    (external / "tools/util/include/util.h").write_text("external-header")
+    monkeypatch.setenv("CUTLASS_ROOT", str(external))
+    original = jit._compute_cache_base()
+    assert jit._aot_module_path("variants") == artifact / "all_variants.so"
+    (external / "tools/util/include/util.h").write_text("changed-external-header")
+    assert jit._compute_cache_base() != original
+    assert jit._aot_module_path("variants") == artifact / "all_variants.so"
+
+
+def test_packaged_can_be_disabled_before_first_lookup(jit_package, monkeypatch):
+    jit, package, _, _ = jit_package
+    _stage_artifacts(jit, package)
+    monkeypatch.setenv("TLLM_FMHA_PACKAGED", "0")
+    assert jit._aot_module_path("variants") is None
+    monkeypatch.delenv("TLLM_FMHA_PACKAGED")
+    assert jit._aot_module_path("variants") is None
+
+
+def test_transient_initial_proxy_query_is_retried(jit_package, monkeypatch):
+    jit, package, _, _ = jit_package
+    artifact = _stage_artifacts(jit, package)
+    calls = iter([RuntimeError("device not ready"), (True, True)])
+
+    def modes():
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(jit, "_proxy_modes", modes)
+    assert jit._aot_module_path("variants") is None
+    assert jit._aot_selection is None
+    assert jit._aot_module_path("variants") == artifact / "all_variants.so"
+
+
+def test_incompatible_manifest_warns_once_with_actual_and_expected(
+    jit_package, monkeypatch, caplog
+):
+    jit, package, _, _ = jit_package
+    _stage_artifacts(jit, package)
+    monkeypatch.setattr(jit, "_aot_ffi_version", lambda: "different-ffi")
+    for kind in ("variants", "plan", "sparse_topk", "reduction"):
+        assert jit._aot_module_path(kind) is None
+    warnings = [
+        record.message for record in caplog.records if "packaged kernels rejected" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "tvm_ffi_version" in warnings[0]
+    assert "0.1.13.post2" in warnings[0] and "different-ffi" in warnings[0]
+
+
+def test_legacy_broken_aggregate_is_only_loaded_once(jit_package, monkeypatch):
+    jit, _, _, _ = jit_package
+    aggregate = jit._all_variants_so()
+    aggregate.parent.mkdir(parents=True)
+    aggregate.touch()
+    attempts = []
+
+    def broken(path):
+        attempts.append(path)
+        raise OSError("legacy broken aggregate")
+
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", broken)
+    manager = jit.FMHAVariantManager()
+    with pytest.raises(OSError, match="legacy broken aggregate"):
+        manager._ensure_all_module()
+    manager._ensure_all_module()
+    assert attempts == [str(aggregate)]
+
+
+@pytest.mark.parametrize("kind", ["plan", "sparse_topk", "reduction"])
+def test_packaged_helper_missing_export_names_library_and_disable_switch(
+    jit_package, monkeypatch, kind
+):
+    jit, package, _, _ = jit_package
+    artifact = _stage_artifacts(jit, package)
+    monkeypatch.setattr(
+        sys.modules["tvm_ffi"], "load_module", lambda _path: types.SimpleNamespace()
+    )
+    helper = {
+        "plan": jit.get_plan_fn,
+        "sparse_topk": jit.get_sparse_topk_module,
+        "reduction": jit.get_reduction_module,
+    }[kind]
+    with pytest.raises(RuntimeError, match=kind + ".*TLLM_FMHA_PACKAGED=0") as error:
+        helper()
+    assert str(artifact / (kind + ".so")) in str(error.value)

@@ -25,28 +25,32 @@ from setuptools.dist import Distribution
 
 
 class MsaBuildPy(build_py):
-    """Replace old FMHA binaries using a non-symlinked wheel staging tree."""
+    """Stage the complete FMHA package afresh for each wheel build."""
 
-    def run(self):
+    def run(self) -> None:
         import shutil
 
         if getattr(self, "editable_mode", False):
             return super().run()
         package_dir = Path(self.build_lib) / "fmha_sm100"
-        target = package_dir / "_aot"
-        for directory in (package_dir, *package_dir.parents):
-            if directory.is_symlink():
-                raise RuntimeError(
-                    f"Refusing to stage FMHA artifacts through symlink: {directory}"
-                )
-        if package_dir.resolve() == Path(
-                self.get_package_dir("fmha_sm100")).resolve():
+        source = Path(self.get_package_dir("fmha_sm100"))
+        source_dir = source.resolve()
+        if (package_dir.parent.resolve() /
+                package_dir.name == source.parent.resolve() / source.name):
             raise RuntimeError(
-                f"Refusing to stage over FMHA source directory: {package_dir}")
-        if target.is_symlink() or target.is_file():
-            target.unlink()
-        elif target.is_dir():
-            shutil.rmtree(target)
+                f"Refusing to stage over the FMHA source package: {package_dir}"
+            )
+        if package_dir.is_symlink():
+            package_dir.unlink()
+        else:
+            staged = package_dir.resolve()
+            if (staged == source_dir or staged.is_relative_to(source_dir)
+                    or source_dir.is_relative_to(staged)):
+                raise RuntimeError(
+                    f"Refusing to clean or stage inside the FMHA source package: {package_dir}"
+                )
+            if package_dir.exists():
+                shutil.rmtree(package_dir)
         super().run()
 
 

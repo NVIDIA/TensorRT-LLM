@@ -33,7 +33,7 @@ from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import PIPE, CalledProcessError, Popen, check_output, run
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
@@ -923,6 +923,71 @@ def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
                 archive.extract(member, package_root)
 
 
+def stage_msa_package(
+        project_dir: Path,
+        wheel_project_dir: Path,
+        build_dir: Path,
+        venv_python: Path,
+        cuda_architectures: str,
+        job_count: int,
+        *,
+        enabled: bool = False,
+        install_file: Callable[[Path, Path], bool | None] = link_or_copy_file,
+        install_tree: Callable[[Path, Path], None] = sync_tree) -> None:
+    """Refresh the MSA wheel sources and optionally precompile stock kernels."""
+    # Stage the FetchContent-patched MSA package for setup.py packaging.
+    msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+    cutlass_src = build_dir / "_deps" / "cutlass-src"
+    msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+    if not (msa_src / "cute" / "interface.py").is_file():
+        raise FileNotFoundError(
+            f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+            "did not populate the expected sources.")
+    if msa_dst.is_symlink():
+        msa_dst.unlink()
+    elif msa_dst.exists():
+        rmtree(msa_dst)
+    msa_dst.mkdir(parents=True)
+    for python_source in msa_src.glob("*.py"):
+        install_file(python_source, msa_dst)
+    for source_dir, relative_dir in (
+        (msa_src / "csrc", Path("csrc")),
+        (msa_src / "cute", Path("cute")),
+        (cutlass_src / "include", Path("cutlass/include")),
+        (cutlass_src / "tools/util/include",
+         Path("cutlass/tools/util/include")),
+    ):
+        (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+        install_tree(
+            source_dir,
+            msa_dst / relative_dir,
+        )
+    install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
+    for notice in ("LICENSE", "NOTICE"):
+        install_file(build_dir / "_deps" / "msa-src" / notice, msa_dst / notice)
+
+    if enabled:
+        # Only stock SM100/SM103 images are packaged by this opt-in worker.
+        env = os.environ.copy()
+        cmake_cache = build_dir / "CMakeCache.txt"
+        if cmake_cache.is_file():
+            compiler = re.search(r"(?m)^CMAKE_CUDA_COMPILER:[A-Z_]+=(.+)$",
+                                 cmake_cache.read_text())
+            if compiler:
+                env["CMAKE_CUDA_COMPILER"] = compiler.group(1).strip()
+        run([
+            str(venv_python),
+            str(project_dir / "scripts/build_msa_aot.py"),
+            str(msa_dst),
+            str(build_dir / "_deps/msa-src/scripts/warmup_fmha_sm100.py"),
+            cuda_architectures,
+            str(max(1, min(job_count, 8))), "--build-dir",
+            str(build_dir)
+        ],
+            env=env,
+            check=True)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -947,6 +1012,7 @@ def main(*,
          fast_build: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
+         msa_aot: bool = False,
          linking_install_binary: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
@@ -1576,36 +1642,16 @@ def main(*,
             build_dir / "tensorrt_llm" / "flash_mla" / "python" / "flash_mla",
             pkg_dir / "flash_mla")
 
-    # Stage the FetchContent-patched MSA package for setup.py packaging.
-    msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
-    cutlass_src = build_dir / "_deps" / "cutlass-src"
-    msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
-    if not (msa_src / "cute" / "interface.py").is_file():
-        raise FileNotFoundError(
-            f"MSA package missing at {msa_src}; CMake FetchContent for msa "
-            "did not populate the expected sources.")
-    if msa_dst.is_symlink():
-        msa_dst.unlink()
-    elif msa_dst.exists():
-        rmtree(msa_dst)
-    msa_dst.mkdir(parents=True)
-    for python_source in msa_src.glob("*.py"):
-        install_file(python_source, msa_dst)
-    for source_dir, relative_dir in (
-        (msa_src / "csrc", Path("csrc")),
-        (msa_src / "cute", Path("cute")),
-        (cutlass_src / "include", Path("cutlass/include")),
-        (cutlass_src / "tools/util/include",
-         Path("cutlass/tools/util/include")),
-    ):
-        (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
-        install_tree(
-            source_dir,
-            msa_dst / relative_dir,
-        )
-    install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
-    for notice in ("LICENSE", "NOTICE"):
-        install_file(build_dir / "_deps" / "msa-src" / notice, msa_dst / notice)
+    stage_msa_package(project_dir,
+                      wheel_project_dir,
+                      build_dir,
+                      venv_python,
+                      cuda_architectures,
+                      job_count,
+                      enabled=msa_aot and not on_windows
+                      and not skip_building_wheel,
+                      install_file=install_file,
+                      install_tree=install_tree)
 
     # Stage the MiniMax-M3.1 MSA packages of the FetchContent-patched msa_vllm
     # tree: the Q8KV8 index scorer (the files it needs from python/fmha_sm100/cute)
@@ -1646,28 +1692,6 @@ def main(*,
                 install_file(package_src / relative, package_dst / relative)
         for notice in ("LICENSE", "NOTICE"):
             install_file(msa_vllm_src.parents[1] / notice, package_dst / notice)
-
-    if not on_windows and not skip_building_wheel:
-        # Build into the staged package, using the same nvcc as CMake. The
-        # helper skips architectures that cannot use the SM100 kernels.
-        env = os.environ.copy()
-        cmake_cache = build_dir / "CMakeCache.txt"
-        if cmake_cache.is_file():
-            compiler = re.search(r"(?m)^CMAKE_CUDA_COMPILER:[A-Z_]+=(.+)$",
-                                 cmake_cache.read_text())
-            if compiler:
-                env["CMAKE_CUDA_COMPILER"] = compiler.group(1).strip()
-        run([
-            str(venv_python),
-            str(project_dir / "scripts/build_msa_aot.py"),
-            str(msa_dst),
-            str(build_dir / "_deps/msa-src/scripts/warmup_fmha_sm100.py"),
-            cuda_architectures,
-            str(max(1, min(job_count, 8))), "--build-dir",
-            str(build_dir)
-        ],
-            env=env,
-            check=True)
 
     if not skip_stubs:
         with working_directory(pkg_dir):
@@ -1886,6 +1910,11 @@ def add_arguments(parser: ArgumentParser):
         action="store_true",
         help=
         "Skip building the *.whl files (they are only needed for distribution)")
+    parser.add_argument(
+        "--msa_aot",
+        action="store_true",
+        help="Precompile all stock SM100/SM103 MSA kernels into the wheel "
+        "(experimental; adds substantial CUDA build time)")
     parser.add_argument(
         "--linking_install_binary",
         action="store_true",

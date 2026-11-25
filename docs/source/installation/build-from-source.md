@@ -92,6 +92,35 @@ built.
 | `--build_type RelWithDebInfo` | Build with debug info (default: `Release`) |
 | `-j <N>` | Number of parallel compile jobs (default: number of available CPUs) |
 | `--fast_build` | Skip compiling some kernels to speed up compilation -- for development only |
+| `--msa_aot` | Opt in to precompiling the complete stock SM100/SM103 MSA FMHA set into a Linux wheel (default: off) |
+
+### Optional MSA FMHA precompilation
+
+`--msa_aot` packages all 350 stock-mode FMHA variants and the plan, sparse top-k,
+and reduction helpers when the configured CUDA architectures include SM100 or
+SM103. For example:
+
+```bash
+python3 scripts/build_wheel.py -a "100;103" --msa_aot
+```
+
+This experimental step runs after the C++ build. It requires `nm`, Ninja, and an
+`nvcc` that can compile every requested SM100a/SM103a image; a build GPU is not
+required. It uses at most eight of the `-j` jobs, compiles the complete set on
+each opted-in build, and keeps its temporary cache and intermediates under
+`--build_dir`. Allow substantial additional build time, disk space, and memory.
+Persistent artifact caching and the default CI image build budgets have not been
+validated for this step. It remains off by default while matching CUDA-wheel,
+GPU correctness, cold-cache performance, and package-cost acceptance are pending.
+The separate `BUILD_MSA_AOT` CMake option for MiniMax-M3.1 proxy modes is unchanged.
+
+At runtime, the packaged stock set is selected once, before the first FMHA use,
+only if every visible GPU is covered and source, bundled CUTLASS, TVM FFI version,
+and host checks pass. An incompatible set emits one warning and falls back to
+JIT. `CUTLASS_ROOT` affects JIT compilation and its cache identity; it does not
+override the headers used to identify the packaged set. Set
+`TLLM_FMHA_PACKAGED=0` before starting the process to force JIT, including when
+diagnosing a packaged-library load failure. Diagnostic modes also use JIT.
 
 ### Building from a checkout on a network filesystem
 

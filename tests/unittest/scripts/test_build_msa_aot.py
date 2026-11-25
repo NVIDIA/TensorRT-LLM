@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _SCRIPT = Path(__file__).resolve().parents[3] / "scripts/build_msa_aot.py"
 spec = importlib.util.spec_from_file_location("build_msa_aot", _SCRIPT)
 builder = importlib.util.module_from_spec(spec)
@@ -26,7 +28,7 @@ spec.loader.exec_module(builder)
 @pytest.mark.parametrize(
     ("requested", "supported", "expected"),
     [
-        ("all", {"sm_100a", "sm_103a", "sm_100f"}, ["sm_100a", "sm_103a", "sm_100f"]),
+        ("all", {"sm_100a", "sm_103a", "sm_100f"}, ["sm_100a", "sm_103a"]),
         ("100", {"sm_100a"}, ["sm_100a"]),
         ("103-real", {"sm_100a", "sm_103a"}, ["sm_103a"]),
         ("90;100", {"sm_100a", "sm_103a"}, ["sm_100a"]),
@@ -113,7 +115,11 @@ def test_cmake_records_resolved_architectures(tmp_path):
     )
     build = tmp_path / "build"
     subprocess.run(
-        ["cmake", "-S", str(tmp_path), "-B", str(build)], check=True, capture_output=True, text=True
+        ["cmake", "-S", str(tmp_path), "-B", str(build)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert (build / "trtllm_cuda_architectures.txt").read_text() == "103"
     assert builder.resolve_requested_architectures("90", build) == "103"
@@ -134,6 +140,7 @@ def test_cli_skips_non_blackwell_without_nvcc(tmp_path):
         ],
         env=env,
         check=True,
+        timeout=60,
     )
     assert list(tmp_path.iterdir()) == []
 
@@ -141,7 +148,7 @@ def test_cli_skips_non_blackwell_without_nvcc(tmp_path):
 def _shared_library(path, symbols):
     source = path.with_suffix(".c")
     source.write_text("\n".join(f"void {symbol}(void) {{}}" for symbol in symbols))
-    subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(path)], check=True)
+    subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(path)], check=True, timeout=60)
 
 
 def test_artifact_validation_checks_each_export_and_helper(tmp_path):
@@ -215,9 +222,74 @@ def main():
     manifest = json.loads(manifest_path.read_text())
     assert manifest["variants"] == ["0_0", "0_1"]
     assert manifest["cuda_architectures"] == ["sm_100a"]
-    assert manifest["cuda_toolkit_version"] == "CUDA release 12.9"
+    assert manifest["nvcc_version"] == "CUDA release 12.9"
     assert all((manifest_path.parent / name).is_file() for name in manifest["files"].values())
     assert not user_cache.exists()
+
+
+def test_installed_package_builder_loader_round_trip(tmp_path, monkeypatch):
+    """CI exercises the real installed jit and worker without CUDA or an external warmup path."""
+    spec = importlib.util.find_spec("fmha_sm100")
+    assert spec is not None and spec.submodule_search_locations, "installed MSA package is required"
+    source = Path(next(iter(spec.submodule_search_locations)))
+    package = tmp_path / "fmha_sm100"
+    package.mkdir()
+    shutil.copy2(source / "jit.py", package / "jit.py")
+    shutil.copytree(source / "csrc", package / "csrc")
+    headers = package / "cutlass/include/cutlass"
+    headers.mkdir(parents=True)
+    (headers / "version.h").write_text(
+        "#define CUTLASS_MAJOR 4\n#define CUTLASS_MINOR 4\n#define CUTLASS_PATCH 2\n"
+    )
+    (package / "cutlass/tools/util/include").mkdir(parents=True)
+    warmup = tmp_path / "warmup.py"
+    warmup.write_text("""
+import os
+import subprocess
+import fmha_sm100.jit as jit
+
+def _cleanup_nvcc_temps():
+    raise AssertionError("unsafe cleanup")
+
+def main():
+    _cleanup_nvcc_temps()
+    assert os.environ["MINFER_FMHA_CACHE_DIR"].startswith(os.environ["EXPECTED_BUILD_DIR"])
+    libraries = {
+        "_all_variants/all_variants.so": ["run_" + name for name in jit._aot_variant_names()],
+        "plan/fmha_sm100_plan.so": ["plan"],
+        "sparse_topk/sparse_topk_select.so": ["sparse_topk_select"],
+        "reduction/fmha_sm100_reduction.so": ["reduction"],
+    }
+    for name, symbols in libraries.items():
+        target = jit.CACHE_BASE / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        code = "\\n".join("int __tvm_ffi_" + symbol + "(void) {return 7;}" for symbol in symbols)
+        subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-o", str(target), "-"],
+                       input=code, text=True, check=True, timeout=60)
+""")
+    nvcc = tmp_path / "nvcc"
+    nvcc.write_text("#!/bin/sh\nprintf 'CPU compiler fixture\\n'\n")
+    nvcc.chmod(0o755)
+    # Native ELF fixtures do not use the real TVM ABI; use controlled package metadata.
+    dependencies = tmp_path / "metadata"
+    distribution = dependencies / "apache_tvm_ffi-0.0.0.dist-info"
+    distribution.mkdir(parents=True)
+    (distribution / "METADATA").write_text("Name: apache-tvm-ffi\nVersion: 0.0.0\n")
+    monkeypatch.syspath_prepend(str(dependencies))
+    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+    build_dir = tmp_path / "configured build"
+    monkeypatch.setenv("EXPECTED_BUILD_DIR", str(build_dir))
+    builder.build(package, warmup, "100;103", nvcc, jobs=2, build_dir=build_dir)
+    jit = builder._load_module("_msa_roundtrip", package / "jit.py")
+    monkeypatch.setattr(jit, "_proxy_modes", lambda: (True, True))
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_100a", "sm_103a"})
+    manifests = list((package / "_aot").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert len(manifest["variants"]) == 350
+    for kind in ("variants", "plan", "sparse_topk", "reduction"):
+        assert jit._aot_module_path(kind) == manifests[0].parent / manifest["files"][kind]
+    assert not list(build_dir.iterdir())
 
 
 @pytest.mark.skipif(not os.environ.get("MSA_WARMUP_SCRIPT"), reason="patched MSA source not staged")
@@ -373,7 +445,7 @@ else:
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(root / "unused runtime cache"))
     jit = builder._load_module("_real_msa_stock_runtime", package / "jit.py")
     monkeypatch.setattr(jit, "_device_is_sm107", lambda: False)
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    monkeypatch.setattr(jit, "_aot_device_archs", lambda: {"sm_103a"})
     monkeypatch.setattr(jit, "_prebuilt_dir", lambda: None)
 
     class NativeModule:
@@ -432,6 +504,7 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     with zipfile.ZipFile(next((tmp_path / "dist").glob("*.whl"))) as archive:
         entries = set(archive.namelist())
@@ -442,53 +515,9 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
         assert f"fmha_sm100/_aot/sourcehash/{name}" in entries
 
 
-def test_incremental_wheel_drops_previous_fmha_artifacts(tmp_path):
-    setup_path = _SCRIPT.parents[1] / "setup.py"
-    setup_source = setup_path.read_text()
-    setup_tree = ast.parse(setup_source)
-    command = next(
-        node
-        for node in setup_tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
-    )
-    command_source = ast.get_source_segment(setup_source, command)
-    package = tmp_path / "fmha_sm100"
-    old = package / "_aot/oldhash"
-    old.mkdir(parents=True)
-    (package / "__init__.py").write_text("")
-    (old / "old.so").write_bytes(b"old")
-    (tmp_path / "setup.py").write_text(
-        "from pathlib import Path\nfrom setuptools import setup\n"
-        "from setuptools.command.build_py import build_py\n"
-        f"{command_source}\n"
-        "setup(name='msa-incremental-check', version='0.0.1', packages=['fmha_sm100'], "
-        "package_data={'fmha_sm100': ['_aot/*/*.so']}, cmdclass={'build_py': MsaBuildPy})\n"
-    )
-    build = [sys.executable, "setup.py", "bdist_wheel"]
-    subprocess.run(build, cwd=tmp_path, check=True, capture_output=True, text=True)
-    shutil.rmtree(package / "_aot")
-    new = package / "_aot/newhash"
-    new.mkdir(parents=True)
-    (new / "new.so").write_bytes(b"new")
-    subprocess.run(build, cwd=tmp_path, check=True, capture_output=True, text=True)
-    with zipfile.ZipFile(next((tmp_path / "dist").glob("*.whl"))) as archive:
-        entries = set(archive.namelist())
-    assert "fmha_sm100/_aot/newhash/new.so" in entries
-    assert "fmha_sm100/_aot/oldhash/old.so" not in entries
-    subprocess.run(
-        [sys.executable, "setup.py", "editable_wheel"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert (new / "new.so").read_bytes() == b"new"
-
-
-@pytest.mark.parametrize("link_kind", ["package", "build_root", "shared_root", "shared_ancestor"])
-def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
+@pytest.fixture
+def staging_command():
     from setuptools.command.build_py import build_py
-    from setuptools.dist import Distribution
 
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_tree = ast.parse(setup_path.read_text())
@@ -497,95 +526,113 @@ def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
         for node in setup_tree.body
         if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
     )
+    setup_call = next(
+        node
+        for node in ast.walk(setup_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "setup"
+    )
+    package_data = next(kw.value for kw in setup_call.keywords if kw.arg == "package_data")
+    patterns = next(
+        ast.literal_eval(value)
+        for key, value in zip(package_data.keys, package_data.values)
+        if isinstance(key, ast.Constant) and key.value == "fmha_sm100"
+    )
     namespace = {"Path": Path, "build_py": build_py}
     exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
+    return namespace["MsaBuildPy"], patterns
+
+
+def _staging_instance(staging_command, source, build):
+    from setuptools.dist import Distribution
+
+    command, patterns = staging_command
+    distribution = Distribution(
+        {
+            "script_name": "setup.py",
+            "packages": ["fmha_sm100"],
+            "package_dir": {"fmha_sm100": str(source)},
+            "package_data": {"fmha_sm100": patterns},
+        }
+    )
+    instance = command(distribution)
+    instance.build_lib = str(build)
+    instance.ensure_finalized()
+    return instance
+
+
+@pytest.mark.parametrize("layout", ["package_symlink", "build_symlink", "ancestor_symlink"])
+def test_wheel_staging_allows_symlinks_without_touching_package_target(
+    tmp_path, staging_command, layout
+):
     source = tmp_path / "source/fmha_sm100"
     artifact = source / "_aot/hash/kernel.so"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"keep")
-    build = tmp_path / "build"
-    if link_kind == "package":
-        build.mkdir()
-        (build / "fmha_sm100").symlink_to(source, target_is_directory=True)
-    elif link_kind == "build_root":
-        build.symlink_to(source.parent, target_is_directory=True)
+    (source / "__init__.py").touch()
+    real_build = tmp_path / "real/build"
+    real_build.mkdir(parents=True)
+    build = real_build
+    if layout == "package_symlink":
+        target = tmp_path / "shared"
+        target.mkdir()
+        (target / "marker").write_text("untouched")
+        (build / "fmha_sm100").symlink_to(target, target_is_directory=True)
+    elif layout == "build_symlink":
+        build = tmp_path / "build-link"
+        build.symlink_to(real_build, target_is_directory=True)
     else:
-        shared = tmp_path / "shared"
-        shared.mkdir()
-        if link_kind == "shared_ancestor":
-            (shared / "build").mkdir()
-            link = tmp_path / "indirect"
-            link.symlink_to(shared, target_is_directory=True)
-            build = link / "build"
-            shared = shared / "build"
-        else:
-            build.symlink_to(shared, target_is_directory=True)
-        other = shared / "fmha_sm100/_aot/hash/kernel.so"
-        other.parent.mkdir(parents=True)
-        other.write_bytes(b"shared")
-    command_instance = namespace["MsaBuildPy"](Distribution())
-    command_instance.build_lib = str(build)
-    command_instance.package_dir = {"fmha_sm100": str(source)}
-    with pytest.raises(RuntimeError, match="symlink|source"):
-        command_instance.run()
+        ancestor = tmp_path / "ancestor-link"
+        ancestor.symlink_to(real_build.parent, target_is_directory=True)
+        build = ancestor / "build"
+    _staging_instance(staging_command, source, build).run()
+    staged = build / "fmha_sm100"
+    assert not staged.is_symlink()
+    assert (staged / "_aot/hash/kernel.so").read_bytes() == b"keep"
     assert artifact.read_bytes() == b"keep"
-    if link_kind.startswith("shared"):
-        assert other.read_bytes() == b"shared"
+    if layout == "package_symlink":
+        assert (target / "marker").read_text() == "untouched"
+        assert not (target / "_aot").exists()
 
 
-def test_wheel_staging_refuses_symlink_even_without_previous_artifacts(tmp_path):
-    from setuptools.command.build_py import build_py
-    from setuptools.dist import Distribution
-
-    setup_path = _SCRIPT.parents[1] / "setup.py"
-    setup_tree = ast.parse(setup_path.read_text())
-    command = next(
-        node
-        for node in setup_tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
-    )
-    namespace = {"Path": Path, "build_py": build_py}
-    exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
-    shared = tmp_path / "shared"
-    shared.mkdir()
-    marker = shared / "existing.py"
-    marker.write_text("keep")
-    build = tmp_path / "build"
-    build.mkdir()
-    (build / "fmha_sm100").symlink_to(shared, target_is_directory=True)
-    command_instance = namespace["MsaBuildPy"](Distribution())
-    command_instance.build_lib = str(build)
-    command_instance.package_dir = {"fmha_sm100": str(tmp_path / "source")}
-    with pytest.raises(RuntimeError, match="symlink"):
-        command_instance.run()
-    assert marker.read_text() == "keep"
-
-
-def test_editable_build_does_not_clean_symlinked_source(tmp_path):
-    from setuptools.command.build_py import build_py
-    from setuptools.dist import Distribution
-
-    setup_path = _SCRIPT.parents[1] / "setup.py"
-    setup_tree = ast.parse(setup_path.read_text())
-    command = next(
-        node
-        for node in setup_tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
-    )
-    namespace = {"Path": Path, "build_py": build_py}
-    exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
-    source = tmp_path / "source"
+@pytest.mark.parametrize("layout", ["same", "same_through_symlink", "inside", "above"])
+def test_wheel_staging_never_cleans_or_stages_inside_source(tmp_path, staging_command, layout):
+    source = tmp_path / "source/fmha_sm100"
     artifact = source / "_aot/hash/kernel.so"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"keep")
+    (source / "__init__.py").touch()
+    if layout == "same":
+        build = source.parent
+    elif layout == "same_through_symlink":
+        build = tmp_path / "linked-source"
+        build.symlink_to(source.parent, target_is_directory=True)
+    elif layout == "inside":
+        build = source / "fresh-build"
+    else:
+        build = tmp_path / "build"
+        source.rename(tmp_path / "original")
+        source = build / "fmha_sm100/nested/fmha_sm100"
+        source.parent.mkdir(parents=True)
+        (tmp_path / "original").rename(source)
+        artifact = source / "_aot/hash/kernel.so"
+    with pytest.raises(RuntimeError, match="FMHA source package"):
+        _staging_instance(staging_command, source, build).run()
+    assert artifact.read_bytes() == b"keep"
+    assert not (source / "fresh-build").exists()
+
+
+def test_editable_build_does_not_clean_symlinked_source(tmp_path, staging_command):
+    source = tmp_path / "source/fmha_sm100"
+    artifact = source / "_aot/hash/kernel.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"keep")
+    (source / "__init__.py").touch()
     build = tmp_path / "build"
     build.mkdir()
     (build / "fmha_sm100").symlink_to(source, target_is_directory=True)
-    command_instance = namespace["MsaBuildPy"](Distribution())
-    command_instance.build_lib = str(build)
-    command_instance.package_dir = {"fmha_sm100": str(source)}
-    command_instance.py_modules = []
-    command_instance.packages = ["fmha_sm100"]
-    command_instance.editable_mode = True
-    command_instance.run()
+    command = _staging_instance(staging_command, source, build)
+    command.editable_mode = True
+    command.run()
     assert artifact.read_bytes() == b"keep"

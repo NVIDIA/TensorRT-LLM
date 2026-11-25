@@ -16,10 +16,13 @@ import subprocess
 import sys
 import tempfile
 import types
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import ModuleType
 
 
-def resolve_requested_architectures(requested, build_dir):
+def resolve_requested_architectures(requested: str, build_dir: Path) -> str:
+    """Read the effective architectures recorded by CMake for this build."""
     recorded = Path(build_dir) / "trtllm_cuda_architectures.txt"
     if recorded.is_file():
         architectures = recorded.read_text().strip()
@@ -38,17 +41,18 @@ def resolve_requested_architectures(requested, build_dir):
     raise ValueError("native CUDA architectures were not recorded; reconfigure the build")
 
 
-def should_build(system, requested, skip_wheel):
+def should_build(system: str, requested: str, skip_wheel: bool) -> bool:
+    """Whether this wheel target can contain the stock SM100/SM103 kernels."""
     if system != "Linux" or skip_wheel:
         return False
     return requested == "all" or bool(select_cuda_architectures(requested, {"sm_100a", "sm_103a"}))
 
 
-def select_cuda_architectures(requested, supported):
+def select_cuda_architectures(requested: str, supported: Iterable[str]) -> list[str]:
     """Select real SM images required by the wheel and available in nvcc."""
     supported = set(supported)
     if requested == "all":
-        return [arch for arch in ("sm_100a", "sm_103a", "sm_100f") if arch in supported]
+        return [arch for arch in ("sm_100a", "sm_103a") if arch in supported]
     wanted = []
     for item in requested.split(";"):
         match = re.fullmatch(r"(100|103)(?:a)?(?:-real)?", item.strip())
@@ -62,7 +66,7 @@ def select_cuda_architectures(requested, supported):
     return wanted
 
 
-def probe_cuda_architectures(nvcc, candidates):
+def probe_cuda_architectures(nvcc: Path, candidates: Iterable[str]) -> set[str]:
     """Compile tiny kernels: nvcc's architecture list omits a/f suffixes."""
     supported = set()
     with tempfile.TemporaryDirectory(prefix="trtllm-msa-arch-probe-") as directory:
@@ -91,7 +95,7 @@ def probe_cuda_architectures(nvcc, candidates):
     return supported
 
 
-def validate_artifacts(files, variant_names):
+def validate_artifacts(files: Mapping[str, Path], variant_names: Iterable[str]) -> None:
     """Require every generated entry point, including auxiliary kernels."""
     required = {
         "variants": {f"__tvm_ffi_run_{name}" for name in variant_names},
@@ -112,7 +116,7 @@ def validate_artifacts(files, variant_names):
             raise ValueError(f"{kind} missing exports: {', '.join(sorted(missing))}")
 
 
-def _load_module(name, path):
+def _load_module(name: str, path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -120,7 +124,7 @@ def _load_module(name, path):
     return module
 
 
-def _worker(package, warmup, architectures, jobs):
+def _worker(package: Path, warmup: Path, architectures: list[str], jobs: int) -> None:
     # Avoid importing the package's GPU-facing API on a CPU-only build host.
     package_module = types.ModuleType("fmha_sm100")
     package_module.__path__ = [str(package)]
@@ -134,8 +138,8 @@ def _worker(package, warmup, architectures, jobs):
 
     flags = jit._get_nvcc_flags
 
-    def selected_flags(*args, **kwargs):
-        original = flags(*args, **kwargs)
+    def selected_flags(cache: Path, fmha: bool = True) -> str:
+        original = flags(cache, fmha)
         original = re.sub(r"-gencode=arch=compute_\w+,code=sm_\w+", "", original)
         if "-I" in original:
             include_dirs = (
@@ -143,7 +147,7 @@ def _worker(package, warmup, architectures, jobs):
                 jit._cutlass_dir() / "include",
                 jit._cutlass_dir() / "tools" / "util" / "include",
                 jit._get_tvm_ffi_include(),
-                args[0],
+                cache,
             )
             directories = sorted(map(str, include_dirs), key=len, reverse=True)
             pattern = "-I(?:" + "|".join(map(re.escape, directories)) + ")"
@@ -179,7 +183,7 @@ def _worker(package, warmup, architectures, jobs):
         "source_sha256": digest,
         "tvm_ffi_version": jit._aot_ffi_version(),
         "host_arch": platform.machine(),
-        "cuda_toolkit_version": os.environ["TRTLLM_MSA_BUILD_CUDA_VERSION"],
+        "nvcc_version": os.environ["TRTLLM_MSA_BUILD_CUDA_VERSION"],
         "cuda_architectures": architectures,
         "variants": variants,
         "files": packaged_files,
@@ -187,7 +191,15 @@ def _worker(package, warmup, architectures, jobs):
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def build(package, warmup, requested, nvcc, jobs):
+def build(
+    package: Path,
+    warmup: Path,
+    requested: str,
+    nvcc: Path,
+    jobs: int,
+    build_dir: Path | None = None,
+) -> None:
+    """Compile and validate a complete stock set in a private build directory."""
     package, warmup, nvcc = Path(package).resolve(), Path(warmup).resolve(), Path(nvcc).resolve()
     candidates = select_cuda_architectures(requested, {"sm_100a", "sm_103a", "sm_100f"})
     supported = probe_cuda_architectures(nvcc, candidates)
@@ -199,7 +211,9 @@ def build(package, warmup, requested, nvcc, jobs):
     ).stdout.strip()
     if not version:
         raise ValueError("nvcc did not report a CUDA toolkit version")
-    with tempfile.TemporaryDirectory(prefix="trtllm-msa-aot-") as directory:
+    if build_dir is not None:
+        build_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="trtllm-msa-aot-", dir=build_dir) as directory:
         cache = Path(directory) / "cache"
         temporary = cache / "tmp"
         temporary.mkdir(parents=True)
@@ -261,4 +275,4 @@ if __name__ == "__main__":
         )
         if not nvcc:
             parser.error("nvcc is required to build MSA artifacts")
-        build(args.package, args.warmup, architectures, nvcc, args.jobs)
+        build(args.package, args.warmup, architectures, Path(nvcc), args.jobs, args.build_dir)

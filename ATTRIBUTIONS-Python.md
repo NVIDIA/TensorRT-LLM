@@ -64295,7 +64295,7 @@ SOFTWARE.
 
 ## MSA (MiniMax sparse attention)
 
-Source files with NVIDIA modifications, compiled at run time, fetched and patched at build time
+Source files with NVIDIA modifications, fetched and patched at build time
 (`3rdparty/fetch_content.json`, `3rdparty/patches/`) and installed as the packages:
 
   - `fmha_sm100`: `python/fmha_sm100` of https://gitlab.com/nvidia/tensorrt-llm/oss-components/msa
@@ -64304,6 +64304,10 @@ Source files with NVIDIA modifications, compiled at run time, fetched and patche
     `25c144700f727b638067e98066a60507081b63ad`.
   - `fmha_sm100_prefill_bf16x`: `python/fmha_sm100/prefill_q8kv4` of https://github.com/vllm-project/MSA
     at commit `25c144700f727b638067e98066a60507081b63ad`.
+
+The sources are compiled at run time by default. Linux wheels built with
+`--msa_aot` also include precompiled stock SM100/SM103 `fmha_sm100` shared libraries
+under `fmha_sm100/_aot/`, built using the bundled CUTLASS and apache-tvm-ffi headers.
 
 The `NOTICE` file of each tree lists the third-party code the sources derive from (NVIDIA CUTLASS,
 BSD-3-Clause; FlashInfer, Apache-2.0). `fmha_sm100_q8kv8/src/sm100/q8kv4_indexer_decode.py` is
