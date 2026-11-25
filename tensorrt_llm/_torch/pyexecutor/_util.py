@@ -30,10 +30,11 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    _KV_CACHE_HOST_HELPER_FIELDS, CacheTransceiverConfig,
+    CapacitySchedulerPolicy, ContextSchedulingPolicy, KVEventsConfig,
+    KvCacheCompressionConfig, KvCacheConfig, MultimodalEncoderSchedulingPolicy,
+    PeftCacheConfig, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -1346,11 +1347,11 @@ class KvCacheCreator:
         """Raise for KV cache fields the resolved manager or executor loop would ignore."""
         kv_cache_config = self._kv_cache_config
         used_fields = {
-            "remote_cache_config":
-            kv_cache_config.remote_cache_config is not None,
-            "defer_generation_only_release":
-            kv_cache_config.defer_generation_only_release,
+            "remote_cache_config": kv_cache_config.remote_cache_config
+            is not None,
         }
+        for field in _KV_CACHE_HOST_HELPER_FIELDS:
+            used_fields[field] = getattr(kv_cache_config, field)
         for field, is_set in used_fields.items():
             if is_set and not self._is_kv_cache_manager_v2:
                 raise ValueError(
@@ -1359,18 +1360,22 @@ class KvCacheCreator:
                     "kv_cache_config.use_kv_cache_manager_v2=True and disable "
                     "features that fall back to V1.")
         # TorchLlmArgs rejects the same at parse time; this sees the resolved values.
-        if kv_cache_config.defer_generation_only_release and (
-                llm_args.disable_overlap_scheduler or mapping.pp_size > 1):
-            raise ValueError(
-                "kv_cache_config.defer_generation_only_release is used only "
-                "by the overlap scheduler loop, which needs "
-                "disable_overlap_scheduler=False and pipeline parallel size 1.")
-        if kv_cache_config.defer_generation_only_release and not self._is_disagg:
-            logger.warning(
-                "kv_cache_config.defer_generation_only_release has no effect "
-                "without a cache transceiver: only the generation-only "
-                "requests of a disaggregated generation server are released "
-                "late.")
+        for field in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(kv_cache_config,
+                       field) and (llm_args.disable_overlap_scheduler
+                                   or mapping.pp_size > 1):
+                raise ValueError(
+                    f"kv_cache_config.{field} is used only "
+                    "by the overlap scheduler loop, which needs "
+                    "disable_overlap_scheduler=False and pipeline parallel size 1."
+                )
+        for field in ("defer_generation_only_release",
+                      "defer_context_only_release"):
+            if getattr(kv_cache_config, field) and not self._is_disagg:
+                logger.warning(
+                    f"kv_cache_config.{field} has no effect without a cache "
+                    "transceiver: only the generation-only and context-only "
+                    "requests of disaggregated servers are released late.")
 
     @property
     def _is_agg_helix(self) -> bool:
@@ -6106,6 +6111,10 @@ def create_py_executor_instance(
         kv_pool_rebalance_config.check_interval,
         defer_generation_only_release=llm_args.kv_cache_config.
         defer_generation_only_release,
+        defer_context_only_release=llm_args.kv_cache_config.
+        defer_context_only_release,
+        deferred_release_thread=llm_args.kv_cache_config.
+        deferred_release_thread,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,

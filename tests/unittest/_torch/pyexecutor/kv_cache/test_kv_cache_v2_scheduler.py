@@ -6834,3 +6834,31 @@ class TestGenInitPauseAfterRelease:
             admitted.append(got)
             pending = [req for req in pending if req.py_request_id not in got]
         assert admitted == [[1], [], [2], []]
+
+
+def _context_out_of_pages(closes_deferred: bool, **scheduler_kwargs):
+    """Request 0 runs out of pages beside started request 99, the preemption candidate."""
+    mgr = make_kv_cache_manager(
+        resize_context_fn=_out_of_pages_for(0),
+        has_cache_tier_below_gpu=False,
+    )
+    mgr.flush_deferred_closes.return_value = closes_deferred
+    sched = make_scheduler(mgr, max_num_tokens=1000, **scheduler_kwargs)
+    victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+    return mgr, victim, sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+
+class TestDeferredClosesBeforeContextPreemption:
+    """defer_context_only_release: a context request out of pages closes the deferred releases
+    before it gives up a started request."""
+
+    def test_deferred_closes_go_first(self):
+        mgr, _, out = _context_out_of_pages(closes_deferred=True)
+        mgr.flush_deferred_closes.assert_called_once_with()
+        mgr.preempt_request.assert_not_called()
+        assert out.recompute_paused_requests == []
+
+    def test_without_deferred_closes_a_started_request_pays_as_before(self):
+        mgr, victim, out = _context_out_of_pages(closes_deferred=False)
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]

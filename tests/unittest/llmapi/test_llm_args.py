@@ -2191,6 +2191,29 @@ def test_KvCacheConfig_defer_generation_only_release():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("field,on", [
+    ("defer_context_only_release", True),
+])
+def test_KvCacheConfig_host_helper_fields_need_v2(field, on):
+    assert getattr(KvCacheConfig(), field) in (False, 0)
+    assert getattr(KvCacheConfig(**{field: on}), field) == on
+    with pytest.raises(ValidationError, match=f"{field} requires"):
+        KvCacheConfig(**{field: on, "use_kv_cache_manager_v2": False})
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_deferred_release_thread_needs_a_deferral():
+    assert KvCacheConfig().deferred_release_thread is False
+    for defer in ("defer_generation_only_release",
+                  "defer_context_only_release"):
+        assert KvCacheConfig(deferred_release_thread=True, **{
+            defer: True
+        }).deferred_release_thread
+    with pytest.raises(ValidationError, match="needs defer_generation_only"):
+        KvCacheConfig(deferred_release_thread=True)
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",
@@ -3438,9 +3461,21 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
 }, {
     "disable_overlap_scheduler": True
 }])
-def test_defer_generation_only_release_needs_the_overlap_loop(loop) -> None:
+@pytest.mark.parametrize("kv", [
+    {
+        "defer_generation_only_release": True
+    },
+    {
+        "defer_context_only_release": True
+    },
+    {
+        "defer_generation_only_release": True,
+        "deferred_release_thread": True
+    },
+])
+def test_defer_generation_only_release_needs_the_overlap_loop(loop, kv) -> None:
     """Rejected at parse time, before any rank loads the checkpoint."""
-    defer = KvCacheConfig(defer_generation_only_release=True)
+    defer = KvCacheConfig(**kv)
     with pytest.raises(ValueError, match="overlap scheduler loop"):
         TorchLlmArgs(model=llama_model_path, kv_cache_config=defer, **loop)
     TorchLlmArgs(model=llama_model_path, kv_cache_config=defer)

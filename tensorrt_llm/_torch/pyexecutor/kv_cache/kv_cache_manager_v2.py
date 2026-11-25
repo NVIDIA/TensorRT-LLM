@@ -159,6 +159,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .host_helper import RELEASE, KvHostHelper
 from .page_table import ByHead, PageTableSpec, Replicated, explicit_layer_specs, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
@@ -2414,6 +2415,14 @@ class KVCacheManagerV2(BaseResourceManager):
     # __init__ gives each instance its own queue.
     _defer_close_enabled: bool = False
     _deferred_closes: "deque[tuple[int, _KVCache]] | tuple[()]" = ()
+    # Also defer the close of finished context-only requests (a disaggregated context server).
+    _defer_context_close: bool = False
+    # Background thread for deferred closes (enable_host_helper); None closes on the calling
+    # thread.
+    _host_helper: KvHostHelper | None = None
+    _helper_releases: bool = False
+    # Deferred closes the helper ran since the last flush_deferred_closes.
+    _num_helper_closes: int = 0
     # Local layer id -> storage of the draft-owned layers a subclass appends
     # after the layers it describes itself (KimiK3HybridCacheManager).
     # Empty when ``layer_specs`` describes every layer.
@@ -9980,12 +9989,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
             publish_donation_failure(planned, error)
 
-    def enable_deferred_close(self, enabled: bool) -> None:
+    def enable_deferred_close(self, enabled: bool, *, context_only: bool = False) -> None:
         """Turn the deferred close of finished generation-only requests on or off
-        (the overlap executor's switch). Turning it off runs any closes still pending."""
+        (the overlap executor's switch); with ``context_only``, finished context-only requests
+        are deferred too. Turning it off runs any closes still pending."""
         if not enabled:
             self.flush_deferred_closes()
         self._defer_close_enabled = bool(enabled) and not self.is_draft
+        self._defer_context_close = self._defer_close_enabled and context_only
 
     def _defer_remove_kv_cache(self, request_id: int) -> bool:
         """`_remove_kv_cache` except for the close, which `flush_deferred_closes` runs later.
@@ -10001,26 +10012,81 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.discard(request_id)
         self.kv_cache_map.pop(request_id, None)
         kv_cache.discard_pending_stats()
+        self._mixed_precision_low_prefix_len.pop(request_id, None)
+        if self.num_locality_domains > 1:
+            self._locality_domain_load[kv_cache.locality_domain_id] -= 1
         self._deferred_closes.append((request_id, kv_cache))
+        if self._helper_releases:
+            self._host_helper.submit(RELEASE, self._close_next_deferred)
         return True
 
-    def flush_deferred_closes(self) -> bool:
-        """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first.
+    def _close_deferred(self, request_id: int, kv_cache: _KVCache) -> None:
+        try:
+            if self._sharing is not None:
+                self._sharing._on_free(request_id, kv_cache)
+            kv_cache.close()
+        finally:
+            self.impl.clear_stats_excluded(request_id)
 
-        Returns whether any was pending. A close that raises leaves the later ones queued; its own
-        request is forgotten all the same.
-        """
+    def _close_next_deferred(self) -> None:
+        """The host helper's release item: the oldest deferred close, if one is left."""
+        try:
+            request_id, kv_cache = self._deferred_closes.popleft()
+        except IndexError:
+            return  # flushed on the executor thread already
+        self._num_helper_closes += 1
+        self._close_deferred(request_id, kv_cache)
+
+    def _flush_deferred_closes_here(self) -> bool:
         if not self._deferred_closes:
             return False
         while self._deferred_closes:
-            request_id, kv_cache = self._deferred_closes.popleft()
-            try:
-                if self._sharing is not None:
-                    self._sharing._on_free(request_id, kv_cache)
-                kv_cache.close()
-            finally:
-                self.impl.clear_stats_excluded(request_id)
+            self._close_deferred(*self._deferred_closes.popleft())
         return True
+
+    def flush_deferred_closes(self) -> bool:
+        """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first, on this thread.
+        With the host helper, first wait for the close it may be running.
+
+        Returns whether any was pending, or closed by the helper since the last flush. A close
+        that raises leaves the later ones queued; its own request is forgotten all the same.
+        """
+        helper = self._host_helper
+        if not self._helper_releases:
+            return self._flush_deferred_closes_here()
+        flushed = []
+        helper.drain(RELEASE, lambda: flushed.append(self._flush_deferred_closes_here()))
+        closed, self._num_helper_closes = self._num_helper_closes, 0
+        return flushed[0] or closed > 0
+
+    def enable_host_helper(
+        self, device: int | None, *, releases: bool = False, start_thread: bool = True
+    ) -> KvHostHelper | None:
+        """Start the background thread that runs the deferred closes (``releases``) beside the
+        executor thread, in the windows the executor opens on the returned helper. Returns None
+        when nothing applies."""
+        if releases and self._sharing is not None:
+            logger.warning(
+                "KV cache host helper: deferred closes notify a cache lender on the executor thread"
+            )
+            releases = False
+        if self.is_draft or not releases:
+            return None
+        self.stop_host_helper()
+        self._host_helper = KvHostHelper(device, start_thread=start_thread)
+        self._helper_releases = releases
+        logger.info(f"KV cache host helper: releases={releases}")
+        return self._host_helper
+
+    def stop_host_helper(self) -> None:
+        """Run the deferred closes and stop the helper thread."""
+        helper = self._host_helper
+        if helper is None:
+            return
+        self.flush_deferred_closes()
+        self._helper_releases = False
+        helper.stop()
+        self._host_helper = None
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -10063,7 +10129,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # Dummies reuse request ids, so their closes stay immediate.
         if (
             self._defer_close_enabled
-            and request.is_generation_only_request
+            and (
+                request.is_generation_only_request
+                or (self._defer_context_close and request.is_context_only_request)
+            )
             and not pin_on_release
             and not request.is_dummy
             # Host history reservations back admission; keep their release with the close.
@@ -10469,6 +10538,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _shutdown_caches(self) -> None:
         # impl.shutdown() raises while any cache is open, deferred ones included.
+        self.stop_host_helper()
         self.enable_deferred_close(False)
         # Before the caches close: a lender waiting on a lease has to be told to stop while
         # the caches it lent against are still alive.

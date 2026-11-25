@@ -6546,6 +6546,14 @@ class MixedPrecisionKV(NamedTuple):
     last_n: int
 
 
+# KvCacheConfig fields of the overlap loop's deferred releases and KV cache host helper.
+_KV_CACHE_HOST_HELPER_FIELDS = (
+    "defer_generation_only_release",
+    "defer_context_only_release",
+    "deferred_release_thread",
+)
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -6845,6 +6853,28 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "are published one iteration later too, "
         "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
         "without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    defer_context_only_release: bool = Field(
+        default=False,
+        status="prototype",
+        description="Release the KV cache of a finished context-only request "
+        "(disaggregated context server) late, as defer_generation_only_release does for "
+        "generation-only requests. Its blocks were committed for reuse while it ran, so "
+        "later requests can match them before the release. Requires KV cache manager v2 and "
+        "the overlap scheduler without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    deferred_release_thread: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Run the deferred releases of defer_generation_only_release and "
+        "defer_context_only_release on a background thread instead of the executor thread: "
+        "a release starts only while the executor waits for the previous step's GPU work, or "
+        "inside the forward call of a context-only batch, which captures no CUDA graph. The "
+        "scheduler and the idle path still release on the executor thread when they need the "
+        "pages. Requires one of the two options.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -7189,11 +7219,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_defer_generation_only_release(self) -> 'KvCacheConfig':
-        if (self.defer_generation_only_release
-                and self.use_kv_cache_manager_v2 is False):
+        for name in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(self, name) and self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    f"kv_cache_config.{name} requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+        if self.deferred_release_thread and not (
+                self.defer_generation_only_release
+                or self.defer_context_only_release):
             raise ValueError(
-                "kv_cache_config.defer_generation_only_release requires "
-                "kv_cache_config.use_kv_cache_manager_v2=True.")
+                "kv_cache_config.deferred_release_thread needs "
+                "defer_generation_only_release or defer_context_only_release.")
         return self
 
     @model_validator(mode='after')
@@ -9373,13 +9409,15 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_defer_generation_only_release(self) -> 'TorchLlmArgs':
-        if self.kv_cache_config.defer_generation_only_release and (
-                self.disable_overlap_scheduler
-                or self.pipeline_parallel_size > 1):
-            raise ValueError(
-                "kv_cache_config.defer_generation_only_release is used only "
-                "by the overlap scheduler loop, which needs "
-                "disable_overlap_scheduler=False and pipeline_parallel_size=1.")
+        for name in _KV_CACHE_HOST_HELPER_FIELDS:
+            if getattr(self.kv_cache_config,
+                       name) and (self.disable_overlap_scheduler
+                                  or self.pipeline_parallel_size > 1):
+                raise ValueError(
+                    f"kv_cache_config.{name} is used only "
+                    "by the overlap scheduler loop, which needs "
+                    "disable_overlap_scheduler=False and pipeline_parallel_size=1."
+                )
         return self
 
     @model_validator(mode="after")

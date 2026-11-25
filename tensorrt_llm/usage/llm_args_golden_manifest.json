@@ -744,7 +744,17 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.defer_context_only_release"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.defer_generation_only_release"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.deferred_release_thread"
     },
     {
       "capture_policy": "int|none",

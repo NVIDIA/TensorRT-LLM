@@ -2304,6 +2304,70 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "defer_context_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_context_only_release"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "deferred_release_thread": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "deferred_release_thread"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
         }
       ],
       "properties": {
@@ -5708,6 +5772,84 @@
         {
           "if": {
             "properties": {
+              "defer_context_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_context_only_release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "defer_generation_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_generation_only_release"
+                ]
+              },
+              {
+                "properties": {
+                  "defer_context_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_context_only_release"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
               "remote_cache_config": {
                 "properties": {
                   "level": {
@@ -5800,11 +5942,25 @@
           "description": "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise.",
           "title": "Cross Kv Cache Fraction"
         },
+        "defer_context_only_release": {
+          "default": false,
+          "description": "Release the KV cache of a finished context-only request (disaggregated context server) late, as defer_generation_only_release does for generation-only requests. Its blocks were committed for reuse while it ran, so later requests can match them before the release. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "status": "prototype",
+          "title": "Defer Context Only Release",
+          "type": "boolean"
+        },
         "defer_generation_only_release": {
           "default": false,
           "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later, or as soon as the scheduler runs out of pages, before it suspends or recompute-pauses a running request. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
           "status": "prototype",
           "title": "Defer Generation Only Release",
+          "type": "boolean"
+        },
+        "deferred_release_thread": {
+          "default": false,
+          "description": "Run the deferred releases of defer_generation_only_release and defer_context_only_release on a background thread instead of the executor thread: a release starts only while the executor waits for the previous step's GPU work, or inside the forward call of a context-only batch, which captures no CUDA graph. The scheduler and the idle path still release on the executor thread when they need the pages. Requires one of the two options.",
+          "status": "prototype",
+          "title": "Deferred Release Thread",
           "type": "boolean"
         },
         "disk_cache_path": {
@@ -10801,6 +10957,70 @@
             },
             "required": [
               "defer_generation_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "defer_context_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_context_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "deferred_release_thread": {
+                "const": true
+              }
+            },
+            "required": [
+              "deferred_release_thread"
             ],
             "type": "object"
           }

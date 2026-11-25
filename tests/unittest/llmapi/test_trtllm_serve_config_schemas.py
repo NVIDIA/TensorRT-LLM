@@ -2268,3 +2268,51 @@ def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
         TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
     for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
         assert Draft202012Validator(schemas[filename]).is_valid(launch), filename
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_config", "loop", "valid"),
+    [
+        *(
+            (kv, loop, valid)
+            for kv in (
+                {"defer_context_only_release": True},
+                {"defer_generation_only_release": True, "deferred_release_thread": True},
+            )
+            for loop, valid in (
+                ({}, True),
+                ({"disable_overlap_scheduler": True}, False),
+                ({"pipeline_parallel_size": 2}, False),
+            )
+        ),
+        ({"deferred_release_thread": True}, {}, False),
+        ({"defer_context_only_release": True, "use_kv_cache_manager_v2": False}, {}, False),
+    ],
+)
+def test_host_helper_rules_match_runtime(
+    schemas: dict[str, dict], kv_cache_config: dict, loop: dict, valid: bool
+) -> None:
+    """Both schemas accept the KV cache host helper fields exactly when KvCacheConfig and TorchLlmArgs do."""
+    from types import SimpleNamespace
+
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+
+    def runtime_accepts() -> bool:
+        try:
+            args = SimpleNamespace(
+                kv_cache_config=KvCacheConfig(**kv_cache_config),
+                disable_overlap_scheduler=loop.get("disable_overlap_scheduler", False),
+                pipeline_parallel_size=loop.get("pipeline_parallel_size", 1),
+            )
+            TorchLlmArgs.validate_defer_generation_only_release(args)
+        except (ValidationError, ValueError):
+            return False
+        return True
+
+    assert runtime_accepts() == valid
+    config = {"kv_cache_config": kv_cache_config, **loop}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename

@@ -1035,6 +1035,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             request take them instead would leave `req` preempting again every
             pass without ever being admitted.
             """
+            if self.kv_cache_manager.flush_deferred_closes():
+                # Pages held by deferred closes (defer_context_only_release) come back
+                # first; `req` retries next pass, as after a preemption.
+                return True
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
