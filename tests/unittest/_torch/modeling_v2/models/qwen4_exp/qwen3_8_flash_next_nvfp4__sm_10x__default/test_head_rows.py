@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The verify rows the shell gathers for its heads (`_head_rows`): under attention DP up to
 `_VERIFY_ROWS_GATHER_MAX` rows in one `embed_rows` launch (a copy, bitwise the embedding), else
-`nn.functional.embedding`. The op is a recorder; no kernel runs."""
+`nn.functional.embedding`. The op is a recorder; no kernel runs. The tep4 half of the same
+dispatch (`core.tep_fast`, any row count) is `test_tep_ple_fork.py::test_head_rows`."""
 
 from types import SimpleNamespace
 
@@ -58,6 +59,6 @@ def test_dispatch(monkeypatch, dp_size, rows, dtype, strided, expected):
 
     monkeypatch.setattr(M, "embed_rows", embed_rows)
     monkeypatch.setattr(M.nn.functional, "embedding", embedding)
-    got = M._head_rows(SimpleNamespace(dp_size=dp_size), final, ids)
+    got = M._head_rows(SimpleNamespace(dp_size=dp_size), ids, final)
     assert calls == ([("embed_rows", 1, False)] if expected == "embed_rows" else [("embedding",)])
     assert got is sentinel[expected]

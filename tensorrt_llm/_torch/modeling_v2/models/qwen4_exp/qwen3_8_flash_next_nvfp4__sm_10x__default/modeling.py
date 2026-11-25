@@ -3109,19 +3109,25 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 _VERIFY_ROWS_GATHER_MAX = 31  # capacity: fixed: a dispatch threshold
 
 
-def _head_rows(core, final: torch.Tensor, gather_ids: torch.Tensor) -> torch.Tensor:
-    """The rows of `final` the verify head reads (`gather_ids`): under attention DP up to
-    `_VERIFY_ROWS_GATHER_MAX` of them on `embed_rows`, else `nn.functional.embedding`."""
-    if (
+def _head_rows(core, gather_ids: torch.Tensor, final: torch.Tensor) -> torch.Tensor:
+    """The rows of `final` the verify head reads (`gather_ids`) in one `embed_rows` launch (a
+    copy: bitwise the gather) where it takes the ids, else `nn.functional.embedding`: under
+    attention DP up to `_VERIFY_ROWS_GATHER_MAX` of them, and at a tep4 rank under
+    `TEP_FAST_DECODE_ENV` (`core.tep_fast`) at any count."""
+    if not (
         gather_ids.dim() == 1
-        and gather_ids.shape[0] <= _VERIFY_ROWS_GATHER_MAX
         and gather_ids.is_contiguous()
         and gather_ids.dtype in (torch.int32, torch.int64)
         and final.dim() == 2
         and final.stride(1) == 1
-        and final.is_cuda
-        and core.dp_size > 1
     ):
+        return nn.functional.embedding(gather_ids, final)
+    dp = (
+        getattr(core, "dp_size", 1) > 1
+        and gather_ids.shape[0] <= _VERIFY_ROWS_GATHER_MAX
+        and final.is_cuda
+    )
+    if dp or getattr(core, "tep_fast", False):
         return embed_rows(gather_ids, final, 1, False)
     return nn.functional.embedding(gather_ids, final)
 
@@ -10190,12 +10196,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 **kwargs,
             )
         )
+        head_rows = _head_rows(self.model, spec_metadata.gather_ids, final)
         if isinstance(self.logits_processor, _WideningLogitsProcessor):
             verify_argmax_only, self.logits_processor.draft_argmax_only = _spec_argmax_only(
                 self.spec_worker, spec_metadata
             )
             logits = self.logits_processor.forward(
-                _head_rows(self.model, final, spec_metadata.gather_ids),
+                head_rows,
                 self.lm_head,
                 attn_metadata,
                 True,
@@ -10205,7 +10212,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # This rank's vocabulary shard for a greedy or temperature-only batch (the worker
             # marks `spec_metadata.sharded_target_logits`), else the gathered fp32 logits.
             logits = self.spec_worker.target_logits(
-                _head_rows(self.model, final, spec_metadata.gather_ids),
+                head_rows,
                 self.lm_head,
                 self.logits_processor,
                 attn_metadata,
@@ -10214,7 +10221,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             )
         else:
             logits = self.logits_processor.forward(
-                _head_rows(self.model, final, spec_metadata.gather_ids),
+                head_rows,
                 self.lm_head,
                 attn_metadata,
                 True,

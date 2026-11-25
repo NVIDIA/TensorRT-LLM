@@ -95,3 +95,28 @@ def test_fork_and_join(monkeypatch, capturing):
         torch.zeros(4, 8), None, (None, None, None, None, 4), None, False, key_value
     )
     assert log == ["main waits ple"] and got == key_value
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tep_fast, ids, expected",
+    [
+        (True, torch.tensor([3, 0, 5]), "embed_rows"),
+        (True, torch.tensor([3, 0, 5], dtype=torch.int32), "embed_rows"),
+        (True, torch.tensor([[3, 0, 5]]).t()[:, 0], "embed_rows"),  # a contiguous view
+        (True, torch.tensor([3, 9, 0, 9, 5])[::2], "embedding"),  # strided ids
+        (False, torch.tensor([3, 0, 5]), "embedding"),
+    ],
+)
+def test_head_rows(monkeypatch, tep_fast, ids, expected):
+    """The verify head's row gather (the rest of the measured TEP_GLUE)."""
+    calls = []
+    monkeypatch.setattr(
+        M,
+        "embed_rows",
+        lambda i, t, copies, clamp: calls.append("embed_rows") or torch.index_select(t, 0, i),
+    )
+    final = torch.arange(24.0).reshape(6, 4)
+    got = M._head_rows(SimpleNamespace(tep_fast=tep_fast), ids, final)
+    assert calls == ([] if expected == "embedding" else ["embed_rows"])
+    assert torch.equal(got, torch.nn.functional.embedding(ids.long(), final))
