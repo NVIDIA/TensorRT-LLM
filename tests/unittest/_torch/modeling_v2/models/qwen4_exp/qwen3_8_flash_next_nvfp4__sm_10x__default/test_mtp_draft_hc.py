@@ -122,6 +122,8 @@ def _core(raw: dict):
         shared_inter=1,
         tp_sum=lambda t: t,
         _hc_first=None,
+        # The stock mixer tiles (`DP_HC_TILES_ENV` is an attention-DP form).
+        hc_tiles=False,
     )
     MOD.Qwen4ExpDefaultModelingV2._fuse_hc_first_projections(core)
     core._mtp = MOD._mtp_views(core)
