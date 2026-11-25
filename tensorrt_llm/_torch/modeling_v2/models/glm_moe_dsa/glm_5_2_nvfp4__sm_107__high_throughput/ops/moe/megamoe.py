@@ -312,6 +312,9 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 and _MEGAMOE_PRIME_LADDER
                 and AutoTuner.get().is_tuning_mode
             ):
+                # The ladder launches the fused kernel too (MoERunContext.before_launch).
+                if kwargs.get("before_launch") is not None:
+                    kwargs["before_launch"]()
                 self._prime_ladder(
                     live_T=launch_max_T,
                     weight_view=kwargs["weight_view"],
@@ -344,6 +347,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 output_dtype=kwargs["output_dtype"],
                 launch_max_T=launch_max_T,
                 staged_inputs=True,
+                before_launch=kwargs.get("before_launch"),
             )
         finally:
             self._launch_defer = False
@@ -398,6 +402,10 @@ class RubinMegaMoE(MegaMoECuteDsl):
             weights.fc1_norm_const,
             output,
         ]
+        # This backend takes MoERunContext.before_launch (the EPLB statistic-allreduce wait): the
+        # generation kernel waits for the other ranks inside the kernel, as the generic one does.
+        if kw.get("before_launch") is not None:
+            kw["before_launch"]()
         shared.set_active_megamoe_cute_weight_cache(self._cute_weight_cache)
         provider = self._symm_providers.get(bucket) if kw.get("staged_inputs") else None
         shared.set_active_megamoe_cute_buffer_cache(

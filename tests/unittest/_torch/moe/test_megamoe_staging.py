@@ -288,3 +288,70 @@ def test_rubin_glm_buckets_read_the_kernel_properties_by_name(monkeypatch):
     for bucket in (64, 256):
         properties = runner.query_rubin_kernel_properties(max_tokens_per_rank=bucket)
         assert isinstance(properties, shared.MegaMoeKernelProperties)
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("bucket", [32, 64, 128, 192])
+def test_rubin_generation_buckets_issue_before_launch_before_the_kernel(
+    preparation_backend, monkeypatch, bucket, direct
+):
+    """Regression: GLM-5.2 SM107's generation-bucket launches dropped MoERunContext.before_launch,
+    so under online EPLB the kernel could run alongside the statistic allreduce and hang."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
+
+    runner, megamoe = _glm_sm107_moe("megamoe_runner", "megamoe")
+    assert bucket in runner.GEN_TOKEN_BUCKETS
+    backend = preparation_backend
+    backend.__class__ = megamoe.RubinMegaMoE
+    del backend._launch_megamoe_kernel  # the generation-bucket launch, down to the runner
+    backend._pending_direct_stage = backend._deferred_topk_tokens = None
+    backend._launch_defer = False
+    backend._maxt_buckets, backend.max_num_tokens = (32, 64, 128, 192), 192
+    backend._symm_providers = {b: SimpleNamespace(cute_views=None) for b in backend._maxt_buckets}
+    backend._use_in_kernel_fc2_reduce = lambda max_T: False
+    backend._cute_weight_cache = None
+    # compute_slot_count and expand_intermediate_size_per_partition derive from these.
+    for name, value in dict(
+        expert_size_per_partition=4,
+        intermediate_size_per_partition=32,
+        intermediate_size_expand_ratio=2,
+        apply_topk_in_fc1=True,
+        act_clamp=None,
+        combine_format="bf16",
+    ).items():
+        setattr(backend, name, value)
+    weights = SimpleNamespace(
+        **{name: torch.zeros(1, dtype=torch.uint8) for name in ("fc1_weight", "fc2_weight")},
+        **{name: torch.zeros(1, dtype=torch.uint8) for name in ("fc1_weight_sf", "fc2_weight_sf")},
+        fc31_alpha=None,
+        fc2_alpha=None,
+        fc1_norm_const=None,
+    )
+    backend._build_weight_view = lambda: weights
+    trace = []
+    monkeypatch.setattr(megamoe, "get_rubin_runner", lambda **kw: object())
+    monkeypatch.setattr(megamoe, "run_rubin_megamoe", lambda *a, **kw: trace.append("launch"))
+    rows = 3
+    x = torch.zeros(rows, 64).bfloat16()
+    ids, weights_in = torch.zeros(rows, 2).int(), torch.ones(rows, 2)
+    if direct:  # RubinFusedCommScheduler's order: quantize into the stage, then the bucket hint
+        backend.set_adaptive_launch_tokens(None)
+        activation = torch.zeros(bucket, 32, dtype=torch.uint8)
+        stage = megamoe.DirectStage(
+            bucket, rows, ids, weights_in, activation, torch.zeros(bucket, 4, dtype=torch.uint8)
+        )
+        quantized, sf = backend.quantize_input_into(x, stage)
+        backend.set_adaptive_launch_tokens(bucket)
+    else:
+        backend.set_adaptive_launch_tokens(bucket, output_dtype=torch.bfloat16)
+        quantized, sf = backend.quantize_input(x)
+    context = MoERunContext(
+        ids,
+        weights_in,
+        quantized,
+        sf,
+        output_dtype=torch.bfloat16,
+        before_launch=lambda: trace.append("wait"),
+    )
+    backend.run_moe(context)
+    assert trace == ["wait", "launch"]
