@@ -1197,18 +1197,24 @@ _INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
 #: 48 / 96 / 120 / 224 rows, 13 plan sets): weight geometry `(N, K)` -> `((largest rows, MMA N
 #: rule, Plan(ks, kpb, stages, l2, epi)), ...)`. MMA N rule "op": `mid_rows_mm`'s (32 / 64 / 128 /
 #: 256); "fine": `max(32, rows rounded up to 16)`. Up to 64 rows 8 k-blocks a stage and 2
-#: k-tiles of L2 prefetch, 65..128 rows the op's ring with 4 k-tiles of prefetch, above the
-#: fine N with the deepest ring. No plan splits K. A geometry not listed does not engage.
+#: k-tiles of L2 prefetch; 65..96 rows the fine N (80 / 96 instead of the op's 128, which pads
+#: 25-47% of every MMA and ring stage with zero rows) with an 8-deep ring; 97..128 rows the op's
+#: ring with 4 k-tiles of prefetch; above, the fine N with the deepest ring. The activation rows
+#: sit on the MMA N, so the fine N only changes how many zero rows ride along. No plan splits K.
+#: GB300 dep8 server step at 18 / 24 requests a rank (72 / 96 rows), fine N against N 128:
+#: -0.063 / -0.052 ms. A geometry not listed does not engage.
 _INPROJ_RELEASE_PLANS: dict = {
     # GDN in_proj (q|k|v|z|a|b)
     (16480, 2560): (
         (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (96, "fine", MidPlan(1, 4, 8, 4, 16)),
         (128, "op", MidPlan(1, 4, 6, 4, 16)),
         (256, "fine", MidPlan(1, 4, 5, 1, 16)),
     ),
     # attention in-proj (q|gate|k|v|index)
     (14080, 2560): (
         (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (96, "fine", MidPlan(1, 4, 8, 4, 16)),
         (128, "op", MidPlan(1, 4, 6, 4, 16)),
         (256, "fine", MidPlan(1, 4, 5, 1, 16)),
     ),
