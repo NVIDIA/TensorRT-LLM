@@ -14,6 +14,17 @@ CTX_PORT=8001
 GEN_PORT=8002
 USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend DEFAULT|NIXL] [--transceiver_runtime auto|PYTHON] [--port N] [--ctx_port N] [--gen_port N] [--help]"
 
+# Exit with the usage message unless $2, the value given for option $1,
+# is a port number. Digits are spelled out because [0-9] also matches
+# non-ASCII digits in UTF-8 locales.
+require_port() {
+    if [[ ! "$2" =~ ^[123456789][0123456789]{0,4}$ ]] || (( $2 > 65535 )); then
+        echo "Error: $1 needs a port number between 1 and 65535"
+        echo "$USAGE"
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --executor)
@@ -41,14 +52,17 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --port)
+            require_port "$1" "${2:-}"
             PORT="$2"
             shift 2
             ;;
         --ctx_port)
+            require_port "$1" "${2:-}"
             CTX_PORT="$2"
             shift 2
             ;;
         --gen_port)
+            require_port "$1" "${2:-}"
             GEN_PORT="$2"
             shift 2
             ;;

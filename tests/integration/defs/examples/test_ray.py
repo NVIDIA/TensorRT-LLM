@@ -149,7 +149,7 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size):
         ray.shutdown()
 
 
-def _run_completion_requests(server_port):
+def _run_completion_requests(server_port: int) -> None:
     prompts = [
         "What is the capital of Germany?",
         "Explain the theory of relativity.",
