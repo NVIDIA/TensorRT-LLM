@@ -25,11 +25,11 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from unittest.mock import patch
 
 import httpx
@@ -1162,22 +1162,11 @@ class TestImageEdit:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        *,
-        image_output: Optional[torch.Tensor] = None,
-        extra_param_specs: Optional[dict] = None,
-        model: str = "Qwen/Qwen-Image-Layered",
-        should_fail: bool = False,
-        supports_image_edit: bool = True,
+        **generator_kwargs: Any,
     ) -> tuple[TestClient, MockVisualGen]:
-        gen = self._generator(
-            image_output=image_output,
-            extra_param_specs=extra_param_specs,
-            model=model,
-            should_fail=should_fail,
-            supports_image_edit=supports_image_edit,
-        )
+        gen = self._generator(**generator_kwargs)
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-        return _create_server(gen, model_name=model), gen
+        return _create_server(gen, model_name=gen._model), gen
 
     @pytest.mark.parametrize(
         ("model", "supports_image_edit", "expected_status"),
@@ -1608,6 +1597,40 @@ class TestImageEdit:
         assert resp.status_code == 400
         assert gen.last_params is None
 
+    async def _probe_health_during_edit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        gen: MockVisualGen,
+        reached: threading.Event,
+        release: threading.Event,
+        still_pending: Callable[[asyncio.Task[httpx.Response]], bool],
+        reach_failure_msg: str,
+    ) -> tuple[httpx.Response, httpx.Response, bool]:
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_async_client(gen, model_name=gen._model)
+        try:
+            edit_task = asyncio.create_task(
+                client.post(
+                    "/v1/images/edits",
+                    json={
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                        "response_format": "b64_json",
+                    },
+                )
+            )
+            try:
+                assert await asyncio.to_thread(reached.wait, 5), reach_failure_msg
+                health = await asyncio.wait_for(client.get("/health"), timeout=5)
+                answered_while_pending = still_pending(edit_task)
+            finally:
+                release.set()
+                resp = await edit_task
+        finally:
+            await client.aclose()
+        return health, resp, answered_while_pending
+
     @pytest.mark.threadleak(enabled=False)  # generate_async runs on a worker thread
     @pytest.mark.asyncio
     async def test_image_edit_does_not_block_the_event_loop(
@@ -1621,8 +1644,6 @@ class TestImageEdit:
         (``/health``, video polling, other edits) behind the running edit.
         """
         gen = self._generator()
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-
         entered = threading.Event()
         release = threading.Event()
         returned = threading.Event()
@@ -1642,30 +1663,15 @@ class TestImageEdit:
                 returned.set()
 
         monkeypatch.setattr(gen, "generate_async", _blocking_generate_async)
-
-        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
-        try:
-            edit_task = asyncio.create_task(
-                client.post(
-                    "/v1/images/edits",
-                    json={
-                        "prompt": "split layers",
-                        "image": _b64_white_png_1x1(),
-                        "response_format": "b64_json",
-                    },
-                )
-            )
-            try:
-                assert await asyncio.to_thread(entered.wait, 5), (
-                    "the edit request never reached generate_async"
-                )
-                health = await asyncio.wait_for(client.get("/health"), timeout=5)
-                answered_while_generating = not returned.is_set()
-            finally:
-                release.set()  # never leave the generation thread blocked
-                resp = await edit_task
-        finally:
-            await client.aclose()
+        health, resp, answered_while_generating = await self._probe_health_during_edit(
+            tmp_path,
+            monkeypatch,
+            gen,
+            entered,
+            release,
+            lambda _edit_task: not returned.is_set(),
+            "the edit request never reached generate_async",
+        )
 
         assert health.status_code == 200
         assert resp.status_code == 200
@@ -1689,8 +1695,6 @@ class TestImageEdit:
         until that wait gives up, so ``/health`` is answered only afterwards.
         """
         gen = self._generator()
-        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-
         waiting = threading.Event()
         health_answered = threading.Event()
         resolved = threading.Event()
@@ -1730,30 +1734,15 @@ class TestImageEdit:
             return _GatedResult(original(inputs=inputs, params=params))
 
         monkeypatch.setattr(gen, "generate_async", _gated_generate_async)
-
-        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
-        try:
-            edit_task = asyncio.create_task(
-                client.post(
-                    "/v1/images/edits",
-                    json={
-                        "prompt": "split layers",
-                        "image": _b64_white_png_1x1(),
-                        "response_format": "b64_json",
-                    },
-                )
-            )
-            try:
-                assert await asyncio.to_thread(waiting.wait, 5), (
-                    "the edit request never waited for its generation result"
-                )
-                health = await asyncio.wait_for(client.get("/health"), timeout=5)
-                answered_while_waiting = not resolved.is_set() and not edit_task.done()
-            finally:
-                health_answered.set()  # never leave the result wait blocked
-                resp = await edit_task
-        finally:
-            await client.aclose()
+        health, resp, answered_while_waiting = await self._probe_health_during_edit(
+            tmp_path,
+            monkeypatch,
+            gen,
+            waiting,
+            health_answered,
+            lambda edit_task: not resolved.is_set() and not edit_task.done(),
+            "the edit request never waited for its generation result",
+        )
 
         assert health.status_code == 200
         assert resp.status_code == 200
