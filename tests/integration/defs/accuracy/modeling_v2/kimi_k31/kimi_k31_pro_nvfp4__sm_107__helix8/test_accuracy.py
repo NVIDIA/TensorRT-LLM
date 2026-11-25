@@ -14,6 +14,8 @@
 # limitations under the License.
 """GSM8K on a 16-rank DEP context worker and an 8-rank Helix generation worker on Rubin."""
 
+import os
+
 import pytest
 
 from tensorrt_llm.llmapi.llm_args import LlmArgs
@@ -30,6 +32,10 @@ class TestModelingV2KimiK31ProNvfp4Sm107Helix8(LlmapiAccuracyTestHarness):
     MODEL_NAME = NVFP4_MODEL_NAME
     MODEL_PATH = NVFP4_PATH
 
+    @pytest.mark.skipif(
+        not os.environ.get("DISAGG_SERVING_TYPE"),
+        reason="Run Helix8 GSM8K through the multi-node disaggregated launcher",
+    )
     @pytest.mark.timeout(7200)
     @pytest.mark.parametrize(
         "test_case", ["disagg-e2e-vr200_kimi-k31-nvfp4-dflash2_gsm8k_ctx1_dep16_gen1_helix8_bs16"]
