@@ -267,6 +267,15 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sp
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_e4m3_decode import (  # noqa: E501
     supports as _e4m3_gqa_supports,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_fp8_verify import (  # noqa: E501
+    MIN_GROUPS as _BITMAP_OP_MIN_GROUPS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_fp8_verify import (  # noqa: E501
+    fp8_sparse_gqa_verify_grouped,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_fp8_verify import (  # noqa: E501
+    takes_grouped as _bitmap_takes_grouped,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4 import (
     qsa_paged_sparse_gqa_nvfp4,
 )
@@ -971,6 +980,18 @@ _GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
 #: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
 #: set at a layout without attention DP it warns and does nothing.
 DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1` runs the trunk verify step's
+#: gated sparse GQA over an e4m3 pool on the bitmap-union grouped kernel
+#: (`qsa_paged_sparse_gqa_fp8_verify`: the NVFP4 verify kernel with an e4m3 operand path, a
+#: one-read loader, the union scan bounded by the highest selected token and its setup before the
+#: PDL wait, two-wave splits at 39-76 requests) instead of `qsa_sparse_gqa_grouped_cute` /
+#: split-K, from `_BITMAP_MIN_REQUESTS` requests of `p` rows (`DP_GQA_MIN_REQUESTS_ENV` when set),
+#: where the kernel takes the call (`_gqa_bitmap_serves`); every other call keeps the row table.
+#: This is the kernel the dep4 / dep8 AgentX front ran (grouped from 8 requests, from 2 at caps
+#: 3-7). Class S against the other two (another union, split plan and summation order; all
+#: within the decode op's band of the reference). The draft layer keeps the row table. Read once,
+#: when the core is built; set at a layout without attention DP it warns and does nothing.
+DP_GQA_BITMAP_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_BITMAP"
 #: Opt-in and LOSSY against the stock bf16 index keys: `TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1` keeps
 #: each four-token group's compressed index key (its anchor) as e4m3 in the first half of its
 #: bf16 slot (`qsa_index_scores_fp8`): every anchor writer converts what it wrote
@@ -994,6 +1015,9 @@ INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
 #: servers of a dep4 x 2 deployment, more where restores from disk dominate. Read once, when the
 #: core is built (the marks) and when the shell is built (the codec).
 CTX_COLDIDX_ENV = "TRTLLM_QWEN4_EXP_CTX_COLDIDX"
+#: Requests from which `DP_GQA_BITMAP_ENV` takes a step when `DP_GQA_MIN_REQUESTS_ENV` is unset:
+#: the measured front's floor at caps 8-52.
+_BITMAP_MIN_REQUESTS = 8  # capacity: fixed: a dispatch threshold
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
 #: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
 #: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
@@ -1376,6 +1400,24 @@ def _dp_gqa_min_requests(core) -> int:
         )
         return _GROUPED_DECODE_MIN_REQUESTS
     return value
+
+
+def _dp_gqa_bitmap(core) -> int:
+    """`DP_GQA_BITMAP_ENV` at this core's layout: the requests from which the trunk verify
+    step's sparse GQA takes the bitmap-union kernel (`DP_GQA_MIN_REQUESTS_ENV` when set, else
+    `_BITMAP_MIN_REQUESTS`), or 0 (off, or a layout without attention DP). Reads
+    `core.dp_gqa_min_requests`, so it runs after `_dp_gqa_min_requests`."""
+    if not _switch(DP_GQA_BITMAP_ENV):
+        return 0
+    if core.dp_size == 1:
+        logger.warning(
+            f"{DP_GQA_BITMAP_ENV} is set but ignored: it serves attention-DP ranks; this rank "
+            f"has attention DP {core.dp_size}"
+        )
+        return 0
+    if os.environ.get(DP_GQA_MIN_REQUESTS_ENV, "").strip():
+        return core.dp_gqa_min_requests
+    return _BITMAP_MIN_REQUESTS
 
 
 def _dp_topk_cluster_rows(core) -> int:
@@ -2584,6 +2626,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._out_proj = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
+        # The trunk verify step's bitmap-union sparse GQA floor, 0 = off (`DP_GQA_BITMAP_ENV`).
+        self.dp_gqa_bitmap = _dp_gqa_bitmap(self)
         # e4m3 index anchors (`INDEX_KEY_FP8_ENV`, lossy, opt-in).
         self.index_key_fp8 = _switch(INDEX_KEY_FP8_ENV)
         if self.index_key_fp8:
@@ -6595,16 +6639,26 @@ def _decode_index_scores(
     )
 
 
-def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p: int):
+def _sparse_gqa_decode(
+    core, kv, q, block_table, selected, req_idx, tpb, gate, p: int, trunk: bool = False
+):
     """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
-    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: at a
-    tep4 rank under `TEP_GQA_E4M3_ENV` the half-height e4m3 one at the rows split-K serves; the
-    request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows (an
-    attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`), else the per-row split-K one up to its rows
-    (`_splitk_serves`). None where none serves the call (an NVFP4 pool, a head geometry or row
-    count they were not measured at): the caller then runs `_sparse_gqa` and the gate apart."""
+    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: at an
+    attention-DP rank under `DP_GQA_BITMAP_ENV` the trunk's (`trunk`) bitmap-union grouped one
+    where it serves the call; at a tep4 rank under `TEP_GQA_E4M3_ENV` the half-height e4m3 one
+    at the rows split-K serves; the request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS`
+    requests of `p` rows (an attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`), else the per-row
+    split-K one up to its rows (`_splitk_serves`). None where none serves the call (an NVFP4
+    pool, a head geometry or row count they were not measured at): the caller then runs
+    `_sparse_gqa` and the gate apart."""
     if kv.k_scale is not None:
         return None
+    bitmap = getattr(core, "dp_gqa_bitmap", 0) if trunk else 0
+    if bitmap and _gqa_bitmap_serves(bitmap, kv, q, block_table, selected, req_idx, tpb, gate, p):
+        return fp8_sparse_gqa_verify_grouped(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p,
+            output_gate=gate, min_groups=min(bitmap, _BITMAP_OP_MIN_GROUPS),
+        )  # fmt: skip
     if (
         getattr(core, "tep_gqa_e4m3", False)
         and _splitk_serves(core, q, kv.k, selected)
@@ -6633,6 +6687,33 @@ def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p
             max_rows=cap,
         )  # fmt: skip
     return None
+
+
+def _gqa_bitmap_serves(floor, kv, q, block_table, selected, req_idx, tpb, gate, p: int) -> bool:
+    """Whether `fp8_sparse_gqa_verify_grouped` takes this trunk verify call under
+    `DP_GQA_BITMAP_ENV`: at least `floor` requests of `p` > 1 rows over an e4m3 pool, the
+    layouts its entry asserts (row-contiguous block table, contiguous int32 selection, contiguous
+    request indices, `[rows, heads * dim]` gate rows 16-byte aligned) and the kernel's own plan
+    (`takes_grouped`: SM103, a shared-memory plan, row offsets the group table addresses). Host
+    side, on shapes only."""
+    return (
+        p > 1
+        and q.shape[0] >= floor * p
+        and kv.k.dtype == torch.float8_e4m3fn
+        and block_table.stride(0) == block_table.shape[1]
+        and selected.dtype == torch.int32
+        and selected.is_contiguous()
+        and req_idx.is_contiguous()
+        and gate is not None
+        and gate.dim() == 2
+        and gate.shape[1] == q.shape[1] * q.shape[2]
+        and gate.stride(1) == 1
+        and (gate.stride(0) * gate.element_size()) % 16 == 0
+        and gate.data_ptr() % 16 == 0
+        and _bitmap_takes_grouped(
+            q, kv.k, block_table, selected, tpb, p, min_groups=min(floor, _BITMAP_OP_MIN_GROUPS)
+        )
+    )
 
 
 def _splitk_serves(core, q, k_cache, selected) -> bool:
@@ -8693,7 +8774,7 @@ class DecodeTarget:
             )
             q = _attn_in_heads(core, proj)[0] if inplace else _packed_q(core, qkv)
             attn = _sparse_gqa_decode(
-                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
+                core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p, trunk=True
             )
             gated = attn is not None
             if not gated:

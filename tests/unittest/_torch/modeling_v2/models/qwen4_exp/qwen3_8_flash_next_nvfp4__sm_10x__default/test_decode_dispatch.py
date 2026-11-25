@@ -5,7 +5,9 @@
 * **Index scores** (`_decode_index_scores`): the visible-split kernel up to
   `_INDEX_GROUP_MIN_ROWS - 1` rows, request groups of `p` rows from there, the CuTe group kernel
   from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups where it serves them.
-* **Sparse GQA** (`_sparse_gqa_decode`): the request-grouped CuTe kernel from
+* **Sparse GQA** (`_sparse_gqa_decode`): at an attention-DP rank under `DP_GQA_BITMAP_ENV` the
+  trunk's bitmap-union kernel from its floor where it takes the call; the request-grouped CuTe
+  kernel from
   `_GROUPED_DECODE_MIN_REQUESTS` requests (an attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`),
   the per-row split-K one where it serves the call
   (and at a tep4 rank under `TEP_FAST_DECODE_ENV` its e4m3 shard up to 16 rows), None (the
@@ -491,6 +493,119 @@ def test_dp_topk_cluster_rows_switch(monkeypatch, env, dp_size, expected):
             M._dp_topk_cluster_rows(core)
     else:
         assert M._dp_topk_cluster_rows(core) == expected
+
+
+def _bitmap_case(monkeypatch, takes: bool):
+    """Recorders for the bitmap-union kernel (`fp8_sparse_gqa_verify_grouped`, its plan) and the
+    row table's two kernels."""
+    calls = _gqa(monkeypatch, True, True)
+    asked = []
+
+    def plan(q, k, bt, sel, tpb, p, min_groups=None):
+        asked.append(min_groups)
+        return takes
+
+    def bitmap(*args, output_gate=None, min_groups=None):
+        calls.append(("bitmap", output_gate is not None, args[-1], min_groups))
+        return "bitmap"
+
+    monkeypatch.setattr(M, "_bitmap_takes_grouped", plan)
+    monkeypatch.setattr(M, "fp8_sparse_gqa_verify_grouped", bitmap)
+    return calls, asked
+
+
+def _bitmap_operands(rows, dtype=torch.float8_e4m3fn, gate_cols=24 * 256):
+    k = torch.zeros(8, 2, 32, 256, dtype=dtype)
+    kv = SimpleNamespace(k=k, v=k, k_scale=None)
+    q = torch.zeros(rows, 24, 256, dtype=torch.bfloat16)
+    sel = torch.zeros(rows, 2051, dtype=torch.int32)
+    req = torch.zeros(rows, dtype=torch.int32)
+    bt = torch.zeros(4, 16, dtype=torch.int32)
+    gate = torch.zeros(rows, gate_cols, dtype=torch.bfloat16)
+    return kv, q, bt, sel, req, gate
+
+
+@pytest.mark.parametrize(
+    "rows, floor, trunk, takes, expected",
+    [
+        (32, 8, True, True, ("bitmap", True, 4, 8)),  # 8 requests of 4 at the front's floor
+        (8, 2, True, True, ("bitmap", True, 4, 2)),  # 2 requests at a floor of 2 (caps 3-7)
+        (28, 8, True, True, ("splitk", True, None)),  # 7 requests: below the floor
+        (128, 32, True, True, ("bitmap", True, 4, 8)),  # a floor past the op's asks it for 8
+        (32, 8, False, True, ("splitk", True, None)),  # the draft layer keeps the row table
+        (32, 8, True, False, ("splitk", True, None)),  # the kernel declines (plan, arch)
+        (32, 0, True, True, ("splitk", True, None)),  # the switch off
+    ],
+)
+def test_sparse_gqa_bitmap_dispatch(monkeypatch, rows, floor, trunk, takes, expected):
+    """`DP_GQA_BITMAP_ENV`: the trunk's verify step takes the bitmap-union kernel from its floor
+    of requests where the kernel's plan takes the call; below it, off the trunk and where it
+    declines, the row table decides as before (here: split-K)."""
+    calls, asked = _bitmap_case(monkeypatch, takes)
+    core = SimpleNamespace(**{**vars(CORE), "dp_gqa_bitmap": floor, "dp_gqa_min_requests": 32})
+    kv, q, bt, sel, req, gate = _bitmap_operands(rows)
+    out = M._sparse_gqa_decode(core, kv, q, bt, sel, req, 32, gate, 4, trunk=trunk)
+    assert out == expected[0] and calls == [expected]
+    if expected[0] == "bitmap" or (floor and trunk and rows >= floor * 4):
+        assert asked == [min(floor, 8)]
+
+
+@pytest.mark.parametrize(
+    "why, mutate",
+    [
+        ("a bf16 pool", "bf16"),
+        ("one row a request", "p1"),
+        ("no gate", "nogate"),
+        ("a gate of other columns", "gatecols"),
+        ("a strided selection", "selstride"),
+    ],
+)
+def test_sparse_gqa_bitmap_declines_layouts_its_entry_refuses(monkeypatch, why, mutate):
+    calls, asked = _bitmap_case(monkeypatch, True)
+    core = SimpleNamespace(**{**vars(CORE), "dp_gqa_bitmap": 8, "dp_gqa_min_requests": 32})
+    kv, q, bt, sel, req, gate = _bitmap_operands(32)
+    p = 4
+    if mutate == "bf16":
+        kv.k = kv.k.bfloat16()
+    elif mutate == "p1":
+        p = 1
+    elif mutate == "nogate":
+        gate = None
+    elif mutate == "gatecols":
+        gate = torch.zeros(32, 16 * 256, dtype=torch.bfloat16)
+    elif mutate == "selstride":
+        sel = torch.zeros(32, 4102, dtype=torch.int32)[:, :2051]
+    M._sparse_gqa_decode(core, kv, q, bt, sel, req, 32, gate, p, trunk=True)
+    assert all(c[0] != "bitmap" for c in calls), why
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "bitmap_env, min_env, dp_size, expected",
+    [
+        (None, None, 8, 0),  # off by default
+        ("1", None, 8, 8),  # the front's floor
+        ("1", "2", 8, 2),  # DP_GQA_MIN_REQUESTS moves it (caps 3-7)
+        ("1", "16", 4, 16),
+        ("0", "2", 8, 0),
+        ("1", None, 1, 0),  # no attention DP: warns, off
+        ("on", None, 4, 8),
+        ("maybe", None, 4, ValueError),
+    ],
+)
+def test_dp_gqa_bitmap_switch(monkeypatch, bitmap_env, min_env, dp_size, expected):
+    for env, value in ((M.DP_GQA_BITMAP_ENV, bitmap_env), (M.DP_GQA_MIN_REQUESTS_ENV, min_env)):
+        if value is None:
+            monkeypatch.delenv(env, raising=False)
+        else:
+            monkeypatch.setenv(env, value)
+    core = SimpleNamespace(dp_size=dp_size)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            M._dp_gqa_bitmap(core)
+        return
+    core.dp_gqa_min_requests = M._dp_gqa_min_requests(core)
+    assert M._dp_gqa_bitmap(core) == expected
 
 
 def _fp8_recorders(monkeypatch):
