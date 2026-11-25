@@ -1,0 +1,16 @@
+# tests/unittest/_torch/moe/test_gptoss_cutlass.py (trimmed, after the change in changes.diff)
+import pytest
+from defs.conftest import skip_pre_blackwell
+
+
+@skip_pre_blackwell
+def test_gptoss_w4_cutlass():
+    """GPT-OSS W4 MoE through the CUTLASS backend (needs SM100 kernels)."""
+    llm = LLM(MODEL, moe_config=MoeConfig(backend="CUTLASS"))
+    assert_accuracy(llm, "gsm8k", threshold=GSM8K_THRESHOLD)
+
+
+def test_gptoss_w4_triton():
+    """GPT-OSS W4 MoE through the TRITON backend."""
+    llm = LLM(MODEL, moe_config=MoeConfig(backend="TRITON"))
+    assert_accuracy(llm, "gsm8k", threshold=GSM8K_THRESHOLD)

@@ -1,0 +1,7 @@
+// jenkins/L0_Test.groovy (excerpt). Format: "Stage": [platform, test-db yaml, split, splits]
+"DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
+"DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
+"B200_PCIe-PyTorch-1": ["auto:b200-x1", "l0_b200", 1, 1],
+"DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-x4", "l0_dgx_b200", 1, 1],
+"DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-x4", "l0_dgx_b200", 1, 1],
+// There is no DGX_B200-8_GPUs stage.

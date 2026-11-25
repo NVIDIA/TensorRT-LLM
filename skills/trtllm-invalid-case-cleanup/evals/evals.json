@@ -1,0 +1,55 @@
+{
+  "skill_name": "trtllm-invalid-case-cleanup",
+  "evals": [
+    {
+      "id": "ticc-fallback-drops-claimed-flag",
+      "prompt": "A new test test_nvfp4_low_precision_combine was added in unittest/_torch/moe/test_moe_comm.py and its four parametrized cases are listed in tests/integration/test_lists/test-db/l0_dgx_b200.yml. Audit whether each listed case exercises what its id claims, tracing through the selector in tensorrt_llm_src/moe_comm_selector.py.txt, and edit the list in place. A trimmed TensorRT-LLM checkout (lists, one test, one source file) is at /workspace/input/tests-mini/. Python files carry a .py.txt suffix. There is no GPU, network or TensorRT-LLM install in this sandbox; do not install or run anything. Put the PR description in your final answer.",
+      "expected_skill": "trtllm-invalid-case-cleanup",
+      "expected_script": null,
+      "expected_output": "Audit A finds that low_precision_combine=True with parallelism=tp4 never reaches NVLinkOneSided: select_comm_strategy returns AllGatherReduceScatter with low_precision_combine=False whenever moe_tp_size != 1, so the tp4-True case silently runs the same path as tp4-False. The tp4-True list entry is removed from l0_dgx_b200.yml; the tp4-False, ep4-False and ep4-True entries stay. The test is made to fail fast for low_precision_combine=True outside pure EP (or the invalid value is dropped with a comment). The PR description has a per-decision row citing the selector branch, and states that tp4-False still covers the all-gather path and ep4-True covers the real feature.",
+      "assertions": [
+        "Identifies the `parallelism=tp4-low_precision_combine=True` case as invalid because `select_comm_strategy` returns AllGatherReduceScatter with `low_precision_combine=False` when `moe_tp_size != 1`, citing the branch in `moe_comm_selector.py.txt`.",
+        "Does not flag `parallelism=ep4-low_precision_combine=True`, which reaches NVLinkOneSided with the flag set, and keeps the ep4 and tp4-False entries in `l0_dgx_b200.yml`.",
+        "Removes only the tp4-True entry from `l0_dgx_b200.yml` and does not delete the test function.",
+        "Makes the unreachable combination observable, either by `pytest.fail` for `low_precision_combine=True` outside pure EP or by dropping the tp4-True value with a comment above the decorator.",
+        "States, for the removed entry, which test still covers the path (tp4-False for all-gather, ep4-True for the feature), rather than claiming a smaller list is equal coverage.",
+        "Writes a PR description with a per-decision table or list that gives the evidence (file and line or branch) and the action for each change, and uses a `[None][test]` title."
+      ],
+      "files": [
+        "files/tests-mini"
+      ]
+    },
+    {
+      "id": "ticc-skip-marker-on-scheduled-stage",
+      "prompt": "The change in changes.diff adds skip_pre_blackwell to test_gptoss_w4_cutlass. Check which existing test-db entries now skip on the platform they are scheduled on, using the lists under tests/integration/test_lists/test-db/ and the stage map in jenkins/stages.txt, and edit the lists in place. A trimmed TensorRT-LLM checkout is at /workspace/input/tests-mini/. Python files carry a .py.txt suffix. There is no GPU, network or TensorRT-LLM install in this sandbox; do not install or run anything. Put the PR description in your final answer.",
+      "expected_skill": "trtllm-invalid-case-cleanup",
+      "expected_script": null,
+      "expected_output": "Audit B: test_gptoss_w4_cutlass is listed in l0_h100.yml and l0_b200.yml. DGX_H100-PyTorch-1/2 run l0_h100 on H100 (SM90), where skip_pre_blackwell skips the test, so the H100 entry is dead and is removed. The B200_PCIe-PyTorch-1 entry runs on SM100 and stays. test_gptoss_w4_triton on H100 is unaffected and its existing waive is left alone. The PR description names where the removed id still runs (B200) and that no coverage is lost.",
+      "assertions": [
+        "Removes `unittest/_torch/moe/test_gptoss_cutlass.py::test_gptoss_w4_cutlass` from `l0_h100.yml` and cites the `skip_pre_blackwell` marker and the H100 stages in `jenkins/stages.txt` as the reason.",
+        "Keeps the `test_gptoss_w4_cutlass` entry in `l0_b200.yml`, because the B200 stage is SM100 and the marker does not skip there.",
+        "Leaves `test_gptoss_w4_triton` in `l0_h100.yml` and does not remove or change its waive in `waives.txt`.",
+        "Does not delete or rewrite the test function, and does not add a `pytest.skip`.",
+        "States in the report or PR description that the removed id still runs on the B200 stage, so no coverage is lost.",
+        "Treats the waive as a deliberate skip rather than an invalid entry."
+      ],
+      "files": [
+        "files/tests-mini"
+      ]
+    },
+    {
+      "id": "ticc-negative",
+      "prompt": "Write a new unit test for the KV cache manager's block eviction under memory pressure, and register it in the right test-db list for pre-merge CI.",
+      "expected_skill": null,
+      "should_trigger": false,
+      "expected_script": null,
+      "expected_output": "A new test authored for block eviction, with an assertion that eviction happened, and a registration in a test-db list chosen by hardware requirement. This is test authoring, not an audit or cleanup of invalid or skipped tests.",
+      "assertions": [
+        "Writes a new test for KV cache block eviction under memory pressure instead of auditing existing tests.",
+        "Registers the test in a test-db list chosen by its GPU requirement.",
+        "Does not run an invalid-case audit or remove existing list entries."
+      ],
+      "files": []
+    }
+  ]
+}
