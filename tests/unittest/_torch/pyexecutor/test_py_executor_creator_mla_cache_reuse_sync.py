@@ -160,6 +160,16 @@ class _DummyKvCacheCreator:
         """No remote donation is started (no-op)."""
 
 
+class _HostTable:
+    """A module of the model holding a host-resident weight table; counts its releases."""
+
+    def __init__(self):
+        self.releases = 0
+
+    def release_host_resident_weights(self):
+        self.releases += 1
+
+
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""
 
@@ -184,7 +194,7 @@ class _DummyModelEngine:
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.warmup_purpose = None
-        self.cleanups = 0
+        self.host_table = _HostTable()
         self.attn_runtime_features = attn_runtime_features
         self.metrics = {}
         self.max_seq_len = max_seq_len
@@ -208,15 +218,12 @@ class _DummyModelEngine:
                 ),
             ),
             vocab_size_padded=32000,
+            modules=lambda: (self.host_table,),
         )
 
     def set_warmup_purpose(self, purpose):
         """Record the label the creator gives the following warmup passes."""
         self.warmup_purpose = purpose
-
-    def cleanup(self):
-        """Count the releases of the engine's model resources."""
-        self.cleanups += 1
 
 
 def _make_llm_args():
@@ -433,20 +440,31 @@ def _run_create_py_executor(
     )
 
 
-def test_a_failed_construction_releases_the_model_engine_it_built(monkeypatch):
-    """An error after the model engine is built (here the executor's warmup) releases the engine
-    before the error reaches the caller, whose traceback would otherwise keep the model, and the
-    memory and threads it owns outside PyTorch's allocator, until the caller drops the error."""
+@pytest.mark.parametrize("fails", [True, False], ids=["failed", "built"])
+def test_only_a_failed_construction_releases_host_resident_weights(monkeypatch, fails: bool):
+    """An error after the model engine is built (here the executor's warmup) releases the model's
+    host-resident weight tables before the error reaches the caller, whose traceback would
+    otherwise keep them, and the threads serving them, until the caller drops the error. A
+    construction that succeeds releases nothing."""
     engines = []
-    with pytest.raises(RuntimeError, match="warmup failed"):
+    error = RuntimeError("warmup failed") if fails else None
+    if fails:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            _run_create_py_executor(
+                monkeypatch,
+                sm_version=100,
+                kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+                executor_error=error,
+                model_engines=engines,
+            )
+    else:
         _run_create_py_executor(
             monkeypatch,
             sm_version=100,
             kv_cache_quant_algo=QuantAlgo.NO_QUANT,
-            executor_error=RuntimeError("warmup failed"),
             model_engines=engines,
         )
-    assert [engine.cleanups for engine in engines] == [1]
+    assert [engine.host_table.releases for engine in engines] == [1 if fails else 0]
 
 
 @pytest.mark.parametrize("requires_encoder_features", [False, True])

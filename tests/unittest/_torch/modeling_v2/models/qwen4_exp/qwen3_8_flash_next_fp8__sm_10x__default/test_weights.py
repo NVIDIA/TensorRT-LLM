@@ -999,17 +999,16 @@ def test_host_table_modes(mode: str, monkeypatch, dtype: torch.dtype) -> None:
     "target",
     ["qwen3_8_flash_next_fp8__sm_10x__default", "qwen3_8_flash_next_nvfp4__sm_10x__default"],
 )
-def test_engine_release_closes_a_node_table_the_model_still_holds(target: str, monkeypatch):
-    """`release_host_resident_weights`, which the engine calls when it releases the model, closes
-    a core's `node` table at once: its broker threads stop and the host's other processes can own
-    its chunks. The model is still referenced here, as a failed engine construction's traceback
-    references it, so the table cannot be collected and its finalizer does not run."""
+def test_core_releases_a_node_table_the_model_still_holds(target: str, monkeypatch):
+    """A core's `release_host_resident_weights`, which the executor creator calls when a
+    construction fails after the model loaded, closes its `node` table at once: the broker
+    threads stop and the host's other processes can own its chunks. The core is still referenced
+    here, as the construction error's traceback references it, so the table cannot be collected
+    and its finalizer does not run."""
     import threading
     import uuid
 
     from torch import nn
-
-    from tensorrt_llm._torch.pyexecutor.model_loader import release_host_resident_weights
 
     PH = _host_table_module()
     if not _vmm_host_numa():
@@ -1029,12 +1028,10 @@ def test_engine_release_closes_a_node_table_the_model_still_holds(target: str, m
     core.w = nn.ParameterDict()
     core._ple_table_host = table
     weights._bind_ngram_table(core)
-    model = nn.Module()
-    model.model = core
     del table
 
-    release_host_resident_weights(model)
-    release_host_resident_weights(model)
+    core.release_host_resident_weights()
+    core.release_host_resident_weights()
 
     assert not any(t.name == brokers for t in threading.enumerate())
     segment = PH._broker.try_own(f"{identity}-c0")
