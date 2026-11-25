@@ -343,11 +343,12 @@ def test_runner_forward_dispatch(m, decode_tuning, monkeypatch):
     _assert_same_expert_rows(got, ref)
 
 
-@pytest.mark.skipif(not _SM107, reason="requires the SM107 FC2 selector")
 def test_sm107_fc2_selector_rejects_incompatible_operands_and_cubin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    monkeypatch.setattr(decode_moe, "get_sm_version", lambda: 107)
 
     def cubin_name(tile, config):
         return decode_moe._SM107_FC2_CUBIN if config == 0 else "other_cubin"
