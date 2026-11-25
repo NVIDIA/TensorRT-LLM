@@ -78,7 +78,9 @@ MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_fina
 and with `TEP_FINAR_SHARED_ENV` (opt-in) that launch also adds the rank's quarter of the shared
 expert at `_TEP_FINAR_SHARED_ROWS` rows;
 with `TEP_MOE_FRONT_ENV` (opt-in) its router GEMM runs in the front's launch
-(`ops/moe/moe_decode_front__decode`). With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
+(`ops/moe/moe_decode_front__decode`). With `TEP_INDEX_PREFETCH_ENV` (opt-in) a verify step's
+trunk index scores at 1-2 requests read their keys before the PDL wait on the attention decode
+prologue. With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
 draft step runs the draft layer on the one-rank decode form at the rank's shard
 (`DecodeTarget._mtp_layer`), a draft-extend step's continuing rows included.
 
@@ -889,6 +891,21 @@ _INDEX_GROUP_MIN_ROWS = 17  # capacity: fixed: a dispatch threshold, not a buffe
 #:   groups) beat the visible-split one (gen_d38 tepidxgrp, 848913; 0 of 209M scores differ
 #:   between them, 849000). 4 rows keep one request's own kernel; 12 and 16 the visible split.
 _TEP_INDEX_GROUP_ROWS = frozenset({8})  # capacity: fixed: a dispatch table
+#: Off by default (opt-in: reads the index plane before the PDL wait, which is only right as long
+#: as its predecessor writes no other index slot than the ones read again after it). At a tep4
+#: rank with its fast forms, a captured verify step's trunk index scores of
+#: `_TEP_INDEX_PREFETCH_ROWS` rows, launched behind the attention decode prologue, run
+#: `qsa_paged_index_scores(prefetch=True, rows_per_request=p)`: the request-group kernel with each
+#: request's pages and keys read before `griddepcontrol.wait` and the anchors from the request's
+#: smallest position minus one compressed block (all the prologue's index store and compression
+#: can write) read again after it. Bitwise the request-group kernel's scores, which are the
+#: visible-split kernel's at these rows (0 of 209M scores differ, 849000). Read once, when the
+#: target is built; set where it cannot apply it warns and does nothing.
+TEP_INDEX_PREFETCH_ENV = "TRTLLM_QWEN4_EXP_TEP_INDEX_PREFETCH"
+#: Rows that take it: 1 and 2 requests of four verify rows (GB300 tep4: -0.020 / -0.022 ms a step
+#: at 1 / 2 requests; at 12 and 16 rows the scores are bandwidth-bound and the prefetching
+#: program, one tile, cost +0.8..+2.8 us a layer in the op micro).
+_TEP_INDEX_PREFETCH_ROWS = frozenset({4, 8})  # capacity: fixed: a dispatch table
 #: - Request groups from which grouped scoring takes the CuTe kernel
 #:   (`qsa_index_scores_groups_cute__decode`, 2 or 3 rows a request). It sums in another order
 #:   (~7e-8 relative), so a row's top-k can differ only at a near-tie.
@@ -1438,6 +1455,20 @@ TEP_PROJ_ENV = "TRTLLM_QWEN4_EXP_TEP_PROJ_SPLITK"
 #: Rows from which the PLE projections take the split-K kernel under `TEP_PROJ_ENV` (measured at
 #: 12 and 16; fewer rows keep cuBLAS).
 _TEP_PLE_WIDE_MIN_ROWS = 9  # capacity: fixed: a dispatch threshold
+
+
+def _tep_index_prefetch(core) -> bool:
+    """`TEP_INDEX_PREFETCH_ENV` at this core: whether a tep4 rank with its fast forms prefetches
+    its verify steps' index keys. Set where it cannot apply, one warning."""
+    if not _switch(TEP_INDEX_PREFETCH_ENV):
+        return False
+    if core.tep_fast and _INDEX_SCORES_PDL:
+        return True
+    logger.warning(
+        f"{TEP_INDEX_PREFETCH_ENV} is set but ignored: it serves a tep4 rank with "
+        f"{TEP_FAST_DECODE_ENV} on and PDL on (TRTLLM_ENABLE_PDL)"
+    )
+    return False
 
 
 def _tep_proj(core) -> bool:
@@ -2542,6 +2573,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         one_rank = self.one_rank
         # A tep4 rank's projections past `low_m_bf16_mm`'s table (`TEP_PROJ_ENV`).
         self.tep_proj = _tep_proj(self)
+        # A tep4 rank's verify-step index keys before the PDL wait (`TEP_INDEX_PREFETCH_ENV`).
+        self.tep_index_prefetch = _tep_index_prefetch(self)
         self.decode_mm = (
             _one_rank_projection
             if one_rank
@@ -6166,12 +6199,41 @@ def _index_anchors_fp8(core, index_cache, block_table, req_idx, logical, tpb) ->
             )
 
 
-def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
+def _decode_index_scores(
+    core, q, index_cache, block_table, logical, req_idx, tpb, p: int, behind_prologue=False
+):
     """`qsa_paged_index_scores` (visible blocks only) of a sparse generation step's rows, `p`
     consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows (and at a tep4 rank's
     `_TEP_INDEX_GROUP_ROWS`) one key gather a request, and from `_INDEX_SCORES_CUTE_MIN_GROUPS`
-    groups on the CuTe kernel where it serves them."""
+    groups on the CuTe kernel where it serves them. `behind_prologue`: the call's PDL
+    predecessor is the trunk's attention decode prologue, after which a tep4 rank's
+    `_TEP_INDEX_PREFETCH_ROWS` rows may take the prefetching request-group kernel
+    (`TEP_INDEX_PREFETCH_ENV`; not under `INDEX_KEY_FP8_ENV`, whose e4m3 anchors only the fp8
+    kernel reads)."""
     rows = q.shape[0]
+    if (
+        behind_prologue
+        and getattr(core, "tep_index_prefetch", False)
+        and not getattr(core, "index_key_fp8", False)
+        and p > 1
+        and rows in _TEP_INDEX_PREFETCH_ROWS
+        and rows % p == 0
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        return qsa_paged_index_scores(
+            q=q,
+            index_cache=index_cache,
+            block_table=block_table,
+            query_positions=logical,
+            request_indices=req_idx,
+            tokens_per_block=tpb,
+            compress_ratio=core.compress_ratio,
+            only_visible_blocks=True,
+            context_rows=False,
+            use_pdl=True,
+            prefetch=True,
+            rows_per_request=p,
+        )
     grouped = rows >= _INDEX_GROUP_MIN_ROWS or (core.tep_fast and rows in _TEP_INDEX_GROUP_ROWS)
     rpr = p if p > 1 and grouped else 1
     if getattr(core, "index_key_fp8", False):
@@ -8227,6 +8289,7 @@ class DecodeTarget:
                 req_idx,
                 tokens_per_block,
                 p,
+                behind_prologue=prologue,
             )
             selected = torch.empty(
                 [num_tokens, core.token_topk + core.compress_ratio - 1],

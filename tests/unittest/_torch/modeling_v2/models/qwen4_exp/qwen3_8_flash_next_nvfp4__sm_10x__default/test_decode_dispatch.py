@@ -94,6 +94,61 @@ def test_index_scores_tep4_rows(monkeypatch, tep_fast, rows, p, expected):
     assert calls == [expected]
 
 
+@pytest.mark.parametrize(
+    "switch, behind, capturing, rows, p, expected",
+    [
+        (True, True, True, 4, 4, ("prefetch", 4)),  # 1 request
+        (True, True, True, 8, 4, ("prefetch", 4)),  # 2 requests
+        (True, True, True, 12, 4, ("triton", 1)),  # past the measured rows
+        (True, True, True, 8, 1, ("triton", 1)),  # one row a request: no verify step
+        (True, False, True, 8, 4, ("triton", 4)),  # not behind the prologue (the draft layer)
+        (True, True, False, 8, 4, ("triton", 4)),  # an eager step
+        (False, True, True, 8, 4, ("triton", 4)),  # the switch off
+    ],
+)
+def test_index_scores_tep4_prefetch(monkeypatch, switch, behind, capturing, rows, p, expected):
+    """`TEP_INDEX_PREFETCH_ENV`: a captured verify step's trunk scores behind the prologue at
+    `_TEP_INDEX_PREFETCH_ROWS` take the prefetching request-group launch."""
+    calls = []
+
+    def scores(**kw):
+        tag = "prefetch" if kw.get("prefetch") else "triton"
+        if kw.get("prefetch"):
+            assert kw["use_pdl"] and kw["only_visible_blocks"] and not kw["context_rows"]
+        calls.append((tag, kw["rows_per_request"]))
+        return tag
+
+    monkeypatch.setattr(M, "qsa_paged_index_scores", scores)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    core = SimpleNamespace(**{**vars(CORE), "tep_fast": True, "tep_index_prefetch": switch})
+    q = torch.zeros(rows, 4, 128, dtype=torch.bfloat16)
+    logical = torch.zeros(rows, dtype=torch.int64)
+    req = torch.zeros(rows, dtype=torch.int32)
+    M._decode_index_scores(core, q, None, None, logical, req, 32, p, behind_prologue=behind)
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize(
+    "env, tep_fast, pdl, expected, warns",
+    [
+        (None, True, True, False, False),
+        ("1", True, True, True, False),
+        ("1", False, True, False, True),  # another layout
+        ("1", True, False, False, True),  # TRTLLM_ENABLE_PDL=0
+    ],
+)
+def test_tep_index_prefetch_switch(monkeypatch, env, tep_fast, pdl, expected, warns):
+    warned = []
+    if env is None:
+        monkeypatch.delenv(M.TEP_INDEX_PREFETCH_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.TEP_INDEX_PREFETCH_ENV, env)
+    monkeypatch.setattr(M, "_INDEX_SCORES_PDL", pdl)
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    assert M._tep_index_prefetch(SimpleNamespace(tep_fast=tep_fast)) is expected
+    assert bool(warned) is warns
+
+
 def test_index_scores_cute_needs_its_index_dtypes(monkeypatch):
     """The CuTe kernel reads int64 positions and int32 request indices; other dtypes keep the
     Triton kernel."""

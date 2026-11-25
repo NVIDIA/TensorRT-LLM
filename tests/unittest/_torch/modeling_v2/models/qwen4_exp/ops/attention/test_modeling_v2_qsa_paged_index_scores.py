@@ -13,9 +13,10 @@ plane in one page (the last layer's plane taken), NaN wherever no request maps a
 page, with the pool's first and last page among those the cell reads -- the last
 one past 2^31 elements from the plane's base.
 
-The call has four kernels behind it: the entry's own visible-split kernel for
-ungrouped decode-sized visible-only calls and request-group kernel for verify-shaped
-ones, and the engine's row-wise and query-tile kernels. `_watch_launches` swaps the four Triton entry points
+The call has five kernels behind it: the entry's own visible-split kernel for
+ungrouped decode-sized visible-only calls and request-group kernel (and its prefetching form)
+for verify-shaped ones, and the engine's row-wise and query-tile kernels. `_watch_launches`
+swaps the five Triton entry points
 for recording proxies that still launch the real kernel, so every cell asserts
 the branch it names. Beyond the cells: capture and replay at every measured-pool decode
 and verify cell, and the refusal of metadata shorter than the rows by both launchers.
@@ -90,6 +91,7 @@ class _watch_launches:
         (_qsa_kernels, "_qsa_paged_index_scores_qtile_kernel", "query_tile"),
         (_entry, "_qsa_index_scores_group_kernel", "request_group"),
         (_entry, "_qsa_index_scores_visible_split_kernel", "visible_split"),
+        (_entry, "_qsa_index_scores_group_prefetch_kernel", "request_group_prefetch"),
     )
 
     def __enter__(self):
@@ -276,6 +278,15 @@ def _assert_reaches_the_pool_ends(args, spec) -> None:
 def _branch_rule(rows, spec):
     heads = spec["heads"]
     if (
+        spec.get("call_rows_per_request", 1) > 1
+        and spec["only_visible_blocks"]
+        and spec.get("prefetch", False)
+        and spec.get("use_pdl", False)
+        and heads in (2, 4, 8)
+        and not (spec["context_rows"] and rows > DECODE_ROW_LIMIT)
+    ):
+        return "request_group_prefetch"
+    if (
         spec.get("call_rows_per_request", 1) == 1
         and spec["only_visible_blocks"]
         and not spec.get("prefetch", False)
@@ -441,6 +452,70 @@ def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(graph_out[visible], _engine_scores(**args)[visible]), f"replay {trial}"
+        _compare(graph_out, op.reference(**args))
+
+
+@pytest.mark.parametrize("requests, mixed", [(1, False), (2, False), (4, True)])
+def test_request_group_prefetch_is_bitwise_and_reads_fresh_keys(requests, mixed) -> None:
+    """`prefetch` with `rows_per_request` 4 and PDL: the request-group kernel with each run's
+    pages and keys read before the wait. Under graph replay a producer rewrites q and, at every
+    row's own position and the anchor of a block ending at one, the index key -- what the
+    attention decode prologue writes -- right before the op; the scores must be the plain
+    request-group kernel's bits on every visible column. With `mixed` the runs name several
+    requests (gathered after the wait)."""
+    rows = 4 * requests
+    spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
+    spec.update(q_layout="scratch_slice", use_pdl=True)
+    args = _build(spec, seed=503 + rows + mixed)
+    slots = torch.unique(args["request_indices"])
+    gen = torch.Generator(device=DEV).manual_seed(rows)
+    if mixed:
+        pick = torch.randint(0, slots.numel(), (rows,), generator=gen, device=DEV)
+    else:
+        pick = (torch.arange(rows, device=DEV) // 4) % slots.numel()
+    args["request_indices"] = slots[pick].to(args["request_indices"].dtype)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    pos = args["query_positions"].long().clamp_min(cr - 1)
+    if not mixed:  # a verify run: four consecutive positions of one request
+        pos = (pos[::4].repeat_interleave(4) // 4) * 4 + torch.arange(rows, device=DEV) % 4
+        pos = pos.clamp_min(cr - 1)
+    args["query_positions"] = pos.to(args["query_positions"].dtype)
+    group = {**args, "rows_per_request": 4}
+    pages = args["block_table"][args["request_indices"].long(), pos // tpb].long()
+    written = (pages, pos % tpb)  # each row's own index slot (the store; anchors among them)
+    visible = _visible(args)
+    with _watch_launches() as watcher:
+        plain = op(**group)
+    assert watcher.branch == "request_group"
+    with _watch_launches() as watcher:
+        early = op(**{**group, "prefetch": True})
+    assert watcher.branch == "request_group_prefetch"
+    assert torch.equal(early[visible].view(torch.int32), plain[visible].view(torch.int32))
+    src_q = args["q"].clone()
+    src_k = args["index_cache"][written].clone()
+
+    def step():
+        args["q"].copy_(src_q * 1.0)
+        args["index_cache"][written] = src_k * 1.0
+        return op(**{**group, "prefetch": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        src_q.copy_(torch.randn(src_q.shape, generator=gen, device=DEV).to(src_q.dtype))
+        src_k.copy_(torch.randn(src_k.shape, generator=gen, device=DEV).to(src_k.dtype))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = op(**group)
+        assert torch.equal(graph_out[visible].view(torch.int32), want[visible].view(torch.int32)), (
+            f"replay {trial}"
+        )
         _compare(graph_out, op.reference(**args))
 
 
