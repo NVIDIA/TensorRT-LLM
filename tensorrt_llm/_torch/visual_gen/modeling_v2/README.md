@@ -17,7 +17,7 @@ Keep changes for one deployment local to its pipeline so developers can merge wo
 
 **Split when a checkpoint or deployment needs a substantially different implementation.** Look for deployment checks spread across components or a new mechanism within a single stage. For example, a checkpoint that needs different modules and a new shard allocation order can own its loader and still reuse the family’s forward pass. If two targets later converge on the same implementation, merge them and keep tests for the deployments they support.
 
-**Name the target for what makes it distinct.** Checkpoint, quantization, SM and parallel layout are optional dimensions. For example, `fasth3/` identifies a checkpoint. A hardware-specific target can include the SM in its name. If Blackwell and Rubin differ only in which kernel a projection calls, keep one target and select the kernel in that projection.
+**Name the target for what makes it distinct.** Include only the dimensions that define its implementation. A checkpoint-specific target such as `fasth3/` needs only the checkpoint name. When checkpoint, quantization, SM and parallel layout all matter, use `<checkpoint>_<quantization>__<sm>__<parallel>/`. For example, a MiniMax-H3 target specialized for NVFP4 on SM107 with four-way Ulysses could be named `minimax_h3_nvfp4__sm_107__u4/`. If Blackwell and Rubin differ only in which kernel a projection calls, keep one target and select the kernel in that projection.
 
 ### Implementation layers
 
