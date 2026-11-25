@@ -5,8 +5,9 @@ tables and NVFP4 activation of a small decode MoE block in one launch.
 
 GPU, every cell, eagerly and replayed from a CUDA graph:
 
-* the logits are within two bf16 steps of an fp32 GEMM rounded once (the class this op is in:
-  another summation order than other router GEMMs);
+* the logits are within `logits_off_bound` of the exact GEMM rounded once: two bf16 steps plus
+  an fp32 sum's worst-case reorder error (the class this op is in: another summation order than
+  other router GEMMs);
 * given those logits, the codes and block scales are bitwise `fp4_quantize`'s, the experts and
   weights bitwise `renorm_moe_routing_op`'s, and the tables hold their meaning
   (`moe_route_front__decode.check_tables`) for the cell's window and tile;
@@ -50,9 +51,8 @@ def _operands(spec, seed: int, device):
 
 def _assert_matches(spec, x, router, global_scale, tables, stage, got):
     logits, xq, xsf, ids, wts = got
-    ref = (x.float() @ router.float().t()).to(torch.bfloat16).float()
-    step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-100))) - 7)
-    assert bool(((logits.float() - ref).abs() <= 2 * step).all()), "logits"
+    off = op.logits_off_bound(logits, x, router)
+    assert not bool(off.any()), f"logits: {int(off.sum())} outside the bound"
     _, rxq, rxsf, _, _ = op.moe_decode_front.reference(
         x,
         router,

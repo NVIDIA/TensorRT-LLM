@@ -4687,7 +4687,8 @@ def _tep_decode_front_check(core, st: _RouteFront, L: _LayerWeights, rows: int, 
     experts and weights are bitwise the route front's over its own logits, its tables hold their
     meaning for those experts (`_route_front_check_tables`: the kernel may order the rows inside
     an expert's tile differently), the staging buffer is back at zero and the logits are within
-    two bf16 steps of an fp32 GEMM rounded once; the second is reported, not required (the
+    the op's bound of the exact GEMM (`moe_decode_front__decode.logits_off_bound`: two bf16 steps
+    plus an fp32 sum's worst-case reorder error); the second is reported, not required (the
     reorder this switch makes). `flat_b` is only the route front's scratch tables."""
     device = L.router.device
     tile = int(st.tactics[rows][0])
@@ -4702,7 +4703,6 @@ def _tep_decode_front_check(core, st: _RouteFront, L: _LayerWeights, rows: int, 
     xq0, xsf0, ids0, wts0 = moe_route_front(
         logits, x, L.moe_gscale, flat_b, tile, core.expert_offset, core.local_experts
     )
-    ref = (x.float() @ L.router.float()).to(torch.bfloat16).float()
     stock = _decode_router(x, L.router)
     torch.cuda.synchronize(device)
     bad = []
@@ -4720,9 +4720,9 @@ def _tep_decode_front_check(core, st: _RouteFront, L: _LayerWeights, rows: int, 
         bad.append(f"tables ({tables})")
     if bool(stage.any()):
         bad.append("the staging buffer is not back at zero")
-    step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-100))) - 7)
-    if bool(((logits.float() - ref).abs() > 2 * step).any()):
-        bad.append("logits more than two bf16 steps from an fp32 GEMM")
+    off = _decode_front.logits_off_bound(logits, x, L.router.t())
+    if bool(off.any()):
+        bad.append(f"{int(off.sum())} logits outside the op's bound of the exact GEMM")
     return ", ".join(bad), int((logits != stock).sum())
 
 

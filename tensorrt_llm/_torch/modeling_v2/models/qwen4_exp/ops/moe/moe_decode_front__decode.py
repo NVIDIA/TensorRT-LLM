@@ -115,6 +115,25 @@ def staging_buffer(device) -> torch.Tensor:
     return torch.zeros([32 * NUM_EXPERTS], dtype=torch.int32, device=device)
 
 
+def reference_logits(x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
+    """The router logits `x @ router.T` (`x` `[T, H]`, `router` `[512, H]`) summed exactly
+    (float64: an fp32 GEMM is TF32 under the containers' `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`)
+    and rounded once to bf16, returned as fp32."""
+    return (x.double() @ router.double().t()).float().to(torch.bfloat16).float()
+
+
+def logits_off_bound(logits: torch.Tensor, x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
+    """Where the kernel's `logits` leave this op's class against `reference_logits`: more than
+    two bf16 steps of the exact logit, plus the worst-case error of an fp32 sum in another
+    order, `2^-16 * sum_k |x_k router_k|` (`n * u` for the fewer than 256 sequential adds of a
+    warp's K slice and the warps' reduction). Without that second term a logit near zero (a
+    cancelling sum, whose bf16 step is tiny) fails any summation order, cuBLAS's included."""
+    ref = reference_logits(x, router)
+    step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-100))) - 7)
+    sum_bound = (x.double().abs() @ router.double().abs().t()).float() * 2.0**-16
+    return (logits.float() - ref).abs() > 2 * step + sum_bound
+
+
 def _cell(rows: int, offset: int, tile: int, why: str) -> Cell:
     return Cell(
         why=why, spec=dict(rows=rows, hidden=2560, local_offset=offset, num_local=128, tile=tile)
@@ -200,11 +219,12 @@ class MoeDecodeFront(OpWrapper):
         local_offset: int,
         num_local: int,
     ):
-        """The composed path over fp32 router logits rounded once to bf16 (the GEMMs agree with
-        it up to their summation order; the tables are checked by their meaning,
+        """The composed path over the exact router logits rounded once to bf16
+        (`reference_logits`; the GEMMs agree with it up to their summation order,
+        `logits_off_bound`; the tables are checked by their meaning,
         `moe_route_front__decode.check_tables`): `fp4_quantize` with linear scales,
         `renorm_moe_routing_op` over those logits."""
-        logits = (x.float() @ router.float().t()).to(torch.bfloat16)
+        logits = reference_logits(x, router).to(torch.bfloat16)
         xq, xsf = fp4_quantize(x, global_scale, _SF_VEC, False, False)
         ids, wts = renorm_moe_routing_op(logits, TOP_K, torch.bfloat16)
         return logits, xq, xsf.reshape(x.shape[0], -1), ids, wts
