@@ -17,7 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's block budget: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4.
@@ -390,7 +391,7 @@ class QsaCanonicalSelection(OpWrapper):
     value would admit more than `k` columns above it.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The target calls this right after `qsa_topk_select`, at `k = 512` over the
     # `[rows, cols]` score matrix whose columns past each `row_end` are allocator

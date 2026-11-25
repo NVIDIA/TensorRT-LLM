@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`SpeculativeRollback`'s staging and commit of a verify step in one launch each.
 
-Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_103__default`,
+Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_10x__default`,
 at every layout). Each `__call__` is one launch of a Triton kernel of this file,
 JIT-compiled on first use for the device it runs on. A verify step runs `p` rows per generation
 request through the trunk; the PLE pools and the QSA planes are written for every row. The staging
@@ -28,7 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import ROW
 
 #: Conv channels a program covers.
@@ -211,7 +212,7 @@ class SpecRollbackStage(OpWrapper):
     Fusion boundary: the two reads of the staging; the slots and ids are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request", spec=dict(n=1, p=4)),
         Cell(why="MTP3, 128 requests", spec=dict(n=128, p=4)),
@@ -298,7 +299,7 @@ class SpecRollbackCommit(OpWrapper):
     `SpecRollbackStage`, `qsa_rollback_gather` and the position gather produced.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request, 12 planes", spec=dict(n=1, p=4, planes=12)),
         Cell(why="MTP3, 128 requests, 12 planes", spec=dict(n=128, p=4, planes=12)),

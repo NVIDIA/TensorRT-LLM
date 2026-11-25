@@ -73,6 +73,42 @@
   scenario: Agentic Disaggregated Decode
   gpu_compatibility: "GB300"
   disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep8-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Remote KV Cache, TEP8 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep8-decode.yaml
+  scenario: AgentX Disaggregated Decode (Remote KV Cache, TEP8)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-dep8-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Remote KV Cache over NIXL, DEP8 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-dep8-decode.yaml
+  scenario: AgentX Disaggregated Decode (Remote KV Cache over NIXL, DEP8)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep16-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Host KV Cache, TEP16 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep16-decode.yaml
+  scenario: AgentX Disaggregated Decode (Host KV Cache, TEP16)
+  gpu_compatibility: "GB300"
+  disagg: true
 - model: Qwen/Qwen3-30B-A3B
   arch: Qwen3MoeForCausalLM
   config_path: examples/configs/curated/qwen3.yaml

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's `ple_embedding` buffers: 3-gram, 8 heads per order.
 CKPT_MULTIPLIERS = (23703573157769, 20109073645365, 8052911324071)
@@ -65,7 +66,7 @@ class NgramHash(OpWrapper):
     are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: batch, length, num_query_tokens; history is uniform random int64 ids
     # with the first `min(CONTEXT_LEN, length)` set to EOS when `lead_eos`

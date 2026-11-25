@@ -309,18 +309,19 @@ def test_fp4_mla_probe_on_the_family_mla_state():
 
 
 def test_kda_inforward_snapshot_plan_on_the_private_metadata():
-    """In-forward KDA snapshots (context, block reuse): ``Mamba2Metadata.prepare`` hands the plan
-    to ``_prepare_inforward_split``, which the step metadata of the dep16 model
-    (``K3MambaMetadata``) turns into a ``kda_snapshot`` plan on the live slots with the plan's
-    staging rows; the KDA layers read those rows through ``inforward_snapshot_stage_views``."""
+    """In-forward KDA snapshots (context, block reuse): ``GDNMambaMetadata.prepare`` hands the
+    plan of main's in-forward snapshots to ``_prepare_inforward_split``, which the step metadata
+    of the dep16 model (``K3MambaMetadata``) implements: it turns the plan into a
+    ``kda_snapshot`` plan on the live slots with the plan's staging rows, which the KDA layers
+    read through ``inforward_snapshot_stage_views``."""
     import torch
 
-    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+    from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
         InforwardSnapshotEntry,
-        MambaHybridCacheManagerV2,
+        InforwardSnapshotHost,
     )
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
     modeling = _dep16("modeling")
     metadata_cls = _dep16("modeling").K3MambaMetadata
@@ -328,12 +329,11 @@ def test_kda_inforward_snapshot_plan_on_the_private_metadata():
     assert modeling.ModelingV2KimiK3Nvfp4Sm107Dep16.mamba_metadata_cls is metadata_cls
     assert issubclass(metadata_cls, Mamba2Metadata)
 
-    assert issubclass(KimiK3HybridCacheManager, MambaHybridCacheManagerV2)
     for name in ("inforward_snapshot_stage_views", "state_index", "finish_inforward_snapshots"):
-        assert callable(getattr(MambaHybridCacheManagerV2, name, None)), name
-    assert "_prepare_inforward_split(" in inspect.getsource(Mamba2Metadata.prepare)
+        assert callable(getattr(InforwardSnapshotHost, name, None)), name
+    assert "_prepare_inforward_split(" in inspect.getsource(GDNMambaMetadata.prepare)
     assert list(inspect.signature(metadata_cls._prepare_inforward_split).parameters) == list(
-        inspect.signature(Mamba2Metadata._prepare_inforward_split).parameters
+        inspect.signature(GDNMambaMetadata._prepare_inforward_split).parameters
     )
 
     metadata = metadata_cls.__new__(metadata_cls)

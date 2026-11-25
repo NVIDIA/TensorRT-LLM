@@ -263,7 +263,15 @@ pool, followed by consistency checks between independent readings.
 * **Startup plan** compares the memory in use with what KV cache sizing
   planned for when the engine started: the peak it profiled outside the KV
   cache, workspace reserves included, plus the KV cache pools. It appears
-  only when sizing profiled a forward pass.
+  while the process is awake and only when sizing profiled a forward pass.
+* **KV sizing budget** appears under the startup plan. It shows how each rank
+  credits back the temporary sizing pools, deducts the pre-fraction reserves
+  and applies the configured free-memory fraction. It then lists the drafter,
+  indexer and context-MLA deductions and any limits applied during sizing.
+  The reported `max_gpu_total_bytes` is the upper bound passed to the KV cache
+  manager. V2 can reduce its quota for sparse offload, for `max_tokens`, or
+  when synchronizing token capacity across ranks. The KV cache row shows
+  actual pool usage.
 * **Suggestion** appears for an out-of-memory error, or a startup that failed
   because it ran out of device memory, and names the setting that controls
   the largest consumer. A startup that fails for another reason, such as a

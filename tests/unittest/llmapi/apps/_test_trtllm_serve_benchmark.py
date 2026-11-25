@@ -20,7 +20,7 @@ import pytest
 from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = ["..", "~/tests/unittest"]
-from test_llm import get_model_path
+from model_paths import get_model_path
 from utils.util import skip_gpu_memory_less_than_80gb, skip_pre_hopper
 
 

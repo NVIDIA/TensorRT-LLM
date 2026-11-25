@@ -4593,6 +4593,28 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def get_gpu_pool_bytes(self) -> list[int]:
+        """Return the device-backed bytes of each GPU pool group: slot count times slot bytes.
+
+        With sparse KV cache offload a GPU-level pool group also holds pools of pinned host
+        memory mapped into the device. The storage statistics give a slot size for every pool
+        of the group, so the host-backed pools' slot bytes are left out.
+        """
+        host_slot_bytes = {
+            int(group.pool_group_index): sum(
+                int(pool.slot_bytes)
+                for pool in group.pools
+                if pool.storage_medium != CacheTier.GPU_MEM
+            )
+            for group in self.impl.pool_group_descs
+        }
+        pool_bytes = []
+        for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL)):
+            slot_bytes = sum(int(size) for size in stat.slot_sizes)
+            slot_bytes -= host_slot_bytes.get(pool_group_id, 0)
+            pool_bytes.append(int(stat.total) * slot_bytes)
+        return pool_bytes
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -9006,6 +9028,36 @@ class KVCacheManagerV2(BaseResourceManager):
     def take_page_table_stats(self) -> tuple[int, int, int, float]:
         """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
         return (0, 0, 0, 0.0)
+
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_pool_utilization(self) -> dict[str, list[float | None] | None]:
+        """Read per-pool-group utilization from CPU-side counters.
+
+        Returns:
+            ``"gpu"`` maps to ``1 - available / total`` per GPU pool group, where
+            ``available`` counts free and evictable slots. ``"host"`` maps to the occupancy
+            ``1 - free / total`` per host pool group, including evictable cached pages, or to
+            ``None`` when there is no host tier. List positions are tier-local pool group ids;
+            zero-capacity groups read ``None``. Disk tiers are not reported.
+        """
+        pool_utilization: dict[str, list[float | None] | None] = {
+            "gpu": [
+                self._utilization(stat.total, stat.available)
+                for stat in self._get_storage_statistics(GPU_LEVEL)
+            ],
+            "host": None,
+        }
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier == CacheTier.HOST_MEM:
+                pool_utilization["host"] = [
+                    self._utilization(stat.total, stat.free)
+                    for stat in self._get_storage_statistics(CacheLevel(level))
+                ]
+        return pool_utilization
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()

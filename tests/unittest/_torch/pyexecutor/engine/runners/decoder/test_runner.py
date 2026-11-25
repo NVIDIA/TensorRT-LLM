@@ -9,6 +9,7 @@ import unittest
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -192,6 +193,95 @@ def test_decoder_forward_routes_compile_bypass(
     selected.assert_called_once_with()
     other.assert_not_called()
     assert not wrapper._bypass_active
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("has_workspace", "has_processor"),
+    [
+        pytest.param(True, True, id="post-processor"),
+        pytest.param(True, False, id="bounded-projection"),
+        pytest.param(False, False, id="no-workspace"),
+    ],
+)
+def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: bool) -> None:
+    from tensorrt_llm._torch.modules.context_logits import (
+        ContextLogitsWorkspace,
+        project_context_logits,
+    )
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+    from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+
+    engine, _, resources, _, _ = _make_decoder_runner(None)
+    replay = _make_request_stub(1)
+    scoring = _make_request_stub(2, prompt_len=2)
+    decode = _make_request_stub(3)
+    replay.py_ced_replay = EncoderReplay(replay.py_request_id, 0, 3, 1)
+    scoring.context_current_position = 0
+    scoring.context_chunk_size = scoring.context_remaining_length = 2
+    scoring.py_return_context_logits = scoring.py_context_logits_explicit = True
+    scoring.prepopulated_prompt_len = 0
+    scoring.py_prompt_logprobs = None
+    scoring.py_result = PyResult(
+        prompt_len=2, max_new_tokens=1, return_context_logits=True, use_device_memory=False
+    )
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [scoring, replay]
+    batch.generation_requests = [decode]
+    # Physical rows after packing: two replay rows, one new prompt row,
+    # the two rows to score, and one decode row.
+    hidden = torch.eye(6)
+    head = SimpleNamespace(
+        weight=torch.eye(6), output_dtype=None, num_embeddings=6, tp_size=1, mapping=None
+    )
+    head.context_logits_workspace = ContextLogitsWorkspace(head) if has_workspace else None
+    engine._context_logits_heads = (head,)
+    processor_rows: list[torch.Tensor] = []
+
+    def process_logits(request_id, logits, token_ids, stream_ptr, client_id):
+        assert request_id == scoring.py_request_id
+        processor_rows.append(logits.clone())
+        logits.zero_()
+
+    if has_processor:
+        scoring.py_orig_prompt_len = scoring.py_prompt_len
+        scoring.get_tokens = lambda beam: [1, 2]
+        scoring.py_logits_post_processors = [process_logits]
+        decode.get_beam_width_by_iter = lambda **kwargs: 1
+        engine._execute_logit_post_processors.side_effect = partial(
+            DecoderRunner._execute_logit_post_processors, engine
+        )
+
+    def forward(*args, **kwargs) -> dict[str, torch.Tensor]:
+        replay.py_ced_replay.consumed = True
+        projected = project_context_logits(hidden, head)
+        assert (projected is not None) == (has_workspace and not has_processor)
+        return {"logits": hidden if projected is None else projected}
+
+    # Input preparation can reorder the requests after the plan was created.
+    def prepare(*args, **kwargs) -> PreparedInputs:
+        batch.context_requests_last_chunk = [replay, scoring]
+        return PreparedInputs({"input_ids": torch.arange(len(hidden))})
+
+    engine._inputs.prepare_inputs.side_effect = prepare
+    engine._forward_step.side_effect = forward
+    with patch("tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs.torch.cuda.Event"):
+        outputs = engine.forward(
+            ScheduledInputs(batch=batch, gather_context_logits=True), resource_manager=resources
+        )
+
+    expected = hidden[[2, 4, 5]]
+    if has_processor:
+        assert len(processor_rows) == 1
+        torch.testing.assert_close(processor_rows[0], hidden[4].view(1, 1, -1))
+        expected[1].zero_()
+    torch.testing.assert_close(outputs["logits"], expected)
+    assert outputs["context_logits_handled"]
+    stored = scoring.py_result.context_logits
+    assert stored is not None
+    torch.testing.assert_close(stored, hidden[3:5])
+    (diff_logits,) = scoring.py_result.get_diff().context_logits_list
+    assert diff_logits.data_ptr() == stored.data_ptr()
 
 
 @pytest.mark.cpu_only

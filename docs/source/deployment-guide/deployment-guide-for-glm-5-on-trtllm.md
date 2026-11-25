@@ -131,7 +131,7 @@ kv_cache_config:
   dtype: auto
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 1
+  max_draft_len: 1
 stream_interval: 10
 moe_config:
   backend: DEEPGEMM
@@ -238,7 +238,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 * **Description**: Configuration for speculative decoding with MTP.
 * **Options**:
   * `decoding_type`: Set to `MTP` to enable Multi-Token Prediction.
-  * `num_nextn_predict_layers`: Number of MTP prediction layers to use (GLM-5 supports `1`).
+  * `max_draft_len`: Maximum number of draft tokens. With GLM-5's single MTP layer, the default MTP-Eagle mode can reuse that layer across draft steps.
 
 #### `enable_chunked_prefill`
 

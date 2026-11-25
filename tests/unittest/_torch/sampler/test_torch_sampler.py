@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     _get_max_beam_width,
     _request_get_sampling_params,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import EmbeddingBiasCache
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
     RowSamplingParams,
     SamplingMode,
@@ -60,7 +61,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
+from tensorrt_llm.sampling_params import EmbeddingBias, LogprobMode, SamplingParams
 
 
 class TestSetupSamplerStepRequestSelection:
@@ -3301,3 +3302,89 @@ class TestTopPDecay:
         # TopPDecayHandler.validate_request resolves the sampling params -- and
         # with them the beam width -- before it checks whether decay is active.
         self._make_sampler().validate_request(request)
+
+
+@force_ampere
+def test_embedding_bias():
+    vocab_size = 1234
+    req_num_steps = torch.tensor([2, 1, 3], dtype=torch.int32)
+    seq_slots = [3, 1, 2]
+    biases = [
+        ((42, 1), (123, -0.5)),
+        ((1, -1.27),),
+        None,
+    ]
+
+    def _mock_request(seq_slot: int, bias: EmbeddingBias | None, request_id: int) -> LlmRequest:
+        return SimpleNamespace(
+            py_seq_slot=seq_slot,
+            py_embedding_bias=bias,
+            py_request_id=request_id,
+        )
+
+    requests = [
+        _mock_request(seq_slot=seq_slot, bias=bias, request_id=request_id)
+        for request_id, (seq_slot, bias) in enumerate(zip(seq_slots, biases))
+    ]
+
+    logits_cuda = torch.testing.make_tensor(
+        (req_num_steps.sum(), vocab_size), dtype=torch.float32, device="cuda"
+    )
+
+    cache = EmbeddingBiasCache(
+        logit_dtype=logits_cuda.dtype,
+        vocab_size=vocab_size,
+        max_seq_slots=128,
+        device=logits_cuda.device,
+    )
+
+    hit_count = 0
+    _is_cached_orig = cache._is_cached
+
+    def _is_cached(req: LlmRequest) -> bool:
+        hit = _is_cached_orig(req)
+        nonlocal hit_count
+        if hit:
+            hit_count += 1
+        return hit
+
+    cache._is_cached = _is_cached
+
+    logits_cuda_in = logits_cuda.clone()
+
+    def _validate_bias_application(requests_mask: list[bool]):
+        logits_cuda[...] = logits_cuda_in
+        req_num_steps_selected = req_num_steps[requests_mask]
+        requests_selected = [req for req, mask in zip(requests, requests_mask, strict=True) if mask]
+        biases_selected = [bias for bias, mask in zip(biases, requests_mask, strict=True) if mask]
+
+        cache.apply_bias(
+            logits_cuda[: req_num_steps_selected.sum()],
+            requests_selected,
+            req_num_steps_selected,
+        )
+
+        current_offset = 0
+        for req, num_steps, bias in zip(requests_selected, req_num_steps_selected, biases_selected):
+            req_logits_in = logits_cuda_in[current_offset : (current_offset + num_steps)]
+            req_logits_out = logits_cuda[current_offset : (current_offset + num_steps)]
+            start_idx = 0
+            if bias is not None:
+                for idx, val in bias:
+                    torch.testing.assert_allclose(
+                        req_logits_out[:, start_idx:idx], req_logits_in[:, start_idx:idx]
+                    )
+                    torch.testing.assert_allclose(
+                        req_logits_out[:, idx], req_logits_in[:, idx] + val
+                    )
+                    start_idx = idx + 1
+            torch.testing.assert_allclose(
+                req_logits_out[:, start_idx:], req_logits_in[:, start_idx:]
+            )
+            current_offset += num_steps
+
+    _validate_bias_application([True, False, True])
+    assert hit_count == 0
+
+    _validate_bias_application([True, True, True])
+    assert hit_count == 1

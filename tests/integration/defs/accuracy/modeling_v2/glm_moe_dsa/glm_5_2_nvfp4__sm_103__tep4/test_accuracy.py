@@ -93,6 +93,14 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
     ACCEPTANCE_KEY = "ModelingV2Glm52Nvfp4Sm103Tep4::mtp1"
     MTP3_ACCEPTANCE_KEY = "ModelingV2Glm52Nvfp4Sm103Tep4::mtp3"
 
+    # The limit on |mtp1 - identity| gsm8k. It is sized from the delta's own
+    # run-to-run spread, not from the stderr lm-eval prints. That stderr
+    # (~0.65) is the error over the question sample, and both legs answer the
+    # same 1319 questions. Over 34 B300 runs the identity score had sd 0.33,
+    # the mtp1 score sd 0.45, their correlation was -0.10, and the delta had
+    # mean +0.02 and sd 0.59. The limit is 3.4 sigma of the delta.
+    MTP1_DELTA_LIMIT = 2.0
+
     # There is deliberately one test. It evaluates the identity config as its
     # first leg and the mtp1 config as its second, and ``task.evaluate``
     # asserts accuracy against the reference on the way past; the mtp1 leg also
@@ -107,16 +115,17 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
         Turning MTP on must not move the answers.
 
         Rejection sampling holds the emitted distribution to the target
-        model's, so the two scores should differ only by sampling noise.
+        model's, so the two scores should differ only by run-to-run noise.
 
         Both legs assert accuracy against the registered reference as they
         run -- this test is therefore the identity gate as well as the
         comparison.
 
-        Both measurements are taken **in this one test** on purpose: a delta
-        against a score recorded in some earlier session carries that
-        session's variance into the judgement. Paired, the variance is common
-        to both and cancels.
+        Both measurements are taken **in this one test** on purpose: the two
+        legs then share the build, the node and the engine bounds. They do not
+        share their noise. Each score still moves between runs and the two
+        scores are uncorrelated, so the gate is sized from the measured spread
+        of the delta itself; see ``MTP1_DELTA_LIMIT``.
 
         The score is the harness default, with no ``scores_filter``. That is
         the protocol the registered GLM-5.2 references were set under and the
@@ -168,11 +177,10 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
 
         delta = mtp1 - identity
         print(f"[modeling_v2] gsm8k identity={identity:.4f} mtp1={mtp1:.4f} delta={delta:+.4f}")
-        # 2 sigma at the ~0.6 stderr this benchmark reports at n=1319.
-        assert abs(delta) < 1.2, (
+        assert abs(delta) < self.MTP1_DELTA_LIMIT, (
             f"MTP moved gsm8k by {delta:+.4f} (identity={identity:.4f}, "
-            f"mtp1={mtp1:.4f}); rejection sampling should have held the "
-            f"distribution, so this is not sampling noise"
+            f"mtp1={mtp1:.4f}); the limit is {self.MTP1_DELTA_LIMIT}, sized "
+            f"from the run-to-run spread of this delta"
         )
         print(f"[AL] mtp1 acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
