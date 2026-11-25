@@ -18,6 +18,7 @@ import itertools
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 
 import pytest
 import torch
@@ -47,7 +48,7 @@ def _qualname(stem: str) -> str:
     return f"{_NAMESPACE}::{stem}_{next(_op_ids)}"
 
 
-def _register_add_one(**kwargs) -> FastCustomOp:
+def _register_add_one(**kwargs: object) -> FastCustomOp:
     @fast_custom_op(_qualname("add_one"), **kwargs)
     def add_one(x: torch.Tensor) -> torch.Tensor:
         return x + 1
@@ -65,7 +66,7 @@ def test_device_agnostic_registration_runs_on_cpu() -> None:
 
 
 @pytest.mark.parametrize("device_types", ["cuda", "CUDA", ("cuda", "cpu")])
-def test_accepts_device_types_and_dispatch_keys(device_types) -> None:
+def test_accepts_device_types_and_dispatch_keys(device_types: str | tuple[str, ...]) -> None:
     op = _register_add_one(device_types=device_types)
     assert torch._C._dispatch_has_kernel_for_dispatch_key(op.qualname, "CUDA")
     if "cpu" in device_types:
@@ -91,7 +92,7 @@ def test_call_traces_to_the_default_overload() -> None:
     op = _register_add_one(device_types=None)
     targets = []
 
-    def capture(gm: torch.fx.GraphModule, example_inputs):
+    def capture(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]) -> Callable:
         targets.extend(n.target for n in gm.graph.nodes if n.op == "call_function")
         return gm.forward
 
@@ -102,7 +103,7 @@ def test_call_traces_to_the_default_overload() -> None:
     assert isinstance(op._op, torch._ops.OpOverload)
 
 
-def _register_mm_out(**kwargs) -> FastCustomOp:
+def _register_mm_out(**kwargs: object) -> FastCustomOp:
     @fast_custom_op(_qualname("mm_out"), mutates_args=("out",), device_types=None, **kwargs)
     def mm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
         torch.mm(a, b, out=out)
@@ -132,7 +133,7 @@ def test_disable_grad_runs_the_body_without_grad() -> None:
     assert not out.requires_grad
 
 
-def test_validate_mode_restores_the_alias_check(monkeypatch) -> None:
+def test_validate_mode_restores_the_alias_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_VALIDATE_CUSTOM_OPS", "1")
 
     @fast_custom_op(_qualname("returns_input"), device_types=None)
@@ -146,7 +147,9 @@ def test_validate_mode_restores_the_alias_check(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("device_types", [None, "CUDA", "cuda", ("CUDA", "CPU")])
-def test_validate_mode_device_types_and_tags(monkeypatch, device_types) -> None:
+def test_validate_mode_device_types_and_tags(
+    monkeypatch: pytest.MonkeyPatch, device_types: str | tuple[str, ...] | None
+) -> None:
     monkeypatch.setenv("TLLM_VALIDATE_CUSTOM_OPS", "1")
     op = _register_add_one(device_types=device_types, tags=(torch.Tag.needs_fixed_stride_order,))
     assert isinstance(op, torch.library.CustomOpDef)

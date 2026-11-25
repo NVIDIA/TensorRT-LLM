@@ -421,8 +421,8 @@ def fused_moe(
         raise
 
     # When out_tensor is provided, the result is written in-place to out_tensor.
-    # Return empty list to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # list rather than out_tensor itself.
     # Callers should use out_tensor directly when they provide it.
     if out_tensor is not None:
         return []

@@ -1125,8 +1125,8 @@ def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
         if rows_in_lamport(result[0], lamport_fc2_out):
             return [result[0].new_empty(0), *result[1:]]
     # When output is provided and do_finalize=True, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None and do_finalize:
         return [torch.empty(0, device=output.device, dtype=output.dtype)]
@@ -1752,8 +1752,8 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
     result = kernel_runner(input_tensors, tactic=best_tactic, output=output)
     # When output is provided, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)
@@ -2125,8 +2125,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
         output=output)
     # When output is provided, the result is written in-place to output.
-    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
-    # (custom op output cannot be the same tensor as input).
+    # The schema declares no output that aliases an input, so return an empty
+    # placeholder rather than output itself.
     # Callers should use output directly when they provide it.
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)

@@ -195,7 +195,7 @@ class FastCustomOp:
         self._lib = lib
         # Set by the register_fake method, under the name custom_op uses, so
         # code that reads the fake from there works on either kind of op.
-        self._abstract_fn = None
+        self._abstract_fn: Callable | None = None
 
     def __call__(self, *args, **kwargs):
         return self._op(*args, **kwargs)

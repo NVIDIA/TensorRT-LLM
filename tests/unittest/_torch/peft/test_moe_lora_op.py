@@ -412,6 +412,33 @@ def test_moe_lora_rejected_in_min_latency_mode():
 
 
 @requires_cuda_and_op
+def test_out_tensor_rejected_in_min_latency_mode():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+
+    with pytest.raises(RuntimeError, match="out_tensor is not supported with min_latency_mode"):
+        torch.ops.trtllm.fused_moe(
+            input=x,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_scores,
+            fc1_expert_weights=w3_w1,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2,
+            fc2_expert_biases=None,
+            output_dtype=dtype,
+            quant_scales=[],
+            min_latency_mode=True,
+            out_tensor=torch.empty(num_tokens, hidden_size, dtype=dtype, device=device),
+        )
+
+
+@requires_cuda_and_op
 @pytest.mark.parametrize("missing_module", ["fc2", "host_request_types"])
 def test_moe_lora_rejects_incomplete_inputs(missing_module):
     """Supplying fc1 LoRA but missing fc2 or host_request_types must raise."""

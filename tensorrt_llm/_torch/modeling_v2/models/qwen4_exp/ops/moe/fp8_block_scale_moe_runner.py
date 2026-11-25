@@ -184,7 +184,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     256 tokens, for the whole stack and for a 128-expert window, which tunes
     under its own `local_num_experts` key).
 
-    The op is a Python `torch.library.custom_op`
+    The op is a Python `fast_custom_op`
     (`trtllm::fp8_block_scale_moe_runner` in
     `_torch/custom_ops/trtllm_gen_custom_ops.py`) over the compiled-in C++ class
     `torch.classes.trtllm.FP8BlockScaleMoERunner`

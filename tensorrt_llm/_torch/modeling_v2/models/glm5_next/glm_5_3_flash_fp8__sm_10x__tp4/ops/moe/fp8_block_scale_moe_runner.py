@@ -164,7 +164,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     runs a deterministic fallback tactic keyed by the row count; a warm, tuned tactic is not
     certified here.
 
-    The op is a Python `torch.library.custom_op` (`trtllm::fp8_block_scale_moe_runner` in
+    The op is a Python `fast_custom_op` (`trtllm::fp8_block_scale_moe_runner` in
     `_torch/custom_ops/trtllm_gen_custom_ops.py`) over the compiled-in C++ class
     `torch.classes.trtllm.FP8BlockScaleMoERunner` (thop/moe/trtllmGen/fp8BlockScaleMoe.cpp),
     which launches the routing kernels, trtllm-gen's precompiled batched-GEMM cubins, a
