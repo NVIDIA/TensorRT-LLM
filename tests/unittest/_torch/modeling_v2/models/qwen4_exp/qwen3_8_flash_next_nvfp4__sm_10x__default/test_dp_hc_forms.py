@@ -48,8 +48,8 @@ def _first_recorder(monkeypatch):
     return calls
 
 
-def _core(tiles=True):
-    return SimpleNamespace(hc_tiles=tiles, hc_lowrank=320, hc_count=4)
+def _core(tiles=True, x2=False):
+    return SimpleNamespace(hc_tiles=tiles, hc_first_x2=x2, hc_lowrank=320, hc_count=4)
 
 
 @pytest.mark.cpu_only
@@ -71,6 +71,40 @@ def test_first_kernel_plan(monkeypatch, tiles, rows, inject, first_kw):
     calls = _first_recorder(monkeypatch)
     M._hc_first(_core(tiles), torch.zeros(rows, 16), None, inject)
     assert calls == [("first", inject, first_kw)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rows, inject, first_kw",
+    [
+        (64, True, {"tm": 64}),
+        (65, True, {"tm64x2": True}),
+        (96, True, {"tm64x2": True}),
+        (80, False, {}),  # the default plan: x2 replaces rows on N only
+        (97, True, {}),
+    ],
+)
+def test_first_kernel_two_tiles(monkeypatch, rows, inject, first_kw):
+    """`DP_HC_FIRST_X2_ENV`: two 64-row tiles in place of the rows-on-N kernel, nowhere else."""
+    calls = _first_recorder(monkeypatch)
+    M._hc_first(_core(True, x2=True), torch.zeros(rows, 16), None, inject)
+    assert calls == [("first", inject, first_kw)]
+
+
+@pytest.mark.cpu_only
+def test_first_x2_build_gating(monkeypatch):
+    compiled = []
+    monkeypatch.setattr(M, "hc_tc_first_precompile", lambda *a, **k: compiled.append(k))
+    core = SimpleNamespace(
+        stream=10240, hc_lowrank=320, hc_count=4, dp_rank=0, dp_size=8, hc_tiles=True
+    )
+    monkeypatch.delenv(M.DP_HC_FIRST_X2_ENV, raising=False)
+    assert not M._hc_first_x2_build(core, torch.device("cpu")) and not compiled
+    monkeypatch.setenv(M.DP_HC_FIRST_X2_ENV, "1")
+    assert M._hc_first_x2_build(core, torch.device("cpu"))
+    assert compiled == [{"tile64x2": True}]
+    core.hc_tiles = False
+    assert not M._hc_first_x2_build(core, torch.device("cpu")) and len(compiled) == 1
 
 
 @pytest.mark.cpu_only

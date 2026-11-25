@@ -1817,6 +1817,16 @@ DP_HC_TILES_ENV = "TRTLLM_QWEN4_EXP_DP_HC_TILES"
 _HC_TILE64_ROWS = (5, _HC_TILE64_MAX_ROWS)  # capacity: fixed: dispatch thresholds
 #: Rows at which an up kernel that does not release early takes two 64-row tiles.
 _HC_UP2_ROWS = (65, 128)  # capacity: fixed: dispatch thresholds
+#: Off by default (class S: another K split). With `DP_HC_TILES_ENV` engaged, a mixer with the
+#: injection at `_HC_FIRST_X2_ROWS` rows runs its first kernel on two 64-row M tiles with an
+#: 8-way K split (`qwen4_exp_hc_decode_tc_first(..., tm64x2=True)`) instead of the rows-on-N
+#: kernel, which is about 1 us slower than a 64-row tile at equal rows. `low` moves within one
+#: bf16 step; `inject` measured bitwise. GB300 micro, us a site: -0.20..-0.51 at 68..96 rows;
+#: dep8 server step at 20 / 24 requests a rank: -0.038 / -0.028 ms. Read once, when the target
+#: is built.
+DP_HC_FIRST_X2_ENV = "TRTLLM_QWEN4_EXP_DP_HC_FIRST_X2"
+#: Rows the switch above serves: the rows-on-N kernel's.
+_HC_FIRST_X2_ROWS = _HC_ROWSN_ROWS  # capacity: fixed: dispatch thresholds
 #: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) with PDL, trunk site
 #: A of a decode step (the mixer in front of a GDN or attention block) releases its dependents
 #: before its own wait (`qwen4_exp_hc_up_gate_mean(release_early=True)`), and the block's bf16
@@ -2141,6 +2151,27 @@ def _hc_tiles_build(core, device) -> bool:
         f"hc mixer plans: rank {core.dp_rank} of {core.dp_size}, 64-row tiles at "
         f"{_HC_TILE64_ROWS[0]}..{_HC_TILE64_ROWS[1]} rows, rows on N at {_HC_ROWSN_ROWS[0]}.."
         f"{_HC_ROWSN_ROWS[1]}, two up tiles at {_HC_UP2_ROWS[0]}..{_HC_UP2_ROWS[1]}"
+    )
+    return True
+
+
+def _hc_first_x2_build(core, device) -> bool:
+    """`DP_HC_FIRST_X2_ENV`, read once at build after `_hc_tiles_build`: True where the switch is
+    set and the mixer plans are engaged (the first kernel's two-tile variants compiled here);
+    set where they are not: one warning, False."""
+    if not _switch(DP_HC_FIRST_X2_ENV):
+        return False
+    if not core.hc_tiles:
+        logger.warning(
+            f"{DP_HC_FIRST_X2_ENV} is set but ignored: it rides on the attention-DP mixer plans "
+            f"({DP_HC_TILES_ENV}), which serve a dep4 / dep8 rank on SM103 and are not engaged"
+        )
+        return False
+    hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64x2=True)
+    lo, hi = _HC_FIRST_X2_ROWS
+    logger.info(
+        f"hc first kernel on two 64-row tiles ({DP_HC_FIRST_X2_ENV}=1): rank {core.dp_rank} of "
+        f"{core.dp_size}, mixers with the injection at {lo}..{hi} rows"
     )
     return True
 
@@ -2709,6 +2740,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The attention-DP decode forms, built after load (`post_load_weights`) on a GPU:
         # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
         self.hc_tiles = False
+        # `DP_HC_FIRST_X2_ENV` (opt-in), built after load on top of `hc_tiles`.
+        self.hc_first_x2 = False
         self._inproj_release = None
         # `DP_GDN_REPLAY_MAP_ENV`, settled at each cache-manager bind.
         self.gdn_replay_map = False
@@ -2944,6 +2977,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._decode = DecodeTarget(self)
         if device.type == "cuda":
             self.hc_tiles = _hc_tiles_build(self, device)
+            self.hc_first_x2 = _hc_first_x2_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
             self._out_proj = _out_proj_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
@@ -4685,11 +4719,16 @@ def _hc_first(core, normed, first, with_inject):
     `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture constant) it is one tcgen05 launch; larger
     steps run cuBLAS's fp32 logits and the activation kernel. With `core.hc_tiles`
     (`DP_HC_TILES_ENV`) the launch takes the 64-row tile or the rows-on-N kernel at their rows
-    (bitwise)."""
+    (bitwise), and with `core.hc_first_x2` (`DP_HC_FIRST_X2_ENV`, class S) two 64-row tiles in
+    place of the rows-on-N kernel."""
     rows = normed.shape[0]
     if rows <= _HC_TC_FIRST_MAX_ROWS:
         if core.hc_tiles:
             if with_inject and _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1]:
+                if getattr(core, "hc_first_x2", False):
+                    return qwen4_exp_hc_decode_tc_first(
+                        normed, first, core.hc_lowrank, core.hc_count, True, tm64x2=True
+                    )
                 return qwen4_exp_hc_decode_tc_first(
                     normed, first, core.hc_lowrank, core.hc_count, True, rows_on_n=True
                 )

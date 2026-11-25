@@ -65,7 +65,7 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
-    kw = {k: cell.spec[k] for k in ("tm", "rows_on_n") if k in cell.spec}
+    kw = {k: cell.spec[k] for k in ("tm", "rows_on_n", "tm64x2") if k in cell.spec}
     low, inject = op(*args, **kw)
     assert low.shape == (cell.spec["rows"], RANK)
     _compare((low, inject), op.reference(*args, **kw))
@@ -142,3 +142,32 @@ def test_guard_refuses_rows_on_n_outside_its_rows() -> None:
     normed, first, rank, c, wi = _build(dict(rows=97), seed=7)
     with validating(op), pytest.raises(AssertionError, match="rows on N"):
         op(normed, first, rank, c, wi, rows_on_n=True)
+
+
+@pytest.mark.parametrize("rows", [65, 68, 80, 96, 112, 128])
+def test_tm64x2_is_one_rounding_from_the_default_plan(rows) -> None:
+    """`tm64x2=True` (two 64-row tiles, an 8-way K split) moves `low` by at most one bf16 step
+    of the default plan's and leaves `inject` within one step too (measured bitwise at 68..96
+    rows on GB300); its graph replay is bitwise its eager call."""
+    normed, first, rank, c, wi = _build(dict(rows=rows), seed=1100 + rows)
+    ref = op(normed, first, rank, c, wi)
+    got = op(normed, first, rank, c, wi, tm64x2=True)
+    torch.cuda.synchronize()
+    for a, b in zip(ref, got):
+        step = torch.finfo(torch.bfloat16).eps * a.float().abs().clamp(min=2.0**-14)
+        assert ((a.float() - b.float()).abs() <= step).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_low, g_inject = op(normed, first, rank, c, wi, tm64x2=True)
+    fresh = _build(dict(rows=rows), seed=1200 + rows)[0]
+    normed.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    low, inject = op(fresh, first, rank, c, wi, tm64x2=True)
+    assert torch.equal(g_low, low) and torch.equal(g_inject, inject)
+
+
+def test_guard_refuses_tm64x2_outside_its_rows() -> None:
+    normed, first, rank, c, wi = _build(dict(rows=64), seed=8)
+    with validating(op), pytest.raises(AssertionError, match="two 64-row tiles"):
+        op(normed, first, rank, c, wi, tm64x2=True)

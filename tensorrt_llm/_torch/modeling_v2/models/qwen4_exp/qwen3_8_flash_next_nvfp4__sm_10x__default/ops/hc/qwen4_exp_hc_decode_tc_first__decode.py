@@ -31,6 +31,11 @@ Two plans for an attention-DP rank's decode rows, both bitwise the 128-row tile'
 - rows on N (`HcDecodeTcFirstRowsNKernel`, `hc_first_rowsn`; 65..96 rows): the operand
   roles swapped, the weight rows on a 64-row MMA M tile and the normed rows on the MMA N
   in 16-row steps, where tcgen05 has no M tile between 64 and 128 rows.
+
+One plan of another K split (opt-in at the call site): `tm64x2=True` (65..128 rows,
+`TILE64X2_ROWS`) runs two 64-row M tiles on an 8-way K split (`_TILE64X2`), the split the
+default plan takes past 128 rows, so the logits are summed in another order than the
+128-row tile's 16-way split at these rows.
 """
 
 from __future__ import annotations
@@ -1086,16 +1091,28 @@ _K_ALIGN = 64 * 80
 _TILE64 = (48, 16)
 TILE64_MAX_ROWS = 64
 
+#: `tm64x2=True`: two 64-row M tiles on an 8-way K split (7 x 8 x 2 = 112 CTAs, one wave of one
+#: CTA an SM), and the rows it serves. GB300 micro, us a launch with the injection against the
+#: rows-on-N kernel: 5.41 / 5.46 / 5.47 -> 5.21 / 5.21 / 5.29 at 68 / 72 / 80 rows, 5.74 / 5.80
+#: / 5.80 -> 5.29 at 84 / 88 / 96. Another K split than the 128-row tile's (8 slices of 1280
+#: columns for 16 of 640): `low` within one bf16 step of the default plan's, `inject` measured
+#: bitwise at 68..96 rows.
+_TILE64X2 = (48, 8)
+TILE64X2_ROWS = (TILE64_MAX_ROWS + 1, 128)
+
 
 def _tile(rows: int) -> tuple[int, int]:
     return next(t for hi, t in _TILES if rows <= hi)
 
 
-def precompile(k: int, rank: int, hc_count: int, device, tile64: bool = False) -> None:
+def precompile(
+    k: int, rank: int, hc_count: int, device, tile64: bool = False, tile64x2: bool = False
+) -> None:
     """Compile every `(tile, with_inject)` variant `Qwen4ExpHcDecodeTcFirst` can launch
     for a `[*, k]` stream, without launching: a variant first met by a serving step would
     stall it for the compile. Placeholder operands (the compile reads only their
-    addresses and the `low` layout). `tile64`: also the two `tm=64` variants."""
+    addresses and the `low` layout). `tile64`: also the two `tm=64` variants;
+    `tile64x2`: the two `tm64x2` variants."""
     normed = torch.empty((MAX_ROWS, k), dtype=torch.bfloat16, device=device)
     first = torch.empty((rank + hc_count, k), dtype=torch.bfloat16, device=device)
     low = torch.empty((MAX_ROWS, rank), dtype=torch.bfloat16, device=device)
@@ -1108,6 +1125,10 @@ def precompile(k: int, rank: int, hc_count: int, device, tile64: bool = False) -
         for with_inject in (True, False):
             n_cols = rank + (hc_count if with_inject else 0)
             _launcher(*_TILE64, hc_count, rank, n_cols, k, with_inject, ptrs, 64)
+    if tile64x2:
+        for with_inject in (True, False):
+            n_cols = rank + (hc_count if with_inject else 0)
+            _launcher(*_TILE64X2, hc_count, rank, n_cols, k, with_inject, ptrs, 64)
 
 
 class Qwen4ExpHcDecodeTcFirst(OpWrapper):
@@ -1185,6 +1206,10 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
             (65, True, dict(rows_on_n=True), "rows on N, 65 rows: MMA N 80"),
             (80, True, dict(rows_on_n=True), "rows on N, 80 rows: dep8 at 20 requests a rank"),
             (96, True, dict(rows_on_n=True), "rows on N, 96 rows: MMA N 96, the last it serves"),
+            (65, True, dict(tm64x2=True), "two 64-row tiles, 8-way K, 65 rows: the first"),
+            (80, True, dict(tm64x2=True), "two 64-row tiles, 80 rows: dep8 at 20 requests a rank"),
+            (96, True, dict(tm64x2=True), "two 64-row tiles, 96 rows: dep8 at 24 requests"),
+            (128, False, dict(tm64x2=True), "two 64-row tiles, no inject, 128 rows: the last"),
         )
     )
     note = """
@@ -1224,7 +1249,9 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     graph replay at 1, 4, 16 and 256 rows.
     `tm=64` (up to 64 rows) and `rows_on_n=True` (`ROWSN_ROWS`) are other plans of the same
     sums: bitwise the default plan's outputs at those rows; cells at 5 / 36 / 64 rows (with
-    and without the injection) and at 65 / 80 / 96 rows (with it).
+    and without the injection) and at 65 / 80 / 96 rows (with it). `tm64x2=True`
+    (`TILE64X2_ROWS`) sums in another order (an 8-way K split): cells at 65 / 80 / 96 rows
+    with the injection and 128 without, under the same fp64 gate as the default plan.
     Not certified: hc_count other than 4, an unpadded weight (N = R + C), zero
     rows (no launch; accepted, no cell drives them), other row counts without
     the injection.
@@ -1239,7 +1266,11 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         with_inject: bool,
         tm: int = 128,
         rows_on_n: bool = False,
+        tm64x2: bool = False,
     ):
+        if tm64x2:
+            assert TILE64X2_ROWS[0] <= normed.shape[0] <= TILE64X2_ROWS[1], normed.shape
+            return hc_decode_tc_first(normed, first, rank, hc_count, with_inject, *_TILE64X2, 64)
         if rows_on_n:
             bn = -(-normed.shape[0] // 16) * 16
             return hc_first_rowsn(normed, first, rank, hc_count, with_inject, bn)
@@ -1260,9 +1291,10 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         with_inject: bool,
         tm: int = 128,
         rows_on_n: bool = False,
+        tm64x2: bool = False,
     ):
-        """float64 projection and activations, one rounding per output. `tm` and
-        `rows_on_n` move no value: ignored."""
+        """float64 projection and activations, one rounding per output. `tm`, `rows_on_n` and
+        `tm64x2` move no value: ignored."""
         n_cols = rank + (hc_count if with_inject else 0)
         lg = normed.double() @ first[:, :n_cols].double()
         low = F.silu(lg[:, :rank] / hc_count).to(normed.dtype)
@@ -1280,10 +1312,15 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         with_inject: bool,
         tm: int = 128,
         rows_on_n: bool = False,
+        tm64x2: bool = False,
     ) -> None:
         rows, k = normed.shape
         assert tm == 128 or (tm == 64 and rows <= TILE64_MAX_ROWS), "tm: 128, or 64 up to 64 rows"
         assert not rows_on_n or ROWSN_ROWS[0] <= rows <= ROWSN_ROWS[1], "rows on N: 65..96 rows"
+        assert not tm64x2 or TILE64X2_ROWS[0] <= rows <= TILE64X2_ROWS[1], (
+            "two 64-row tiles: 65..128 rows"
+        )
+        assert not (tm64x2 and (rows_on_n or tm != 128)), "one plan a call"
         n_cols = rank + (hc_count if with_inject else 0)
         assert normed.dtype == first.dtype == torch.bfloat16, "bf16 operands"
         assert rows <= MAX_ROWS, f"at most {MAX_ROWS} rows (two MMA tiles)"
