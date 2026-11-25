@@ -37,8 +37,10 @@ from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
+from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
+    ExecutorRequestQueue,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
@@ -2950,6 +2952,224 @@ class TestComputeScheduledTokens:
 # We exercise the actual PyExecutor methods by binding them to a lightweight
 # stub that carries only the attributes those methods touch.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "failure, stage_responses",
+    [
+        (None, False),
+        (None, True),
+        ("peer_missing", False),
+        ("cleanup_error", False),
+        ("loop_teardown_error", False),
+        ("device_fault", False),
+        ("collective_fault", False),
+        ("math_library_fault", False),
+        ("wrapped_device_fault", False),
+        ("late_device_fault", False),
+        ("group_close_error", False),
+    ],
+)
+def test_periodic_tp_fatal_response_requires_peer_and_cleanup_agreement(
+    monkeypatch, failure, stage_responses
+):
+    from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+
+    dist = types.SimpleNamespace(
+        rank=0, world_size=2, mapping=types.SimpleNamespace(tp_group=[0, 1])
+    )
+    request_queue = ExecutorRequestQueue(dist, 4, False, 0)
+    queued = Mock(spec=ExecutorRequest, client_id=22)
+    request_queue.get_request_queue().put(RequestQueueItem(2, request=queued))
+    active = Mock(
+        spec=LlmRequest,
+        py_request_id=11,
+        py_client_id=111,
+        is_child=True,
+        parent_request_id=1,
+        context_remaining_length=0,
+        is_finished=False,
+        py_encoder_output=None,
+    )
+    deferred = RequestQueueItem(3, request=Mock(spec=ExecutorRequest, client_id=33))
+    group = Mock()
+    if failure == "peer_missing":
+        group.arrive.side_effect = TimeoutError("missing peer")
+    if failure == "group_close_error":
+        group.close.side_effect = RuntimeError("group close failed")
+    watchdog = Mock(deadline=time.monotonic() + 10.0)
+    start_watchdog = Mock(return_value=watchdog)
+    hard_kill = Mock()
+    monkeypatch.setattr(executor_module, "start_rank_crash_kill_watchdog", start_watchdog)
+    monkeypatch.setattr(executor_module, "hard_kill_on_rank_crash", hard_kill)
+
+    @contextmanager
+    def profiler(**_):
+        yield
+        if failure == "loop_teardown_error":
+            raise RuntimeError("loop teardown failed")
+
+    monkeypatch.setattr(executor_module, "host_profiler_context", profiler)
+    monkeypatch.setattr(executor_module, "customized_gc_thresholds", lambda *_: nullcontext())
+    monkeypatch.setattr(executor_module.monitor_triggers, "notify_error", Mock())
+    device_sync = Mock(
+        side_effect=RuntimeError("asynchronous CUDA error")
+        if failure == "late_device_fault"
+        else None
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", device_sync)
+
+    delivered = threading.Event()
+    delivered.set()
+    executor = make_partial_executor(
+        dist=dist,
+        active_requests=[active],
+        request_accumulated=[deferred],
+        executor_request_queue=request_queue,
+        _error_budget=ErrorBudget(budget=0.05, recovery_rate=0),
+        _fatal_error=None,
+        _periodic_snapshot_tp_used=True,
+        _periodic_tp_failure_group=group,
+        _periodic_tp_fatal_watchdog=None,
+        _periodic_tp_fatal_responses_done=False,
+        _event_loop_error_delivered=delivered,
+        _event_loop_error=None,
+        _pending_transfer_responses=[],
+        _pending_response_terminations=[],
+        _merged_transfer_flush=None,
+        _stage_responses=stage_responses,
+        _staged_responses=[],
+        _loop_iteration=1,
+        is_shutdown=False,
+        garbage_collection_gen0_threshold=None,
+        _apply_dynamo_recompile_limit=Mock(),
+        _release_memory_monitor=Mock(),
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _terminate_request=Mock(),
+        _free_request_resources=Mock(),
+        _release_multimodal_resources=Mock(),
+    )
+    result_queue = Mock()
+    executor._response_channel.register([1], result_queue)
+    parent = Mock(
+        spec=LlmRequest,
+        py_request_id=1,
+        is_child=False,
+        child_requests=[active],
+        py_encoder_output=None,
+    )
+    executor._do_terminate_request(parent)
+    assert executor._response_channel.result_wait_queues[1] is result_queue
+    message = {
+        "device_fault": "CUDA error: device-side assert triggered",
+        "collective_fault": "NCCL timeout",
+        "math_library_fault": "CUBLAS_STATUS_EXECUTION_FAILED",
+    }.get(failure, "ordinary failure")
+    deliver_responses = executor._response_channel.deliver
+
+    def deliver(routed):
+        if routed:
+            assert not executor.is_shutdown
+            assert not request_queue.can_enqueue_request()
+        deliver_responses(routed)
+
+    monkeypatch.setattr(executor._response_channel, "deliver", deliver)
+
+    def loop():
+        if failure == "group_close_error":
+            executor._event_loop_completed = True
+            return
+        error = RuntimeError(message)
+        if failure == "wrapped_device_fault":
+            error.__cause__ = RuntimeError("CUBLAS_STATUS_EXECUTION_FAILED")
+        executor.sampler.beam_width.side_effect = error
+        executor._sample_async(ScheduledRequests(), {})
+        pytest.fail("The sampling caller continued after a terminal error")
+
+    def cleanup():
+        watchdog.cancel.assert_not_called()
+        if failure == "cleanup_error":
+            raise RuntimeError("cleanup failed")
+
+    executor.event_loop = loop
+    executor._executor_loop_cleanup = cleanup
+    if failure is None:
+        executor._event_loop_wrapper()
+        group.close.assert_called_once_with()
+        assert group.arrive.call_count == 2
+        hard_kill.assert_not_called()
+    else:
+        match = {
+            "cleanup_error": "cleanup failed",
+            "loop_teardown_error": "loop teardown failed",
+            "group_close_error": "group close failed",
+        }.get(failure, message)
+        with pytest.raises(RuntimeError, match=match):
+            executor._event_loop_wrapper()
+        assert group.close.call_count == (failure == "group_close_error")
+        assert group.arrive.call_count == (
+            failure in {"peer_missing", "cleanup_error", "loop_teardown_error"}
+        )
+        hard_kill.assert_called_once_with(2, deadline=watchdog.deadline, error_delivered=None)
+    start_watchdog.assert_called_once()
+    watchdog.cancel.assert_called_once_with()
+
+    if failure in {None, "cleanup_error", "loop_teardown_error"}:
+        device_sync.assert_called_once_with(executor.device_id)
+        assert not request_queue.can_enqueue_request()
+        assert not executor.request_accumulated
+        assert request_queue.get_request_queue().get_nowait().is_shutdown_request
+        assert [
+            executor._await_single_response(req_id, timeout=0)[0].error_msg for req_id in (1, 2, 3)
+        ] == [message, message, message]
+        assert active.state == LlmRequestState.GENERATION_COMPLETE
+        assert not executor.active_requests
+        result_queue.put_response.remote.assert_called_once()
+        client_id, response = result_queue.put_response.remote.call_args.args
+        assert (client_id, response.request_id, response.error_msg) == (111, 1, message)
+        executor._do_terminate_request(active)
+        assert 1 not in executor._response_channel.result_wait_queues
+    else:
+        assert executor._response_channel.responses == {}
+        result_queue.put_response.remote.assert_not_called()
+        assert request_queue.get_request_queue().get_nowait().id == 2
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_enqueue_registers_result_route_before_making_request_visible(monkeypatch, batch_size):
+    dist = types.SimpleNamespace(rank=0)
+    request_queue = ExecutorRequestQueue(dist, 4, False, 0)
+    executor = make_partial_executor(
+        dist=dist,
+        executor_request_queue=request_queue,
+        _check_benchmark_schedule_request=Mock(),
+    )
+    requests = [
+        Mock(
+            spec=ExecutorRequest,
+            disagg_request_id=None,
+            num_input_tokens=1,
+            sampling_config=types.SimpleNamespace(beam_width=1, num_return_sequences=1),
+        )
+        for _ in range(batch_size)
+    ]
+    result_wait_queue = Mock()
+    observed = []
+    raw_queue = request_queue.get_request_queue()
+    original_put = raw_queue.put
+
+    def put(item):
+        assert executor._response_channel.result_wait_queues[item.id] is result_wait_queue
+        observed.append(item.id)
+        original_put(item)
+
+    monkeypatch.setattr(raw_queue, "put", put)
+    expected = (
+        [executor.enqueue_request(requests[0], result_wait_queue=result_wait_queue)]
+        if batch_size == 1
+        else executor.enqueue_requests(requests, result_wait_queue=result_wait_queue)
+    )
+    assert observed == expected
 
 
 class _ResponseStub:

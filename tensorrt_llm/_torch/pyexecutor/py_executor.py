@@ -118,9 +118,9 @@ from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, distributed_warmup_guard,
-                            hard_kill_on_rank_crash, propagate_hard_kill,
-                            start_rank_crash_kill_watchdog)
+from .hang_detector import (HangDetector, RankCrashKillWatchdog,
+                            distributed_warmup_guard, hard_kill_on_rank_crash,
+                            propagate_hard_kill, start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .iteration_stats import IterationStatsRecord
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -137,6 +137,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
+from .periodic_snapshot_failure import PeriodicSnapshotFailureGroup
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
 from .profiling import ProfileController, PyExecutorProfileManager
@@ -209,23 +210,45 @@ def _periodic_tp_unrecoverable_error(error_msg: str) -> bool:
                         for marker in _PERIODIC_TP_CUDA_FATAL_MARKERS)))
 
 
-def _find_periodic_tp_unrecoverable_exception(
-        error: BaseException) -> BaseException | None:
-    # A cleanup failure can suppress a fatal CUDA error in its context.
-    pending = [error]
+def _periodic_tp_can_drain_fatal_error(error_msg: str) -> bool:
+    # Budget exhaustion alone does not show the device or transport is
+    # usable. Allow ordinary host errors and explicitly recoverable CUDA OOM.
+    lowered = error_msg.lower()
+    if (_periodic_tp_unrecoverable_error(error_msg)
+            or any(library in lowered
+                   for library in ("nccl", "nvshmem", "cublas", "cudnn",
+                                   "cusparse", "cufft", "curand"))):
+        return False
+    if "cuda" in lowered:
+        return "cuda out of memory" in lowered
+    return classify_error(error_msg) == "transient"
+
+
+def _periodic_tp_exception_chain(
+        error: BaseException | None) -> Iterator[BaseException]:
+    # A wrapper or cleanup failure can hide a transport or device error.
+    pending = [error] if error is not None else []
     seen: set[int] = set()
     while pending:
         current = pending.pop()
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if _periodic_tp_unrecoverable_error(str(current)):
-            return current
+        yield current
         if current.__cause__ is not None:
             pending.append(current.__cause__)
         if current.__context__ is not None:
             pending.append(current.__context__)
-    return None
+
+
+def _find_periodic_tp_unrecoverable_exception(
+        error: BaseException) -> BaseException | None:
+    return next((item for item in _periodic_tp_exception_chain(error)
+                 if _periodic_tp_unrecoverable_error(str(item))), None)
+
+
+class _PeriodicTpFatalShutdown(BaseException):
+    """Leave the executor loop after an agreed fatal response drain."""
 
 
 # Per-rank int64 words of the DSpark attention-DP agreement, all-gathered once
@@ -1278,6 +1301,9 @@ class PyExecutor:
         self._finish_periodic_snapshots = (self._is_kv_manager_v2 and getattr(
             self.kv_cache_manager, "periodic_snapshot_capacity", 0) > 0)
         self._periodic_snapshot_tp_used = False
+        self._periodic_tp_failure_group: PeriodicSnapshotFailureGroup | None = None
+        self._periodic_tp_fatal_watchdog: RankCrashKillWatchdog | None = None
+        self._periodic_tp_fatal_responses_done = False
         # A request's unique tokens are read only by block reuse, V1 managers
         # and a transceiver that keys transfers on them; otherwise none are built.
         self.track_unique_tokens = any(
@@ -2263,6 +2289,7 @@ class PyExecutor:
         crashed = False
         watchdog = None
         error_delivered = None
+        loop_exited_cleanly = False
         self._event_loop_completed = False
         try:
             self._apply_dynamo_recompile_limit()
@@ -2272,7 +2299,11 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-                self.event_loop()
+                try:
+                    self.event_loop()
+                except _PeriodicTpFatalShutdown:
+                    self._event_loop_completed = True
+            loop_exited_cleanly = True
         except Exception as e:
             # A raise AFTER the loop reached its own normal-exit `break` (from
             # the profiler's or hang detector's __exit__, or from the enclosing
@@ -2302,10 +2333,12 @@ class PyExecutor:
                 error_delivered = (None if getattr(
                     self, "_periodic_snapshot_tp_used", False) else
                                    self._event_loop_error_delivered)
-                watchdog = start_rank_crash_kill_watchdog(
-                    self.dist.world_size,
-                    error_delivered=error_delivered,
-                )
+                watchdog = getattr(self, "_periodic_tp_fatal_watchdog", None)
+                if watchdog is None:
+                    watchdog = start_rank_crash_kill_watchdog(
+                        self.dist.world_size,
+                        error_delivered=error_delivered,
+                    )
                 # One of the executor's own error exits: an out-of-memory
                 # crash is reported in every monitor mode but off, on its own
                 # thread so the error still reaches the waiters first.
@@ -2336,42 +2369,104 @@ class PyExecutor:
             # enforces, not this one.
             raise
         finally:
+            cleanup_completed = False
             try:
-                node_server = getattr(self, "_openengine_node_server", None)
-                if node_server is not None:
-                    node_server.close()
-                    self._openengine_node_server = None
-                self._executor_loop_cleanup()
+                try:
+                    node_server = getattr(self, "_openengine_node_server", None)
+                    if node_server is not None:
+                        node_server.close()
+                        self._openengine_node_server = None
+                    self._executor_loop_cleanup()
+                finally:
+                    if not crashed:
+                        # Also release the monitor for a follower whose loop
+                        # ends without a rank-local shutdown() call.
+                        self._release_memory_monitor()
+                cleanup_completed = True
             finally:
-                if not crashed:
-                    # A rank whose loop ends without its own shutdown() -- a
-                    # follower under the RPC orchestrator's rank-local
-                    # shutdown -- still leaves the monitor. A crashed rank is
-                    # about to be killed and skips it.
-                    self._release_memory_monitor()
-                if crashed:
-                    # Peers cannot make progress without this rank's loop:
-                    # they would block in their next collective until their
-                    # own HangDetectors fire 300s later. Kill the world now
-                    # instead; the grace inside lets the stashed error reach
-                    # rank-local waiters and the ready handshake first, so
-                    # the client sees the original exception rather than a
-                    # bare worker death. Nested finally: the kill must fire
-                    # even when cleanup itself raises.
-                    #
-                    # Cleanup returned, so the watchdog's only job (covering
-                    # a cleanup that never returns) is done: hand the timer
-                    # over rather than leave two running. This is bookkeeping,
-                    # not protection -- the kill still fires, on the SAME
-                    # deadline, one line below. Whether a rank is killed at
-                    # all is decided solely by `crashed` above.
-                    deadline = None
-                    if watchdog is not None:
-                        watchdog.cancel()
-                        deadline = watchdog.deadline
-                    hard_kill_on_rank_crash(self.dist.world_size,
-                                            deadline=deadline,
-                                            error_delivered=error_delivered)
+                fatal_watchdog = getattr(self, "_periodic_tp_fatal_watchdog",
+                                         None)
+                if (fatal_watchdog is not None and loop_exited_cleanly
+                        and self._event_loop_completed and cleanup_completed
+                        and self._periodic_tp_fatal_responses_done):
+                    self._finish_periodic_tp_fatal_shutdown(fatal_watchdog)
+                elif crashed or fatal_watchdog is not None:
+                    self._kill_after_event_loop_error(
+                        fatal_watchdog or watchdog, error_delivered)
+                elif (self._event_loop_completed and getattr(
+                        self, "_periodic_tp_failure_group", None) is not None):
+                    self._close_periodic_tp_failure_group_on_exit()
+
+    def _kill_after_event_loop_error(
+        self,
+        watchdog: RankCrashKillWatchdog | None,
+        error_delivered: threading.Event | None,
+    ) -> None:
+        # If cleanup returned, take over the same deadline from the watchdog.
+        # It was needed while cleanup could block without returning here.
+        deadline = None
+        if watchdog is not None:
+            watchdog.cancel()
+            deadline = watchdog.deadline
+        hard_kill_on_rank_crash(self.dist.world_size,
+                                deadline=deadline,
+                                error_delivered=error_delivered)
+
+    def _close_periodic_tp_failure_group(self) -> None:
+        group = getattr(self, "_periodic_tp_failure_group", None)
+        if group is not None:
+            group.close()
+            self._periodic_tp_failure_group = None
+            self._periodic_tp_cache_manager_ref = None
+
+    def _close_periodic_tp_failure_group_on_exit(self) -> None:
+        watchdog = start_rank_crash_kill_watchdog(self.dist.world_size)
+        try:
+            self._close_periodic_tp_failure_group()
+        except Exception:
+            self._kill_after_event_loop_error(watchdog, None)
+            raise
+        if watchdog is not None:
+            watchdog.cancel()
+
+    def _finish_periodic_tp_fatal_shutdown(
+            self, watchdog: RankCrashKillWatchdog) -> None:
+        group = self._periodic_tp_failure_group
+        try:
+            assert group is not None
+            group.arrive(watchdog.deadline)
+            self._close_periodic_tp_failure_group()
+        except Exception:
+            self._kill_after_event_loop_error(watchdog, None)
+            raise
+        watchdog.cancel()
+        self._periodic_tp_fatal_watchdog = None
+        self._periodic_tp_fatal_responses_done = False
+
+    def _agree_periodic_tp_fatal_shutdown(self,
+                                          fatal_error: BaseException) -> bool:
+        group = getattr(self, "_periodic_tp_failure_group", None)
+        if group is None:
+            return False
+        if self._periodic_tp_fatal_watchdog is not None:
+            # Another ordinary failure can be reported while the loop exits.
+            # The failure group already agreed to enter terminal cleanup.
+            return True
+        watchdog = start_rank_crash_kill_watchdog(self.dist.world_size)
+        if watchdog is None:
+            # Without a kill available, there is no safe way to leave an
+            # incomplete rendezvous or a stalled cleanup behind.
+            return False
+        self._periodic_tp_fatal_watchdog = watchdog
+        arrival_deadline = (time.monotonic() + watchdog.deadline) / 2
+        try:
+            # Pending asynchronous device work can fail after the CPU vote.
+            # The watchdog also covers a device sync waiting on a stranded peer.
+            torch.cuda.synchronize(self.device_id)
+            group.arrive(arrival_deadline)
+        except Exception as error:
+            raise fatal_error from error
+        return True
 
     @property
     def is_warmup(self) -> bool:
@@ -2724,10 +2819,13 @@ class PyExecutor:
         """
         for request in requests:
             self._check_benchmark_schedule_request(request)
-        req_ids = self.executor_request_queue.enqueue_requests(requests)
-        if result_wait_queue is not None:
-            self._response_channel.register(req_ids, result_wait_queue)
-        return req_ids
+        if result_wait_queue is None:
+            return self.executor_request_queue.enqueue_requests(requests)
+        return self.executor_request_queue.enqueue_requests(
+            requests,
+            before_enqueue=lambda req_id: self._response_channel.register(
+                (req_id, ), result_wait_queue),
+        )
 
     @staticmethod
     def _non_dummy_request_ids(requests: Iterable[LlmRequest]) -> List[int]:
@@ -3339,10 +3437,13 @@ class PyExecutor:
         Enqueue a new request.
         """
         self._check_benchmark_schedule_request(request)
-        req_id = self.executor_request_queue.enqueue_request(request)
-        if result_wait_queue is not None:
-            self._response_channel.register([req_id], result_wait_queue)
-        return req_id
+        if result_wait_queue is None:
+            return self.executor_request_queue.enqueue_request(request)
+        return self.executor_request_queue.enqueue_request(
+            request,
+            before_enqueue=lambda req_id: self._response_channel.register(
+                (req_id, ), result_wait_queue),
+        )
 
     def set_resource_governor_queue(self, queue):
         """Swap the queue used by ResourceGovernor.
@@ -6378,12 +6479,20 @@ class PyExecutor:
                 try:
                     rank_support = self.dist.tp_allgather_int64([
                         int(enabled and manager.periodic_snapshot_capacity > 1),
-                        int(mm_capable)
+                        int(mm_capable),
+                        int(enabled and PeriodicSnapshotFailureGroup.supported(
+                            self.dist)),
                     ])
                 except Exception:
                     self._periodic_snapshot_tp_used = True
                     raise
                 self._periodic_tp_enabled = all(row[0] for row in rank_support)
+                if (self._periodic_tp_enabled
+                        and all(row[2] for row in rank_support) and getattr(
+                            self, "_periodic_tp_failure_group", None) is None):
+                    self._periodic_snapshot_tp_used = True
+                    self._periodic_tp_failure_group = PeriodicSnapshotFailureGroup.create(
+                        self.dist)
                 self._periodic_tp_has_multimodal = any(row[1]
                                                        for row in rank_support)
                 self._periodic_tp_cache_manager_ref = weakref.ref(manager)
@@ -12893,14 +13002,26 @@ class PyExecutor:
                          f"(budget={self._error_budget.budget:.3f}), "
                          "treating as fatal")
 
+        periodic_tp_fatal = False
         if is_fatal:
             if self._fatal_error is None:
                 self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
-            # A CUDA fault from a periodic TP batch can surface after its
-            # CPU-side commit vote. Let the rank-crash path tear down peers.
             if getattr(self, "_periodic_snapshot_tp_used", False):
-                raise self._fatal_error
-            self.is_shutdown = True
+                # A device fault can surface after the CPU-side commit vote.
+                # Never enter the graceful shutdown protocol in that case.
+                # Most exception callers pass str(error) while still in
+                # their except block. Check the live cause and context too.
+                if (not _periodic_tp_can_drain_fatal_error(error_msg) or any(
+                        not _periodic_tp_can_drain_fatal_error(str(error))
+                        for error in _periodic_tp_exception_chain(
+                            sys.exc_info()[1]))
+                        or not self._agree_periodic_tp_fatal_shutdown(
+                            self._fatal_error)):
+                    raise self._fatal_error
+                periodic_tp_fatal = True
+                self.executor_request_queue.stop_admitting_requests()
+            else:
+                self.is_shutdown = True
             logger.error(
                 f"Fatal error detected, initiating shutdown: {error_msg}")
             requests = None
@@ -12917,8 +13038,15 @@ class PyExecutor:
             # enters the same number of collectives (attention-DP /
             # gather-all modes use collective gathers internally).
             waiting_responses: List[Tuple[int, LlmResponse]] = []
-            for item in drain_queued_items(self.waiting_queue,
-                                           self.executor_request_queue):
+            queued_items = drain_queued_items(self.waiting_queue,
+                                              self.executor_request_queue)
+            if periodic_tp_fatal:
+                # Control requests may have deferred already accepted items
+                # without putting those items back into either queue.
+                queued_items = itertools.chain(self.request_accumulated,
+                                               queued_items)
+                self.request_accumulated = []
+            for item in queued_items:
                 if (self.gather_all_responses
                         or self.dist.rank == 0) and item.request is not None:
                     waiting_responses.append(
@@ -12991,6 +13119,8 @@ class PyExecutor:
                     "whose KV blocks a transfer still owns")
         for request in failed_requests:
             req_id = request.py_request_id
+            if periodic_tp_fatal and getattr(request, "is_child", False):
+                req_id = request.parent_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             # A context request failing before its first chunk completed has
             # written no KV. Tag it so the V1 KV-cache release skips the
@@ -13066,6 +13196,12 @@ class PyExecutor:
             pending_terminations = self._pending_response_terminations
             self._pending_response_terminations = []
             self._enqueue_responses(pending + list(error_responses.items()))
+            if periodic_tp_fatal:
+                # Flush both queued and active errors before exposing shutdown.
+                # Waking an active waiter with only a queued response published
+                # would make it return a generic error instead of its response.
+                self._flush_staged_responses()
+                self.is_shutdown = True
             for request in pending_terminations:
                 self._terminate_request(request)
 
@@ -13095,6 +13231,11 @@ class PyExecutor:
                                                     "_memory_monitor_token",
                                                     None),
                                       background=True)
+        if periodic_tp_fatal:
+            self._periodic_tp_fatal_responses_done = True
+            # Some error callers would otherwise proceed to the next sampling
+            # or communication step before the normal loop stop condition.
+            raise _PeriodicTpFatalShutdown
 
     def _terminate_request(self, request: LlmRequest) -> None:
         if self.disagg.defer_gen_termination(request) is True:
@@ -13164,7 +13305,19 @@ class PyExecutor:
             request.py_encoder_output = None
             request.py_encoder_output_ready_event = None
         if self.gather_all_responses or self.dist.rank == 0:
-            self._response_channel.release(request.py_request_id)
+            response_id = request.py_request_id
+            if getattr(self, "_periodic_snapshot_tp_used",
+                       False) and (request.is_child or request.child_requests):
+                # A sequence may finish before its siblings. Keep the
+                # frontend route for a later error on a surviving sequence.
+                response_id = (request.parent_request_id
+                               if request.is_child else response_id)
+                if any(item is not request and not item.is_finished and (
+                        item.parent_request_id if item.is_child else item.
+                        py_request_id) == response_id
+                       for item in self.active_requests):
+                    return
+            self._response_channel.release(response_id)
 
     def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
         """Finish a PP-synchronized termination and any deferred recompute."""

@@ -262,7 +262,11 @@ class ExecutorRequestQueue:
 
         return child_req_ids
 
-    def _enqueue_impl(self, requests: Iterable[ExecutorRequest]) -> List[int]:
+    def _enqueue_impl(
+        self,
+        requests: Iterable[ExecutorRequest],
+        before_enqueue: Optional[Callable[[int], None]] = None,
+    ) -> List[int]:
         req_ids = []
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
@@ -284,21 +288,29 @@ class ExecutorRequestQueue:
                     num_input_tokens=request.num_input_tokens)
                 if self._stamp_admission_times is not None:
                     self._stamp_admission_times(item, time.monotonic())
+                if before_enqueue is not None:
+                    before_enqueue(req_id)
                 self.request_queue.put(item)
                 req_ids.append(req_id)
         return req_ids
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
-        """
-        Enqueue new requests
-        """
-        return self._enqueue_impl(requests)
+    def enqueue_requests(
+        self,
+        requests: List[ExecutorRequest],
+        *,
+        before_enqueue: Optional[Callable[[int], None]] = None,
+    ) -> List[int]:
+        """Enqueue each request after registering any result route."""
+        return self._enqueue_impl(requests, before_enqueue)
 
-    def enqueue_request(self, request: ExecutorRequest) -> int:
-        """
-        Enqueue a new request.
-        """
-        return self._enqueue_impl([request])[0]
+    def enqueue_request(
+        self,
+        request: ExecutorRequest,
+        *,
+        before_enqueue: Optional[Callable[[int], None]] = None,
+    ) -> int:
+        """Enqueue a request after registering any result route."""
+        return self._enqueue_impl([request], before_enqueue)[0]
 
     def enqueue_cancel_request(self, req_id: int):
         with self.enqueue_lock:
@@ -359,6 +371,11 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(
                 RequestQueueItem(id=BENCHMARK_STAGE_VOTE_REQUEST_ID))
+
+    def stop_admitting_requests(self) -> None:
+        """Close ingress before draining the queue on terminal failure."""
+        with self.enqueue_lock:
+            self.active = False
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
