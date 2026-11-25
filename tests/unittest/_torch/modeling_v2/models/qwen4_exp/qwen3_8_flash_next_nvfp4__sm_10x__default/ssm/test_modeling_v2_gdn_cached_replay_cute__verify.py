@@ -529,6 +529,8 @@ def _dispatch_core(bench, separate):
         head_k_dim=K,
         num_v_heads=bench.hv,
         head_v_dim=V,
+        # The kernel's own launch mapping (`DP_GDN_REPLAY_MAP_ENV` off).
+        gdn_replay_map=False,
         _bound=SimpleNamespace(
             pools=SimpleNamespace(ssm=dict(enumerate(bench.pool))),
             replay=replay,
