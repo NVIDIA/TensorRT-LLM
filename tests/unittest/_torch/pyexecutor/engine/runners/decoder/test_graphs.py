@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
@@ -166,6 +167,22 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIsNot(graph_batch, batch)
         self.assertEqual(graph_batch.generation_requests, [context])
         self.assertEqual(promoted_ids, frozenset({context.py_request_id}))
+
+    def test_prompt_embeds_row_on_final_token_falls_back(self) -> None:
+        # A decode row embeds the placeholder id, so only a final token without a row is promoted.
+        for row_on_final_token in (True, False):
+            with self.subTest(row_on_final_token=row_on_final_token):
+                context = _make_request_stub(1)
+                mask = [p == context.context_current_position for p in range(4)]
+                if not row_on_final_token:
+                    mask = mask[::-1]
+                context.py_prompt_embeds = build_prompt_embeds([0] * 4, torch.ones(1, 2), mask)[1]
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = [context]
+
+                _, promoted_ids = _make_single_token_context_graph_batch(batch)
+
+                self.assertEqual(bool(promoted_ids), not row_on_final_token)
 
     def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)

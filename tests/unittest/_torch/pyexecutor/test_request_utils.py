@@ -2299,3 +2299,50 @@ def test_suppressed_response_preserves_pending_logprobs() -> None:
     response = prepare_response(request)
     assert response.result.log_probs == [pending]
     assert response.result.cum_log_probs == [-0.75]
+
+
+@pytest.mark.parametrize("broadcast_kind", ["single_round", "tensor_parallel", "pipeline_parallel"])
+def test_request_broadcast_leaves_prompt_embeds_rows_on_rank0(broadcast_kind: str) -> None:
+    # Other ranks get the identity; first-stage TP ranks receive each chunk's
+    # rows from TP rank 0 when it runs.
+    from contextlib import nullcontext
+
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    _, prompt_embeds = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
+    request = ExecutorRequest.adapt(trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4))
+    request.inputs.prompt_embeds = prompt_embeds
+    generation_only = ExecutorRequest.adapt(trtllm.Request(input_token_ids=[1, 2], max_tokens=4))
+    generation_only.inputs.prompt_embeds = prompt_embeds.identity_only()
+    # A cancellation carries no request.
+    items = [
+        RequestQueueItem(1, request),
+        RequestQueueItem(2, generation_only),
+        RequestQueueItem(3, is_canceled_request=True),
+    ]
+    transport = MagicMock(world_size=2, rank=0, has_pp=broadcast_kind == "pipeline_parallel")
+    transport.supports_single_round_broadcast = broadcast_kind == "single_round"
+    transport.is_first_pp_rank, transport.is_last_pp_rank = True, False
+    transport.pp_size = 2
+    transport.tp_cp_broadcast.side_effect = lambda value, root: value
+    broadcaster = RequestBroadcaster(transport, SimpleNamespace(pause=nullcontext))
+    with patch.dict("os.environ", {"TRTLLM_PP_REQ_SEND_ASYNC": "0"}):
+        assert broadcaster.broadcast(items, known_nonempty=True) is items
+        if broadcast_kind == "single_round":
+            assert broadcaster.broadcast(items) is items
+    sent_calls = {
+        "single_round": transport.broadcast_or_none,
+        "tensor_parallel": transport.broadcast,
+        "pipeline_parallel": transport.tp_cp_broadcast,
+    }[broadcast_kind].call_args_list
+    if broadcast_kind == "pipeline_parallel":
+        sent_calls += transport.send_object.call_args_list
+    assert sent_calls
+    for call in sent_calls:
+        sent, sent_generation_only, cancel = pickle.loads(pickle.dumps(call.args[0]))
+        peer = sent.request.inputs.prompt_embeds
+        assert peer.embeds is None and peer.prefillable
+        assert peer.digest == prompt_embeds.digest
+        assert not sent_generation_only.request.inputs.prompt_embeds.prefillable
+        assert cancel.request is None and cancel.is_canceled_request
+    assert request.inputs.prompt_embeds is prompt_embeds

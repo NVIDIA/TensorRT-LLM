@@ -472,6 +472,7 @@ def test_worker_and_llm_request_conversion(with_hints: bool) -> None:
     worker = MagicMock()
     worker._is_pytorch_backend = True
     worker.max_seq_len = None
+    worker._effective_cache_salt.side_effect = lambda r: r.cache_salt
     worker.engine.enqueue_request.return_value = 42
     BaseWorker._enqueue_request(worker, request)
     native_request = worker.engine.enqueue_request.call_args.args[0]

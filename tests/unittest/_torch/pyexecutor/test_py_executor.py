@@ -635,6 +635,7 @@ def test_context_model_without_decoder_requires_replay_configuration(
         ("py_beam_width", 2, "requires beam_width == 1"),
         ("py_return_context_logits", True, "does not support context logits"),
         ("py_multimodal_data", {"image": object()}, "supports text prompts only"),
+        ("py_prompt_embeds", object(), "does not support prompt_embeds"),
     ],
 )
 def test_remote_tail_short_prompt_rejects_unsupported_requests(

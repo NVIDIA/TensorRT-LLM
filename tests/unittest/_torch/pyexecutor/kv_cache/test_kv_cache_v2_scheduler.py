@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MIN_GAIN_BLOCKS,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
+from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
 from tensorrt_llm.llmapi.llm_args import (
     CapacitySchedulerPolicy,
     ContextChunkingPolicy,
@@ -855,6 +857,7 @@ class TestInflightPrefixWait:
         req.get_tokens_view.return_value = tokens
         req.cache_salt = None
         req.multimodal_hashes = None
+        req.py_prompt_embeds = None
         req.is_dummy_request = False
         req.is_dummy = False
         return req
@@ -5588,6 +5591,21 @@ def test_pending_connector_load_is_not_a_recompute_or_eviction_victim() -> None:
     scheduler = make_scheduler(manager)
     assert not scheduler._is_evictable(request, set())
     assert not scheduler._is_recompute_pause_candidate(request, set())
+
+
+@pytest.mark.parametrize("copy", ["full", "peer_ranks", "identity_only"])
+def test_recompute_needs_prompt_embeds_rows(copy: str) -> None:
+    # A disaggregated generation request holds only the identity of its rows and
+    # cannot recompute its context; TP peers get the rows from rank 0 per chunk.
+    _, prompt_embeds = build_prompt_embeds([1, 2], torch.ones(2, 4))
+    request = make_gen_request(1)
+    request.py_prompt_embeds = {
+        "full": prompt_embeds,
+        "peer_ranks": prompt_embeds.for_peer_ranks(),
+        "identity_only": prompt_embeds.identity_only(),
+    }[copy]
+    scheduler = make_scheduler(make_kv_cache_manager(can_evict=True))
+    assert scheduler._is_recompute_pause_candidate(request, set()) == (copy != "identity_only")
 
 
 def test_pending_connector_load_does_not_self_evict_or_report_deadlock() -> None:

@@ -100,6 +100,7 @@ def _request(request_id, tokens, salt=None):
         lora_task_id=None,
         cache_salt=salt,
         multimodal_hashes=None,
+        py_prompt_embeds=None,
     )
 
 
@@ -194,8 +195,10 @@ def test_requests_with_a_claim_or_a_later_chunk_never_wait():
     manager.kv_cache_map[2] = object()
     continuing = _request(3, SHARED + [5] * 40)
     continuing.is_first_context_chunk = False
+    embeds = _request(4, SHARED + [6] * 40)
+    embeds.py_prompt_embeds = object()
 
-    assert planner.plan([claimed, continuing]) == {}
+    assert planner.plan([claimed, continuing, embeds]) == {}
 
 
 # ---------------------------------------------------------------------------
