@@ -27,9 +27,9 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _StubLinear:
-    """Records load_weights calls; quant_algo resolves via the loader's global config."""
+    """Records the weight dictionaries passed to load_weights."""
 
-    quant_config = None
+    quant_config: QuantConfig | None = None
 
     def __init__(self, quant_algo=None, force_dynamic_quantization=False):
         self.loaded = None
@@ -157,6 +157,36 @@ class TestStaticQuantGuard:
 
 
 class TestDynamicQuantGuard:
+    def test_proj_out_alias_uses_target_module_quant_config(self) -> None:
+        loader = _make_loader(
+            QuantAlgo.FP8_BLOCK_SCALES, dynamic_weight_quant=True, exclude_modules=["proj_out"]
+        )
+        single_stream_proj = _StubLinear()
+        single_stream_proj.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+        output_proj = _StubLinear()
+        output_proj.quant_config = QuantConfig()
+        single_stream_weights = _bf16_weights()
+        output_weights = _bf16_weights()
+        fp8_weight = torch.zeros_like(single_stream_weights["weight"], dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones((1, 1), dtype=torch.float32)
+
+        with (
+            patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
+            patch(
+                "tensorrt_llm._torch.visual_gen.quantization.loader.quantize_fp8_blockwise",
+                return_value=(fp8_weight, weight_scale),
+            ) as quantize,
+        ):
+            loader.load_linear_weights(single_stream_proj, "proj_out", [single_stream_weights])
+            loader.load_linear_weights(output_proj, "proj_out", [output_weights])
+
+        quantize.assert_called_once_with(single_stream_weights["weight"], block_size=128)
+        assert single_stream_proj.loaded[0]["weight"] is fp8_weight
+        assert single_stream_proj.loaded[0]["weight_scale"] is weight_scale
+        assert output_proj.loaded[0]["weight"] is output_weights["weight"]
+        assert output_proj.loaded[0]["weight"].dtype == torch.bfloat16
+        assert "weight_scale" not in output_proj.loaded[0]
+
     @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.uint8])
     def test_unsupported_algorithm_raises_before_retaining_or_loading_weights(
         self, weight_dtype: torch.dtype
