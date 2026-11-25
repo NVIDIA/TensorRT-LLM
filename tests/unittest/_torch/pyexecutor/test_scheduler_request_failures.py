@@ -1,18 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import pickle
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import cloudpickle
 import pytest
+from mpi4py import MPI
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
+
+# Pool workers cannot import this module by name, so ship its functions by value.
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 ADMISSION_ERROR = "KV cache admission made no progress within the scheduler limit"
 COLLECTIVES = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}
@@ -236,12 +244,10 @@ def test_adp_failure_consensus_covers_both_cp_and_pp_without_tp_vote():
     assert executor._handle_errors.call_args.kwargs["requests"] == failed
 
 
-def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
-    from mpi4py import MPI
-
+def _scheduler_failure_consensus_rank() -> int:
+    """One of four ranks laid out as CP2 x PP2; only rank 3 fails the request."""
     world = MPI.COMM_WORLD
-    if world.Get_size() != 4:
-        pytest.skip("launch this test with mpirun -np 4")
+    assert world.Get_size() == 4
     rank = world.Get_rank()
     cp, pp = world.Split(rank // 2, rank), world.Split(rank % 2, rank)
     try:
@@ -287,6 +293,13 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
     finally:
         cp.Free()
         pp.Free()
+    return rank
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_mpi_scheduler_failure_consensus_spans_cp_and_pp(mpi_pool_executor):
+    ranks = mpi_pool_executor.starmap(_scheduler_failure_consensus_rank, [()] * 4)
+    assert sorted(ranks) == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])

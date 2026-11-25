@@ -2794,8 +2794,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         preempted_ids: set[int],
         made_progress: bool,
     ) -> None:
-        """Return stalled requests for request-scoped executor cleanup.
+        """Record a stalled request in `_failed_requests` for request-scoped executor cleanup.
 
+        After `_DEADLOCK_STALL_ITERS` passes in a row that schedule nothing while
+        a candidate waits, the newest candidate that holds pages (or the newest
+        candidate, if none does) is failed and the count starts over.
         Unchecked, the executor spins at full speed while scheduling nothing,
         which looks healthy to the hang detector and to `/health`. Context
         candidates count alongside generation ones because a disaggregated
@@ -2875,7 +2878,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self._stalled_schedules += 1
         if self._stalled_schedules < self._DEADLOCK_STALL_ITERS:
-            # Warn as the stall builds so the raise is not a surprise. A quarter
+            # Warn as the stall builds so the failed request is not a surprise. A quarter
             # of the threshold keeps this to a handful of lines beforehand.
             if self._stalled_schedules == 1:
                 logger.debug(
