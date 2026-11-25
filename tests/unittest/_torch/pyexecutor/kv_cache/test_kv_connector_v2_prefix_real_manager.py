@@ -1017,7 +1017,7 @@ def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None
         manager.shutdown()
 
 
-# -- disaggregated completion reservation -----------------------------------------
+# -- failed loads, retained allocations and the external-prefix backoff -----------
 
 
 class _FailedLoadScheduler(KvCacheConnectorScheduler):

@@ -334,6 +334,31 @@ def test_ranks_that_disagree_about_capacity_only_are_rejected(
         manager.configure_prefix_reservations(True)
 
 
+@pytest.mark.parametrize(
+    "index, declaration, consequence",
+    [
+        (2, "requires_block_aligned_reuse", "prefixes of different lengths"),
+        (3, "reports_failed_loads", "poll for failed loads"),
+    ],
+)
+def test_a_split_declaration_names_its_own_consequence(
+    manager, monkeypatch, index, declaration, consequence
+):
+    """Only capacity_only gates a collective, so only its message speaks of a hang."""
+    manager._prefix_capability = None
+
+    def split(value):
+        flipped = list(value)
+        flipped[index] = not flipped[index]
+        return [value, tuple(flipped)]
+
+    monkeypatch.setattr(connector, "mpi_allgather", split)
+    with pytest.raises(ValueError, match=rf"{declaration} must be the same") as error:
+        manager.configure_prefix_reservations(True)
+    assert consequence in str(error.value)
+    assert "allgather" not in str(error.value)
+
+
 def test_capacity_only_agreed_on_every_rank_is_accepted(manager, monkeypatch):
     manager._prefix_capability = None
     manager.capacity_only = True

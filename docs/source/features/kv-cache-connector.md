@@ -452,8 +452,9 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 
 The manager reads `requires_block_aligned_reuse` once after constructing the worker.
 It may be set per instance. A `capacity_only` worker's declaration is ignored.
-Startup checks require all ranks to agree on this declaration, `reports_failed_loads`,
-and `capacity_only`.
+Under tensor parallelism, startup checks require all ranks to agree on this declaration,
+`reports_failed_loads` and `capacity_only`. Attention-DP owners are not checked against
+each other, so a deployment must give every owner the same connector class and role.
 
 ## Attention data parallelism
 

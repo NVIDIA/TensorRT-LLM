@@ -206,11 +206,11 @@ class KvCacheConnectorWorker(ABC):
     supports_speculative_prefill: bool = False
     #: The connector stores and offers KV by whole blocks starting at the local
     #: prefix match, so that match must end on a block boundary.
-    #: `KVCacheManagerV2` disables partial reuse for this connector. When a
-    #: one-model draft's lookahead backoff is in effect, it also aligns each
-    #: local match down to `tokens_per_block`. Only an explicit True counts. May be set per
+    #: `KVCacheManagerV2` disables partial reuse for this connector and aligns
+    #: each local match down to `tokens_per_block`, with or without a one-model
+    #: draft's lookahead backoff. Only an explicit True counts. May be set per
     #: instance in `__init__`, since the manager is built after the connector.
-    #: Must be the same on every rank.
+    #: Must be the same on every rank (see `capacity_only` for what is checked).
     requires_block_aligned_reuse: bool = False
     #: Opt in when a prefix load can come up short (a page offered at lookup
     #: is gone at load time) and the worker reports the affected requests
@@ -247,8 +247,10 @@ class KvCacheConnectorWorker(ABC):
         registers nothing needs none of them, so overriding this leaves its
         engine alone. It still participates in construction and shutdown.
 
-        Must answer the same on every rank. The ranks are gathered at startup
-        and a deployment whose ranks disagree is rejected there.
+        Must answer the same on every rank. Under tensor parallelism the ranks
+        are gathered at startup and a deployment whose ranks disagree is
+        rejected there. Attention-DP owners are not gathered: keeping them
+        consistent is the deployer's responsibility.
         """
         return False
 
@@ -1089,14 +1091,26 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 self.requires_block_aligned_reuse,
                 self.reports_failed_loads,
             )
+            # Attention-DP owners run this check on their own probe only: their
+            # connector callbacks are owner-local, so there is no gather to join.
             probe = [local_probe] if self.enable_attention_dp else mpi_allgather(local_probe)
             worker_capabilities = [rank_probe[0] for rank_probe in probe]
-            declarations = (
-                "capacity_only",
-                "requires_block_aligned_reuse",
-                "reports_failed_loads",
-            )
-            for index, declaration in enumerate(declarations, start=1):
+            # What goes wrong when the ranks of one server disagree on a declaration.
+            split_consequences = {
+                "capacity_only": (
+                    "It gates collectives the other ranks still enter, such as the "
+                    "get_finished allgather, so a split hangs rather than fails."
+                ),
+                "requires_block_aligned_reuse": (
+                    "Ranks that align the local reuse match and ranks that do not "
+                    "would reuse prefixes of different lengths for the same request."
+                ),
+                "reports_failed_loads": (
+                    "Some ranks would poll for failed loads and restart the request "
+                    "while the others raise on the same failure."
+                ),
+            }
+            for index, (declaration, consequence) in enumerate(split_consequences.items(), start=1):
                 declaring_ranks = [
                     rank for rank, rank_probe in enumerate(probe) if rank_probe[index]
                 ]
@@ -1104,8 +1118,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     raise ValueError(
                         f"KV connector {declaration} must be the same on every rank, but "
                         f"only rank(s) {declaring_ranks} of {len(probe)} declare it. "
-                        "It gates collectives the other ranks still enter, such as the "
-                        "get_finished allgather, so a split hangs rather than fails. "
+                        f"{consequence} "
                         "Give every rank of this server the same connector class and role."
                     )
             capabilities = scheduler_methods + worker_capabilities
