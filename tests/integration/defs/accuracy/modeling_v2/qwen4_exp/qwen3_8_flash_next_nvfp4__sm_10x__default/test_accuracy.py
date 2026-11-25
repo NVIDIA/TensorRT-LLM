@@ -480,7 +480,15 @@ _QUANTIZED_KV = [
 
 
 # tp2 (attention TP2, every expert split by intermediate), dep2 (attention DP, experts EP2) and
-# dep8 (attention DP over two nodes of four GPUs).
+# dep8 (attention DP over two nodes of four GPUs), the last once more with the MoE round trip on
+# the Lamport transport with host-indexed slots (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport_step`,
+# SM103 only; MNNVL peer memory, so both nodes in one rack). Each case: (layout, extra env).
+_DEP8 = dict(
+    tensor_parallel_size=8,
+    moe_expert_parallel_size=8,
+    enable_attention_dp=True,
+    gpus_per_node=4,
+)
 _MTP3_LAYOUTS = [
     pytest.param(
         dict(
@@ -489,23 +497,33 @@ _MTP3_LAYOUTS = [
             moe_expert_parallel_size=1,
             enable_attention_dp=False,
         ),
+        {},
         id="tp2",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
         dict(tensor_parallel_size=2, moe_expert_parallel_size=2, enable_attention_dp=True),
+        {},
         id="dep2",
         marks=pytest.mark.skip_less_device(2),
     ),
     pytest.param(
-        dict(
-            tensor_parallel_size=8,
-            moe_expert_parallel_size=8,
-            enable_attention_dp=True,
-            gpus_per_node=4,
-        ),
+        _DEP8,
+        {},
         id="dep8",
         marks=[skip_not_in_a_world_across_nodes, pytest.mark.skip_less_mpi_world_size(8)],
+    ),
+    pytest.param(
+        _DEP8,
+        {"TRTLLM_QWEN4_EXP_DP_MOE_COMM": "lamport_step"},
+        id="dep8_lamport_step",
+        marks=[
+            skip_not_in_a_world_across_nodes,
+            pytest.mark.skip_less_mpi_world_size(8),
+            pytest.mark.skipif(
+                get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
+            ),
+        ],
     ),
 ]
 
@@ -834,11 +852,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         assert_acceptance_length(self.ACCEPTANCE_KEY_LONG_CONTEXT, acceptance_length)
 
     @skip_unserved_gpu
-    @pytest.mark.parametrize("parallel", _MTP3_LAYOUTS)
-    def test_mtp3_gsm8k(self, mocker, request, parallel):
+    @pytest.mark.parametrize("parallel, env", _MTP3_LAYOUTS)
+    def test_mtp3_gsm8k(self, mocker, request, parallel, env):
         """gsm8k with three drafts over bf16 KV: the tep4 case's engine at tp2, dep2 and dep8."""
         with (
-            scoped_env_overrides(_VALIDATE) as rank_env,
+            scoped_env_overrides({**_VALIDATE, **env}) as rank_env,
             LLM(
                 self.MODEL_PATH,
                 speculative_config=self.MTP3,
