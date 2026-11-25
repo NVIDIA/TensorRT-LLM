@@ -18,6 +18,7 @@
 #include "hostExchange.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <algorithm>
@@ -99,8 +100,8 @@ void copy2D(SlotCopy const& copy, cudaMemcpyKind kind, cudaStream_t stream)
 //! destination row, which cudaMemcpy2DAsync rejects.
 void enqueueSends(std::vector<SlotCopy> const& sends, cudaStream_t stream)
 {
-    std::vector<void*> dsts;
-    std::vector<void const*> srcs;
+    std::vector<CUdeviceptr> dsts;
+    std::vector<CUdeviceptr> srcs;
     std::vector<size_t> sizes;
     size_t rows = 0;
     for (auto const& send : sends)
@@ -114,8 +115,8 @@ void enqueueSends(std::vector<SlotCopy> const& sends, cudaStream_t stream)
     {
         for (size_t row = 0; row < height; ++row)
         {
-            dsts.push_back(reinterpret_cast<void*>(dst + row * dstPitch));
-            srcs.push_back(reinterpret_cast<void const*>(src + row * srcPitch));
+            dsts.push_back(static_cast<CUdeviceptr>(dst + row * dstPitch));
+            srcs.push_back(static_cast<CUdeviceptr>(src + row * srcPitch));
             sizes.push_back(width);
         }
     }
@@ -123,13 +124,12 @@ void enqueueSends(std::vector<SlotCopy> const& sends, cudaStream_t stream)
     {
         return;
     }
-    cudaMemcpyAttributes attributes{};
-    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    // Prefer copy engines over SMs (cudaMemcpyFlagPreferOverlapWithCompute).
-    attributes.flags = 1u;
+    CUmemcpyAttributes attributes{};
+    attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+    attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
     size_t firstCopy = 0;
-    TLLM_CUDA_CHECK(
-        cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes, &firstCopy, 1, stream));
+    TLLM_CU_CHECK(
+        cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes, &firstCopy, 1, stream));
 }
 
 struct SlotCheck

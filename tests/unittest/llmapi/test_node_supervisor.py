@@ -651,6 +651,50 @@ def test_failed_replacements_back_off(monkeypatch):
     assert supervisor._given_up == {3}
 
 
+@pytest.mark.parametrize("failing", ["pidfd_open", "register"])
+def test_unwatched_replacement_ended_when_start_fails(monkeypatch, failing):
+    """End and reap a process that started but cannot be watched, and close its pidfd.
+
+    A retry would otherwise start a second process on the rank's GPU.
+    """
+    monkeypatch.setenv(SHARED_SECRET_ENV, secrets.token_hex(32))
+    supervisor = supervisor_module.NodeSupervisor(NODE, NODES, GPUS, [], {})
+    supervisor._exec_rank = [sys.executable, "-c", "import time; time.sleep(600)"]
+    children, pidfds = [], []
+    popen, pidfd_open = subprocess.Popen, os.pidfd_open
+
+    def start_process(*args, **kwargs):
+        children.append(popen(*args, **kwargs))
+        return children[-1]
+
+    def open_pidfd(pid):
+        if failing == "pidfd_open":
+            raise OSError("too many open files")
+        pidfds.append(pidfd_open(pid))
+        return pidfds[-1]
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", start_process)
+    monkeypatch.setattr(supervisor_module.os, "pidfd_open", open_pidfd)
+    if failing == "register":
+        monkeypatch.setattr(
+            supervisor._selector, "register", Mock(side_effect=OSError("cannot register"))
+        )
+    try:
+        supervisor._replace(3, 0.0)
+        assert len(children) == 1
+        assert children[0].poll() is not None
+        assert 3 not in supervisor._processes
+        assert supervisor._failed_replacements == {3: 1}
+        for pidfd in pidfds:
+            with pytest.raises(OSError):
+                os.fstat(pidfd)
+    finally:
+        for child in children:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+
+
 _INSTALL = "a replacement could not install the change that adds it"
 # The membership gives no reason when it leaves out a hung replacement.
 _HUNG = ""

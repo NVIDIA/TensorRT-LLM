@@ -9209,6 +9209,8 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "Keep a wide expert-parallel deployment serving at reduced capacity "
         "when one of its ranks fails, until a replacement rejoins. "
+        "Failover covers every rank except rank 0: losing rank 0 (or node 0) "
+        "ends the deployment. "
         "Requires attention DP over more than one rank, no MoE TP, the "
         "built-in MoE layers, EPLB and KV cache manager V2; unsupported "
         "configurations are rejected at startup with the reason. Turns off "

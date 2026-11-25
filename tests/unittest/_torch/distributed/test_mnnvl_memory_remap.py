@@ -526,6 +526,31 @@ def test_failed_cleanup_breaks_allocation(memory, driver, monkeypatch):
         memory.remap(_gather_without({2}), _ALL)
 
 
+def test_failed_rollback_breaks_allocation(memory, driver, monkeypatch):
+    """Check that a mapping failure whose rollback also fails leaves the allocation broken.
+
+    Rank 1 cannot set access on row 3 nor unmap the rows it mapped. It still reports the failure in
+    the outcome exchange, so every active rank raises the same error.
+    """
+    memory.checkpoint_prepare()
+    monkeypatch.setattr(
+        driver, "cuMemSetAccess", lambda address, size, descs, count: 2 * (address in _rows(3))
+    )
+    monkeypatch.setattr(driver, "cuMemUnmap", lambda address, size: 2)
+    comm = _gather_outcomes({0: (), 3: ()}, absent={2})
+
+    with pytest.raises(MnnvlMappingError, match="rank 1: MnnvlRollbackError") as raised:
+        memory.remap(comm, _ALL)
+
+    assert raised.value.ranks == (1,)
+    assert isinstance(raised.value.__cause__, mnnvl.MnnvlRollbackError)
+    assert len(comm.calls) == 2
+    assert sorted(driver.mapped) == _rows(0, 1, 3)
+    assert _RemapMemory.allocated_map[_BASE].state is mnnvl._MnnvlAllocationState.BROKEN
+    with pytest.raises(RuntimeError, match="Cannot remap MNNVL allocation in broken state"):
+        memory.remap(_gather_without({2}), _ALL)
+
+
 @pytest.fixture
 def rows_driver(driver, monkeypatch):
     monkeypatch.setattr(HostExchangeMnnvlMemory, "allocation_granularity", _SIZE)
