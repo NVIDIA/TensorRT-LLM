@@ -1601,8 +1601,8 @@ async def _create_input_tokens(
         PromptInputs: The token ids, or a prompt dict with the multimodal data.
     """
     model_type = resolve_top_level_model_type(model_config)
-    # Same pipeline as the chat route: the server template and the model
-    # extension's history rules and tool serialization apply here too.
+    # Use the shared render pipeline with the server template, Responses
+    # history hooks, and the model extension's tool serialization.
     render_resources = RenderResources.from_parts(
         tokenizer=tokenizer,
         model_type=model_type,
@@ -1662,11 +1662,12 @@ async def _create_input_tokens(
     # untouched and stay subject to the render-site guard. A serve-derived
     # effort also goes through the model's normalizer (see
     # ServingExtension.normalize_reasoning_effort).
-    chat_template_kwargs = reasoning_chat_template_kwargs(
-        request,
-        template_source=template_source,
-        model_type=model_type,
-    )
+    chat_template_kwargs, injected_chat_template_kwargs = (
+        reasoning_chat_template_kwargs_with_injected(
+            request,
+            template_source=template_source,
+            model_type=model_type,
+        ))
 
     rendered, (mm_data, mm_embeddings) = await render_conversation_with_media(
         render_resources,
@@ -1676,8 +1677,7 @@ async def _create_input_tokens(
         add_generation_prompt=True,
         tools=tools_dict,
         chat_template_kwargs=chat_template_kwargs or None,
-        injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
-            request, model_type=model_type),
+        injected_chat_template_kwargs=injected_chat_template_kwargs,
         # Media is rendered to text for the model's input processor to expand,
         # unless the renderer tokenizes it itself.
         tokenize=not has_media,
@@ -1721,6 +1721,14 @@ async def _create_input_tokens_harmony(
     return _render_for_completion(messages)
 
 
+def _strip_client_injected_chat_template_kwargs(
+        request: ResponsesRequest) -> None:
+    """Drop any client-supplied ``injected_chat_template_kwargs`` extra field before hooks run."""
+    extra = getattr(request, "model_extra", None)
+    if isinstance(extra, dict) and "injected_chat_template_kwargs" in extra:
+        delattr(request, "injected_chat_template_kwargs")
+
+
 def _serving_extension_for(model_config: Optional[PretrainedConfig],
                            use_harmony: bool) -> ServingExtension:
     """The serving extension of the model a Responses request is served by.
@@ -1745,6 +1753,8 @@ async def request_preprocess(
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     chat_template: Optional[str] = None,
 ) -> tuple[PromptInputs, SamplingParams]:
+    # Strip any client-supplied extra field so only server hooks can exempt keys.
+    _strip_client_injected_chat_template_kwargs(request)
     # The model's extension sees the request before anything reads it: the
     # sampling parameters built next and the prompt rendered below both read
     # the fields it may derive or pin.
@@ -1818,6 +1828,65 @@ async def request_preprocess(
 
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
+def reasoning_chat_template_kwargs_with_injected(
+    request,
+    *,
+    template_source: Optional[str] = None,
+    model_type: Optional[str],
+    include_request_injected: bool = True,
+) -> tuple[dict, frozenset[str]]:
+    """Derive chat-template kwargs and their server-injected keys in one pass.
+
+    Combines client ``chat_template_kwargs``, keys recorded by a Responses
+    serving extension in ``request.injected_chat_template_kwargs`` (when
+    ``include_request_injected`` is True), and kwargs derived from
+    ``request.reasoning``. When ``template_source`` is provided, injected keys
+    that the template never references are dropped while client-sent keys are
+    preserved verbatim.
+
+    Returns:
+        ``(kwargs, injected_keys)`` where ``injected_keys`` is the frozenset of
+        keys in ``kwargs`` that were server- or extension-injected rather than
+        client-sent.
+    """
+    # Check the type rather than the truthiness of each attribute. A caller
+    # that passes a stand-in object - a Mock in a unit test, say - hands back a
+    # truthy attribute for any name, so `dict(attr or {})` would call
+    # `attr.keys()` and fail with a TypeError instead of falling back.
+    raw = getattr(request, "chat_template_kwargs", None)
+    kwargs = dict(raw) if isinstance(raw, Mapping) else {}
+    raw_injected = (getattr(request, "injected_chat_template_kwargs", None)
+                    if include_request_injected else None)
+    hook_injected = (frozenset(key for key in raw_injected
+                               if isinstance(key, str) and key in kwargs) if
+                     isinstance(raw_injected,
+                                (list, tuple, set, frozenset)) else frozenset())
+    client_keys = frozenset(kwargs) - hook_injected
+    reasoning = getattr(request, "reasoning", None)
+    if reasoning is not None:
+        effort = getattr(reasoning, "effort", None)
+        if isinstance(effort, str) and effort:
+            # Serve-derived, so it goes through the model's normalizer (identity
+            # unless the model registers one). None means "leave the template
+            # default"; a model whose template cannot turn reasoning off maps
+            # `none` to one of its levels instead.
+            effort = normalize_reasoning_effort(effort, model_type)
+        if effort == "none":
+            kwargs.setdefault("thinking", False)
+        else:
+            if isinstance(effort, str) and effort:
+                # A kwarg the client wrote stays verbatim.
+                kwargs.setdefault("reasoning_effort", effort)
+            # A `reasoning` object asks a reasoning model to reason; without an
+            # effort it reasons at the model's default effort.
+            kwargs.setdefault("thinking", True)
+    injected = [key for key in kwargs if key not in client_keys]
+    if template_source is not None and injected:
+        for key in unreferenced_chat_template_kwargs(template_source, injected):
+            del kwargs[key]
+    return kwargs, frozenset(key for key in kwargs if key not in client_keys)
+
+
 def reasoning_chat_template_kwargs(request,
                                    template_source: Optional[str] = None,
                                    model_type: Optional[str] = None) -> dict:
@@ -1843,36 +1912,11 @@ def reasoning_chat_template_kwargs(request,
     `ServingExtension.normalize_reasoning_effort`) for an effort derived
     from `reasoning.effort`; without it the effort is forwarded unchanged.
     """
-    # Check the type rather than the truthiness of each attribute. A caller
-    # that passes a stand-in object - a Mock in a unit test, say - hands back a
-    # truthy attribute for any name, so `dict(attr or {})` would call
-    # `attr.keys()` and fail with a TypeError instead of falling back.
-    raw = getattr(request, "chat_template_kwargs", None)
-    kwargs = dict(raw) if isinstance(raw, Mapping) else {}
-    client_keys = frozenset(kwargs)
-    reasoning = getattr(request, "reasoning", None)
-    if reasoning is None:
-        return kwargs
-    effort = getattr(reasoning, "effort", None)
-    if isinstance(effort, str) and effort:
-        # Serve-derived, so it goes through the model's normalizer (identity
-        # unless the model registers one). None means "leave the template
-        # default"; a model whose template cannot turn reasoning off maps
-        # `none` to one of its levels instead.
-        effort = normalize_reasoning_effort(effort, model_type)
-    if effort == "none":
-        kwargs.setdefault("thinking", False)
-        return kwargs
-    if isinstance(effort, str) and effort:
-        # A kwarg the client wrote stays verbatim.
-        kwargs.setdefault("reasoning_effort", effort)
-    # A `reasoning` object asks a reasoning model to reason; without an
-    # effort it reasons at the model's default effort.
-    kwargs.setdefault("thinking", True)
-    if template_source is not None:
-        injected = [key for key in kwargs if key not in client_keys]
-        for key in unreferenced_chat_template_kwargs(template_source, injected):
-            del kwargs[key]
+    kwargs, _ = reasoning_chat_template_kwargs_with_injected(
+        request,
+        template_source=template_source,
+        model_type=model_type,
+    )
     return kwargs
 
 
@@ -1889,10 +1933,11 @@ def reasoning_injected_chat_template_keys(request,
     the selector used to derive the kwargs so model-normalized keys retain
     their server-injected provenance.
     """
-    raw = getattr(request, "chat_template_kwargs", None)
-    caller_keys = set(raw) if isinstance(raw, Mapping) else set()
-    kwargs = reasoning_chat_template_kwargs(request, model_type=model_type)
-    return frozenset(set(kwargs) - caller_keys)
+    _, injected = reasoning_chat_template_kwargs_with_injected(
+        request,
+        model_type=model_type,
+    )
+    return injected
 
 
 def _apply_reasoning_parser(

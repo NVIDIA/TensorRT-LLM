@@ -27,7 +27,7 @@ rendered, the history hooks on the conversation the template renders.
 import asyncio
 import copy
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Iterator, Optional
 
 import pytest
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
@@ -35,7 +35,9 @@ from transformers import PreTrainedTokenizerFast
 
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.serve import serving_extensions
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
+from tensorrt_llm.serve.render import RenderResources, UnsupportedRenderError
+from tensorrt_llm.serve.render.chat import _render_chat_without_request_hooks
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
     _create_input_messages,
@@ -110,7 +112,9 @@ class TestDefaultHooks:
             pytest.param(REASONING_WITH_TEXT, None, id="reasoning_with_text_is_left_out"),
         ],
     )
-    def test_replay_stored_turn(self, stored, expected) -> None:
+    def test_replay_stored_turn(
+        self, stored: dict[str, Any], expected: Optional[dict[str, Any]]
+    ) -> None:
         replayed = ServingExtension().replay_stored_turn(stored)
 
         assert replayed == expected
@@ -154,27 +158,30 @@ class _RecordingExtension(ServingExtension):
     """Records every hook call; replays and prepares in a recognizable way."""
 
     def __init__(self) -> None:
-        self.applied: list = []
-        self.replayed: list = []
-        self.prepared: list = []
+        self.applied: list[ResponsesRequest] = []
+        self.replayed: list[dict[str, Any]] = []
+        self.prepared: list[list[dict[str, Any]]] = []
         self.top_p: Optional[float] = None
-        self.chat_template_kwargs: Optional[dict] = None
+        self.chat_template_kwargs: Optional[dict[str, Any]] = None
+        self.injected_chat_template_kwargs: Optional[list[str]] = None
         self.history_note: Optional[str] = None
 
-    def apply_responses_extensions(self, request) -> None:
+    def apply_responses_extensions(self, request: ResponsesRequest) -> None:
         self.applied.append(request)
         if self.top_p is not None:
             request.top_p = self.top_p
         if self.chat_template_kwargs is not None:
             request.chat_template_kwargs = dict(self.chat_template_kwargs)
+        if self.injected_chat_template_kwargs is not None:
+            request.injected_chat_template_kwargs = list(self.injected_chat_template_kwargs)
 
-    def replay_stored_turn(self, message):
+    def replay_stored_turn(self, message: dict[str, Any]) -> Optional[dict[str, Any]]:
         self.replayed.append(message)
         if message.get("role") == "tool":
             return None
         return {**message, "content": f"replayed:{message.get('content')}"}
 
-    def prepare_responses_history(self, messages):
+    def prepare_responses_history(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         self.prepared.append(list(messages))
         if self.history_note is None:
             return messages
@@ -266,7 +273,7 @@ def _probe_tokenizer() -> TransformersTokenizer:
 
 
 @pytest.fixture
-def scratch_model():
+def scratch_model() -> Iterator[SimpleNamespace]:
     """A registered recording extension and a model config that resolves to it."""
     model_type = "responses-hooks-test-model"
     register_serving_extension(model_types=(model_type,))(_RecordingExtension)
@@ -279,7 +286,12 @@ def scratch_model():
         serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
 
 
-def _preprocess(request, model_config, tokenizer=None, **overrides):
+def _preprocess(
+    request: ResponsesRequest,
+    model_config: Any,
+    tokenizer: Optional[TransformersTokenizer] = None,
+    **overrides: Any,
+) -> tuple[Any, Any]:
     kwargs = dict(
         request=request,
         prev_response=None,
@@ -452,16 +464,72 @@ class TestRequestPreprocess:
         assert (sampling_params.top_p, sampling_params.temperature) == (0.8, 0.3)
         assert tokenizer.decode(input_tokens) == "<|system|>Be brief.<|user|>hi<|assistant|>"
 
-    def test_the_harmony_path_is_gpt_oss(self) -> None:
-        """The Harmony path passes no model config; its extension is gpt-oss's."""
+    def test_the_harmony_path_is_gpt_oss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Harmony path passes no model config; request_preprocess invokes gpt-oss's extension."""
+        from tensorrt_llm.serve import responses_utils
+
         assert _serving_extension_for(None, use_harmony=True) is (
             serving_extensions.get_serving_extension("gpt_oss")
         )
         assert type(_serving_extension_for(None, use_harmony=False)) is ServingExtension
 
-    def test_a_rejected_request_raises_before_anything_is_built(self, scratch_model) -> None:
+        gpt_oss_ext = serving_extensions.get_serving_extension("gpt_oss")
+        applied: list[ResponsesRequest] = []
+        monkeypatch.setattr(
+            gpt_oss_ext,
+            "apply_responses_extensions",
+            lambda req: applied.append(req),
+        )
+        monkeypatch.setattr(
+            responses_utils,
+            "get_harmony_adapter",
+            lambda: SimpleNamespace(get_stop_tokens=lambda: [200002]),
+        )
+        request = _request(
+            disaggregated_params={"request_type": "generation_only"},
+            prompt_token_ids=[11, 12],
+        )
+        input_tokens, _ = _preprocess(request, None, use_harmony=True)
+        assert input_tokens == [11, 12]
+        assert applied == [request]
+
+    def test_hook_injected_chat_template_kwargs_are_filtered_and_client_forgeries_stripped(
+        self, scratch_model: SimpleNamespace
+    ) -> None:
+        """Hook-injected kwargs are exempt from the unused-kwargs guard; client-sent ones are not."""
+        scratch_model.extension.chat_template_kwargs = {"probe": "on", "unused_hook_key": "x"}
+        scratch_model.extension.injected_chat_template_kwargs = ["probe", "unused_hook_key"]
+        tokenizer = _probe_tokenizer()
+
+        # Hook-injected unused_hook_key is dropped against PROBE_TEMPLATE without 400.
+        input_tokens, _ = _preprocess(_request(), scratch_model.model_config, tokenizer)
+        assert (
+            tokenizer.decode(input_tokens) == "<|system|>Be brief.<|user|>hi<probe:on><|assistant|>"
+        )
+
+        # A client cannot bypass the unused-kwargs guard by sending injected_chat_template_kwargs.
+        scratch_model.extension.chat_template_kwargs = None
+        scratch_model.extension.injected_chat_template_kwargs = None
+        forged = _request(
+            chat_template_kwargs={"unused_client_key": "x"},
+            injected_chat_template_kwargs=["unused_client_key"],
+        )
+        with pytest.raises(ValueError, match="unused_client_key"):
+            _preprocess(forged, scratch_model.model_config, tokenizer)
+
+    def test_render_chat_without_request_hooks_refuses_harmony(self) -> None:
+        res = RenderResources.from_tokenizer(None, model_type="gpt_oss", use_harmony=True)
+        req = ChatCompletionRequest.model_construct(
+            model="m", messages=[{"role": "user", "content": "hi"}]
+        )
+        with pytest.raises(UnsupportedRenderError, match="Harmony"):
+            _render_chat_without_request_hooks(req, res)
+
+    def test_a_rejected_request_raises_before_anything_is_built(
+        self, scratch_model: SimpleNamespace
+    ) -> None:
         class Rejecting(ServingExtension):
-            def apply_responses_extensions(self, request) -> None:
+            def apply_responses_extensions(self, request: ResponsesRequest) -> None:
                 raise ValueError("top_p is fixed for this model")
 
         # Replaces the fixture's registration under the same key; the fixture removes it.
@@ -477,7 +545,7 @@ def test_a_registered_extension_hooks_are_reachable_through_the_registry() -> No
 
     @register_serving_extension(model_types=(model_type,))
     class Registered(ServingExtension):
-        def prepare_responses_history(self, messages):
+        def prepare_responses_history(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return [*messages, {"role": "user", "content": "registered"}]
 
     try:

@@ -139,12 +139,17 @@ class ServingExtension:
 
         The Responses counterpart of :meth:`apply_chat_extensions`: mutates
         ``request`` in place, typically deriving chat-template kwargs or
-        sampling fields from request-level fields. Each worker calls it before
+        sampling fields from request-level fields. Keys derived into
+        ``request.chat_template_kwargs`` can be listed in
+        ``request.injected_chat_template_kwargs`` so they are template-filtered
+        and exempt from the unused-kwargs guard. Each worker calls it before
         ``to_sampling_params``, including for relayed (pre-tokenized) prompts.
-        A KV-aware router also calls it on a separate request copy for
-        chat-template routing, but not when reusing relayed token ids or using
-        native Harmony rendering. Overrides must not rely on a single call
-        across the router, context worker and generation worker.
+        A KV-aware router—and a conversation router with ``use_token_ids=True``—
+        also calls it on a separate request copy for chat-template routing (using
+        extensions registered in the router process), but not when reusing
+        relayed token ids or using native Harmony rendering. Overrides must not
+        rely on a single call across the router, context worker and generation
+        worker.
 
         Any exception raised here rejects the request with a 400
         ``BadRequestError`` carrying its message, as the route answers every
@@ -161,7 +166,8 @@ class ServingExtension:
         one becomes, ``None`` leaving it out. The default replays a message as
         stored unless it is an assistant message carrying ``reasoning``: the
         reasoning is not replayed, only the tool calls the message carries,
-        which the tool results that follow answer.
+        which the tool results that follow answer. Native Harmony rendering
+        bypasses this hook.
 
         Stored messages can contain output from an earlier
         :meth:`prepare_responses_history` call. Treat ``message`` and its nested
@@ -181,12 +187,15 @@ class ServingExtension:
     ) -> List["ChatCompletionMessageParam"]:
         """Adapt the chat messages converted from a Responses request to the model's renderer.
 
-        ``messages`` is the whole conversation the chat template is about to
-        render: the instructions, the replayed history and the request's
-        input, in order. The returned list is what is rendered and stored;
-        the default returns ``messages`` unchanged. On a follow-up, stored
-        output passes through :meth:`replay_stored_turn` and this hook again,
-        so transformations must remain stable when reapplied.
+        ``messages`` is the converted conversation before developer-to-system
+        fallback: the instructions, the replayed history and the request's
+        input, in order. On templates without a developer role, developer
+        messages are converted to system messages after this hook runs, and
+        native Harmony rendering bypasses this hook. The returned list is what
+        is stored and passed to subsequent rendering steps; the default returns
+        ``messages`` unchanged. On a follow-up, stored output passes through
+        :meth:`replay_stored_turn` and this hook again, so transformations must
+        remain stable when reapplied.
 
         Message dicts and their nested values can be shared with stored history
         or request input. An override that changes the conversation returns a

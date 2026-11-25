@@ -487,27 +487,79 @@ class _ModelToolsExtension(ServingExtension):
         return self._model_extension.serialize_tool(tool)
 
 
-def render_prepared_chat(
+def _render_chat_without_request_hooks(
     request: "ChatCompletionRequest",
     res: RenderResources,
     *,
-    tokenize: bool = True,
+    tools: Optional[List[Dict[str, Any]]] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
 ) -> RenderedPrompt:
-    """Render a chat request whose request-level preprocessing already happened.
+    """Render a synthetic chat request without running chat request hooks.
 
-    The Responses route derives the chat-template kwargs and the tool list from the
-    Responses request through the model's Responses hooks, then renders the converted
-    chat messages with the model's tool serialization and without
-    ``apply_chat_extensions``. A caller that rebuilt that chat request to render the
-    same prompt (the KV-aware router) renders it the same way here. Like
-    :func:`render_chat_for_length`, the result serves routing and is never forwarded
-    to a worker.
+    Used by the router when turning a preprocessed Responses request into
+    routing-only token ids: ``apply_chat_extensions`` is skipped while the
+    model's ``serialize_tool`` hook stays active (or pre-selected ``tools``
+    dicts, such as native deferred/namespace declarations, are handed directly
+    to ``apply_chat_template``). The result serves routing only and is never
+    forwarded to a worker.
+
+    Args:
+        request: Synthetic chat request whose messages, tools, and kwargs were
+            prepared on the Responses path.
+        res: Render resources for the target model. Harmony resources are
+            rejected because native Harmony rendering bypasses chat templates.
+        tools: Pre-selected tool dicts from the Responses path (for example
+            native deferred or namespace tool structures). When ``None``,
+            ``request.tools`` is serialized through ``res.extension.serialize_tool``.
+        encode_rendered: Optional encoder callback forwarded to
+            :func:`render_chat` for prefix-cache tokenization.
     """
-    return render_chat(
-        request,
-        dataclasses.replace(res, extension=_ModelToolsExtension(res.extension)),
-        tokenize=tokenize,
+    if res.use_harmony:
+        raise UnsupportedRenderError(
+            "_render_chat_without_request_hooks does not support Harmony rendering."
+        )
+    if tools is None:
+        return render_chat(
+            request,
+            dataclasses.replace(res, extension=_ModelToolsExtension(res.extension)),
+            tokenize=True,
+            encode_rendered=encode_rendered,
+        )
+    if _has_media(request.messages):
+        raise UnsupportedRenderError("Multimodal input is not supported by prompt rendering.")
+    if _is_passthrough_model(res):
+        raise UnsupportedRenderError(
+            f"Model type {res.model_type!r} builds its prompt in its own input processor; "
+            "rendering its prompts is not supported."
+        )
+    conversation, mm_coroutine, mm_placeholder_counts, _mm_item_order = _parse_text_conversation(
+        request, res, None
+    )
+    mm_coroutine.close()
+    native_ids = request.truncate_prompt_tokens is None and _has_python_chat_template(
+        getattr(res.tokenizer, "tokenizer", res.tokenizer)
+    )
+    rendered = apply_chat_template(
+        **_template_kwargs(
+            res,
+            conversation=conversation,
+            mm_placeholder_counts=mm_placeholder_counts,
+            add_generation_prompt=request.add_generation_prompt,
+            tools=tools,
+            documents=request.documents,
+            chat_template=request.chat_template,
+            chat_template_kwargs=request.chat_template_kwargs,
+            injected_chat_template_kwargs=request.injected_chat_template_kwargs,
+            enable_tokenize=native_ids,
+        )
+    )
+    return _finish(
+        res,
+        rendered,
+        forced_prefix=None,
+        tokenize=True,
+        add_special_tokens=request.add_special_tokens,
+        truncate_prompt_tokens=request.truncate_prompt_tokens,
         encode_rendered=encode_rendered,
     )
 

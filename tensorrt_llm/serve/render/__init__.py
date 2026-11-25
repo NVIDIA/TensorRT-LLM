@@ -29,7 +29,6 @@ from .chat import (
     render_chat_for_length,
     render_conversation,
     render_conversation_with_media,
-    render_prepared_chat,
     tokenize_rendered,
 )
 from .fingerprint import (
@@ -77,7 +76,6 @@ __all__ = [
     "render_conversation",
     "render_conversation_with_media",
     "render_endpoints_enabled",
-    "render_prepared_chat",
     "tokenize_rendered",
     "worker_resolves_thinking",
 ]
