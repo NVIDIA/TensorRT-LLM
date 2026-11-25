@@ -442,3 +442,49 @@ def test_ownk_check_draws_the_same_group_on_every_rank(monkeypatch):
     assert len(first) == len(other) == 8
     for p, (a, b) in enumerate(zip(first, other)):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16)), f"rank {p}'s logits differ"
+
+
+@pytest.mark.parametrize("ownk", [False, True])
+def test_check_holds_the_codes_to_what_the_transport_delivers(monkeypatch, ownk):
+    """Both gathers, of the logits and the owner top-k one, send the NVFP4 codes through the same
+    transport, which delivers a 16-bit half equal to its marker 0x8000 as 0x0000. In both modes the
+    check compares the gathered codes to `dep_lamport_transported_codes` of the reference, so a
+    row count whose check data holds such a half is not declined (the logits gather declined 15
+    of 27 dep8 row counts on raw codes before the full3 gate fix)."""
+    raw = torch.tensor([[0x00, 0x80, 0x12, 0x34]], dtype=torch.uint8)
+    delivered = torch.tensor([[0x00, 0x00, 0x12, 0x34]], dtype=torch.uint8)
+    scales = torch.zeros([1, 2], dtype=torch.uint8)
+    routed = torch.zeros([1, 24], dtype=torch.int16)
+    ids, wts = torch.zeros([1, 10], dtype=torch.int32), torch.zeros([1, 10], dtype=torch.bfloat16)
+    transported = []
+
+    def transport(codes):
+        transported.append(codes)
+        out = codes.clone()
+        out[:, 1] = 0
+        return out
+
+    def gather(x, logits, gs):
+        return delivered, scales, routed.view(torch.bfloat16) if ownk else logits
+
+    monkeypatch.setattr(M, "dep_lamport_transported_codes", transport)
+    monkeypatch.setattr(M, "dep_lamport_sanitized", lambda t: t)
+    monkeypatch.setattr(M, "fp4_quantize", lambda *a: (raw.clone(), scales.clone()))
+    monkeypatch.setattr(M, "_route_front_only", lambda *a: (ids, wts))
+    monkeypatch.setattr(M, "_route_front_run", lambda *a: (None, None, None, ids, wts))
+    monkeypatch.setattr(M, "_routed_rows", lambda *a: routed)
+    monkeypatch.setattr(M.torch.cuda, "synchronize", lambda device=None: None)
+    core = SimpleNamespace(
+        _lamport_trip=SimpleNamespace(world=1),
+        _decode=SimpleNamespace(_layers=[SimpleNamespace(moe_gscale="gs")]),
+        dp_rank=0,
+        hidden=16,
+        num_experts=512,
+        local_experts=64,
+        expert_offset=0,
+    )
+    st = SimpleNamespace(tactics={1: [0]}, flats={1: [torch.zeros(4)]}, fast2=frozenset())
+    pk = M._DpPack(gather, frozenset({1}), {}, frozenset())
+    what = M._dp_pack_check(core, pk, st, 1, "cpu", ownk=gather if ownk else None)
+    assert what == ""
+    assert len(transported) == 1 and torch.equal(transported[0], raw)
