@@ -36,8 +36,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import dep_lamport_round_trip as rt
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import dep_lamport_rs_inject as op
 
+# `_sass_pdl` is imported inside the SASS test: the rank processes `mp.spawn` starts re-import this
+# module without pytest's import-path finder, so a module-level import fails in every rank.
 __extra_import_path__ = ["~/tests/unittest/_torch/modeling_v2"]
-from _sass_pdl import nc_loads, pre_wait_violations  # noqa: E402
 
 HIDDEN, HC, TOPK = 2560, 4, 10
 REPLAYS = int(os.environ.get("QWEN4_EXP_LAMPORT_REPLAYS", "200"))
@@ -259,6 +260,8 @@ def test_finalize_pdl_reads_nothing_before_its_wait(tmp_path, world, rank, spp, 
     (`griddepcontrol.wait`) and no global access, branch or label before it, in its PTX no
     global load above the wait, and no `ld.global.nc` anywhere (ptxas may move one above the
     wait; the runner's output is still being written when the grid starts)."""
+    from _sass_pdl import nc_loads, pre_wait_violations
+
     env = dict(
         os.environ,
         CUTE_DSL_KEEP="ptx,cubin,sass",
