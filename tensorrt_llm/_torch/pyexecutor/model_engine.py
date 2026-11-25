@@ -157,16 +157,21 @@ class ModelEngine:
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-        if not self.model.model_config.is_generation:
-            raise ValueError(
-                "Non-generation models run through ScheduledEncoderExecutor, which does not "
-                "use ModelEngine."
-            )
-        self._validate_breakable_cuda_graph_compatibility()
-        self._init_from_model()
-        self._size_cuda_graphs()
-        self._compile_model(configured_encoder_max_num_tokens)
-        self._init_execution_services()
+        try:
+            if not self.model.model_config.is_generation:
+                raise ValueError(
+                    "Non-generation models run through ScheduledEncoderExecutor, which does not "
+                    "use ModelEngine."
+                )
+            self._validate_breakable_cuda_graph_compatibility()
+            self._init_from_model()
+            self._size_cuda_graphs()
+            self._compile_model(configured_encoder_max_num_tokens)
+            self._init_execution_services()
+        except BaseException:
+            # The error's traceback references this engine, and through it the model.
+            release_failed_model_engines([self])
+            raise
 
     def _init_from_args(
         self,
@@ -1258,3 +1263,32 @@ class ModelEngine:
         """
         if self._runner is not None:
             self._runner.wait_for_input_copy()
+
+
+def release_failed_model_engines(model_engines: list[ModelEngine]) -> None:
+    """Release the model engines of a failed engine or executor construction.
+
+    The construction error keeps them reachable through its traceback for as
+    long as the caller holds it, so their finalizers would release the model's
+    resources only after that; among them memory outside PyTorch's allocator
+    and threads that serve it to other processes. Failures here are logged: the
+    construction error stays the one raised.
+    """
+    if not model_engines:
+        return
+    if torch.cuda.is_available():
+        try:
+            # Work the failed step queued may still read the model's memory.
+            torch.cuda.synchronize()
+        except RuntimeError as error:
+            logger.error(
+                "Synchronizing before releasing the model engine of a failed "
+                f"construction failed: {error!r}"
+            )
+    for engine in model_engines:
+        try:
+            engine.cleanup()
+        except Exception as error:  # noqa: BLE001 - logged
+            logger.error(
+                f"Releasing the model engine of a failed construction also failed: {error!r}"
+            )

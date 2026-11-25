@@ -210,6 +210,42 @@ def test_cleanup_releases_runner_model_before_release_gc(
     assert release_gc.call_count == (2 if failure_stage == "gc" else 1)
 
 
+@pytest.mark.cpu_only
+def test_a_failed_construction_releases_the_model_it_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step after the model is loaded fails: the engine releases the model before the error
+    reaches the caller, whose traceback references the engine and its model."""
+    released = []
+
+    class HostResident(torch.nn.Module):
+        model_config = SimpleNamespace(is_generation=True)
+
+        def release_host_resident_weights(self) -> None:
+            released.append(self)
+
+    def load_model(engine: ModelEngine, **_kwargs) -> None:
+        engine.moe_load_balancer = None
+        engine.model = HostResident()
+
+    def compile_model(_engine: ModelEngine, _encoder_max_num_tokens) -> None:
+        raise RuntimeError("compile failed")
+
+    for name, step in {
+        "_init_from_args": lambda _engine, **_kwargs: None,
+        "_load_model": load_model,
+        "_validate_breakable_cuda_graph_compatibility": lambda _engine: None,
+        "_init_from_model": lambda _engine: None,
+        "_size_cuda_graphs": lambda _engine: None,
+        "_compile_model": compile_model,
+    }.items():
+        monkeypatch.setattr(ModelEngine, name, step)
+    with pytest.raises(RuntimeError, match="compile failed") as error:
+        ModelEngine(model_path="dummy", llm_args=Mock(), mapping=Mock())
+    # `error` holds the traceback, so the engine's finalizer has not run.
+    assert len(released) == 1, error.value
+
+
 class GraphOwnerTeardownTestCase(unittest.TestCase):
     def test_engine_graph_ownership_is_split(self) -> None:
         clear_blocks_graph = Mock()

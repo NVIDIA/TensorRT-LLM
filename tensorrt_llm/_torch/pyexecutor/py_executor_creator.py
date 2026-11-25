@@ -78,7 +78,7 @@ from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .model_engine import ModelEngine
+from .model_engine import ModelEngine, release_failed_model_engines
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
 from .runtime_hooks import runtime_hooks_of
@@ -1735,7 +1735,8 @@ def create_py_executor(
     construction are exited, in that order; managers registered before it are
     left alone. Exiting the DWDP manager also exits the dense manager it
     registered, so the second rollback finds a standalone one only. The model
-    engine the construction built is then released (``_release_model_engines``).
+    engine the construction built is then released
+    (``release_failed_model_engines``).
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
@@ -1777,7 +1778,7 @@ def create_py_executor(
                 logger.error(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
-        _release_model_engines(model_engines)
+        release_failed_model_engines(model_engines)
         raise
     py_executor._memory_monitor_token = monitor_token
     if monitor_token.monitored:
@@ -1795,32 +1796,6 @@ def create_py_executor(
     # thread, or a report request answered next to the serving loop.
     monitor_pools.prime()
     return py_executor
-
-
-def _release_model_engines(model_engines: list[ModelEngine]) -> None:
-    """Release the model engines of a failed executor construction.
-
-    The construction error keeps them reachable through its traceback for as
-    long as the caller holds it, so their finalizers would release the model's
-    resources only after that; among them memory outside PyTorch's allocator
-    and threads that serve it to other processes. Failures here are logged: the
-    construction error stays the one raised.
-    """
-    if not model_engines:
-        return
-    if torch.cuda.is_available():
-        try:
-            # Work the failed step queued may still read the model's memory.
-            torch.cuda.synchronize()
-        except RuntimeError as error:
-            logger.error("Synchronizing before releasing the model engine of "
-                         f"a failed executor construction failed: {error!r}")
-    for engine in model_engines:
-        try:
-            engine.cleanup()
-        except Exception as error:  # noqa: BLE001 - logged
-            logger.error("Releasing the model engine of a failed executor "
-                         f"construction also failed: {error!r}")
 
 
 def _begin_monitor(llm_args: TorchLlmArgs) -> "monitor_providers.ExecutorToken":
