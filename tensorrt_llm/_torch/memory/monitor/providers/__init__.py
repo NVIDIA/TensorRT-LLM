@@ -84,6 +84,16 @@ class MonitorProvider(Protocol):
     def collect(self) -> list[Entry]: ...
 
 
+@runtime_checkable
+class _ComponentProvider(Protocol):
+    def describes(self, component: object) -> bool: ...
+
+
+@runtime_checkable
+class _PoolRowsProvider(Protocol):
+    def collect_with_pool_rows(self) -> tuple[list[Entry], list[dict] | None]: ...
+
+
 #: Providers whose host object cannot be reached from here, with the
 #: executor that registered them. The KV cache manager lives in a
 #: ``ResourceManager`` owned by the executor and a
@@ -225,7 +235,7 @@ def unregister_providers_of(component: object) -> None:
     _registered[:] = [
         (o, p)
         for o, p in _registered
-        if not (callable(getattr(p, "describes", None)) and p.describes(component))
+        if not (isinstance(p, _ComponentProvider) and p.describes(component))
     ]
 
 
@@ -292,9 +302,8 @@ def collect_all(
         try:
             if not provider.available():
                 continue
-            read_pool_rows = getattr(provider, "collect_with_pool_rows", None)
-            if pool_rows is not None and read_pool_rows is not None:
-                collected, rows = read_pool_rows()
+            if pool_rows is not None and isinstance(provider, _PoolRowsProvider):
+                collected, rows = provider.collect_with_pool_rows()
                 if rows is not None:
                     pool_rows[provider.name] = rows
                 entries.extend(collected)

@@ -31,7 +31,7 @@ from memory_monitor_test_utils import MB, FakeKvManager, capture_warnings, kv_st
 
 from tensorrt_llm._torch.memory.monitor import providers, settings, startup
 from tensorrt_llm._torch.memory.monitor.providers import collect_all, register_provider
-from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
+from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProviderV2
 from tensorrt_llm._torch.memory.monitor.schema import Category
 from tensorrt_llm._torch.memory.monitor.triggers import (
     install_oom_reporter,
@@ -46,7 +46,7 @@ from tensorrt_llm.logger import logger
 def test_manager_is_held_weakly():
     """The pool is the largest allocation in the process."""
     manager = FakeKvManager(kv_stats(100, 0, 0))
-    provider = KvCacheProvider(manager)
+    provider = KvCacheProviderV2(manager)
     register_provider(provider)
     assert provider.available()
 
@@ -668,7 +668,7 @@ def test_the_monitor_follows_one_executor_per_process(monkeypatch):
     first = providers.begin_executor()
     assert providers.executor_monitored(first)
     first_manager = FakeKvManager(kv_stats(100, 0, 0))
-    register_provider(KvCacheProvider(first_manager, role="first"))
+    register_provider(KvCacheProviderV2(first_manager, role="first"))
     assert install_oom_reporter(rank=0, device=1, owner=first)
     periodic = trig._periodic
 
@@ -679,7 +679,7 @@ def test_the_monitor_follows_one_executor_per_process(monkeypatch):
     assert [w for w in warnings if "this executor is not" in w]
     assert settings.mode() == "full", "the monitored executor's settings stay"
     manager = FakeKvManager(kv_stats(200, 0, 0))
-    register_provider(KvCacheProvider(manager, role="second"))
+    register_provider(KvCacheProviderV2(manager, role="second"))
     assert [p.name for _, p in providers._registered] == ["kv_cache.first"], (
         "no providers of its own"
     )

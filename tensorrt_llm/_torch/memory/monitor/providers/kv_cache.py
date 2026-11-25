@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV cache pool provider (manager V2 statistics, with a V1 fallback).
+"""KV cache pool providers for V1 allocated bytes and V2 storage statistics.
 
 The pool is allocated once and held for the process's life, so its physical
 footprint is the *configured* capacity -- ``total`` slots -- and does not
@@ -29,6 +29,7 @@ conservation check into a tautology.
 
 import dataclasses
 import weakref
+from abc import ABC, abstractmethod
 from typing import Any
 
 from tensorrt_llm.logger import logger
@@ -37,7 +38,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import GPU_LEVEL, CacheTier
 from ..pools import is_tag_released
 from ..schema import Basis, Category, Entry, Placement, Source
 
-__all__ = ["KvCacheProvider", "kv_pool_group_stats"]
+__all__ = ["KvCacheProvider", "KvCacheProviderV1", "KvCacheProviderV2", "kv_pool_group_stats"]
 
 
 def _host_backed_slot_bytes(manager: Any) -> dict[int, int]:
@@ -104,7 +105,7 @@ def kv_pool_group_stats(manager: Any) -> list[dict]:
 KV_CACHE_SLEEP_TAG = "kv_cache"
 
 
-class KvCacheProvider:
+class KvCacheProvider(ABC):
     """One KV cache pool: the target model's, a draft model's, or the
     cross-attention pool.
 
@@ -148,6 +149,50 @@ class KvCacheProvider:
                 f"referenced weakly; the {role} KV cache pool will be absent"
             )
 
+    @property
+    def _manager(self) -> Any:
+        return self._ref() if self._ref is not None else None
+
+    def available(self) -> bool:
+        return self._manager is not None
+
+    def describes(self, component: object) -> bool:
+        """Whether ``component`` is the manager this provider reads."""
+        return component is not None and self._manager is component
+
+    @abstractmethod
+    def collect(self) -> list[Entry]: ...
+
+    @staticmethod
+    def _with_sleep_release(entries: list[Entry]) -> list[Entry]:
+        """Mark a pool that sleep mode has released.
+
+        The pool is allocated inside the ``kv_cache`` sleep scope. Once that
+        tag is released the GPU no longer backs it, while the manager still
+        reports it; it is then listed as released and left out of the totals.
+        """
+        if not is_tag_released(KV_CACHE_SLEEP_TAG):
+            return entries
+        return [
+            dataclasses.replace(
+                e,
+                counts_toward_total=False,
+                released=True,
+                note=f"{e.note}; released by sleep mode" if e.note else "released by sleep mode",
+            )
+            if e.counts_toward_total
+            else e
+            for e in entries
+        ]
+
+
+class KvCacheProviderV1(KvCacheProvider):
+    def collect(self) -> list[Entry]:
+        manager = self._manager
+        if manager is None:
+            return []
+        return self._with_sleep_release([self._v1_entry(manager)])
+
     def _v1_entry(self, manager: Any) -> Entry:
         """KV cache manager V1: its own count of the primary (device) pools.
 
@@ -177,58 +222,16 @@ class KvCacheProvider:
             ),
         )
 
-    @property
-    def _manager(self) -> Any:
-        return self._ref() if self._ref is not None else None
 
-    def available(self) -> bool:
-        return self._manager is not None
-
-    def describes(self, component: object) -> bool:
-        """Whether ``component`` is the manager this provider reads."""
-        return component is not None and self._manager is component
-
+class KvCacheProviderV2(KvCacheProvider):
     def collect(self) -> list[Entry]:
         return self.collect_with_pool_rows()[0]
 
     def collect_with_pool_rows(self) -> tuple[list[Entry], list[dict] | None]:
-        """The entries, and the pool-group rows they were built from.
-
-        Returned together so the conservation check runs on the reading the
-        KV row shows. The rows are ``None`` when the manager has no storage
-        statistics (KV cache manager V1).
-        """
+        """Return device entries and conservation-check rows from the same reading."""
         manager = self._manager
         if manager is None:
             return [], None
-        entries, rows = self._collect(manager)
-        return self._with_sleep_release(entries), rows
-
-    @staticmethod
-    def _with_sleep_release(entries: list[Entry]) -> list[Entry]:
-        """Mark a pool that sleep mode has released.
-
-        The pool is allocated inside the ``kv_cache`` sleep scope. Once that
-        tag is released the GPU no longer backs it, while the manager still
-        reports it; it is then listed as released and left out of the totals.
-        """
-        if not is_tag_released(KV_CACHE_SLEEP_TAG):
-            return entries
-        return [
-            dataclasses.replace(
-                e,
-                counts_toward_total=False,
-                released=True,
-                note=f"{e.note}; released by sleep mode" if e.note else "released by sleep mode",
-            )
-            if e.counts_toward_total
-            else e
-            for e in entries
-        ]
-
-    def _collect(self, manager: Any) -> tuple[list[Entry], list[dict] | None]:
-        if not hasattr(manager, "get_storage_statistics"):
-            return [self._v1_entry(manager)], None
 
         entries = []
         rows = kv_pool_group_stats(manager)
@@ -290,4 +293,4 @@ class KvCacheProvider:
                 )
             )
 
-        return entries, rows
+        return self._with_sleep_release(entries), rows

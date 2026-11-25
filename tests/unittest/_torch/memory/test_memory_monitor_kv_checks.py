@@ -30,6 +30,8 @@ from memory_monitor_test_utils import MB, FakeKvManager, kv_stats
 from tensorrt_llm._torch.memory.monitor.checks import check_kv_pool_conservation
 from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
     KvCacheProvider,
+    KvCacheProviderV1,
+    KvCacheProviderV2,
     kv_pool_group_stats,
 )
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
@@ -75,7 +77,7 @@ def test_capacity_is_physical_and_in_use_is_logical():
     # The provider holds the manager weakly, so the caller keeps it
     # alive -- in production the ResourceManager owns it.
     manager = FakeKvManager(kv_stats(100, 60, 20))
-    entries = KvCacheProvider(manager).collect()
+    entries = KvCacheProviderV2(manager).collect()
     physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
     assert len(physical) == 1
     # The pool is resident in full; free blocks are not given back.
@@ -90,7 +92,9 @@ def test_capacity_is_physical_and_in_use_is_logical():
 
     def physical_of(m):
         return next(
-            e.size_bytes for e in KvCacheProvider(m).collect() if e.basis is Basis.PHYSICAL_BACKING
+            e.size_bytes
+            for e in KvCacheProviderV2(m).collect()
+            if e.basis is Basis.PHYSICAL_BACKING
         )
 
     busy_manager, idle_manager = (
@@ -101,13 +105,13 @@ def test_capacity_is_physical_and_in_use_is_logical():
     assert physical_of(busy_manager) == physical_of(idle_manager) == 100 * MB
 
     small = FakeKvManager(kv_stats(8, 1, 1))
-    entries = KvCacheProvider(small).collect()
+    entries = KvCacheProviderV2(small).collect()
     assert all(e.category is Category.KV_CACHE_POOL for e in entries)
     assert "pool_group[0]" in entries[0].owner
 
     # free + evictable > total is what check C exists to catch.
     inconsistent = FakeKvManager(kv_stats(100, 70, 50))
-    entries = KvCacheProvider(inconsistent).collect()
+    entries = KvCacheProviderV2(inconsistent).collect()
     physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
     # A negative split must not drop the pool: its accounting is most worth
     # seeing exactly when it is inconsistent.
@@ -143,7 +147,7 @@ def test_host_backed_pools_are_not_counted_as_device_memory():
     assert rows[0]["in_use_bytes"] == 5 * MB
     assert rows[0]["host_capacity_bytes"] == 40 * MB
 
-    entries = KvCacheProvider(manager).collect()
+    entries = KvCacheProviderV2(manager).collect()
     counted = [e for e in entries if e.counts_toward_total]
     assert [e.size_bytes for e in counted] == [10 * MB], "only the device pool is device memory"
     host = [e for e in entries if "host-backed" in e.owner]
@@ -158,7 +162,7 @@ def test_managers_without_storage_statistics():
     assert not any(isinstance(p, KvCacheProvider) for p in default_providers()), (
         "the manager has no process-wide accessor, so it must be passed in rather than discovered"
     )
-    provider = KvCacheProvider(None)
+    provider = KvCacheProviderV1(None)
     assert provider.available() is False and provider.collect() == [], "no manager"
 
     # KV cache manager V1 has no storage statistics. Omitting it would
@@ -168,7 +172,7 @@ def test_managers_without_storage_statistics():
         pass
 
     manager = _V1Manager()
-    entries = KvCacheProvider(manager).collect()
+    entries = KvCacheProviderV1(manager).collect()
     assert len(entries) == 1
     assert entries[0].size_bytes is None
     assert entries[0].basis is Basis.PHYSICAL_BACKING
@@ -179,7 +183,7 @@ def test_managers_without_storage_statistics():
             return types.SimpleNamespace(allocated_bytes=12 * MB)
 
     v1 = _V1()
-    entries = KvCacheProvider(v1).collect()
+    entries = KvCacheProviderV1(v1).collect()
     assert entries[0].size_bytes == 12 * MB
     assert entries[0].basis is Basis.PHYSICAL_BACKING
 
@@ -188,16 +192,27 @@ def test_managers_without_storage_statistics():
             raise RuntimeError("not ready")
 
     broken = _Broken()
-    assert KvCacheProvider(broken).collect()[0].size_bytes is None, "a failing accessor is unknown"
+    assert KvCacheProviderV1(broken).collect()[0].size_bytes is None, (
+        "a failing accessor is unknown"
+    )
 
 
 @pytest.mark.cpu_only
-def test_main_draft_and_cross_pools_are_registered_once_each():
+def test_main_draft_and_cross_pools_are_registered_once_each(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import providers as reg
-    from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    monkeypatch.setattr(_util, "KVCacheManagerV2", FakeKvManager)
+
+    class V1Manager:
+        def get_kv_cache_stats(self):
+            return types.SimpleNamespace(allocated_bytes=5 * MB)
+
+        def get_storage_statistics(self, level):
+            pytest.fail("the V1 provider must use allocated_bytes")
 
     a, b = FakeKvManager(kv_stats(10, 0, 0)), FakeKvManager(kv_stats(20, 0, 0))
-    assert KvCacheProvider(a, "main").name != KvCacheProvider(b, "draft").name
+    assert KvCacheProviderV2(a, "main").name != KvCacheProviderV2(b, "draft").name
 
     def physical():
         return sorted(
@@ -208,17 +223,18 @@ def test_main_draft_and_cross_pools_are_registered_once_each():
 
     reg.clear_registered_providers()
     try:
-        main, draft, cross = (FakeKvManager(kv_stats(n, 0, 0)) for n in (100, 20, 5))
-        _register_kv_cache_monitor_providers(main, draft, cross)
+        main, draft = (FakeKvManager(kv_stats(n, 0, 0)) for n in (100, 20))
+        cross = V1Manager()
+        _util._register_kv_cache_monitor_providers(main, draft, cross)
         # A shared fixed name would have let the registry keep only one.
         assert physical() == [5 * MB, 20 * MB, 100 * MB]
 
         reg.clear_registered_providers()
-        _register_kv_cache_monitor_providers(main, main, None)
+        _util._register_kv_cache_monitor_providers(main, main, None)
         assert physical() == [100 * MB], "a draft sharing the main manager is counted once"
 
         rebuilt = FakeKvManager(kv_stats(200, 0, 0))
-        _register_kv_cache_monitor_providers(rebuilt, None, None)
+        _util._register_kv_cache_monitor_providers(rebuilt, None, None)
         assert physical() == [200 * MB], "a rebuilt manager supersedes the one it replaced"
     finally:
         reg.clear_registered_providers()
@@ -246,8 +262,8 @@ class TestChecksRunInRealReports:
             FakeKvManager(kv_stats(100, 70, 50)),
             FakeKvManager(kv_stats(100, 30, 20)),
         )
-        register_provider(KvCacheProvider(inconsistent, "main"))
-        register_provider(KvCacheProvider(consistent, "draft"))
+        register_provider(KvCacheProviderV2(inconsistent, "main"))
+        register_provider(KvCacheProviderV2(consistent, "draft"))
         snapshot = capture(tag="unit")
 
         main = [c.passed for c in snapshot.checks if c.name.startswith("C:kv_cache.main")]
