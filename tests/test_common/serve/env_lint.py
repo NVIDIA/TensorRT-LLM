@@ -41,9 +41,9 @@ from __future__ import annotations
 
 import ast
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set
 
 __all__ = ["Finding", "find_direct_env_reads", "scan_source", "scope_files"]
 
@@ -92,7 +92,7 @@ class Finding:
         )
 
 
-def scope_files(repo_root: Path, *, visual_gen: bool) -> List[Path]:
+def scope_files(repo_root: Path, *, visual_gen: bool) -> list[Path]:
     """The files the lint covers, as absolute paths.
 
     ``visual_gen=False``: every ``.py`` under ``tensorrt_llm/serve/`` except
@@ -125,9 +125,9 @@ def scope_files(repo_root: Path, *, visual_gen: bool) -> List[Path]:
     return files
 
 
-def find_direct_env_reads(paths: Iterable[Path], *, root: Optional[Path] = None) -> List[Finding]:
+def find_direct_env_reads(paths: Iterable[Path], *, root: Path | None = None) -> list[Finding]:
     """Every finding in ``paths``; with ``root``, finding paths are relative to it."""
-    findings: List[Finding] = []
+    findings: list[Finding] = []
     for path in paths:
         path = Path(path)
         shown = path
@@ -140,7 +140,7 @@ def find_direct_env_reads(paths: Iterable[Path], *, root: Optional[Path] = None)
     return findings
 
 
-def scan_source(source: str, path: Path) -> List[Finding]:
+def scan_source(source: str, path: Path) -> list[Finding]:
     """The findings of one module's source text, in line order."""
     tree = ast.parse(source, filename=str(path))
     scanner = _Scanner(source, Path(path))
@@ -157,11 +157,11 @@ class _Scanner(ast.NodeVisitor):
     def __init__(self, source: str, path: Path) -> None:
         self._source = source
         self._path = path
-        self.findings: List[Finding] = []
-        self._os_names: Set[str] = set()
-        self._environ_names: Set[str] = set()
-        self._getenv_names: Set[str] = set()
-        self._statement_calls: Set[int] = set()
+        self.findings: list[Finding] = []
+        self._os_names: set[str] = set()
+        self._environ_names: set[str] = set()
+        self._getenv_names: set[str] = set()
+        self._statement_calls: set[int] = set()
 
     def collect_names(self, tree: ast.AST) -> None:
         """Aliases of ``os``, ``os.environ`` and ``os.getenv``, wherever imported."""

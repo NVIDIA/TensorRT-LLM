@@ -29,7 +29,7 @@ pytestmark = pytest.mark.cpu_only
 REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
-def test_no_direct_environment_reads_in_visual_gen_serving():
+def test_no_direct_environment_reads_in_visual_gen_serving() -> None:
     files = scope_files(REPO_ROOT, visual_gen=True)
     assert files, (
         "the VisualGen env-lint scanned no file; update scope_files(visual_gen=True) in "

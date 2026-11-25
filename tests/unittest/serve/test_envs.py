@@ -17,12 +17,11 @@
 Three groups of checks:
 
 - the lint: no module in ``tensorrt_llm/serve/`` (except ``scripts/``) or the
-  trtllm-serve CLI reads ``os.environ`` directly, and the lint itself sees every
-  read form and ignores writes (so an empty scan cannot pass vacuously);
-- the declarations: every reader reproduces the parsing its call site used
-  before the declaration moved into ``envs.py`` (a table written out here, per
-  environment state), values are read at access time, secrets are marked, the
-  launcher enums and the ``*_ENV`` name constants agree with the declarations;
+  trtllm-serve CLI reads ``os.environ`` directly, and the lint recognizes the
+  documented read forms and ignores writes (so an empty scan cannot pass vacuously);
+- the declarations: the table states every reader's parsing contract per
+  environment state, values are read at access time, secrets are marked, and
+  launcher enums and ``*_ENV`` name constants agree with the declarations;
 - the module contract: undeclared names raise ``AttributeError``, required
   variables raise ``KeyError``, ``consume()`` reads once.
 """
@@ -35,7 +34,12 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from test_common.serve.env_lint import ENVS_IMPORTABLE_NAMES, find_direct_env_reads, scope_files
+from test_common.serve.env_lint import (
+    ENVS_IMPORTABLE_NAMES,
+    Finding,
+    find_direct_env_reads,
+    scope_files,
+)
 
 from tensorrt_llm.serve import envs
 
@@ -50,14 +54,14 @@ AGENTS_MD = REPO_ROOT / "tensorrt_llm" / "serve" / "AGENTS.md"
 # ---------------------------------------------------------------------------
 
 
-def test_no_direct_environment_reads():
+def test_no_direct_environment_reads() -> None:
     files = scope_files(REPO_ROOT, visual_gen=False)
     assert files, "the env-lint scanned no file; scope_files() lost the serve tree"
     findings = find_direct_env_reads(files, root=REPO_ROOT)
     assert not findings, "\n".join(finding.message() for finding in findings)
 
 
-def test_scope_files_cover_the_serve_tree_and_the_cli():
+def test_scope_files_cover_the_serve_tree_and_the_cli() -> None:
     relative = {
         path.relative_to(REPO_ROOT).as_posix() for path in scope_files(REPO_ROOT, visual_gen=False)
     }
@@ -79,7 +83,9 @@ def test_scope_files_cover_the_serve_tree_and_the_cli():
 
 
 @pytest.mark.parametrize("cli_package_exists", [False, True])
-def test_scope_files_checks_present_and_future_cli_layouts(tmp_path, cli_package_exists):
+def test_scope_files_checks_present_and_future_cli_layouts(
+    tmp_path: Path, cli_package_exists: bool
+) -> None:
     included = ["tensorrt_llm/commands/serve.py", "tensorrt_llm/serve/openai_server.py"]
     if cli_package_exists:
         included.append("tensorrt_llm/commands/serve_cli/disaggregated.py")
@@ -96,7 +102,7 @@ def test_scope_files_checks_present_and_future_cli_layouts(tmp_path, cli_package
     }
 
 
-def _findings(tmp_path, source):
+def _findings(tmp_path: Path, source: str) -> list[Finding]:
     module = tmp_path / "mod.py"
     module.write_text(textwrap.dedent(source))
     return find_direct_env_reads([module], root=tmp_path)
@@ -142,7 +148,7 @@ def _findings(tmp_path, source):
         ("from ..serve.envs import SLURM_PROCID\n", 1, "from ..serve.envs import SLURM_PROCID"),
     ],
 )
-def test_lint_flags_every_read_form(tmp_path, source, line, text):
+def test_lint_flags_every_read_form(tmp_path: Path, source: str, line: int, text: str) -> None:
     findings = _findings(tmp_path, source)
     assert [(finding.line, finding.source) for finding in findings] == [(line, text)]
     message = findings[0].message()
@@ -174,18 +180,18 @@ def test_lint_flags_every_read_form(tmp_path, source, line, text):
         'environ = {}\nx = environ.get("A")\n',
     ],
 )
-def test_lint_allows_writes_and_copies(tmp_path, source):
+def test_lint_allows_writes_and_copies(tmp_path: Path, source: str) -> None:
     assert _findings(tmp_path, source) == []
 
 
-def test_lint_allows_exactly_the_module_api():
+def test_lint_allows_exactly_the_module_api() -> None:
     assert ENVS_IMPORTABLE_NAMES == set(envs.__all__), (
         "the names the lint lets code import from tensorrt_llm/serve/envs.py are the module's "
         "__all__; keep ENVS_IMPORTABLE_NAMES in tests/test_common/serve/env_lint.py in step with it"
     )
 
 
-def test_lint_reports_every_read_in_file_order(tmp_path):
+def test_lint_reports_every_read_in_file_order(tmp_path: Path) -> None:
     source = """\
         import os
 
@@ -206,13 +212,13 @@ def test_lint_reports_every_read_in_file_order(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The declarations reproduce the parsing of the call sites they replaced.
+# The declarations follow the per-state reader contracts.
 # ---------------------------------------------------------------------------
 
 # Environment states a reader is checked in: unset, empty, "0", "1", text, an integer.
 STATES = ("unset", "", "0", "1", "abc", "12")
 
-# What today's call sites compute in each state; an exception class means it raises.
+# Expected reader values in each state; an exception class means the reader raises.
 FLAG_OFF_UNLESS_1 = (False, False, False, True, False, False)
 FLAG_ON_UNLESS_SET_OTHERWISE = (True, False, False, True, False, False)
 NON_EMPTY = (False, False, True, True, True, True)
@@ -291,98 +297,28 @@ EXPECTED = {
 }
 
 
-# Where each variable was read before its declaration moved into envs.py (the parsing the
-# reader reproduces). Several files: the ones that shared one expression.
-CALL_SITES = {
-    "TRTLLM_SERVER_DISABLE_GC": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_SERVER_DISABLE_GC": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_RESPONSES_API_DISABLE_STORE": "tensorrt_llm/commands/serve.py, tensorrt_llm/serve/openai_server.py",
-    "TRTLLM_RUNTIME_CONTROL_API_KEY": "tensorrt_llm/commands/serve.py, tensorrt_llm/serve/openai_server.py",
-    "TRTLLM_MEDIA_STORAGE_PATH": "tensorrt_llm/serve/openai_server.py",
-    "DISABLE_HARMONY_ADAPTER": (
-        "tensorrt_llm/serve/chat_tokenization.py, tensorrt_llm/serve/openai_server.py, "
-        "tensorrt_llm/serve/render/resources.py"
-    ),
-    "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": "tensorrt_llm/serve/openai_server.py, tensorrt_llm/serve/responses_utils.py",
-    "TRTLLM_KIMI_PARAM_POLICY": "tensorrt_llm/serve/extensions/kimi_k3.py",
-    "TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR": "tensorrt_llm/serve/tool_parser/kimi_k3_tool_parser.py",
-    "TRTLLM_DISAGG_NO_RETRY": "tensorrt_llm/serve/openai_client.py",
-    "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": (
-        "tensorrt_llm/serve/disagg_coordinator.py, tensorrt_llm/serve/openai_disagg_service.py"
-    ),
-    "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT": "tensorrt_llm/serve/disagg_coordinator.py",
-    "TRTLLM_DISAGG_COORDINATOR_PORT": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_COORDINATOR_UDS": "tensorrt_llm/commands/serve.py",
-    "TLLM_FRONTEND_READY_TIMEOUT": "tensorrt_llm/serve/_frontend_processes.py",
-    "TRTLLM_ANTHROPIC_BATCH_CONCURRENCY": "tensorrt_llm/serve/anthropic_batches.py",
-    "TRTLLM_ANTHROPIC_BATCH_MAX_RETAINED": "tensorrt_llm/serve/anthropic_batches.py",
-    "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK": "tensorrt_llm/serve/router_utils.py",
-    "TRTLLM_RESPONSES_DEBUG": "tensorrt_llm/serve/responses_utils.py",
-    "TRTLLM_ENABLE_RENDER_ENDPOINTS": "tensorrt_llm/serve/render/api_router.py",
-    "TRTLLM_RENDER_IGNORED_FIELDS": "tensorrt_llm/serve/render/serving.py",
-    "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH": "tensorrt_llm/serve/visual_gen_utils.py",
-    "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE": "tensorrt_llm/serve/visual_gen_utils.py",
-    "TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION": "tensorrt_llm/serve/tokenization_owners.py",
-    "TRTLLM_WEB_SEARCH": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_WEB_SEARCH_MAX_RESULTS": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_WEB_SEARCH_TIMEOUT_S": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_WEB_SEARCH_MAX_USES": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_WEB_SEARCH_RETRIES": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_WEB_SEARCH_UNAVAILABLE": "tensorrt_llm/serve/responses_web_search.py",
-    "BRAVE_SEARCH_API_KEY": "tensorrt_llm/serve/web_search.py",
-    "TAVILY_API_KEY": "tensorrt_llm/serve/web_search.py",
-    "SEARXNG_URL": "tensorrt_llm/serve/web_search.py",
-    "TRTLLM_TRUST_KV_HINTS": "tensorrt_llm/serve/openai_server.py, tensorrt_llm/serve/openai_disagg_server.py",
-    "TRTLLM_DISAGG_SHARED_DRAFT_KV": "tensorrt_llm/commands/serve.py",
-    "PROMETHEUS_MULTIPROC_DIR": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_CONFIG_FILE": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_COORDINATOR_URL": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_METADATA_CONFIG_FILE": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_REQUEST_TIMEOUT": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_SERVER_START_TIMEOUT": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_SCHEDULE_STYLE": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_LOG_LEVEL": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_WORKER_PROCESS_ID": "tensorrt_llm/commands/serve.py",
-    "TLLM_DISAGG_INSTANCE_IDX": "tensorrt_llm/commands/serve.py",
-    "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT": "tensorrt_llm/commands/serve.py",
-    "TLLM_EXECUTOR_ATTACH_INFO": "tensorrt_llm/serve/_frontend_processes.py",
-    "TLLM_EXECUTOR_FRONTEND_ID": "tensorrt_llm/serve/_frontend_processes.py",
-    "TLLM_FRONTEND_READY_FD": "tensorrt_llm/serve/_frontend_processes.py (consumed)",
-    "TLLM_FRONTEND_AFFINITY_FD": "tensorrt_llm/serve/_frontend_processes.py (consumed)",
-    "TLLM_SERVE_LAUNCHER_UDS": "tensorrt_llm/commands/serve.py (consumed)",
-    "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_ROLE": "tensorrt_llm/commands/serve.py",
-    "TRTLLM_DISAGG_DEPLOYMENT_ID": (
-        "tensorrt_llm/commands/serve.py (written there; read by tensorrt_llm/usage/usage_lib.py)"
-    ),
-    "OMPI_COMM_WORLD_RANK": "tensorrt_llm/commands/serve.py",
-    "SLURM_PROCID": "tensorrt_llm/commands/serve.py",
-}
-
-
-def _set_state(monkeypatch, name, state):
+def _set_state(monkeypatch: pytest.MonkeyPatch, name: str, state: str) -> None:
     if state == "unset":
         monkeypatch.delenv(name, raising=False)
     else:
         monkeypatch.setenv(name, state)
 
 
-def _describe(state):
+def _describe(state: str) -> str:
     return "unset" if state == "unset" else f"set to {state!r}"
 
 
-def test_parsing_table_covers_every_declaration():
+def test_parsing_table_covers_every_declaration() -> None:
     assert set(EXPECTED) == set(envs.environment_variables), (
         "every declared variable has a row in EXPECTED (and every row a declaration): add the "
-        "parsing today's call site does for each state in STATES."
-    )
-    assert set(CALL_SITES) == set(envs.environment_variables), (
-        "every declared variable names the call site its reader reproduces in CALL_SITES"
+        "reader contract for each state in STATES."
     )
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
-def test_readers_reproduce_todays_parsing(monkeypatch, name):
+def test_readers_follow_declared_parsing_contract(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
     for state, expected in zip(STATES, EXPECTED[name]):
         _set_state(monkeypatch, name, state)
         if isinstance(expected, type) and issubclass(expected, BaseException):
@@ -391,18 +327,17 @@ def test_readers_reproduce_todays_parsing(monkeypatch, name):
             continue
         actual = getattr(envs, name)
         assert actual == expected and type(actual) is type(expected), (
-            f"envs.{name} {_describe(state)} gave {actual!r}; today's code gives {expected!r}. "
-            f"The reader must reproduce the parsing at {CALL_SITES[name]}; changing it is a "
-            "behavior change."
+            f"envs.{name} {_describe(state)} gave {actual!r}; its declared contract is "
+            f"{expected!r}. Changing the reader or default is a behavior change."
         )
 
 
-def test_render_ignored_fields_are_split_and_stripped(monkeypatch):
+def test_render_ignored_fields_are_split_and_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_RENDER_IGNORED_FIELDS", " a ,b,, c ,")
     assert envs.TRTLLM_RENDER_IGNORED_FIELDS == ("a", "b", "c")
 
 
-def test_disable_store_is_any_non_empty_value(monkeypatch):
+def test_disable_store_is_any_non_empty_value(monkeypatch: pytest.MonkeyPatch) -> None:
     # Not a boolean: TRTLLM_RESPONSES_API_DISABLE_STORE=0 disables the store too.
     monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "0")
     assert envs.TRTLLM_RESPONSES_API_DISABLE_STORE is True
@@ -410,14 +345,14 @@ def test_disable_store_is_any_non_empty_value(monkeypatch):
     assert envs.TRTLLM_RESPONSES_API_DISABLE_STORE is False
 
 
-def test_unset_and_empty_differ_where_they_did(monkeypatch):
+def test_unset_and_empty_use_distinct_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", raising=False)
     assert envs.TRTLLM_DISAGG_SERVER_DISABLE_GC is True
     monkeypatch.setenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "")
     assert envs.TRTLLM_DISAGG_SERVER_DISABLE_GC is False
 
 
-def test_values_are_read_at_access_time(monkeypatch):
+def test_values_are_read_at_access_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_RESPONSES_API_DISABLE_STORE", raising=False)
     assert envs.TRTLLM_RESPONSES_API_DISABLE_STORE is False
     monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "1")
@@ -431,14 +366,14 @@ def test_values_are_read_at_access_time(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_consume_reads_once(monkeypatch):
+def test_consume_reads_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_FRONTEND_READY_FD", "7")
     assert envs.consume("TLLM_FRONTEND_READY_FD") == "7"
     assert "TLLM_FRONTEND_READY_FD" not in os.environ
     assert envs.consume("TLLM_FRONTEND_READY_FD") is None
 
 
-def test_consume_rejects_names_that_are_not_internal(monkeypatch):
+def test_consume_rejects_names_that_are_not_internal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", "1")
     with pytest.raises(KeyError, match="not a declared internal variable"):
         envs.consume("TRTLLM_SERVER_DISABLE_GC")
@@ -449,13 +384,13 @@ def test_consume_rejects_names_that_are_not_internal(monkeypatch):
         envs.consume("TRTLLM_NOT_DECLARED")
 
 
-def test_undeclared_name_raises_attribute_error():
+def test_undeclared_name_raises_attribute_error() -> None:
     with pytest.raises(AttributeError, match=r"tensorrt_llm/serve/envs\.py"):
         envs.TRTLLM_NOT_DECLARED
     assert not hasattr(envs, "TRTLLM_NOT_DECLARED")
 
 
-def test_required_internal_variable_raises_key_error(monkeypatch):
+def test_required_internal_variable_raises_key_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_DISAGG_CONFIG_FILE", raising=False)
     with pytest.raises(KeyError):
         envs.TRTLLM_DISAGG_CONFIG_FILE
@@ -479,7 +414,7 @@ KINDS_IN_ORDER = ("deploy", "internal", "external")
 SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
 
-def test_declarations_are_complete():
+def test_declarations_are_complete() -> None:
     problems = []
     kinds_seen = []
     for name, var in envs.environment_variables.items():
@@ -509,7 +444,7 @@ def test_declarations_are_complete():
     assert not problems, "\n".join(problems)
 
 
-def test_secrets_are_marked():
+def test_secrets_are_marked() -> None:
     unmarked = [
         name
         for name, var in envs.environment_variables.items()
@@ -521,7 +456,7 @@ def test_secrets_are_marked():
     )
 
 
-def test_type_declarations_match_the_declared_names():
+def test_type_declarations_match_the_declared_names() -> None:
     tree = ast.parse(ENVS_PATH.read_text())
     annotated = set()
     for node in tree.body:
@@ -540,7 +475,7 @@ def test_type_declarations_match_the_declared_names():
     )
 
 
-def _module_level_string_assignments(path):
+def _module_level_string_assignments(path: Path) -> dict[str, str]:
     """``NAME = "value"`` statements at module level, as name -> value."""
     out = {}
     for node in ast.parse(path.read_text()).body:
@@ -555,7 +490,7 @@ def _module_level_string_assignments(path):
     return out
 
 
-def _envs_enums(path):
+def _envs_enums(path: Path) -> dict[str, dict[str, str]]:
     """``class <Name>Envs(...)`` definitions in a module, as class name -> {member: value}."""
     out = {}
     for node in ast.parse(path.read_text()).body:
@@ -574,7 +509,7 @@ def _envs_enums(path):
     return out
 
 
-def test_launcher_enums_are_declared():
+def test_launcher_enums_are_declared() -> None:
     enums = {}
     for path in scope_files(REPO_ROOT, visual_gen=False):
         enums.update(_envs_enums(path))
@@ -594,7 +529,7 @@ def test_launcher_enums_are_declared():
     assert launcher["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] in envs.environment_variables
 
 
-def test_env_name_constants_are_declared():
+def test_env_name_constants_are_declared() -> None:
     constants = {}
     for path in scope_files(REPO_ROOT, visual_gen=False):
         for name, value in _module_level_string_assignments(path).items():
@@ -609,7 +544,7 @@ def test_env_name_constants_are_declared():
     assert not undeclared, "\n".join(undeclared)
 
 
-def test_agents_md_states_the_rule():
+def test_agents_md_states_the_rule() -> None:
     text = AGENTS_MD.read_text()
     assert "`serve/envs.py`" in text and "`tests/unittest/serve/test_envs.py`" in text, (
         "tensorrt_llm/serve/AGENTS.md must tell contributors to read environment variables through "

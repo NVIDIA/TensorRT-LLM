@@ -28,10 +28,10 @@ would freeze the value at import time.
 Values are read from ``os.environ`` on every access and never cached:
 launchers write some of these variables at run time
 (``TRTLLM_RESPONSES_API_DISABLE_STORE``, ``TRTLLM_DISAGG_ROLE``, the
-fleet-worker variables) and code reads them later. Each reader reproduces the
-parsing of the call site that read the variable before it was declared here
-(``tests/unittest/serve/test_envs.py`` pins it); changing a reader or a default
-is a behavior change. Where unset and empty differ today, they still differ.
+fleet-worker variables) and code reads them later. Each reader's parsing and
+defaults are its contract, pinned by ``tests/unittest/serve/test_envs.py``;
+changing either is a behavior change. Unset and empty values remain distinct
+where the declared parser distinguishes them.
 A required variable raises ``KeyError`` when it is unset, including an explicit
 ``hasattr(envs, NAME)`` probe. Dynamic settings are not advertised by ``dir()``,
 so introspection does not evaluate them. Enumerate declarations through
@@ -124,7 +124,7 @@ class EnvVar:
 
     name: str
     kind: Kind
-    read: Callable[[], Any]  # reproduces the call site's parsing; reads os.environ on each call
+    read: Callable[[], Any]  # reads os.environ on each call
     default: str  # what an unset variable means, in words or as the literal default
     description: str
     secret: bool = False  # never logged and never echoed by any listing
