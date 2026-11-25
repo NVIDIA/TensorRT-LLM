@@ -115,23 +115,12 @@ if self._config.backend == "pytorch":
 
 ### 4.1 PyTorch Model Configuration
 
-The default PyTorch configuration is defined in [pytorch_model_config.py](pytorch_model_config.py) and can be overridden for specific test patterns. For example:
+In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches substrings of the label from `PerfTestConfig.to_string()`. Each matching rule updates the config in order. Nested fields are merged, so a model variant only needs to specify its differences.
 
 ```python
-{
-    'patterns': [
-        'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
-    ],
-    'config': {
-        'enable_attention_dp': False,
-        'moe_config': {
-            'backend': 'TRTLLM'
-        }
-    }
-}
+if 'qwen3.6_35b_a3b_fp4' in label:
+    update(moe_config={'backend': 'TRTLLM'})
 ```
-
-This configuration allows you to customize PyTorch-specific settings for different model patterns while maintaining the base configuration as a fallback.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files
