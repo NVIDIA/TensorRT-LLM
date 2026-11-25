@@ -180,6 +180,7 @@ set_target_properties(
                                                      ON)
 
 add_library(tllm_common_fp8 STATIC cudaFp8Utils.cu)
+add_cuda_architectures(tllm_common_fp8 89)
 add_library(tllm::common_fp8 ALIAS tllm_common_fp8)
 target_link_libraries(
   tllm_common_fp8
