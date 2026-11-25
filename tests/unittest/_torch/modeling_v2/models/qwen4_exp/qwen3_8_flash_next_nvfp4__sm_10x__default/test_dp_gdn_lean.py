@@ -237,6 +237,121 @@ def test_bind_without_the_wish_touches_nothing(want, expected):
         assert not hasattr(core, "_gdn_lean_on")
 
 
+# --- DP_GDN_INPROJ_CONV_BF16: the lean conv as the input projection's epilogue -------------------
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows, expected", [(20, True), (24, False), (64, False)])
+def test_step_takes_the_conv_gemm_at_its_rows(monkeypatch, rows, expected):
+    monkeypatch.delenv(M.DP_LOWROWS_ENV, raising=False)
+    monkeypatch.setattr(M, "_gdn_lean_seen", lambda *a: None)
+    core = _lean_core(max_batch=64)
+    core._gdn_inconv = {20: "entry", 64 + 1: "never"}
+    M._gdn_lean_step(core, rows // 4, rows, 4)
+    assert core._gdn_step.lean and core._gdn_step.inconv is expected
+    assert M._gdn_inconv_now(core) is expected
+    core._gdn_step.clear()
+    assert not core._gdn_step.inconv and not M._gdn_inconv_now(core)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bad", [None, 20, 28, 48])
+def test_inconv_selfcheck_runs_every_row_count(monkeypatch, bad):
+    """The bind's check of the conv GEMM runs at every row count it will serve, not once a
+    (MMA N, plan): rows 20 / 24 / 28 share one compiled kernel whose epilogue predicates move
+    with the request count, so a difference at 28 rows alone must decline the form."""
+    c, n_cols, k = 8, 16, 4
+    seen = []
+
+    def conv_gemm(x, w, plan, conv_w, pool, slots, xrows, xsave, p, mpad, pad_slot_id):
+        rows = x.shape[0]
+        seen.append((rows, mpad, plan))
+        conv = torch.full((rows, c), 1.0 if rows == bad else 0.0)
+        return conv, torch.zeros(rows, n_cols)
+
+    monkeypatch.setattr(M, "mid_mm_conv_bf16", conv_gemm)
+    monkeypatch.setattr(M, "_inproj_mm", lambda x, ent: torch.zeros(x.shape[0], n_cols))
+    monkeypatch.setattr(M, "gdn_conv_lean", lambda x, *a, **kw: torch.zeros(x.shape[0], c))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **kw: None)
+    layer = SimpleNamespace(conv_w=torch.zeros(c, 4, dtype=torch.bfloat16))
+    core = SimpleNamespace(gdn_layers=[0], _decode=SimpleNamespace(_layers={0: layer}), conv_dim=c)
+    a = SimpleNamespace(mpad=32, plan="A", w=torch.zeros(n_cols, k))
+    b = SimpleNamespace(mpad=64, plan="B", w=torch.zeros(n_cols, k))
+    why = M._gdn_inconv_selfcheck(core, {20: a, 24: a, 28: a, 48: b}, 4)
+    assert why == (
+        "" if bad is None else f"the conv GEMM differs from the two launches at {bad} rows"
+    )
+    expected = [(20, 32, "A"), (24, 32, "A"), (28, 32, "A"), (48, 64, "B")]
+    assert seen == (
+        expected if bad is None else expected[: [r for r, _, _ in expected].index(bad) + 1]
+    )
+
+
+@pytest.mark.cpu_only
+def test_verify_keeps_the_gemms_conv_output_on_an_inconv_step(monkeypatch):
+    monkeypatch.setattr(M, "_GDN_REPLAY_PDL", True)
+    monkeypatch.setattr(M, "gdn_conv_lean", lambda *a, **kw: pytest.fail("a second conv"))
+    monkeypatch.setattr(M, "causal_conv1d_triton_update", lambda **kw: pytest.fail("stock conv"))
+    monkeypatch.setattr(
+        M,
+        "gdn_cached_replay_cute",
+        lambda **kw: torch.zeros(kw["q"].shape[0] * kw["q"].shape[1] * 16),
+    )
+    core, mq, a, n, p = _verify_core(True)
+    core._gdn_step.inconv = True
+    L = SimpleNamespace(conv_w="taps", a_log=None, dt_bias=None)
+    verify = ("int_idx", None, None, False, None)
+    out = M._gdn_verify(core, None, a, a, 0, L, "slots", n, p, verify, torch.zeros(n * p, 48))
+    assert out.shape == (1, n * p, 1, 16)
+
+
+def _block_self(inconv):
+    step = M._GdnStep()
+    step.lean, step.gens, step.inconv = True, 5, inconv
+    pools = SimpleNamespace(conv={3: "pool3"}, ssm={3: None})
+    core = SimpleNamespace(
+        _bound=SimpleNamespace(pools=pools),
+        _gdn_step=step,
+        _gdn_xsave={3: "xsave3"},
+        in_proj_split=[48, 16, 1, 1],
+    )
+    seen = {}
+    target = SimpleNamespace(core=core)
+    target._gdn_epilogue = lambda out, z, L, rows: seen.setdefault("epilogue", (out, z.shape))
+    return target, seen
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("inconv", [True, False])
+def test_block_runs_the_conv_gemm_behind_a_releasing_site(monkeypatch, inconv):
+    calls = []
+    q_in = M._InProj(3, "w3", 32, "plan")
+    target, seen = _block_self(inconv)
+
+    def conv_gemm(x, w, plan, taps, pool, slots, rows, xsave, p, *, mpad, pad_slot_id):
+        calls.append(("conv", w, plan, pool, rows, xsave, p, mpad))
+        return torch.zeros(x.shape[0], 48), torch.zeros(x.shape[0], 66)
+
+    monkeypatch.setattr(M, "mid_mm_conv_bf16", conv_gemm)
+    monkeypatch.setattr(
+        M, "_inproj_mm", lambda x, ent: calls.append(("gemm",)) or torch.zeros(20, 66)
+    )
+    monkeypatch.setattr(
+        M, "_gdn_verify", lambda core, mq, *a, **kw: calls.append(("verify", mq is None)) or "out"
+    )
+    x = torch.zeros(20, 8)
+    L = SimpleNamespace(in_proj_nv=None, in_proj_g=None, conv_w="taps3")
+    slots = torch.zeros(5, dtype=torch.int32)
+    M.DecodeTarget._gdn_block(
+        target, x, 3, L, slots, ("rows", None, None, False, None), 4, True, q_in
+    )
+    if inconv:
+        assert calls == [("conv", "w3", "plan", "pool3", "rows", "xsave3", 4, 32), ("verify", True)]
+    else:
+        assert calls == [("gemm",), ("verify", False)]
+    assert seen["epilogue"][0] == "out"
+
+
 class _ReplayState:
     """Laid out as the bind requires: 2 GDN layers, a stacked conv pool and snapshot buffer the
     pool views alias, linear chains, step width 4."""

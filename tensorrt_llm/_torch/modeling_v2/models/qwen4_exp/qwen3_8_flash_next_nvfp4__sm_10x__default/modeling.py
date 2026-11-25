@@ -389,6 +389,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm imp
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
+    CONV_ROWS as _MID_CONV_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     INJECT_UNIT_COLS as _INJECT_UNIT_COLS,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
@@ -396,6 +399,8 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm impor
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MidWeight,
+    conv_ready,
+    mid_mm_conv_bf16,
     mid_mm_inject,
     mid_mm_raw,
     mid_rows_mm_op,
@@ -2282,9 +2287,10 @@ _INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
 #: split the rows-on-N kernel keeps): the input projections behind a releasing site A
 #: (`DP_INPROJ_RELEASE_ENV`, its first plan; its build self-check still gates every row count),
 #: the rows-on-N hc first kernel for a mixer with the injection (`DP_HC_TILES_ENV`, in place of
-#: the 64-row tile; the same K slices in the same order) and the lean verify conv
-#: (`DP_GDN_CONV_LEAN_ENV`, the same kernels at fewer rows). Measured on dep8 at 3 requests a
-#: rank with r = 2, as part of a -0.33 ms step. Read once, when the target is built.
+#: the 64-row tile; the same K slices in the same order), the lean verify conv
+#: (`DP_GDN_CONV_LEAN_ENV`) and the conv as the input projection's epilogue
+#: (`DP_GDN_INPROJ_CONV_BF16_ENV`): the same kernels at fewer rows. Measured on dep8 at 3
+#: requests a rank with r = 2, as part of a -0.33 ms step. Read once, when the target is built.
 DP_LOWROWS_ENV = "TRTLLM_QWEN4_EXP_DP_LOWROWS"
 #: The most rows the lowered floors reach below their own ranges: 4 requests a rank.
 _DP_LOWROWS_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
@@ -2420,7 +2426,7 @@ class _GdnStep:
     requests it carried. Both trunk targets clear it before they decide; the wrapped promotion,
     the last launch of the step's state update, clears `lean` again."""
 
-    __slots__ = ("lean", "gens")
+    __slots__ = ("lean", "gens", "inconv")
 
     def __init__(self) -> None:
         self.clear()
@@ -2428,12 +2434,22 @@ class _GdnStep:
     def clear(self) -> None:
         self.lean = False
         self.gens = 0
+        # `DP_GDN_INPROJ_CONV_BF16_ENV`: the step's GDN input projections run the lean conv as
+        # their epilogue.
+        self.inconv = False
 
 
 def _gdn_lean_now(core) -> bool:
     """Whether the trunk step in flight runs lean (`DP_GDN_CONV_LEAN_ENV`)."""
     step = getattr(core, "_gdn_step", None)
     return step is not None and step.lean
+
+
+def _gdn_inconv_now(core) -> bool:
+    """Whether the trunk step in flight runs the lean conv in the GDN input projections
+    (`DP_GDN_INPROJ_CONV_BF16_ENV`)."""
+    step = getattr(core, "_gdn_step", None)
+    return step is not None and step.lean and step.inconv
 
 
 def _gdn_step_clear(core) -> None:
@@ -2589,6 +2605,7 @@ def _gdn_lean_bind(core, cm) -> None:
     core._gdn_lean_on = False
     core._gdn_lean_state_ref = None
     core._gdn_xsave, core._gdn_xsave_all = {}, None
+    core._gdn_inconv = {}
     core._gdn_step.clear()
     state, why = _gdn_lean_state(core, cm)
     layers = list(core.gdn_layers)
@@ -2628,6 +2645,8 @@ def _gdn_lean_bind(core, cm) -> None:
         _gdn_lean_wrap(core, state)
     core._gdn_lean_state_ref = state
     core._gdn_lean_on = True
+    # `DP_GDN_INPROJ_CONV_BF16_ENV`, on top.
+    _gdn_inconv_bind(core, cm, state)
     logger.info(
         f"DP GDN conv lean bound ({DP_GDN_CONV_LEAN_ENV}): rank {core.dp_rank} of {core.dp_size}, "
         f"{type(cm).__name__}, verify steps of {_dp_lowrows_floor(_GDN_LEAN_ROWS[0])}.."
@@ -2687,6 +2706,131 @@ def _gdn_lean_step(core, num_gens: int, rows: int, p: int) -> None:
         _gdn_lean_seen(
             core, "conv lean", rows, "rows (gdn_conv_lean, gdn_promote_x, PDL gated norm)"
         )
+        if rows in getattr(core, "_gdn_inconv", {}):
+            step.inconv = True
+            _gdn_lean_seen(
+                core,
+                "inproj conv bf16",
+                rows,
+                "rows (the lean conv in the input projection's GEMM)",
+            )
+
+
+#: Switch, on by default, riding on `DP_GDN_CONV_LEAN_ENV` and `DP_INPROJ_RELEASE_ENV`: a lean
+#: verify step of `_GDN_INPROJ_CONV_REQUESTS` requests a rank runs each GDN layer's lean conv as
+#: the EPILOGUE of its bf16 input projection (`mid_rows_mm`'s conv mode, `mid_mm_conv_bf16`: the
+#: release's GEMM at the same plan and MMA N; the weight tiles of q|k|v apply the 4-tap conv +
+#: SiLU to the bf16 tile they stage and store the conv output and the raw rows into `xsave`),
+#: so the `gdn_conv_lean` launch leaves the chain (36 a step) and the replay becomes the GEMM's
+#: PDL dependent. The conv keeps `gdn_conv_lean`'s instructions on the same bf16 columns: the
+#: conv output, `xsave` and z | a | b are bitwise the two launches'. From 17 requests an
+#: epilogue thread of a conv tile holds two items and the epilogue costs more than the launch it
+#: replaces (GB300 micro), hence the range; `DP_LOWROWS_ENV` lowers its floor. The bind runs the
+#: conv GEMM against the two launches on private buffers with this rank's weights (rank-local; a
+#: difference or an error leaves the lean steps on `gdn_conv_lean`). Part of the -0.47..-0.49 ms
+#: dep4 trunk-loop micro of the input-projection release. `0` keeps `gdn_conv_lean`. Read once,
+#: when the target is built.
+DP_GDN_INPROJ_CONV_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_INPROJ_CONV_BF16"
+#: Requests a rank the switch above serves.
+_GDN_INPROJ_CONV_REQUESTS = (5, 16)  # capacity: fixed: dispatch thresholds
+
+
+def _gdn_inconv_bind(core, cm, state) -> None:
+    """`DP_GDN_INPROJ_CONV_BF16_ENV` against a manager the lean conv engaged for (called at the
+    end of `_gdn_lean_bind`): `core._gdn_inconv = {rows: _InProj of the first GDN layer}` for
+    the CUDA-graph row counts of the request range whose release entry has a K-unsplit plan,
+    after compiling each conv GEMM and checking it bitwise against `mid_mm_raw` + `gdn_conv_lean`
+    on private buffers. Empty where it cannot take effect (one warning when it was set)."""
+    core._gdn_inconv = {}
+    if not _switch(DP_GDN_INPROJ_CONV_BF16_ENV, default=True):
+        return
+    explicit = bool(os.environ.get(DP_GDN_INPROJ_CONV_BF16_ENV, "").strip())
+    release = core._inproj_release or {}
+    layers = list(core.gdn_layers)
+    xsave = core._gdn_xsave_all
+    p = xsave.shape[2]
+    bad = ""
+    if any(i not in release for i in layers):
+        bad = f"{DP_INPROJ_RELEASE_ENV} does not serve every GDN layer"
+    elif p != _MID_CONV_ROWS:
+        bad = f"{p} rows a request; the conv epilogue is written for {_MID_CONV_ROWS}"
+    elif core._bound.int_idx is None or core._bound.int_idx.dtype != torch.int32:
+        bad = "the manager's snapshot-row indices are not int32"
+    elif core.conv_dim % 128 or core.conv_dim > sum(core.in_proj_split):
+        bad = f"a conv of {core.conv_dim} columns is not whole weight tiles"
+    else:
+        for i in layers:
+            why = conv_ready(
+                core._decode._layers[i].conv_w, core._bound.pools.conv[i], core._gdn_xsave[i]
+            )
+            if why:
+                bad = f"GDN layer {i}: {why}"
+                break
+    lo = min(_GDN_INPROJ_CONV_REQUESTS[0], _dp_lowrows() or _GDN_INPROJ_CONV_REQUESTS[0])
+    hi = min(_GDN_INPROJ_CONV_REQUESTS[1], xsave.shape[1])
+    ents = {}
+    if not bad:
+        first = release[layers[0]]
+        for r in range(lo, hi + 1):
+            ent = first.get(r * p)
+            if ent is not None and ent.plan.ks == 1:
+                ents[r * p] = ent
+        bad = "" if ents else f"no CUDA-graph row count of {lo}..{hi} requests has a release entry"
+    if not bad:
+        bad = _gdn_inconv_selfcheck(core, ents, p)
+    if bad:
+        if explicit or bad.startswith("the conv GEMM"):
+            logger.warning(
+                f"{DP_GDN_INPROJ_CONV_BF16_ENV} is set but not engaged for {type(cm).__name__} "
+                f"at rank {core.dp_rank}: {bad}; every lean step keeps gdn_conv_lean"
+            )
+        return
+    core._gdn_inconv = ents
+    logger.info(
+        f"DP GDN inproj conv bf16 ({DP_GDN_INPROJ_CONV_BF16_ENV}): rank {core.dp_rank} of "
+        f"{core.dp_size}, the lean conv in the input projection's GEMM at rows {sorted(ents)} "
+        f"(bind {core._binds})"
+    )
+
+
+def _gdn_inconv_selfcheck(core, ents: dict, p: int) -> str:
+    """Every row count of `ents` (one compile a distinct (MMA N, plan); the request count only
+    moves the epilogue's item predicates, which a check at one row count of a plan would leave
+    unchecked at the others), run on private buffers with the first GDN layer's weight and taps
+    against `mid_mm_raw` + `gdn_conv_lean`: '' when the conv output, `xsave` and z | a | b are
+    equal, else what differs. Rank-local."""
+    i = core.gdn_layers[0]
+    L = core._decode._layers[i]
+    c = core.conv_dim
+    try:
+        device = L.conv_w.device
+        gen = torch.Generator(device=device).manual_seed(20261125)
+        page = torch.randn(8, 1, c, 3, generator=gen, device=device).to(torch.bfloat16)
+        for rows, ent in sorted(ents.items()):
+            n = rows // p
+            x = torch.randn(rows, ent.w.shape[1], generator=gen, device=device)
+            x = x.to(torch.bfloat16)
+            slots = torch.randperm(8, generator=gen, device=device)[: min(n, 8)].int()
+            slots = slots.repeat(-(-n // slots.shape[0]))[:n].contiguous()
+            xrows = torch.arange(n, dtype=torch.int32, device=device)
+            xs_a = torch.zeros(n, p, c, dtype=torch.bfloat16, device=device)
+            xs_b = torch.zeros_like(xs_a)
+            conv_a, out_a = mid_mm_conv_bf16(
+                x, ent.w, ent.plan, L.conv_w, page[:, 0], slots, xrows, xs_a, p,
+                mpad=ent.mpad, pad_slot_id=_PAD_SLOT_ID,
+            )  # fmt: skip
+            out_b = _inproj_mm(x, ent)
+            conv_b = gdn_conv_lean(out_b[:, :c], L.conv_w, page[:, 0], slots, xrows, xs_b, p)
+            if not (
+                torch.equal(conv_a, conv_b)
+                and torch.equal(xs_a, xs_b)
+                and torch.equal(out_a[:, c:], out_b[:, c:])
+            ):
+                return f"the conv GEMM differs from the two launches at {rows} rows"
+        torch.cuda.synchronize(device)
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        return f"the conv GEMM raised {type(e).__name__}: {e}"
+    return ""
 
 
 #: Off by default (class S: another K split than the bf16 entry). At an attention-DP rank on
@@ -4276,6 +4420,8 @@ def _decode_forms(core) -> str:
             "hc tiles": core.hc_tiles,
             "in-proj release rows": rows({r for t in (inproj or {}).values() for r in t}),
             "gdn conv lean": getattr(core, "_gdn_lean_want", False),
+            "gdn inproj conv": _switch(DP_GDN_INPROJ_CONV_BF16_ENV, default=True)
+            and getattr(core, "_gdn_lean_want", False),
             "out-proj gdn rows": rows(out["gdn_out"] if out else None),
             "out-proj attn rows": rows(out["attn_o"] if out else None),
             "out-proj inject rows": rows(getattr(getattr(core, "_siteb", None), "gemm", None)),
@@ -4732,6 +4878,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._gdn_lean_state_ref = None
         self._gdn_xsave, self._gdn_xsave_all = {}, None
         self._gdn_step = _GdnStep()
+        # `DP_GDN_INPROJ_CONV_BF16_ENV`: `{rows: _InProj}` of each bind.
+        self._gdn_inconv = {}
         # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
         self._out_proj = None
         # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
@@ -6168,17 +6316,22 @@ def _gdn_verify(
         # raw rows `gdn_promote_x` builds the accepted window from; no window snapshots, no pool
         # advance. A PDL dependent of the input projection: it reads the slots, the window and
         # the taps before its wait.
-        assert mq_out is None and cute and pdl, f"layer {i}: a lean step off the lean path"
-        mq_out = gdn_conv_lean(
-            mq,
-            L.conv_w,
-            pools.conv[i],
-            si_d,
-            int_idx,
-            core._gdn_xsave[i],
-            p,
-            pad_slot_id=_PAD_SLOT_ID,
-        )
+        assert cute and pdl, f"layer {i}: a lean step off the lean path"
+        if mq_out is None:
+            mq_out = gdn_conv_lean(
+                mq,
+                L.conv_w,
+                pools.conv[i],
+                si_d,
+                int_idx,
+                core._gdn_xsave[i],
+                p,
+                pad_slot_id=_PAD_SLOT_ID,
+            )
+        else:
+            # `DP_GDN_INPROJ_CONV_BF16_ENV`: the input projection's GEMM ran the lean conv as
+            # its epilogue (the conv output, the raw rows in `xsave`).
+            assert core._gdn_step.inconv and mq is None, f"layer {i}: a conv output off the GEMM"
     if mq_out is None:
         # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
         x3 = torch.transpose(torch.reshape(mq, [n, p, core.conv_dim]), 1, 2)
@@ -11982,6 +12135,29 @@ class DecodeTarget:
             )
         elif nv is not None:
             proj = nvfp4_split_gemv_op(x, nv)
+        elif (
+            q_in is not None and is_verify and _gdn_inconv_now(core) and si_all.dtype == torch.int32
+        ):
+            # `DP_GDN_INPROJ_CONV_BF16_ENV`: the lean conv as the release GEMM's epilogue (one
+            # launch for the two); z | a | b are column views of its output.
+            mq_out, proj = mid_mm_conv_bf16(
+                x,
+                q_in.w,
+                q_in.plan,
+                L.conv_w,
+                pools.conv[i],
+                si_all,
+                verify[0],
+                core._gdn_xsave[i],
+                gen_p,
+                mpad=q_in.mpad,
+                pad_slot_id=_PAD_SLOT_ID,
+            )
+            z, a, b = torch.split(proj, core.in_proj_split, 1)[1:]
+            out = _gdn_verify(
+                core, None, a, b, i, L, si_all, num_tokens // gen_p, gen_p, verify, mq_out
+            )
+            return self._gdn_epilogue(out, z, L, num_tokens)
         elif q_in is not None:
             proj = _inproj_mm(x, q_in)
         else:
