@@ -1109,17 +1109,6 @@ def pytest_collection_modifyitems(session, config, items):
             if item.get_closest_marker("ray") is not None:
                 item.add_marker(skip_marker)
 
-    if re.fullmatch(r"DGX_B300-4_GPUs-PyTorch-Post-Merge-\d+", test_prefix
-                    or ""):
-        splitter = config.pluginmanager.get_plugin("pytestsplitplugin")
-        if splitter is not None:
-            attention_dir = "unittest/_torch/attention/multi_gpu"
-            suite = (
-                f"{attention_dir} --ignore={attention_dir}/test_helix_zero_kv.py "
-                f"--ignore={attention_dir}/test_gqa_kv_replica.py")
-            splitter.cached_durations.setdefault(
-                f"test_unittests.py::test_unittests_v2[{suite}]", 75 * 60)
-
     # We have to remove prefix temporarily before splitting the test list
     # After that change back the test id.
     for item in items:
@@ -1139,6 +1128,20 @@ def pytest_collection_modifyitems(session, config, items):
             if test_prefix and name.startswith(f"{test_prefix}/") else name
             for name in parsed[1]
         }
+
+    if re.fullmatch(r"DGX_B300-4_GPUs-PyTorch-Post-Merge-\d+(?:-cbts)?",
+                    test_prefix or ""):
+        splitter = config.pluginmanager.get_plugin("pytestsplitplugin")
+        if splitter is not None:
+            for item in items:
+                suite = re.fullmatch(
+                    r"test_unittests\.py::test_unittests_v2\[unittest/_torch/attention/multi_gpu"
+                    r"(?: --ignore=[^\s\]]+)*\]", item.nodeid)
+                if suite and item.nodeid not in splitter.cached_durations:
+                    splitter.cached_durations[item.nodeid] = 75 * 60
+                    print_info(
+                        f"Budgeting 75 minutes for {item.nodeid} without recorded timing"
+                    )
     yield
     if cbts_names is not None:
         deselected = [item for item in items if item.nodeid not in cbts_names]
