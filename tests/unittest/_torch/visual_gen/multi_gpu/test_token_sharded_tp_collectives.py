@@ -2386,6 +2386,41 @@ def _shared_input_parts(rank, world_size, device, mode, *, tp=None):
     return tp, tuple(columns + mlps), root
 
 
+def _check_shared_outputs(
+    consumers: tuple[nn.Module, ...],
+    actual: tuple[torch.Tensor, ...],
+    reference: tuple[torch.Tensor, ...],
+    what: str,
+    device: torch.device,
+) -> None:
+    """Check exact outputs collectively and identify each failing consumer."""
+    matches = tuple(torch.equal(got, ref) for got, ref in zip(actual, reference))
+    ok = len(actual) == len(reference) == len(consumers) and all(matches)
+    details = []
+    if not ok:
+        for index, (consumer, got, ref, equal) in enumerate(
+            zip(consumers, actual, reference, matches)
+        ):
+            if equal:
+                continue
+            detail = f"consumer {index} ({type(consumer).__name__}): {got.shape} vs {ref.shape}"
+            if got.shape == ref.shape and got.numel():
+                diff = (got.float() - ref.float()).abs()
+                detail += (
+                    f", unequal={(got != ref).sum().item()}/{got.numel()}"
+                    f", max_abs={diff.max().item()}, rel_l2={_rel_l2(got, ref)}"
+                    f", actual_finite={torch.isfinite(got).all().item()}"
+                    f", reference_finite={torch.isfinite(ref).all().item()}"
+                )
+            details.append(detail)
+        if len(actual) != len(reference) or len(actual) != len(consumers):
+            details.append(
+                f"output counts: actual={len(actual)}, reference={len(reference)}, "
+                f"consumers={len(consumers)}"
+            )
+    _check(ok, f"{what}; {'; '.join(details)}" if details else what, device)
+
+
 def _logic_shared_input_adapters(rank, world_size, device):
     import torch._dynamo
 
@@ -2420,10 +2455,8 @@ def _logic_shared_input_adapters(rank, world_size, device):
             if transport is not None:
                 del transport.issue
             del tp.all_gather
-            _check(
-                all(torch.equal(g, r) for g, r in zip(got, reference)),
-                f"shared {mode} != independent {(b, s)}",
-                device,
+            _check_shared_outputs(
+                consumers, got, reference, f"shared {mode} != independent {(b, s)}", device
             )
             _check(
                 len(moved) == (mode == "nccl") and len(issued) == (mode == "copy_engine"),
@@ -2432,10 +2465,8 @@ def _logic_shared_input_adapters(rank, world_size, device):
             )
             packed = quantize_fp8_block(loc)
             got_packed = grouped(packed)
-            _check(
-                all(torch.equal(g, r) for g, r in zip(got_packed, reference)),
-                f"shared prequantized {mode} {(b, s)}",
-                device,
+            _check_shared_outputs(
+                consumers, got_packed, reference, f"shared prequantized {mode} {(b, s)}", device
             )
         _check(tuple(root.state_dict()) == keys, "sharing changed state_dict keys", device)
         if world_size in (2, 4):
@@ -2446,11 +2477,7 @@ def _logic_shared_input_adapters(rank, world_size, device):
             compiled = torch.compile(grouped, fullgraph=True)
             compiled_ref = torch.compile(independent, fullgraph=True)
             actual, reference = compiled(loc), compiled_ref(loc)
-            _check(
-                all(torch.equal(g, r) for g, r in zip(actual, reference)),
-                f"shared compiled {mode}",
-                device,
-            )
+            _check_shared_outputs(consumers, actual, reference, f"shared compiled {mode}", device)
             # Both slots must be warm before capture.
             grouped(loc)
             reference = grouped(loc)
@@ -2459,18 +2486,14 @@ def _logic_shared_input_adapters(rank, world_size, device):
             with torch.cuda.graph(graph):
                 captured = grouped(loc)
             graph.replay()
-            _check(
-                all(torch.equal(g, r) for g, r in zip(captured, reference)),
-                f"shared CUDA graph {mode}",
-                device,
+            _check_shared_outputs(
+                consumers, captured, reference, f"shared CUDA graph {mode}", device
             )
             loc.add_(0.125)
             reference = grouped(loc)
             graph.replay()
-            _check(
-                all(torch.equal(g, r) for g, r in zip(captured, reference)),
-                f"shared CUDA graph fresh rows {mode}",
-                device,
+            _check_shared_outputs(
+                consumers, captured, reference, f"shared CUDA graph fresh rows {mode}", device
             )
             del graph
         tp.close()
