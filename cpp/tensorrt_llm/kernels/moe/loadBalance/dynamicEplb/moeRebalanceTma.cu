@@ -979,7 +979,7 @@ struct MegamoeTmaCopyState
     void const* fused_kernel = nullptr;
     int fused_total_slots = 0;
     int fused_dynamic_bytes = 0;
-    cudaLaunchAttribute fused_attributes[2]{};
+    cudaLaunchAttribute fused_attributes[3]{};
     unsigned fused_attribute_count = 0;
     std::mutex submit_mutex;
 };
@@ -989,6 +989,8 @@ namespace
 
 // Every fused launch has one HALO-Q CTA of this size per SM.
 constexpr int kFusedThreads = 512;
+// The largest thread block cluster the hardware co-schedules.
+constexpr int kMaxClusterCtas = 8;
 
 /* Loads the fused kernel and reserves its local memory at cold setup: doing
  * either at the first launch waits for the device, which deadlocks against
@@ -1048,6 +1050,16 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
         state.fused_attributes[1].val.memSyncDomainMap.default_ = 0;
         state.fused_attributes[1].val.memSyncDomainMap.remote = 1;
         state.fused_attribute_count = 2;
+    }
+    // One cluster holds every CTA, so the kernel takes whole cluster slots and the clustered
+    // kernels that run beside it on the remaining SMs can place all of their clusters.
+    if (c.sms <= kMaxClusterCtas)
+    {
+        auto& cluster = state.fused_attributes[state.fused_attribute_count++];
+        cluster.id = cudaLaunchAttributeClusterDimension;
+        cluster.val.clusterDim.x = static_cast<unsigned>(c.sms);
+        cluster.val.clusterDim.y = 1;
+        cluster.val.clusterDim.z = 1;
     }
     return cudaSuccess;
 }
