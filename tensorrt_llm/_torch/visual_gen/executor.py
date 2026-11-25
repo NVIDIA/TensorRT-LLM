@@ -23,6 +23,7 @@ from torch.distributed.constants import default_pg_timeout
 
 from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import release_ulysses_exchanges
 from tensorrt_llm._torch.visual_gen.batching import (
     BatchInfo,
     DynamicBatchScheduler,
@@ -899,6 +900,7 @@ def run_diffusion_worker(
             executor.memory_monitor.release()
         if executor.pipeline is not None:
             executor.pipeline.cleanup()
+        release_ulysses_exchanges()
         dist.destroy_process_group()
 
     except Exception as e:

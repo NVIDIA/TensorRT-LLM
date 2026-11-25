@@ -23,7 +23,7 @@ identically on every rank and (c) allocated once, outside CUDA-graph capture.
 ``torch.distributed._symmetric_memory`` gives exactly that: ``empty`` + ``rendezvous`` return a
 handle whose ``get_buffer(peer, ...)`` is a tensor view of the peer's copy of the allocation and
 whose signal pad carries the ``put_signal`` / ``wait_signal`` flags that order a consumer's reads
-after a producer's copies. The shared copy-engine transport orders peer copies and signals. Each
+after a producer's copies. CeTransport uses these flags to order peer copies and reads. Each
 :class:`SymmMemPool` is one allocation; a group may carry several (one per protocol), nothing
 ties a group to one.
 
@@ -34,8 +34,9 @@ A :class:`PoolLayout` carves the allocation into ``slots`` slots of ``world_size
 rank ``r``: it holds the bytes rank ``r`` pushed into that slot on every rank. A producer writes
 its own region inside a peer's buffer (:meth:`SymmMemPool.peer_region`); a consumer reads source
 ``src``'s region of its local buffer (:meth:`SymmMemPool.region`). What the bytes mean (payload,
-scales, ...) is the caller's layout, expressed as ``(offset, nbytes)`` inside a region. Several
-slots let boundary ``b + 1`` be pushed while slot ``b`` is still being read.
+scales, ...) is the caller's layout, expressed as ``(offset, nbytes)`` inside a region. For
+rank-interleaved writes, :meth:`SymmMemPool.peer_slot` exposes the whole slot. The caller must
+assign disjoint addresses to senders. Several slots let a new boundary start during a read.
 
 Addressing
 ----------
@@ -148,6 +149,7 @@ __all__ = [
     "DEFAULT_ALIGN",
     "DEFAULT_TIMEOUT_MS",
     "PoolLayout",
+    "SymmMemAllocationError",
     "SymmMemPool",
     "probe_symmetric_memory",
 ]
@@ -385,6 +387,10 @@ def _local_preconditions(group: dist.ProcessGroup, device: torch.device) -> list
 # =============================================================================
 
 
+class SymmMemAllocationError(RuntimeError):
+    """Every rank agreed that the requested allocation failed and released it."""
+
+
 class SymmMemPool:
     """A symmetric-memory allocation shared by the ranks of a process group, carved by a
     :class:`PoolLayout`.
@@ -532,13 +538,11 @@ class SymmMemPool:
             Whether a new allocation was made.
 
         Raises:
-            RuntimeError: Under CUDA-graph capture, on an unsupported group or device, when the
-                ranks hold the pool in different states, and with the agreed reason when the
-                allocation fails on any rank (``symm_mem.empty``, the rendezvous, a signal pad
-                that is too small or whose size differs across ranks, the addressing check).
-                Whatever a group collective raises
-                after the rendezvous propagates as well, with the allocation dropped without a
-                fence.
+            SymmMemAllocationError: The group agreed on an allocation failure (buffer,
+                rendezvous, signal pad or addressing check).
+            RuntimeError: Under CUDA-graph capture, on an unsupported group or device, or when
+                the ranks hold the pool in different states. A group collective error also
+                propagates.
             ValueError: On a non-positive request or when the ranks disagree on the alignment.
         """
         if _is_capturing():
@@ -592,7 +596,7 @@ class SymmMemPool:
             dist.barrier(group=self.group)
         ok, reason = self._allocate(agreed, min_channels)
         if not ok:
-            raise RuntimeError(f"SymmMemPool.reserve: {reason}")
+            raise SymmMemAllocationError(f"SymmMemPool.reserve: {reason}")
         logger.info(
             f"SymmMemPool[{self.group_name}]: reserved {agreed.slots} slot(s) x "
             f"{agreed.world_size} regions x {agreed.region_nbytes} B = "
@@ -822,6 +826,18 @@ class SymmMemPool:
         if peer == self.rank:
             return self._buf[start:stop]
         return self._peer_buffer(peer)[start:stop]
+
+    def peer_slot(self, peer: int, slot: int) -> torch.Tensor:
+        """A whole slot on ``peer`` for collectives with rank-interleaved writes.
+
+        The caller assigns disjoint byte ranges to senders and synchronizes all reads and
+        writes. The view has the same lifetime and base offset as ``peer_region``.
+        """
+        self._require_reserved("peer_slot")
+        self._check_peer(peer, "peer_slot")
+        start = self._layout.region_start(slot, 0)
+        buf = self._buf if peer == self.rank else self._peer_buffer(peer)
+        return buf.narrow(0, start, self.slot_nbytes)
 
     def _peer_buffer(self, peer: int) -> torch.Tensor:
         view = self._peer_buffers.get(peer)

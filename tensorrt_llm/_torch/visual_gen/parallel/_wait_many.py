@@ -60,6 +60,10 @@ def wait_signal_words(pad: torch.Tensor, indices: torch.Tensor, timeout_ms: int)
 
 
 def warm_wait_many(device: torch.device, timeout_ms: int) -> None:
+    # Word layout and the release/acquire protocol are private to PyTorch's CUDA backend.
+    # Revalidate both when lifting the package's PyTorch 2.14 pin.
+    if not torch.__version__.startswith("2.14."):
+        raise RuntimeError(f"Unsupported PyTorch symmetric-memory signal ABI: {torch.__version__}")
     # Trigger JIT before a peer can send or wait on real flags. All batch lengths use
     # this binary: indices select the words and grid size selects the number of warps.
     pad = torch.ones(32, dtype=torch.int32, device=device)

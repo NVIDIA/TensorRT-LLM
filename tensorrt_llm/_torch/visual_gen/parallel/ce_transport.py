@@ -129,6 +129,16 @@ class CeTransport:
         self._enabled = True
         self._fused_waits = False
 
+    @property
+    def fused_waits(self) -> bool:
+        """Whether every rank can use the fused wait for eagerly prepared flag sets."""
+        return self._fused_waits
+
+    @property
+    def interrupted(self) -> bool:
+        """Whether this rank has an unfinished boundary; recovery must be agreed by all ranks."""
+        return self._interrupted
+
     def _finish(self) -> None:
         compute = torch.cuda.current_stream(self.pool.device)
         for peer in self._forked:
@@ -182,12 +192,14 @@ class CeTransport:
         copy_to: Callable[[int], None],
         *,
         destinations: Iterable[int] | None = None,
-    ) -> None:
+        record_publication: bool = False,
+    ) -> tuple[torch.cuda.Event, ...]:
         """Run copy_to(peer) and signal on each peer's stream after preceding compute.
 
         Keep each source alive and unmodified until its copies complete. Tensor.record_stream
         on the copy stream protects temporary storage from deallocation. After boundary exit,
-        the compute stream can safely overwrite the source.
+        the compute stream can safely overwrite the source. When requested, return one event
+        per destination recorded immediately after its signal.
         """
         if self._expected is None:
             raise RuntimeError("A CE push requires an active boundary.")
@@ -198,6 +210,7 @@ class CeTransport:
             dst not in self._streams or (dst, channel) in self._sent for dst in peers
         ):
             raise ValueError(f"Invalid or duplicate CE destination on channel {channel}.")
+        published = []
         ready = torch.cuda.current_stream(self.pool.device).record_event()
         for dst in peers:
             stream = self._streams[dst]
@@ -207,6 +220,9 @@ class CeTransport:
                 copy_to(dst)
                 self.pool.signal(dst, channel)
                 self._sent.add((dst, channel))
+                if record_publication:
+                    published.append(stream.record_event())
+        return tuple(published)
 
     def wait_ready(self, src: int, channel: int) -> None:
         """Order subsequent compute after one sender's data. Each flag is consumed once."""
