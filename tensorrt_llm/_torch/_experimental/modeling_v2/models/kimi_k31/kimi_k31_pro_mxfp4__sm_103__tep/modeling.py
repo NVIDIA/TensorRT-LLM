@@ -9312,7 +9312,8 @@ def _make_trampoline(num_locals: int) -> Callable[..., Any]:
         "    return fn(*args, **kwargs)\n"
     )
     namespace = {"_NEVER": False}
-    exec(compile(source, "<kimi_k31 host_datastack>", "exec"), namespace)
+    # ``source`` is built above from fixed text; no external input reaches it.
+    exec(compile(source, "<kimi_k31 host_datastack>", "exec"), namespace)  # nosec B102
     return namespace["run_on_large_datastack_chunk"]
 
 

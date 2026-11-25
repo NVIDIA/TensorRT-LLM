@@ -76,7 +76,8 @@ BASE_ENV = "TLLM_K31_RANK_LOCAL_CACHE_BASE"
 SEED_ENV = "TLLM_K31_RANK_LOCAL_CACHE_SEED"
 DIR_ENV = "TLLM_K31_RANK_LOCAL_CACHE_DIR"
 
-DEFAULT_BASE = "/tmp/trtllm_rank_cache"
+# Default only; BASE_ENV overrides it.
+DEFAULT_BASE = "/tmp/trtllm_rank_cache"  # nosec B108
 # Seed only entries whose newest file is at least this old; publish every PUBLISH_EVERY_S seconds for the
 # first PUBLISH_FOR_S seconds of the process.
 SEED_MIN_AGE_S = 60.0
