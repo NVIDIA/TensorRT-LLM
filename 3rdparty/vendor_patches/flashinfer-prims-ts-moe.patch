@@ -1,0 +1,293 @@
+diff --git a/__init__.py b/__init__.py
+index 920ff23fe915f242482992ff4c99d0e2b3ed4bb5..4853a8f64ff17359e0b2ea42dbde508ad3652748 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -25,24 +26,12 @@ from .utils import (
+ 
+ configure_cute_dsl_cache_dir()
+ 
+-from .gemm import (
+-    fp4_linear,
+-    fp4_linear_swiglu,
+-    fp4_qkv_qknorm_rope,
+-    fp8_linear,
+-    fp8_linear_swiglu,
+-    fp8_qkv_qknorm_rope,
+-)
++# TensorRT-LLM vendors only the batched-GEMM MoE path, not the dense ``gemm``
++# package, so its re-exports are omitted.
+ 
+ __all__ = [
+     "configure_cute_dsl_cache_dir",
+     "ensure_cutlass_dsl_experimental",
+     "get_prims_ts_compile_options",
+     "is_prims_ts_available",
+-    "fp8_linear",
+-    "fp8_linear_swiglu",
+-    "fp8_qkv_qknorm_rope",
+-    "fp4_linear",
+-    "fp4_linear_swiglu",
+-    "fp4_qkv_qknorm_rope",
+ ]
+diff --git a/moe/compile_cache.py b/moe/compile_cache.py
+index 7690d500d71f0d1e9d70687b91f18f55b62257fa..ab84e303bd50f0fc7ad1dc4fa71767a4076980fe 100644
+--- a/moe/compile_cache.py
++++ b/moe/compile_cache.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -28,6 +29,7 @@ from __future__ import annotations
+ import enum
+ import functools
+ import hashlib
++import inspect
+ import json
+ import os
+ from dataclasses import asdict, is_dataclass
+@@ -35,9 +37,11 @@ from pathlib import Path
+ from typing import Any
+ 
+ from flashinfer.jit.cute_dsl_core import _get_compile_arch
+-from flashinfer.prims_ts.utils import get_prims_ts_compile_options
++from ..utils import get_prims_ts_compile_options
+ 
+-_DISK_MODULE_NAME = "prims_ts_moe_gemm"
++# TensorRT-LLM: distinct from the installed flashinfer's own Prims-TS MoE
++# module, whose different sources would otherwise invalidate this one.
++_DISK_MODULE_NAME = "trtllm_prims_ts_moe_gemm"
+ 
+ 
+ def stable_config_hash(cfg: Any, **constexpr_args: Any) -> str:
+@@ -101,11 +105,15 @@ def _kernel_source_files() -> tuple[str, ...]:
+     config and build the launch arguments, both of which are part of each
+     kernel's name instead.
+     """
++    from flashinfer.cute_dsl import fp4_common
++
+     root = Path(__file__).resolve().parents[1]
+     files = [
+         *(root / "batched_gemm").rglob("*.py"),
+         root / "cutlass_dsl.py",
+-        root.parent / "cute_dsl" / "fp4_common.py",
++        # TensorRT-LLM: the vendored tree is not inside the flashinfer package,
++        # so the FP4 helpers come from the installed flashinfer.
++        Path(fp4_common.__file__).resolve(),
+     ]
+     return tuple(sorted(str(path) for path in files))
+ 
+@@ -147,7 +155,7 @@ def _disk_kernel_name(cfg_hash: str, fc1_or_fc2: str, io: dict) -> str:
+     """
+     import torch
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _compile_arg_tuple,
+         _cute_compile_options,
+     )
+@@ -196,16 +204,25 @@ def _compile_or_load(
+     import torch
+ 
+     from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, cute_dsl_cache_disabled
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch
++    from ..batched_gemm.batched_gemm_run import _compile_for_launch
+ 
+     def compile_fn():
+         return _compile_for_launch(io, stream)
+ 
+     source_sha256 = _kernel_source_sha256()
++    # TensorRT-LLM: a flashinfer whose JitSpecCuteDsl has no ``enable_tvm_ffi``
++    # persists only TVM-FFI kernels, and these GEMMs are compiled without it.
++    persists_plain_kernels = (
++        "enable_tvm_ffi" in inspect.signature(JitSpecCuteDsl.__init__).parameters
++    )
+     # ``cute.compile``, the spec's module directory and metadata, and the
+     # kernel name all resolve the target architecture from the current device.
+     with torch.cuda.device(device_index):
+-        if cute_dsl_cache_disabled() or source_sha256 is None:
++        if (
++            cute_dsl_cache_disabled()
++            or source_sha256 is None
++            or not persists_plain_kernels
++        ):
+             return compile_fn()
+         spec = JitSpecCuteDsl(
+             _DISK_MODULE_NAME,
+diff --git a/moe/config_mapper.py b/moe/config_mapper.py
+index cd16f9b52b1fc7c2397a00e20720e21c0a15ea5b..967f5eea0b6eb3ec5f703c8a4e90a683948411eb 100644
+--- a/moe/config_mapper.py
++++ b/moe/config_mapper.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -63,8 +64,8 @@ class PrimsTsConfigSpec:
+     kwargs: dict[str, int]
+ 
+     def build(self) -> object:
+-        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+-        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++        from ..batched_gemm.batched_gemm_config import make_config
++        from ..batched_gemm.batched_gemm_run import (
+             _resolve_runtime_sm_arch,
+         )
+ 
+@@ -489,7 +490,7 @@ def _json_act_kind(options: dict[str, object]) -> int:
+ def _resolve_moe_sm_arch(sm_arch: int | None = None) -> int:
+     """Resolve the architecture used to select and materialize MoE configs."""
+     if sm_arch is None:
+-        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++        from ..batched_gemm.batched_gemm_run import (
+             _resolve_runtime_sm_arch,
+         )
+ 
+@@ -1432,7 +1433,7 @@ def _validate_config_task_manager(
+     top_k: int,
+     num_experts: int,
+ ) -> None:
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
++    from ..batched_gemm.batched_gemm_kernel import (
+         build_batched_gemm_task_manager,
+     )
+ 
+@@ -1461,7 +1462,7 @@ def _ensure_config_task_manager_buildable(
+ ) -> None:
+     validation_top_k = max(1, int(top_k or 1))
+     validation_num_experts = max(validation_top_k, int(num_experts or 2))
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
++    from ..batched_gemm.batched_gemm_kernel import (
+         _exhaustive_deadlock_race_check_enabled,
+     )
+ 
+diff --git a/moe/support.py b/moe/support.py
+index 996defa9ba4c25221f72190ecb53d13d000788ae..c71bfc7808421ef8004475a1890f59501fbd5069 100644
+--- a/moe/support.py
++++ b/moe/support.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -23,7 +24,7 @@ from typing import Any, Sequence
+ 
+ import torch
+ 
+-from flashinfer.prims_ts.utils import (
++from ..utils import (
+     is_prims_ts_arch_available,
+     is_prims_ts_available,
+ )
+@@ -193,7 +194,7 @@ def _gemm1_oa_flags(kwargs: dict[str, Any]) -> dict[str, bool]:
+ 
+ 
+ def _per_token_sf_dtype_value(tensor: torch.Tensor) -> int:
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from ..batched_gemm.batched_gemm_config import DType
+ 
+     if tensor.dtype == torch.bfloat16:
+         return int(DType.BF16)
+diff --git a/moe/tensor_adapter.py b/moe/tensor_adapter.py
+index e025da43482ba7952f060e26efa1aeeb236be273..e1dd82c8726f81a6980b7ea75bf5f78b1b0e3e62 100644
+--- a/moe/tensor_adapter.py
++++ b/moe/tensor_adapter.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -60,7 +61,7 @@ def _validate_swap_ab_cluster_span(cfg, out_hidden: int) -> None:
+     validated by the launch-capacity path.
+     """
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _validate_swap_ab_out_hidden,
+     )
+ 
+@@ -313,7 +314,7 @@ def _block_scaled_sf_required_span(
+     m_offset: int = 0,
+ ) -> int:
+     """Number of SF-C elements addressable from the unshifted base pointer."""
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
++    from ..batched_gemm.batched_gemm_config import SfLayout
+ 
+     groups = (int(pitch) + int(sf_block_size) * 4 - 1) // (int(sf_block_size) * 4)
+     last_n = int(output_n) - 1
+@@ -389,7 +390,7 @@ def _launch_early_exit_max_token_ctas(
+     if not cfg.use_early_exit:
+         return 0
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
++    from ..batched_gemm.batched_gemm_config import (
+         compute_max_num_ctas_in_token_dim_for_moe,
+     )
+ 
+@@ -573,7 +574,7 @@ def build_bf16_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -901,10 +902,10 @@ def build_nvfp4_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from ..batched_gemm.batched_gemm_config import DType
+ 
+     if fc == "fc1":
+         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+@@ -1298,7 +1299,7 @@ def build_mxfp4_mxfp8_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -1671,7 +1672,7 @@ def build_fp8_block_scale_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -2101,7 +2102,7 @@ def build_mxfp4_bf16_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+ 
+@@ -2426,10 +2427,10 @@ def build_fp8_per_tensor_launch_io(
+     from cutlass.cute.runtime import make_ptr
+     import cutlass
+ 
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
++    from ..batched_gemm.batched_gemm_run import (
+         _runtime_config,
+     )
+-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
++    from ..batched_gemm.batched_gemm_config import DType
+ 
+     if fc == "fc1":
+         out_hidden = _fc1_out_hidden(intermediate_size, activation_type)

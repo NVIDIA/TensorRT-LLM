@@ -208,6 +208,7 @@ package_data += [
     'evaluate/lm_eval_tasks/**/*',
     'schemas/*.json',
     'usage/schemas/*.json',
+    '_torch/moe/kernels/prims_ts/moe/*.json',
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
@@ -251,13 +252,14 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
     Precompiled wheels own native bits. Source owns configuration/telemetry schemas, the
-    OpenEngine contract and the kernel sources compiled at run time. Skip those wheel files so
-    Python-only edits layer over old wheels and tracked bindings from the current checkout
-    remain authoritative.
+    vendored PrimsTS MoE config tables, the OpenEngine contract and the kernel sources
+    compiled at run time. Skip those wheel files so Python-only edits layer over old wheels
+    and tracked bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith(
-        ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/")):
+        ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/",
+         "tensorrt_llm/_torch/moe/kernels/prims_ts/")):
         return filename.endswith(".json")
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",

@@ -175,10 +175,11 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
         # Different backends have different alignment requirements:
         # - CUTLASS: weight_alignment=128, input_hidden_alignment=128
-        # - TRTLLM: weight_alignment=128, input_hidden_alignment=512
+        # - TRTLLM (and PRIMS_TS, which uses its weight method): weight_alignment=128,
+        #   input_hidden_alignment=512
         backend_name = _normalize_backend_name(backend_type)
         if backend_name is not None:
-            if backend_name == "TRTLLM":
+            if backend_name in ("TRTLLM", "PRIMS_TS"):
                 quant_kwargs["weight_alignment"] = 128
                 quant_kwargs["input_hidden_alignment"] = 512
             elif backend_name == "CUTLASS":
