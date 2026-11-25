@@ -509,7 +509,7 @@ void SingleLayerMoeLoadBalancer::setInitialWeightAssignments(std::vector<int> co
         for (int localSlotId = 0; localSlotId < mMetaInfo.slotCountPerRank; ++localSlotId)
         {
             int const globalSlotId = rank * mMetaInfo.slotCountPerRank + localSlotId;
-            int expertId = initialWeightAssignments[globalSlotId];
+            int const expertId = initialWeightAssignments[globalSlotId];
             TLLM_CHECK_WITH_INFO(expertId >= minExpertId && expertId < mMetaInfo.expertCount, "expertId=%d", expertId);
             mCpuPlacementInfo.rankExpertIds[rank][localSlotId] = expertId;
             if (expertId == -1)
@@ -736,7 +736,6 @@ void SingleLayerMoeLoadBalancer::installPlacement(
             mUnusableSlots[rank * mMetaInfo.slotCountPerRank + localSlotId] = static_cast<uint8_t>(empty);
         }
     }
-    mCpuPlacementInfo.rankExpertIds = rankExpertIds;
     mCpuPlacementInfo.oldRankExpertIds = rankExpertIds;
     reconfigureMaskOnly(deadRankMask);
 }

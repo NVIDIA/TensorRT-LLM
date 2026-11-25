@@ -364,6 +364,49 @@ def test_current_placement_hides_invalid_slots(monkeypatch):
     assert restore.current_placement() == [(EXPERTS, expected.tolist())]
 
 
+def test_plan_after_stopped_restore_names_loaded_experts(monkeypatch):
+    """Replan from current_placement after a stopped restore, so every slot holds what it names."""
+    load_balancer, layer = _online_balancer(monkeypatch, _ONLINE_WITHOUT_1)
+    restore = load_balancer.expert_restore
+    impl = load_balancer.load_balancer_impl
+    host = {(expert, "w"): torch.full((4,), expert, dtype=torch.int32) for expert in range(EXPERTS)}
+    layer.host_tensor_sharer.node_host_weights = host
+    # Rank 0's slots hold the experts of the installed placement; slot 3 is empty.
+    slots = torch.tensor(
+        [[expert] * 4 for expert in _ONLINE_WITHOUT_1[0].tolist()], dtype=torch.int32
+    )
+    layer.slot_tensors = {"w": slots}
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "moe_unbacked_slots_set_backed",
+        lambda tensors, slot_ids, slot_counts, backed: 0,
+        raising=False,
+    )
+    # Rank 1 rejoins, and a newer membership change stops the restore once it loaded rank 0's
+    # active slots with the initial placement's experts 0 and 1, before it installed the placement.
+    rejoin = restore.plan_expert_restore(
+        [True] * WORLD_SIZE, [_ONLINE_WITHOUT_1], rejoining=[False, True, False, False]
+    )
+    with pytest.raises(RuntimeError, match="newer membership change"):
+        restore.restore_lost_experts(
+            rejoin, progress=Mock(side_effect=[None, RuntimeError("a newer membership change")])
+        )
+    impl.restore_placement.assert_not_called()
+    assert slots[:, 0].tolist() == [0, 1, 3, -1]
+    # Rank 1 fails again. Rank 0's view names no expert in the slots the stopped restore wrote,
+    # so the next plan does not keep the installed placement's experts 1 and 0 there.
+    ((_, view),) = restore.current_placement()
+    assert view[0] == [-1, -1, 3, -1]
+    retry = restore.plan_expert_restore([True, False, True, True], [view])
+    restore.restore_lost_experts(retry)
+    (dead_ranks, (installed,)), _ = impl.restore_placement.call_args
+    assert dead_ranks == [1]
+    for slot, expert in enumerate(installed[0]):
+        if expert >= 0:
+            assert torch.equal(slots[slot], host[(expert, "w")]), (slot, expert)
+    assert installed[0] == [-1, -1, 3, -1]
+
+
 class _SpareSlotOwner(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin):
     """A MoE layer's weight owner with the quantization method of the MoE backend ``leaf``."""
 
