@@ -194,6 +194,14 @@ and `gdn_mtp_replay` (GDN), and `inforward_snapshot_min_main` (Qwen4Exp). The fa
 `family_init_kwargs` from its `model` argument, which is `None` when a manager is built without a
 model, as the manager of a separate draft cache is.
 
+The cost estimates of a manager (`get_cache_size_per_token` and the per-request estimates) run
+before the manager exists and take the configurations, not the model. Where such an option selects
+state that an estimate sizes, the manager class returns it from `family_estimate_kwargs(model)`,
+and `KvCacheCreator._per_manager_cache_cost` adds the result to the estimate calls of a target
+manager that keeps recurrent state. The GDN managers return `gdn_mtp_replay`, which selects their
+replay state; the default on `MambaHybridCacheManager` adds nothing. A draft manager is costed
+without them, as it is built without the model.
+
 A manager that lays out the attention layers of an NVFP4 MLA model together with the recurrent
 state lists `Fp4MlaLayoutHooks` in its bases (see `../REGIONS_DEVELOPER_GUIDE.md`), as Kimi K3's
 does. `get_kv_cache_manager_cls` rejects such a model for a family whose manager does not.
@@ -203,7 +211,7 @@ selects `Qwen4ExpHybridCacheManager` for a model that is not Qwen4Exp, so that c
 the config which arguments it adds.
 
 The branch raises `ValueError` when the model declares no recurrent layer, and when the manager
-class and the declaration disagree on whether there is recurrent state.
+class does not declare that it keeps recurrent state (`keeps_recurrent_state`, below).
 
 A V1 hybrid manager (`CppMambaHybridCacheManager`, `MixedMambaHybridCacheManager`) takes the same
 shared arguments; its family arguments come from `_legacy_recurrent_manager_arguments` in
@@ -241,27 +249,66 @@ The manager itself answers the rest:
 
 ### What shared runtime code asks
 
-The executor, the decoder runner and the KV connector setup ask the owner of a fact. For the
-facts below they do not check for a recurrent manager class:
+The executor, the decoder runner, the KV connector setup and the KV cache creator ask the owner of
+a fact. For the facts below they do not check for a recurrent manager class:
 
 | Hook | When | Use |
 |---|---|---|
 | `has_state_layers(manager)` in `pyexecutor/connectors/kv_cache_layout.py` | `PyExecutor`, when a KV connector is configured on a V2 cache | Whether the layout has an `SsmLayerConfig` layer. A connector has nothing to transfer for such a layer, so the setup is rejected |
 | `prepare_expect_snapshot_points(requests)` | `PyExecutor`, before it schedules the active requests | Fill `LlmRequest.expect_snapshot_points`. The hybrid managers set the snapshot points; `MambaHybridCacheManagerV2` also aligns them to the attention layout and, with block reuse, adds branch-snapshot and waiter points |
+| `keeps_recurrent_state`, read through `cache_keeps_recurrent_state()` in `pyexecutor/resource_manager.py` | Step metadata, decoder warmup, the MLA latent-cache append of the TRTLLM backend, the cache managers' constructors, the KV cache creator and the executor's resource factory | `True` on the `MambaHybridCacheManager` mixin, and so on every hybrid manager, and on the V1 `MambaCacheManager`: the cache is that of a recurrent model. The manager answers for the model and not for its rank, so the manager of a rank that holds no recurrent layer still answers `True`. The next two sections say what step metadata and warmup decide with it. A cache manager's constructor turns a positive speculative recompute tail into a full re-prefill for such a cache, since the state already summarizes the matched prefix; the TRTLLM backend appends the MLA latent cache of a generation step on the graph-safe path for it. `create_py_executor_resources` passes such a cache to `create_kv_cache_transceiver` a second time, as `mamba_cache_manager`: the creation rejects the hybrid managers it cannot serve by that argument, and the C++ transceiver takes the recurrent layers of the rank from it |
 | `is_context_only_cache` | Decoder warmup, dummy requests and the executor | `True` when the cache omits generation-only state, so its worker runs context requests only: the KDA draft-verification buffers, or the FP4 MLA V scales and packed V. The KDA and FP4 MLA managers report their own flags. A CSA2 cache pruned for a context worker reports `context_swa_layer_limit` instead |
 | `resets_recurrent_state_in_context` on the causal LM | The CUDA-graph runner, before it promotes a one-token context request into a decode graph | A class flag, `True` when only the context forward resets the state of a fresh slot. The runner also reads `has_ple` from the decoder, which is how Qwen4-exp reports active PLE |
+| `describes_own_target_layers()`, `appended_draft_layers_use_target_kv_factor()` | The KV cache creator, when it places the layers of a DFlash or standalone DSpark drafter in the target's cache | Classmethods of the V2 manager, `False` on `KVCacheManagerV2` and `True` on `MambaHybridCacheManagerV2`. A manager that describes its own target layers is given the drafter's layer specs alone, and the token estimate does not take its group count from the combined layout. Where appended draft layers take the target's `kv_factor`, a target and a drafter of which only one stores K alone keep separate caches |
 
 `prepare_expect_snapshot_points` and `on_state_transfer_complete` are steps of
-`BaseResourceManager`, which does nothing in either, and `is_context_only_cache` is `False` there.
+`BaseResourceManager`, which does nothing in either, and `is_context_only_cache` and
+`keeps_recurrent_state` are `False` there.
 Such a default goes there and not on a KV cache manager base: `MambaHybridCacheManagerV2` derives
 from `KVCacheManagerV2` before the `MambaHybridCacheManager` mixin, so a default on the KV base
 would shadow the mixin's implementation. The executor calls both steps on the primary KV cache
-manager only.
+manager only. The creator reads its two declarations from the manager class, before a manager
+exists, so they are classmethods beside `accepts_appended_draft_layers` on `KVCacheManagerV2`.
 
-Decoder warmup and per-step metadata still check the manager class. So does `PyExecutor` in two
-places, both on V1 caches: the connector setup, which has no layout to ask, and `_schedule`, which
-filters context requests by capacity for `MixedMambaHybridCacheManager` when a transceiver is
-present.
+`PyExecutor` checks the manager class in two places, both on V1 caches: the connector setup,
+which has no layout to ask, and `_schedule`, which filters context requests by capacity for
+`MixedMambaHybridCacheManager` when a transceiver is present.
+
+### Per-step metadata
+
+The step metadata of the recurrent layers is a `Mamba2Metadata` or a subclass of it, kept on
+`AttentionMetadata.mamba_metadata`.
+
+| Step | Where | What happens |
+|---|---|---|
+| Declare the class | `mamba_metadata_cls`, on the model or on the cache manager | The V1 managers serve several families and declare none, so every recurrent model declares its class, as a class attribute or a property. A VLM wrapper forwards the declaration of its language model |
+| Resolve it | `resolve_mamba_metadata_cls(model, kv_cache_manager)` in `pyexecutor/engine/runners/decoder/metadata.py` | The model's class, else the manager's, else `Mamba2Metadata`. Warmup resolves through the same function |
+| Hand it to attention | `DecoderMetadata.setup_attention` | Writes the resolved class to `AttentionMetadata.mamba_metadata_cls` for every model. For a cache that keeps recurrent state it also copies `chunk_size` from the configuration to `mamba_chunk_size` |
+| Build and prepare | `AttentionMetadata._prepare_mamba_metadata`, from `prepare()` | With a cache that keeps recurrent state, the first call builds the object and every call runs its `prepare()`. With any other manager, or none, `mamba_metadata` is `False` |
+
+Both read `keeps_recurrent_state`, which the manager class declares, and not the layout of the
+rank. Under pipeline parallelism a rank can hold none of the recurrent layers; its hybrid manager
+then has no state layer, and the metadata is still read there. A speculative worker reads `mamba_metadata.state_indices` on every
+rank before it calls `update_mamba_states`, and GLM5Next's kpool attention keeps its block tables
+on the metadata object.
+
+### Warmup and CUDA graphs
+
+Decoder warmup and the CUDA-graph runner read these declarations:
+
+| Declared on | Name | Read by | Use |
+|---|---|---|---|
+| The metadata class | `prefill_chunk_alignment` | `_run_mamba_hybrid_warmup`, on the class that `resolve_mamba_metadata_cls` returns | Set by a class whose prefill kernel compiles one variant for context lengths that are all multiples of this value and another for the rest; warmup then covers both. `None` on `Mamba2Metadata`, 16 on `KimiK3MambaMetadata` |
+| `Mamba2Metadata` | `force_initial_states_for_warmup()` | `_run_mamba_hybrid_warmup` | A context manager that switches on the warmup-only branches of `prepare()`: the kernel variants with initial states for Mamba2, the state-reset kernel for GDN. The readers read the flag on `Mamba2Metadata`, so it is called on that class and not on a subclass |
+| A module of the model | `prewarm_decode_kernels(max_num_tokens, verify_batches)` | `_prewarm_model_decode_kernels` | Optional. Compiles the kernels that no warmup forward reaches with every variant, and returns how many it compiled |
+| The V2 manager | `inforward_snapshot_rows` | The CUDA-graph runner, the V2 scheduler and `PyExecutor` | Staging rows per batch for snapshots taken inside the forward; 0 on `KVCacheManagerV2`. When it is positive, the runner warms the kernels of the split |
+| The causal LM and its decoder | `resets_recurrent_state_in_context`, `has_ple` | The CUDA-graph runner | See [What shared runtime code asks](#what-shared-runtime-code-asks) |
+
+Warmup reads `keeps_recurrent_state` in three places. Two are in `_warmup_scheduled`: a cache
+that keeps recurrent state skips the general warmup, the context and mixed shapes of the attention
+warmup, and the pre-population of the memory pool. The third is in `_run_mamba_hybrid_warmup`,
+which runs for such a cache only and compiles the multi-sequence and initial-state kernel variants.
+The source does not record why such a cache skips the general warmup.
 
 ## Adding a recurrent family
 
@@ -269,7 +316,9 @@ present.
    only base state; give each plane its whole shape and how ranks split it.
 2. Subclass `MambaHybridCacheManagerV2` in the family module and return the subclass from
    `get_recurrent_kv_cache_manager_cls` on the model class. Override `attention_cache_geometry`
-   and `family_init_kwargs` for what the constructor needs beyond the shared arguments.
+   and `family_init_kwargs` for what the constructor needs beyond the shared arguments, and
+   `family_estimate_kwargs` when one of those arguments comes from the built model and selects
+   state that the cost estimates size.
 3. In every VLM wrapper around the model, forward both classmethods with the config the wrapper
    builds the language model from, and accept that config as well as the composite one.
 4. Add the family's predicate to `is_hybrid_linear` in `pyexecutor/config_utils.py`, which the
