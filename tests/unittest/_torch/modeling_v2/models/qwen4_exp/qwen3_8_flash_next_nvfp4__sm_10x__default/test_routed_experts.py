@@ -720,8 +720,13 @@ def test_draft_shared_expert_overlap_preserves_serial_output(draft_experts, rows
         sh_gate=sh_gu[2 * INTER :].t(),
     )
     target = object.__new__(M.DecodeTarget)
+    # One rank: the routed window is `_mtp_routed_nvfp4`, as `serial` composes it.
     target.core = SimpleNamespace(
-        **vars(core), _mtp=weights, _side_stream=torch.cuda.Stream(), shared_inter=INTER
+        **vars(core),
+        _mtp=weights,
+        _side_stream=torch.cuda.Stream(),
+        shared_inter=INTER,
+        one_rank=True,
     )
     x = torch.randn(rows, H, generator=gen, device=DEV).to(torch.bfloat16)
 
