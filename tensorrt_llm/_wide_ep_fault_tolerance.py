@@ -66,10 +66,7 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     """
     adp_config = llm_args.attention_dp_config
     spec_config = llm_args.speculative_config
-    spec_mode = None if spec_config is None else spec_config.spec_dec_mode
-    decoding_type = None if spec_config is None else spec_config.decoding_type
-    sa_enhanced = getattr(spec_config, "sa_config", None) is not None
-    current_decoding = f"{decoding_type!r} with sa_config" if sa_enhanced else repr(decoding_type)
+    spec_blocker = None if spec_config is None else spec_config.wide_ep_fault_tolerance_blocker()
     # The options with which each rank picks its own draft length.
     rank_local_draft_len = []
     if spec_config is not None:
@@ -207,17 +204,21 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "pool that a membership change resizes would also hold the compressed pages",
             ),
             (
-                spec_mode is None or (spec_mode.is_mtp_one_model() and not sa_enhanced),
-                "MTP or no speculative decoding (speculative_config: none, or decoding_type 'MTP' "
-                f"without sa_config, not {current_decoding})",
+                spec_blocker is None,
+                "speculative decoding that supports fault tolerance (speculative_config: none, or "
+                "one whose wide_ep_fault_tolerance_blocker() is None; not "
+                f"{spec_blocker}), because the drafter must run no host collectives, rebuild its "
+                "per-request state when a request restarts as a context, keep its KV cache in the "
+                "KV cache manager that fault tolerance resizes, and have EPLB slots for its MoE "
+                "layers",
             ),
             (
                 not rank_local_draft_len,
                 "a fixed draft length (no speculative_config.draft_len_schedule or max_concurrency, "
                 "and no acceptance-rate gate, which is acceptance_rate_window_size with "
                 f"acceptance_rate_threshold; not {', '.join(rank_local_draft_len)}), because "
-                "ranks with different draft lengths run different numbers of MTP-layer "
-                "all-to-alls",
+                "ranks with different draft lengths run different numbers of draft passes, and so "
+                "different numbers of collectives",
             ),
             (
                 llm_args.enable_chunked_prefill

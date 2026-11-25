@@ -203,9 +203,10 @@ def test_supported_configuration_is_accepted(fields):
         *(
             (
                 {"speculative_config": config},
-                "speculative_config: none, or decoding_type 'MTP' without sa_config, "
-                f"not {current})",
+                "speculative_config: none, or one whose wide_ep_fault_tolerance_blocker() is "
+                f"None; not {current})",
             )
+            # Every config here but MTP keeps the default wide_ep_fault_tolerance_blocker().
             for config, current in (
                 (NGramDecodingConfig(max_draft_len=1), "'NGram'"),
                 (UserProvidedDecodingConfig(max_draft_len=1, drafter=object()), "'User_Provided'"),

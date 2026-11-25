@@ -3337,6 +3337,16 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
+    def wide_ep_fault_tolerance_blocker(self) -> Optional[str]:
+        """What rules out enable_wide_ep_fault_tolerance, or None if nothing does.
+
+        Override to return None for a drafter that runs no host collectives,
+        rebuilds its per-request state when a request restarts as a context,
+        keeps its KV cache in the KVCacheManagerV2 that fault tolerance resizes,
+        and has EPLB slots for its MoE layers.
+        """
+        return repr(self.decoding_type)
+
     @field_validator("moe_tactic")
     @classmethod
     def validate_moe_tactic_syntax(cls,
@@ -4113,6 +4123,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def wide_ep_fault_tolerance_blocker(self) -> Optional[str]:
+        # The MTP layers run inside the target's step, and their MoEs get EPLB
+        # slots. The suffix automaton (sa_config) is not tested with fault
+        # tolerance.
+        if self.sa_config is not None:
+            return f"{self.decoding_type!r} with sa_config"
+        return None
 
     @property
     def num_capture_layers(self) -> int:

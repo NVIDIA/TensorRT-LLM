@@ -31,7 +31,9 @@ reason, but not all of them: see [Limitations](#limitations) for what it checks 
   back to Cutlass and logs a warning that names fault tolerance and the reason. Other quantizations, FP8 among them,
   are rejected when the model loads.
 - Attention DP with tensor and expert parallelism over all ranks, `NVLinkOneSided` MoE communication, EPLB, KV cache
-  manager V2, the overlap scheduler, MTP with a fixed draft length or no speculative decoding, no `torch_compile_config`
+  manager V2, the overlap scheduler, speculative decoding whose configuration supports fault tolerance
+  (`wide_ep_fault_tolerance_blocker()` is None: MTP without `sa_config`) with a fixed draft length, or no speculative
+  decoding, no `torch_compile_config`
   and no piecewise prefill CUDA graphs (`prefill_cuda_graph_backend: piecewise`), and `enable_chunked_prefill` or a
   `max_seq_len` of at most `max_num_tokens`. Online EPLB (`layer_updates_per_iter` above 0) also needs CDMM mode and
   GDRCopy.
