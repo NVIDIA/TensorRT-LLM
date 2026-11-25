@@ -3,7 +3,7 @@
 
 import copy
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -1110,6 +1110,107 @@ def test_qwen_vl_embeddings_on_model_without_support_raise(model):
     with pytest.raises(NotImplementedError, match="does not support external multimodal"):
         processor.attach_multimodal_embeddings(
             {"prompt": "p"}, {"image": [torch.zeros(6, width)]}, SamplingParams()
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_encoder_handoff_preserves_adjacent_images_and_fragmented_video(model):
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes, hexdigest_to_int32
+    from tensorrt_llm.llmapi.llm import BaseLLM, _encoder_input_from_item_lengths
+
+    # Two adjacent image items, then two frame groups separated by text.
+    ids = [5, 12, 12, 12, 12, 12, 9, 11, 14, 14, 8, 7, 11, 14, 6]
+    processor, width = _make_qwen_vl_embedding_processor(model, [])
+    processor._processor = SimpleNamespace(mm_special_token_ids=torch.tensor([11]))
+    processor.config.text_config.max_position_embeddings = 128
+    items = {"image": [torch.zeros(2), torch.ones(2)], "video": [[torch.ones(3)]]}
+    uuids = {"image": ["left", "right"], "video": ["clip"]}
+    refs = [("image", 0), ("image", 1), ("video", 0)]
+    producer = MultimodalParams(
+        multimodal_data={
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                refs, output_embedding_lengths=[2, 3, 3]
+            ),
+        }
+    )
+    record = _encoder_input_from_item_lengths(
+        {"multi_modal_data": items, "multi_modal_uuids": uuids}, ids, producer, processor
+    )
+    hashes = apply_mm_hashes(items, uuids).hashes
+    assert record.multimodal_hashes == [hexdigest_to_int32(hashes[m][i]) for m, i in refs]
+    assert record.multimodal_uuids == ["left", "right", "clip"]
+    assert record.multimodal_lengths == [2, 3, 5]
+    assert record.multimodal_item_run_cu_offsets == [0, 1, 2, 4]
+    assert record.multimodal_run_positions == [1, 3, 7, 12]
+    assert record.multimodal_run_lengths == [2, 3, 3, 2]
+    handles = [
+        SharedTensorContainer.from_tensor_bytes(torch.full((size, width), value)).dump_to_dict()
+        for value, size in enumerate([2, 3, 3], start=1)
+    ]
+    pos = torch.arange(len(ids)).expand(3, 1, -1)
+    handoff = DisaggregatedParams(
+        request_type="context_only",
+        multimodal_embedding_handles=handles,
+        multimodal_input=asdict(record),
+        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(pos).dump_to_dict(),
+        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([[0]], dtype=torch.int32)
+        ).dump_to_dict(),
+    )
+    llm = object.__new__(BaseLLM)
+    llm.args = SimpleNamespace(max_seq_len=128)
+    llm.input_processor = processor
+    llm._is_encoder_decoder_model = lambda: False
+    out, _, params, _ = llm._preprocess({"prompt_token_ids": ids}, SamplingParams(), handoff)
+    assert out == ids
+    assert params.multimodal_input == record
+    data = params.multimodal_data
+    assert data["multimodal_embedding"] == handles
+    assert data["mrope_config"]["mrope_position_ids"] == handoff.mrope_position_ids_handle
+    assert data["special_token_offsets"] == [5, 8]
+    assert data["multimodal_embed_mask_cumsum"].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        5,
+        5,
+        6,
+        7,
+        7,
+        7,
+        7,
+        8,
+        8,
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("positions", [[1, 1], [3, 1]], ids=["overlap", "swapped"])
+def test_legacy_encoder_layout_rejects_misassigned_image_spans(positions):
+    from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
+
+    ids = [0, 12, 12, 12, 12, 7]
+    processor, width = _make_qwen_vl_embedding_processor("qwen3", [])
+    processor._processor = SimpleNamespace()
+    layout = MultimodalInputLayout(
+        prompt_token_ids=ids,
+        multimodal_positions=positions,
+        multimodal_lengths=[2, 2],
+        multimodal_embedding_lengths=[2, 2],
+        multimodal_item_run_cu_offsets=[0, 1, 2],
+        multimodal_run_positions=positions,
+        multimodal_run_lengths=[2, 2],
+        item_types=[0, 0],
+    )
+    with pytest.raises(ValueError, match="ordered and non-overlapping"):
+        processor.build_disagg_prefill_multimodal_inputs(
+            {}, [{"tensor_size": [2, width]}] * 2, encoder_inputs=layout
         )
 
 

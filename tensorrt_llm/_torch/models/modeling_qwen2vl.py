@@ -1325,9 +1325,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """
         # Check support first, so models without it (such as Qwen2-VL) raise
         # this error instead of asking for a grid.
-        build_disagg_prefill_multimodal_inputs = getattr(
-            self, "build_disagg_prefill_multimodal_inputs", None)
-        if not callable(build_disagg_prefill_multimodal_inputs):
+        if not getattr(self, "support_mm_disagg", False):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support external multimodal embeddings"
             )
@@ -1375,7 +1373,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mm_handles = [{
             "tensor_size": tuple(image_embedding.shape)
         } for image_embedding in image_embeddings]
-        prompt_token_ids, multimodal_params = build_disagg_prefill_multimodal_inputs(
+        prompt_token_ids, multimodal_params = self.build_disagg_prefill_multimodal_inputs(
             inputs, mm_handles)
 
         # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
@@ -2680,100 +2678,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
-
-    def build_disagg_prefill_multimodal_inputs(
-        self,
-        inputs: TextPrompt,
-        mm_handles: List[Dict[str, Any]],
-        *,
-        mm_hashes: list[list[int]] | None = None,
-    ) -> tuple[list[int], MultimodalParams]:
-        """
-        Build disaggregated prefill inputs from multimodal embedding handles.
-
-        Args:
-            inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles.
-            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
-
-        Returns:
-            Expanded token IDs and common multimodal params containing
-            prompt layout, item metadata, and embedding handles.
-        """
-        text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
-
-        if not isinstance(mm_handles, list):
-            raise TypeError("mm_handles must be a list")
-
-        expected_hidden_size = self.config.text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle['tensor_size'][1]
-            if hidden_size != expected_hidden_size:
-                raise RuntimeError(
-                    f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
-                )
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
-
-        image_token_index = self.config.image_token_id
-
-        image_mask = input_ids == image_token_index
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(
-            mm_handles), "Number of images must match number of mm_handles"
-        total_mm_tokens = sum(mm_handle["tensor_size"][0]
-                              for mm_handle in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-        # Create output tensor
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        # Use the in-vocab image_token_id as the placeholder repeated mm_token_num
-        # times, so the model engine can locate mm positions via
-        # ``torch.isin(input_ids, mm_token_ids)`` without the legacy OOV remap.
-        placeholder_id = image_token_index
-
-        # Fill the expanded sequence
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length = []
-        mm_token_offsets = []
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == image_token_index:
-                # Replace with placeholder id
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos:write_pos + mm_token_num] = \
-                    placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                # Copy text token as-is
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
-        assert mm_token_length[-1] + mm_token_offsets[
-            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return expanded_ids.to(
-            torch.int32).tolist(), MultimodalParams.from_embeddings(
-                mm_handles,
-                MultimodalItemMetadata(
-                    [("image", i) for i in range(len(mm_handles))],
-                    output_embedding_lengths=[
-                        handle["tensor_size"][0] for handle in mm_handles
-                    ],
-                ),
-                multimodal_hashes=mm_hashes,
-                multimodal_lengths=mm_token_length,
-                multimodal_positions=mm_token_offsets,
-                multimodal_item_run_cu_offsets=list(
-                    range(len(mm_token_length) + 1)),
-                multimodal_run_positions=mm_token_offsets,
-                multimodal_run_lengths=mm_token_length,
-            )
+    """Qwen2.5-VL processor with external embedding support."""
 
 
 @support_multimodal_disaggregated

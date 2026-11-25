@@ -740,6 +740,74 @@ class TestKimiK25Structure(unittest.TestCase):
             os.unlink(video_path)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not os.path.isdir(_KIMI_K25_MODEL_DIR), reason="requires Kimi processor")
+@pytest.mark.parametrize("order", [("video", "image"), ("image", "video")])
+@pytest.mark.parametrize("shared_marker", [False, True], ids=["explicit", "shared"])
+def test_kimi_mixed_media_owns_features_and_prompt_slots(order, shared_marker):
+    from PIL import Image
+
+    from tensorrt_llm.inputs.registry import create_input_processor_with_hash
+
+    tokenizer = AutoTokenizer.from_pretrained(_KIMI_K25_MODEL_DIR, trust_remote_code=True)
+    processor = KimiK25InputProcessor(_KIMI_K25_MODEL_DIR, _build_hf_config(), tokenizer)
+    process = create_input_processor_with_hash(processor)
+    image = Image.new("RGB", (112, 140), "red")
+    frames = [Image.new("RGB", (112, 168), "blue") for _ in range(2)]
+    media = {"image": [image], "video": [frames]}
+    image_marker = "<|media_begin|><|media_pad|><|media_end|>"
+    markers = {"image": image_marker, "video": "<|kimi_k25_video_placeholder|>"}
+    singles = {}
+    for modality in order:
+        _, single = process(
+            {
+                "prompt": markers[modality],
+                "multi_modal_data": {modality: media[modality]},
+                "multi_modal_uuids": {modality: [modality]},
+            },
+            None,
+        )
+        singles[modality] = single
+    ids, mixed = process(
+        {
+            "prompt": (
+                image_marker + " and " + image_marker
+                if shared_marker
+                else markers[order[0]] + " and " + markers[order[1]]
+            ),
+            "multi_modal_data": media,
+            "mm_item_order": [{"modality": m, "index": 0} for m in order],
+            "multi_modal_uuids": {m: [m] for m in order},
+        },
+        None,
+    )
+    record = mixed["multimodal_input"]
+    expected = [singles[m]["multimodal_input"] for m in order]
+    assert record.multimodal_uuids == list(order)
+    assert record.multimodal_hashes == [item.multimodal_hashes[0] for item in expected]
+    counts = [item.multimodal_lengths[0] for item in expected]
+    assert counts[0] != counts[1]
+    assert record.multimodal_lengths == counts
+    assert record.multimodal_item_run_cu_offsets == [0, 1, 2]
+    assert record.multimodal_run_lengths == counts
+    mask = [i for i, token in enumerate(ids) if token == processor.get_mm_token_ids().item()]
+    assert mask == [
+        i
+        for pos, size in zip(record.multimodal_run_positions, counts)
+        for i in range(pos, pos + size)
+    ]
+    payload = mixed["multimodal_data"]["image"]
+    for key in ("pixel_values", "image_grid_thw"):
+        torch.testing.assert_close(
+            payload[key], torch.cat([singles[m]["multimodal_data"]["image"][key] for m in order])
+        )
+    with mock.patch("tensorrt_llm._torch.models.modeling_kimi_k25.DISAGG", True):
+        with pytest.raises(NotImplementedError, match="Disaggregated inference"):
+            KimiK25ForConditionalGeneration.forward(
+                None, None, multimodal_params=[MultimodalParams(**mixed)]
+            )
+
+
 class TestKimiK25AutoModelRegistration(unittest.TestCase):
     """Verify KimiK25ForConditionalGeneration is registered in MODEL_CLASS_MAPPING."""
 

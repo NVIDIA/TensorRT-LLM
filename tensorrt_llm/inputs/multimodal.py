@@ -597,6 +597,35 @@ def _validate_multimodal_runs(
                     "within each item")
 
 
+def _validate_relayed_spans(
+    record: "MultimodalInput | MultimodalInputLayout",
+    prompt_len: int,
+) -> None:
+    """Check the prompt bounds and ordering of relayed item spans and runs."""
+    positions, lengths = record.multimodal_positions, record.multimodal_lengths
+    if record.multimodal_run_positions is not None:
+        if any(pos + size > prompt_len
+               for pos, size in zip(positions, lengths, strict=True)):
+            raise ValueError(
+                f"multimodal spans exceed the prompt of {prompt_len} tokens")
+        positions, lengths = record.multimodal_run_positions, record.multimodal_run_lengths
+        if any(positions[start] != item_pos for start, item_pos in zip(
+                record.multimodal_item_run_cu_offsets[:-1],
+                record.multimodal_positions)):
+            raise ValueError(
+                "multimodal item position must match its first run")
+    previous_end = 0
+    for pos, length in zip(positions, lengths, strict=True):
+        if pos < previous_end:
+            raise ValueError(
+                "multimodal runs must be ordered and non-overlapping across items"
+            )
+        previous_end = pos + length
+        if previous_end > prompt_len:
+            raise ValueError(
+                f"multimodal spans exceed the prompt of {prompt_len} tokens")
+
+
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
 
@@ -770,16 +799,7 @@ class MultimodalInput:
                 for digest in self.multimodal_hashes):
             raise ValueError(
                 "multimodal_hashes must hold eight int32 values per item")
-        spans = list(
-            zip(self.multimodal_positions, self.multimodal_lengths,
-                strict=True))
-        if self.multimodal_run_positions is not None:
-            spans += zip(self.multimodal_run_positions,
-                         self.multimodal_run_lengths,
-                         strict=True)
-        if any(position + length > prompt_len for position, length in spans):
-            raise ValueError(
-                f"multimodal spans exceed the prompt of {prompt_len} tokens")
+        _validate_relayed_spans(self, prompt_len)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""

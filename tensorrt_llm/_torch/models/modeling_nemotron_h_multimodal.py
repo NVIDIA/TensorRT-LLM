@@ -104,6 +104,69 @@ def _resolve_video_context_token_id(config: transformers.PretrainedConfig) -> in
     return -1 if token_id is None else token_id
 
 
+def _validate_retained_token_counts(counts, size, num_tubelets=None) -> None:
+    if (
+        not isinstance(counts, list)
+        or (num_tubelets is not None and len(counts) != num_tubelets)
+        or any(type(count) is not int or count < 0 for count in counts)
+        or sum(counts) != size
+    ):
+        raise ValueError(
+            "EVS handoff requires non-negative retained_token_counts per tubelet "
+            "whose sum matches the embedding length."
+        )
+
+
+def _validate_prepared_evs_handoff(processor, ids, params, handles) -> None:
+    """Check the finalized pruned prompt against the per-tubelet encoder outputs."""
+    from tensorrt_llm.inputs.registry import _validate_embedding_handles, _validate_embedding_runs
+
+    sizes = _validate_embedding_handles(processor, handles)
+    refs, output_sizes = params.get_item_layout()
+    if refs != tuple(("video", i) for i in range(len(sizes))) or tuple(sizes) != output_sizes:
+        raise ValueError("Prepared EVS items must match the video exports in order and length")
+    tokens = _as_cpu_tensor(ids)
+    mm_mask, embed, special = _compute_mm_masks(
+        tokens,
+        processor.get_vocab_size(),
+        processor.get_mm_token_ids(),
+        processor.get_mm_special_token_ids(),
+    )
+    actual = tokens[mm_mask].tolist()
+    start, end = processor._img_start_token_ids, processor._img_end_token_ids
+    offset = 0
+    lengths = []
+    for size, handle in zip(sizes, handles, strict=True):
+        counts = (handle.get("metadata") or {}).get("retained_token_counts")
+        _validate_retained_token_counts(counts, size)
+        length = size + len(counts) * (len(start) + len(end))
+        if offset + length > len(actual):
+            raise ValueError("Prepared EVS prompt is shorter than its retained counts")
+        lengths.append(length)
+        for count in counts:
+            frame = [*start, *([processor.img_context_token_id] * count), *end]
+            if actual[offset : offset + len(frame)] != frame:
+                raise ValueError("Prepared EVS prompt disagrees with the retained tubelet counts")
+            offset += len(frame)
+    if offset != len(actual):
+        raise ValueError("Prepared EVS prompt has unowned multimodal tokens")
+    identity = params.multimodal_input
+    if identity is not None:
+        identity.validate_for_prompt(len(ids))
+        if identity.multimodal_lengths != lengths:
+            raise ValueError("Prepared EVS identity disagrees with the final item lengths")
+        _validate_embedding_runs(processor, ids, identity, sizes)
+    data = params.multimodal_data
+    cumsum = data.get("multimodal_embed_mask_cumsum")
+    if not isinstance(cumsum, torch.Tensor) or not torch.equal(
+        cumsum, embed.cumsum(0, dtype=torch.int64)
+    ):
+        raise ValueError("Prepared EVS embedding mask conflicts with the final prompt")
+    expected_offsets = torch.where(special[mm_mask])[0].tolist() if special is not None else []
+    if (data.get("special_token_offsets") or []) != expected_offsets:
+        raise ValueError("Prepared EVS special token offsets conflict with the final prompt")
+
+
 def _compute_aspect_preserving_size(
     orig_w: int,
     orig_h: int,
@@ -2591,16 +2654,7 @@ class NemotronHMultimodalInputProcessor(
                 ):
                     frames = getattr(video, "frames", video)
                     num_tubelets = math.ceil(len(frames) / self.video_temporal_patch_size)
-                    if (
-                        not isinstance(item_counts, list)
-                        or len(item_counts) != num_tubelets
-                        or any(type(count) is not int or count < 0 for count in item_counts)
-                        or sum(item_counts) != embedding_length
-                    ):
-                        raise ValueError(
-                            "EVS handoff requires non-negative retained_token_counts per tubelet "
-                            "whose sum matches the embedding length."
-                        )
+                    _validate_retained_token_counts(item_counts, embedding_length, num_tubelets)
                     counts.extend(item_counts)
                 if updates is None or "video" not in updates:
                     raise ValueError("EVS handoff requires the video placeholder layout.")

@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Input processor registry and multimodal preprocessing helpers."""
 
+import copy
 import enum
 import importlib
 import traceback
@@ -63,6 +64,77 @@ if TYPE_CHECKING:
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
+
+
+def _validate_embedding_handles(processor: "BaseMultimodalInputProcessor",
+                                handles: List[Dict[str, Any]]) -> list[int]:
+    """Validate packed feature dimensions before the worker opens an export."""
+    if not isinstance(handles, list) or not handles:
+        raise ValueError("A nonempty list of embedding handles is required")
+    config = processor.config
+    text_config = getattr(config, "text_config", None) or getattr(
+        config, "llm_config", config)
+    width = getattr(text_config, "hidden_size", None)
+    if width is not None:
+        vision = getattr(config, "vision_config", None)
+        width *= 1 + len(
+            getattr(vision, "deepstack_visual_indexes", None) or ())
+    lengths = []
+    for i, handle in enumerate(handles):
+        shape = handle.get("tensor_size") if isinstance(handle, dict) else None
+        if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+            raise ValueError(f"Multimodal embedding {i} must be rank 2")
+        if any(type(size) is not int or size <= 0 for size in shape):
+            raise ValueError(
+                f"Multimodal embedding {i} must have positive integer dimensions"
+            )
+        if width is not None and shape[1] != width:
+            raise ValueError(
+                f"Expected multimodal embedding {i} to have hidden size {width}, got {shape[1]}"
+            )
+        lengths.append(shape[0])
+    return lengths
+
+
+def _validate_embedding_runs(
+    processor: "BaseMultimodalInputProcessor",
+    ids: List[int],
+    record: MultimodalInput | multimodal.MultimodalInputLayout,
+    sizes: List[int],
+) -> tuple[torch.Tensor, List[int]]:
+    """Check that each export owns its exact embedding slots in the prompt."""
+    mm, embed, special = _compute_mm_masks(_as_cpu_tensor(ids),
+                                           processor.get_vocab_size(),
+                                           processor.get_mm_token_ids(),
+                                           processor.get_mm_special_token_ids())
+    if sum(record.multimodal_lengths) != int(mm.sum()):
+        raise ValueError(
+            "Encoder runs must cover all multimodal prompt positions")
+    offsets = record.multimodal_item_run_cu_offsets
+    starts = record.multimodal_run_positions
+    lengths = record.multimodal_run_lengths
+    if isinstance(record, multimodal.MultimodalInputLayout):
+        multimodal._validate_relayed_spans(record, len(ids))
+        if offsets is None:
+            # Early Python layout snapshots described one contiguous span per item.
+            starts, lengths = record.multimodal_positions, record.multimodal_lengths
+            offsets = list(range(len(starts) + 1))
+    if offsets is None or starts is None or lengths is None:
+        raise ValueError("Encoder handoff requires exact multimodal runs")
+    for i, size in enumerate(sizes):
+        count = 0
+        for j in range(offsets[i], offsets[i + 1]):
+            start = starts[j]
+            end = start + lengths[j]
+            if not mm[start:end].all():
+                raise ValueError(
+                    "Encoder runs do not match the multimodal prompt positions")
+            count += int(embed[start:end].sum())
+        if count != size:
+            raise ValueError(
+                "Encoder embedding lengths do not match their prompt runs")
+    return embed, torch.where(
+        special[mm])[0].tolist() if special is not None else []
 
 
 def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
@@ -270,25 +342,101 @@ class BaseMultimodalInputProcessor(ABC):
         """Return per-modality decode defaults, below server and request overrides."""
         return {}
 
-    def get_disagg_prefill_inputs(
+    def build_disagg_prefill_multimodal_inputs(
         self,
-        prompt_token_ids: List[int],
-        multimodal_params: multimodal.MultimodalParams,
-    ) -> Optional[multimodal.MultimodalInputLayout]:
-        """Export exact encoder-side prompt layout for models that preserve it.
+        inputs: TextPrompt,
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+        encoder_inputs: Optional[multimodal.MultimodalInputLayout] = None,
+    ) -> tuple[list[int], multimodal.MultimodalParams]:
+        """Expand legacy Python inputs with one placeholder per embedding.
 
-        Returning None keeps the model's existing prefill reconstruction path.
-        Models that return a layout accept it as ``encoder_inputs`` in their
-        ``build_disagg_prefill_multimodal_inputs`` method.
-
-        Args:
-            prompt_token_ids: Fully expanded prompt produced by preprocessing.
-            multimodal_params: Processed media and layout metadata for the prompt.
-
-        Returns:
-            Encoder layout to carry to prefill, or None to use reconstruction.
+        Encoder-prepared requests already carry expanded IDs and exact runs.
+        Older callers may send a Qwen layout snapshot or an unexpanded prompt.
         """
-        return None
+        lengths = _validate_embedding_handles(self, mm_handles)
+        if encoder_inputs is None:
+            ids = inputs.get("prompt_token_ids")
+            if ids is None:
+                if not inputs.get("prompt"):
+                    raise ValueError("Text prompt or token IDs are required")
+                ids = self.tokenizer(inputs["prompt"],
+                                     return_tensors="pt").input_ids[0].tolist()
+            mm_token_ids = self.get_mm_token_ids()
+            if mm_token_ids is None:
+                raise ValueError(
+                    "Encoder handles require an expanded prompt and multimodal runs"
+                )
+            placeholder_ids = set(mm_token_ids.tolist())
+            video_id = getattr(self.config, "video_token_id", None)
+            frame_id = getattr(self.config, "vision_start_token_id", None)
+            expanded = []
+            positions, counts = [], []
+            types, special_offsets = [], []
+            flat_offset = 0
+            for token in ids:
+                if token not in placeholder_ids:
+                    expanded.append(token)
+                    continue
+                if len(types) == len(lengths):
+                    raise ValueError(
+                        "More multimodal placeholders than embedding handles")
+                size = lengths[len(types)]
+                framed = bool(expanded and expanded[-1] == frame_id)
+                positions.append(len(expanded) - int(framed))
+                counts.append(size + int(framed))
+                types.append(int(token == video_id))
+                if framed:
+                    special_offsets.append(flat_offset)
+                flat_offset += counts[-1]
+                expanded.extend([token] * size)
+            if len(types) != len(lengths):
+                raise ValueError(
+                    "Fewer multimodal placeholders than embedding handles")
+            layout = multimodal.MultimodalInputLayout(
+                prompt_token_ids=expanded,
+                multimodal_lengths=counts,
+                multimodal_positions=positions,
+                multimodal_embedding_lengths=lengths,
+                multimodal_item_run_cu_offsets=list(range(len(lengths) + 1)),
+                multimodal_run_positions=positions,
+                multimodal_run_lengths=counts,
+                special_token_offsets=special_offsets or None,
+                item_types=types)
+        else:
+            layout = copy.deepcopy(encoder_inputs)
+            if layout.multimodal_embedding_lengths != lengths:
+                raise ValueError(
+                    "Encoder layout embedding lengths do not match embedding handles"
+                )
+            _, special_offsets = _validate_embedding_runs(
+                self, layout.prompt_token_ids, layout, lengths)
+            if special_offsets != (layout.special_token_offsets or []):
+                raise ValueError(
+                    "Encoder layout framing offsets do not match the prompt")
+        if layout.item_types is None or any(i not in (0, 1)
+                                            for i in layout.item_types):
+            raise ValueError(
+                "Encoder layout must identify each image or video item")
+        local_counts = [0, 0]
+        refs = []
+        for i in layout.item_types:
+            refs.append((("image", "video")[i], local_counts[i]))
+            local_counts[i] += 1
+        params = multimodal.MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(refs, output_embedding_lengths=lengths),
+            multimodal_hashes=mm_hashes,
+            multimodal_positions=layout.multimodal_positions,
+            multimodal_lengths=layout.multimodal_lengths,
+            multimodal_item_run_cu_offsets=layout.
+            multimodal_item_run_cu_offsets,
+            multimodal_run_positions=layout.multimodal_run_positions,
+            multimodal_run_lengths=layout.multimodal_run_lengths,
+            special_token_offsets=layout.special_token_offsets,
+        )
+        return layout.prompt_token_ids, params
 
     def get_mm_item_metadata(
         self,
@@ -414,11 +562,11 @@ class BaseMultimodalInputProcessor(ABC):
                 "Setting add_special_tokens to False because prompt_token_ids "
                 "were provided to generate. VLMs will re-encode the prompt.")
             sampling_params.add_special_tokens = False
-        return TextPrompt(
-            prompt=prompt,
-            multi_modal_data=inputs.get("multi_modal_data"),
-            mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
-        )
+        inputs = inputs.copy()
+        inputs.pop("prompt_token_ids", None)
+        inputs["prompt"] = prompt
+        inputs["mm_processor_kwargs"] = inputs.get("mm_processor_kwargs") or {}
+        return inputs
 
     @property
     @abstractmethod
@@ -1160,10 +1308,9 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
     validate requirements, and set `support_mm_disagg = True` on both
     the processor class and the model class.
 
-    The processor implements ``build_disagg_prefill_multimodal_inputs(inputs,
-    mm_handles, *, mm_hashes=None)`` and returns ``(prompt_token_ids,
-    MultimodalParams)``. The params hold prompt layout, item metadata, and
-    embedding handles; the worker resolves the handles before model execution.
+    The encoder supplies expanded prompt IDs, one embedding handle per item,
+    and the corresponding MultimodalInput. Prefill can attach these embeddings
+    using the processor's multimodal token mask.
     """
     processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type.get(
         model_cls)
@@ -1175,13 +1322,6 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
         raise TypeError(
             f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
         )
-    method = getattr(processor_cls, "build_disagg_prefill_multimodal_inputs",
-                     None)
-    if method is None or not callable(method):
-        raise TypeError(
-            f"{processor_cls.__name__} must implement a callable method `build_disagg_prefill_multimodal_inputs` to support multimodal disagg"
-        )
-
     setattr(processor_cls, "support_mm_disagg", True)
     setattr(model_cls, "support_mm_disagg", True)
     return model_cls

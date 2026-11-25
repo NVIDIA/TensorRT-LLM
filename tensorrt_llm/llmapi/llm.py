@@ -15,6 +15,7 @@
 
 import atexit
 import base64
+import copy
 import math
 import os
 import socket
@@ -22,7 +23,7 @@ import threading
 import time
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
                     cast)
@@ -35,9 +36,14 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
-                                            _compute_mm_masks)
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.multimodal import (MultimodalInput,
+                                            MultimodalInputLayout,
+                                            MultimodalParams, _compute_mm_masks,
+                                            _find_mm_token_runs_from_mask,
+                                            apply_mm_hashes, hexdigest_to_int32)
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          _validate_embedding_handles,
+                                          _validate_embedding_runs)
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
@@ -48,7 +54,9 @@ from .._startup_errors import (classify_startup_error, log_startup_error,
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import (DisaggregatedParams,
+                                    _has_retained_token_counts,
+                                    _release_encoder_handles_on_error)
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -344,6 +352,152 @@ def _multimodal_params_have_encoder_features(
                       dict) and "encoder_input_features" in audio_data
 
 
+def _is_pruned_video_handoff(processor, handles, inputs) -> bool:
+    if not _has_retained_token_counts(handles):
+        return False
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor, _validate_prepared_evs_handoff)
+
+    if (not isinstance(processor, NemotronHMultimodalInputProcessor)
+            or processor.video_pruning_rate <= 0):
+        raise ValueError("retained_token_counts require a pruned video handoff")
+    if isinstance(inputs, PreprocessedInputs):
+        if inputs.multimodal_params is None:
+            raise ValueError(
+                "Prepared EVS handoff requires the final video layout")
+        _validate_prepared_evs_handoff(processor, inputs.prompt_token_ids,
+                                       inputs.multimodal_params, handles)
+    elif {
+            key
+            for key, items in (inputs.get("multi_modal_data") or {}).items()
+            if items is not None
+    } != {"video"}:
+        raise ValueError("EVS handoff requires the original video")
+    return True
+
+
+def _validate_prepared_embedding_layout(processor, ids, params, disagg):
+    """Check any spans declared by a Python descriptor-only handoff."""
+    sizes = _validate_embedding_handles(processor,
+                                        disagg.multimodal_embedding_handles)
+    if params is None:
+        raise ValueError("Prepared handoff requires multimodal parameters")
+    metadata = params.item_metadata
+    if metadata is not None and metadata.output_embedding_lengths != tuple(
+            sizes):
+        raise ValueError("Prepared item lengths must match the encoder exports")
+    layout = disagg.multimodal_input_layout
+    if layout is not None and (ids != layout.prompt_token_ids
+                               or layout.multimodal_embedding_lengths != sizes):
+        raise ValueError(
+            "Prepared prompt or item lengths conflict with the encoder layout")
+    identity = params.multimodal_input
+    if identity is not None:
+        # Prepared inputs are mutable between preprocess() and generate_async().
+        identity = replace(identity)
+        identity.validate_for_prompt(len(ids))
+        if identity.multimodal_run_positions is None:
+            # Early Python snapshots described one contiguous span per item.
+            identity = MultimodalInputLayout(ids, identity.multimodal_lengths,
+                                             identity.multimodal_positions,
+                                             sizes)
+    if layout is None and identity is None:
+        _, embed, _ = _compute_mm_masks(torch.tensor(ids),
+                                        processor.get_vocab_size(),
+                                        processor.get_mm_token_ids(),
+                                        processor.get_mm_special_token_ids())
+        if metadata is None or int(embed.sum()) != sum(sizes):
+            raise ValueError(
+                "Prepared embedding lengths do not match the prompt")
+    for record in (layout, identity):
+        if record is not None:
+            if len(record.multimodal_lengths) != len(sizes):
+                raise ValueError(
+                    "Encoder handoff requires one embedding handle per item")
+            _validate_embedding_runs(processor, ids, record, sizes)
+
+
+def _encoder_item_digests(inputs, item_refs=None):
+    hashes, uuids = apply_mm_hashes(inputs["multi_modal_data"],
+                                    inputs.get("multi_modal_uuids"))
+    if item_refs is None:
+        order = inputs.get("mm_item_order")
+        item_refs = ([(item["modality"], item["index"]) for item in order]
+                     if order else [(m, i) for m, digests in hashes.items()
+                                    for i in range(len(digests))])
+    return ([hexdigest_to_int32(hashes[m][i]) for m, i in item_refs],
+            [uuids[m][i] for m, i in item_refs] if uuids is not None else None)
+
+
+def _encoder_input_from_item_lengths(inputs, prompt_token_ids, mm_params,
+                                     processor):
+    """Use finalized encoder item sizes when the processor did not publish a KV record."""
+    refs, sizes = mm_params.get_item_layout()
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError(
+            "Encoder handoff requires an identity and an embedding length per item"
+        )
+    tokens = torch.tensor(prompt_token_ids)
+    mm, embed, _ = _compute_mm_masks(tokens, processor.get_vocab_size(),
+                                     processor.get_mm_token_ids(),
+                                     processor.get_mm_special_token_ids())
+    slots = torch.where(embed[mm])[0]
+    if len(slots) != sum(sizes):
+        raise ValueError("Encoder embedding lengths do not match the prompt")
+    boundaries = torch.tensor(sizes).cumsum(0)[:-1]
+    ends = slots[boundaries - 1] + 1
+    # A leading vision marker belongs to the following item. Other framing
+    # between adjacent items needs the producer's exact record to identify its owner.
+    markers = tokens[mm]
+    vision_start = getattr(processor.config, "vision_start_token_id", None)
+    for end, start in zip(ends.tolist(), slots[boundaries].tolist()):
+        if end < start and (vision_start is None
+                            or not (markers[end:start] == vision_start).all()):
+            raise ValueError(
+                "Encoder handoff requires exact runs for inter-item framing")
+    ends = torch.cat((ends, mm.sum().reshape(1)))
+    lengths = torch.diff(ends, prepend=ends.new_zeros(1)).tolist()
+    offsets, starts, runs = _find_mm_token_runs_from_mask(mm, lengths)
+    hashes, uuids = _encoder_item_digests(inputs, refs)
+    return MultimodalInput.from_components(hashes,
+                                           [starts[i]
+                                            for i in offsets[:-1]], lengths,
+                                           uuids, offsets, starts, runs)
+
+
+def _encoder_disaggregated_params(
+    prompt_token_ids: List[int],
+    params: MultimodalParams,
+    disagg: Optional[DisaggregatedParams],
+) -> DisaggregatedParams:
+    record = asdict(params.multimodal_input)
+    metadata = params.item_metadata
+    layout = None
+    if metadata is not None and metadata.output_embedding_lengths:
+        refs, sizes = metadata.item_refs, metadata.output_embedding_lengths
+        # Python callers can submit the encoder result with their original
+        # prompt. The HTTP response carries the expanded IDs directly.
+        layout = MultimodalInputLayout(
+            prompt_token_ids=list(prompt_token_ids),
+            multimodal_embedding_lengths=list(sizes),
+            item_types=[0 if m == "image" else 1
+                        for m, _ in refs] if all(m in ("image", "video")
+                                                 for m, _ in refs) else None,
+            special_token_offsets=copy.copy(
+                params.multimodal_data.get("special_token_offsets")),
+            **{
+                k: v
+                for k, v in record.items()
+                if k not in ("multimodal_hashes", "multimodal_uuids")
+            },
+        )
+    return replace(
+        disagg or DisaggregatedParams(request_type="context_and_generation"),
+        multimodal_input=record,
+        multimodal_hashes=record["multimodal_hashes"],
+        multimodal_input_layout=layout)
+
+
 def _check_mrope_bytes_handle(name: str, handle: Dict[str, Any],
                               prompt_len: int) -> np.ndarray:
     """Check a portable mRoPE handle from the context worker and decode it once.
@@ -358,8 +512,8 @@ def _check_mrope_bytes_handle(name: str, handle: Dict[str, Any],
             != _SharedTensorRebuildMethodRegistry.REBUILD_BYTES
             or not {"tensor_size", "dtype", "data"}.issubset(handle)):
         raise ValueError(
-            "Generation-only multimodal input requires portable "
-            "mRoPE position IDs and deltas from the context worker")
+            "Multimodal handoff requires portable mRoPE position IDs and deltas"
+        )
     shape = list(handle["tensor_size"])
     if (shape != [3, 1, prompt_len] if name == "mrope_position_ids_handle" else
             any(size != 1 for size in shape)):
@@ -908,78 +1062,133 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
         """
-        if self._encode_only:
-            raise RuntimeError(
-                "generate_async() is not available when encode_only=True. "
-                "Use llm.encode() for encoder-only models.")
+        with _release_encoder_handles_on_error(disaggregated_params):
+            if self._encode_only:
+                raise RuntimeError(
+                    "generate_async() is not available when encode_only=True. "
+                    "Use llm.encode() for encoder-only models.")
 
-        # Check if the worker is shutting down
-        if self._executor is None or self._executor.is_shutdown():
-            raise RuntimeError("LLM is shutting down")
+            # Check if the worker is shutting down
+            if self._executor is None or self._executor.is_shutdown():
+                raise RuntimeError("LLM is shutting down")
 
-        sampling_params = self._prepare_sampling_params(sampling_params)
+            sampling_params = self._prepare_sampling_params(sampling_params)
 
-        # With pytorch backend, py_executor has logic to handle max_tokens of 1,
-        # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
-        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
-        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+            # With pytorch backend, py_executor has logic to handle max_tokens of 1,
+            # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
+            is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+            is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
 
-        if is_ctx_only:
-            sampling_params.max_tokens = 1
-            self._configure_bart_decoder_prefix(sampling_params)
+            if is_ctx_only:
+                sampling_params.max_tokens = 1
+                self._configure_bart_decoder_prefix(sampling_params)
 
-        if isinstance(inputs, PreprocessedInputs):
-            prompt_token_ids = inputs.prompt_token_ids
-            prompt = None
-            multimodal_params = inputs.multimodal_params
-            preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
-            if preprocessed_encoder_input_token_ids is not None:
-                preprocessed_encoder_input_token_ids = self._normalize_token_ids(
-                    preprocessed_encoder_input_token_ids,
-                    "inputs.encoder_input_token_ids")
-            encoder_input_token_ids = preprocessed_encoder_input_token_ids
-            if (encoder_input_token_ids is not None
-                    and self._is_encoder_decoder_model()):
-                prompt_token_ids = self._get_decoder_prompt_token_ids(
-                    sampling_params)
-        else:
-            (prompt_token_ids, prompt, multimodal_params,
-             encoder_input_token_ids) = self._preprocess(
-                 inputs,
-                 sampling_params,
-                 disaggregated_params,
-             )
-        if is_gen_only:
-            # Raw and prepared inputs alike.
-            self._check_generation_only_inputs(prompt_token_ids,
-                                               multimodal_params,
-                                               disaggregated_params)
+            if isinstance(inputs, PreprocessedInputs):
+                prompt_token_ids = inputs.prompt_token_ids
+                prompt = None
+                multimodal_params = inputs.multimodal_params
+                preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
+                if preprocessed_encoder_input_token_ids is not None:
+                    preprocessed_encoder_input_token_ids = self._normalize_token_ids(
+                        preprocessed_encoder_input_token_ids,
+                        "inputs.encoder_input_token_ids")
+                encoder_input_token_ids = preprocessed_encoder_input_token_ids
+                if (encoder_input_token_ids is not None
+                        and self._is_encoder_decoder_model()):
+                    prompt_token_ids = self._get_decoder_prompt_token_ids(
+                        sampling_params)
+                if disaggregated_params is not None and not is_gen_only:
+                    handles = disaggregated_params.multimodal_embedding_handles
+                    pruned_video = _is_pruned_video_handoff(
+                        self.input_processor, handles, inputs)
+                    if disaggregated_params.multimodal_input is not None and not pruned_video:
+                        if handles is None:
+                            raise ValueError(
+                                "Encoder handoff requires one embedding handle per item"
+                            )
+                        multimodal_params = self._restore_encoder_handoff(
+                            prompt_token_ids, disaggregated_params,
+                            sampling_params, multimodal_params)
+                    elif handles is not None:
+                        # A legacy Python handoff can only be submitted with
+                        # the same embeddings and metadata used in preprocess.
+                        data = (multimodal_params.multimodal_data
+                                or {}) if multimodal_params else {}
+                        identity = multimodal_params.multimodal_input if multimodal_params else None
+                        hashes = identity.multimodal_hashes if identity is not None else None
+                        mrope = data.get("mrope_config") or {}
+                        source = disaggregated_params.multimodal_input or {}
+                        expected_hashes = source.get(
+                            "multimodal_hashes",
+                            disaggregated_params.multimodal_hashes)
+                        if not pruned_video:
+                            _validate_prepared_embedding_layout(
+                                self.input_processor, prompt_token_ids,
+                                multimodal_params, disaggregated_params)
+                        if pruned_video and source and (
+                                identity is None or identity.multimodal_uuids
+                                != source.get("multimodal_uuids")
+                                or disaggregated_params.multimodal_hashes
+                                is not None
+                                and disaggregated_params.multimodal_hashes
+                                != expected_hashes):
+                            raise ValueError(
+                                "Prepared EVS identity conflicts with the encoder"
+                            )
+                        if hashes is None and getattr(
+                                getattr(self.args, "kv_cache_config", None),
+                                "enable_block_reuse", False):
+                            raise ValueError(
+                                "Encoder handoff with KV reuse requires a cache identity per item"
+                            )
+                        if (data.get("multimodal_embedding") != handles or
+                            {"image", "audio", "video"}.intersection(data)
+                                or hashes != expected_hashes
+                                or mrope.get("mrope_position_ids") !=
+                                disaggregated_params.mrope_position_ids_handle
+                                or mrope.get("mrope_position_deltas")
+                                != disaggregated_params.
+                                mrope_position_deltas_handle):
+                            raise ValueError(
+                                "Prepared multimodal inputs conflict with encoder handoff"
+                            )
+                elif is_gen_only and disaggregated_params.multimodal_embedding_handles is not None:
+                    raise ValueError(
+                        "Generation-only requests cannot receive encoder embeddings"
+                    )
+            else:
+                (prompt_token_ids, prompt, multimodal_params,
+                 encoder_input_token_ids) = self._preprocess(
+                     inputs,
+                     sampling_params,
+                     disaggregated_params,
+                 )
+            if is_gen_only:
+                # Raw and prepared inputs alike.
+                self._check_generation_only_inputs(prompt_token_ids,
+                                                   multimodal_params,
+                                                   disaggregated_params)
 
-        if (not self.args.mm_encoder_only and disaggregated_params is not None
-                and disaggregated_params.multimodal_input_layout is not None):
-            disaggregated_params = replace(disaggregated_params,
-                                           multimodal_input_layout=None)
+            if (not self.args.mm_encoder_only
+                    and disaggregated_params is not None and
+                    disaggregated_params.multimodal_input_layout is not None):
+                disaggregated_params = replace(disaggregated_params,
+                                               multimodal_input_layout=None)
 
-        if (self.args.mm_encoder_only
-                and multimodal_params is not None and isinstance(
-                    self.input_processor, BaseMultimodalInputProcessor)):
-            encoder_layout = self.input_processor.get_disagg_prefill_inputs(
-                prompt_token_ids, multimodal_params)
-            if encoder_layout is not None:
-                disaggregated_params = replace(
-                    disaggregated_params or
-                    DisaggregatedParams(request_type="context_and_generation"),
-                    multimodal_input_layout=encoder_layout)
+            if (self.args.mm_encoder_only and multimodal_params is not None
+                    and multimodal_params.multimodal_input is not None):
+                disaggregated_params = _encoder_disaggregated_params(
+                    prompt_token_ids, multimodal_params, disaggregated_params)
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
+            arrival_time = steady_clock_now(
+            ) if self.args.return_perf_metrics else None
 
-        self._check_arguments(len(prompt_token_ids),
-                              sampling_params,
-                              is_gen_only=is_gen_only)
-        if _postproc_params:
-            _postproc_params.postproc_args.num_prompt_tokens = len(
-                prompt_token_ids)
+            self._check_arguments(len(prompt_token_ids),
+                                  sampling_params,
+                                  is_gen_only=is_gen_only)
+            if _postproc_params:
+                _postproc_params.postproc_args.num_prompt_tokens = len(
+                    prompt_token_ids)
         result = self._executor.generate_async(
             prompt_token_ids,
             sampling_params=sampling_params,
@@ -1010,10 +1219,80 @@ class BaseLLM:
             self.tokenizer,
             post_processor_hook=self._post_processor_hook)
 
-    def _check_mrope_handles(self, prompt_len: int,
+    def _restore_encoder_handoff(
+            self,
+            ids: List[int],
+            disagg: DisaggregatedParams,
+            sampling_params: SamplingParams,
+            prepared: Optional[MultimodalParams] = None) -> MultimodalParams:
+        """Bind each pending export to its exact positions in the expanded prompt."""
+        processor = self.input_processor
+        if not getattr(processor, "support_mm_disagg", False):
+            raise ValueError(
+                "Multimodal disaggregated inference is not supported for this model"
+            )
+        if disagg.request_type not in ("context_only",
+                                       "context_and_generation"):
+            raise ValueError("Encoder handles require a context request")
+        if disagg.multimodal_input_layout is not None and ids != disagg.multimodal_input_layout.prompt_token_ids:
+            raise ValueError(
+                "Prepared token IDs conflict with the encoder prompt")
+        record_data = disagg.multimodal_input
+        if record_data is None:
+            raise ValueError(
+                "Encoder handoff requires a multimodal input record")
+        record = MultimodalInput(**copy.deepcopy(record_data))
+        record.validate_for_prompt(len(ids))
+        handles = disagg.multimodal_embedding_handles
+        sizes = _validate_embedding_handles(processor, handles)
+        if disagg.multimodal_hashes is not None and disagg.multimodal_hashes != record.multimodal_hashes:
+            raise ValueError(
+                "Encoder handoff contains conflicting item digests")
+
+        if len(sizes) != len(record.multimodal_lengths):
+            raise ValueError(
+                "Encoder handoff requires one embedding handle per item")
+        embed, special_offsets = _validate_embedding_runs(
+            processor, ids, record, sizes)
+        data = {
+            "multimodal_embedding":
+            handles,
+            "multimodal_embed_mask_cumsum":
+            embed.cumsum(0, dtype=torch.int64),
+            "mm_bidirectional_blocks":
+            bool(getattr(processor, "mm_bidirectional_blocks", False))
+        }
+        if special_offsets:
+            data["special_token_offsets"] = special_offsets
+        if (disagg.mrope_position_ids_handle is not None
+                or disagg.mrope_position_deltas_handle is not None
+                or getattr(processor, "uses_mrope", False)):
+            self._check_mrope_handles(len(ids),
+                                      disagg,
+                                      sampling_params.max_tokens,
+                                      require_portable=True)
+            data["mrope_config"] = {
+                "mrope_position_ids": disagg.mrope_position_ids_handle,
+                "mrope_position_deltas": disagg.mrope_position_deltas_handle
+            }
+        if prepared is not None:
+            local = prepared.multimodal_data or {}
+            if (prepared.multimodal_input is not None
+                    and prepared.multimodal_input != record
+                    or local.keys() - data.keys() or any(
+                        key in local and local[key] != data.get(key)
+                        for key in ("mrope_config", "multimodal_embedding"))):
+                raise ValueError(
+                    "Prepared multimodal inputs conflict with encoder handoff")
+        return MultimodalParams(multimodal_input=record, multimodal_data=data)
+
+    def _check_mrope_handles(self,
+                             prompt_len: int,
                              disaggregated_params: DisaggregatedParams,
-                             max_tokens: Optional[int]) -> None:
-        """Check the mRoPE handles of a generation-only request.
+                             max_tokens: Optional[int],
+                             *,
+                             require_portable: bool = False) -> None:
+        """Check the mRoPE handles of a relayed multimodal request.
 
         The context worker sends both or neither. Byte handles are checked on
         any prompt, and an input processor that knows its rotary table checks
@@ -1024,15 +1303,17 @@ class BaseLLM:
 
         names = ("mrope_position_ids_handle", "mrope_position_deltas_handle")
         handles = [getattr(disaggregated_params, name) for name in names]
-        if (handles[0] is None) != (handles[1] is None):
+        bytes_key = _SharedTensorRebuildMethodRegistry.REBUILD_BYTES
+        if ((handles[0] is None) != (handles[1] is None)
+                or require_portable and any(
+                    (h or {}).get("method_key") != bytes_key for h in handles)):
             raise ValueError(
-                "Generation-only multimodal input requires portable "
-                "mRoPE position IDs and deltas from the context worker")
+                "Multimodal handoff requires portable mRoPE position IDs and deltas"
+            )
         values = [
             _check_mrope_bytes_handle(name, handle, prompt_len)
             for name, handle in zip(names, handles)
-            if (handle or {}).get("method_key") == (
-                _SharedTensorRebuildMethodRegistry.REBUILD_BYTES)
+            if (handle or {}).get("method_key") == bytes_key
         ]
         check_positions = getattr(self.input_processor, "check_mrope_positions",
                                   None)
@@ -1173,26 +1454,85 @@ class BaseLLM:
 
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
-        if is_mm_disagg:
+        if (not is_gen_only and disaggregated_params is not None
+                and disaggregated_params.multimodal_input is not None
+                and not is_mm_disagg):
+            raise ValueError(
+                "Encoder handoff requires one embedding handle per item")
+        pruned_video = is_mm_disagg and _is_pruned_video_handoff(
+            self.input_processor,
+            disaggregated_params.multimodal_embedding_handles, inputs)
+        if is_mm_disagg and disaggregated_params.multimodal_input is not None and not pruned_video:
+            layout = disaggregated_params.multimodal_input_layout
+            prompt_token_ids = inputs.get("prompt_token_ids")
+            if inputs.get("multi_modal_embeddings") is not None:
+                raise ValueError(
+                    "Local multimodal embeddings conflict with encoder handoff")
+            if inputs.get("multi_modal_data") is not None:
+                if layout is None:
+                    raise ValueError(
+                        "Local media conflicts with encoder handoff")
+                # Older Python callers pass their original media with the encoder result.
+                digests, uuids = _encoder_item_digests(inputs)
+                record = disaggregated_params.multimodal_input
+                if digests != record["multimodal_hashes"] or uuids != record.get(
+                        "multimodal_uuids"):
+                    raise ValueError(
+                        "Local media conflicts with encoder handoff")
+                if (prompt_token_ids is not None and len(prompt_token_ids)
+                        >= len(layout.prompt_token_ids)
+                        and prompt_token_ids != layout.prompt_token_ids):
+                    raise ValueError(
+                        "Local token IDs conflict with the expanded encoder prompt"
+                    )
+                prompt_token_ids = layout.prompt_token_ids
+            elif prompt_token_ids is None and layout is not None:
+                prompt_token_ids = layout.prompt_token_ids
+            if prompt_token_ids is None:
+                raise ValueError(
+                    "Encoder handoff requires the encoder's expanded prompt token IDs"
+                )
+            multimodal_params = self._restore_encoder_handoff(
+                prompt_token_ids, disaggregated_params, sampling_params)
+            prompt = inputs.get("prompt")
+        elif is_mm_disagg:
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
+            mm_hashes = disaggregated_params.multimodal_hashes
+            source = disaggregated_params.multimodal_input
+            if pruned_video and source is not None:
+                # The encoder has the original identities. Prefill computes new
+                # positions after the encoder has chosen the retained tubelets.
+                digests, uuids = _encoder_item_digests(inputs)
+                if (digests != source["multimodal_hashes"]
+                        or uuids != source.get("multimodal_uuids")
+                        or mm_hashes is not None and mm_hashes != digests):
+                    raise ValueError(
+                        "Pruned video media conflicts with encoder identity")
+                mm_hashes = digests
+            if (mm_hashes is None and getattr(
+                    getattr(getattr(self, "args", None), "kv_cache_config",
+                            None), "enable_block_reuse", False)):
+                raise ValueError(
+                    "Encoder handoff with KV reuse requires a cache identity per item"
+                )
             layout_kwargs = {}
-            if disaggregated_params.multimodal_input_layout is not None:
+            if disaggregated_params.multimodal_input_layout is not None and not pruned_video:
                 layout_kwargs[
                     "encoder_inputs"] = disaggregated_params.multimodal_input_layout
             prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs,
-                    mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes,
-                    **layout_kwargs))
+                    inputs, mm_handles, mm_hashes=mm_hashes, **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
                     "(prompt_token_ids, MultimodalParams)")
+            if pruned_video and source is not None and multimodal_params.multimodal_input is not None:
+                multimodal_params.multimodal_input.multimodal_uuids = copy.copy(
+                    source.get("multimodal_uuids"))
             prompt = inputs.get("prompt", None)
             if is_gen_only:
                 raise ValueError(
@@ -1305,6 +1645,14 @@ class BaseLLM:
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
+                    if (getattr(self.args, "mm_encoder_only", False)
+                            and multimodal_params.multimodal_input is None
+                            and inputs.get("multi_modal_data") and not (getattr(
+                                self.input_processor, "video_pruning_rate",
+                                0) and "video" in inputs["multi_modal_data"])):
+                        multimodal_params.multimodal_input = _encoder_input_from_item_lengths(
+                            inputs, prompt_token_ids, multimodal_params,
+                            self.input_processor)
                     if disaggregated_params is not None:
                         mrope_config = multimodal_params.multimodal_data.get(
                             "mrope_config", {})
@@ -1372,13 +1720,14 @@ class BaseLLM:
             tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
                 passed directly to :meth:`generate_async` as `inputs`.
         """
-        sampling_params = self._prepare_sampling_params(sampling_params)
-        (prompt_token_ids, _prompt, multimodal_params,
-         encoder_input_token_ids) = self._preprocess(
-             inputs,
-             sampling_params,
-             disaggregated_params,
-         )
+        with _release_encoder_handles_on_error(disaggregated_params):
+            sampling_params = self._prepare_sampling_params(sampling_params)
+            (prompt_token_ids, _prompt, multimodal_params,
+             encoder_input_token_ids) = self._preprocess(
+                 inputs,
+                 sampling_params,
+                 disaggregated_params,
+             )
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -141,6 +144,40 @@ def test_llava_next_embeddings_keep_tensor_list(with_grid):
     assert ids == [1, 9, 9, 9, 2, 9, 9, 3]
     torch.testing.assert_close(extra["multimodal_data"]["multimodal_embedding"],
                                torch.cat(embeddings))
+
+
+def test_llava_prefill_uses_encoder_prompt_and_item_handles():
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    processor = object.__new__(LlavaNextInputProcessor)
+    processor._config = SimpleNamespace(
+        vocab_size=100, text_config=SimpleNamespace(hidden_size=4))
+    processor.image_token_index = 9
+    processor._processor = SimpleNamespace()
+    llm = object.__new__(BaseLLM)
+    llm.input_processor = processor
+    llm._is_encoder_decoder_model = lambda: False
+    ids = [1, 9, 9, 9, 9, 9, 2]
+    handles = [{"tensor_size": [3, 4]}, {"tensor_size": [2, 4]}]
+    handoff = DisaggregatedParams(
+        request_type="context_only",
+        multimodal_embedding_handles=handles,
+        multimodal_input=dict(multimodal_hashes=[[1] * 8, [2] * 8],
+                              multimodal_positions=[1, 4],
+                              multimodal_lengths=[3, 2],
+                              multimodal_item_run_cu_offsets=[0, 1, 2],
+                              multimodal_run_positions=[1, 4],
+                              multimodal_run_lengths=[3, 2]),
+    )
+    out, _, params, _ = llm._preprocess({"prompt_token_ids": ids},
+                                        SamplingParams(), handoff)
+    assert out == ids
+    assert params.multimodal_data["multimodal_embedding"] == handles
+    assert params.multimodal_input.multimodal_positions == [1, 4]
+    assert params.multimodal_data["multimodal_embed_mask_cumsum"].tolist() == [
+        0, 1, 2, 3, 4, 5, 5
+    ]
 
 
 if __name__ == "__main__":

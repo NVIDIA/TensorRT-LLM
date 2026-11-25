@@ -497,3 +497,325 @@ def test_prepared_inputs_with_handoff_state_are_submitted(llm):
     )
     prepared = PreprocessedInputs(prompt_token_ids=[1, 91, 2, 91], multimodal_params=local)
     assert submit(llm, prepared, DisaggregatedParams(request_type="generation_only")) is local
+
+
+class EncoderHandoffProcessor(PlainRopeProcessor):
+    support_mm_disagg = True
+    config = SimpleNamespace(hidden_size=2)
+
+    def get_vocab_size(self):
+        return 100
+
+    def get_mm_special_token_ids(self):
+        return torch.tensor([93])
+
+
+def image_handoff(starts=(1, 2), sizes=(1, 1)):
+    from dataclasses import asdict
+
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    identity = MultimodalInput.from_components(
+        [[1] * 8, [2] * 8],
+        list(starts),
+        [1, 1],
+        ["red", "green"],
+        [0, 1, 2],
+        list(starts),
+        [1, 1],
+    )
+    return DisaggregatedParams(
+        request_type="context_and_generation",
+        multimodal_input=asdict(identity),
+        multimodal_embedding_handles=[
+            SharedTensorContainer.from_tensor(torch.full((size, 2), i + 1)).dump_to_dict()
+            for i, size in enumerate(sizes)
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "raw,starts,sizes",
+    [
+        (True, (1, 1), (1, 1)),
+        (False, (2, 1), (1, 1)),
+        (False, (1, 3), (1, 1)),
+        (True, (1, 2), (1,)),
+        (True, (1, 2), (2, 1)),
+    ],
+    ids=["duplicate", "swapped", "text-gap", "missing-handle", "embedding-length"],
+)
+def test_rejected_encoder_handoff_retires_exports(llm, raw, starts, sizes):
+    import base64
+    from pathlib import Path
+
+    llm.input_processor = EncoderHandoffProcessor()
+    disagg = image_handoff(starts, sizes)
+    paths = [
+        Path("/dev/shm") / base64.b64decode(h["storage_handle"]).decode().lstrip("/")
+        for h in disagg.multimodal_embedding_handles
+    ]
+    assert all(p.exists() for p in paths)
+    ids = [0, 91, 91, 0]
+    if raw:
+        with pytest.raises(ValueError):
+            llm.preprocess(ids, SamplingParams(), disagg)
+    else:
+        with pytest.raises(ValueError):
+            submit(llm, PreprocessedInputs(ids), disagg)
+    assert not any(p.exists() for p in paths)
+    assert not llm._executor.requests
+
+
+@pytest.mark.parametrize("form", ["raw", "token-only", "preprocess"])
+def test_matching_encoder_handoff_opens_each_export_at_worker(llm, form, monkeypatch):
+    llm.input_processor = EncoderHandoffProcessor()
+    disagg = image_handoff()
+    ids = [0, 91, 91, 0]
+    restores = []
+    original = SharedTensorContainer.from_dict
+
+    def restore(handle):
+        restores.append(handle)
+        return original(handle)
+
+    monkeypatch.setattr(SharedTensorContainer, "from_dict", restore)
+    if form == "token-only":
+        inputs = PreprocessedInputs(ids)
+    elif form == "preprocess":
+        inputs = llm.preprocess(ids, SamplingParams(), disagg)
+    else:
+        inputs = ids
+    mm = submit(llm, inputs, disagg)
+    assert not restores
+    assert mm.multimodal_input.multimodal_uuids == ["red", "green"]
+    assert mm.multimodal_data["multimodal_embed_mask_cumsum"].tolist() == [0, 1, 2, 2]
+    mm.to_tensor("multimodal_data")
+    assert restores == disagg.multimodal_embedding_handles
+    assert [x.tolist() for x in mm.multimodal_data["multimodal_embedding"]] == [[[1, 1]], [[2, 2]]]
+
+
+@pytest.mark.parametrize("conflict", ["media", "digest", "rotary", "embeddings"])
+def test_prepared_prefill_conflict_is_request_local(llm, conflict):
+    llm.input_processor = EncoderHandoffProcessor()
+    ids = [0, 91, 91, 0]
+    disagg = image_handoff()
+    prepared = llm.preprocess(ids, SamplingParams(), disagg)
+    mm = prepared.multimodal_params
+    if conflict == "digest":
+        mm.multimodal_input.multimodal_hashes[0][0] = 3
+    else:
+        field, value = {
+            "media": ("image", {}),
+            "rotary": ("mrope_config", {"x": 3}),
+            "embeddings": ("multimodal_embedding", []),
+        }[conflict]
+        mm.multimodal_data[field] = value
+    with pytest.raises(ValueError, match="conflict"):
+        submit(llm, prepared, disagg)
+    assert not llm._executor.requests
+    following = submit(llm, PreprocessedInputs(ids), image_handoff())
+    following.to_tensor("multimodal_data")
+    assert following.multimodal_data["multimodal_embedding"][0].tolist() == [[1, 1]]
+
+
+def test_hashless_encoder_rejects_ambiguous_framing_between_items():
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+    from tensorrt_llm.llmapi.llm import _encoder_input_from_item_lengths
+
+    metadata = MultimodalItemMetadata([("image", 0), ("image", 1)], output_embedding_lengths=[1, 1])
+    mm = MultimodalParams(multimodal_data={MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata})
+    with pytest.raises(ValueError, match="inter-item framing"):
+        _encoder_input_from_item_lengths({}, [0, 91, 93, 93, 91, 0], mm, EncoderHandoffProcessor())
+
+
+def test_encoder_media_requires_portable_rotary_and_embeddings(llm):
+    llm.input_processor = EncoderHandoffProcessor()
+    llm.input_processor.uses_mrope = True
+    with pytest.raises(ValueError, match="requires portable mRoPE"):
+        submit(llm, [0, 91, 91, 0], image_handoff())
+    disagg = image_handoff(sizes=())
+    disagg.multimodal_embedding_handles = None
+    with pytest.raises(ValueError, match="one embedding handle per item"):
+        submit(llm, PreprocessedInputs([0, 91, 91, 0]), disagg)
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_raw_python_media_uses_encoder_prompt_and_checks_expanded_ids(llm, conflict):
+    from tensorrt_llm.inputs.multimodal import (
+        MultimodalInputLayout,
+        apply_mm_hashes,
+        hexdigest_to_int32,
+    )
+
+    llm.input_processor = EncoderHandoffProcessor()
+    disagg = image_handoff()
+    media = {"image": [torch.tensor([10]), torch.tensor([20])]}
+    uuids = {"image": ["red", "green"]}
+    hashes = apply_mm_hashes(media, uuids).hashes["image"]
+    disagg.multimodal_input["multimodal_hashes"] = [hexdigest_to_int32(h) for h in hashes]
+    disagg.multimodal_input_layout = MultimodalInputLayout(
+        prompt_token_ids=[0, 91, 91, 0],
+        multimodal_lengths=[1, 1],
+        multimodal_positions=[1, 2],
+        multimodal_embedding_lengths=[1, 1],
+    )
+    inputs = {
+        "multi_modal_uuids": uuids,
+        "multi_modal_data": media,
+        "prompt_token_ids": [99, 91, 91, 0] if conflict else [91, 91],
+    }
+    if conflict:
+        with pytest.raises(ValueError, match="conflict"):
+            submit(llm, inputs, disagg)
+        return
+    mm = submit(llm, inputs, disagg)
+    mm.to_tensor("multimodal_data")
+    assert mm.multimodal_data["multimodal_embed_mask_cumsum"].tolist() == [0, 1, 2, 2]
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_retained_counts_cannot_select_legacy_admission_on_plain_processor(llm, prepared):
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+
+    llm.input_processor = EncoderHandoffProcessor()
+    disagg = image_handoff(starts=(2, 1))
+    handles = disagg.multimodal_embedding_handles
+    for h in handles:
+        h["metadata"] = {"retained_token_counts": [1]}
+    ids = [0, 91, 91, 0]
+    if prepared:
+        metadata = MultimodalItemMetadata(
+            [("video", 0), ("video", 1)], output_embedding_lengths=[1, 1]
+        )
+        inputs = PreprocessedInputs(
+            ids,
+            MultimodalParams(
+                multimodal_data={
+                    "multimodal_embedding": handles,
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+                }
+            ),
+        )
+    else:
+        inputs = {"prompt_token_ids": ids, "multi_modal_data": {"video": []}}
+    with pytest.raises(ValueError, match="retained_token_counts require a pruned video"):
+        submit(llm, inputs, disagg)
+    assert not llm._executor.requests
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["final", "hashless", "swapped-runs", "swapped-refs", "wrong-length", "wrong-frame", "uuid"],
+)
+def test_prepared_evs_uses_final_video_layout(llm, case):
+    from dataclasses import asdict
+
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MultimodalInput,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+    from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
+
+    processor = NemotronHMultimodalInputProcessor.__new__(NemotronHMultimodalInputProcessor)
+    processor._config = SimpleNamespace(llm_config=SimpleNamespace(hidden_size=2, vocab_size=1024))
+    processor._img_start_token_ids, processor._img_end_token_ids = [500], [501]
+    processor._sound_start_token_id = processor._sound_context_token_id = None
+    processor.video_pruning_rate, processor.img_context_token_id = 0.5, 20
+    llm.input_processor = processor
+
+    ids = [10, 500, 20, 501, 11, 500, 20, 20, 501, 12]
+    handles = [
+        SharedTensorContainer.from_tensor_bytes(torch.ones(size, 2)).dump_to_dict()
+        for size in (1, 2)
+    ]
+    for size, handle in enumerate(handles, start=1):
+        handle["metadata"] = {"retained_token_counts": [size]}
+    hashes = None if case == "hashless" else [[5] * 8, [6] * 8]
+    refs = [("video", 0), ("video", 1)]
+    mm = MultimodalParams.from_embeddings(
+        handles,
+        MultimodalItemMetadata(
+            refs[::-1] if case == "swapped-refs" else refs,
+            output_embedding_lengths=[2, 1] if case == "wrong-length" else [1, 2],
+        ),
+        multimodal_positions=[1, 5],
+        multimodal_lengths=[3, 4],
+        multimodal_hashes=hashes,
+        multimodal_item_run_cu_offsets=[0, 1, 2],
+        multimodal_run_positions=[1, 5],
+        multimodal_run_lengths=[3, 4],
+        special_token_offsets=[0, 2, 3, 6],
+    )
+    maybe_compute_mm_embed_cumsum(ids, {"multimodal_data": mm.multimodal_data}, processor)
+    source = None
+    if hashes is not None:
+        # The encoder's pre-pruning spans differ from the finalized video layout.
+        source = asdict(
+            MultimodalInput.from_components(
+                hashes, [1, 9], [7, 8], ["a", "b"], [0, 1, 2], [1, 9], [7, 8]
+            )
+        )
+        mm.multimodal_input.multimodal_uuids = ["b", "a"] if case == "uuid" else ["a", "b"]
+    if case == "swapped-runs":
+        mm.multimodal_input.multimodal_run_positions[:] = [5, 1]
+    if case == "wrong-frame":
+        handles[1]["metadata"]["retained_token_counts"] = [1, 1]
+
+    inputs = PreprocessedInputs(ids, mm)
+    disagg = DisaggregatedParams(
+        request_type="context_and_generation",
+        multimodal_input=source,
+        multimodal_embedding_handles=handles,
+    )
+    if case in ("final", "hashless"):
+        assert submit(llm, inputs, disagg) is mm
+    else:
+        with pytest.raises(ValueError):
+            submit(llm, inputs, disagg)
+        assert not llm._executor.requests
+
+
+def test_legacy_prepared_embedding_runs_are_checked_at_submission(llm):
+    from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
+
+    llm.input_processor = EncoderHandoffProcessor()
+    handles = [
+        SharedTensorContainer.from_tensor_bytes(torch.tensor([[1, 2]])).dump_to_dict()
+        for _ in range(2)
+    ]
+    hashes = [[1] * 8, [2] * 8]
+    mm = MultimodalParams.from_embeddings(
+        handles,
+        MultimodalItemMetadata([("image", 0), ("image", 1)], output_embedding_lengths=[1, 1]),
+        multimodal_hashes=hashes,
+        multimodal_positions=[1, 2],
+        multimodal_lengths=[1, 1],
+        multimodal_item_run_cu_offsets=[0, 1, 2],
+        multimodal_run_positions=[1, 2],
+        multimodal_run_lengths=[1, 1],
+    )
+    inputs = PreprocessedInputs([0, 91, 91, 0], mm)
+    disagg = DisaggregatedParams(
+        request_type="context_and_generation",
+        multimodal_hashes=hashes,
+        multimodal_embedding_handles=handles,
+    )
+    assert submit(llm, inputs, disagg) is mm
+    mm.multimodal_input.multimodal_positions[:] = [1, 1]
+    mm.multimodal_input.multimodal_run_positions[:] = [1, 1]
+    with pytest.raises(ValueError, match="ordered and non-overlapping"):
+        submit(llm, inputs, disagg)
+    assert len(llm._executor.requests) == 1

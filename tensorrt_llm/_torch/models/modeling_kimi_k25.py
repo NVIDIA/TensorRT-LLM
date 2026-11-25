@@ -49,7 +49,11 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -1280,6 +1284,8 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 img = to_pil_image(img)
             medias.append({"type": "image", "image": img})
 
+        refs: list[tuple[str, int]] = []
+        video_chunks: List[List[Dict[str, Any]]] = []
         video_prompt_parts: List[str] = []
         if videos:
             # Read video processing config from the HF image processor
@@ -1328,53 +1334,63 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                         sample_fps=sfps,
                         timestamp_mode=ts_mode,
                     )
-                medias.extend(chunks)
+                video_chunks.append(chunks)
                 video_prompt_parts.append(vid_prompt)
 
-        # Replace the video placeholder(s) in the prompt with actual
-        # chunk-level timestamp prompts (matching HF update_raw_text).
-        #
-        # Two cases:
-        # 1. Prompt contains <|kimi_k25_video_placeholder|> (explicit video
-        #    placeholder from chat template or manual prompt).
-        # 2. Prompt contains auto-inserted <|media_begin|><|media_pad|><|media_end|>
-        #    from the framework's placeholder_map (high-level LLM.generate() API).
-        #    In this case images and videos share the same placeholder string.
-        #    Images come first in the prompt, videos after, so we skip the
-        #    first N_images occurrences.
-        #
-        # In both cases, each video's single placeholder must be replaced
-        # with the concatenated per-chunk timestamp prompts (each chunk has
-        # its own <|media_pad|> for the vision encoder).
-        if video_prompt_parts:
-            video_placeholder = getattr(
+        # Each video can produce multiple physical chunks. Keep those chunks
+        # together and interleave them with images in the original prompt order.
+        if videos:
+            image_marker = "<|media_begin|><|media_pad|><|media_end|>"
+            video_marker = getattr(
                 self._config, "video_placeholder", "<|kimi_k25_video_placeholder|>"
             )
-
-            if video_placeholder in text_prompt:
-                for vid_prompt in video_prompt_parts:
-                    text_prompt = text_prompt.replace(video_placeholder, vid_prompt, 1)
+            order = inputs.get("mm_item_order")
+            if video_marker in text_prompt:
+                parts = text_prompt.split(video_marker)
+                if len(parts) != len(videos) + 1:
+                    raise ValueError("Number of video placeholders does not match video inputs")
+                modalities = []
+                for i, part in enumerate(parts):
+                    modalities.extend(["image"] * part.count("<|media_pad|>"))
+                    if i < len(videos):
+                        modalities.append("video")
+                replacements = video_prompt_parts
             else:
-                # Auto-inserted placeholder from framework's placeholder_map.
-                # Both images and videos use the same placeholder string, so
-                # skip the first N_images occurrences (image placeholders),
-                # then replace the next ones (video placeholders).
-                auto_ph = "<|media_begin|><|media_pad|><|media_end|>"
-                n_img = len(images)
-                for vid_prompt in video_prompt_parts:
-                    # Find the (n_img+1)-th occurrence and replace it.
-                    idx = 0
-                    for _ in range(n_img + 1):
-                        idx = text_prompt.find(auto_ph, idx)
-                        if idx == -1:
-                            break
-                    if idx != -1:
-                        text_prompt = (
-                            text_prompt[:idx] + vid_prompt + text_prompt[idx + len(auto_ph) :]
-                        )
-                    # After replacement, the image placeholders still count
-                    # the same but the replaced video placeholder is now
-                    # multiple chunk prompts, so n_img stays the same.
+                modalities = (
+                    [ref["modality"] for ref in order]
+                    if order
+                    else ["image"] * len(images) + ["video"] * len(videos)
+                )
+                parts = text_prompt.split(image_marker)
+                if (
+                    len(parts) != len(modalities) + 1
+                    or modalities.count("video") != len(videos)
+                    or modalities.count("image") != len(images)
+                ):
+                    raise ValueError("Media placeholders do not match image and video inputs")
+                video_prompts = iter(video_prompt_parts)
+                replacements = [
+                    image_marker if modality == "image" else next(video_prompts)
+                    for modality in modalities
+                ]
+            text_prompt = parts[0]
+            for marker, part in zip(replacements, parts[1:], strict=True):
+                text_prompt += marker + part
+            indices = {"image": 0, "video": 0}
+            for modality in modalities:
+                refs.append((modality, indices[modality]))
+                indices[modality] += 1
+            if indices != {"image": len(images), "video": len(videos)} or (
+                order and refs != [(ref["modality"], ref["index"]) for ref in order]
+            ):
+                raise ValueError("Media order does not match Kimi prompt placeholders")
+            image_medias = medias
+            medias = []
+            for modality, i in refs:
+                if modality == "image":
+                    medias.append(image_medias[i])
+                else:
+                    medias.extend(video_chunks[i])
 
         if videos:
             # When we have pre-decoded video_chunk items, we CANNOT pass
@@ -1459,6 +1475,8 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         # Do NOT duplicate under "video" — that would cause forward()
         # to process the same tensors twice and trigger device mismatches.
         multimodal_data: Dict[str, Any] = {}
+        if refs:
+            multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(refs)
         pv = processed.get("pixel_values")
         gt = processed.get("grid_thws", processed.get("image_grid_thw"))
         if pv is not None:
@@ -1470,85 +1488,6 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         return input_ids.to(torch.int32).tolist(), {
             "multimodal_data": multimodal_data,
         }
-
-    def build_disagg_prefill_multimodal_inputs(
-        self,
-        inputs: TextPrompt,
-        mm_handles: List[Dict[str, Any]],
-        *,
-        mm_hashes: list[list[int]] | None = None,
-    ) -> tuple[list[int], MultimodalParams]:
-        """Build disaggregated prefill inputs from multimodal embedding handles.
-
-        Args:
-            inputs: Text prompt input container.
-            mm_handles: List of multimodal embedding handles, each
-                containing ``tensor_size``.
-            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
-
-        Returns:
-            Expanded token IDs and common multimodal params containing
-            prompt layout, item metadata, and embedding handles.
-        """
-        text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
-
-        text_config = getattr(self._config, "text_config", self._config)
-        expected_hidden_size = text_config.hidden_size
-        for i, mm_handle in enumerate(mm_handles):
-            hidden_size = mm_handle["tensor_size"][1]
-            if hidden_size != expected_hidden_size:
-                raise RuntimeError(
-                    f"Multimodal embedding {i} hidden size {hidden_size} "
-                    f"must match model hidden size {expected_hidden_size}"
-                )
-
-        input_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids[0]
-
-        placeholder_id = self._media_placeholder_token_id
-        image_mask = input_ids == self._media_placeholder_token_id
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(mm_handles), (
-            f"Number of placeholders ({num_images}) must match "
-            f"number of mm_handles ({len(mm_handles)})"
-        )
-
-        total_mm_tokens = sum(h["tensor_size"][0] for h in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length = []
-        mm_token_offsets = []
-
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == self._media_placeholder_token_id:
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos : write_pos + mm_token_num] = placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        return expanded_ids.to(torch.int32).tolist(), MultimodalParams.from_embeddings(
-            mm_handles,
-            MultimodalItemMetadata(
-                [("image", i) for i in range(len(mm_handles))],
-                output_embedding_lengths=[handle["tensor_size"][0] for handle in mm_handles],
-            ),
-            multimodal_hashes=mm_hashes,
-            multimodal_lengths=mm_token_length,
-            multimodal_positions=mm_token_offsets,
-            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
-            multimodal_run_positions=mm_token_offsets,
-            multimodal_run_lengths=mm_token_length,
-        )
 
 
 # ---------------------------------------------------------------------------
