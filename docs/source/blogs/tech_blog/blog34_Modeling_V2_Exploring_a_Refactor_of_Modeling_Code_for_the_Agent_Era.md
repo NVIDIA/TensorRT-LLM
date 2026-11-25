@@ -286,9 +286,18 @@ The deepest change is speculative decoding. In the GLM-5.3-Flash ModelCores, MTP
 - the commit of the recurrent KDA state;
 - the next draft chain.
 
-No separate speculative worker runs after the forward. The engine keeps only what lies outside it: input packing, the sampler and the KV rewind. The whole step therefore runs in one CUDA graph together with the rest of the model, and the draft and verify kernels are tuned together with the rest of the model. On the NVFP4 TP4 ModelCore, the entire decode step is launched by one native C++ step program.
+No separate speculative worker runs after the forward. The engine keeps only what lies outside it: input packing, the sampler and the KV rewind. The whole step therefore runs in one CUDA graph, and the draft and verify kernels are tuned together with the rest of the model. On the NVFP4 TP4 ModelCore, the entire decode step is launched by one native C++ step program.
 
-**[TBD: performance results]**
+GLM-5.3-Flash also has a Modeling V1 implementation, so we can compare the two directly. Figure 3 shows both on four GB300 GPUs with TP4 and MTP with three draft tokens. The two runs use the same serving configuration and differ only in the `modeling_v2` option. Both fix the MTP acceptance length to the same value, so the comparison measures the cost of a step, not the quality of the drafts. At concurrency 1, interactivity doubles from 524 to 1,075 tok/s/user. At concurrency 16, it rises from 191 to 532 tok/s/user (2.8×). At concurrency 32, throughput per GPU rises from 24.0k to 45.5k tokens/s (1.9×).
+
+<div align="center">
+<figure>
+  <img src="../media/tech_blog34_glm53_pareto.svg" width="900">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: GLM-5.3-Flash NVFP4 on four GB300 GPUs with TP4 and MTP (three draft tokens). The Modeling V1 line runs the built-in implementation; the Modeling V2 line runs the NVFP4 TP4 ModelCore. Each line is the Pareto frontier of the EP1 and EP4 configurations, labeled by layout and concurrency.</em></sub></p>
+
+We have not yet profiled how the gain splits between its sources. Besides the fused step, the Modeling V2 ModelCore runs the MTP experts in FP8, where Modeling V1 falls back to an unquantized MoE path, and the two implementations use different KV cache layouts.
 
 ## Future Work
 
