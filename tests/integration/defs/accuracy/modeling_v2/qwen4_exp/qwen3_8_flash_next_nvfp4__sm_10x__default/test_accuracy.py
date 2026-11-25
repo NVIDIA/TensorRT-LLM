@@ -429,12 +429,15 @@ _DEP8 = dict(
 # once more with host-indexed slots and the router front (`lamport_step` and
 # `TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT=1`, class S: the bf16 trunk router at 48-112 gathered rows),
 # and FP8 at tep4 once more with each decode MoE block's finalize and all-reduce in one Lamport
-# launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only). FP8 at dep4 once more with both
-# output projections on the bf16 mid-rows GEMM (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in,
-# another K split; SM103 only), and once more with the two opt-in attention-DP row ranges: the
-# grouped sparse GQA from 2 requests a rank (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another
-# summation order than split-K) and the cluster top-k up to 256 rows
-# (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`). Then the whole attention-DP stack the AgentX
+# launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only), and once with every opt-in tep4 form on
+# (the draft layer on the one-rank form, the router GEMM in the route front's launch, the split-K
+# projections past the low-M table, the fused finalize all-reduce; SM103 only). FP8 at dep4 once
+# more with both output projections on the bf16 mid-rows GEMM
+# (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in, another K split; SM103 only), and once more
+# with the two opt-in attention-DP row ranges: the grouped sparse GQA from 2 requests a rank
+# (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another summation order than split-K) and the
+# cluster top-k up to 256 rows (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`).
+# Then the whole attention-DP stack the AgentX
 # front points run, every opt-in form together on top of the default ones (host-indexed Lamport
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
 # widest; SM103 only), at dep4 and at dep8 (two nodes of one rack).
@@ -518,6 +521,16 @@ _QUANTIZED_KV = [
         marks=pytest.mark.skipif(
             get_sm_version() != 103,
             reason="the fused MoE finalize all-reduce is certified on SM103",
+        ),
+    ),
+    pytest.param(
+        _TEP4,
+        "fp8",
+        dict(finar="early", tep_opt_in=True),
+        id="tep4_fp8_kv_opt_in",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the decode front and the fused MoE finalize all-reduce are certified on SM103",
         ),
     ),
 ]
@@ -946,6 +959,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("dp_rows"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
+        if variant.get("tep_opt_in"):
+            for name in ("DRAFT_LAYER", "MOE_FRONT", "PROJ_SPLITK"):
+                env[f"TRTLLM_QWEN4_EXP_TEP_{name}"] = "1"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
             scoped_env_overrides(env) as rank_env,
