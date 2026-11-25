@@ -147,7 +147,7 @@ def _encrypt(raw: bytearray, archive: zipfile.ZipFile) -> None:
         raw[central + 8] |= 1
 
 
-def _corrupt(record: str) -> Callable:
+def _corrupt(record: str) -> Callable[[bytearray, zipfile.ZipFile], None]:
     """An edit flipping a bit of one record's first byte, keeping its declared CRC."""
 
     def edit(raw: bytearray, archive: zipfile.ZipFile) -> None:
@@ -157,7 +157,9 @@ def _corrupt(record: str) -> Callable:
     return edit
 
 
-def _zip64_edit(field: int, value: Callable[[int], int], in_record: bool) -> Callable:
+def _zip64_edit(
+    field: int, value: Callable[[int], int], in_record: bool
+) -> Callable[[bytearray, zipfile.ZipFile], None]:
     """An edit of one 8-byte field of the zip64 locator, or of the record it points to."""
 
     def edit(raw: bytearray, archive: zipfile.ZipFile) -> None:
@@ -366,7 +368,8 @@ def test_whitespace_retry_releases_the_failed_attempt() -> None:
 
 
 _FRAMED = b"\x80\x04\x95" + (10_000).to_bytes(8, "little")
-_BODY = _pickle((4, 2), (2, 1), 8)[2:]
+_GOOD = _pickle((4, 2), (2, 1), 8)
+_BODY = _GOOD[2:]
 # An outer frame holding an inner frame that holds the whole body.
 _NESTED = b"\x80\x04" + b"".join(
     b"\x95" + n.to_bytes(8, "little") for n in (9 + len(_BODY), len(_BODY))
@@ -388,6 +391,12 @@ _PICKLE_REJECTED = {
     "escaped-global": (
         _pickle((4, 2), (2, 1), 8, rebuild=b"ctorch\\x2e_utils\n_rebuild_tensor_v2\n"),
         "malformed",
+    ),
+    "empty-tuple-hooks": (_GOOD.replace(b"ccollections\nOrderedDict\n)R", b")"), "exactly one"),
+    "four-field-storage-id": (_GOOD.replace(b"X\x03\x00\x00\x00cpu", b""), "exactly one"),
+    "non-storage-global-in-id": (
+        _GOOD.replace(b"ctorch\nFloatStorage\n", b"ccollections\nOrderedDict\n"),
+        "exactly one",
     ),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
     # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
