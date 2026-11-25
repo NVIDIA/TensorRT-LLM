@@ -119,12 +119,28 @@ _WIDE: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
 }
 
 
+#: Shapes `wide` 2 runs on split-K's own default tactic at every row up to `WIDE_MAX_ROWS`, ahead
+#: of `_TABLE`'s rows: the shared expert's gate|up (with or without its gate row), the shape a
+#: tep4 rank's measured shared expert ran that way at 4..16 rows (GB300 tep4, against cuBLAS:
+#: -0.037 / -0.073 / -0.013 / -0.047 ms a step at 1-4 requests). The table's own rows for it
+#: (direct at <= 4 rows, split-K (64, 8, 4, 10) at <= 8) were not measured in a step.
+_WIDE_DEFAULT_FIRST = frozenset({(1280, 2560), (1296, 2560)})
+
+
 @functools.lru_cache(maxsize=None)
 def plan(m: int, n: int, k: int, wide: int = 0) -> _Plan:
     """The kernel and tactic `LowMBf16Mm` launches for an [M, K] x [K, N] product. `wide` 1 adds
     `_WIDE`'s rows past the table; 2 also runs any other shape of up to `WIDE_MAX_ROWS` rows on
     split-K's own default tactic where that tactic takes it (the shared expert, the PLE
-    projections), cuBLAS where it does not."""
+    projections), cuBLAS where it does not, and `_WIDE_DEFAULT_FIRST`'s shapes on that tactic
+    ahead of the table."""
+    if wide == 2 and (n, k) in _WIDE_DEFAULT_FIRST and m <= WIDE_MAX_ROWS:
+        try:
+            t = _fi_splitk.default_tactic(m, n, k)
+            _fi_splitk.validate_tactic(t, m, n, k)
+            return _Plan("splitk", t)
+        except Exception:  # noqa: BLE001 — a refused shape takes the table's rows below
+            pass
     for bound, choice in _TABLE.get((n, k), ()):
         if m <= bound:
             if choice[0] == "direct":
@@ -231,6 +247,15 @@ class LowMBf16Mm(OpWrapper):
             "splitk",
             True,
             wide=1,
+        ),
+        _cell(
+            "tep4 shared expert gate|up M=4, wide 2: split-K default tactic ahead of the table",
+            4,
+            1296,
+            2560,
+            "splitk",
+            True,
+            wide=2,
         ),
         _cell(
             "tep4 shared expert down M=16, wide 2: split-K default tactic, pdl on",

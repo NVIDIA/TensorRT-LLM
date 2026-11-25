@@ -120,7 +120,21 @@ _WIDE_PINS = (
     (2, 4352, 2560, 1, "direct"),
     (12, 10240, 2560, 0, "cublas"),
     (17, 2560, 640, 2, "cublas"),
+    (4, 1296, 2560, 2, "splitk"),  # _WIDE_DEFAULT_FIRST: ahead of the table's direct row
+    (8, 1280, 2560, 2, "splitk"),
+    (4, 1296, 2560, 1, "direct"),  # wide 0 / 1 keep the table's row
+    (17, 1296, 2560, 2, "cublas"),
 )
+
+
+def test_plan_wide_2_runs_the_shared_gate_up_on_the_default_tactic() -> None:
+    """The measured form: split-K's own default tactic, not the table's (64, 8, 4, 10) row."""
+    from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as fi_splitk
+
+    for m in (4, 8, 12, 16):
+        picked = plan(m, 1296, 2560, 2)
+        assert picked.kind == "splitk", m
+        assert picked.tactic == fi_splitk.default_tactic(m, 1296, 2560), m
 
 
 def test_plan_pins_the_wide_rows() -> None:
