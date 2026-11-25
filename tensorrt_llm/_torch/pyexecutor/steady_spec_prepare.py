@@ -1200,7 +1200,8 @@ class SteadyMtpPrepare:
         rng_state: tuple[list[int], list[int]] | None = None,
         rng_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         from_host: bool = False,
-    ) -> tuple[list[int], list[int], int, np.ndarray, bool]:
+        copy_host_positions: bool = False,
+    ) -> tuple[list[int], list[int], int, np.ndarray | None, bool]:
         """Write this step's device inputs (one slab write, one kernel launch).
 
         Args:
@@ -1214,11 +1215,13 @@ class SteadyMtpPrepare:
             rng_buffers: ``SpecMetadata``'s (request_seeds, request_offsets, seeds, offsets).
             from_host: The requests joined this step (``admit``): their last token and drafts come
                 from the host, and nothing past their last token is cached.
+            copy_host_positions: Return a copy of the positions for host-side metadata.
 
         Returns:
             The per-row cached-token counts (``KVCacheParams.num_cached_tokens_per_seq``) and KV
             lengths (without the extra spec tokens), the number of tokens staged in the CUDA graph's
-            static inputs (0: none), the host positions, and whether the launch did the hooks' work.
+            static inputs (0: none), the host positions when requested, and whether the launch did
+            the hooks' work.
         """
         rec = self.record
         b = len(rec.slots)
@@ -1275,7 +1278,7 @@ class SteadyMtpPrepare:
         else:
             plan = self._glue_plan(rec, n)
         assert used <= self.slab_capacity
-        host_positions = positions.copy()
+        host_positions = positions.copy() if copy_host_positions else None
         if self.zero_copy:
             slab = self.host_slabs[k]
         else:
