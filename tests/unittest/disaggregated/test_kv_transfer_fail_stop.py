@@ -656,9 +656,6 @@ def test_shutdown_retains_receive_reserved_for_blocked_publication() -> None:
 def test_existing_proxy_closes_endpoint_after_retirement_worker_death() -> None:
     """The existing supervisor fails pending requests and rejects replacement work."""
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy._init_lifecycle()
-    # This lifecycle-only fixture owns no worker or transport to shut down.
-    proxy._shutdown_complete = True
     proxy._engine_dead = False
     proxy._fatal_error = None
     proxy.doing_shutdown = False

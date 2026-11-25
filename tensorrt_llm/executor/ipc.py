@@ -38,10 +38,6 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
 CLOSE_LINGER_MS = 1000
 
 
-class RequestSendCancelled(RuntimeError):
-    """A proxy-owned send stopped before delivery because it was cancelled."""
-
-
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
 
@@ -89,7 +85,6 @@ class ZeroMqQueue:
         self.socket = None
 
         self._setup_done = False
-        self._interruptible_send_configured = False
         self.name = name
         self.socket = self.context.socket(socket_type)
         self.socket.set_hwm(0)
@@ -229,46 +224,6 @@ class ZeroMqQueue:
             else:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
-
-    def put_interruptible(self, obj: Any, should_stop: Callable[[],
-                                                                bool]) -> None:
-        """Send on a proxy-owned socket until delivery or local cancellation.
-
-        A 50 ms SNDTIMEO remains on this socket after its first interruptible
-        send. Later blocking sends on the same socket can therefore raise
-        ``zmq.Again``; other sockets are unchanged. Successful sends add no
-        poll, while retries let the owning thread observe cancellation without
-        another thread closing its socket.
-
-        Args:
-            obj: Object to serialize and deliver to the peer.
-            should_stop: Predicate checked before setup and between send
-                attempts. Returning True cancels delivery; the predicate must
-                return promptly for cancellation to remain responsive.
-
-        Raises:
-            RequestSendCancelled: Local cancellation interrupted delivery.
-                This exception is a RuntimeError subclass.
-            zmq.ZMQError: A transport error other than a retryable send timeout.
-        """
-        cancelled = "Executor proxy request send cancelled during shutdown."
-        if should_stop():
-            raise RequestSendCancelled(cancelled)
-        self.setup_lazily()
-        self._check_thread_safety()
-        if not self._interruptible_send_configured:
-            self.socket.setsockopt(zmq.SNDTIMEO, 50)
-            self._interruptible_send_configured = True
-        data = self._prepare_data(obj)
-        with nvtx_range_debug("send", color="blue", category="IPC"):
-            # Serialization can outlast the shutdown deadline.
-            while not should_stop():
-                try:
-                    self._send_data(data)
-                    return
-                except zmq.Again:
-                    continue
-        raise RequestSendCancelled(cancelled)
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.

@@ -532,21 +532,16 @@ async def _rpc_shutdown() -> None:
 
                 client._client_socket.put_async = blocked_send
             if mode == "queued":
-                # An occupied pool keeps close incomplete, not falsely successful.
-                blocker = client._executor.submit(release.wait, 10)
+                # Hold the sole worker until close has stopped the RPC loop.
+                blocker = client._executor.submit(release.wait)
                 read = asyncio.wrap_future(
                     client.fetch_stats_wait_async(timeout=0.1).remote_future()
                 )
-                client._CLOSE_TIMEOUT_SECONDS = 0.05
-                with pytest.raises(TimeoutError, match="still closing"):
-                    await asyncio.to_thread(client.close)
-                assert not client._closed
-                release.set()
-                client._CLOSE_TIMEOUT_SECONDS = 3
-                await asyncio.wait_for(asyncio.to_thread(client.close), 4)
+                closing = asyncio.create_task(asyncio.to_thread(client.close))
+                await asyncio.to_thread(client._loop_thread.join, 3)
                 assert not client._loop_thread.is_alive()
-                assert client._loop.is_closed()
-                assert all(not worker.is_alive() for worker in client._executor._threads)
+                release.set()
+                await asyncio.wait_for(closing, 3)
                 assert blocker.result(timeout=1)
                 with pytest.raises(RPCCancelled):
                     await asyncio.wait_for(read, 3)
@@ -581,17 +576,28 @@ async def _rpc_shutdown() -> None:
                 assert await asyncio.wait_for(read, 3) == []
             else:
                 await asyncio.wait_for(asyncio.to_thread(client.close), 3)
-                assert not client._loop_thread.is_alive()
-                assert client._loop.is_closed()
-                assert not asyncio.all_tasks(client._loop)
-                assert all(not worker.is_alive() for worker in client._executor._threads)
-                assert asyncio.get_running_loop().is_running()
                 with pytest.raises(RPCCancelled):
                     await asyncio.wait_for(read, 3)
                 assert not client._streaming_queues
         finally:
             release.set()
             await asyncio.to_thread(client.close)
+            if mode.startswith("send_"):
+                # Drain cancellation callbacks queued after the deliberately stopped loop.
+                async def drain_cancelled_sends():
+                    pending = asyncio.all_tasks() - {asyncio.current_task()}
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                drain_thread = threading.Thread(target=client._loop.run_forever)
+                drain_thread.start()
+                await asyncio.wrap_future(
+                    asyncio.run_coroutine_threadsafe(drain_cancelled_sends(), client._loop)
+                )
+                client._loop.call_soon_threadsafe(client._loop.stop)
+                await asyncio.to_thread(drain_thread.join, 3)
+                client._loop.close()
             await asyncio.to_thread(server.shutdown)
 
 

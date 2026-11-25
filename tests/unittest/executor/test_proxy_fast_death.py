@@ -23,7 +23,6 @@ from unittest.mock import Mock
 from unittest.mock import Mock as _Mock
 
 import pytest
-import zmq
 
 from tensorrt_llm._startup_errors import (
     StartupErrorInfo,
@@ -35,7 +34,6 @@ from tensorrt_llm._startup_errors import (
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor import worker as worker_module
-from tensorrt_llm.executor.ipc import RequestSendCancelled
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
@@ -61,12 +59,9 @@ class _FakeResult:
 
 def _bare_proxy():
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy._init_lifecycle()
-    proxy._error_queue = _queue.Queue()
     proxy._engine_dead = False
     proxy._results = {}
-    proxy._request_sender = None
-    # No workers to reap on the __del__ -> shutdown() path at GC time.
+    # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
     proxy._multi_frontend_ipc_dir = None
     # Borrowed-session default; ownership-sensitive tests override it.
@@ -149,9 +144,6 @@ class _FakeWorkerInitStatusQueue:
 
     def put(self, message):
         self.acks.append(message)
-
-    def close(self) -> None:
-        pass
 
 
 class _DeadAfterRegistrationMonitor:
@@ -455,183 +447,6 @@ def test_aresult_stays_failed_after_engine_dead():
     asyncio.run(run())
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("first", ["engine_death", "shutdown"])
-def test_death_and_shutdown_handoff_notifies_async_result_once(
-    monkeypatch: pytest.MonkeyPatch, first: str
-) -> None:
-    """A paused terminal notifier retains ownership when the registry is cleared."""
-    from tensorrt_llm.executor.utils import ErrorResponse
-    from tensorrt_llm.llmapi.utils import AsyncQueue
-
-    async def run() -> None:
-        proxy = _bare_proxy()
-        result = GenerationResult.__new__(GenerationResult)
-        result.aqueue = AsyncQueue()
-        result.queue = result.aqueue.sync_q
-        result._done = False
-        result._terminal_error = None
-        result._background_error_handler = None
-        result._error_msg = None
-        proxy._results = {7: result}
-        cause = RuntimeError("worker died")
-        waiting = asyncio.Event()
-        real_wait = result.aqueue._event.wait
-
-        async def observe_wait() -> bool:
-            waiting.set()
-            return await real_wait()
-
-        monkeypatch.setattr(result.aqueue._event, "wait", observe_wait)
-        put = Mock(wraps=result.queue.put)
-        monkeypatch.setattr(result.queue, "put", put)
-        entered, release = threading.Event(), threading.Event()
-        completed = _Future()
-
-        def pause_notification() -> None:
-            entered.set()
-            if not release.wait(timeout=5):
-                raise TimeoutError("terminal notification was not released")
-
-        def dead_error(error: BaseException | None = None) -> EngineDeadError:
-            assert proxy._engine_dead
-            pause_notification()
-            return EngineDeadError(error)
-
-        def shutdown_error(client_id: int, message: str, request_id: int) -> ErrorResponse:
-            pause_notification()
-            return ErrorResponse(client_id, message, request_id)
-
-        def mark_dead() -> None:
-            proxy._mark_engine_dead(cause)
-
-        if first == "engine_death":
-            monkeypatch.setattr(proxy_module, "EngineDeadError", dead_error)
-            notify_first, notify_second = mark_dead, proxy._finish_pending_requests
-        else:
-            monkeypatch.setattr(proxy_module, "ErrorResponse", shutdown_error)
-            notify_first, notify_second = proxy._finish_pending_requests, mark_dead
-
-        def notify() -> None:
-            try:
-                notify_first()
-            except Exception as error:  # noqa: BLE001 - transfer owned-thread failures to the test
-                completed.set_exception(error)
-            else:
-                completed.set_result(None)
-
-        notifier = threading.Thread(target=notify)
-        waiter = asyncio.create_task(result.aresult())
-        try:
-            # observe_wait does not yield until the real empty-queue wait is entered.
-            await asyncio.wait_for(waiting.wait(), timeout=5)
-            assert not waiter.done()
-            assert result.aqueue.empty()
-            notifier.start()
-            assert entered.wait(timeout=5)
-            notify_second()
-            release.set()
-            notifier.join(timeout=5)
-            assert not notifier.is_alive()
-            completed.result(timeout=1)
-            if first == "engine_death":
-                with pytest.raises(EngineDeadError) as raised:
-                    await asyncio.wait_for(asyncio.shield(waiter), timeout=1)
-                assert raised.value.root_cause is cause
-                assert result._terminal_error is raised.value
-            else:
-                assert await asyncio.wait_for(asyncio.shield(waiter), timeout=1) is result
-                assert result.error == "Executor proxy shut down"
-            mark_dead()
-            proxy._finish_pending_requests()
-            put.assert_called_once()
-            assert result.aqueue.empty()
-            assert not proxy._results
-        finally:
-            release.set()
-            try:
-                if notifier.ident is not None:
-                    notifier.join(timeout=5)
-            finally:
-                waiter.cancel()
-                await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=1)
-            assert not notifier.is_alive()
-
-    asyncio.run(run())
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("error_type", [None, TimeoutError, RuntimeError])
-def test_exit_pre_shutdown_preserves_explicit_errors(
-    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception] | None
-) -> None:
-    proxy = _bare_proxy()
-    # Only the callback boundary is exercised; no executor resources were created.
-    proxy._shutdown_complete = True
-    error = error_type("teardown incomplete") if error_type is not None else None
-    pre_shutdown = Mock(return_value=None, side_effect=error)
-    warning = Mock()
-    monkeypatch.setattr(proxy, "pre_shutdown", pre_shutdown)
-    monkeypatch.setattr(proxy_module.logger, "warning", warning)
-
-    proxy._pre_shutdown_at_exit()
-    pre_shutdown.assert_called_once_with()
-    if error is None:
-        warning.assert_not_called()
-    else:
-        warning.assert_called_once()
-        assert "interpreter exit is incomplete" in warning.call_args.args[0]
-        assert str(error) in warning.call_args.args[0]
-        with pytest.raises(type(error)) as raised:
-            proxy.pre_shutdown()
-        assert raised.value is error
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("fatal_cleanup", [False, True])
-def test_monitor_warns_for_incomplete_fatal_cleanup(
-    monkeypatch: pytest.MonkeyPatch, fatal_cleanup: bool
-) -> None:
-    proxy = _bare_proxy()
-    proxy._shutdown_complete = True
-    proxy._fatal_error = None
-    monkeypatch.setattr(proxy, "_check_mpi_workers", lambda: False)
-    monkeypatch.setattr(proxy, "_check_remote_worker_death", lambda: False)
-    monkeypatch.setattr(
-        proxy._shutdown_event, "wait", lambda timeout: setattr(proxy, "doing_shutdown", True)
-    )
-    cleanup = Mock(side_effect=TimeoutError("profile cleanup incomplete"))
-    monkeypatch.setattr(proxy, "_pre_shutdown", cleanup)
-    warning = Mock()
-    debug = Mock()
-    monkeypatch.setattr(proxy_module.logger, "warning", warning)
-    monkeypatch.setattr(proxy_module.logger, "debug", debug)
-    monkeypatch.setattr(proxy_module.logger, "error", Mock())
-    worker_error = RuntimeError("worker failed")
-    if fatal_cleanup:
-        proxy._error_queue.put(worker_error)
-    else:
-        monkeypatch.setattr(
-            proxy, "_drain_error_queue", Mock(side_effect=OSError("poll unavailable"))
-        )
-
-    proxy._error_monitor_loop()
-
-    if fatal_cleanup:
-        assert proxy._fatal_error is worker_error
-        assert not proxy._pre_shutdown_complete
-        cleanup.assert_called_once_with()
-        warning.assert_called_once()
-        assert "shutdown() can retry" in warning.call_args.args[0]
-        assert "profile cleanup incomplete" in warning.call_args.args[0]
-        debug.assert_not_called()
-    else:
-        assert proxy._fatal_error is None
-        cleanup.assert_not_called()
-        warning.assert_not_called()
-        debug.assert_called_once()
-
-
 def test_submit_fast_fails_when_engine_already_dead():
     """submit() must reject new work immediately once the engine is dead."""
     proxy = _bare_proxy()
@@ -652,99 +467,37 @@ class _FakeRequest:
         self.id = request_id
 
 
-@pytest.mark.cpu_only
-def test_submit_rechecks_engine_death_after_registration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reject recorded death after result registration, before transport writes."""
+def test_submit_rechecks_engine_death_after_registration(monkeypatch):
+    """Close the submit-vs-death race.
+
+    If the engine dies between the top-of-submit guard and registering the
+    result in _results (so _mark_engine_dead's one-shot sweep misses it),
+    submit() must still fail fast and not leak the dangling result.
+    """
     proxy = _bare_proxy()
     proxy._fatal_error = None
-    monkeypatch.setattr(proxy, "_start_dispatch_threads", lambda: None)
-    monkeypatch.setattr(proxy, "_get_next_client_id", lambda: 42)
-    monkeypatch.setattr(proxy, "_get_logprob_params", lambda request: None)
-    monkeypatch.setattr(proxy, "_handle_background_error", lambda: None)
-    send = Mock()
-    monkeypatch.setattr(proxy, "_send_generation_request", send)
+    proxy._engine_dead = False
+    proxy._results = {}
+    proxy._start_dispatch_threads = lambda: None
+    proxy._get_next_client_id = lambda: 42
+    proxy._get_logprob_params = lambda request: None
+    proxy._handle_background_error = lambda *a, **k: None
+
     fake_result = _FakeResult()
-    monkeypatch.setattr(proxy_module, "GenerationResult", lambda *args, **kwargs: fake_result)
-    cause = RuntimeError("worker died after registration")
-    registered = []
 
-    class DeathAfterRegistration(dict[int, _FakeResult]):
-        def __setitem__(self, request_id: int, result: _FakeResult) -> None:
-            super().__setitem__(request_id, result)
-            registered.append(request_id)
-            proxy._engine_dead = True
-            proxy._fatal_error = cause
+    def fake_generation_result(*args, **kwargs):
+        # Simulate the error-monitor thread marking the engine dead mid-submit,
+        # after the top guard passed but as the result is being created.
+        proxy._engine_dead = True
+        return fake_result
 
-    proxy._results = DeathAfterRegistration()
-    with pytest.raises(EngineDeadError) as raised:
+    monkeypatch.setattr("tensorrt_llm.executor.proxy.GenerationResult", fake_generation_result)
+
+    with pytest.raises(EngineDeadError):
         proxy.submit(_FakeRequest())
 
-    assert registered == [42]
-    assert raised.value.root_cause is cause
-    assert not proxy._results
-    send.assert_not_called()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "send_error_type,state",
-    [
-        pytest.param(RequestSendCancelled, "engine_dead", id="cancel-after-death"),
-        pytest.param(RequestSendCancelled, "fatal_error", id="cancel-after-fatal-error"),
-        pytest.param(RequestSendCancelled, "shutdown", id="orderly-cancel"),
-        pytest.param(RuntimeError, "shutdown", id="runtime-error-during-shutdown"),
-        pytest.param(RuntimeError, "engine_dead", id="runtime-error-with-death"),
-        pytest.param(zmq.ZMQError, "engine_dead", id="zmq-error-with-death"),
-    ],
-)
-def test_submit_send_exception_contract(
-    monkeypatch: pytest.MonkeyPatch, send_error_type: type[Exception], state: str
-) -> None:
-    proxy = _bare_proxy()
-    proxy._fatal_error = None
-    monkeypatch.setattr(proxy, "_start_dispatch_threads", lambda: None)
-    monkeypatch.setattr(proxy, "_get_next_client_id", lambda: 42)
-    monkeypatch.setattr(proxy, "_get_logprob_params", lambda request: None)
-    monkeypatch.setattr(proxy, "_handle_background_error", lambda: None)
-    result = _FakeResult()
-    monkeypatch.setattr(proxy_module, "GenerationResult", lambda *args, **kwargs: result)
-    request = _FakeRequest()
-    fatal_error = RuntimeError("worker died")
-    send_error = send_error_type("send interrupted")
-    original_cause = ValueError("send cause")
-
-    def send(submitted: object) -> None:
-        assert submitted is request
-        assert proxy._results == {42: result}
-        proxy.doing_shutdown = True
-        proxy._request_transport_closed = True
-        if state == "engine_dead":
-            proxy._mark_engine_dead(fatal_error)
-        elif state == "fatal_error":
-            proxy._fatal_error = fatal_error
-        raise send_error from original_cause
-
-    monkeypatch.setattr(proxy, "_send_generation_request", send)
-    translate = send_error_type is RequestSendCancelled and state != "shutdown"
-    expected_type = EngineDeadError if translate else send_error_type
-    with pytest.raises(expected_type) as raised:
-        proxy.submit(request)
-
-    assert type(raised.value) is expected_type
-    assert not proxy._results
-    assert send_error.__cause__ is original_cause
-    if translate:
-        assert isinstance(raised.value, EngineDeadError)
-        assert raised.value.root_cause is proxy._fatal_error
-        assert raised.value.__cause__ is send_error
-    else:
-        assert raised.value is send_error
-        assert raised.value.__cause__ is original_cause
-    if state == "engine_dead":
-        notification = result.queue.get_nowait()
-        assert isinstance(notification, EngineDeadError)
-        assert notification.root_cause is fatal_error
-    assert result.queue.empty()
+    # The raced result must not be left dangling in _results.
+    assert 42 not in proxy._results
 
 
 # --- Remote (TLLM_SPAWN_PROXY_PROCESS / trtllm-llmapi-launch) mode coverage ---
@@ -836,9 +589,9 @@ def test_proxy_check_remote_worker_death_marks_engine_dead():
 
 def _teardown_proxy(engine_dead):
     proxy = _bare_proxy()
+    proxy._error_queue = _queue.Queue()
     proxy.workers_started = True
-    proxy.doing_shutdown = True
-    proxy._pre_shutdown_complete = True  # teardown path only
+    proxy.doing_shutdown = True  # skip pre_shutdown(); teardown path only
     proxy._engine_dead = engine_dead
     proxy._fatal_error = RuntimeError("worker died") if engine_dead else None
     proxy.dispatch_result_thread = None
@@ -863,7 +616,7 @@ def test_shutdown_does_not_block_on_dead_engine():
     done.set_exception(RuntimeError("captured by mpi_done_callback already"))
     proxy.mpi_futures = [pending, done]
 
-    proxy._stop_dispatch_thread = _Mock()
+    proxy._stop_dispatch_thread = _Mock(return_value=True)
 
     start = _time.monotonic()
     proxy.shutdown()
@@ -873,6 +626,7 @@ def test_shutdown_does_not_block_on_dead_engine():
     assert elapsed < 30
     assert not pending.done()
     proxy._stop_dispatch_thread.assert_called_once_with(drain=False)
+    proxy.result_queue.close.assert_called_once_with()
     # The dead pool is not joined; the session is abandoned instead.
     proxy.mpi_session.abandon.assert_called_once_with()
     proxy.mpi_session.shutdown.assert_not_called()
@@ -886,11 +640,12 @@ def test_shutdown_keeps_blocking_semantics_when_engine_alive():
     done.set_result(None)
     proxy.mpi_futures = [done]
 
-    proxy._stop_dispatch_thread = _Mock()
+    proxy._stop_dispatch_thread = _Mock(return_value=True)
 
     proxy.shutdown()
 
     proxy._stop_dispatch_thread.assert_called_once_with(drain=True)
+    proxy.result_queue.close.assert_called_once_with()
     proxy.mpi_session.shutdown.assert_called_once_with()
     proxy.mpi_session.abandon.assert_not_called()
     assert proxy.workers_started is False
@@ -911,7 +666,7 @@ def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
     stuck = [_Future() for _ in range(4)]  # never complete
     proxy.mpi_futures = [done, *stuck]
 
-    proxy._stop_dispatch_thread = _Mock()
+    proxy._stop_dispatch_thread = _Mock(return_value=True)
 
     start = _time.monotonic()
     proxy.shutdown()
@@ -924,9 +679,133 @@ def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
     assert isinstance(item, EngineDeadError)
     assert isinstance(item.root_cause, TimeoutError)
     proxy._stop_dispatch_thread.assert_called_once_with(drain=False)
+    proxy.result_queue.close.assert_called_once_with()
     proxy.mpi_session.abandon.assert_called_once_with()
     proxy.mpi_session.shutdown.assert_not_called()
     assert proxy.workers_started is False
+
+
+@pytest.mark.cpu_only
+def test_shutdown_skips_result_socket_close_without_raising_timeout_error() -> None:
+    """If a dispatcher still fails to exit, shutdown warns without raising TimeoutError."""
+    proxy = _teardown_proxy(engine_dead=True)
+    proxy.mpi_futures = []
+    dispatcher = _Mock()
+    dispatcher.is_alive.return_value = True
+    proxy.dispatch_result_thread = dispatcher
+
+    proxy.shutdown()
+
+    dispatcher.stop.assert_called_once_with()
+    dispatcher.join.assert_called_once_with(timeout=proxy._DISPATCH_STOP_TIMEOUT_S)
+    proxy.result_queue.close.assert_not_called()
+    proxy.mpi_session.abandon.assert_called_once_with()
+    assert proxy.workers_started is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "block_site", ["normal_batch", "raising_batch", "after_task_error", "after_sentinel_log"]
+)
+def test_slow_dispatcher_settles_pending_requests_when_exiting_after_join_timeout(
+    monkeypatch, block_site: str
+) -> None:
+    """A dispatcher blocked past join timeout still settles waiters and closes result_queue once."""
+    from tensorrt_llm.executor.utils import ErrorResponse
+    from tensorrt_llm.llmapi import utils as llmapi_utils
+
+    proxy = _teardown_proxy(engine_dead=False)
+    proxy.mpi_futures = []
+    proxy.garbage_collection_gen0_threshold = None
+    proxy.doing_shutdown = False
+    in_block = threading.Event()
+    release_block = threading.Event()
+    pending = _FakeResult()
+    other = _FakeResult()
+    proxy._results = {1: other, 2: pending}
+
+    class _BlockingErrorQueue:
+        def __init__(self) -> None:
+            self.items = []
+
+        def put(self, item: object) -> None:
+            in_block.set()
+            assert release_block.wait(5)
+            self.items.append(item)
+
+    class _SlowResultQueue:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def get(self) -> object:
+            if block_site == "after_task_error":
+                raise RuntimeError("task failed before stop_event")
+            if block_site == "after_sentinel_log":
+                return None
+            in_block.set()
+            assert release_block.wait(5)
+            if block_site == "raising_batch":
+                raise RuntimeError("batch read failed")
+            return [ErrorResponse(1, "in-flight", 1)]
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    if block_site == "after_task_error":
+        proxy._error_queue = _BlockingErrorQueue()
+    if block_site == "after_sentinel_log":
+        real_info = llmapi_utils.logger.info
+
+        def blocking_info(msg, *args, **kwargs):
+            if "proxy_dispatch_result_thread" in str(msg):
+                in_block.set()
+                assert release_block.wait(5)
+            return real_info(msg, *args, **kwargs)
+
+        monkeypatch.setattr(llmapi_utils.logger, "info", blocking_info)
+    proxy.result_queue = _SlowResultQueue()
+    monkeypatch.setattr(proxy, "_DISPATCH_DRAIN_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(proxy, "_DISPATCH_STOP_TIMEOUT_S", 0.02)
+    try:
+        proxy._start_dispatch_threads()
+        assert in_block.wait(5)
+        proxy.doing_shutdown = True
+        proxy.shutdown()
+        assert proxy.dispatch_result_thread.is_alive()
+        if block_site == "after_sentinel_log":
+            assert proxy.result_queue.close_calls == 1
+        else:
+            assert proxy.result_queue.close_calls == 0
+        release_block.set()
+        proxy.dispatch_result_thread.join(timeout=5)
+        assert not proxy.dispatch_result_thread.is_alive()
+        assert proxy.result_queue.close_calls == 1
+        if block_site == "normal_batch":
+            assert other.queue.get_nowait().error_msg == "in-flight"
+        else:
+            assert other.queue.get_nowait().error_msg == "Executor proxy shut down"
+        assert pending.queue.get_nowait().error_msg == "Executor proxy shut down"
+        assert not proxy._results
+    finally:
+        release_block.set()
+        if proxy.dispatch_result_thread is not None and proxy.dispatch_result_thread.is_alive():
+            proxy.dispatch_result_thread.stop()
+            proxy.dispatch_result_thread.join(timeout=5)
+
+
+@pytest.mark.cpu_only
+def test_submit_rejects_new_work_during_shutdown() -> None:
+    """Submitting after shutdown starts fails fast without registering or starting threads."""
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    proxy = _teardown_proxy(engine_dead=False)
+    proxy.doing_shutdown = True
+    proxy._results = {}
+    with pytest.raises(RuntimeError, match="shutting down"):
+        proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
+    assert proxy.dispatch_result_thread is None
+    assert not proxy._results
 
 
 @pytest.mark.cpu_only
@@ -971,16 +850,14 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
         closed.append(True)
         real_close()
 
-    def stop(*, drain: bool) -> None:
+    def stop(*, drain: bool) -> bool:
         closing_dispatcher.set()
-        real_stop(drain=drain)
+        return real_stop(drain=drain)
 
     monkeypatch.setattr(proxy.result_queue.queue, "_recv_data", recv)
     monkeypatch.setattr(proxy.result_queue, "close", close)
     monkeypatch.setattr(proxy, "_stop_dispatch_thread", stop)
-    # A healthy tail exits on its sentinel; only missing-sentinel cases need a short drain.
     monkeypatch.setattr(proxy, "_DISPATCH_DRAIN_TIMEOUT_S", 5.0 if send_tail else 0.1)
-    # Neither timed idle receive nor healthy responses should call poll().
     monkeypatch.setattr(proxy.result_queue.queue.socket, "poll", _Mock(side_effect=AssertionError))
 
     def send_final_batch() -> None:
@@ -988,7 +865,7 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
             worker_lane.put([])
             assert closing_dispatcher.wait(10)
             worker_lane.put([ErrorResponse(7, "final worker response", 7), None])
-        except Exception as error:  # noqa: BLE001 - transfer owned-thread failures to the test
+        except Exception as error:  # noqa: BLE001
             writer_completed.set_exception(error)
         else:
             writer_completed.set_result(None)
@@ -1000,11 +877,9 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
         proxy._start_dispatch_threads()
         assert received.wait(5)
         if writer is not None:
-            # A decoded warm-up batch proves the IPC lane works before shutdown.
             assert lane_ready.wait(5)
         proxy.doing_shutdown = True
         proxy.shutdown()
-        # No sleep or extra join before the at-return lifetime assertion.
         assert not proxy.dispatch_result_thread.is_alive()
         assert closed == [True]
         assert proxy._error_queue.empty()
@@ -1012,12 +887,14 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
             assert pending.queue.get_nowait().error_msg == "final worker response"
             assert not proxy.dispatch_result_thread.stop_event.is_set()
             writer_completed.result(timeout=5)
+        elif not engine_dead:
+            assert pending.queue.get_nowait().error_msg == "Executor proxy shut down"
+            assert not proxy._results
     finally:
         if writer is not None and writer.ident is not None:
             closing_dispatcher.set()
             writer.join(timeout=5)
         if proxy.dispatch_result_thread is not None and proxy.dispatch_result_thread.is_alive():
-            # Failure cleanup only: stop the reader before closing its socket.
             proxy.dispatch_result_thread.stop()
             if writer is None:
                 worker_lane.put(None)
@@ -1029,14 +906,32 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
 
 
 @pytest.mark.cpu_only
-def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(tmp_path) -> None:
-    """A sentinel in a fused batch must not skip the preceding async notification."""
+@pytest.mark.parametrize("trailing_raises", [False, True])
+def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(
+    tmp_path, monkeypatch, trailing_raises: bool
+) -> None:
+    """A sentinel or trailing cleanup error must not skip notifications, cleanup, or exit."""
     from tensorrt_llm.executor.ipc import FusedIpcQueue
     from tensorrt_llm.executor.utils import ErrorResponse
     from tensorrt_llm.llmapi.utils import AsyncQueue
 
+    released_ids = []
+
+    def flaky_release(response: object) -> None:
+        cid = getattr(response, "client_id", None)
+        released_ids.append(cid)
+        if trailing_raises and cid == 8:
+            raise RuntimeError("trailing cleanup boom")
+
+    if trailing_raises:
+        monkeypatch.setattr(proxy_module, "release_undelivered_response", flaky_release)
+
     async def run() -> None:
         proxy = _bare_proxy()
+        proxy._error_queue = _queue.Queue()
+        proxy.dispatch_result_thread = None
+        proxy.garbage_collection_gen0_threshold = None
+        proxy.doing_shutdown = False
         proxy.result_queue = FusedIpcQueue(
             (f"ipc://{tmp_path / 'final.sock'}", b"private-test-key"),
             is_server=True,
@@ -1048,6 +943,15 @@ def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(tmp_path) ->
         pending.queue = aqueue.sync_q
         proxy._results = {7: pending}
         ready = asyncio.Event()
+        get_calls = 0
+        real_get = proxy.result_queue.get
+
+        def counting_get() -> object:
+            nonlocal get_calls
+            get_calls += 1
+            return real_get()
+
+        monkeypatch.setattr(proxy.result_queue, "get", counting_get)
 
         async def wait_response() -> object:
             ready.set()
@@ -1056,14 +960,25 @@ def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(tmp_path) ->
         waiter = asyncio.create_task(wait_response())
         try:
             await ready.wait()
-            worker_lane.put([ErrorResponse(7, "final response", 7), None])
-            assert not await asyncio.to_thread(proxy.dispatch_result_task)
+            batch = [ErrorResponse(7, "final response", 7), None]
+            if trailing_raises:
+                batch.extend([ErrorResponse(8, "trailing-1", 8), ErrorResponse(9, "trailing-2", 9)])
+            worker_lane.put(batch)
+            proxy._start_dispatch_threads()
             response = await asyncio.wait_for(waiter, 2)
+            await asyncio.to_thread(proxy.dispatch_result_thread.join, 5)
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert get_calls == 1
             assert response.error_msg == "final response"
             assert not proxy._results
+            if trailing_raises:
+                assert released_ids == [8, 9]
         finally:
             waiter.cancel()
             await asyncio.gather(waiter, return_exceptions=True)
+            if proxy.dispatch_result_thread is not None and proxy.dispatch_result_thread.is_alive():
+                proxy.dispatch_result_thread.stop()
+                proxy.dispatch_result_thread.join(timeout=5)
             worker_lane.close()
             proxy.result_queue.close()
 
@@ -1232,11 +1147,11 @@ def _proxy_awaiting_worker_init(
     proxy._fatal_error = None
     proxy._owns_mpi_session = owns_session
     proxy.worker_cls = object
-    # This init-wait fake owns no runtime resources. Suppress only its shutdown
-    # phases, including finalizer waits on deliberately pending futures;
-    # lifecycle tests using _bare_proxy() still exercise real teardown.
+    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
+    # time is live: keep it out of pre_shutdown(), whose attributes (the
+    # worker-process monitor teardown, the request queue) this fixture does
+    # not seed.
     proxy.doing_shutdown = True
-    proxy._shutdown_complete = True
 
     worker_future = _Future()
     if ready_status is None:
@@ -1284,7 +1199,6 @@ def test_worker_death_during_init_aborts_the_wedged_world():
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
     # Pending work fails fast rather than waiting on a gone producer.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
-    proxy.mpi_session.abandon.assert_not_called()
 
 
 def test_worker_death_during_init_does_not_abort_borrowed_session():
@@ -1425,8 +1339,6 @@ def test_non_ready_status_during_init_aborts_then_marks_dead():
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
     # Pending work fails fast on this path too.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
-    assert not proxy.mpi_futures[0].done()
-    proxy.mpi_session.abandon.assert_not_called()
 
 
 def test_non_ready_status_reports_worker_rank_stage_and_root_cause():

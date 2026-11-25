@@ -375,12 +375,8 @@ def test_proxy_batching_preserves_hint_snapshots() -> None:
 
     request_queue = queue.Queue()
     error_queue = queue.Queue()
-    transport = SimpleNamespace(
-        put_interruptible=lambda message, should_stop: request_queue.put(message)
-    )
-    sender = _RequestSender(transport, error_queue)
+    sender = _RequestSender(request_queue, error_queue)
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    proxy._init_lifecycle()
     proxy.workers_started = False
     proxy._request_sender = sender
     try:

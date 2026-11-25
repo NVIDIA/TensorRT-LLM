@@ -51,16 +51,9 @@ class RpcExecutorMixin:
 
         self._results = {}
         self._shutdown_event = threading.Event()
-        self._rpc_client_close_pending = False
         self.main_loop_task_obj = None
         self.main_loop = None
         self.main_loop_thread = None
-
-    def _close_rpc_client(self) -> None:
-        # A later shutdown retries only local cleanup, not worker teardown.
-        self._rpc_client_close_pending = True
-        self.rpc_client.close()
-        self._rpc_client_close_pending = False
 
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"
