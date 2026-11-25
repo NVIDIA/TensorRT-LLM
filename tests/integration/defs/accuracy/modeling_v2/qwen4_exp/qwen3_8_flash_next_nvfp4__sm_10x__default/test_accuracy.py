@@ -437,6 +437,9 @@ _DEP8 = dict(
 # with the two opt-in attention-DP row ranges: the grouped sparse GQA from 2 requests a rank
 # (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another summation order than split-K) and the
 # cluster top-k up to 256 rows (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`).
+# FP8 at dep4 once more with the e4m3 QSA index anchors
+# (`TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1`, opt-in and lossy against the bf16 keys: every anchor and
+# the index query rounded to e4m3), which only the pass keys reach (gsm8k stays dense).
 # Then the whole attention-DP stack the AgentX
 # front points run, every opt-in form together on top of the default ones (host-indexed Lamport
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
@@ -504,6 +507,16 @@ _QUANTIZED_KV = [
                 get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
             ),
         ],
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(index_key_fp8=True),
+        id="dep4_fp8_kv_index_key_fp8",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (103, 107),
+            reason="the e4m3 index-score kernels serve SM103/SM107",
+        ),
     ),
     pytest.param(
         _TEP4,
@@ -959,6 +972,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("dp_rows"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
+        if variant.get("index_key_fp8"):
+            env["TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"] = "1"
         if variant.get("tep_opt_in"):
             for name in ("DRAFT_LAYER", "MOE_FRONT", "PROJ_SPLITK"):
                 env[f"TRTLLM_QWEN4_EXP_TEP_{name}"] = "1"
