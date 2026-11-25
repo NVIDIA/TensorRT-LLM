@@ -477,6 +477,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gro
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_pack_gather import (
     PackGather as _PackGather,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_pack_gather import (
+    transported_codes as dep_lamport_transported_codes,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
     LamportSteps,
     dep_lamport_round_trip,
@@ -3374,8 +3377,10 @@ class _DpPack:
 def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
     """At `rows` rows a rank, eagerly: one packed gather (a collective every rank launches) of rows
     and logits every rank draws from the same per-rank seeds, against `fp4_quantize` of the
-    group's sanitized rows and the sanitized logits, and the routing-only front against the route
-    front over the gathered logits (experts, weights, tables). "" when bitwise.
+    group's sanitized rows (its codes as the transport delivers them: a 16-bit half equal to the
+    marker 0x8000, an E2M1 -0 after three +0, arrives as 0x0000, the same zeros) and the sanitized
+    logits, and the routing-only front against the route front over the gathered logits (experts,
+    weights, tables). "" when bitwise.
 
     The gather is the check's only collective, so every rank launches it: a rank whose inputs
     fail to build (an allocation that raises on that rank alone) launches it over zeros and
@@ -3412,7 +3417,7 @@ def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
     bad = [
         name
         for name, a, b in (
-            ("codes", xq, rxq),
+            ("codes", xq, dep_lamport_transported_codes(rxq)),
             ("scales", xsf, rxsf.reshape(g, -1)),
             ("logits", lg, torch.cat([dep_lamport_sanitized(t) for t in lgs])),
         )

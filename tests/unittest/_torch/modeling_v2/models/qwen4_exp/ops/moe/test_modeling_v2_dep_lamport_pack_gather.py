@@ -5,7 +5,8 @@
 One process a GPU, the host-index Lamport workspace of `dep_lamport_round_trip` over torch
 symmetric memory. Every rank draws every rank's rows and logits from per-rank seeds, so each
 holds the group's reference: the codes and linear block scales bitwise `fp4_quantize` of the
-group's rows with -0.0 lanes as +0.0, the logits bitwise the group's with -0.0 as +0.0. Eagerly,
+group's rows with -0.0 lanes as +0.0 (the codes as the transport delivers them: a 16-bit half
+0x8000, an E2M1 -0 after three +0, as 0x0000), the logits bitwise the group's with -0.0 as +0.0. Eagerly,
 inside regions that also hold the workspace's reduce-scatters (the slots rotate under both), and
 replayed from one CUDA graph. The 8-rank cells need eight SM103 GPUs in one node.
 """
@@ -120,3 +121,26 @@ def test_a_row_is_1232_lanes():
     """Host only: 80 code, 10 scale and 64 logit vectors a row (154 x 8 = 1,232 bf16 lanes)."""
     assert op.vectors_a_row(HIDDEN, EXPERTS) == 154
     assert op.threads(HIDDEN, EXPERTS) == 192
+
+
+@pytest.mark.cpu_only
+def test_transported_codes_zero_only_the_marker_halves():
+    """Host only: a code half 0x8000 (little-endian bytes 0x00, 0x80) becomes 0x0000; a -0 nibble
+    anywhere else, and every other byte, is unchanged (the full3 dep8 build check declined 15 of 27
+    row counts on raw `fp4_quantize` codes, each with one to three such halves)."""
+    codes = torch.tensor(
+        [
+            [0x00, 0x80, 0x80, 0x00, 0x08, 0x00, 0x00, 0x88],
+            [0x00, 0x80, 0x01, 0x80, 0x00, 0x80, 0xFF, 0x7F],
+        ],
+        dtype=torch.uint8,
+    )
+    want = torch.tensor(
+        [
+            [0x00, 0x00, 0x80, 0x00, 0x08, 0x00, 0x00, 0x88],
+            [0x00, 0x00, 0x01, 0x80, 0x00, 0x00, 0xFF, 0x7F],
+        ],
+        dtype=torch.uint8,
+    )
+    assert torch.equal(op.transported_codes(codes), want)
+    assert torch.equal(op.transported_codes(codes[:, :4]), want[:, :4])

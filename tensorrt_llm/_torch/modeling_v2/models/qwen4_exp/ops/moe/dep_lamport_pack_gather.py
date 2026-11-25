@@ -440,6 +440,15 @@ def _pack_launch(
 _COMPILED: dict = {}
 
 
+def transported_codes(codes: torch.Tensor) -> torch.Tensor:
+    """NVFP4 `codes` (uint8, an even byte count a row) as the gather delivers them: a 16-bit half
+    equal to the transport's marker 0x8000 (three E2M1 +0 nibbles, then a -0 nibble) arrives as
+    0x0000, the same four zeros. Every other byte is unchanged."""
+    halves = codes.contiguous().view(torch.int16)
+    clean = torch.where(halves == _rt._NEG_ZERO, torch.zeros_like(halves), halves)
+    return clean.view(torch.uint8).view(codes.shape)
+
+
 def vectors_a_row(hidden: int, experts: int) -> int:
     """16-byte vectors a row travels as."""
     return hidden // 32 + hidden // 256 + experts // 8
@@ -571,8 +580,9 @@ class DepLamportPackGather(OpWrapper):
 
     def reference(self, xs_in_rank_order, logits_in_rank_order, global_scale):
         """Collective (the documented exception to mirroring `__call__`): every rank's rows and
-        logits in rank order; `fp4_quantize` (linear scales) of the sanitized gathered rows and the
-        sanitized gathered logits."""
+        logits in rank order; `fp4_quantize` (linear scales) of the sanitized gathered rows, its
+        codes as the transport delivers them (`transported_codes`), and the sanitized gathered
+        logits."""
         from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (  # noqa: E501
             fp4_quantize,
         )
@@ -580,7 +590,7 @@ class DepLamportPackGather(OpWrapper):
         rows = torch.cat([_rt._sanitized(x) for x in xs_in_rank_order])
         xq, xsf = fp4_quantize(rows, global_scale, 16, False, False)
         lg = torch.cat([_rt._sanitized(g) for g in logits_in_rank_order])
-        return xq, xsf.reshape(rows.shape[0], -1), lg
+        return transported_codes(xq), xsf.reshape(rows.shape[0], -1), lg
 
     def is_valid(self, x, logits, global_scale, pack: PackGather) -> None:
         rows = x.shape[0]
