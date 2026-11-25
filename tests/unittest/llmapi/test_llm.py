@@ -680,7 +680,10 @@ class MyLogitsProcessor(LogitsProcessor):
             logits[..., self.biased_word_id] = 0
 
 
-def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
+def _logits_processor_case(
+    enable_chunked_prefill: bool = False
+) -> tuple[list[str], SamplingParams, str]:
+    """Build the logits-processor prompts, sampling params and expected text."""
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     max_tokens = 6
@@ -689,14 +692,35 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
         logits_processor=MyLogitsProcessor(biased_word_id))
 
     prompts = ["A B C"]
-    if llm_kwargs.get('enable_chunked_prefill', None):
+    if enable_chunked_prefill:
         prompts[0] = prompts[0] * 256
-        llm_kwargs["max_num_tokens"] = 256
 
     # The biased token's decoded text (e.g. with or without a leading space)
     # is tokenizer-specific, so derive the expected repeated-token output
     # rather than hardcoding a particular tokenizer's rendering.
     expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+    return prompts, sampling_params, expected_output
+
+
+def check_llm_logits_processor(llm: LLM) -> None:
+    """Check that a logits processor forces every generated token.
+
+    The LLM must not use chunked prefill: the chunked case also needs the
+    small max_num_tokens that tinyllama_logits_processor_test_harness sets.
+    """
+    assert not llm.args.enable_chunked_prefill
+    prompts, sampling_params, expected_output = _logits_processor_case()
+    llm_check_output(llm,
+                     prompts, [expected_output],
+                     sampling_params=sampling_params)
+
+
+def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
+    enable_chunked_prefill = bool(llm_kwargs.get('enable_chunked_prefill'))
+    if enable_chunked_prefill:
+        llm_kwargs["max_num_tokens"] = 256
+    prompts, sampling_params, expected_output = _logits_processor_case(
+        enable_chunked_prefill)
 
     llm_test_harness(
         llama_model_path,
@@ -842,7 +866,17 @@ def validate_stats(
     use_overlap=False,
     enable_chunked_prefill=False,
     enable_iter_req_stats=False,
+    microbatch_base: Optional[int] = 0,
 ):
+    """Validate the iteration stats of exactly one request.
+
+    Args:
+        microbatch_base: Microbatch slot of the request's first iteration.
+            It is 0 on a fresh LLM and always 0 without pipeline parallelism.
+            With pipeline parallelism, on an LLM that already served
+            requests, the slot depends on that history; pass ``None`` to take
+            it from the first scheduled iteration.
+    """
     assert results
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
@@ -858,7 +892,9 @@ def validate_stats(
     generation_iterations = max_tokens - 1
     assert len(results) == context_iterations + generation_iterations
 
-    microbatch_id = 0
+    if microbatch_base is None:
+        microbatch_base = results[0]["inflightBatchingStats"]["microBatchId"]
+    microbatch_id = microbatch_base
     for iter, result in enumerate(results):
         ifbStats = result["inflightBatchingStats"]
 
@@ -878,7 +914,7 @@ def validate_stats(
         # In pipeline parallel mode, increment microbatch_id for each context iteration except the last one,
         # since the context chunks can be scheduled in each iteration.
         if pp_size > 1 and iter < context_iterations - 1:
-            microbatch_id += 1
+            microbatch_id = (microbatch_id + 1) % pp_size
 
         if enable_iter_req_stats:
             assert "requestStats" in result, f"iter: {iter}"
@@ -993,48 +1029,95 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                  enable_iter_req_stats=enable_iter_req_stats,
                  disable_overlap_scheduler=not use_overlap))
 
-    # Since we need to check pp's internal states, we disable the async broadcast
-    # to get a deterministic behavior.
-    env_ctx = altered_env(TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE="0") \
-        if pp_size > 1 else contextlib.nullcontext()
+    with pp_sync_sample_state_env(pp_size), LLM(
+            model=llama_model_path,
+            kv_cache_config=global_kvcache_config,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            **llm_args_extra) as llm:
+        check_llm_get_stats(llm,
+                            pp_size=pp_size,
+                            pytorch_backend=pytorch_backend,
+                            use_overlap=use_overlap,
+                            enable_chunked_prefill=enable_chunked_prefill,
+                            enable_iter_req_stats=enable_iter_req_stats,
+                            sampling_args_extra=sampling_args_extra)
 
-    with env_ctx, LLM(model=llama_model_path,
-                      kv_cache_config=global_kvcache_config,
-                      tensor_parallel_size=tp_size,
-                      pipeline_parallel_size=pp_size,
-                      **llm_args_extra) as llm:
 
-        max_tokens = 5
-        sampling_params = SamplingParams(max_tokens=max_tokens,
-                                         **sampling_args_extra)
+def pp_sync_sample_state_env(
+        pp_size: int) -> contextlib.AbstractContextManager[None]:
+    """Keep the synchronous pipeline-parallel sample-state broadcast.
 
-        long_prompts = [
-            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
-        ]
+    The stats checks inspect pipeline-parallel internal states, which are
+    deterministic only with the synchronous broadcast. That is the executor
+    default, so the environment changes only when it requests the
+    asynchronous broadcast; an unchanged environment lets session reuse keep
+    its cached worker pool.
+    """
+    if pp_size > 1 and os.environ.get(
+            "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE") == "1":
+        return altered_env(TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE="0")
+    return contextlib.nullcontext()
 
-        prompt_len = None
-        for output in llm.generate(long_prompts,
-                                   sampling_params=sampling_params):
-            print(output)
-            prompt_len = len(output.prompt_token_ids)
 
-        time.sleep(2)
-        results = llm.get_stats(2)
+def drain_llm_stats(llm: LLM, timeout: float = 2, max_polls: int = 10) -> None:
+    """Consume iteration stats until the engine only reports idle heartbeats.
 
-        validate_stats(results=results,
-                       pp_size=pp_size,
-                       pytorch_backend=pytorch_backend,
-                       prompt_len=prompt_len,
-                       max_tokens=max_tokens,
-                       use_overlap=use_overlap,
-                       enable_chunked_prefill=enable_chunked_prefill,
-                       enable_iter_req_stats=enable_iter_req_stats)
+    Lets a stats check run on an LLM that already served other requests: the
+    rows of those requests, including the ones still arriving after their
+    final responses, are discarded first.
+    """
+    for _ in range(max_polls):
+        if all(is_idle_heartbeat(r) for r in llm.get_stats(timeout)):
+            return
+    raise AssertionError(
+        f"iteration stats did not run dry after {max_polls} polls")
 
-        assert not [r for r in llm.get_stats(0.5) if not is_idle_heartbeat(r)]
 
-        # test that IterationResult()._done is properly set
-        _ = llm.generate(prompts, sampling_params=sampling_params)
-        assert [r for r in llm.get_stats(2) if not is_idle_heartbeat(r)]
+def check_llm_get_stats(llm: LLM,
+                        *,
+                        pp_size: int = 1,
+                        pytorch_backend: bool = False,
+                        use_overlap: bool = False,
+                        enable_chunked_prefill: bool = False,
+                        enable_iter_req_stats: bool = False,
+                        sampling_args_extra: Optional[dict] = None,
+                        microbatch_base: Optional[int] = 0) -> None:
+    """Check get_stats for one request on an LLM built with iteration stats.
+
+    The LLM's stats buffer must hold no rows of other requests: on a shared
+    LLM, call ``drain_llm_stats`` first and, with pipeline parallelism, pass
+    ``microbatch_base=None``.
+    """
+    max_tokens = 5
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **(sampling_args_extra or {}))
+
+    long_prompts = ["A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2]
+
+    prompt_len = None
+    for output in llm.generate(long_prompts, sampling_params=sampling_params):
+        print(output)
+        prompt_len = len(output.prompt_token_ids)
+
+    time.sleep(2)
+    results = llm.get_stats(2)
+
+    validate_stats(results=results,
+                   pp_size=pp_size,
+                   pytorch_backend=pytorch_backend,
+                   prompt_len=prompt_len,
+                   max_tokens=max_tokens,
+                   use_overlap=use_overlap,
+                   enable_chunked_prefill=enable_chunked_prefill,
+                   enable_iter_req_stats=enable_iter_req_stats,
+                   microbatch_base=microbatch_base)
+
+    assert not [r for r in llm.get_stats(0.5) if not is_idle_heartbeat(r)]
+
+    # test that IterationResult()._done is properly set
+    _ = llm.generate(prompts, sampling_params=sampling_params)
+    assert [r for r in llm.get_stats(2) if not is_idle_heartbeat(r)]
 
 
 def test_llm_get_queued_stats():
@@ -1134,66 +1217,98 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
              tensor_parallel_size=tp_size,
              pipeline_parallel_size=pp_size,
              **llm_args_extra) as llm:
+        check_llm_get_stats_async(llm,
+                                  pp_size=pp_size,
+                                  pytorch_backend=pytorch_backend,
+                                  use_overlap=use_overlap,
+                                  enable_chunked_prefill=enable_chunked_prefill,
+                                  enable_iter_req_stats=enable_iter_req_stats,
+                                  sampling_args_extra=sampling_args_extra)
 
-        max_tokens = 6
-        sampling_params = SamplingParams(max_tokens=max_tokens,
-                                         **sampling_args_extra)
 
-        long_prompts = [
-            "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
-        ]
+def check_llm_get_stats_async(
+        llm: LLM,
+        *,
+        pp_size: int = 1,
+        pytorch_backend: bool = False,
+        use_overlap: bool = False,
+        enable_chunked_prefill: bool = False,
+        enable_iter_req_stats: bool = False,
+        sampling_args_extra: Optional[dict] = None) -> None:
+    """Check get_stats_async over two requests with iteration stats.
 
-        prompt_len = None
+    The asynchronous stats queue is bound to the event loop that is running
+    when the LLM receives its first request, so these must be the LLM's first
+    requests.
+    """
+    assert llm._executor._iter_stats_result is None, (
+        "check_llm_get_stats_async must issue the LLM's first request")
 
-        async def task0():
-            nonlocal prompt_len
-            async for output in llm.generate_async(
-                    long_prompts[0],
-                    streaming=True,
-                    sampling_params=sampling_params):
-                print(output)
-                prompt_len = len(output.prompt_token_ids)
+    max_tokens = 6
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     **(sampling_args_extra or {}))
 
-        async def task1(repetition_index: int):
-            results = []
-            await asyncio.sleep(
-                4)  # ensure there's stats to collect for the assertion
-            async for stats in llm.get_stats_async(
-                    10):  # it will return immediately
-                results.append(stats)
+    long_prompts = ["A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2]
 
-            assert results
-            if not use_overlap:
-                validate_stats(
-                    results=results,
-                    pp_size=pp_size,
-                    pytorch_backend=pytorch_backend,
-                    max_tokens=max_tokens,
-                    prompt_len=prompt_len,
-                    use_overlap=use_overlap,
-                    # After the first repetition, context will be reused and there will be no chunking.
-                    enable_chunked_prefill=enable_chunked_prefill
-                    if repetition_index == 0 else False,
-                    enable_iter_req_stats=enable_iter_req_stats)
+    prompt_len = None
 
-        async def main():
-            for repetition_index in range(2):  # test recurrent usage
-                await asyncio.gather(task0(), task1(repetition_index))
+    async def task0():
+        nonlocal prompt_len
+        async for output in llm.generate_async(long_prompts[0],
+                                               streaming=True,
+                                               sampling_params=sampling_params):
+            print(output)
+            prompt_len = len(output.prompt_token_ids)
 
-        asyncio.run(main())
+    async def task1(repetition_index: int):
+        results = []
+        await asyncio.sleep(
+            4)  # ensure there's stats to collect for the assertion
+        async for stats in llm.get_stats_async(
+                10):  # it will return immediately
+            results.append(stats)
+
+        assert results
+        if not use_overlap:
+            validate_stats(
+                results=results,
+                pp_size=pp_size,
+                pytorch_backend=pytorch_backend,
+                max_tokens=max_tokens,
+                prompt_len=prompt_len,
+                use_overlap=use_overlap,
+                # After the first repetition, context will be reused and there will be no chunking.
+                enable_chunked_prefill=enable_chunked_prefill
+                if repetition_index == 0 else False,
+                enable_iter_req_stats=enable_iter_req_stats)
+
+    async def main():
+        for repetition_index in range(2):  # test recurrent usage
+            await asyncio.gather(task0(), task1(repetition_index))
+
+    asyncio.run(main())
+
+
+def check_llm_capture_request_error(llm: LLM) -> None:
+    """Check that a prompt longer than max_num_tokens raises RequestError.
+
+    The LLM must not use chunked prefill, which lifts the limit.
+    """
+    max_num_tokens = llm.args.max_num_tokens
+    assert max_num_tokens and not llm.args.enable_chunked_prefill
+    prompt = 'A ' * (max_num_tokens + 1)
+    with pytest.raises(RequestError, match="max_num_tokens"):
+        llm.generate(prompt)
 
 
 def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
-    llm = LLM(
-        model=llama_model_path,
-        max_num_tokens=64,
-        tensor_parallel_size=tp_size,
-    )
-
-    prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-    # Both backends now consistently raise RequestError for max_num_tokens validation
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    # 64 is the minimum max_num_tokens.
+    with LLM(
+            model=llama_model_path,
+            max_num_tokens=64,
+            tensor_parallel_size=tp_size,
+    ) as llm:
+        check_llm_capture_request_error(llm)
 
 
 def test_oversized_prompt_rejected_with_inflated_max_seq_len():
