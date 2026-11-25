@@ -42,21 +42,6 @@ def _read_yaml(path: str) -> dict:
     return data
 
 
-@cache
-def _manifest_profiles(filename: str) -> dict:
-    if filename not in ('llm_perf_core.yml', 'llm_spark_perf.yml'):
-        raise ValueError(f"Unknown perf manifest {filename!r}")
-    groups = _read_yaml(f'tests/integration/test_lists/qa/{filename}')[Path(
-        filename).stem]
-    profiles = {}
-    for group in groups:
-        for name, profile in group.get('model_configs', {}).items():
-            if name in profiles:
-                raise ValueError(f"Duplicate profile {name!r} in {filename}")
-            profiles[name] = profile
-    return profiles
-
-
 def _select_fields(source: dict, fields: list[str]) -> dict:
     result = {}
     for path in fields:
@@ -69,12 +54,7 @@ def _select_fields(source: dict, fields: list[str]) -> dict:
     return result
 
 
-def _load_profile(selection: str) -> dict:
-    filename, _, name = selection.partition('@')
-    profiles = _manifest_profiles(filename)
-    if name not in profiles:
-        raise ValueError(f"Unknown profile {selection!r}")
-    profile = profiles[name]
+def _load_profile(profile: dict) -> dict:
     config = {}
     if 'source' in profile:
         source = _read_yaml(profile['source'])
@@ -88,8 +68,7 @@ def _load_profile(selection: str) -> dict:
                 source = matches[0]
             else:
                 source = source[key]
-        config = (_select_fields(source, profile['fields'])
-                  if 'fields' in profile else copy.deepcopy(source))
+        config = _select_fields(source, profile['fields'])
     recursive_update(config, copy.deepcopy(profile.get('settings', {})))
     if 'on_sm' in profile and get_sm_version() in profile['on_sm']['versions']:
         recursive_update(config, copy.deepcopy(profile['on_sm']['settings']))
@@ -98,78 +77,42 @@ def _load_profile(selection: str) -> dict:
 
 def get_perf_config_preset(selection: str) -> dict:
     """Load the selected recipe and apply explicit field overrides to its values."""
-    if selection == 'mtp3':
-        return {
-            'speculative_config': {
-                'decoding_type': 'MTP',
-                'max_draft_len': 3
-            }
-        }
-    if selection in ('reuse', 'noreuse'):
-        kv = {'enable_block_reuse': selection == 'reuse'}
-        if selection == 'reuse':
-            # Hybrid models reuse prefixes up to a recurrent-state snapshot.
-            kv['mamba_state_config'] = {'periodic_snapshot_interval': 8192}
-        return {'kv_cache_config': kv}
-
+    catalog = _read_yaml('examples/configs/model_presets.yml')
     overrides = selection.split(',')
     config = {}
     if '=' not in overrides[0]:
         name = overrides.pop(0)
-        if '@' in name:
-            config = _load_profile(name)
-        elif name.endswith('.yaml') and Path(name).name == name:
+        if name.endswith('.yaml') and Path(name).name == name:
             try:
                 config = copy.deepcopy(
                     _read_yaml(f'examples/configs/curated/{name}'))
             except FileNotFoundError as exc:
                 raise ValueError(f"Unknown curated config {name!r}") from exc
         else:
-            raise ValueError(f"Unknown cfg selection {selection!r}")
+            preset_name = name.removeprefix('model_presets.yml@')
+            if preset_name not in catalog['presets']:
+                raise ValueError(f"Unknown performance preset {name!r}")
+            config = _load_profile(catalog['presets'][preset_name])
 
-    boolean_fields = ('print_iter_log', 'enable_attention_dp',
-                      'enable_chunked_prefill', 'disable_overlap_scheduler',
-                      'disable_mm_encoder', 'trust_remote_code',
-                      'kv_cache_config.enable_block_reuse')
-    integer_fields = ('max_seq_len', 'stream_interval',
-                      'num_postprocess_workers', 'max_draft_len', 'block_size',
-                      'periodic_snapshot_interval',
-                      'cuda_graph_config.max_batch_size',
-                      'num_nextn_predict_layers')
     for override in overrides:
         field, _, value = override.partition('=')
-        if field in boolean_fields and value in ('true', 'false'):
-            parsed = value == 'true'
-        elif (field in integer_fields and value.isascii() and value.isdecimal()
-              and (int(value) > 0 or field == 'num_postprocess_workers')):
-            parsed = int(value)
-        elif field in ('speculative_config',
-                       'guided_decoding_backend') and value == 'null':
-            parsed = None
-        elif field == 'decoding_type' and value in ('MTP', 'DSpark'):
-            parsed = value
-        elif field == 'moe_config.backend' and value in ('TRTLLM', 'CUTEDSL',
-                                                         'CUTLASS', 'DEEPGEMM',
-                                                         'MEGAMOE_DEEPGEMM'):
-            parsed = value
-        elif field == 'kv_cache_config.dtype' and value == 'fp8':
-            parsed = value
-        elif field == 'kv_cache_config.mamba_ssm_cache_dtype' and value in (
-                'auto', 'float16', 'bfloat16', 'float32'):
-            parsed = value
-        else:
-            raise ValueError(f"Invalid override {override!r} in {selection!r}")
+        path = catalog['field_aliases'].get(field, field).split('.')
+        if not value.strip() or not all(key.isidentifier() for key in path):
+            raise ValueError(f"Expected a dotted field=value in {override!r}")
+        if '/' in value:
+            raise ValueError(f"Use a YAML recipe for paths in {override!r}")
+        try:
+            parsed = yaml.safe_load(value)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML value in {override!r}") from exc
+        if parsed is not None and not isinstance(parsed,
+                                                 (bool, int, float, str)):
+            raise ValueError(f"Expected a YAML scalar in {override!r}")
 
-        if field in ('decoding_type', 'max_draft_len', 'block_size',
-                     'num_nextn_predict_layers'):
-            field = f'speculative_config.{field}'
-        elif field == 'periodic_snapshot_interval':
-            field = 'kv_cache_config.mamba_state_config.periodic_snapshot_interval'
-        *parents, key = field.split('.')
-        target = config
-        for parent in parents:
-            target = target.setdefault(parent, {})
-        target[key] = parsed
+        update = {path[-1]: parsed}
+        for parent in reversed(path[:-1]):
+            update = {parent: update}
+        recursive_update(config, update)
     return config
 
 

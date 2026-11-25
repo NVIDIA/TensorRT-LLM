@@ -119,26 +119,24 @@ YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
 
 - Select a file in [examples/configs/curated](../../../../examples/configs/curated)
   by filename, for example `-cfg:deepseek-v4-pro-latency.yaml`.
-- Select a shared configuration from a test list with `filename@profile`. For example,
-  `-cfg:llm_spark_perf.yml@lightning_mtp` reads the Lightning settings from
-  [the Spark list](../../test_lists/qa/llm_spark_perf.yml). The two variants specify
-  their MoE backends with `-moe:CUTEDSL` or `-moe:CUTLASS`.
+- Select shared benchmark settings from [model_presets.yml](../../../../examples/configs/model_presets.yml)
+  with `-cfg:model_presets.yml@lightning_mtp`. Both Lightning variants use this
+  preset and select their respective backend with `-moe:CUTEDSL` or `-moe:CUTLASS`.
+  A complete recipe can be followed by its workload-specific differences, for example
+  `-cfg:musespark-open.yaml+model_presets.yml@musespark_text`.
 - Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
   Append comma-separated overrides to a selection, or combine selections from left
   to right with `+`, as in `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
+  Use YAML scalar values and dotted field names, for example
+  `cfg:speculative_config.decoding_type=NGram,max_draft_len=3`. The runner passes these fields to
+  the same configuration validation as a YAML file. Put paths and lists in YAML.
   Later selections override earlier ones and merge nested mappings.
 
-Define shared profiles under `model_configs` beside the `tests` that first use them.
-Profile names are unique within each manifest and can be selected from either list.
-The runner reads profiles from the repository manifests. A `trt-test-db` export of
-the schedule contains only the conditions and test IDs.
-A profile can read an existing repository-relative YAML `source`. Use `section`
-to select a nested mapping or a named entry in a sequence, and `fields` to import
-only the required settings (dotted paths select nested fields). Omitting `fields`
-imports the whole selected mapping. Put shared overrides in `settings` and any
-GPU-specific overrides under `on_sm`, as in the Gemma 4 NVFP4 profile in
-[the Core list](../../test_lists/qa/llm_perf_core.yml). Use `${LLM_MODELS_ROOT}/` for draft
-checkpoints stored in the test model cache. The runner resolves this prefix at launch.
+Define shared settings under `presets` in [model_presets.yml](../../../../examples/configs/model_presets.yml).
+Use `source` and `fields` to reuse individual fields from a repository YAML. An optional
+`section` selects a nested mapping or a named entry in a sequence. Put workload-specific
+values in `settings`, and hardware-specific values in `on_sm`. Draft paths prefixed
+with `${LLM_MODELS_ROOT}/` resolve against the test model cache at launch.
 
 The test parameter also names the engine directory. Keep both the full parameter and
 the exported benchmark name within 255 bytes. Reuse a shared profile when inlining
