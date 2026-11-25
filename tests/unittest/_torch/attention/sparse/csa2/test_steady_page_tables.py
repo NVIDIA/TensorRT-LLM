@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2 import cache_manager, ke
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     BAD_PAGE_INDEX,
     CSA2CacheManager,
+    CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
@@ -377,7 +378,12 @@ def _run_mixed_adp_preparation(rank: int, rendezvous: str) -> None:
             buffers = DecoderInputBuffers.for_config(config, False)
             preparer = input_preparer(config, model=model, buffers=buffers, mapping=mapping)
             preparer.dist = SimpleNamespace(tp_cp_allgather_int64=allgather)
-            preparer.attach_cuda_graph_runners(None, None)
+            graph_runner = SimpleNamespace(
+                enabled=True,
+                shared_static_tensors={},
+                take_agreed_replay_key=lambda _: None,
+            )
+            preparer.attach_cuda_graph_runners(graph_runner, None)
             metadata = _metadata(manager).create_cuda_graph_metadata(
                 count, max_draft_tokens=DRAFT_LEN
             )
@@ -764,6 +770,32 @@ def test_overlapping_block_offset_views_convert_only_live_columns(monkeypatch):
             manager.copy_batch_block_offsets(view, [], 1, 0, 0)
         manager.copy_batch_block_offsets(view, [1], 1, 0, 1)
         assert torch.equal(view, expected)
+
+        # Direct metadata copies can write a wider row into a previously published view.
+        # Switching to another destination and back must clear the earlier wide row.
+        active.append(_admit(manager, 3, 7 * BLOCK))
+        first = storage[:, :2]
+        second = torch.empty_like(first)
+        manager.copy_batch_block_offsets(first, [3, 1], 1, 0, 2)
+        reference = first.clone()
+        metadata = _metadata(manager)
+        for layer, pages in zip(manager.pp_layers, first[:, :, 0]):
+            metadata._bind_swa_pages(layer, pages, pages, [])
+        other_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(other_stream):
+            manager.compute_batch_page_tables([1, 3], 0)
+            copies = []
+            for layer in manager.pp_layers:
+                pages = manager.batch_page_table((layer, CSA2CacheRole.SWA), max_blocks)
+                metadata._bind_swa_pages(layer, pages, None, copies)
+            assert copies
+            targets, sources = zip(*copies)
+            with manager._write_swa_page_tables(targets):
+                torch._foreach_copy_(targets, sources, non_blocking=True)
+        manager.copy_batch_block_offsets(second, [3, 1], 1, 0, 2)
+        manager.copy_batch_block_offsets(first, [3, 1], 1, 0, 2)
+        assert torch.equal(second, reference)
+        assert torch.equal(first, reference)
     finally:
         for request in active:
             manager.free_resources(request)

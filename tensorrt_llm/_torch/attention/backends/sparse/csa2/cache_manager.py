@@ -1187,6 +1187,22 @@ class CSA2CacheManager(KVCacheManagerV2):
             stream.wait_event(self._base_rows_read[self._base_rows_slot])
         return stream
 
+    @contextmanager
+    def _write_swa_page_tables(self, targets: tuple[torch.Tensor, ...]):
+        """Serialize metadata writes that may alias previously published block offsets."""
+        if not targets:
+            yield
+            return
+        if self._block_offsets_live.invalidate_overlaps(targets):
+            self._batch_conversion_inputs = None
+            self._swa_publication = None
+        stream = self._wait_for_page_table_conversion()
+        try:
+            yield
+        finally:
+            self._base_rows_read[self._base_rows_slot].record(stream)
+            self._page_tables_stream = stream
+
     def take_page_table_stats(self) -> tuple[int, int, int, float]:
         stats = (
             self._num_page_table_reuses,

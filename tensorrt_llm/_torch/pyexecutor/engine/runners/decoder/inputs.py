@@ -961,7 +961,9 @@ class DecoderInputPreparer:
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
         spec_config = self._config.spec_config
         if (
-            spec_config is not None
+            cuda_graph_runner is not None
+            and cuda_graph_runner.enabled
+            and spec_config is not None
             and self._config.is_spec_decode
             and (
                 self._config.steady_decode_prepare
@@ -976,10 +978,6 @@ class DecoderInputPreparer:
             and not self.mapping.has_cp_helix()
             and not self._dspark_trims_submitted_tokens
         ):
-            has_static_inputs = cuda_graph_runner is not None and cuda_graph_runner.enabled
-            stage_rng = False
-            if self.runtime_hooks.pack_spec_rng_uploads:
-                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -987,14 +985,14 @@ class DecoderInputPreparer:
                     self._config.max_draft_len
                 ),
                 use_mrope=self._config.use_mrope,
-                has_static_inputs=has_static_inputs,
+                has_static_inputs=True,
                 graph_runner=(
                     cuda_graph_runner
-                    if has_static_inputs and steady_glue_enabled(self._config.enable_attention_dp)
+                    if steady_glue_enabled(self._config.enable_attention_dp)
                     else None
                 ),
                 steady_decode_prepare=self._config.steady_decode_prepare,
-                stage_rng=stage_rng,
+                stage_rng=self.runtime_hooks.pack_spec_rng_uploads,
             )
 
     @property

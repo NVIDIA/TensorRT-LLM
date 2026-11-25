@@ -642,7 +642,18 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                     buffer.zero_()
             preparer = input_preparer(config, model=model, buffers=buffers)
             preparer.dist = types.SimpleNamespace(tp_cp_allgather_int64=allgather)
-            preparer.attach_cuda_graph_runners(None, None)
+            disabled_graph_runner = types.SimpleNamespace(enabled=False)
+            with patch.object(SteadyMtpPrepare, "_warm_stage_kernel") as warm_stage_kernel:
+                preparer.attach_cuda_graph_runners(disabled_graph_runner, None)
+                warm_stage_kernel.assert_not_called()
+            assert preparer._steady_mtp is None
+            enabled_graph_runner = types.SimpleNamespace(
+                enabled=True,
+                shared_static_tensors={},
+                fusible_engram_hook=None,
+                take_agreed_replay_key=lambda _: None,
+            )
+            preparer.attach_cuda_graph_runners(enabled_graph_runner, None)
             assert preparer._steady_mtp is not None
             metadata = DecoderMetadata(
                 config=config,

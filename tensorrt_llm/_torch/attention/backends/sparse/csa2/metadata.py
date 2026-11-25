@@ -1838,6 +1838,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         *,
         fallback_columns: int | None = None,
         uploads: _CoalescedUploads | None = None,
+        use_row_bounds: bool = True,
     ) -> None:
         """Copy into bank-owned tables and record their bounds after the copy."""
         from .....pyexecutor import device_copy
@@ -1852,7 +1853,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 if uploads is not None:
                     uploads._upload_pending()
             else:
-                bounds = self._table_copy_bounds(tracked, targets, lives, max_rows)
+                bounds = (
+                    self._table_copy_bounds(tracked, targets, lives, max_rows)
+                    if use_row_bounds
+                    else None
+                )
                 columns = None
                 width = max_columns if fallback_columns is None else fallback_columns
                 if uploads is not None:
@@ -2036,7 +2041,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             else:
                 visible.zero_()
 
-    def _bind_swa_pages(self, layer, pages, published_pages):
+    def _bind_swa_pages(self, layer, pages, published_pages, copies):
         # Select backing once for each existing shape/graph key. A direct or
         # draft fallback must update it, never redirect a captured consumer.
         if published_pages is not None and (
@@ -2051,14 +2056,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         if published_pages is not None and key not in self._csa2_buffers:
             self._csa2_buffers[key] = published_pages
         result = self._get_csa2_buffer(f"swa_pages/{layer}", pages.shape, pages.dtype, like=pages)
-        if published_pages is None:
-            result.copy_(pages, non_blocking=True)
-        elif (
-            result.data_ptr() != published_pages.data_ptr()
-            or result.stride() != published_pages.stride()
-        ):
-            # Fallback-first preparation may already own a private allocation.
-            result.copy_(published_pages, non_blocking=True)
+        source = pages if published_pages is None else published_pages
+        if result.data_ptr() != source.data_ptr() or result.stride() != source.stride():
+            copies.append((result, source))
         return result
 
     def prepare_csa2(self, *, swa_publication=None) -> None:
@@ -2368,10 +2368,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         else:
             local = published_swa.unbind(0)
             layer_pages = device_views = [local[manager.layer_offsets[i]] for i in live_swa_layers]
+        swa_copies = []
         for layer_idx, pages, device_pages in zip(live_swa_layers, layer_pages, device_views):
             self._csa2_swa_page_tables[layer_idx] = self._bind_swa_pages(
-                layer_idx, pages, device_pages
+                layer_idx, pages, device_pages, swa_copies
             )
+        if swa_copies:
+            targets, sources = zip(*swa_copies)
+            with manager._write_swa_page_tables(targets):
+                torch._foreach_copy_(targets, sources, non_blocking=True)
         # Context-only caches: layers without SWA pages share one -1 slot.
         self._csa2_missing_swa_slot = None
         if len(swa_layers) < num_layers:
@@ -2721,6 +2726,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             for owner, batch in self._csa2_compression.items():
                 refresh(batch.kv_page_table, (owner, CSA2CacheRole.COMPRESSOR_KV))
                 refresh(batch.score_page_table, (owner, CSA2CacheRole.COMPRESSOR_SCORE))
+            owner_count = len(targets)
             for layer, table in self._csa2_swa_page_tables.items():
                 refresh(
                     table,
@@ -2741,26 +2747,36 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 descriptors,
                 max((target.shape[0] for target in targets), default=0),
                 any(published_copies),
+                tuple(targets[owner_count:]),
                 None,
             ]
-        _, targets, sources, descriptors, max_rows, copies_published, copied = plan
+        _, targets, sources, descriptors, max_rows, copies_published, swa_targets, copied = plan
         # The manager's per-row bounds cover the owner tables and the SWA tables
         # converted for the same batch, including a published SWA destination.
         if targets:
             lives = [manager.batch_table_live()] * len(targets)
             live = manager.batch_live_columns()
-            self._copy_page_tables(
-                "page_table_refresh",
-                targets,
-                sources,
-                lives,
-                descriptors,
-                max_rows,
-                page_count,
-                fallback_columns=None if copied is None else min(page_count, max(live, copied)),
-            )
+            with manager._write_swa_page_tables(swa_targets):
+                # Published SWA backing can also be written by the block-offset converter,
+                # so a bank-local bound can't limit a copy back into that storage.
+                bounded = not swa_targets
+                self._copy_page_tables(
+                    "page_table_refresh",
+                    targets,
+                    sources,
+                    lives,
+                    descriptors,
+                    max_rows,
+                    page_count,
+                    fallback_columns=(
+                        min(page_count, max(live, copied))
+                        if bounded and copied is not None
+                        else None
+                    ),
+                    use_row_bounds=bounded,
+                )
             if descriptors is not None:
-                plan[6] = None if copies_published else live
+                plan[7] = None if copies_published else live
 
     def _finish_prepare_csa2(self, snapshot, *, defer_outputs: bool) -> None:
         manager = self.kv_cache_manager

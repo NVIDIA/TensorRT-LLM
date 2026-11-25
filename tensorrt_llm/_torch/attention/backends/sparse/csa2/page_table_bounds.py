@@ -43,13 +43,26 @@ class PageTableBounds:
         """Take the previous bound and invalidate entries that this write may affect."""
         address_range = self._address_range(target)
         live = self._get(target, address_range if self._track_overlaps else None)
-        first, last = address_range
+        self._invalidate_ranges((address_range,))
+        return live
+
+    def invalidate_overlaps(self, targets: tuple[torch.Tensor, ...]) -> bool:
+        """Forget tracked views that another writer may overwrite."""
+        if not self._entries:
+            return False
+        return self._invalidate_ranges(tuple(self._address_range(target) for target in targets))
+
+    def _invalidate_ranges(self, writes: tuple[tuple[int, int], ...]) -> bool:
+        invalidated = False
         for key, (tensor_ref, extent, _) in list(self._entries.items()):
-            if tensor_ref() is None or (
-                extent is not None and extent[0] < last and first < extent[1]
+            if tensor_ref() is None:
+                del self._entries[key]
+            elif extent is not None and any(
+                extent[0] < last and first < extent[1] for first, last in writes
             ):
                 del self._entries[key]
-        return live
+                invalidated = True
+        return invalidated
 
     def record(self, target: torch.Tensor, live: np.ndarray | None) -> None:
         if live is None:
