@@ -425,7 +425,9 @@ def cuda_error_early_quit(capfd):
                                                     None):
         try:
             yield
-            torch.cuda.synchronize()
+            # Re-check device_count() while test-scoped torch.cuda monkeypatches are active.
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                torch.cuda.synchronize()
         except RuntimeError as e:
             msg = str(e)
             if 'CUDA error:' in msg:

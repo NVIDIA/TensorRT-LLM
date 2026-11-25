@@ -33,14 +33,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from cbts.blocks import Stage, YAMLIndex, normalize_test_id
+import yaml
 
-from ._helpers import (
-    is_perf_stem,
-    lookup_ids_into_block_filters,
-    resolve_affected_stages,
-    stages_by_yaml_stem,
-)
+from cbts.blocks import Stage, YAMLIndex, _entry_target, normalize_test_id
+
+from ._helpers import is_perf_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 
 TEST_DB_DIR = "tests/integration/test_lists/test-db/"
@@ -205,23 +202,12 @@ def _line_is_in_stage_select(lines: list[str], line_no: int) -> bool:
     return False
 
 
-def _scan_tests_entries(diff: str) -> tuple[set[str], set[str]]:
-    """Extract added / removed test IDs from a stage-select-clean diff.
-
-    The caller must have already confirmed the diff does not touch any
-    stage-select area; every `+/-` list item is then by construction
-    inside a `tests:` block.
-    """
-    added: set[str] = set()
+def _scan_removed_entries(diff: str) -> set[str]:
+    """Extract removed test IDs from a stage-select-clean diff."""
     removed: set[str] = set()
     for raw in diff.splitlines():
-        if not raw or raw.startswith(("+++", "---")):
+        if not raw.startswith("-") or raw.startswith("---"):
             continue
-        if _HUNK_HEADER_RE.match(raw):
-            continue
-        if raw[0] not in ("+", "-"):
-            continue
-        sign = raw[0]
         body = raw[1:]
         if not body.strip() or _COMMENT_RE.match(body):
             continue
@@ -230,8 +216,72 @@ def _scan_tests_entries(diff: str) -> tuple[set[str], set[str]]:
             continue
         tid = normalize_test_id(lm.group("body"))
         if tid:
-            (added if sign == "+" else removed).add(tid)
-    return added, removed
+            removed.add(tid)
+    return removed
+
+
+def _added_entries_by_block(
+    post_text: str, post_lines: list[str], added_line_nums: set[int]
+) -> tuple[dict[tuple[str, int], set[str]], set[str]]:
+    """Map `(yaml_stem, block_index)` to normalized test IDs touched by `+` lines.
+
+    Walks each block's `tests` sequence in the composed YAML tree so wrapped
+    multiline scalars resolve to their complete folded value (matching
+    `YAMLIndex`), including when a diff only adds/extends continuation lines.
+    """
+    by_block: dict[tuple[str, int], set[str]] = {}
+    unresolved: set[str] = set()
+    usable_lines = {
+        ln
+        for ln in added_line_nums
+        if 1 <= ln <= len(post_lines)
+        and post_lines[ln - 1].strip()
+        and not _COMMENT_RE.match(post_lines[ln - 1])
+    }
+    if not usable_lines:
+        return by_block, unresolved
+    try:
+        root = yaml.compose(post_text)
+    except yaml.YAMLError:
+        root = None
+
+    covered_lines: set[int] = set()
+    if isinstance(root, yaml.MappingNode):
+        for k_node, v_node in root.value:
+            if k_node.value == "version" or not isinstance(v_node, yaml.SequenceNode):
+                continue
+            stem = str(k_node.value)
+            for b_idx, b_node in enumerate(v_node.value):
+                if not isinstance(b_node, yaml.MappingNode):
+                    continue
+                for bk_node, bv_node in b_node.value:
+                    if bk_node.value != "tests" or not isinstance(bv_node, yaml.SequenceNode):
+                        continue
+                    for t_node in bv_node.value:
+                        if not isinstance(t_node, yaml.ScalarNode):
+                            continue
+                        t_start = t_node.start_mark.line + 1
+                        t_end = (
+                            t_node.end_mark.line
+                            if t_node.end_mark.column == 0
+                            and t_node.end_mark.line > t_node.start_mark.line
+                            else t_node.end_mark.line + 1
+                        )
+                        hit = {ln for ln in usable_lines if t_start <= ln <= t_end}
+                        if not hit:
+                            continue
+                        covered_lines |= hit
+                        tid = normalize_test_id(str(t_node.value))
+                        if tid:
+                            by_block.setdefault((stem, b_idx), set()).add(tid)
+
+    for ln in sorted(usable_lines - covered_lines):
+        lm = _LIST_ITEM_RE.match(post_lines[ln - 1])
+        if lm:
+            tid = normalize_test_id(lm.group("body"))
+            if tid:
+                unresolved.add(tid)
+    return by_block, unresolved
 
 
 class TestListRule(Rule):
@@ -255,6 +305,8 @@ class TestListRule(Rule):
 
         added: set[str] = set()
         removed: set[str] = set()
+        added_by_block: dict[tuple[str, int], set[str]] = {}
+        unresolved_added: set[str] = set()
         stage_select_files: list[str] = []
         unverifiable_files: list[str] = []
 
@@ -281,7 +333,8 @@ class TestListRule(Rule):
             # line anchors are intentionally excluded — they can land
             # on neighboring blocks and trigger false positives.
             try:
-                post_lines = (self._repo_root / path).read_text(encoding="utf-8").splitlines()
+                post_text = (self._repo_root / path).read_text(encoding="utf-8")
+                post_lines = post_text.splitlines()
             except (OSError, UnicodeDecodeError):
                 unverifiable_files.append(path)
                 continue
@@ -291,9 +344,15 @@ class TestListRule(Rule):
                 stage_select_files.append(path)
                 continue
 
-            a, r = _scan_tests_entries(diff)
-            added |= a
-            removed |= r
+            removed |= _scan_removed_entries(diff)
+            file_by_block, file_unresolved = _added_entries_by_block(
+                post_text, post_lines, added_line_nums
+            )
+            for b_key, tids in file_by_block.items():
+                added_by_block.setdefault(b_key, set()).update(tids)
+                added |= tids
+            unresolved_added |= file_unresolved
+            added |= file_unresolved
 
         if stage_select_files:
             preview = ", ".join(stage_select_files[:3])
@@ -333,7 +392,26 @@ class TestListRule(Rule):
                 reason=f"testlist: no additions across {len(touched)} file(s){note}",
             )
 
-        block_filters, misses = lookup_ids_into_block_filters(self.yaml_index, added)
+        block_by_key = {(b.yaml_stem, b.block_index): b for b in self.yaml_index.blocks}
+        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        misses = sorted(unresolved_added)
+        for b_key, tids in added_by_block.items():
+            block = block_by_key.get(b_key)
+            if block is None:
+                misses.extend(sorted(tids))
+                continue
+            raw_by_norm: dict[str, list[str]] = {}
+            for raw in block.tests:
+                raw_by_norm.setdefault(normalize_test_id(raw), []).append(raw)
+            for tid in sorted(tids):
+                matched_raws = raw_by_norm.get(tid)
+                if not matched_raws:
+                    misses.append(tid)
+                    continue
+                for raw in matched_raws:
+                    target = _entry_target(raw)
+                    if target:
+                        block_filters.setdefault(b_key, {}).setdefault(target, set()).add(tid)
         if not block_filters:
             preview = ", ".join(sorted(misses)[:3])
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""

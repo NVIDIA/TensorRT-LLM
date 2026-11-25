@@ -25,9 +25,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 import shutil
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
+from fnmatch import fnmatch, fnmatchcase
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -85,11 +86,11 @@ def normalize_test_id(test_id: str) -> str:
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 
-# Detect a pytest-style option flag (e.g. ` -k`, ` -m`) inside a YAML target
-# spec. Used to peel `-k "..."` / `-m "..."` off so the bare path/node-id can
-# be indexed as an additional lookup key — that lets a fine-grained waive id
-# match a coarse YAML entry like `dir/x.py -k "deepseek"`.
-_PYTEST_OPTION_RE = re.compile(r"\s+-[a-zA-Z]\b")
+# Detect a pytest-style option flag (e.g. ` -k`, ` -m`, ` --ignore=...`) inside
+# a YAML target spec. Used to peel options off so the bare path/node-id can be
+# indexed as an additional lookup key — that lets a fine-grained waive or path
+# match a coarse YAML entry like `dir/x.py -k "deepseek"` or `dir --ignore=...`.
+_PYTEST_OPTION_RE = re.compile(r"\s+(?:-[a-zA-Z]\b|--[a-zA-Z][\w-]*(?:=|\b))")
 
 
 def _strip_pytest_options(s: str) -> str:
@@ -130,41 +131,120 @@ def _iter_parent_ids(test_id: str):
             yield s
 
 
-# pytest's `-k` keyword expressions can be a single word like `"deepseek"` or
-# a boolean expression like `"a and not b"`. We tokenize on identifier chars
-# and strip the boolean operators, then check substring against the waive id.
-# Over-includes for complex expressions; never under-includes.
+# pytest's `-k` keyword expressions can be a single word like `"deepseek"`,
+# dotted file selectors like `"a.py or b.py"`, or boolean expressions with
+# `not`. Keep dots inside tokens, compare case-insensitively like pytest, and
+# treat expressions containing `not` as unconstrained (over-include safely).
 _K_VALUE_RE = re.compile(r'\s+-k\s+"([^"]*)"')
 _M_FLAG_RE = re.compile(r"\s+-m\b")
+_IGNORE_OPT_RE = re.compile(r"\s+--ignore(?:=|\s+)(\S+)")
+_IGNORE_GLOB_OPT_RE = re.compile(r"\s+--ignore-glob(?:=|\s+)(\S+)")
+_DESELECT_OPT_RE = re.compile(r"\s+--deselect(?:=|\s+)(\S+)")
 _K_RESERVED_WORDS = {"and", "or", "not"}
 
 
 def _extract_k_keyword(entry: str) -> Optional[str]:
-    """Return the raw `-k "<value>"` keyword text, or None."""
-    m = _K_VALUE_RE.search(entry)
-    return m.group(1) if m else None
+    """Return the last `-k` keyword expression (matching pytest's `action="store"`), or None."""
+    norm = normalize_test_id(entry)
+    try:
+        tokens = shlex.split(norm)
+    except ValueError:
+        matches = list(_K_VALUE_RE.finditer(norm))
+        return matches[-1].group(1) if matches else None
+    last: Optional[str] = None
+    idx = 1
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            break
+        if tok == "-k" and idx + 1 < len(tokens):
+            last = tokens[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("-k="):
+            last = tok[3:]
+        idx += 1
+    return last
+
+
+def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
+    """True when `entry`'s `--ignore` / `--ignore-glob` / `--deselect` drops `waive_id`."""
+    norm_entry = normalize_test_id(entry)
+    norm_waive = _normalize_target_path(_strip_pytest_options(normalize_test_id(waive_id)))
+    waive_target = _normalize_target_path(_strip_params(norm_waive))
+    if not waive_target:
+        return False
+    waive_file = waive_target.split("::", 1)[0]
+    waive_paths = [waive_file]
+    cur_path = waive_file
+    while "/" in cur_path:
+        cur_path = cur_path.rsplit("/", 1)[0]
+        waive_paths.append(cur_path)
+    for m in _IGNORE_OPT_RE.finditer(norm_entry):
+        ignored = _normalize_target_path(m.group(1).strip("\"'"))
+        if ignored and _target_in_filter_subtree(waive_target, ignored):
+            return True
+    for m in _IGNORE_GLOB_OPT_RE.finditer(norm_entry):
+        pat = m.group(1).strip("\"'")
+        if not pat:
+            continue
+        if any(fnmatchcase(p, pat) for p in waive_paths) or (
+            not waive_file.endswith(".py")
+            and pat.endswith("/*")
+            and fnmatchcase(f"{waive_file}/_", pat)
+        ):
+            return True
+    for m in _DESELECT_OPT_RE.finditer(norm_entry):
+        deselected = _normalize_target_path(m.group(1).strip("\"'"))
+        if deselected and _target_in_filter_subtree(norm_waive, deselected):
+            return True
+    return False
 
 
 def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
-    """Best-effort check: would this entry's pytest options run the waived test.
+    """Best-effort check: would this entry's pytest target and options run the waived test.
 
-    Skips ancestor-level entries whose `-k` filter excludes the waive (e.g.
-    `file.py -k "weights"` shouldn't match a `test_biases[a]` waive).
-
-    `-k "<expr>"`: extract identifier tokens, drop boolean operators, accept
-                   if any remaining token appears in waive id.
-    `-m "<mark>"`: always accept (markers are runtime metadata, can't verify
-                   from the test id string alone).
-    No options:    always accept.
+    Rejects entries that lie on a sibling path, explicitly `--ignore`/`--deselect`
+    the waived target, or carry a `-k` expression with no token matching `waive_id`.
     """
+    norm_entry = normalize_test_id(entry)
+    norm_waive = normalize_test_id(waive_id)
+    if _PYTEST_OPTION_RE.search(norm_waive) is not None:
+        return norm_entry == norm_waive
+    if _entry_excludes_waive(entry, waive_id):
+        return False
+    entry_target = _entry_target(entry)
+    waive_target = _entry_target(waive_id)
+    if (
+        entry_target
+        and waive_target
+        and not (
+            _target_in_filter_subtree(waive_target, entry_target)
+            or _target_in_filter_subtree(entry_target, waive_target)
+        )
+    ):
+        return False
     kw = _extract_k_keyword(entry)
     if kw is None:
         return True  # no -k → unconstrained
-    tokens = re.findall(r"[A-Za-z_]\w*", kw)
+    tokens = re.findall(r"[A-Za-z_][\w.]*", kw)
+    if any(t.lower() == "not" for t in tokens):
+        return True  # negations match the complement; over-include safely
     real = [t for t in tokens if t.lower() not in _K_RESERVED_WORDS]
     if not real:
         return True  # all-reserved expression → can't decide; over-include
-    return any(t in waive_id for t in real)
+    waive_file = waive_target.split("::", 1)[0]
+    if "[" not in norm_waive and not (
+        not entry_target.endswith(".py")
+        and waive_file.endswith(".py")
+        and all(
+            t.lower().rsplit("/", 1)[-1].startswith("test_") and t.lower().endswith(".py")
+            for t in real
+        )
+    ):
+        return True  # unparameterized waive may match `-k` via unseen `[params]`
+    waive_lower = norm_waive.lower()
+    return any(t.lower() in waive_lower for t in real)
 
 
 def _strip_params(s: str) -> str:
@@ -184,7 +264,8 @@ def _normalize_target_path(target: str) -> str:
 def _entry_target(entry: str) -> str:
     """Canonical "target" key for indexing/lookup.
 
-    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
+    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m/--ignore/--ignore-glob/--deselect),
+    and `[params]` suffix.
 
     `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
     `file.py -k "kw"`                          → `file.py`
@@ -297,53 +378,37 @@ class YAMLIndex:
                     if head:
                         self._yaml_first_components.add(head)
 
-    def find_match_for_waive(self, waive_id: str) -> Optional[tuple[str, list[Block]]]:
-        """Walk up the pytest parent chain; first level with a match wins.
+    def find_matches_for_waive(self, waive_id: str) -> Optional[list[tuple[Block, str]]]:
+        """Resolve the most specific matching YAML target level independently per block.
 
-        Returns (level, blocks) for the first level whose YAML index has at
-        least one matching entry, or None when even the root level misses.
-
-        Detail:
-            (level, blocks): `level` is the YAML target string where the match
-                            was found; `blocks` are the affected blocks at
-                            that level.
-            None:            no level matched all the way to the root —
-                            caller should treat as fallback (CBTS exits,
-                            baseline runs).
-
-        An entry "matches" at a level when its target (after stripping pytest
-        options) equals the level AND its `-k` filter (if any) actually applies
-        to the waive id.
+        Different platforms can register the same test at different granularities
+        (e.g. a standalone file on GB300 and a parent directory batch on B200).
+        Walking the parent chain across all blocks and recording only the first
+        matching level per `(yaml_stem, block_index)` keeps every applicable
+        platform selected at its own narrowest level.
         """
-        # Step 1+2: normalize the waive id, strip [params] to get the start.
-        #   `file.py::TestC::test_m[a-b]` → `file.py::TestC::test_m`
-        #   `file.py::TestC::test_m`      → unchanged (already at function level)
-        #   `file.py::TestC`              → unchanged (class)
-        #   `file.py`                     → unchanged (file)
         target = _strip_pytest_options(normalize_test_id(waive_id))
         if "[" in target:
             target = target.rsplit("[", 1)[0]
 
-        # Step 3: walk up until something matches.
+        resolved: list[tuple[Block, str]] = []
+        done_blocks: set[tuple[str, int]] = set()
         for level in [target, *_iter_parent_ids(target)]:
-            candidates = self._test_to_blocks.get(level, [])
-            matched: list[Block] = []
-            seen_keys: set[tuple[str, int]] = set()
-            for block in candidates:
+            for block in self._test_to_blocks.get(level, []):
                 key = (block.yaml_stem, block.block_index)
-                if key in seen_keys:
+                if key in done_blocks:
                     continue
-                # Verify at least one entry in this block has canonical
-                # target == level AND its -k constraint (if any) applies to
-                # the waive. Canonical = strip pytest options and [params].
-                for raw in block.tests:
-                    if _entry_target(raw) == level and _entry_applies_to_waive(raw, waive_id):
-                        matched.append(block)
-                        seen_keys.add(key)
-                        break
-            if matched:
-                return level, matched
-        return None
+                hits = [
+                    raw
+                    for raw in block.tests
+                    if _entry_target(raw) == level and _entry_applies_to_waive(raw, waive_id)
+                ]
+                if not hits:
+                    continue
+                resolved.append((block, level))
+                if any(_extract_k_keyword(raw) is None for raw in hits):
+                    done_blocks.add(key)
+        return resolved or None
 
     def git_path_to_yaml_key(self, git_path: str) -> Optional[str]:
         """Translate a repo-relative git path to its YAML namespace form.
@@ -364,6 +429,8 @@ class YAMLIndex:
         for block in self.blocks:
             covering: list[str] = []
             for entry in block.tests:
+                if _entry_excludes_waive(entry, anchor):
+                    continue
                 t = _entry_target(entry)
                 if _target_in_filter_subtree(t, anchor) or _target_in_filter_subtree(anchor, t):
                     covering.append(t)
@@ -373,6 +440,22 @@ class YAMLIndex:
             prefix = min(ancestors, key=len) if ancestors else anchor
             result.append((block, prefix))
         return result or None
+
+    def find_match_for_path_with_anchor(
+        self, path: str
+    ) -> Optional[tuple[str, list[tuple[Block, str]]]]:
+        """Like `find_match_for_path`, also returning the resolved lookup anchor."""
+        anchor = _path_lookup_anchor(path)
+        if not anchor:
+            return None
+        is_file_anchor = anchor == path
+        while True:
+            matches = self._lookup_at_anchor(anchor)
+            if matches is not None:
+                return anchor, matches
+            if is_file_anchor or "/" not in anchor:
+                return None
+            anchor = anchor.rsplit("/", 1)[0]
 
     def find_match_for_path(self, path: str) -> Optional[list[tuple[Block, str]]]:
         """Find YAML entries that share pytest-tree lineage with `path`.
@@ -389,17 +472,8 @@ class YAMLIndex:
         such ancestor. `test_*.py` paths anchor on the file itself
         without walking up.
         """
-        anchor = _path_lookup_anchor(path)
-        if not anchor:
-            return None
-        is_file_anchor = anchor == path
-        while True:
-            matches = self._lookup_at_anchor(anchor)
-            if matches is not None:
-                return matches
-            if is_file_anchor or "/" not in anchor:
-                return None
-            anchor = anchor.rsplit("/", 1)[0]
+        res = self.find_match_for_path_with_anchor(path)
+        return res[1] if res is not None else None
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()
@@ -720,11 +794,19 @@ def _avg_duration(durations: dict[str, float]) -> float:
 
 
 def _estimate_entries_seconds(entries: list[str], durations: dict[str, float], avg: float) -> float:
-    """Sum entries' wall-time: exact node-id, else subtree-sum (deduped), else avg."""
+    """Sum entries' wall-time: wrapped/exact node-id, else bare, else subtree-sum, else avg."""
     matched: set[str] = set()
     unknown = 0
     for entry in entries:
-        bare = _strip_pytest_options(normalize_test_id(entry))
+        norm = normalize_test_id(entry)
+        wrapped = f"test_unittests.py::test_unittests_v2[{norm}]"
+        if wrapped in durations:
+            matched.add(wrapped)
+            continue
+        if norm in durations:
+            matched.add(norm)
+            continue
+        bare = _strip_pytest_options(norm)
         if bare in durations:
             matched.add(bare)
             continue
@@ -836,10 +918,8 @@ def write_filtered_test_db(
                         matched_waives |= waives
                 if not matched_waives:
                     continue
-                # -k keyword guard: drop entries whose `-k` filter
-                # excludes every matching waive. Entries without `-k`
-                # are always kept (`_entry_applies_to_waive` returns
-                # True when no keyword is present).
+                # Applicability guard: drop sibling entries and entries whose
+                # `--ignore`/`--deselect`/`-k` options exclude every matching id.
                 if any(_entry_applies_to_waive(t, w) for w in matched_waives):
                     kept.append(t)
             # Safety: empty filter result → fallback to original (prevents

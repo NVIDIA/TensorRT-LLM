@@ -21,6 +21,7 @@ from typing import Iterable, Iterator
 from cbts.blocks import (
     Stage,
     YAMLIndex,
+    _entry_excludes_waive,
     _entry_target,
     _target_in_filter_subtree,
     block_matches_stage,
@@ -280,21 +281,19 @@ def lookup_ids_into_block_filters(
     yaml_index: YAMLIndex,
     test_ids: Iterable[str],
 ) -> tuple[dict[tuple[str, int], dict[str, set[str]]], list[str]]:
-    """Resolve test ids via `find_match_for_waive`; return (block_filters, misses).
+    """Resolve test ids via `find_matches_for_waive`; return (block_filters, misses).
 
-    Each id is added to its matched level's identifier set per affected
-    block, so `write_filtered_test_db`'s `-k` keyword guard re-checks
-    each entry against the original test ids.
+    Each block receives its own most-specific matching level so cross-platform
+    file-vs-directory registrations all participate in narrowing.
     """
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     misses: list[str] = []
     for tid in test_ids:
-        match = yaml_index.find_match_for_waive(tid)
-        if match is None:
+        matches = yaml_index.find_matches_for_waive(tid)
+        if matches is None:
             misses.append(tid)
             continue
-        level, blocks = match
-        for block in blocks:
+        for block, level in matches:
             key = (block.yaml_stem, block.block_index)
             block_filters.setdefault(key, {}).setdefault(level, set()).add(tid)
     return block_filters, misses
@@ -308,22 +307,30 @@ def lookup_paths_into_block_filters(
     covering entry's raw text as identifier so it passes its own `-k` guard.
 
     Returns (block_filters, unmatched_paths). A path is "unmatched" when
-    no YAML entry shares pytest-tree lineage with it. Over-includes
-    sibling `-k` variants on purpose: a path change should run every
-    parameterization of the affected file/scope.
+    no YAML entry shares pytest-tree lineage with it. Intentionally retains
+    every entry under `prefix` that does not explicitly exclude `resolved_anchor`
+    (including sibling `-k` variants and sibling `test_*.py` files): `test_*.py`
+    modules can import or subclass sibling test modules directly, and static
+    importer discovery in `TestsDefRule` deliberately skips `test_*.py` targets.
     """
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     unmatched: list[str] = []
     for path in paths:
-        matches = yaml_index.find_match_for_path(path)
-        if matches is None:
+        res = yaml_index.find_match_for_path_with_anchor(path)
+        if res is None:
             unmatched.append(path)
             continue
+        resolved_anchor, matches = res
         for block, prefix in matches:
             key = (block.yaml_stem, block.block_index)
             ids = block_filters.setdefault(key, {}).setdefault(prefix, set())
             for raw in block.tests:
-                if _target_in_filter_subtree(_entry_target(raw), prefix):
+                target = _entry_target(raw)
+                # Keep all non-excluded entries under `prefix` so cross-test
+                # subclasses/importers under a directory prefix are not dropped.
+                if _target_in_filter_subtree(target, prefix) and not _entry_excludes_waive(
+                    raw, resolved_anchor
+                ):
                     ids.add(raw)
     return block_filters, unmatched
 

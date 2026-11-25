@@ -42,7 +42,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from cbts.blocks import Stage, YAMLIndex, _entry_target
+from cbts.blocks import (
+    Stage,
+    YAMLIndex,
+    _entry_target,
+    _extract_k_keyword,
+    _strip_pytest_options,
+    normalize_test_id,
+)
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
@@ -131,10 +138,16 @@ def _entry_is_spec(entry: str) -> bool:
     `mtp_nextn=0` carve-out: those parametrizations test MTP-disabled
     baseline behavior, not the spec-dec code path. Skip them unless the
     entry also carries another spec-dec marker (e.g. `_mtp`, `test_eagle`).
+    Exclusions (`--ignore`/`--deselect`) are stripped first so ignoring an
+    `_mtp` file does not mark the parent directory batch as spec-dec.
     """
-    if _MTP_DISABLED_MARKER in entry:
-        return any(p in entry for p in _SPEC_ENTRY_PATTERNS if p != "mtp_nextn")
-    return any(p in entry for p in _SPEC_ENTRY_PATTERNS)
+    searchable = _strip_pytest_options(normalize_test_id(entry))
+    kw = _extract_k_keyword(entry)
+    if kw:
+        searchable = f"{searchable} {kw}"
+    if _MTP_DISABLED_MARKER in searchable:
+        return any(p in searchable for p in _SPEC_ENTRY_PATTERNS if p != "mtp_nextn")
+    return any(p in searchable for p in _SPEC_ENTRY_PATTERNS)
 
 
 def _spec_entries(block) -> list[str]:
