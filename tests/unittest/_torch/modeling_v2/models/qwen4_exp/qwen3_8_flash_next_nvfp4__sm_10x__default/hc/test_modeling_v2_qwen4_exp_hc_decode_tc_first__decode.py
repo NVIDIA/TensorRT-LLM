@@ -146,16 +146,26 @@ def test_guard_refuses_rows_on_n_outside_its_rows() -> None:
 
 @pytest.mark.parametrize("rows", [65, 68, 80, 96, 112, 128])
 def test_tm64x2_is_one_rounding_from_the_default_plan(rows) -> None:
-    """`tm64x2=True` (two 64-row tiles, an 8-way K split) moves `low` by at most one bf16 step
-    of the default plan's and leaves `inject` within one step too (measured bitwise at 68..96
-    rows on GB300); its graph replay is bitwise its eager call."""
+    """`tm64x2=True` (two 64-row tiles, an 8-way K split) stays in the float64 reference's band, as
+    every cell does, and moves `low` and `inject` by at most one bf16 step of the default plan's
+    wherever a lane is not cancelling (at least `eps / 16` of the tensor's largest value, the
+    band's absolute term). A cancelling lane can move further: the two fp32 sums of 10240 terms
+    differ by a few fp32 ulps of the row's scale, many bf16 steps of a value near 0 (full-stack3
+    GPU gate: 1 lane at 65 rows, 2 at 80, |low| about 1e-4, both plans inside the band). Its
+    graph replay is bitwise its eager call."""
     normed, first, rank, c, wi = _build(dict(rows=rows), seed=1100 + rows)
     ref = op(normed, first, rank, c, wi)
     got = op(normed, first, rank, c, wi, tm64x2=True)
+    exact = op.reference(normed, first, rank, c, wi)
     torch.cuda.synchronize()
-    for a, b in zip(ref, got):
-        step = torch.finfo(torch.bfloat16).eps * a.float().abs().clamp(min=2.0**-14)
-        assert ((a.float() - b.float()).abs() <= step).all()
+    eps = torch.finfo(torch.bfloat16).eps
+    for a, b, r in zip(ref, got, exact):
+        if a is None:
+            continue
+        assert _ratio(b, r) <= 1.0, f"{_ratio(b, r):.4g}x the band"
+        a, b = a.float(), b.float()
+        kept = a.abs() >= eps / 16 * a.abs().max()
+        assert ((a - b).abs() <= eps * a.abs())[kept].all()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         g_low, g_inject = op(normed, first, rank, c, wi, tm64x2=True)
