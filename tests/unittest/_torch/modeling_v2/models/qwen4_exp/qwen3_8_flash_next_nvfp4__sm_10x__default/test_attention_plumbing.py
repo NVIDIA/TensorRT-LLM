@@ -440,8 +440,9 @@ def _chunked_calls(monkeypatch, rows: int, pages: int, parts, limit=None):
         assert q.shape[0] * columns < (limit or M._SCORE_TABLE_ELEMENTS)
         return q[:, 0, :1].expand(q.shape[0], columns)
 
-    def selection(core, scores, visible, logical, seq_lens, topk, starts, out, live_cols):
+    def selection(core, scores, visible, logical, seq_lens, topk, starts, out, live_cols, context):
         assert scores.shape == (logical.shape[0], columns) and live_cols == 7
+        assert context == calls[-1][2]  # the scoring call's context rows pick the launch
         out.copy_(logical[:, None].to(out.dtype).expand_as(out))
 
     monkeypatch.setattr(M, "qsa_paged_index_scores", scores_op)
