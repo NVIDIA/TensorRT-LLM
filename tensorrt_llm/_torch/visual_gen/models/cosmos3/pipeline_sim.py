@@ -78,6 +78,33 @@ PIPELINE_CONFIG_DEFAULTS = {
 """The ``pipeline_config`` keys of the Sim pipeline. All are fixed for the engine's
 lifetime: the cache is sized at warmup and CUDA graphs are captured over its layout."""
 
+SIM_EXTRA_PARAMS = (
+    "use_duration_template",
+    "use_resolution_template",
+    "use_system_prompt",
+    "use_guardrails",
+    "enable_audio",
+    "output_type",
+    "flow_shift",
+    "sigma_grid",
+    "action_mode",
+    "domain_name",
+    "domain_id",
+    "raw_action_dim",
+    "action_chunk_size",
+    "action",
+    "action_resolution",
+    "action_fps",
+)
+"""The Cosmos3 request parameters a rollout takes. The family's other parameters belong
+to inputs it refuses: transfer controls, a reference video and the policy mode's state
+row."""
+
+
+def _validate_audio_off(value: Any) -> None:
+    if value:
+        raise ValueError("Cosmos3 Sim does not generate audio; enable_audio must be false")
+
 
 def _validate_domain_ids(value: Any) -> None:
     ids = value if isinstance(value, (list, tuple)) else [value]
@@ -293,7 +320,26 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 
     @property
     def extra_param_specs(self):
-        specs = super().extra_param_specs
+        family = super().extra_param_specs
+        specs = {key: family[key] for key in SIM_EXTRA_PARAMS}
+        specs["action_mode"] = specs["action_mode"].model_copy(
+            update={
+                "type": f"Literal[{ACTION_MODE_FORWARD_DYNAMICS!r}]",
+                "default": None,
+                "description": (
+                    "forward_dynamics: generate the video an action trajectory causes, from "
+                    "a first frame. Unset: generate from the prompt alone. A forward-dynamics "
+                    "result carries the trajectory with the video, which a video container "
+                    "cannot hold, so it is served as a tensor payload."
+                ),
+            }
+        )
+        specs["enable_audio"] = specs["enable_audio"].model_copy(
+            update={
+                "description": "Audio generation. A rollout generates none: only false is accepted.",
+                "validator": _validate_audio_off,
+            }
+        )
         specs["domain_id"] = specs["domain_id"].model_copy(
             update={
                 "type": "int | list[int]",
@@ -316,6 +362,12 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
             }
         )
         return specs
+
+    @property
+    def ref_slot_specs(self):
+        """The first frame of a forward-dynamics request. A rollout takes no reference
+        video."""
+        return {"image_reference": super().ref_slot_specs["image_reference"]}
 
     def _load_vae(self, checkpoint_dir: str, device: torch.device) -> torch.nn.Module:
         # Every process must encode a first frame to the same latent: the rollout turns a
@@ -1188,6 +1240,7 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 
 __all__ = [
     "PIPELINE_CONFIG_DEFAULTS",
+    "SIM_EXTRA_PARAMS",
     "Cosmos3SimPipeline",
     "domain_runs",
     "largest_tier_frame",

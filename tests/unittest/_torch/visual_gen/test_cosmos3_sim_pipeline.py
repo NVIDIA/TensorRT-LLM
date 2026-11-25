@@ -37,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmo
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     KV_TOKENS_PER_PAGE,
     PIPELINE_CONFIG_DEFAULTS,
+    SIM_EXTRA_PARAMS,
     Cosmos3SimPipeline,
     domain_runs,
     largest_tier_frame,
@@ -50,7 +51,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams, validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
 
@@ -845,6 +846,60 @@ def test_domain_parameters_take_one_value_or_one_per_row():
     for domain_name in ([], 15, ["agibotworld", 15]):
         with pytest.raises(ValueError, match="domain_name must be a string"):
             validate(domain_name=domain_name)
+
+
+def test_advertised_inputs_are_the_ones_the_rollout_takes():
+    """What a caller discovers through ``extra_param_specs`` and ``ref_slot_specs`` is
+    what a rollout runs: a prompt alone, or forward dynamics from a first frame. The
+    family's other inputs are refused when the request is validated, before it is
+    queued."""
+    pipe = _envelope_pipe()
+    pipe._resolver = bare_resolver("qwen3")
+    specs, slots = pipe.extra_param_specs, pipe.ref_slot_specs
+    family = Cosmos3OmniMoTPipeline.extra_param_specs.fget(pipe)
+
+    assert set(specs) == set(SIM_EXTRA_PARAMS) and set(specs) < set(family)
+    assert set(slots) == {"image_reference"}
+    assert [role.role for role in slots["image_reference"].roles] == ["first_frame"]
+    # An action request is still answered with a tensor payload, and a request that
+    # sets no mode is the prompt-only rollout.
+    assert specs["action_mode"].requires_tensor_output is True
+    assert specs["action_mode"].default is None
+
+    def validate(**fields):
+        validate_visual_gen_params(
+            VisualGenParams(**fields),
+            declared_defaults=None,
+            extra_param_specs=specs,
+            ref_slot_specs=slots,
+        )
+
+    first_frame = [MediaRef(content="frame.png", format="path")]
+    validate()
+    validate(extra_params={"enable_audio": False, "output_type": "video"})
+    validate(
+        image_reference=first_frame,
+        extra_params={"action_mode": "forward_dynamics", "action": [[0.0] * 59] * 4},
+    )
+
+    for action_mode in ("policy", "inverse_dynamics"):
+        with pytest.raises(ValueError, match=r"expected one of \['forward_dynamics'\]"):
+            validate(image_reference=first_frame, extra_params={"action_mode": action_mode})
+    with pytest.raises(ValueError, match="'video_reference' is not accepted"):
+        validate(video_reference=[MediaRef(content="clip.mp4", format="path")])
+    with pytest.raises(ValueError, match="does not generate audio"):
+        validate(extra_params={"enable_audio": True})
+    refused = {
+        "edge": True,
+        "show_input": True,
+        "condition_video_latent_indexes": [0, 1],
+        "use_state": True,
+        "view_point": "ego_view",
+    }
+    assert set(refused) < set(family)
+    for key, value in refused.items():
+        with pytest.raises(ValueError, match=rf"Unknown extra_params \['{key}'\]"):
+            validate(extra_params={key: value})
 
 
 @dataclass(frozen=True)
