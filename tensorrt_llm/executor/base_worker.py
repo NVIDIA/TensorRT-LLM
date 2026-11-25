@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import datetime
 import enum
 import gc
@@ -41,6 +42,8 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..inputs.prompt_embeds import (plain_cache_salt, prompt_embeds_cache_salt,
+                                    value_range)
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -406,6 +409,90 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
+    def _effective_cache_salt(self,
+                              request: GenerationRequest) -> Optional[str]:
+        """Fold the embedding identity into the salt unless block keys carry it."""
+        if request.prompt_embeds is None or self._kv_cache_keys_prompt_embeds():
+            return plain_cache_salt(request.cache_salt)
+        return prompt_embeds_cache_salt(request.cache_salt,
+                                        request.prompt_embeds.digest)
+
+    def _kv_cache_keys_prompt_embeds(self) -> bool:
+        """Whether block keys carry the rows; KV connectors key by ids and salt."""
+        if self.llm_args is not None and getattr(
+                self.llm_args, "kv_connector_config", None) is not None:
+            return False
+        return self._cache_manager_keys_rows()
+
+    def _cache_manager_keys_rows(self) -> bool:
+        return getattr(getattr(self.engine, "kv_cache_manager", None),
+                       "keys_prompt_embeds_rows", False)
+
+    def _check_prompt_embeds(self, request: GenerationRequest) -> None:
+        """Reject prompt embeddings this engine cannot place correctly."""
+        prompt_embeds = request.prompt_embeds
+        if prompt_embeds is None:
+            return
+        request_type = (request.disaggregated_params.request_type
+                        if request.disaggregated_params is not None else None)
+        if prompt_embeds.embeds is None and request_type != "generation_only":
+            raise RequestError("prompt_embeds carries no rows.")
+        if self.llm_args is None:
+            raise RequestError("prompt_embeds requires the PyTorch backend.")
+        unsupported = []
+        if self.llm_args.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        parallel_config = self.llm_args.parallel_config
+        if parallel_config.enable_attention_dp:
+            unsupported.append("attention data parallelism")
+        if parallel_config.cp_size > 1:
+            unsupported.append("context parallelism")
+        if unsupported:
+            raise RequestError("prompt_embeds is not supported with " +
+                               ", ".join(unsupported) + ".")
+        from .._torch.models.modeling_utils import \
+            prompt_embeds_unsupported_reason
+        model = self.engine.model_engine.model
+        reason = prompt_embeds_unsupported_reason(model)
+        if reason is not None:
+            raise RequestError(
+                f"prompt_embeds is not supported by {type(model).__name__}: "
+                f"{reason}.")
+        config = model.config
+        if getattr(config, "hidden_size", None) is None:
+            config = config.text_config
+        hidden_size = config.hidden_size
+        if prompt_embeds.hidden_size != hidden_size:
+            raise RequestError(
+                f"prompt_embeds hidden size ({prompt_embeds.hidden_size}) "
+                f"does not match the model hidden size ({hidden_size}).")
+        model_dtype = getattr(config, "torch_dtype", None)
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, None)
+        # The overlay casts rows to the model dtype, where values beyond its
+        # range become inf. A generation-only request carries no rows to
+        # check. The extremes compare as Python floats: the float16 limit
+        # rounds up to 65536 as a bfloat16 scalar.
+        if (model_dtype in (torch.float16, torch.bfloat16)
+                and prompt_embeds.embeds is not None
+                and prompt_embeds.dtype != model_dtype
+                and max(abs(v) for v in value_range(prompt_embeds.embeds))
+                > torch.finfo(model_dtype).max):
+            raise RequestError(
+                f"prompt_embeds holds values outside the "
+                f"{str(model_dtype).removeprefix('torch.')} range of this "
+                "model.")
+        if int(prompt_embeds.positions[-1]) >= request.prompt_len:
+            raise RequestError(
+                "prompt_embeds positions exceed the prompt length.")
+        if (request_type in ("context_only", "generation_only")
+                and not self._cache_manager_keys_rows()):
+            # The V1 transceiver looks up transferred blocks without the
+            # request salt that carries the embedding identity.
+            raise RequestError(
+                "prompt_embeds with disaggregated serving requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
+
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
@@ -413,6 +500,7 @@ class BaseWorker(GenerationExecutor):
         if request.prompt_adapter_request is not None:
             raise RequestError(
                 "Prompt adapters are not supported by the PyTorch executor.")
+        self._check_prompt_embeds(request)
         py_lora_path = None
         py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -578,7 +666,7 @@ class BaseWorker(GenerationExecutor):
                 encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
                 disagg_request_id=disagg_request_id,
-                cache_salt=request.cache_salt,
+                cache_salt=self._effective_cache_salt(request),
                 priority=request.priority)
             if request.multimodal_params is not None:
                 # Resolve worker-handoff handles before constructing the input envelope.
@@ -615,6 +703,7 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
+                    prompt_embeds=request.prompt_embeds,
                 ),
             )
 
@@ -1726,7 +1815,15 @@ def _get_params_for_first_rsp(
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params, res.disaggregated_params
+        disaggregated_params = res.disaggregated_params
+        embeds = getattr(getattr(res, "_generation_request", None),
+                         "prompt_embeds", None)
+        if (embeds is not None and disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"):
+            # Postproc records have no request to read the identity from.
+            disaggregated_params = dataclasses.replace(
+                disaggregated_params, prompt_embeds=embeds.identity_only())
+        return res.sampling_params, res.postproc_params, disaggregated_params
     return None, None, None
 
 

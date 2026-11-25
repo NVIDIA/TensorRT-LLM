@@ -23,6 +23,7 @@ from tensorrt_llm.bindings import executor as tllme
 
 if TYPE_CHECKING:
     from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
+    from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -59,6 +60,9 @@ class DisaggregatedParams:
         multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
         multimodal_input_layout (MultimodalInputLayout): Exact encoder-side
          prompt and multimodal layout to preserve during E/P handoff.
+        prompt_embeds (PromptEmbeds): Identity (no rows) of the context request's
+         prompt_embeds, set on context-only results. The generation-only request keys
+         the transferred blocks by it and needs no rows of its own.
     """
 
     request_type: Optional[str] = None
@@ -90,6 +94,7 @@ class DisaggregatedParams:
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
     multimodal_input_layout: Optional["MultimodalInputLayout"] = None
+    prompt_embeds: Optional["PromptEmbeds"] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id

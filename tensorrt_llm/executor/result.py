@@ -719,6 +719,10 @@ class GenerationResultBase:
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
                     multimodal_input_layout=None,
+                    prompt_embeds=getattr(
+                        getattr(self, "_generation_request", None),
+                        "prompt_embeds", None)
+                    or getattr(existing_disagg_params, "prompt_embeds", None),
                 )
 
             finish_reasons = response_result.finish_reasons

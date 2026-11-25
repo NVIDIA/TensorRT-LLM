@@ -35,6 +35,8 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
 # Linger applied by ZeroMqQueue.close() to a socket still at zmq's infinite
 # default, so closing never waits forever for a peer that has exited.
 CLOSE_LINGER_MS = 1000
+# Protocol 5 writes large buffers (PickleBuffer) into the payload without an extra copy.
+_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
 
 
 class ZeroMqQueue:
@@ -214,7 +216,7 @@ class ZeroMqQueue:
                 self._send_data(data, routing_id=routing_id)
             else:
                 # Standard socket without encryption - use pyobj directly
-                self.socket.send_pyobj(obj)
+                self.socket.send_pyobj(obj, protocol=_PICKLE_PROTOCOL)
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.
@@ -229,7 +231,9 @@ class ZeroMqQueue:
                 data = self._prepare_data(obj)
                 self._send_data(data, flags=zmq.NOBLOCK, routing_id=routing_id)
             else:
-                self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+                self.socket.send_pyobj(obj,
+                                       flags=zmq.NOBLOCK,
+                                       protocol=_PICKLE_PROTOCOL)
 
     def put_noblock(self,
                     obj: Any,
@@ -272,7 +276,7 @@ class ZeroMqQueue:
                 await self._send_data_async(data, routing_id=routing_id)
             else:
                 # Standard socket without encryption
-                await self.socket.send_pyobj(obj)
+                await self.socket.send_pyobj(obj, protocol=_PICKLE_PROTOCOL)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -288,11 +292,13 @@ class ZeroMqQueue:
         self._check_thread_safety()
         try:
             if self.use_hmac_encryption:
-                data = pickle.dumps(obj)  # nosec B301
+                data = pickle.dumps(obj, _PICKLE_PROTOCOL)  # nosec B301
                 signed_data = self._sign_data(data)
                 await self.socket.send(signed_data, flags=zmq.NOBLOCK)
             else:
-                await self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+                await self.socket.send_pyobj(obj,
+                                             flags=zmq.NOBLOCK,
+                                             protocol=_PICKLE_PROTOCOL)
         except Exception as e:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
@@ -435,7 +441,7 @@ class ZeroMqQueue:
 
     def _prepare_data(self, obj: Any) -> bytes:
         """Serialize object and optionally add HMAC signature."""
-        data = pickle.dumps(obj)  # nosec B301
+        data = pickle.dumps(obj, _PICKLE_PROTOCOL)  # nosec B301
         if self.use_hmac_encryption:
             return self._sign_data(data)
         return data

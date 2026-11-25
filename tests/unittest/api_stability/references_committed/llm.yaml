@@ -98,8 +98,8 @@ methods:
   generate:
     parameters:
       inputs:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
-          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, tensorrt_llm.inputs.data.EmbedsPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, tensorrt_llm.inputs.data.EmbedsPrompt]]]
         default: inspect._empty
       sampling_params:
         annotation: Union[tensorrt_llm.sampling_params.SamplingParams, List[tensorrt_llm.sampling_params.SamplingParams],
@@ -121,7 +121,7 @@ methods:
   generate_async:
     parameters:
       inputs:
-        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, tensorrt_llm.inputs.data.EmbedsPrompt,
           tensorrt_llm.llmapi.llm.PreprocessedInputs]
         default: inspect._empty
       sampling_params:

@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse, RequestError
 
 
 class RpcWorkerMixin:
@@ -222,6 +223,19 @@ class RpcWorkerMixin:
             result = super().submit(request)
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
+
+    def submit_from_proxy(self, request: GenerationRequest) -> None:
+        """RPC entry for proxies, which submit without awaiting a reply.
+
+        A rejected request is answered through the response stream, as on the MPI path.
+        """
+        try:
+            self.submit(request)
+        except RequestError as e:
+            logger.error(f"submit request failed: {e}")
+            self._await_response_helper.temp_error_responses.put(
+                ErrorResponse(request.id, str(e), request.id)
+            )
 
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         """Fetch responses from the response queue (blocking)."""
