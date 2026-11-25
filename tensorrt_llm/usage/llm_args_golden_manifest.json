@@ -732,6 +732,16 @@
       "path": "kv_cache_config.cold_tier_offload_min_priority"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.context_claim_ahead"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.context_prefetch_blocks"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.copy_on_partial_reuse"

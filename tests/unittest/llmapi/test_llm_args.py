@@ -2193,6 +2193,8 @@ def test_KvCacheConfig_defer_generation_only_release():
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("field,on", [
     ("defer_context_only_release", True),
+    ("context_claim_ahead", 6),
+    ("context_prefetch_blocks", 24000),
 ])
 def test_KvCacheConfig_host_helper_fields_need_v2(field, on):
     assert getattr(KvCacheConfig(), field) in (False, 0)
@@ -2211,6 +2213,15 @@ def test_KvCacheConfig_deferred_release_thread_needs_a_deferral():
         }).deferred_release_thread
     with pytest.raises(ValidationError, match="needs defer_generation_only"):
         KvCacheConfig(deferred_release_thread=True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("field",
+                         ["context_claim_ahead", "context_prefetch_blocks"])
+def test_KvCacheConfig_context_helpers_need_block_reuse(field):
+    with pytest.raises(ValidationError, match="requires enable_block_reuse"):
+        KvCacheConfig(**{field: 8, "enable_block_reuse": False})
+    KvCacheConfig(**{field: 0, "enable_block_reuse": False})
 
 
 @pytest.mark.cpu_only
@@ -3471,6 +3482,12 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
     {
         "defer_generation_only_release": True,
         "deferred_release_thread": True
+    },
+    {
+        "context_claim_ahead": 6
+    },
+    {
+        "context_prefetch_blocks": 24000
     },
 ])
 def test_defer_generation_only_release_needs_the_overlap_loop(loop, kv) -> None:

@@ -2368,6 +2368,72 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "context_claim_ahead": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "context_claim_ahead"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "context_prefetch_blocks": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "context_prefetch_blocks"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
+              }
+            }
+          }
         }
       ],
       "properties": {
@@ -5814,6 +5880,50 @@
         {
           "if": {
             "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
               "deferred_release_thread": {
                 "const": true
               }
@@ -5845,6 +5955,50 @@
                 ]
               }
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_block_reuse": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
+            ]
+          },
+          "then": {
+            "properties": {
+              "enable_block_reuse": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
           }
         },
         {
@@ -5922,6 +6076,22 @@
           "default": null,
           "description": "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset.",
           "title": "Cold Tier Offload Min Priority"
+        },
+        "context_claim_ahead": {
+          "default": 0,
+          "description": "Create and resume the KV cache (reuse match and page restore) of up to this many waiting first context chunks on a background thread, inside the forward call of a context-only batch; the next scheduling pass adopts the cache instead of creating it. A claim not adopted within four passes, or whose pages the scheduler needs, is released. 0 disables it. Requires KV cache manager v2 with block reuse, and the overlap scheduler without pipeline parallelism.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Context Claim Ahead",
+          "type": "integer"
+        },
+        "context_prefetch_blocks": {
+          "default": 0,
+          "description": "Bring the reusable prefix of each new first context chunk to the GPU tier on a background thread, inside the forward call of a context-only batch, while at most this many prefetched blocks wait for their request's KV cache. A request whose prefix sits in a lower tier then resumes without waiting for those copies. 0 disables it. Requires KV cache manager v2 with block reuse, and the overlap scheduler without pipeline parallelism.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Context Prefetch Blocks",
+          "type": "integer"
         },
         "copy_on_partial_reuse": {
           "default": true,
@@ -11021,6 +11191,72 @@
             },
             "required": [
               "deferred_release_thread"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "context_claim_ahead": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_claim_ahead"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "context_prefetch_blocks": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context_prefetch_blocks"
             ],
             "type": "object"
           }

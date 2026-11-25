@@ -6836,13 +6836,14 @@ class TestGenInitPauseAfterRelease:
         assert admitted == [[1], [], [2], []]
 
 
-def _context_out_of_pages(closes_deferred: bool, **scheduler_kwargs):
+def _context_out_of_pages(closes_deferred: bool, claims_parked: bool = False, **scheduler_kwargs):
     """Request 0 runs out of pages beside started request 99, the preemption candidate."""
     mgr = make_kv_cache_manager(
         resize_context_fn=_out_of_pages_for(0),
         has_cache_tier_below_gpu=False,
     )
     mgr.flush_deferred_closes.return_value = closes_deferred
+    mgr.release_claims_ahead.return_value = claims_parked
     sched = make_scheduler(mgr, max_num_tokens=1000, **scheduler_kwargs)
     victim = make_ctx_request(99, 100, is_first_context_chunk=False)
     return mgr, victim, sched.schedule_request([make_ctx_request(0, 100), victim], set())
@@ -6862,3 +6863,28 @@ class TestDeferredClosesBeforeContextPreemption:
         mgr, victim, out = _context_out_of_pages(closes_deferred=False)
         mgr.preempt_request.assert_called_once_with(victim)
         assert ids(out.recompute_paused_requests) == [99]
+
+
+class TestContextClaimsReclaimedBeforePreemption:
+    """kv_cache_config.context_claim_ahead: a context request out of pages takes back the pages
+    of caches claimed ahead before it gives up a started request."""
+
+    def test_parked_claims_go_first(self):
+        mgr, _, out = _context_out_of_pages(
+            closes_deferred=False, claims_parked=True, reclaim_context_claims=True
+        )
+        mgr.release_claims_ahead.assert_called_once_with()
+        mgr.preempt_request.assert_not_called()
+        assert out.recompute_paused_requests == []
+
+    def test_without_parked_claims_a_started_request_pays_as_before(self):
+        mgr, victim, out = _context_out_of_pages(
+            closes_deferred=False, claims_parked=False, reclaim_context_claims=True
+        )
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+
+    def test_off_without_claims_ahead(self):
+        mgr, victim, _ = _context_out_of_pages(closes_deferred=False, claims_parked=True)
+        mgr.release_claims_ahead.assert_not_called()
+        mgr.preempt_request.assert_called_once_with(victim)

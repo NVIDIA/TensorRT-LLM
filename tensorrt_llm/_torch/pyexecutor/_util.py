@@ -5879,6 +5879,8 @@ def create_py_executor_resources(
                                   if scheduler_config is not None else False),
             gen_handoff_seat=gen_handoff_seat,
             gen_init_pause_after_release=gen_init_pause_after_release,
+            reclaim_context_claims=llm_args.kv_cache_config.context_claim_ahead
+            > 0,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -6115,6 +6117,9 @@ def create_py_executor_instance(
         defer_context_only_release,
         deferred_release_thread=llm_args.kv_cache_config.
         deferred_release_thread,
+        context_claim_ahead=llm_args.kv_cache_config.context_claim_ahead,
+        context_prefetch_blocks=llm_args.kv_cache_config.
+        context_prefetch_blocks,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,

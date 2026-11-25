@@ -2278,6 +2278,8 @@ def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
             for kv in (
                 {"defer_context_only_release": True},
                 {"defer_generation_only_release": True, "deferred_release_thread": True},
+                {"context_claim_ahead": 6},
+                {"context_prefetch_blocks": 24000},
             )
             for loop, valid in (
                 ({}, True),
@@ -2285,7 +2287,10 @@ def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
                 ({"pipeline_parallel_size": 2}, False),
             )
         ),
+        ({"context_claim_ahead": 0}, {"disable_overlap_scheduler": True}, True),
         ({"deferred_release_thread": True}, {}, False),
+        ({"context_claim_ahead": 6, "enable_block_reuse": False}, {}, False),
+        ({"context_prefetch_blocks": 8, "enable_block_reuse": False}, {}, False),
         ({"defer_context_only_release": True, "use_kv_cache_manager_v2": False}, {}, False),
     ],
 )

@@ -197,6 +197,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     _ctx_decoder_held = False
     _gen_init_pause_after_release = False
     _gen_release_pending = False
+    _reclaim_context_claims = False
     # Holds since take_decision_counters (see RequestScheduler.take_decision_counters).
     _num_gen_init_cap_holds = 0
     _num_gen_init_transfer_budget_holds = 0
@@ -228,6 +229,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         context_demote_probe: bool = False,
         gen_handoff_seat: bool = False,
         gen_init_pause_after_release: bool = False,
+        reclaim_context_claims: bool = False,
     ) -> None:
         """``recover_lost_kv_per_rank`` False is for ranks that schedule in lock step (TP without attention DP, CP,
         PP): a failed remote cache level then raises RemoteMemError out of ``schedule_request`` instead of re-matching,
@@ -378,6 +380,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # generation-init request (note_generation_release).
         self._gen_init_pause_after_release = gen_init_pause_after_release
         self._gen_release_pending = False
+        # Claims ahead (kv_cache_config.context_claim_ahead) hold GPU pages, which a context
+        # request out of pages takes back before it gives up a started request.
+        self._reclaim_context_claims = reclaim_context_claims
 
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
         # multi-hundred-k-token prefill takes the whole token budget for as many
@@ -1035,9 +1040,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             request take them instead would leave `req` preempting again every
             pass without ever being admitted.
             """
-            if self.kv_cache_manager.flush_deferred_closes():
-                # Pages held by deferred closes (defer_context_only_release) come back
-                # first; `req` retries next pass, as after a preemption.
+            if self.kv_cache_manager.flush_deferred_closes() or (
+                self._reclaim_context_claims and self.kv_cache_manager.release_claims_ahead()
+            ):
+                # Pages held by deferred closes (defer_context_only_release) or by caches
+                # claimed ahead for waiting requests come back first; `req` retries next
+                # pass, as after a preemption.
                 return True
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)

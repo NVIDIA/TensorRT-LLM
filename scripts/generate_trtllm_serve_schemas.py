@@ -204,6 +204,8 @@ _HOST_HELPER_FIELDS_ON = {
     "defer_generation_only_release": {"const": True},
     "defer_context_only_release": {"const": True},
     "deferred_release_thread": {"const": True},
+    "context_claim_ahead": {"type": "integer", "minimum": 1},
+    "context_prefetch_blocks": {"type": "integer", "minimum": 1},
 }
 
 
@@ -261,6 +263,13 @@ def _cross_field_rules(definitions: dict) -> None:
                         _is_set_to("defer_context_only_release", {"const": True}),
                     ]
                 },
+            ),
+            *(
+                when(
+                    _is_set_to(name, _HOST_HELPER_FIELDS_ON[name]),
+                    {"properties": {"enable_block_reuse": {"not": {"const": False}}}},
+                )
+                for name in ("context_claim_ahead", "context_prefetch_blocks")
             ),
             when(
                 _is_set_to("remote_cache_config", _is_set_to("level", {"type": "object"})),

@@ -6551,6 +6551,8 @@ _KV_CACHE_HOST_HELPER_FIELDS = (
     "defer_generation_only_release",
     "defer_context_only_release",
     "deferred_release_thread",
+    "context_claim_ahead",
+    "context_prefetch_blocks",
 )
 
 
@@ -6875,6 +6877,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "inside the forward call of a context-only batch, which captures no CUDA graph. The "
         "scheduler and the idle path still release on the executor thread when they need the "
         "pages. Requires one of the two options.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    context_claim_ahead: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Create and resume the KV cache (reuse match and page restore) of up to "
+        "this many waiting first context chunks on a background thread, inside the forward "
+        "call of a context-only batch; the next scheduling pass adopts the cache instead of "
+        "creating it. A claim not adopted within four passes, or whose pages the scheduler "
+        "needs, is released. 0 disables it. Requires KV cache manager v2 with block reuse, "
+        "and the overlap scheduler without pipeline parallelism.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    context_prefetch_blocks: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Bring the reusable prefix of each new first context chunk to the GPU "
+        "tier on a background thread, inside the forward call of a context-only batch, while "
+        "at most this many prefetched blocks wait for their request's KV cache. A request "
+        "whose prefix sits in a lower tier then resumes without waiting for those copies. 0 "
+        "disables it. Requires KV cache manager v2 with block reuse, and the overlap "
+        "scheduler without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -7230,6 +7256,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.deferred_release_thread needs "
                 "defer_generation_only_release or defer_context_only_release.")
+        for name in ("context_claim_ahead", "context_prefetch_blocks"):
+            if getattr(self, name) and not self.enable_block_reuse:
+                raise ValueError(
+                    f"kv_cache_config.{name} requires enable_block_reuse=True.")
         return self
 
     @model_validator(mode='after')

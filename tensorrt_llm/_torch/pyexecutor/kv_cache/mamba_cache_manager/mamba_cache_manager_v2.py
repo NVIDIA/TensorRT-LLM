@@ -127,6 +127,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # Context claims ahead (KVCacheManagerV2.enable_host_helper): _create_kv_cache only logs the
+    # reuse of the cache the base created or adopted.
+    _context_claim_safe_overrides = ("_create_kv_cache",)
     # Whether a decode step whose requests, SSM base blocks and dummy flags all
     # match the last upload keeps the uploaded state indices and dummy mask
     # without rebuilding them.
