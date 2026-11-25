@@ -26,6 +26,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -40,12 +41,14 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_sim
-from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import SIM_CONFIG_KEY
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
+    SIM_CONFIG_KEY,
+    Cosmos3RolloutSettings,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import _PreparedLatents
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     PIPELINE_CONFIG_DEFAULTS,
     Cosmos3SimPipeline,
-    Cosmos3SimSettings,
     _ChunkDecoder,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
@@ -96,10 +99,12 @@ SIM_BLOCK = {
 }
 
 
-def sim_settings(sim_block, **window) -> Cosmos3SimSettings:
-    """The Sim settings a checkpoint with this rollout block resolves to. ``window`` is
-    the serving config's ``inference_size`` and ``sink_frames``."""
-    return Cosmos3SimSettings.from_config(rollout_config(sim_block), **window)
+def sim_settings(
+    sim_block, *, inference_size: Optional[int] = None, sink_frames: Optional[int] = None
+) -> Cosmos3RolloutSettings:
+    """The rollout settings a checkpoint with this rollout block resolves to.
+    ``inference_size`` and ``sink_frames`` are the serving config's window."""
+    return rollout_config(sim_block).require_rollout().with_window(inference_size, sink_frames)
 
 
 def _model_config(backend: str):

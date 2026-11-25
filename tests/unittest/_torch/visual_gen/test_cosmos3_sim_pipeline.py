@@ -30,6 +30,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_sim
 from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     Cosmos3Embodiment,
+    Cosmos3RolloutSettings,
     ParameterResolver,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
@@ -37,8 +38,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     KV_TOKENS_PER_PAGE,
     PIPELINE_CONFIG_DEFAULTS,
     Cosmos3SimPipeline,
-    Cosmos3SimSettings,
     domain_runs,
+    largest_tier_frame,
     split_row_domain_ids,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
@@ -99,14 +100,19 @@ CHECKPOINT_BLOCK = {
 }
 
 
-def sim_settings(sim_block, resolution: Optional[str] = "480", **window) -> Cosmos3SimSettings:
-    """The Sim settings a checkpoint with this rollout block resolves to; its training
-    config declares the ``resolution`` tier unless that is ``None``. ``window`` is the
-    serving config's ``inference_size`` and ``sink_frames``."""
+def sim_settings(
+    sim_block,
+    resolution: Optional[str] = "480",
+    *,
+    inference_size: Optional[int] = None,
+    sink_frames: Optional[int] = None,
+) -> Cosmos3RolloutSettings:
+    """The rollout settings a checkpoint with this rollout block resolves to; its
+    training config declares the ``resolution`` tier unless that is ``None``.
+    ``inference_size`` and ``sink_frames`` are the serving config's window."""
     model_config = None if resolution is None else {"resolution": resolution}
-    return Cosmos3SimSettings.from_config(
-        rollout_config(sim_block, model_config=model_config), **window
-    )
+    config = rollout_config(sim_block, model_config=model_config)
+    return config.require_rollout().with_window(inference_size, sink_frames)
 
 
 def test_checkpoint_resolves_to_the_sim_pipeline(tmp_path):
@@ -199,11 +205,11 @@ def test_settings_window_and_envelope():
     and nothing stands in for a tier it does not declare."""
     s = sim_settings(dict(CHECKPOINT_BLOCK, window_frames=None, sink_frames=0))
     assert s.history_frames is None
-    assert s.resolution == "480" and s.largest_frame() == (640, 640)
-    assert sim_settings(CHECKPOINT_BLOCK, resolution="256").largest_frame() == (256, 320)
+    assert s.resolution == "480" and largest_tier_frame(s.resolution) == (640, 640)
+    assert largest_tier_frame("256") == (256, 320)
     for tier in (None, "1080"):
         with pytest.raises(ValueError, match="compilation_config.resolutions"):
-            sim_settings(CHECKPOINT_BLOCK, resolution=tier).largest_frame()
+            largest_tier_frame(sim_settings(CHECKPOINT_BLOCK, resolution=tier).resolution)
 
 
 def test_serving_window_replaces_the_checkpoint_window():
@@ -229,10 +235,10 @@ def test_training_config_window_beats_the_block():
     config = rollout_config(
         CHECKPOINT_BLOCK, model_config={"kv_cache_inference_size": 64, "attention_sink_size": 8}
     )
-    s = Cosmos3SimSettings.from_config(config)
+    s = config.require_rollout()
     assert (s.history_frames, s.sink_frames) == (55, 8)
     config = rollout_config(CHECKPOINT_BLOCK, model_config={"kv_cache_inference_size": None})
-    assert Cosmos3SimSettings.from_config(config).history_frames is None
+    assert config.require_rollout().history_frames is None
 
 
 def test_serving_config_reaches_the_pipeline(tmp_path, monkeypatch):

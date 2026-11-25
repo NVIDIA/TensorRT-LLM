@@ -50,7 +50,7 @@ from .action import (
     vision_condition_indexes,
 )
 from .defaults import VIDEO_RES_SIZE_INFO, resolve_raw_action_dim
-from .parameter_resolver import SIM_CONFIG_KEY, Cosmos3CheckpointSettings, Cosmos3Embodiment
+from .parameter_resolver import Cosmos3RolloutSettings
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from .sampling import FixedStochasticSchedule
 
@@ -119,147 +119,19 @@ def domain_runs(row_ids: Sequence[int], lead_rows: int = 0) -> list[tuple[int, i
     return runs
 
 
-@dataclass(frozen=True)
-class Cosmos3SimSettings:
-    """The rollout geometry the pipeline runs: the checkpoint's, with the serving
-    config's window in place of the checkpoint's where it sets one. Frames are latent
-    frames throughout."""
-
-    chunk_frames: int
-    """Latent frames generated together after the first chunk."""
-    chunk_partition: tuple[int, ...]
-    """Leading chunk sizes from the start; the last repeats."""
-    history_frames: Optional[int]
-    """Recent frames before a chunk that it attends to, sinks excluded: the window.
-    ``None``: full history; the pipeline sizes the cache from the memory left after
-    warmup."""
-    sink_frames: int
-    """Leading frames pinned for the whole rollout."""
-    text_cache_max_len: int
-    """Most prompt tokens the fixed region may hold; longer prompts are rejected."""
-    action_tokens_per_frame: int
-    """Action rows packed before each frame's vision tokens."""
-    embodiments: dict[str, Cosmos3Embodiment]
-    """Embodiments declared under ``conditioning.embodiments``, by lower-case name."""
-    default_embodiment: str
-    """``conditioning.default_embodiment``: the embodiment of a request that names
-    none. One of ``embodiments``, with a domain id."""
-    resolution: Optional[str]
-    """The frame-size tier the checkpoint was trained at; ``None`` where it declares
-    none."""
-
-    def largest_frame(self) -> tuple[int, int]:
-        """``(height, width)`` of the biggest frame of the checkpoint's resolution tier:
-        the warmup shape when the serving config lists no warmup resolutions. Raises
-        when the checkpoint declares no tier, or one without a frame-size table."""
-        sizes = VIDEO_RES_SIZE_INFO.get(self.resolution)
-        if sizes is None:
-            raise ValueError(
-                f"Cosmos3 Sim: the checkpoint's resolution tier is {self.resolution!r}, "
-                f"which is not one of {sorted(VIDEO_RES_SIZE_INFO)}; list the first-frame "
-                "sizes to warm up under compilation_config.resolutions."
-            )
-        shapes = [(h, w) for (w, h) in sizes.values()]
-        return max(shapes, key=lambda hw: hw[0] * hw[1])
-
-    @classmethod
-    def from_config(
-        cls,
-        config: Cosmos3CheckpointSettings,
-        *,
-        inference_size: Optional[int] = None,
-        sink_frames: Optional[int] = None,
-    ) -> "Cosmos3SimSettings":
-        """``inference_size`` and ``sink_frames`` are the serving config's window and
-        sinks; ``None`` keeps the checkpoint's. Raises for a checkpoint without the
-        rollout block and for sinks that do not fit the window."""
-        if config.rollout is None:
-            raise ValueError(
-                f"Not a Cosmos3 Sim checkpoint: transformer/config.json has no "
-                f"'{SIM_CONFIG_KEY}' block."
-            )
-        rollout = config.rollout.with_window(inference_size, sink_frames)
-        return cls(
-            chunk_frames=rollout.chunk_frames,
-            chunk_partition=rollout.chunk_partition,
-            history_frames=rollout.history_frames,
-            sink_frames=rollout.sink_frames,
-            text_cache_max_len=rollout.text_cache_max_len,
-            action_tokens_per_frame=rollout.action_tokens_per_frame,
-            embodiments=dict(rollout.embodiments),
-            default_embodiment=rollout.default_embodiment,
-            resolution=rollout.resolution,
+def largest_tier_frame(resolution: Optional[str]) -> tuple[int, int]:
+    """``(height, width)`` of the biggest frame of a resolution tier: the warmup shape
+    when the serving config lists no warmup resolutions. Raises for ``None`` (the
+    checkpoint declares no tier) and for a tier without a frame-size table."""
+    sizes = VIDEO_RES_SIZE_INFO.get(resolution)
+    if sizes is None:
+        raise ValueError(
+            f"Cosmos3 Sim: the checkpoint's resolution tier is {resolution!r}, "
+            f"which is not one of {sorted(VIDEO_RES_SIZE_INFO)}; list the first-frame "
+            "sizes to warm up under compilation_config.resolutions."
         )
-
-    def resolve_embodiment(
-        self,
-        domain_name: Optional[str],
-        domain_id: Optional[int],
-        raw_action_dim: Optional[int],
-    ) -> tuple[Optional[str], Optional[int], Optional[int]]:
-        """Complete a request's ``(domain_name, domain_id, raw_action_dim)`` from the
-        checkpoint's embodiment table: a missing domain falls back to the declared
-        default, a missing id or width is filled in, and a given one that disagrees
-        with the checkpoint is an error. Embodiments the checkpoint does not list
-        pass through untouched."""
-        if (domain_name is None or not str(domain_name).strip()) and domain_id is None:
-            domain_name = self.default_embodiment
-        if domain_name is not None and str(domain_name).strip():
-            name = str(domain_name).strip().lower()
-        elif domain_id is not None:
-            name = next(
-                (n for n, e in self.embodiments.items() if e.domain_id == int(domain_id)), None
-            )
-        else:
-            name = None
-        spec = self.embodiments.get(name) if name is not None else None
-        if spec is None:
-            return domain_name, domain_id, raw_action_dim
-        if spec.domain_id is not None:
-            if domain_id is not None and int(domain_id) != spec.domain_id:
-                raise ValueError(
-                    f"Cosmos3 Sim domain_id={domain_id} contradicts the checkpoint, which "
-                    f"maps {name!r} to domain_id={spec.domain_id}."
-                )
-            domain_id = spec.domain_id
-        if spec.action_dim is not None:
-            if raw_action_dim is not None and int(raw_action_dim) != spec.action_dim:
-                raise ValueError(
-                    f"Cosmos3 Sim raw_action_dim={raw_action_dim} contradicts the checkpoint, "
-                    f"which expects {spec.action_dim} values per action row for {name!r}."
-                )
-            raw_action_dim = spec.action_dim
-        return name, domain_id, raw_action_dim
-
-    def row_domain_ids(self, names: Sequence[str]) -> tuple[int, ...]:
-        """The domain id of each action row's embodiment, from the checkpoint's table."""
-        if not names:
-            raise ValueError("Cosmos3 Sim domain_name list must not be empty.")
-        ids = []
-        for name in names:
-            spec = self.embodiments.get(str(name).strip().lower())
-            if spec is None or spec.domain_id is None:
-                raise ValueError(
-                    f"The Cosmos3 Sim checkpoint declares no domain id for embodiment "
-                    f"{name!r}; it lists {sorted(self.embodiments)}."
-                )
-            ids.append(spec.domain_id)
-        return tuple(ids)
-
-    def chunk_ranges(self, num_latent_frames: int) -> list[tuple[int, int]]:
-        """Latent frame ranges ``[f0, f1)`` of the rollout's chunks, in order: the
-        partition's chunks first, then ``chunk_frames`` at a time, the last possibly
-        shorter."""
-        ranges: list[tuple[int, int]] = []
-        f0 = 0
-        sizes: Sequence[int] = self.chunk_partition
-        i = 0
-        while f0 < num_latent_frames:
-            size = sizes[i] if i < len(sizes) else self.chunk_frames
-            f1 = min(f0 + size, num_latent_frames)
-            ranges.append((f0, f1))
-            f0, i = f1, i + 1
-        return ranges
+    shapes = [(h, w) for (w, h) in sizes.values()]
+    return max(shapes, key=lambda hw: hw[0] * hw[1])
 
 
 class _ChunkDecoder:
@@ -376,7 +248,7 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 
     def __init__(self, pipeline_config):
         super().__init__(pipeline_config)
-        self.sim: Optional[Cosmos3SimSettings] = None  # set by load_standard_components
+        self.sim: Optional[Cosmos3RolloutSettings] = None  # set by load_standard_components
         # The page pool's size; what it holds in frames depends on each request's frame
         # geometry. Until it is settled (by warmup from the memory left after the
         # measured peak, or by the first request when warmup is skipped) it is the size
@@ -472,10 +344,12 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 
     def load_standard_components(self, checkpoint_dir, device, skip_components=None):
         super().load_standard_components(checkpoint_dir, device, skip_components)
-        self.sim = Cosmos3SimSettings.from_config(
-            self.resolver.config(),
-            inference_size=self._settings["kv_cache_inference_size"],
-            sink_frames=self._settings["attention_sink_size"],
+        self.sim = (
+            self.resolver.config()
+            .require_rollout()
+            .with_window(
+                self._settings["kv_cache_inference_size"], self._settings["attention_sink_size"]
+            )
         )
         if self.sim.history_frames is None:
             logger.info("Cosmos3 Sim: full history, the K/V cache is sized from free memory.")
@@ -688,7 +562,7 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 
     @property
     def default_warmup_resolutions(self):
-        return [self.sim.largest_frame()]
+        return [largest_tier_frame(self.sim.resolution)]
 
     @property
     def default_warmup_num_frames(self):
@@ -1315,7 +1189,7 @@ class Cosmos3SimPipeline(Cosmos3OmniMoTPipeline):
 __all__ = [
     "PIPELINE_CONFIG_DEFAULTS",
     "Cosmos3SimPipeline",
-    "Cosmos3SimSettings",
     "domain_runs",
+    "largest_tier_frame",
     "split_row_domain_ids",
 ]

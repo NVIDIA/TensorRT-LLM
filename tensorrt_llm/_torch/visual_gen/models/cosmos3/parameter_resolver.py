@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal, NamedTuple, Optional, TypeVar
@@ -314,6 +314,81 @@ class Cosmos3RolloutSettings:
         _check_window(size, sinks)
         return replace(self, inference_size=size, sink_frames=sinks)
 
+    def chunk_ranges(self, num_latent_frames: int) -> list[tuple[int, int]]:
+        """Frame ranges ``[f0, f1)`` of the rollout's chunks, in order: the partition's
+        chunks first, then ``chunk_frames`` at a time, the last possibly shorter."""
+        ranges: list[tuple[int, int]] = []
+        f0 = 0
+        sizes: Sequence[int] = self.chunk_partition
+        i = 0
+        while f0 < num_latent_frames:
+            size = sizes[i] if i < len(sizes) else self.chunk_frames
+            f1 = min(f0 + size, num_latent_frames)
+            ranges.append((f0, f1))
+            f0, i = f1, i + 1
+        return ranges
+
+    def embodiment(
+        self, domain_name: Optional[str], domain_id: Optional[int]
+    ) -> tuple[Optional[str], Optional[Cosmos3Embodiment]]:
+        """The declared embodiment a domain names, with its name in the table: looked up
+        by ``domain_name`` when one is given, else by ``domain_id``. ``(None, None)``
+        when the checkpoint does not list it."""
+        name = normalize_domain_name(domain_name)
+        if name is None and domain_id is not None:
+            name = next(
+                (n for n, e in self.embodiments.items() if e.domain_id == int(domain_id)), None
+            )
+        spec = None if name is None else self.embodiments.get(name)
+        return (None, None) if spec is None else (name, spec)
+
+    def resolve_embodiment(
+        self,
+        domain_name: Optional[str],
+        domain_id: Optional[int],
+        raw_action_dim: Optional[int],
+    ) -> tuple[Optional[str], Optional[int], Optional[int]]:
+        """Complete a request's ``(domain_name, domain_id, raw_action_dim)`` from the
+        checkpoint's embodiment table: a missing domain falls back to the declared
+        default, a missing id or width is filled in, and a given one that disagrees
+        with the checkpoint is an error. Embodiments the checkpoint does not list
+        pass through untouched."""
+        if normalize_domain_name(domain_name) is None and domain_id is None:
+            domain_name = self.default_embodiment
+        name, spec = self.embodiment(domain_name, domain_id)
+        if spec is None:
+            return domain_name, domain_id, raw_action_dim
+        if spec.domain_id is not None:
+            if domain_id is not None and int(domain_id) != spec.domain_id:
+                raise ValueError(
+                    f"Cosmos3 Sim domain_id={domain_id} contradicts the checkpoint, which "
+                    f"maps {name!r} to domain_id={spec.domain_id}."
+                )
+            domain_id = spec.domain_id
+        if spec.action_dim is not None:
+            if raw_action_dim is not None and int(raw_action_dim) != spec.action_dim:
+                raise ValueError(
+                    f"Cosmos3 Sim raw_action_dim={raw_action_dim} contradicts the checkpoint, "
+                    f"which expects {spec.action_dim} values per action row for {name!r}."
+                )
+            raw_action_dim = spec.action_dim
+        return name, domain_id, raw_action_dim
+
+    def row_domain_ids(self, names: Sequence[str]) -> tuple[int, ...]:
+        """The domain id of each action row's embodiment, from the checkpoint's table."""
+        if not names:
+            raise ValueError("Cosmos3 Sim domain_name list must not be empty.")
+        ids = []
+        for name in names:
+            spec = self.embodiments.get(str(name).strip().lower())
+            if spec is None or spec.domain_id is None:
+                raise ValueError(
+                    f"The Cosmos3 Sim checkpoint declares no domain id for embodiment "
+                    f"{name!r}; it lists {sorted(self.embodiments)}."
+                )
+            ids.append(spec.domain_id)
+        return tuple(ids)
+
 
 @dataclass(frozen=True)
 class Cosmos3CheckpointSettings:
@@ -325,6 +400,15 @@ class Cosmos3CheckpointSettings:
     """Every setting by dotted name (``vae.temporal_compression``), with origin."""
     rollout: Optional[Cosmos3RolloutSettings] = None
     """``None`` unless the checkpoint generates chunk by chunk."""
+
+    def require_rollout(self) -> Cosmos3RolloutSettings:
+        """The rollout settings; raises for a checkpoint that does not generate chunk by
+        chunk."""
+        if self.rollout is None:
+            raise ValueError(
+                f"Not a Cosmos3 Sim checkpoint: {TRANSFORMER_FILE} has no '{SIM_CONFIG_KEY}' block."
+            )
+        return self.rollout
 
     def require_vae_compression(self, checkpoint_dir: str) -> None:
         """Raise unless ``vae/config.json`` declares both compression factors, as a
@@ -815,15 +899,7 @@ class ParameterResolver:
         rollout = self._config.rollout
         if rollout is None:
             return None
-        name = normalize_domain_name(domain_name)
-        if name is not None:
-            spec = rollout.embodiments.get(name)
-        elif domain_id is not None:
-            spec = next(
-                (e for e in rollout.embodiments.values() if e.domain_id == int(domain_id)), None
-            )
-        else:
-            spec = None
+        _, spec = rollout.embodiment(domain_name, domain_id)
         return None if spec is None else spec.action_dim
 
     def override(
