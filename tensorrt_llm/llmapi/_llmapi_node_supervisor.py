@@ -528,8 +528,17 @@ class NodeSupervisor:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        pidfd = os.pidfd_open(child.pid)
-        self._selector.register(pidfd, selectors.EVENT_READ, rank)
+        pidfd = None
+        try:
+            pidfd = os.pidfd_open(child.pid)
+            self._selector.register(pidfd, selectors.EVENT_READ, rank)
+        except Exception:
+            # Nothing would watch the process, and a retry would start a second one on its GPU.
+            if pidfd is not None:
+                os.close(pidfd)
+            self._signal_group(child.pid, signal.SIGKILL)
+            child.wait()
+            raise
         self._processes[rank] = _Process(
             child, replacement, pidfd, None if replacement else 0, started_s=time.monotonic()
         )
