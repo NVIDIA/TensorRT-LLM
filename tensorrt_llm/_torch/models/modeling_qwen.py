@@ -247,6 +247,7 @@ class QwenModel(DecoderModel):
 
 @register_auto_model("Qwen2ForCausalLM")
 class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
+    supports_prompt_embeds = True
 
     def __init__(
         self,

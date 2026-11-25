@@ -602,6 +602,8 @@ class LagunaModel(DecoderModel):
 
 @register_auto_model("LagunaForCausalLM")
 class LagunaForCausalLM(SpecDecOneEngineForCausalLM[LagunaModel, PretrainedConfig]):
+    supports_prompt_embeds = True
+
     def __init__(self, model_config):
         super().__init__(LagunaModel(model_config), model_config)
 

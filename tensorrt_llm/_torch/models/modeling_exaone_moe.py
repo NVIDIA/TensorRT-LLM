@@ -703,6 +703,8 @@ class ExaoneMoeModel(DecoderModel):
 # refreshed config.json.
 @register_auto_model("ExaoneMoeForCausalLM")
 class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[ExaoneMoeConfig],

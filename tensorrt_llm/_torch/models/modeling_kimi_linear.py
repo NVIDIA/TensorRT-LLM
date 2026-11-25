@@ -3487,6 +3487,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     (``modeling_kimi_k3_vl``). The composite ``KimiK3ForConditionalGeneration``
     architecture is registered by that wrapper, not here."""
 
+    supports_prompt_embeds = True
+
     mamba_metadata_cls = KimiK3MambaMetadata
     # Set from the environment in __init__; loaders that build the model without
     # it (modeling_v2 targets, checkpoint tests) inherit the defaults.

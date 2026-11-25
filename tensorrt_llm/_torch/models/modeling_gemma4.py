@@ -1611,7 +1611,27 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    supports_prompt_embeds = True
+
     build_mtp_draft_model_from_config = True
+
+    def prompt_embeds_model_inputs(
+        self, input_ids: torch.Tensor, embed_rows: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Per-layer embeddings read ids; embedding rows use ``pad_token_id`` like image rows."""
+        if not self.model.hidden_size_per_layer_input:
+            return {}
+        ple_input_ids = input_ids.clone()
+        ple_input_ids.index_fill_(0, embed_rows, self.config.pad_token_id)
+        return {"ple_input_ids": ple_input_ids}
+
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        if (
+            self.model.hidden_size_per_layer_input
+            and getattr(self.config, "pad_token_id", None) is None
+        ):
+            return "per-layer embeddings need pad_token_id for embedding rows"
+        return None
 
     def __init__(
         self,

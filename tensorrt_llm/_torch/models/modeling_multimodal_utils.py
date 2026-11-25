@@ -689,6 +689,23 @@ def _as_copy_index(index: torch.Tensor,
                     non_blocking=True)
 
 
+def apply_prompt_embeds_overlay(
+    embedding_layer: Embedding,
+    input_ids: torch.Tensor,
+    inputs_embeds: Optional[torch.Tensor],
+    prompt_embeds_overlay: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Write ``(dst_rows [K], src_rows [K, H])`` into ``inputs_embeds`` ([N, H], in place).
+
+    ``inputs_embeds`` is None for a text-only pass; it is then looked up from ``input_ids``.
+    """
+    dst_rows, src_rows = prompt_embeds_overlay
+    if inputs_embeds is None:
+        inputs_embeds = embedding_layer(input_ids)
+    inputs_embeds.index_copy_(0, dst_rows, src_rows.to(inputs_embeds.dtype))
+    return inputs_embeds
+
+
 def fuse_input_embeds(
     embedding_layer: Embedding,
     input_ids: torch.IntTensor,

@@ -244,6 +244,9 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
             "multimodal_embedding",
         ]
 
+    # Its forward does not apply prompt_embeds after multimodal fusion.
+    supports_prompt_embeds = False
+
     @torch.inference_mode()
     def forward(
         self,

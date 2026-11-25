@@ -618,6 +618,8 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                                                         HunYuanPretrainedConfig]
                                 ):
 
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[HunYuanPretrainedConfig]):
         super().__init__(HunYuanModel(model_config),
                          config=model_config,

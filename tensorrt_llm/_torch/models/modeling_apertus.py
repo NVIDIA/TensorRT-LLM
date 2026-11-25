@@ -198,6 +198,8 @@ class ApertusModel(DecoderModel):
 
 @register_auto_model("ApertusForCausalLM")
 class ApertusForCausalLM(SpecDecOneEngineForCausalLM[ApertusModel, ApertusConfig]):
+    supports_prompt_embeds = True
+
     _params_map = _APERTUS_PARAMS_MAP
 
     def __init__(self, model_config: ModelConfig[ApertusConfig]):

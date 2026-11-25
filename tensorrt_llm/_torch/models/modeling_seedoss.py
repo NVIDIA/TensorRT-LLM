@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from typing import Optional, Tuple
 
 import torch
@@ -183,6 +183,8 @@ class SeedOssModel(DecoderModel):
 @register_auto_model("SeedOssForCausalLM")
 class SeedOssForCausalLM(SpecDecOneEngineForCausalLM[SeedOssModel,
                                                      SeedOssConfig]):
+
+    supports_prompt_embeds = True
 
     def __init__(
         self,

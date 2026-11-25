@@ -280,5 +280,7 @@ class NemotronNASModel(DecoderModel):
 class NemotronNASForCausalLM(SpecDecOneEngineForCausalLM[NemotronNASModel,
                                                          PretrainedConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(NemotronNASModel(model_config), model_config)

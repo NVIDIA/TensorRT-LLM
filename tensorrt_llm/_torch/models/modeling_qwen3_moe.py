@@ -438,6 +438,7 @@ class Qwen3MoEModel(DecoderModel):
 @register_auto_model("Qwen3MoeForCausalLM")
 class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                                                       Qwen3MoeConfig]):
+    supports_prompt_embeds = True
 
     def __init__(
         self,
