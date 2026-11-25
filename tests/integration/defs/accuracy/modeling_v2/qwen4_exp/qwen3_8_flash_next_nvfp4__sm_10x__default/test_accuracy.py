@@ -1057,6 +1057,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("pack"):
             env["TRTLLM_QWEN4_EXP_DP_MOE_PACK_GATHER"] = "1"
             env["TRTLLM_QWEN4_EXP_DP_MOE_PACK_ROUTER"] = "mid"
+            # the owner top-k at every packed row count past the lean routing front
+            env["TRTLLM_QWEN4_EXP_DP_MOE_OWNK"] = "all"
         if variant.get("draftpack"):
             env["TRTLLM_QWEN4_EXP_DP_DRAFTPACK"] = variant["draftpack"]
         if variant.get("tep_opt_in"):

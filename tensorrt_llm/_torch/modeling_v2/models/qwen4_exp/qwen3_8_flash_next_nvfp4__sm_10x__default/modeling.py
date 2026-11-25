@@ -547,6 +547,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__d
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
     route_front_only as _route_front_only,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    routed_rows as _routed_rows,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_sort import moe_sort
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_unpermute_inplace import (
     moe_unpermute_inplace,
@@ -3360,27 +3363,88 @@ DP_MOE_PACK_GATHER_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_PACK_GATHER"
 #: PDL launch that streams the router weight before its wait; checked at build against the fp32
 #: product, one bf16 ulp), else the decode router. Opt-in (class S, as the router front).
 DP_MOE_PACK_ROUTER_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_PACK_ROUTER"
+#: Default on where `DP_MOE_PACK_GATHER_ENV` is engaged (bitwise; at `_DP_MOE_OWNK_ROWS`, and only
+#: at row counts the build checked on every rank). Each row's owner routes it inside the packed
+#: gather (`PackGather(ownk=True)`: one warp a row runs the route front's own `route_one_token`
+#: over the owner's sanitized logits), and the row carries its 10 experts and weights (3 vectors)
+#: instead of its 512 logits (64). The routing-only front then builds the tables from them
+#: (`route_front_only(ids_in=True)`) instead of every rank routing all `W R` gathered rows on one
+#: 16-CTA cluster. The experts, weights and tables are the bits the packed gather's routing-only
+#: front writes. GB300 dep8 server A/B (two nodes of one rack, packed gather on both sides):
+#: -0.091 / -0.121 / -0.137 ms a step at 18 / 20 / 24 requests a rank; -0.026 at 12 (noise).
+#: Values: unset or `1` -- `_DP_MOE_OWNK_ROWS`; `all` -- every gathered row count the packed
+#: gather serves past the lean routing front (`LEAN_MAX_ROWS`); `0` -- off. Read once, after load.
+DP_MOE_OWNK_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_OWNK"
+#: Gathered rows the default serves: the routing front's two-tokens-a-warp launch up to the
+#: largest measured cap (17..28 requests a rank at dep8 MTP-3; caps 18 / 20 / 24 by A/B, 26 / 28
+#: in the F2 servers that ran it). At a token a warp it measured within noise; caps 29..32
+#: (928..1024 rows) were never run and take `all`.
+_DP_MOE_OWNK_ROWS = (513, 896)  # capacity: fixed: dispatch thresholds
+#: The most gathered rows a routing-only front takes (`moe_route_front__decode.MAX_ROWS`).
+_DP_PACK_MAX_GATHERED = 1024  # capacity: fixed: the route front's launch bound
 
 
 class _DpPack:
     """What `DP_MOE_PACK_GATHER_ENV` built (`_dp_pack_build`): the packed gather, the gathered row
     counts whose routing-only front compiled and checked (`rows`), and with `mid` each layer's
-    router weight (`mids`, by its pointer) and the own row counts it serves (`mid_rows`)."""
+    router weight (`mids`, by its pointer) and the own row counts it serves (`mid_rows`); with
+    `DP_MOE_OWNK_ENV` the owner top-k gather (`ownk`) and the gathered rows it serves
+    (`ownk_rows`, `_dp_ownk_build`)."""
 
     def __init__(self, gather, rows: frozenset, mids: dict, mid_rows: frozenset) -> None:
         self.gather = gather
         self.rows = rows
         self.mids = mids
         self.mid_rows = mid_rows
+        self.ownk = None
+        self.ownk_rows: frozenset = frozenset()
 
 
-def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
+def _dp_ownk_wanted() -> tuple | None:
+    """`DP_MOE_OWNK_ENV` as a `(first, last)` range of gathered rows, None off."""
+    raw = os.environ.get(DP_MOE_OWNK_ENV, "")
+    value = raw.strip().lower()
+    if value in _SWITCH_OFF:
+        return None
+    if not value or value in _SWITCH_ON:
+        return _DP_MOE_OWNK_ROWS
+    if value == "all":
+        return (1, _DP_PACK_MAX_GATHERED)
+    raise ValueError(f"{DP_MOE_OWNK_ENV}={raw!r}: expected unset, 0, 1 or all")
+
+
+def _dp_ownk_logits(rows: int, experts: int, offset: int, local: int, gen, device, salt: int):
+    """`[rows, experts]` bf16 router logits for the owner top-k check, row `r` of kind
+    `(r + salt) % 5`: plain; lifted on the expert window at `offset` (the caller names it by the
+    owning rank, the same on every rank); coarse (bf16 ties inside the
+    top-10 and at its edge); one lane's 16 experts on top (the fast path runs dry: the full sort);
+    +-0.0 ties (the sanitized -0.0 lanes)."""
+    lg = torch.randn([rows, experts], generator=gen, device=device)
+    kinds = (torch.arange(rows, device=device) + salt) % 5
+    lifted = lg.clone()
+    lifted[:, offset : offset + local] += 3.0
+    lg = torch.where((kinds == 1)[:, None], lifted, lg)
+    lg = torch.where((kinds == 2)[:, None], (lg * 2).round() / 2, lg)
+    lane = (torch.arange(experts, device=device) // 16)[None, :]
+    owner = (torch.arange(rows, device=device) % (experts // 16))[:, None]
+    lg = torch.where((kinds == 3)[:, None] & (lane == owner), lg + 8.0, lg)
+    zeros = torch.zeros_like(lg)
+    zeros[:, ::3] = -0.0
+    zeros[:, ::37] = 1.0
+    lg = torch.where((kinds == 4)[:, None], zeros, lg)
+    return lg.to(torch.bfloat16)
+
+
+def _dp_pack_check(core, pk: _DpPack, st, rows: int, device, ownk=None) -> str:
     """At `rows` rows a rank, eagerly: one packed gather (a collective every rank launches) of rows
     and logits every rank draws from the same per-rank seeds, against `fp4_quantize` of the
     group's sanitized rows (its codes as the transport delivers them: a 16-bit half equal to the
     marker 0x8000, an E2M1 -0 after three +0, arrives as 0x0000, the same zeros) and the sanitized
     logits, and the routing-only front against the route front over the gathered logits (experts,
-    weights, tables). "" when bitwise.
+    weights, tables). "" when bitwise. With `ownk` (the owner top-k gather, `_dp_ownk_build`) that
+    gather runs over logits of every kind `_dp_ownk_logits` draws; its codes are held the same
+    way, its routing rows to `routed_rows` of the routing-only front over the group's sanitized
+    logits, and the front reading them (`ids_in`) to that front's experts, weights and tables.
 
     The gather is the check's only collective, so every rank launches it: a rank whose inputs
     fail to build (an allocation that raises on that rank alone) launches it over zeros and
@@ -3396,11 +3460,23 @@ def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
             x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
             x[:, ::131] = -0.0
             xs.append(x)
-            lgs.append(
-                torch.randn([rows, core.num_experts], generator=gen, device=device).to(
-                    torch.bfloat16
+            if ownk is None:
+                lg = torch.randn([rows, core.num_experts], generator=gen, device=device)
+                lgs.append(lg.to(torch.bfloat16))
+            else:
+                # Rank p's rows are lifted on a window named by p, not by this rank's own
+                # `expert_offset`: every rank must draw the same group's logits.
+                lgs.append(
+                    _dp_ownk_logits(
+                        rows,
+                        core.num_experts,
+                        (p * core.local_experts) % core.num_experts,
+                        core.local_experts,
+                        gen,
+                        device,
+                        p,
+                    )
                 )
-            )
         mine = (xs[me], lgs[me].contiguous())
     except Exception as e:  # noqa: BLE001 -- reported below, after the collective
         failed = f"inputs raised {type(e).__name__}: {e}"
@@ -3408,30 +3484,40 @@ def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
             torch.zeros([rows, core.hidden], dtype=torch.bfloat16, device=device),
             torch.zeros([rows, core.num_experts], dtype=torch.bfloat16, device=device),
         )
-    xq, xsf, lg = pk.gather(*mine, L.moe_gscale)
+    xq, xsf, lg = (pk.gather if ownk is None else ownk)(*mine, L.moe_gscale)
     if failed:
         torch.cuda.synchronize(device)
         return failed
     gathered = torch.cat([dep_lamport_sanitized(x) for x in xs])
     rxq, rxsf = fp4_quantize(gathered, L.moe_gscale, _SF_VEC, False, False)
+    logits = torch.cat([dep_lamport_sanitized(t) for t in lgs])
+    checked = [
+        ("codes", xq, dep_lamport_transported_codes(rxq)),
+        ("scales", xsf, rxsf.reshape(g, -1)),
+    ]
+    if ownk is None:
+        checked.append(("logits", lg, logits))
     bad = [
         name
-        for name, a, b in (
-            ("codes", xq, dep_lamport_transported_codes(rxq)),
-            ("scales", xsf, rxsf.reshape(g, -1)),
-            ("logits", lg, torch.cat([dep_lamport_sanitized(t) for t in lgs])),
-        )
+        for name, a, b in checked
         if not torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
     ]
     tile = int(st.tactics[g][0])
     flat = st.flats[g][0].clone()
-    ids, wts = _route_front_only(
-        lg, flat, tile, core.expert_offset, core.local_experts, core.hidden, g in st.fast2
-    )
-    _, rxq2, _, rids, rwts = _route_front_run(core, st, gathered, L, 0, lg)
+    window = (tile, core.expert_offset, core.local_experts, core.hidden, g in st.fast2)
+    if ownk is None:
+        ids, wts = _route_front_only(lg, flat, *window)
+        _, rxq2, _, rids, rwts = _route_front_run(core, st, gathered, L, 0, lg)
+        want = st.flats[g][0]
+    else:
+        want = st.flats[g][0].clone()
+        rids, rwts = _route_front_only(logits, want, *window)
+        if not torch.equal(lg.view(torch.int16), _routed_rows(rids, rwts)):
+            bad.append("owner routing")
+        ids, wts = _route_front_only(lg, flat, *window, True)
     if not torch.equal(ids, rids) or not torch.equal(wts.view(torch.int16), rwts.view(torch.int16)):
         bad.append("routing")
-    if not torch.equal(flat, st.flats[g][0]):
+    if not torch.equal(flat, want):
         bad.append("tables")
     torch.cuda.synchronize(device)
     return ", ".join(bad)
@@ -3517,12 +3603,66 @@ def _dp_pack_build(core, device) -> "_DpPack | None":
             logger.warning(
                 f"{DP_MOE_PACK_GATHER_ENV}: {g} gathered rows keep the bf16 gather: {what}"
             )
+    _dp_ownk_build(core, pk, st, device, dist)
     logger.info(
         f"DP packed MoE gather: rank {core.dp_rank} of {core.dp_size}, gathered rows "
         f"{sorted(pk.rows)}, owner router "
         + (f"mid_rows_mm at own rows {sorted(pk.mid_rows)}" if pk.mid_rows else "the decode router")
+        + f", owner top-k at gathered rows {sorted(pk.ownk_rows)}"
     )
     return pk if pk.rows else None
+
+
+def _dp_ownk_build(core, pk: _DpPack, st, device, dist) -> None:
+    """`DP_MOE_OWNK_ENV`, at the end of `_dp_pack_build` (collective; `pk.rows` is the group's):
+    the owner top-k gather and each `ids_in` routing-only front are compiled at the agreed row
+    counts in the value's range (the front declines its lean rows), the group agrees the builds,
+    every row count is checked (`_dp_pack_check(ownk=)`, one collective each) and a row count that
+    differs on any rank is dropped on every rank: those keep the packed gather of the logits. Sets
+    `pk.ownk` / `pk.ownk_rows`."""
+    want = _dp_ownk_wanted()
+    if want is None:
+        return
+    trip = core._lamport_trip
+    wanted = sorted(g for g in pk.rows if want[0] <= g <= want[1])
+    gather, built, error = None, set(), ""
+    try:
+        with torch.cuda.device(device):
+            if wanted:
+                gather = _PackGather(trip, core.hidden, core.num_experts, ownk=True)
+            for g in wanted:
+                tile = int(st.tactics[g][0])
+                if _route_front_compile(
+                    g, core.hidden, core.hidden, core.local_experts, tile, g in st.fast2, True, True
+                ):
+                    built.add(g)
+    except Exception as e:  # noqa: BLE001 -- every rank decides together below
+        error = f"{type(e).__name__}: {e}"
+    errors = [e for e in dist.tp_allgather(error) if e]
+    if errors:
+        logger.warning(
+            f"{DP_MOE_OWNK_ENV}: not engaged at rank {core.dp_rank}: {len(errors)} rank(s) failed "
+            f"the build: {errors[0]}; the packed gather keeps the logits"
+        )
+        return
+    every = dist.tp_allgather(sorted(built))
+    rows = sorted(set.intersection(*(set(r) for r in every)))
+    bad = []
+    with torch.cuda.device(device):
+        for g in rows:
+            try:
+                what = _dp_pack_check(core, pk, st, g // trip.world, device, ownk=gather)
+            except Exception as e:  # noqa: BLE001 -- recorded; the launch itself ran or raised early
+                what = f"{type(e).__name__}: {e}"
+            bad.append((g, what))
+    off = {g for rank_bad in dist.tp_allgather(bad) for g, what in rank_bad if what}
+    for g, what in bad:
+        if what:
+            logger.warning(
+                f"{DP_MOE_OWNK_ENV}: {g} gathered rows keep the packed gather of the logits: {what}"
+            )
+    pk.ownk_rows = frozenset(g for g in rows if g not in off)
+    pk.ownk = gather if pk.ownk_rows else None
 
 
 def _dp_pack_block(core, pk: _DpPack, x, L, rs_next, shared_expert, forked, main, side):
@@ -3535,13 +3675,16 @@ def _dp_pack_block(core, pk: _DpPack, x, L, rs_next, shared_expert, forked, main
     rows = x.shape[0]
     g = rows * core.dp_size
     layer = st.layers.get(L.fc1_w.data_ptr())
-    if g not in pk.rows or layer is None or not pk.gather.takes(rows, x):
+    # `DP_MOE_OWNK_ENV`: the rows travel routed by their owners
+    ownk = g in pk.ownk_rows
+    gather = pk.ownk if ownk else pk.gather
+    if g not in pk.rows or layer is None or not gather.takes(rows, x):
         return None
     if rows in pk.mid_rows:
         logits = mid_rows_mm_op(x, pk.mids[L.router.data_ptr()])
     else:
         logits = _decode_router(x, L.router)
-    xq, xsf, lg = pk.gather(x, logits.contiguous(), L.moe_gscale)
+    xq, xsf, lg = gather(x, logits.contiguous(), L.moe_gscale)
     if not forked:
         shared_expert()
     tile = int(st.tactics[g][0])
@@ -3553,6 +3696,7 @@ def _dp_pack_block(core, pk: _DpPack, x, L, rs_next, shared_expert, forked, main
         core.local_experts,
         core.hidden,
         g in st.fast2,
+        ownk,
     )
     rsi = getattr(core, "_rs_inject", None) if rs_next is not None else None
     fin = (
@@ -3832,6 +3976,7 @@ def _decode_forms(core) -> str:
             "fin rs pdl": bool(rsi is not None and rsi.rs.pdl),
             "draftpack": sorted(getattr(core, "dp_draftpack", ())),
             "pack gather rows": rows(getattr(getattr(core, "_dp_pack", None), "rows", None)),
+            "pack ownk rows": rows(getattr(getattr(core, "_dp_pack", None), "ownk_rows", None)),
             "scores early": getattr(core, "dp_scores_early", False),
             "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
