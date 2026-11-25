@@ -76,6 +76,56 @@ def _run(extract, source, workspace, link):
             os.environ["TRTLLM_PRECOMPILED_LINK"] = previous
 
 
+@pytest.fixture(scope="module")
+def linux_package_data():
+    tree = ast.parse(_SETUP_PY.read_text(encoding="utf-8"))
+    platform_branch = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "on_windows"
+    )
+    namespace = {"on_windows": False}
+    exec(
+        compile(ast.Module(body=[platform_branch], type_ignores=[]), str(_SETUP_PY), "exec"),
+        namespace,
+    )
+    return namespace["package_data"]
+
+
+@pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
+def test_precompiled_keeps_direct_and_nested_transport_libraries(
+    extract_from_precompiled, linux_package_data, build_tree, tmp_path, monkeypatch, source_kind
+):
+    import zipfile
+
+    libraries = (
+        "tensorrt_llm/libs/nixl/libnixl.so",
+        "tensorrt_llm/libs/nixl/plugins/libplugin.so",
+        "tensorrt_llm/libs/ucx/libucp.so",
+        "tensorrt_llm/libs/ucx/ucx/libuct_cuda.so",
+    )
+    for name in libraries:
+        artifact = build_tree / name
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(name)
+    source = build_tree
+    if source_kind == "wheel":
+        source = tmp_path / "precompiled.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+            for name in libraries:
+                archive.writestr(name, name)
+    monkeypatch.setenv("TRTLLM_PRECOMPILED_LINK", "1" if source_kind == "link" else "0")
+    extract_from_precompiled(str(source), linux_package_data, str(tmp_path))
+
+    for name in libraries:
+        artifact = Path(name)
+        assert artifact.read_text() == name
+        assert artifact.is_symlink() == (source_kind == "link")
+
+
 def test_link_mode_symlinks_the_artifacts(extract_from_precompiled, build_tree, tmp_path):
     _run(extract_from_precompiled, build_tree, tmp_path, link=True)
 
