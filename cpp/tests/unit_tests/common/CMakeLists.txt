@@ -148,6 +148,17 @@ add_tllm_gtest(
   LABELS
   "unit;common;host")
 
+add_tllm_gtest(
+  ncclWindowSupportTest
+  OWNER
+  common
+  SOURCES
+  ncclWindowSupportTest.cpp
+  LINK_LIBRARIES
+  tllm::common_nccl
+  LABELS
+  "unit;common;nccl;host")
+
 if(ENABLE_MULTI_DEVICE AND BUILD_PYT)
   add_tllm_gtest(
     getCommLegacyConfigTest

@@ -100,6 +100,7 @@ from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.dsl_helpers import spin_wait
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
+from .....helpers.ptx_helpers import read_smid
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.topk_reduce import TopkReduce
 from .....helpers.utils import ceil_div, round_up
@@ -201,6 +202,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "total_helper_slots": OptionalRequirement(int),
             # None = off; cluster_shape_mn is not declared here: it is checked by value below.
             "die_aware": OptionalRequirement(Optional[str]),
+            # TensorRT-LLM local patch, removed once the pinned CuTe DSL provides
+            # cute.arch.locality_domain_id: the die of each %smid, four 64-bit words.
+            "die_smid_mask": OptionalRequirement(Optional[tuple]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -296,6 +300,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 f"die_aware {self.die_aware!r} runs on the decode scheduler only: schedule_policy must be "
                 f"('decode', None) or ('decode', L), got {self.schedule_policy!r}."
             )
+        self.die_smid_mask = impl_desc.get("die_smid_mask")
+        if self.die_smid_mask is not None and (
+            len(self.die_smid_mask) != 4
+            or not all(type(word) is int and 0 <= word < 1 << 64 for word in self.die_smid_mask)
+        ):
+            raise ValueError("die_smid_mask must be four 64-bit words (bit s: the die of SM s).")
         if self.die_aware != "off" and self.helper_expert_count > 0:
             # The per-die placement covers this rank's local experts; DLB helper slots are not placed or owned.
             raise ValueError("die_aware is not supported together with DLB helper slots (helper_expert_count > 0).")
@@ -361,7 +371,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         resolved_impl_desc = ImplDesc(
             {
                 # die_aware is forwarded below only when not off (an explicit None reads as off).
-                **{key: value for key, value in impl_desc.items() if key != "die_aware"},
+                **{key: value for key, value in impl_desc.items() if key not in ("die_aware", "die_smid_mask")},
                 # Resolved or fixed here, but the scheduler, the epilogue and the mainloop
                 # read them from the descriptor, so they have to be forwarded rather than assumed.
                 "cluster_shape_mn": self.cluster_shape_mn,
@@ -682,6 +692,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             else f"sched{self.schedule_mode}_hint{self.hint}"
         )
         die_tag = {"off": "", "on": "die_aware_", "expert_half": "die_aware_expert_half_"}[self.die_aware]
+        if self.die_smid_mask is not None:
+            die_tag += f"smidmask{hashlib.sha256(repr(self.die_smid_mask).encode()).hexdigest()[:12]}_"
         return (
             f"sm107_block_scaled_swap_ab_gen_phase_specialized_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -705,6 +717,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
             + ("_dlb_v1" if self.helper_expert_count > 0 else "")
         )
+
+    @cute.jit
+    def _die_from_smid_mask(self) -> Int32:
+        """TensorRT-LLM local patch: this SM's die from die_smid_mask, for DSL builds without
+        cute.arch.locality_domain_id (remove with die_smid_mask)."""
+        smid = read_smid()
+        word = Int64(0)
+        for index in cutlass.range_constexpr(4):
+            if (smid >> Int32(6)) == Int32(index):
+                # A 64-bit word with the top bit set is passed as its two's-complement value.
+                value = self.die_smid_mask[index]
+                word = Int64(value - (1 << 64) if value >= 1 << 63 else value)
+        return Int32((word >> Int64(smid & Int32(63))) & Int64(1))
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
         """Compile against fake (metadata-only) inputs; ``out_path=None`` returns the in-memory callable.
@@ -866,10 +891,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             ):
                 if cutlass.const_expr(scalar is None):
                     raise ValueError(f"{self.quant_kind} requires {scalar_name}.")
-        if cutlass.const_expr(self.die_aware != "off" and not hasattr(cute.arch, "locality_domain_id")):
+        if cutlass.const_expr(
+            self.die_aware != "off" and self.die_smid_mask is None and not hasattr(cute.arch, "locality_domain_id")
+        ):
             raise RuntimeError(
                 "die_aware reads the die of each SM with cute.arch.locality_domain_id (PTX %locality_domain_id), "
-                "which this CuTe DSL build lacks: use one that provides cute.arch.locality_domain_id."
+                "which this CuTe DSL build lacks: use one that provides cute.arch.locality_domain_id, "
+                "or pass die_smid_mask."
             )
 
         local_rank = peer_rank_ptr_mapper_host.rank
@@ -1342,7 +1370,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             die = None
             if cutlass.const_expr(self.die_aware != "off"):
                 # %locality_domain_id is the die of this CTA's SM; a cluster lies within one GPC, so within one die.
-                die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
+                if cutlass.const_expr(self.die_smid_mask is not None):
+                    die = cute.arch.make_warp_uniform(self._die_from_smid_mask())
+                else:
+                    die = cute.arch.make_warp_uniform(cute.arch.locality_domain_id())
             self.scheduler.assign_device_members(
                 expert_token_sizes=scheduler_expert_sizes,
                 block_idx=block_idx,

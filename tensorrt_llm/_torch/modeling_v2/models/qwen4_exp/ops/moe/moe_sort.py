@@ -8,7 +8,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
 def _ckpt(tokens: int, tile_tokens_dim: int, dist: str = "router") -> dict:
@@ -67,7 +68,7 @@ class MoeSort(OpWrapper):
     any output.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # One cell per kernel path the target reaches at its tile, 128: block (T <= 4),
     # cluster (T 5..8192) and cooperative (T >= 8193).

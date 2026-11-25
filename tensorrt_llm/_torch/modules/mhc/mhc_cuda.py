@@ -1016,6 +1016,8 @@ class MhcFusedHcRunner(TunableRunner):
             # comb_mix_prev (input[3]) dim 0 = M
             ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
         ),
+        # TP peers consume replicated residual streams and must use the same reduction order.
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(
@@ -1037,7 +1039,7 @@ class MhcFusedHcRunner(TunableRunner):
         self.sinkhorn_repeat = sinkhorn_repeat
 
     def unique_id(self):
-        return (self.n, self.hidden_size)
+        return (self.n, self.hidden_size, self.tuning_config.distributed_tuning_strategy.value)
 
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
         M = inputs[0].shape[0]

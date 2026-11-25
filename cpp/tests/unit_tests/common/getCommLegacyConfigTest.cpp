@@ -8,7 +8,7 @@
 #undef NCCL_VERSION_CODE
 #define NCCL_VERSION_CODE NCCL_VERSION(2, 28, 0)
 
-#include "tensorrt_llm/common/opUtils.cpp"
+#include "tensorrt_llm/common/ncclCommUtils.cpp"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
