@@ -3897,7 +3897,6 @@ def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
     def filtered = parallelJobsFiltered.findAll { key, _ ->
         return autoTriggerTags.any { key.contains(it) } || affectedSet.contains(key) ||
                (cbts.sanity_required && key =~ /PackageSanityCheck/) ||
-               (cbts.perfsanity_required && key =~ /PerfSanity/ && !key.contains("Post-Merge")) ||
                (cbts.enable_multi_gpu && key =~ /\d+_GPUs/)
     }
 

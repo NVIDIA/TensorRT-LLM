@@ -32,12 +32,11 @@ CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the baseline-eligible stage set with affected stages, then add PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Empty affectedSet + nothing force-kept → no-op. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the command-selected stages with `affected_stages`, including affected PerfSanity stages. Also keep eligible PackageSanityCheck stages if `sanity_required`. The coverage tier can retain eligible multi-GPU and auto-triggered stages. |
 | **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
-CBTS only subtracts; anything it can't narrow → fallback to the existing
-filter chain.
+CBTS narrows the command-selected stage set. If it cannot make a selection, CI keeps that set.
 
 ## Rules
 
@@ -297,7 +296,8 @@ Decision JSON:
 - `scope: null` → fallback; Groovy defers to baseline.
 - `scope: "noop"` → rule(s) fired without a test contribution; the final
   affected stages remain empty. No generic CPU suite is appended. Layer 2
-  still honors `sanity_required` / `perfsanity_required`.
+  still honors `sanity_required`.
+- `perfsanity_required` → diagnostic signal retained in the decision JSON.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
 - `affected_stage_test_counts` → per-stage kept-entry count (telemetry).
