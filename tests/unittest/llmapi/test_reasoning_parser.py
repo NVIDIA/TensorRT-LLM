@@ -1105,6 +1105,9 @@ _EMPTY_THINK_PREFILL_TEMPLATE = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     pytest.param(_EMPTY_THINK_PREFILL_TEMPLATE + _FORCED_THINKING_TEMPLATE,
                  "deepseek-r1",
                  id="with_open_block"),
+    pytest.param(_FORCED_THINKING_TEMPLATE + _EMPTY_THINK_PREFILL_TEMPLATE,
+                 "deepseek-r1",
+                 id="open_block_first"),
 ])
 def test_detect_qwen3_empty_think_prefill(tmp_path, jinja, expected):
     """An empty, closed <think></think> block does not open reasoning."""
