@@ -3352,12 +3352,22 @@ def _live_score_columns(core, md, batch: int) -> int:
 
 
 def _selection(
-    core, scores, visible_blocks, logical, seq_lens_q, topk_indices, row_starts, out, live_cols=None
+    core,
+    scores,
+    visible_blocks,
+    logical,
+    seq_lens_q,
+    topk_indices,
+    row_starts,
+    out,
+    live_cols=None,
+    context=False,
 ):
     """The selected token indices of `scores`' rows into `out` `[rows, token_topk +
-    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch, or, for
-    a score table that kernel does not serve, the selection and the expansion apart (the
-    rewrite bounded by `live_cols`, `_select`)."""
+    compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a context
+    chunk's rows, `context`, on the op's context launch), or, for a score table that kernel
+    does not serve, the selection and the expansion apart (the rewrite bounded by
+    `live_cols`, `_select`). They all give the same selection."""
     if _topk_expand_supports(scores):
         qsa_topk_expand_decode(
             scores,
@@ -3368,6 +3378,7 @@ def _selection(
             core.compress_ratio,
             core.token_topk,
             out=out,
+            context=context,
         )
         return
     _select(core, scores, row_starts, visible_blocks, topk_indices, live_cols)
@@ -3437,6 +3448,7 @@ def _score_and_select(
                 row_starts[a:b],
                 selected[a:b],
                 live_cols,
+                context=context_rows,
             )
 
 
