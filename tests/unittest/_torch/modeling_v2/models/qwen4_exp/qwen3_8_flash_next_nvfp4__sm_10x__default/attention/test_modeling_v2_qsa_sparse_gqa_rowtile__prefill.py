@@ -49,8 +49,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 class _LaunchRecorder:
-    """Records which of the entry's kernels a call indexed with a grid; the bitmap pass
-    (`_row_bits`, a plain call) is recorded with its one-CTA-a-row grid."""
+    """Records which of the entry's kernels a call indexed with a grid; the group plan and the
+    bitmap pass (`_group_plan`, `_row_bits`: plain calls) are recorded with their row count."""
 
     def __init__(self, inner, name, log):
         self._inner, self._name, self._log = inner, name, log
@@ -65,6 +65,15 @@ class _LaunchRecorder:
 
 
 _KERNELS = (
+    "_group_plan",
+    "_row_bits",
+    "_rowtile_plan_kernel",
+    "_rowtile_lone_kernel",
+    "_rowtile_attention_cute",
+)
+#: The launches of a call the group plan fits, and of one it does not.
+_GROUP_PLANNED = ("_group_plan", "_rowtile_lone_kernel", "_rowtile_attention_cute")
+_TWO_PASSES = (
     "_row_bits",
     "_rowtile_plan_kernel",
     "_rowtile_lone_kernel",
@@ -233,15 +242,16 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     assert bool(_is_prefix_packed(selected).all())
     assert torch.equal((selected >= 0).sum(1), _bound(args["query_positions"], spec))
     out = op(**args)
-    assert [name for name, _ in launches] == list(_KERNELS)
+    # Every cell's geometry fits the group plan: one launch in place of the two passes.
+    assert tuple(name for name, _ in launches) == _GROUP_PLANNED
     group_rows = rows_per_group(spec["q_heads"] // spec["kv_heads"])
     assert group_rows == {12: 10, 6: 20}[spec["q_heads"] // spec["kv_heads"]]
     groups = math.ceil(rows / group_rows)
-    assert launches[0][1] == (rows,) and launches[1][1] == (groups,)
-    assert launches[2][1] == (min(rows, 256), spec["kv_heads"])
+    assert launches[0][1] == (rows,)
+    assert launches[1][1] == (min(rows, 256), spec["kv_heads"])
     # The row-tile pass is persistent: one CTA per SM, never more than (group, KV head) items.
     items = groups * spec["kv_heads"]
-    assert launches[3][1] == (
+    assert launches[2][1] == (
         min(items, torch.cuda.get_device_properties(0).multi_processor_count),
     )
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
@@ -273,3 +283,133 @@ def test_small_launches_match_the_reference(segments) -> None:
     an item the pass skips (a lone group) between items it serves."""
     args = _build(_with(segments, slots=8), seed=7700 + len(segments))
     _compare(op(**args), op.reference(**args))
+
+
+class _PlanCapture:
+    """Wraps the plan stage the entry runs and keeps copies of what it wrote, enqueued behind
+    it: `row_info`, `group_plan`, `slots`, `packed_bits`, the lone rows and the lone count."""
+
+    def __init__(self, monkeypatch, group_plan: bool):
+        self.out = {}
+        if group_plan:
+            inner = _module._group_plan
+
+            def call(selected_tokens, query_positions, request_indices, block_table, *rest):
+                row_info = inner(selected_tokens, query_positions, request_indices, block_table,
+                                 *rest)  # fmt: skip
+                slots, packed, plan, lone, count = rest[-5:]
+                self._keep(row_info, plan, slots, packed, lone, count)
+                return row_info
+
+            monkeypatch.setattr(_module, "_group_plan", call)
+        else:
+            monkeypatch.setattr(_module, "_group_plan_fits", lambda *args: False)
+            kernel = _module._rowtile_plan_kernel
+            capture = self
+
+            class _Grid:
+                def __getitem__(self, grid):
+                    def launch(*args, **kwargs):
+                        kernel[grid](*args, **kwargs)
+                        _, row_info, _, _, slots, packed, plan, lone, count = args[:9]
+                        capture._keep(row_info, plan, slots, packed, lone, count)
+
+                    return launch
+
+            monkeypatch.setattr(_module, "_rowtile_plan_kernel", _Grid())
+
+    def _keep(self, row_info, plan, slots, packed, lone, count):
+        self.out = dict(
+            row_info=row_info.clone(),
+            group_plan=plan.clone(),
+            slots=slots.clone(),
+            packed_bits=packed.clone(),
+            lone=lone.clone(),
+            lone_count=count.clone(),
+        )
+
+
+def _plan(args, monkeypatch, group_plan: bool) -> dict:
+    with monkeypatch.context() as m:
+        capture = _PlanCapture(m, group_plan)
+        op(**args)
+    torch.cuda.synchronize()
+    return capture.out
+
+
+def _assert_same_plan(new: dict, old: dict) -> None:
+    """What the group plan writes, against the bitmap pass and the plan pass: `row_info`,
+    `group_plan`, each group's listed slots, every row's re-indexed bits, the lone count and the
+    lone rows as a set (their order is the launch's in both)."""
+    assert torch.equal(new["row_info"], old["row_info"]), "row_info"
+    assert torch.equal(new["group_plan"], old["group_plan"]), "group_plan"
+    for g, listed in enumerate(old["group_plan"][:, 1].tolist()):
+        assert torch.equal(new["slots"][g, :listed], old["slots"][g, :listed]), f"slots of {g}"
+    assert torch.equal(new["packed_bits"], old["packed_bits"]), "packed_bits"
+    count = int(old["lone_count"][0])
+    assert int(new["lone_count"][0]) == count, "lone count"
+    assert torch.equal(
+        torch.sort(new["lone"][:count]).values, torch.sort(old["lone"][:count]).values
+    ), "lone rows"
+
+
+def _scramble(args, seed):
+    """The plan stage's inputs past what an engine step holds: 2% of the selected columns holes
+    (-1), repeats of the row's first token or tokens off the 4-grid; some pages unmapped (-1) and
+    some past the pool. Only the plan stage is compared on these."""
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    sel = args["selected_tokens"].clone()
+    pick = torch.rand(sel.shape, generator=gen, device=DEV)
+    live = sel >= 0
+    sel = torch.where(live & (pick < 0.007), -1, sel)
+    sel = torch.where(live & (pick >= 0.007) & (pick < 0.014), sel[:, :1].expand_as(sel), sel)
+    sel = torch.where(live & (pick >= 0.014) & (pick < 0.02), (sel + 1).clamp(min=0), sel)
+    table = args["block_table"].clone()
+    mapped = table >= 0
+    hit = torch.rand(table.shape, generator=gen, device=DEV)
+    table = torch.where(mapped & (hit < 0.01), -1, table)
+    table = torch.where(mapped & (hit >= 0.99), args["k_cache"].shape[0] + 5, table)
+    return {**args, "selected_tokens": sel, "block_table": table}
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [c.spec for c in op.CELLS]
+    + [
+        # A cold request (positions from 0), and a step whose groups span requests.
+        _with([(0, 4096)], slots=8),
+        _with([(9000, 2051), (40000, 7), (120000, 2048)], slots=8),
+        # Deep histories of one request.
+        _with([(200000, 2048)], slots=8),
+    ],
+    ids=[c.why[:44] for c in op.CELLS] + ["cold", "groups across requests", "deep"],
+)
+@pytest.mark.parametrize("scrambled", [False, True], ids=["engine-like", "scrambled"])
+def test_group_plan_writes_what_the_two_passes_write(spec, scrambled, monkeypatch) -> None:
+    """The group plan is the bitmap pass and the plan pass in one launch: every output of the
+    plan stage bitwise theirs, so the lone-row and row-tile passes run on the same plan and
+    `attn_out` is the same bytes."""
+    args = _build(spec, seed=900 + len(spec["segments"]))
+    if scrambled:
+        args = _scramble(args, seed=17)
+    new = _plan(args, monkeypatch, group_plan=True)
+    old = _plan(args, monkeypatch, group_plan=False)
+    assert new and old, "a plan stage did not run"
+    _assert_same_plan(new, old)
+    if not scrambled:
+        assert torch.equal(op(**args), _two_pass_out(args, monkeypatch)), "attn_out"
+
+
+def _two_pass_out(args, monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(_module, "_group_plan_fits", lambda *a: False)
+        return op(**args)
+
+
+def test_a_launch_the_group_plan_does_not_fit_takes_the_two_passes(monkeypatch, launches) -> None:
+    """Past the group plan's shared memory (a much wider table) the entry keeps the bitmap
+    pass and the plan pass."""
+    monkeypatch.setattr(_module, "_GP_MAX_SMEM", 1024)
+    args = _build(_with([(5000, 37)], slots=8), seed=31)
+    _compare(op(**args), op.reference(**args))
+    assert tuple(name for name, _ in launches) == _TWO_PASSES
