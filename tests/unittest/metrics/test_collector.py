@@ -921,7 +921,7 @@ class TestCollectedRequestRecords:
         from tensorrt_llm.sampling_params import SamplingParams
 
         result = GenerationResultBase(id=1, sampling_params=SamplingParams())
-        result.finished = True
+        result._done = True
         result.prompt_token_ids = [1, 2]
         result.per_pos_drafted = [4, 2]
         result.per_pos_accepted = [3, 1]
