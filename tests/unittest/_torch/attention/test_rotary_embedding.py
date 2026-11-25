@@ -243,7 +243,7 @@ class TestLongRopeFactorChoice:
     SHORT_FACTOR = [1.0, 1.5, 2.0, 2.5]
     LONG_FACTOR = [4.0, 8.0, 16.0, 32.0]
 
-    def _expected_table(self, factor):
+    def _expected_table(self, factor: list[float]) -> np.ndarray:
         inv_freq = 1.0 / (10000.0**(np.arange(0, self.DIM, 2) / self.DIM))
         angles = np.outer(np.arange(self.NUM_POS),
                           inv_freq / np.asarray(factor))
@@ -257,8 +257,9 @@ class TestLongRopeFactorChoice:
         (16, False),
         (8, False),
     ])
-    def test_factor_choice_and_warning(self, monkeypatch, max_seq_len,
-                                       expect_long):
+    def test_factor_choice_and_warning(self, monkeypatch: pytest.MonkeyPatch,
+                                       max_seq_len: int | None,
+                                       expect_long: bool) -> None:
         warnings = []
         monkeypatch.setattr(logger, "warning_once",
                             lambda *msg, key: warnings.append(" ".join(msg)))
