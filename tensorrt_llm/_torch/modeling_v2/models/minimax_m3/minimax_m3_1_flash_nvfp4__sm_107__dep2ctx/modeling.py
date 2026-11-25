@@ -43,7 +43,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
 )
@@ -3514,9 +3514,10 @@ class MiniMaxM3Attention(Attention):
         enabled_libs = get_enabled_fmha_lib_classes()
         if FlashInferTrtllmGenFmha not in enabled_libs:
             return
-        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
-            FlashInferTrtllmGenFmha
-        ):
+        first_native = next(
+            (index for index, lib in enumerate(enabled_libs) if lib in NATIVE_FMHA_LIBS), None
+        )
+        if first_native is not None and first_native < enabled_libs.index(FlashInferTrtllmGenFmha):
             # A fallback-first policy cannot serve P128 cached prefill safely.
             return
         if not FlashInferTrtllmGenFmha.is_environment_available():

@@ -552,12 +552,13 @@ Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
 `meta` and `fwd` into the native struct, build an `AttentionConfig` key, and
 resolve the op from a per-thread C++ cache keyed by that configuration; the op
-is built outside CUDA graph capture on first use and its kernel runners are
-created lazily per phase. `*_is_supported` prepares the call in the op without
-launching or growing the workspace. Workspace sizing, growth and the multi-CTA
-counter live in C++; generation reserves the largest requirement among the op's
-libraries, so a CUDA graph replay can switch library without growth, and
-`prepare_workspace()` only warns when SageAttention smoothing is requested. After each launch the holder drops
+is built outside CUDA graph capture on first use and each library's kernel
+runners are created lazily when that library is queried or run. `*_is_supported`
+prepares the call in the op without launching or growing the workspace.
+Workspace sizing, growth and the multi-CTA counter live in C++; generation
+reserves the largest requirement among the op's initialized libraries, so a CUDA
+graph replay can switch between consulted libraries without growth. After each
+launch the holder drops
 every tensor reference so cached parameters never pin a layer's activations.
 Streams are not part of the key so CUDA graph capture reuses runners
 initialized during warmup.
@@ -649,9 +650,10 @@ returning False. A False would let selection fall through to the generic
 no-library error (or, for a library that is not last in the registry, hand
 the request to a library that masks the broken configuration), while the
 raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
-way for FP4 MLA configurations only it can serve, and `UnfusedFmha` raises to
-refuse a paged-context call that no fused context kernel serves, which would
-otherwise corrupt the cached prefix.
+way for FP4 MLA configurations only it can serve. `UnfusedFmha` declines a
+paged-context call so custom library orders can still reach a later fused
+library, and `TrtllmAttention.forward` raises an actionable error when no fused
+paged-context kernel serves the call instead of corrupting the cached prefix.
 
 The FMHA package is split by role:
 

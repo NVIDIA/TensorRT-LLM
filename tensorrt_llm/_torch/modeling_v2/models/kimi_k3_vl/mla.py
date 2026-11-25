@@ -14,7 +14,7 @@ kernels:
 
 * projections: ``gemm/cublas_mm`` for the fused ``[q_a | kv_a | k_pe]`` rows, ``torch.nn.functional.linear`` for
   q_b, kv_b, the gate and ``o_proj`` (what the built-in bf16 ``Linear`` runs), the q_a / kv_a RMSNorms on ``norm.py``;
-* context: the MLA context phase of the layer's FMHA libraries over K / V expanded from the latent (fresh
+* context: ``attention/thop_attention`` with ``attention_input_type`` 1 over K / V expanded from the latent (fresh
   prefill: kv_b per head with ``gemm/bmm_out`` straight into the strided K buffer); with a cached prefix (a later
   chunk of chunked prefill), ``attention/mla_rope_append_paged_kv_assign_q`` and then the prefix chunk by chunk with
   the partials merged on their softmax statistics (``load_chunked_kv_cache_for_mla``,
@@ -40,11 +40,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    PredefinedAttentionMask,
-)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
     mla_rope_append_paged_kv_assign_q,
@@ -52,6 +47,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_append_paged_kv_
 from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_generation import (
     mla_rope_generation,
 )
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
@@ -66,9 +62,6 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention import (
     flashinfer_mla_decode as _flashinfer,
 )
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attention import (
-    run_mla_phase,
-)
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn_vb_out import (
     k3_mla_attn_vb_out,
 )
@@ -76,9 +69,6 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_attn
     K3MlaAttnWorkspace,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_qkv import k3_mla_qkv
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_state import (
-    K3MlaAttnState,
-)
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.load_chunked_kv_cache_for_mla import (  # noqa: E501
     load_chunked_kv_cache_for_mla,
 )
@@ -101,6 +91,9 @@ if TYPE_CHECKING:
 # position, so it covers max_position_embeddings and grows to the engine's max_seq_len. KIMI_K3_MLA_MAX_POSITIONS
 # overrides the starting size for short-context deployments.
 _ROPE_THETA = 10000.0
+# PositionEmbeddingType.rope_gpt_neox: what the built-in K3 MLA hands the attention op (the MLA kernels read only the
+# rope table).
+_POSITION_EMBEDDING_ROPE_GPT_NEOX = 2
 _MASK_PADDING, _MASK_CAUSAL = 0, 1
 _CONTEXT, _GENERATION = 1, 2
 _QUANT_MODE_BF16_KV = 0
@@ -397,9 +390,6 @@ class K3DecodeMLA(nn.Module):
         self.decode_gemvs: Optional[Any] = None
         # The FlashInfer MLA decode's multi-CTA KV counter (mixed steps), made on first use.
         self._fi_counter: Optional[torch.Tensor] = None
-        # The context and generation roles' attention layers and FMHA managers, built in post_load_weights.
-        self._mha: Optional[K3MlaAttnState] = None
-        self._mqa: Optional[K3MlaAttnState] = None
         # The key a breakable CUDA graph's eager break finds this layer by (``_core_inplace``).
         self._break_key = f"{layer_idx}:{id(self)}"
         _BREAK_LAYERS[self._break_key] = self
@@ -428,27 +418,6 @@ class K3DecodeMLA(nn.Module):
         ag = self.k3_ag_weight.detach()
         self.a_proj_weight, self.g_proj_weight = ag[: self._a_rows], ag[self._a_rows :]
         _IdentityRope.get(ag.device, self.max_position_embeddings, self.qk_rope_head_dim)
-        roles = dict(
-            layer_idx=self.layer_idx,
-            q_lora_rank=self.q_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            quant_config=None,
-            device=ag.device,
-        )
-        self._mha = K3MlaAttnState.context(
-            num_context_heads=self.num_heads_tp,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            v_head_dim=self.v_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            **roles,
-        )
-        self._mqa = K3MlaAttnState.generation(
-            num_heads=self.num_heads_tp,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            **roles,
-        )
 
     # ------------------------------------------------------------------------------------------------------------
     # The decode branch.
@@ -606,7 +575,7 @@ class K3DecodeMLA(nn.Module):
         window = md.kv_cache_manager.max_attention_window_vec[self._local_layer(md)]
         return md.max_seq_len if window is None else window
 
-    def _attend(
+    def _thop(
         self,
         md,
         rope: _IdentityRope,
@@ -628,41 +597,105 @@ class K3DecodeMLA(nn.Module):
         cu_kv_seqlens: Optional[torch.Tensor] = None,
         fmha_scheduler_counter: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """One MLA phase on the layer's FMHA libraries, with what the built-in MLA's backends hand them: the context
-        role runs the heads as MHA over [nope | rope] = 192, the generation role as latent MQA over 576 with v = 512.
-        The KV lengths are the call's: the step's, or a chunked-prefill partial's, presented on the metadata for the
-        call as the built-in MLA does."""
+        """``attention/thop_attention`` with what the built-in MLA's backends hand it: the context backend runs the
+        heads as MHA over [nope | rope] = 192, the generation backend as latent MQA over 576 with v = 512."""
         context = attention_input_type == _CONTEXT
-        state = self._mha if context else self._mqa
-        state.rotary_inv_freq = rope.inv_freq
-        state.rotary_cos_sin = rope.cos_sin
-        state.rope_params.max_positions = rope.positions
-        fwd = AttentionForwardArgs(
+        heads = self.num_heads_tp
+        spec = bool(md.is_spec_decoding_enabled and md.use_spec_decoding) and not context
+        return thop_attention(
+            q=q,
+            k=k,
+            v=v,
             output=output,
+            output_sf=None,
+            workspace=md.effective_workspace,
+            sequence_length=sequence_length,
+            host_past_key_value_lengths=host_past_key_value_lengths,
+            host_total_kv_lens=host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            max_context_q_len_override=None,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            cache_indirection=md.cache_indirection,
+            kv_scale_orig_quant=None,
+            kv_scale_quant_orig=None,
+            out_scale=None,
+            rotary_inv_freq=rope.inv_freq,
+            rotary_cos_sin=rope.cos_sin,
             latent_cache=latent_cache,
             q_pe=q_pe,
-            attention_mask=(
-                PredefinedAttentionMask.FULL
-                if mask_type == _MASK_PADDING
-                else PredefinedAttentionMask.CAUSAL
-            ),
-            attention_input_type=(
-                AttentionInputType.context_only if context else AttentionInputType.generation_only
-            ),
+            block_ids_per_seq=None,
+            attention_sinks=None,
+            is_fused_qkv=False,
+            update_kv_cache=True,
+            predicted_tokens_per_seq=1,
+            local_layer_idx=self._local_layer(md),
+            num_heads=heads,
+            num_kv_heads=heads if context else 1,
+            head_size=self.qk_head_dim if context else self.kv_lora_rank + self.qk_rope_head_dim,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            attention_window_size=self._window(md),
+            beam_width=md.beam_width,
+            mask_type=mask_type,
+            quant_mode=_QUANT_MODE_BF16_KV,
+            q_scaling=self.q_scaling,
+            position_embedding_type=_POSITION_EMBEDDING_ROPE_GPT_NEOX,
+            rope_dim=self.qk_rope_head_dim,
+            rope_base=_ROPE_THETA,
+            rope_scale_type=0,
+            rope_scale=1.0,
+            rope_short_m_scale=1.0,
+            rope_long_m_scale=1.0,
+            rope_max_positions=rope.positions,
+            rope_original_max_positions=self.max_position_embeddings,
+            use_paged_context_fmha=False,
+            attention_input_type=attention_input_type,
+            is_mla_enable=True,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim if context else self.kv_lora_rank,
+            rope_append=True,
+            mrope_rotary_cos_sin=None,
+            mrope_position_deltas=None,
+            helix_position_offsets=None,
+            helix_is_inactive_rank=None,
+            attention_chunk_size=None,
             softmax_stats_tensor=softmax_stats_tensor,
+            is_spec_decoding_enabled=bool(md.is_spec_decoding_enabled),
+            use_spec_decoding=bool(md.use_spec_decoding),
+            is_spec_dec_tree=bool(md.is_spec_dec_tree),
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths if spec else None,
+            spec_decoding_position_offsets=_spec_position_offsets(md) if spec else None,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask if spec else None,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset
+            if spec
+            else None,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask if spec else None,
+            spec_bl_tree_first_sparse_mask_offset_kv=(
+                md.spec_bl_tree_first_sparse_mask_offset_kv if spec else None
+            ),
+            sparse_kv_indices=None,
+            sparse_kv_offsets=None,
+            sparse_attn_indices=None,
+            sparse_attn_offsets=None,
+            sparse_attn_indices_block_size=1,
             cu_q_seqlens=cu_q_seqlens,
             cu_kv_seqlens=cu_kv_seqlens,
             fmha_scheduler_counter=fmha_scheduler_counter,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            max_num_sequences=md.max_num_sequences,
+            trtllm_gen_jit_warmup=bool(getattr(md, "trtllm_gen_jit_warmup", False)),
         )
-        saved = (md.kv_lens_cuda_runtime, md.kv_lens_runtime, md.host_total_kv_lens)
-        md.kv_lens_cuda_runtime = sequence_length
-        md.kv_lens_runtime = host_past_key_value_lengths
-        md.host_total_kv_lens = host_total_kv_lens
-        try:
-            return run_mla_phase(state, q, k, v, md, fwd)
-        finally:
-            md.kv_lens_cuda_runtime, md.kv_lens_runtime, md.host_total_kv_lens = saved
 
     # -- context ------------------------------------------------------------------------------------------------
 
@@ -697,7 +730,7 @@ class K3DecodeMLA(nn.Module):
         heads = self.num_heads_tp
         k = torch.empty_like(q).view(-1, heads, self.qk_head_dim)
         v = self._expand_kv_strided(compressed_kv, k)
-        self._attend(
+        self._thop(
             md,
             rope,
             q=q,
@@ -807,7 +840,7 @@ class K3DecodeMLA(nn.Module):
 
         def attend_and_merge(k, v, mask_type, seq_lens, host_seq_lens, total, merge_op):
             host_total[0] = total
-            self._attend(
+            self._thop(
                 md,
                 rope,
                 q=q,
@@ -986,7 +1019,7 @@ class K3DecodeMLA(nn.Module):
         """The generation requests' latent MQA ``[tokens, heads * kv_lora]`` over the paged cache, on the kernel the
         built-in MLA's attention backend selects for this step: the CuTe DSL decode kernel on a decode-only step
         (``cute_dsl_mla_decode``), FlashInfer's TRTLLM-Gen MLA decode beside context requests
-        (``flashinfer_mla_decode``), else the generation role's FMHA libraries."""
+        (``flashinfer_mla_decode``), else the attention op's generation phase."""
         linear = md.beam_width == 1 and not md.is_spec_dec_tree
         if md.num_contexts == 0 and linear and _cute.available():
             return self._latent_attention_cute(fused_q, md)
@@ -995,7 +1028,7 @@ class K3DecodeMLA(nn.Module):
             if total_num_blocks is not None:
                 return self._latent_attention_flashinfer(fused_q, md, total_num_blocks)
         latent_out = fused_q.new_empty(fused_q.shape[0], self.num_heads_tp * self.kv_lora_rank)
-        return self._attend(
+        return self._thop(
             md,
             rope,
             q=fused_q,
@@ -1220,6 +1253,14 @@ def _split_kv_plan(md, cache_seqs, num_requests, seq_len_q, num_heads) -> Option
         _cute.mla_split_kv_plan(cache_seqs, plan, num_requests, rows, waves)
         md._cute_dsl_mla_split_plan_key = key
     return plan[:num_requests]
+
+
+def _spec_position_offsets(md) -> Optional[torch.Tensor]:
+    """The speculative position offsets as the attention op takes them on SM100: ``[max_num_requests, width]``."""
+    offsets = md.spec_decoding_position_offsets
+    if offsets is not None and offsets.dim() == 1:
+        offsets = offsets.view(md.max_num_requests, -1)
+    return offsets
 
 
 _CAT_WARMED: set = set()

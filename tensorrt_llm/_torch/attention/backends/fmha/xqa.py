@@ -22,14 +22,19 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._utils import is_sm_100f, is_sm_120f
 from tensorrt_llm.bindings.internal import thop
 
 from .native import NativeFmha
-from .phased import FmhaParams
+from .phased import FmhaParams, _host_max
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
+
+_MAX_PERF_GAIN_CACHE_SIZE = 256
 
 
 class XqaFmha(NativeFmha):
@@ -37,18 +42,29 @@ class XqaFmha(NativeFmha):
 
     op_is_supported = staticmethod(thop.xqa_is_supported)
 
-    def __init__(self, attn: "AttentionLayer"):
+    def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         # has_perf_gain() by (generation batch, history in XQA multi-block units, spec decoding,
         # output dtype).
         self._perf_gain: dict[tuple[int, int, bool, torch.dtype], bool] = {}
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        if is_sm_100f():
+            return False
+        if attn.is_mla_enable:
+            is_gen_mla = attn.head_dim == (attn.kv_lora_rank or 0) + (attn.qk_rope_head_dim or 0)
+            if not (is_sm_120f() and is_gen_mla):
+                return False
+        return super()._is_available(attn)
 
     def is_phase_supported(self, params: FmhaParams, is_gen: bool) -> bool:
         # Judge support at the longest KV history the selection cache key admits, so the choice
         # holds for every request sharing the key; has_perf_gain() is keyed separately.
         metadata = params.meta
         if is_gen and metadata.max_seq_len is not None:
-            if metadata.beam_width == 1:
+            beam_width = getattr(metadata, "effective_beam_width", metadata.beam_width)
+            if beam_width == 1:
                 params.max_past_kv_length = metadata.max_seq_len
             elif not self.kv_exceeds_beam_search_window(metadata, params.fwd):
                 params.max_past_kv_length = min(
@@ -72,8 +88,8 @@ class XqaFmha(NativeFmha):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        max_kv_len = int(
-            metadata.kv_lens_runtime[num_contexts : num_contexts + num_generations].max()
+        max_kv_len = _host_max(
+            metadata.kv_lens_runtime, num_contexts, num_contexts + num_generations
         )
         key = (
             num_generations,
@@ -88,9 +104,14 @@ class XqaFmha(NativeFmha):
             params = self.generation_params(
                 q, k, v, metadata, forward_args, metadata.effective_workspace, 0, num_gen_tokens
             )
-            gain = thop.xqa_has_perf_gain(params)
-            if gain is None:
+            raw_gain = thop.xqa_has_perf_gain(params)
+            if raw_gain is None:
+                # Declined per-call inputs must not poison future supported calls under the same
+                # shape key unless the layer's static op itself lacks XQA.
                 return False
+            gain = raw_gain
+            if len(self._perf_gain) >= _MAX_PERF_GAIN_CACHE_SIZE:
+                self._perf_gain.clear()
             self._perf_gain[key] = gain
         return gain
 
@@ -99,13 +120,19 @@ class XqaFmha(NativeFmha):
         metadata: "TrtllmAttentionMetadata", forward_args: AttentionForwardArgs
     ) -> bool:
         """Whether beam search generation holds KV history past the cyclic window, where XQA declines it."""
-        if metadata.beam_width <= 1 or metadata.num_generations <= 0:
+        beam_width = getattr(metadata, "effective_beam_width", metadata.beam_width)
+        if beam_width <= 1 or metadata.num_generations <= 0:
+            return False
+        window = forward_args.attention_window_size
+        if window is None:
+            window = metadata.max_seq_len
+        if window is None:
             return False
         num_contexts = metadata.num_contexts
-        max_kv_len = int(
-            metadata.kv_lens_runtime[num_contexts : num_contexts + metadata.num_generations].max()
+        max_kv_len = _host_max(
+            metadata.kv_lens_runtime, num_contexts, num_contexts + metadata.num_generations
         )
-        return max_kv_len + 1 > forward_args.attention_window_size
+        return max_kv_len + 1 > window
 
     @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:

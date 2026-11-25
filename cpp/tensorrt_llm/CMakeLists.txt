@@ -30,11 +30,10 @@ set(TRTLLM_FMHA_PARAMS_SCHEMAS
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/phased.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/trtllm.py"
-    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/attention_layer.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
 )
 # The C++ consumer decides which members of the mirrored runtime classes
-# (AttentionLayer, TrtllmAttentionMetadata) are emitted: a member crosses when
+# (TrtllmAttention, TrtllmAttentionMetadata) are emitted: a member crosses when
 # these sources read it as attn.<name> / meta.<name>.
 set(TRTLLM_FMHA_PARAMS_USAGE_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.h"

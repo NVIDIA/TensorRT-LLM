@@ -70,26 +70,7 @@ RUNTIME_INTERFACES: Dict[str, Tuple[object, str]] = {
         {"AttentionMetadata", "TrtllmAttentionMetadata"},
         "attention metadata, the engine's per-step interface (README names it)",
     ),
-    f"{_ATTENTION}.interface": (
-        {
-            "AttentionMetadata",
-            "AttentionForwardArgs",
-            "AttentionInputType",
-            "PredefinedAttentionMask",
-            "MLAParams",
-            "RopeParams",
-        },
-        "attention metadata (as above), and the per-call arguments and layer parameters a "
-        "model hands the FMHA libraries",
-    ),
-    f"{_ATTENTION}.attention_layer": (
-        {"AttentionLayer"},
-        "the layer state the FMHA libraries read; a model that drives them builds one per role",
-    ),
-    f"{_ATTENTION}.fmha.manager": (
-        {"FmhaManager"},
-        "the FMHA library selection a model drives its attention through",
-    ),
+    f"{_ATTENTION}.interface": ({"AttentionMetadata"}, "attention metadata (as above)"),
     f"{_ATTENTION}.trtllm": (
         {"TrtllmAttentionMetadata"},
         "attention metadata: KV pool pointers, block offsets and the FP4 MLA state",

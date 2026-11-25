@@ -9,11 +9,11 @@ A K3 MLA layer runs two attention roles over one latent KV cache:
 * the generation role (``K3MlaAttnState.generation(...)``): ``H`` absorbed heads of 576 (latent 512 + K-pe
   64) dims over one KV head, the decode's view.
 
-This object is the role's ``AttentionLayer`` and carries its ``FmhaManager``: the head geometry, the softmax
-scaling, the KV cache quantization of the layer (FP8, NVFP4 or none), the unit KV scales, the identity RoPE
-table (K3 is NoPE: every MLA kernel that rotates reads an identity ``(cos, sin) = (1, 0)`` table) and this
-layer's index in the KV cache manager. The engine owns the KV cache manager; the ops read its pools and
-block offsets from the attention metadata.
+This object carries what those calls read besides the batch: the head geometry, the softmax scaling, the KV
+cache quantization of the layer (FP8, NVFP4 or none), the unit KV scales, the identity RoPE table (K3 is
+NoPE: every MLA kernel that rotates reads an identity ``(cos, sin) = (1, 0)`` table) and this layer's index
+in the KV cache manager. The engine owns the KV cache manager; the ops read its pools and block offsets
+from the attention metadata.
 
 Attribute names match those the K3 FP4 MLA decode and KV-only append read from the layer's generation role
 (``num_heads``, ``kv_lora_rank``, ``qk_*_head_dim``, ``q_scaling``, ``layer_idx``, ``rotary_cos_sin``,
@@ -27,12 +27,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
-from tensorrt_llm._torch.attention.backends.interface import MLAParams, RopeParams
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils, RotaryScalingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantMode
 
 # K3's MLA RoPE configuration: GPT-NeoX positions over the 64 K-pe dims, interleaved (cos, sin) pairs
 # duplicated over the rope dim (the FP4 MLA cache update requires the duplicated layout).
@@ -103,9 +101,9 @@ def has_fp8_context_mla_fmha(sm_version: int) -> bool:
     return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
 
 
-class K3MlaAttnState(AttentionLayer):
+class K3MlaAttnState:
     """One K3 MLA attention role (context or generation) of one layer: geometry, quantization, scales,
-    identity RoPE table, KV cache layer index and FMHA manager (see the module docstring)."""
+    identity RoPE table and KV cache layer index (see the module docstring)."""
 
     def __init__(
         self,
@@ -125,29 +123,24 @@ class K3MlaAttnState(AttentionLayer):
         device: Optional[torch.device] = None,
     ) -> None:
         device = torch.device("cuda") if device is None else torch.device(device)
-        # No positional embedding here: AttentionLayer would build a full RoPE table per role.
-        super().__init__(
-            layer_idx=layer_idx,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            num_kv_heads=num_kv_heads,
-            mla_params=MLAParams(
-                q_lora_rank=q_lora_rank,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                qk_nope_head_dim=qk_nope_head_dim,
-                v_head_dim=v_head_dim,
-            ),
-            quant_config=quant_config,
-        )
+        self.layer_idx = layer_idx
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.is_mla_enable = True
+        self.rope_append = True
+        self.predicted_tokens_per_seq = 1
+        self.q_scaling = 1.0
         self.position_embedding_type = _ROPE_POSITION_EMBEDDING_TYPE
-        self.rope_params = RopeParams(
-            dim=qk_rope_head_dim,
-            theta=_ROPE_THETA,
-            max_positions=max_position_embeddings,
-            original_max_positions=max_position_embeddings,
-            duplicate_data=_ROPE_DUPLICATE_DATA,
-        )
+        self.rope_dim = qk_rope_head_dim
+        self.rope_base = _ROPE_THETA
+        self.rope_max_positions = max_position_embeddings
+        self.rope_original_max_positions = max_position_embeddings
         self.rope_duplicate_data = _ROPE_DUPLICATE_DATA
         sm = get_sm_version()
         threshold = float(skip_correction_threshold)
@@ -164,6 +157,7 @@ class K3MlaAttnState(AttentionLayer):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
         # Counters the attention op updates when skip-softmax statistics are on.
         self.skip_softmax_stat = torch.zeros(2, dtype=torch.uint32, device=device)
+        self.local_layer_idx: Optional[int] = None
         self.update_quant_config(quant_config)
 
     @classmethod
@@ -208,10 +202,12 @@ class K3MlaAttnState(AttentionLayer):
     # ------------------------------------------------------------------------------------------
 
     def update_quant_config(self, quant_config: Optional[QuantConfig]) -> None:
-        """The layer's KV cache quantization (``quant_config.layer_quant_mode``), and the FMHA manager that
-        serves it."""
-        self.set_layer_quant_config(quant_config)
-        self.fmha_manager = FmhaManager(self)
+        """The layer's KV cache quantization (``quant_config.layer_quant_mode``)."""
+        self.quant_config = quant_config or QuantConfig()
+        mode = self.quant_config.layer_quant_mode
+        self.quant_mode: QuantMode = mode
+        self.has_fp8_kv_cache = bool(mode.has_fp8_kv_cache())
+        self.has_fp4_kv_cache = bool(mode.has_fp4_kv_cache())
 
     @property
     def uses_fp4_mla_attention(self) -> bool:
@@ -239,7 +235,7 @@ class K3MlaAttnState(AttentionLayer):
         """Grow the identity table (and the RoPE position count the op receives) to
         ``required_max_positions``."""
         table_positions = self.rotary_cos_sin.numel() // self._floats_per_position
-        self.rope_params.max_positions = max(
+        self.rope_max_positions = max(
             self.rope_max_positions, table_positions, required_max_positions
         )
         if required_max_positions > table_positions:
@@ -250,6 +246,15 @@ class K3MlaAttnState(AttentionLayer):
     # ------------------------------------------------------------------------------------------
     # KV cache layer index and cache-state predicates.
     # ------------------------------------------------------------------------------------------
+
+    def get_local_layer_idx(self, metadata) -> int:
+        """This layer's index in the metadata's KV cache manager (``layer_offsets``), cached."""
+        if self.local_layer_idx is not None:
+            return self.local_layer_idx
+        if metadata.kv_cache_manager is None:
+            return self.layer_idx
+        self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        return self.local_layer_idx
 
     def get_fp4_mla_local_layer_idx(self, metadata) -> int:
         """This layer's compact index in the FP4 MLA side pools (the manager's

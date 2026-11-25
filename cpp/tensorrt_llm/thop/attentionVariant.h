@@ -67,24 +67,99 @@ public:
     }
 
     /// Whether \p fmha serves this call's phase; false when it is null, a library the key
-    /// does not admit. Prepares the call as a launch does, without growing the workspace.
-    [[nodiscard]] bool isFmhaSupported(PhasedFmha<Derived> const* fmha, FmhaParams& p, bool isGen)
+    /// does not admit. Prepares the call and initializes \p fmha lazily, without growing the
+    /// workspace.
+    [[nodiscard]] bool isFmhaSupported(PhasedFmha<Derived>* fmha, FmhaParams& p, bool isGen)
     {
         if (fmha == nullptr)
         {
             return false;
         }
         preparePhase(p, isGen);
+        ensureFmhaInitialized(*fmha, isGen);
         return fmha->isSupported(p, isGen);
     }
 
-    /// Every phase call, launched or only queried: once-only phase initialization, feature
+    /// Every phase call, launched or only queried: once-only op initialization, feature
     /// preparation, and the derived op's input validation and derived fields.
     void preparePhase(FmhaParams& p, bool isGen)
     {
         initPhase(isGen);
         (Features::prepare(p, isGen), ...);
         derived().prepareInputs(p, isGen);
+    }
+
+    /// Ensures \p fmha has initialized its runner for \p isGen.
+    void ensureFmhaInitialized(PhasedFmha<Derived>& fmha, bool isGen)
+    {
+        initPhase(isGen);
+        if (!fmha.isInitialized(isGen))
+        {
+            checkNotCapturing(isGen ? "generation runner initialization" : "context runner initialization");
+            fmha.ensureInitialized(derived(), isGen);
+        }
+    }
+
+    /// Selects the first native FMHA library in priority order that serves this call's phase,
+    /// yielding when `hasPerfGain` is false and a later library also serves the call.
+    [[nodiscard]] PhasedFmha<Derived>* selectFmha(FmhaParams& p, bool isGen)
+    {
+        if (!Derived::checkParams(p, isGen))
+        {
+            return nullptr;
+        }
+        preparePhase(p, isGen);
+        PhasedFmha<Derived>* withoutGain = nullptr;
+        for (auto* fmha : derived().fmhas())
+        {
+            if (fmha == nullptr)
+            {
+                continue;
+            }
+            ensureFmhaInitialized(*fmha, isGen);
+            if (!fmha->isSupported(p, isGen))
+            {
+                continue;
+            }
+            if (!fmha->hasPerfGain(p))
+            {
+                if (withoutGain == nullptr)
+                {
+                    withoutGain = fmha;
+                }
+                continue;
+            }
+            return fmha;
+        }
+        return withoutGain;
+    }
+
+    /// Runs this call's context phase on the first native library that serves it.
+    void runContext(FmhaParams& p)
+    {
+        auto* fmha = selectFmha(p, /*isGen=*/false);
+        TLLM_CHECK_WITH_INFO(fmha != nullptr, "No native FMHA library supports this context call.");
+        if (p.num_gen_tokens > 0)
+        {
+            for (auto* listed : derived().fmhas())
+            {
+                if (listed != nullptr)
+                {
+                    ensureFmhaInitialized(*listed, /*isGen=*/true);
+                }
+            }
+        }
+        growWorkspace(p, /*isGen=*/false, *fmha);
+        derived().enqueueContext(p, *fmha);
+    }
+
+    /// Runs this call's generation phase on the first native library that serves it.
+    void runGeneration(FmhaParams& p)
+    {
+        auto* fmha = selectFmha(p, /*isGen=*/true);
+        TLLM_CHECK_WITH_INFO(fmha != nullptr, "No native FMHA library supports this generation call.");
+        growWorkspace(p, /*isGen=*/true, *fmha);
+        derived().enqueueGeneration(p, *fmha);
     }
 
     /// Runs this call's context phase on \p fmha. The caller chose it with `isFmhaSupported()`,
@@ -104,6 +179,14 @@ public:
             "The attention op does not list the requested FMHA library for the key: %s", toString().c_str());
         prepare(p, /*isGen=*/true, *fmha);
         derived().enqueueGeneration(p, *fmha);
+    }
+
+    /// Runner construction, scratch allocation and workspace growth are illegal while a
+    /// stream is capturing; warmup must have exercised the phase first.
+    static void checkNotCapturing(char const* what)
+    {
+        TLLM_CHECK_WITH_INFO(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None,
+            "%s is not allowed during CUDA graph capture; run a warmup that covers this phase first.", what);
     }
 
 protected:
@@ -143,55 +226,34 @@ protected:
             ...);
     }
 
-    /// Runner construction, scratch allocation and workspace growth are illegal while a
-    /// stream is capturing; warmup must have exercised the phase first.
-    static void checkNotCapturing(char const* what)
-    {
-        TLLM_CHECK_WITH_INFO(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None,
-            "%s is not allowed during CUDA graph capture; run a warmup that covers this phase first.", what);
-    }
-
     /// A \p Fmha for this op when its key check admits it, null otherwise.
     template <typename Fmha>
     [[nodiscard]] std::unique_ptr<Fmha> makeFmha() const
     {
-        return Fmha::isAvailable(*this) ? std::make_unique<Fmha>(*this) : nullptr;
+        return Fmha::isAvailable(*this) ? std::make_unique<Fmha>(derived()) : nullptr;
     }
 
-    /// The phase's once-only initialization: the derived op's hook, then every library's.
+    /// The phase's once-only op initialization; individual FMHA libraries initialize lazily
+    /// when queried or run.
     void initPhase(bool isGen)
     {
         if (!isGen && !mContextInitialized)
         {
             checkNotCapturing("context initialization");
             derived().initContext();
-            for (auto* fmha : derived().fmhas())
-            {
-                if (fmha != nullptr)
-                {
-                    fmha->initContext(derived());
-                }
-            }
             mContextInitialized = true;
         }
         if (isGen && !mGenerationInitialized)
         {
             checkNotCapturing("generation initialization");
             derived().initGeneration();
-            for (auto* fmha : derived().fmhas())
-            {
-                if (fmha != nullptr)
-                {
-                    fmha->initGeneration(derived());
-                }
-            }
             mGenerationInitialized = true;
         }
     }
 
     /// Bytes the FMHA libraries need for this call: the context library's, and the largest
-    /// generation requirement among the libraries, so a generation call can switch library
-    /// without growing the workspace.
+    /// generation requirement among initialized libraries, so a generation call can switch
+    /// between consulted libraries without growing the workspace.
     [[nodiscard]] std::size_t getFmhaWorkspaceSize(
         FmhaParams const& p, bool isGen, PhasedFmha<Derived> const& fmha) const
     {
@@ -202,7 +264,7 @@ protected:
         }
         for (auto const* listed : derived().fmhas())
         {
-            if (listed != nullptr)
+            if (listed != nullptr && listed->isInitialized(/*isGen=*/true))
             {
                 bytes = std::max(bytes, listed->getWorkspaceSize(derived(), p, /*isGen=*/true));
             }
@@ -210,18 +272,13 @@ protected:
         return bytes;
     }
 
-    /// Every launched phase: `preparePhase()`, then workspace growth. A context call that
-    /// also carries generation tokens launches both phases from one workspace, so it
-    /// initializes both and reserves both phases' requirements before the first launch.
-    void prepare(FmhaParams& p, bool isGen, PhasedFmha<Derived> const& fmha)
+    void growWorkspace(FmhaParams& p, bool isGen, PhasedFmha<Derived> const& fmha)
     {
-        preparePhase(p, isGen);
         bool const mixed = !isGen && p.num_gen_tokens > 0;
         if (mixed)
         {
             initPhase(/*isGen=*/true);
         }
-
         std::size_t const featureBytes = (std::size_t{0} + ... + Features::getRequiredWorkspaceSize(isGen))
             + (mixed ? (std::size_t{0} + ... + Features::getRequiredWorkspaceSize(true)) : 0);
         std::size_t const bytes = getFmhaWorkspaceSize(p, isGen, fmha) + featureBytes;
@@ -230,6 +287,15 @@ protected:
             checkNotCapturing("workspace growth");
             p.workspace.resize_({static_cast<int64_t>(bytes)});
         }
+    }
+
+    /// Every launched phase: `preparePhase()`, lazy initialization of \p fmha, then workspace
+    /// growth.
+    void prepare(FmhaParams& p, bool isGen, PhasedFmha<Derived>& fmha)
+    {
+        preparePhase(p, isGen);
+        ensureFmhaInitialized(fmha, isGen);
+        growWorkspace(p, isGen, fmha);
     }
 
     /// Multi-CTA KV counter semaphores on \p device, allocated on first use and grown when
@@ -288,6 +354,18 @@ public:
     /// Separate Q/K/V input is read only by cross attention and SageAttention.
     [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
     {
+        if (p.attn.uses_spcompress && tensorrt_llm::common::getSMVersion() != 107)
+        {
+            return false;
+        }
+        if (!isGen && (p.fwd.variable_window_token_starts.has_value() || p.fwd.variable_window_token_ends.has_value()))
+        {
+            int const sm = tensorrt_llm::common::getSMVersion();
+            if (sm != 100 && sm != 103)
+            {
+                return false;
+            }
+        }
         return (p.fwd.is_fused_qkv || p.is_cross || torch_ext::SageAttnFeature::isRequested(p))
             && checkFeatureParams(p, isGen);
     }
@@ -450,6 +528,10 @@ public:
     /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
     [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
     {
+        if (p.attn.uses_spcompress && tensorrt_llm::common::getSMVersion() != 107)
+        {
+            return false;
+        }
         return static_cast<AttentionMaskType>(p.fwd.mask_type) != AttentionMaskType::CUSTOM_MASK
             && checkFeatureParams(p, isGen);
     }
@@ -527,8 +609,10 @@ private:
         FmhaParams const& p) const;
     [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p) const;
     /// Generation bytes of the trtllm-gen, fmha_v2 and FlashMLA kernels: the buffers they
-    /// share, then the \p kernelWorkspaceSize bytes of the calling library's own buffers.
-    [[nodiscard]] size_t getGenerationWorkspaceSize(FmhaParams const& p, size_t kernelWorkspaceSize) const noexcept;
+    /// share, optional trtllm-gen multi-CTA scratch, then the \p kernelWorkspaceSize bytes of
+    /// the calling library's own buffers.
+    [[nodiscard]] size_t getGenerationWorkspaceSize(
+        FmhaParams const& p, size_t kernelWorkspaceSize, bool needsMultiCtasKvScratch) const noexcept;
 
     /// The FP8 output scale, which only FP8 context FMHA quantizes the output with.
     [[nodiscard]] float* getOutQuantScale(FmhaParams const& p) const

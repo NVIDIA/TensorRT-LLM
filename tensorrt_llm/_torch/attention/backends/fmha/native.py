@@ -27,11 +27,13 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._utils import is_sm_120f
 
 from .interface import FmhaPhase
-from .phased import FmhaParams, PhasedFmha
+from .phased import FmhaParams, PhasedFmha, _host_max
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 class NativeFmha(PhasedFmha):
@@ -51,11 +53,12 @@ class NativeFmha(PhasedFmha):
     op_is_supported: ClassVar[Callable[[FmhaParams, bool], bool]]
 
     @classmethod
-    def _is_available(cls, attn: "AttentionLayer") -> bool:
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
         is_mla = attn.is_mla_enable
         if not (cls.serves(is_mla, is_gen=False) or cls.serves(is_mla, is_gen=True)):
             return False
-        if getattr(attn.sparse_params, "algorithm", None) in ("deepseek_v4", "dsa"):
+        sparse_params = getattr(attn, "sparse_params", None)
+        if getattr(sparse_params, "algorithm", None) in ("deepseek_v4", "dsa"):
             if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla" or is_sm_120f():
                 return False
         return True
@@ -106,8 +109,8 @@ class NativeFmha(PhasedFmha):
                 forward_args,
                 workspace,
                 0,
-                max_q_len=int(metadata.prompt_lens_cpu_runtime[:num_contexts].max()),
-                max_kv_len=int(metadata.kv_lens_runtime[:num_contexts].max()),
+                max_q_len=_host_max(metadata.prompt_lens_cpu_runtime, 0, num_contexts),
+                max_kv_len=_host_max(metadata.kv_lens_runtime, 0, num_contexts),
                 num_gen_tokens=phase_num_gen_tokens,
             )
             if not self.is_phase_supported(params, False):

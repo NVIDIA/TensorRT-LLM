@@ -777,6 +777,37 @@ def test_xqa_without_perf_gain_yields_only_to_a_later_serving_library(
             assert selected is libs[expected]
 
 
+def test_declined_xqa_does_not_mark_selection_perf_gain_dependent() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    xqa = FakePhasedFmha(attn, set(), "xqa", events)
+    perf_gain_calls = 0
+
+    def fail_if_called(*_args: object) -> bool:
+        nonlocal perf_gain_calls
+        perf_gain_calls += 1
+        return False
+
+    xqa.has_perf_gain = fail_if_called
+    mmha = FakePhasedFmha(attn, {None, FmhaPhase.GENERATION}, "mmha", events)
+    manager.fmha_libs = [xqa, mmha]
+    manager._xqa = xqa
+    metadata = _make_metadata(num_contexts=0, num_generations=1)
+    metadata.beam_width = 2
+    metadata.effective_beam_width = 2
+    metadata.kv_lens_runtime = torch.tensor([16], dtype=torch.int32)
+    metadata.max_seq_len = 64
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for _ in range(2):
+            assert (
+                manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
+                is mmha
+            )
+    assert perf_gain_calls == 0
+
+
 def test_fmha_cache_tracks_lora_output_representation() -> None:
     for lora_first in (True, False):
         events: list[tuple] = []

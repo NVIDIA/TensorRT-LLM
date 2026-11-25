@@ -14,18 +14,28 @@
 # limitations under the License.
 """The FlashMLA FMHA library of the native attention op."""
 
+from typing import TYPE_CHECKING
+
 import torch
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
 from .native import NativeFmha
 from .phased import FmhaParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 
 class FlashMlaFmha(NativeFmha):
     """FlashMLA generation kernels (SM90, 64-token pages, 576-wide latent heads)."""
 
     op_is_supported = staticmethod(thop.flash_mla_is_supported)
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        return get_sm_version() == 90 and attn.head_dim == 576 and super()._is_available(attn)
 
     @torch.compiler.disable
     def run_mla_generation(self, params: FmhaParams) -> None:

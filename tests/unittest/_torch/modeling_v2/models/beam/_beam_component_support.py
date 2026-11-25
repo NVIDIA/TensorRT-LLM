@@ -27,11 +27,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, NoReturn
 
-import pytest
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
-
-from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 
 if TYPE_CHECKING:
     __extra_import_path__ = ["~/tests/integration/defs"]
@@ -280,31 +277,6 @@ def cheap_weights(
 
 
 # -------------------------------------------------- op-path instrumentation
-
-
-def attention_core_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
-    """Log every attention core call: the cache slot, geometry and window it ran with and its
-    packed q|k|v."""
-    calls: list[dict] = []
-    core = _attention.attention_core
-
-    def logged(qkv, md, *, layer, fmha_manager, window):
-        out = core(qkv, md, layer=layer, fmha_manager=fmha_manager, window=window)
-        calls.append(
-            {
-                "local_layer_idx": layer.local_layer_idx,
-                "num_heads": layer.num_heads,
-                "num_kv_heads": layer.num_kv_heads,
-                "head_size": layer.head_dim,
-                "attention_window_size": window,
-                "q_shape": list(qkv.shape),
-                "qkv": qkv,
-            }
-        )
-        return out
-
-    monkeypatch.setattr(_attention, "attention_core", logged)
-    return calls
 
 
 @contextlib.contextmanager

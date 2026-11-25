@@ -41,13 +41,16 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs, AttentionMetadata
+from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2._router_index import disable_v2_by_default
+from tensorrt_llm._torch.modeling_v2._router_index import (
+    disable_v2_by_default,
+    step_contract_enabled,
+)
 from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import fused_qk_norm_rope
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import (
     RESIDUAL_RMS_NORM,
@@ -75,6 +78,61 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm._utils import mpi_disabled
 
 from . import weights as _weights
+
+_CALL_CONSTANTS = dict(
+    output_sf=None,
+    k=None,
+    v=None,
+    is_fused_qkv=True,
+    update_kv_cache=True,
+    predicted_tokens_per_seq=1,
+    attention_input_type=0,
+    is_mla_enable=False,
+    mask_type=1,
+    q_scaling=1.0,
+    quant_mode=0,
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    # In-kernel RoPE is disabled here; the rope_* values below are inert placeholders, not this model's rope config.
+    position_embedding_type=0,
+    rotary_inv_freq=None,
+    rotary_cos_sin=None,
+    rope_dim=0,
+    rope_base=10000.0,
+    rope_scale_type=0,
+    rope_scale=1.0,
+    rope_short_m_scale=1.0,
+    rope_long_m_scale=1.0,
+    rope_max_positions=1024,
+    rope_original_max_positions=1024,
+    out_scale=None,
+    latent_cache=None,
+    q_pe=None,
+    q_lora_rank=None,
+    kv_lora_rank=None,
+    qk_nope_head_dim=None,
+    qk_rope_head_dim=None,
+    v_head_dim=None,
+    rope_append=None,
+    chunked_prefill_buffer_batch_size=1,
+    attention_chunk_size=None,
+    softmax_stats_tensor=None,
+    sparse_kv_indices=None,
+    sparse_kv_offsets=None,
+    sparse_attn_indices=None,
+    sparse_attn_offsets=None,
+    sparse_attn_indices_block_size=0,
+    mrope_rotary_cos_sin=None,
+    mrope_position_deltas=None,
+    helix_position_offsets=None,
+    helix_is_inactive_rank=None,
+    cross_kv=None,
+    relative_attention_bias=None,
+    relative_attention_max_distance=0,
+    kv_norm_weight=None,
+    kv_norm_eps=1e-6,
+    skip_correction_threshold=0.0,
+)
 
 _FC1_K_ALIGN = _weights.FC1_K_ALIGN
 
@@ -147,47 +205,6 @@ def _layer_views(w, num_layers: int, attn_tp_rank: int) -> list[_LayerWeights]:
         )
         for i in range(num_layers)
     ]
-
-
-def _attention_layers(cfg: PretrainedConfig, d) -> list[AttentionLayer]:
-    """One layer per decoder layer; RoPE is applied before attention and the pool is bf16."""
-    return [
-        AttentionLayer(
-            layer_idx=i,
-            num_heads=d.heads_q,
-            head_dim=cfg.head_dim,
-            num_kv_heads=d.heads_kv,
-            local_layer_idx=i,
-        )
-        for i in range(cfg.num_hidden_layers)
-    ]
-
-
-def _attend(
-    layer: AttentionLayer,
-    fmha_manager: FmhaManager,
-    qkv: torch.Tensor,
-    output: torch.Tensor,
-    md: TrtllmAttentionMetadata,
-    sinks: torch.Tensor,
-    window: int,
-) -> torch.Tensor:
-    """Append this step's fused QKV to the pool and attend causally over it into ``output``."""
-    fwd = AttentionForwardArgs(
-        output=output,
-        attention_sinks=sinks,
-        attention_window_size=window,
-        cu_q_seqlens=md.cu_q_seqlens,
-        cu_kv_seqlens=md.cu_kv_seqlens,
-        is_fused_qkv=True,
-    )
-    fmha = fmha_manager.select(layer, qkv, None, None, md, fwd)
-    if fmha is None:
-        raise RuntimeError("No FMHA library supports this gpt-oss attention call.")
-    if md.is_cuda_graph or not fmha.supports_workspace_reclamation:
-        md.workspace_reclaimable = False
-    fmha.forward(qkv, None, None, md, fwd)
-    return output
 
 
 def _residual_norm(core: "GptOssDefaultModelingV2") -> ResidualNorm:
@@ -408,6 +425,10 @@ class PrefillTarget:
         MoE block the forward calls.
         """
         self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         cfg = core.model_config.pretrained_config
         d = core.dims
         w = core.w
@@ -421,8 +442,6 @@ class PrefillTarget:
 
         self._norm0 = w["l0_norm1"]
         self._layers = _layer_views(w, cfg.num_hidden_layers, d.attn_tp_rank)
-        self._attn = _attention_layers(cfg, d)
-        self._fmha = [FmhaManager(layer) for layer in self._attn]
         # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
         # the values are unused.
         self._no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
@@ -489,6 +508,64 @@ class PrefillTarget:
         moe_pad = reducescatter(moe_all, None, group, pg)
         return moe_pad if not pad_rows else moe_pad[:num_tokens]
 
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets=get_spec_decoding_position_offsets(md),
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -504,6 +581,11 @@ class PrefillTarget:
         eps = cfg.rms_norm_eps
         head_dim = cfg.head_dim
 
+        self._check_step_contract(attn_metadata)
+        step = self.step_args(attn_metadata)
+        # Full-attention layers take the no-window value; sliding layers take the checkpoint's
+        # window. Both are host-derived per-capture constants.
+        full_window = attn_metadata.max_seq_len
         no_qk_norm = self._no_qk_norm
 
         pos = torch.reshape(position_ids, [-1])
@@ -539,14 +621,17 @@ class PrefillTarget:
                 attention_factor=self._yarn_attn_factor,
                 is_qk_norm=False,
             )
-            attn_out = _attend(
-                self._attn[i],
-                self._fmha[i],
-                qkv,
-                attn_out,
-                attn_metadata,
-                L.sinks,
-                core.window if core.sliding[i] else attn_metadata.max_seq_len,
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=i,
+                num_heads=d.heads_q,
+                num_kv_heads=d.heads_kv,
+                head_size=head_dim,
+                attention_sinks=L.sinks,
+                attention_window_size=core.window if core.sliding[i] else full_window,
+                **step,
+                **_CALL_CONSTANTS,
             )
             o = cublas_mm(attn_out, L.o, L.o_bias)
             o, residual = self._residual_norm(o, residual, L.norm2)
@@ -575,6 +660,10 @@ class DecodeTarget:
         MoE block the forward calls.
         """
         self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
+        # forward. Each target owns its own flag: the two `step_args` projections differ,
+        # so probing one does not prove the other's fields exist.
+        self._contract_pending = step_contract_enabled()
         cfg = core.model_config.pretrained_config
         d = core.dims
         w = core.w
@@ -588,8 +677,6 @@ class DecodeTarget:
 
         self._norm0 = w["l0_norm1"]
         self._layers = _layer_views(w, cfg.num_hidden_layers, d.attn_tp_rank)
-        self._attn = _attention_layers(cfg, d)
-        self._fmha = [FmhaManager(layer) for layer in self._attn]
         # fused_qk_norm_rope requires valid q/k norm weight tensors even when is_qk_norm=False, where
         # the values are unused.
         self._no_qk_norm = torch.zeros(cfg.head_dim, dtype=dtype, device=device)
@@ -658,6 +745,64 @@ class DecodeTarget:
         moe_pad = reducescatter(moe_all, None, group, pg)
         return moe_pad if not pad_rows else moe_pad[:num_tokens]
 
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
+        the metadata fields this target consumes must exist (they are private trtllm
+        surface). Calling `step_args` is the check -- it reads every field this target
+        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
+        checked is fixed at engine construction, so once per target instance is sound,
+        and it is off in a served engine."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """Project the prepared metadata onto thop_attention's explicit batch state, once per forward."""
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets=get_spec_decoding_position_offsets(md),
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -673,6 +818,11 @@ class DecodeTarget:
         eps = cfg.rms_norm_eps
         head_dim = cfg.head_dim
 
+        self._check_step_contract(attn_metadata)
+        step = self.step_args(attn_metadata)
+        # Full-attention layers take the no-window value; sliding layers take the checkpoint's
+        # window. Both are host-derived per-capture constants.
+        full_window = attn_metadata.max_seq_len
         no_qk_norm = self._no_qk_norm
 
         pos = torch.reshape(position_ids, [-1])
@@ -708,14 +858,17 @@ class DecodeTarget:
                 attention_factor=self._yarn_attn_factor,
                 is_qk_norm=False,
             )
-            attn_out = _attend(
-                self._attn[i],
-                self._fmha[i],
-                qkv,
-                attn_out,
-                attn_metadata,
-                L.sinks,
-                core.window if core.sliding[i] else attn_metadata.max_seq_len,
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                local_layer_idx=i,
+                num_heads=d.heads_q,
+                num_kv_heads=d.heads_kv,
+                head_size=head_dim,
+                attention_sinks=L.sinks,
+                attention_window_size=core.window if core.sliding[i] else full_window,
+                **step,
+                **_CALL_CONSTANTS,
             )
             o = cublas_mm(attn_out, L.o, L.o_bias)
             o, residual = self._residual_norm(o, residual, L.norm2)

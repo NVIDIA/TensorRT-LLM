@@ -32,8 +32,10 @@ from tensorrt_llm._utils import get_sm_version
 from .interface import Fmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 @dataclass(slots=True)
@@ -47,7 +49,7 @@ class FmhaParams:
     whole-batch and native accessors apply ``seq_offset`` / ``token_offset``.
     """
 
-    attn: "AttentionLayer"
+    attn: "TrtllmAttention"
     meta: "TrtllmAttentionMetadata"
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
@@ -154,7 +156,7 @@ class PhasedFmha(Fmha):
     # Required by backends that construct tensor views over the KV pool.
     NEEDS_BLOCK_EXTENT = True
 
-    def __init__(self, attn: "AttentionLayer"):
+    def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self.kv_factor = 1 if attn.is_mla_enable else 2
         self.generation_out_head_size = attn.out_head_size(is_gen_only=True)

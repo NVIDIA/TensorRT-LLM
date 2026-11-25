@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
-from typing_extensions import deprecated
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -42,7 +41,7 @@ from .unfused import UnfusedFmha
 from .xqa import XqaFmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    pass
 
 
 _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardArgs))
@@ -109,60 +108,26 @@ class _FlatAttention(SimpleNamespace):
 class FallbackFmha(NativeFmha):
     """The native libraries as one library: each phase call runs the first that serves it.
 
-    The order is the native op's own priority for the layer's attention variant.
+    Selection happens inside C++ in a single nanobind call per phase, in the native op's
+    priority order for the layer's attention variant.
     """
 
     supports_variable_window = True
-
-    def __init__(self, attn: "TrtllmAttention"):
-        super().__init__(attn)
-        libraries = _MLA_LIBRARIES if attn.is_mla_enable else _MHA_LIBRARIES
-        self._libraries = tuple(library(attn) for library in libraries)
-
-    def _first_library(self, params: FmhaParams, is_gen: bool) -> Optional[NativeFmha]:
-        """The first native library that serves this phase call, or None.
-
-        XQA without an expected perf gain yields to a later library that serves the call.
-        """
-        is_mla = params.attn.is_mla_enable
-        xqa_without_gain = None
-        for library in self._libraries:
-            if not (library.serves(is_mla, is_gen) and library.op_is_supported(params, is_gen)):
-                continue
-            if isinstance(library, XqaFmha) and not thop.xqa_has_perf_gain(params):
-                xqa_without_gain = library
-                continue
-            return library
-        return xqa_without_gain
-
-    def is_phase_supported(self, params: FmhaParams, is_gen: bool) -> bool:
-        return self._first_library(params, is_gen) is not None
+    op_is_supported = staticmethod(thop.fallback_is_supported)
 
     # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
     @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
-        library = self._first_library(params, False)
-        if library is None:
-            raise RuntimeError("No native FMHA library supports this context call.")
-        (library.run_mla_context if params.attn.is_mla_enable else library.run_context)(params)
+        thop.run_context(params)
 
     @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
-        library = self._first_library(params, True)
-        if library is None:
-            raise RuntimeError("No native FMHA library supports this generation call.")
-        (library.run_mla_generation if params.attn.is_mla_enable else library.run_generation)(
-            params
-        )
+        thop.run_generation(params)
 
     run_mla_context = run_context
     run_mla_generation = run_generation
 
     @classmethod
-    @deprecated(
-        "FallbackFmha.attention is deprecated and will be removed; run attention through "
-        "TrtllmAttention instead."
-    )
     def attention(
         cls,
         q: torch.Tensor,
@@ -284,8 +249,6 @@ class FallbackFmha(NativeFmha):
         uses_spcompress: Optional[bool] = None,
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.
-
-        Deprecated: this entry point will be removed; run attention through TrtllmAttention.
 
         Builds native FMHA parameters and runs each phase on the first native
         library that serves it. Direct callers supply the flat attention
@@ -410,8 +373,6 @@ class FallbackFmha(NativeFmha):
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size or 1,
         )
 
-        fallback = cls(attn)
-
         def phase_params(token_lo: int, token_hi: int, seq_lo: int, seq_hi: int) -> FmhaParams:
             return FmhaParams(
                 attn=attn,
@@ -467,7 +428,7 @@ class FallbackFmha(NativeFmha):
             params.max_past_kv_length = max_past_kv_len
             # The context call reserves the generation phase's workspace as well.
             params.num_gen_tokens = num_gen_tokens if has_generation else 0
-            fallback.run_context(params)
+            thop.run_context(params)
 
         if has_generation:
             params = phase_params(num_ctx_tokens, num_tokens, num_contexts, total_seqs)
@@ -479,7 +440,7 @@ class FallbackFmha(NativeFmha):
             )
             params.num_requests = num_generations // effective_beam_width
             params.num_gen_tokens = num_gen_tokens
-            fallback.run_generation(params)
+            thop.run_generation(params)
 
 
 # The libraries that run in the native attention op.

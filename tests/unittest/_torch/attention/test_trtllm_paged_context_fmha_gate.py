@@ -109,6 +109,12 @@ def test_paged_context_without_fused_kernel_is_declined():
     ) as batch:
         assert not _is_supported(FallbackFmha, batch)
         assert not _is_supported(UnfusedFmha, batch)
+        attn, metadata, qkv = batch
+        with pytest.raises(
+            RuntimeError,
+            match="chunked_prefill requires a fused paged-context FMHA kernel",
+        ):
+            attn.forward(qkv, None, None, metadata)
 
 
 @_NEEDS_GPU

@@ -1030,9 +1030,20 @@ bool MHA::isSeparateQAndKvInput() const
 
 bool MHA::supportsNvFp4Output(bool useTrtllmGen, bool useFmhaV2, bool useXqa)
 {
-    initPhase(/*isGen=*/false);
-    initPhase(/*isGen=*/true);
     bool const trtllmGen = useTrtllmGen && mTrtllmGen != nullptr;
+    if (trtllmGen)
+    {
+        ensureFmhaInitialized(*mTrtllmGen, /*isGen=*/false);
+        ensureFmhaInitialized(*mTrtllmGen, /*isGen=*/true);
+    }
+    if (useFmhaV2 && mFmhaV2 != nullptr)
+    {
+        ensureFmhaInitialized(*mFmhaV2, /*isGen=*/false);
+    }
+    if (useXqa && mXqa != nullptr)
+    {
+        ensureFmhaInitialized(*mXqa, /*isGen=*/true);
+    }
     bool const fusedContextKernel = (trtllmGen && mTrtllmGen->hasKernels(/*isGen=*/false))
         || (useFmhaV2 && mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false));
     bool const fp4GenerationKernel = (trtllmGen && mTrtllmGen->hasKernels(/*isGen=*/true))
@@ -1042,10 +1053,20 @@ bool MHA::supportsNvFp4Output(bool useTrtllmGen, bool useFmhaV2, bool useXqa)
 
 bool MHA::supportsVariableWindow(bool useTrtllmGen, bool useFmhaV2)
 {
-    initPhase(/*isGen=*/false);
-    return use_variable_window
-        && ((useTrtllmGen && mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/false))
-            || (useFmhaV2 && mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false)));
+    if (!use_variable_window)
+    {
+        return false;
+    }
+    if (useTrtllmGen && mTrtllmGen != nullptr)
+    {
+        ensureFmhaInitialized(*mTrtllmGen, /*isGen=*/false);
+    }
+    if (useFmhaV2 && mFmhaV2 != nullptr)
+    {
+        ensureFmhaInitialized(*mFmhaV2, /*isGen=*/false);
+    }
+    return (useTrtllmGen && mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/false))
+        || (useFmhaV2 && mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false));
 }
 
 void MHA::prepareInputs(FmhaParams& p, bool isGen)
@@ -1077,10 +1098,6 @@ void MHA::prepareInputs(FmhaParams& p, bool isGen)
         TORCH_CHECK(p.num_tokens % p.batch_size == 0,
             "seq_len should be same for all generation requests, num_tokens=", p.num_tokens,
             ", num_seqs=", p.batch_size);
-        if (mXqa)
-        {
-            mXqa->prepareGeneration(*this, p);
-        }
     }
 
     if (p.fwd.softmax_stats_tensor.has_value())
@@ -1639,7 +1656,8 @@ size_t MLA::getWorkspaceSizeForContext(FmhaParams const& p) const
     return p.num_tokens == 0 ? 0 : contextWorkspaceLayout(p).totalSize;
 }
 
-size_t MLA::getGenerationWorkspaceSize(FmhaParams const& p, size_t kernelWorkspaceSize) const noexcept
+size_t MLA::getGenerationWorkspaceSize(
+    FmhaParams const& p, size_t kernelWorkspaceSize, bool needsMultiCtasKvScratch) const noexcept
 {
     // Sized per sequence (max_num_requests * beam_width) from the batch bound, not from this
     // call's rows, so a context call sizing a mixed batch and the following generation call
@@ -1653,8 +1671,9 @@ size_t MLA::getGenerationWorkspaceSize(FmhaParams const& p, size_t kernelWorkspa
 
     size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
     size_t const fmha_scheduler_counter = sizeof(uint32_t);
-    size_t const fmha_multi_ctas_kv_scratch_size
-        = TrtllmGenFmha<MLA>::getMultiCtasKvScratchSize(mMLAParams.kv_lora_rank, mMultiProcessorCount);
+    size_t const fmha_multi_ctas_kv_scratch_size = needsMultiCtasKvScratch
+        ? TrtllmGenFmha<MLA>::getMultiCtasKvScratchSize(mMLAParams.kv_lora_rank, mMultiProcessorCount)
+        : 0;
 
     int const NUM_BUFFERS = 5;
     size_t workspaces[NUM_BUFFERS];

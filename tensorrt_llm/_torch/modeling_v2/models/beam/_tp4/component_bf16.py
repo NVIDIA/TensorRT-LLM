@@ -157,12 +157,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.head_dim = config["head_dim"]
         self.local_heads = config["num_attention_heads"] // WORLD_SIZE
         self.local_kv_heads = config["num_key_value_heads"] // WORLD_SIZE
-        self._attn = {
-            layer: _attention.attention_layer(
-                layer, self.local_heads, self.local_kv_heads, self.head_dim
-            )
-            for layer in self.layers
-        }
         self.eps = config["rms_norm_eps"]
         self.window = config["sliding_window"]
         self.rope_theta = config["rope_parameters"]["sliding_attention"]["rope_theta"]
@@ -454,14 +448,12 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 num_kv_heads=self.local_kv_heads,
                 head_dim=self.head_dim,
             )
-        attn_layer, fmha_manager = self._attn[layer]
+        step = _attention.step_args(md, layer)
         sliding = self.schedule.is_sliding(layer)
         part = _attention.attention(
             h,
             positions,
-            md,
-            layer=attn_layer,
-            fmha_manager=fmha_manager,
+            step,
             q_proj=self._layer(layer, "self_attn.q_proj.weight"),
             k_proj=self._layer(layer, "self_attn.k_proj.weight"),
             v_proj=self._layer(layer, "self_attn.v_proj.weight"),
@@ -470,9 +462,12 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             q_norm=self._layer(layer, "self_attn.q_norm.weight"),
             k_norm=self._layer(layer, "self_attn.k_norm.weight"),
             gate_bias=self._layer(layer, "self_attn.gate_bias"),
+            num_heads=self.local_heads,
+            num_kv_heads=self.local_kv_heads,
+            head_dim=self.head_dim,
             eps=self.eps,
             rope_theta=self.rope_theta if sliding else None,
-            window=self.window if sliding else md.max_seq_len,
+            window=self.window if sliding else step["max_seq_len"],
         )
         out = self.all_reduce(part)
         return out

@@ -634,14 +634,14 @@ int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads)
     return roundUp<int32_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * group_size * headSize, 128);
 }
 
-std::size_t xqaKernelWorkspaceSize(int headSize, int numQHeads, int numKvHeads, bool isMLA, int max_num_tokens)
+std::size_t xqaKernelWorkspaceSize(int headSize, int numQHeads, int numKvHeads, bool isMLA, int maxNumTokens)
 {
     // buffer for RoPE / output quantization.
-    constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
-    size_t workspace_size = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * headSize * numQHeads * max_num_tokens, 128); // rope
+    constexpr size_t kXqaOutElemSize = 2; // fp16 or bf16.
+    size_t workspace_size = roundUp<size_t>(kXqaOutElemSize * headSize * numQHeads * maxNumTokens, 128); // rope
     // output conversion.
-    workspace_size = roundUp<size_t>(workspace_size + kXQA_OUT_ELEM_SIZE * headSize * numQHeads * max_num_tokens, 128);
-    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * max_num_tokens;
+    workspace_size = roundUp<size_t>(workspace_size + kXqaOutElemSize * headSize * numQHeads * maxNumTokens, 128);
+    workspace_size = roundUp<size_t>(workspace_size, 128) + xqaMlaCgaXBufSize * maxNumTokens;
     size_t workspaces[4];
     size_t const nbSubSeq = getXqaMaxNumSubSeq(isMLA);
     size_t const nbSeq = nbSubSeq / 2;
@@ -708,7 +708,7 @@ bool TrtllmGenFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGe
     }
     else
     {
-        auto const& key = this->attention;
+        auto const& key = this->mAttention;
         return isTrtllmGenGenerationUsable(p, key.cross_attention, key.use_kv_cache,
             static_cast<int>(key.tokens_per_block), key.mNumAttnHeads, key.mNumAttnKVHeads);
     }
@@ -874,7 +874,7 @@ std::size_t TrtllmGenFmha<AttentionVariant>::getWorkspaceSize(
     }
     else
     {
-        return op.getGenerationWorkspaceSize(p, /*kernelWorkspaceSize=*/0);
+        return op.getGenerationWorkspaceSize(p, /*kernelWorkspaceSize=*/0, /*needsMultiCtasKvScratch=*/true);
     }
 }
 
@@ -981,7 +981,7 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
     tllmRunnerParams.mScaleQ = mContextParams.qScaling;
     // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
     tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-    tllmRunnerParams.mMultiProcessorCount = this->attention.getMultiProcessorCount();
+    tllmRunnerParams.mMultiProcessorCount = this->mAttention.getMultiProcessorCount();
     tllmRunnerParams.mSfStartTokenIdx = 0;
     // SageAttention scaling factors.
     tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;
@@ -1641,9 +1641,6 @@ void FmhaV2Fmha<AttentionVariant>::initGeneration(AttentionVariant const& op)
         mGenerationRunner = std::make_unique<FusedMHARunnerV2>(fmhaParams);
         if (!mGenerationRunner->isFmhaSupported())
         {
-            // FlashMLA serves the generation configs FMHA-v2 has no kernel for.
-            TLLM_CHECK_WITH_INFO(
-                FlashMlaFmha::isAvailable(op), "Deepseek should be supported by fmha in generation part.");
             mGenerationRunner.reset();
         }
     }
@@ -1661,7 +1658,7 @@ std::size_t FmhaV2Fmha<AttentionVariant>::getWorkspaceSize(
     {
         if (mGenerationRunner != nullptr)
         {
-            return op.getGenerationWorkspaceSize(p, /*kernelWorkspaceSize=*/0);
+            return op.getGenerationWorkspaceSize(p, /*kernelWorkspaceSize=*/0, /*needsMultiCtasKvScratch=*/false);
         }
     }
     return 0;
@@ -1870,7 +1867,7 @@ bool XqaFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) con
     {
         return false;
     }
-    auto const& op = static_cast<AttentionVariant const&>(this->attention);
+    auto const& op = this->mAttention;
     bool usable = false;
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>)
@@ -1889,6 +1886,10 @@ bool XqaFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) con
             return false;
         }
     }
+    if (usable && c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None)
+    {
+        dispatchOnDtype(p.getQueryInput().scalar_type(), [&]<typename T>(std::type_identity<T>) { prepare<T>(op, p); });
+    }
     return usable;
 }
 
@@ -1899,7 +1900,7 @@ bool XqaFmha<AttentionVariant>::hasPerfGain(FmhaParams const& p) const
     {
         return false;
     }
-    auto const& op = static_cast<AttentionVariant const&>(this->attention);
+    auto const& op = this->mAttention;
     bool gain = false;
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>)
@@ -1980,7 +1981,7 @@ std::size_t XqaFmha<AttentionVariant>::getWorkspaceSize(
 
 template <typename AttentionVariant>
 template <typename T>
-void XqaFmha<AttentionVariant>::prepare(AttentionVariant const& op, FmhaParams const& p)
+void XqaFmha<AttentionVariant>::prepare(AttentionVariant const& op, FmhaParams const& p) const
 {
     // Batch size and window extents do not specialize XQA cubins. Only prepare
     // again for a new execution mode or a beam width beyond the covered range.
@@ -1997,20 +1998,11 @@ void XqaFmha<AttentionVariant>::prepare(AttentionVariant const& op, FmhaParams c
         if (fillParams<T>(op, p, params, /*forConfigurePlugin=*/true)
             && mRunner->shouldUse(params, /*forConfigurePlugin=*/true))
         {
+            AttentionVariant::checkNotCapturing("XQA kernel compilation");
             mRunner->prepare(params);
         }
         preparedBeamWidth = p.meta.effective_beam_width;
     }
-}
-
-template <typename AttentionVariant>
-void XqaFmha<AttentionVariant>::prepareGeneration(AttentionVariant const& op, FmhaParams const& p)
-{
-    if (mRunner == nullptr)
-    {
-        return;
-    }
-    dispatchOnDtype(p.getQueryInput().scalar_type(), [&]<typename T>(std::type_identity<T>) { prepare<T>(op, p); });
 }
 
 template <typename AttentionVariant>
@@ -2086,8 +2078,9 @@ std::size_t FlashMlaFmha::getWorkspaceSize(MLA const& op, FmhaParams const& p, b
     flashMlaWorkspaceSizes.softmaxLse = sizeof(float) * (batch_beam * s_q * num_q_heads);
     flashMlaWorkspaceSizes.softmaxLseAccum = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q);
     flashMlaWorkspaceSizes.outAccum = sizeof(float) * ((batch_beam + num_sm_parts) * num_q_heads * s_q * head_size_v);
-    return op.getGenerationWorkspaceSize(
-        p, AttentionWorkspaceManager::buildFlashMlaLayout(flashMlaWorkspaceSizes).totalSize);
+    return op.getGenerationWorkspaceSize(p,
+        AttentionWorkspaceManager::buildFlashMlaLayout(flashMlaWorkspaceSizes).totalSize,
+        /*needsMultiCtasKvScratch=*/false);
 }
 
 void FlashMlaFmha::runGeneration(MLA const& op, FmhaParams const& p, cudaStream_t stream)
@@ -2247,7 +2240,7 @@ bool MmhaFmha::isSupported(FmhaParams const& p, bool isGen) const
     {
         return false;
     }
-    auto const& op = static_cast<MHA const&>(this->attention);
+    auto const& op = this->mAttention;
     if (op.template feature<torch_ext::SpecDecodingFeature>().active() || op.is_fp4_out
         || op.quant_mode.hasFp4KvCache())
     {
@@ -2476,7 +2469,7 @@ bool UnfusedFmha::isSupported(FmhaParams const& p, bool isGen) const
         TLLM_LOG_WARNING("Unfused attention declines this call: %s", reason);
         return false;
     };
-    auto const& op = this->attention;
+    auto const& op = this->mAttention;
     if (op.use_variable_window)
     {
         return decline("variable-window attention requires a supported context FMHA kernel configuration.");
@@ -2912,6 +2905,197 @@ void UnfusedFmha::runContextImpl(MHA const& op, FmhaParams const& p, cudaStream_
             p.batch_size, attention_seq_len_1, op.num_heads, op.getHeadSize(), workspaceViews.paddingOffset,
             (float*) nullptr, 0, stream);
     }
+}
+
+namespace
+{
+
+template <typename Op>
+Op& getOp(FmhaParams const& p)
+{
+    auto* cached = AttentionBase::getCached(AttentionBase::getCacheKey(p));
+    constexpr bool kExpectsMla = std::is_same_v<Op, MLA>;
+    TLLM_CHECK_WITH_INFO(
+        cached->isMLAEnabled() == kExpectsMla, "Cached attention op variant does not match the requested variant.");
+    return static_cast<Op&>(*cached);
+}
+
+template <auto MhaGetter, auto MlaGetter>
+bool isDualVariantSupported(FmhaParams& p, bool isGen)
+{
+    if (p.attn.is_mla_enable)
+    {
+        if (!MLA::checkParams(p, isGen))
+        {
+            return false;
+        }
+        auto& op = getOp<MLA>(p);
+        return op.isFmhaSupported((op.*MlaGetter)(), p, isGen);
+    }
+    if (!MHA::checkParams(p, isGen))
+    {
+        return false;
+    }
+    auto& op = getOp<MHA>(p);
+    return op.isFmhaSupported((op.*MhaGetter)(), p, isGen);
+}
+
+template <auto MhaGetter, auto MlaGetter>
+void runDualVariant(FmhaParams& p, bool isGen)
+{
+    if (p.attn.is_mla_enable)
+    {
+        auto& op = getOp<MLA>(p);
+        isGen ? op.runGeneration((op.*MlaGetter)(), p) : op.runContext((op.*MlaGetter)(), p);
+    }
+    else
+    {
+        auto& op = getOp<MHA>(p);
+        isGen ? op.runGeneration((op.*MhaGetter)(), p) : op.runContext((op.*MhaGetter)(), p);
+    }
+}
+
+} // namespace
+
+bool fallbackIsSupported(FmhaParams& p, bool isGen)
+{
+    if (p.attn.is_mla_enable)
+    {
+        return MLA::checkParams(p, isGen) && getOp<MLA>(p).selectFmha(p, isGen) != nullptr;
+    }
+    return MHA::checkParams(p, isGen) && getOp<MHA>(p).selectFmha(p, isGen) != nullptr;
+}
+
+void fallbackRunContext(FmhaParams& p)
+{
+    p.attn.is_mla_enable ? getOp<MLA>(p).runContext(p) : getOp<MHA>(p).runContext(p);
+}
+
+void fallbackRunGeneration(FmhaParams& p)
+{
+    p.attn.is_mla_enable ? getOp<MLA>(p).runGeneration(p) : getOp<MHA>(p).runGeneration(p);
+}
+
+bool trtllmGenIsSupported(FmhaParams& p, bool isGen)
+{
+    return isDualVariantSupported<&MHA::trtllmGen, &MLA::trtllmGen>(p, isGen);
+}
+
+void trtllmGenRunContext(FmhaParams& p)
+{
+    runDualVariant<&MHA::trtllmGen, &MLA::trtllmGen>(p, /*isGen=*/false);
+}
+
+void trtllmGenRunGeneration(FmhaParams& p)
+{
+    runDualVariant<&MHA::trtllmGen, &MLA::trtllmGen>(p, /*isGen=*/true);
+}
+
+bool fmhaV2IsSupported(FmhaParams& p, bool isGen)
+{
+    return isDualVariantSupported<&MHA::fmhaV2, &MLA::fmhaV2>(p, isGen);
+}
+
+void fmhaV2RunContext(FmhaParams& p)
+{
+    runDualVariant<&MHA::fmhaV2, &MLA::fmhaV2>(p, /*isGen=*/false);
+}
+
+void fmhaV2RunGeneration(FmhaParams& p)
+{
+    runDualVariant<&MHA::fmhaV2, &MLA::fmhaV2>(p, /*isGen=*/true);
+}
+
+bool xqaIsSupported(FmhaParams& p, bool isGen)
+{
+    return isDualVariantSupported<&MHA::xqa, &MLA::xqa>(p, isGen);
+}
+
+std::optional<bool> xqaHasPerfGain(FmhaParams& p)
+{
+    if (p.attn.is_mla_enable)
+    {
+        if (!MLA::checkParams(p, /*isGen=*/true))
+        {
+            return std::nullopt;
+        }
+        auto& op = getOp<MLA>(p);
+        if (op.xqa() == nullptr)
+        {
+            return std::nullopt;
+        }
+        op.preparePhase(p, /*isGen=*/true);
+        op.ensureFmhaInitialized(*op.xqa(), /*isGen=*/true);
+        return op.xqa()->hasPerfGain(p);
+    }
+    if (!MHA::checkParams(p, /*isGen=*/true))
+    {
+        return std::nullopt;
+    }
+    auto& op = getOp<MHA>(p);
+    if (op.xqa() == nullptr)
+    {
+        return std::nullopt;
+    }
+    op.preparePhase(p, /*isGen=*/true);
+    op.ensureFmhaInitialized(*op.xqa(), /*isGen=*/true);
+    return op.xqa()->hasPerfGain(p);
+}
+
+void xqaRunGeneration(FmhaParams& p)
+{
+    runDualVariant<&MHA::xqa, &MLA::xqa>(p, /*isGen=*/true);
+}
+
+bool flashMlaIsSupported(FmhaParams& p, bool isGen)
+{
+    if (!p.attn.is_mla_enable || !MLA::checkParams(p, isGen))
+    {
+        return false;
+    }
+    auto& op = getOp<MLA>(p);
+    return op.isFmhaSupported(op.flashMla(), p, isGen);
+}
+
+void flashMlaRunGeneration(FmhaParams& p)
+{
+    TLLM_CHECK_WITH_INFO(p.attn.is_mla_enable, "The FlashMLA FMHA library does not serve this attention variant.");
+    auto& op = getOp<MLA>(p);
+    op.runGeneration(op.flashMla(), p);
+}
+
+bool mmhaIsSupported(FmhaParams& p, bool isGen)
+{
+    if (p.attn.is_mla_enable || !MHA::checkParams(p, isGen))
+    {
+        return false;
+    }
+    auto& op = getOp<MHA>(p);
+    return op.isFmhaSupported(op.mmha(), p, isGen);
+}
+
+void mmhaRunGeneration(FmhaParams& p)
+{
+    TLLM_CHECK_WITH_INFO(!p.attn.is_mla_enable, "The MMHA FMHA library does not serve this attention variant.");
+    auto& op = getOp<MHA>(p);
+    op.runGeneration(op.mmha(), p);
+}
+
+bool unfusedIsSupported(FmhaParams& p, bool isGen)
+{
+    if (p.attn.is_mla_enable || !MHA::checkParams(p, isGen))
+    {
+        return false;
+    }
+    auto& op = getOp<MHA>(p);
+    return op.isFmhaSupported(op.unfused(), p, isGen);
+}
+
+void unfusedRunContext(FmhaParams& p)
+{
+    TLLM_CHECK_WITH_INFO(!p.attn.is_mla_enable, "The unfused FMHA library does not serve this attention variant.");
+    auto& op = getOp<MHA>(p);
+    op.runContext(op.unfused(), p);
 }
 
 template class TrtllmGenFmha<MHA>;

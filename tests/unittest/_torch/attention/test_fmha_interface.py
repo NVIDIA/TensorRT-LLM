@@ -367,3 +367,48 @@ def test_support_checks_capabilities_before_implementation(
                 hook.assert_called_once_with(q, k, v, metadata, forward_args, phase=None)
             else:
                 hook.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_variable_window_gate_allows_generation_phase() -> None:
+    attn = cast(TrtllmAttention, FakeAttention())
+    fmha = _MinimalFmha(attn)
+    q = torch.empty((2, 4))
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    forward_args = AttentionForwardArgs(
+        variable_window_token_starts=torch.zeros(1, dtype=torch.int32),
+        variable_window_token_ends=torch.zeros(1, dtype=torch.int32),
+    )
+
+    assert not fmha.is_supported(q, None, None, metadata, forward_args, phase=FmhaPhase.CONTEXT)
+    assert fmha.is_supported(q, None, None, metadata, forward_args, phase=FmhaPhase.GENERATION)
+    assert not FMHA_LIBS["fmha_v2"].supports_variable_window
+    assert not FMHA_LIBS["unfused"].supports_variable_window
+    assert FMHA_LIBS["trtllm_gen"].supports_variable_window
+
+
+@pytest.mark.cpu_only
+def test_native_libraries_filter_static_sm_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import flash_mla, fmha_v2, trtllm_gen, xqa
+
+    attn = FakeAttention()
+    attn.head_dim = 128
+    monkeypatch.setattr(trtllm_gen, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(fmha_v2, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(xqa, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(flash_mla, "get_sm_version", lambda: 100)
+    assert trtllm_gen.TrtllmGenFmha.is_available(cast(TrtllmAttention, attn))
+    assert not fmha_v2.FmhaV2Fmha.is_available(cast(TrtllmAttention, attn))
+    assert not xqa.XqaFmha.is_available(cast(TrtllmAttention, attn))
+    assert not flash_mla.FlashMlaFmha.is_available(cast(TrtllmAttention, attn))
+
+    attn.head_dim = 72
+    assert fmha_v2.FmhaV2Fmha.is_available(cast(TrtllmAttention, attn))
+
+    monkeypatch.setattr(trtllm_gen, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(fmha_v2, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(xqa, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(flash_mla, "get_sm_version", lambda: 90)
+    assert not trtllm_gen.TrtllmGenFmha.is_available(cast(TrtllmAttention, attn))
+    assert fmha_v2.FmhaV2Fmha.is_available(cast(TrtllmAttention, attn))
+    assert xqa.XqaFmha.is_available(cast(TrtllmAttention, attn))

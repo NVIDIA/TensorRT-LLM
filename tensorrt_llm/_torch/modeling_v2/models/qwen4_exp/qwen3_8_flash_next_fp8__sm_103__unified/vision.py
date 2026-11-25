@@ -16,13 +16,7 @@ from typing import NamedTuple
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    PredefinedAttentionMask,
-)
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.gelu_tanh import gelu_tanh
@@ -30,7 +24,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.norm.layer_norm import
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.vision.patch_embed_conv3d import (
     patch_embed_conv3d,
 )
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import prepare_encoder_attn_metadata
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
 from .ops.attention.vision_rope_2d_packed_qk import vision_rope_2d_packed_qk
@@ -50,6 +43,86 @@ VISION_CALL_MAX_PATCHES = 32768
 #: that is not (2x2).
 WARM_UP_GRIDS = (((1, 4, 4),), ((1, 2, 2),))
 
+#: `mask_type` 0: bidirectional within a batch segment (causal would depend on raster order).
+_VISION_MASK_PADDING = 0
+
+# `thop_attention`'s encoder-only mode, selected by omitting the KV cache pool arguments.
+# `update_kv_cache=False` is rejected, so it stays True.
+_VISION_CALL_CONSTANTS = dict(
+    k=None,
+    v=None,
+    output_sf=None,
+    kv_cache_block_offsets=None,
+    host_kv_cache_pool_pointers=None,
+    host_kv_cache_pool_mapping=None,
+    tokens_per_block=None,
+    use_paged_context_fmha=False,
+    is_fused_qkv=True,
+    update_kv_cache=True,
+    predicted_tokens_per_seq=1,
+    local_layer_idx=0,
+    max_context_q_len_override=None,
+    cache_indirection=None,
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    out_scale=None,
+    quant_mode=0,
+    beam_width=1,
+    mask_type=_VISION_MASK_PADDING,
+    q_scaling=1.0,
+    # Rotation is applied before the op (`vision_rope_2d_packed_qk`); rope_* inert.
+    position_embedding_type=0,
+    rotary_inv_freq=None,
+    rotary_cos_sin=None,
+    rope_dim=0,
+    rope_base=10000.0,
+    rope_scale_type=0,
+    rope_scale=1.0,
+    rope_short_m_scale=1.0,
+    rope_long_m_scale=1.0,
+    rope_max_positions=1024,
+    rope_original_max_positions=1024,
+    attention_input_type=0,
+    is_mla_enable=False,
+    chunked_prefill_buffer_batch_size=1,
+    attention_sinks=None,
+    block_ids_per_seq=None,
+    latent_cache=None,
+    q_pe=None,
+    q_lora_rank=None,
+    kv_lora_rank=None,
+    qk_nope_head_dim=None,
+    qk_rope_head_dim=None,
+    v_head_dim=None,
+    rope_append=None,
+    attention_chunk_size=None,
+    softmax_stats_tensor=None,
+    is_spec_decoding_enabled=False,
+    use_spec_decoding=False,
+    is_spec_dec_tree=False,
+    spec_decoding_generation_lengths=None,
+    spec_decoding_position_offsets=None,
+    spec_decoding_packed_mask=None,
+    spec_decoding_bl_tree_mask_offset=None,
+    spec_decoding_bl_tree_mask=None,
+    spec_bl_tree_first_sparse_mask_offset_kv=None,
+    sparse_kv_indices=None,
+    sparse_kv_offsets=None,
+    sparse_attn_indices=None,
+    sparse_attn_offsets=None,
+    sparse_attn_indices_block_size=0,
+    mrope_rotary_cos_sin=None,
+    mrope_position_deltas=None,
+    helix_position_offsets=None,
+    helix_is_inactive_rank=None,
+    is_cross=False,
+    cross_kv=None,
+    relative_attention_bias=None,
+    relative_attention_max_distance=0,
+    kv_norm_weight=None,
+    kv_norm_eps=1e-6,
+    skip_correction_threshold=0.0,
+)
 
 #: Per modality: the `multimodal_data` keys of the flat patch rows and the host `(t, h, w)` grid.
 MEDIA_KEYS = {
@@ -118,7 +191,7 @@ def _vision_views(w: dict, depth: int) -> _VisionWeights:
             _VisionBlockWeights(
                 n1_w=w[f"l{b}_vis_n1_w"],
                 n1_b=w[f"l{b}_vis_n1_b"],
-                # Row layout (q heads, k, v) is already the attention op's packed form.
+                # Row layout (q heads, k, v) is already thop_attention's packed form.
                 qkv=w[f"l{b}_vis_qkv_w"].t(),
                 qkv_b=w[f"l{b}_vis_qkv_b"],
                 proj=w[f"l{b}_vis_proj_w"].t(),
@@ -198,7 +271,7 @@ class VisionTower:
     """One request's images or videos through the 27-block ViT and its patch merger.
 
     Attention is bidirectional per frame (a video's frame group is a frame): one context
-    "sequence" per frame for the attention op. The position embedding and the 2-D rope emit in
+    "sequence" per frame for `thop_attention`. The position embedding and the 2-D rope emit in
     spatial-merge order, which the merger's 4-to-1 reshape needs; raster order gives a correctly
     shaped, silently wrong tower. Calls of at most `VISION_CALL_MAX_PATCHES` rows are cut only
     between frames: every op is per frame or per row, and merger blocks stay whole."""
@@ -219,29 +292,8 @@ class VisionTower:
         self.grid_side = math.isqrt(vcfg.num_position_embeddings)
         self.dtype = w["embed"].dtype
         self._w = _vision_views(w, self.depth)
-        # The tower's attention, built on its first call: one layer for every block (no KV
-        # cache, so none to address) and the encoder metadata its calls reuse.
-        self._attn: tuple[AttentionLayer, FmhaManager, TrtllmAttentionMetadata] | None = None
-
-    def _attention(
-        self, qkv: torch.Tensor, output: torch.Tensor, md: TrtllmAttentionMetadata
-    ) -> torch.Tensor:
-        """Packed `[q | k | v]` rows -> attention over each frame's rows (padding mask), into
-        `output`. The rotation is applied before the call."""
-        layer, fmha_manager, _ = self._attn
-        fwd = AttentionForwardArgs(
-            output=output,
-            attention_mask=PredefinedAttentionMask.FULL,
-            attention_window_size=md.max_seq_len,
-            cu_q_seqlens=md.cu_q_seqlens,
-            cu_kv_seqlens=md.cu_kv_seqlens,
-            is_fused_qkv=True,
-        )
-        fmha = fmha_manager.select(layer, qkv, None, None, md, fwd)
-        if fmha is None:
-            raise RuntimeError("No FMHA library supports this vision tower attention call.")
-        fmha.forward(qkv, None, None, md, fwd)
-        return output
+        # Persistent scratch `thop_attention` grows in place; not the engine's own workspace.
+        self._ws: torch.Tensor | None = None
 
     def warm_up(self) -> None:
         """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
@@ -301,18 +353,15 @@ class VisionTower:
         for frames, height, width in grid:
             seg_lens.extend([height * width] * frames)
         num_patches = pixel_values.shape[0]
+        num_segments = len(seg_lens)
         max_seg = max(seg_lens)
 
-        # The encoder-only attention's batch: one bidirectional context sequence per frame.
-        if self._attn is None:
-            layer = AttentionLayer(layer_idx=0, num_heads=self.heads, head_dim=self.head_dim)
-            md = TrtllmAttentionMetadata(
-                max_num_requests=VISION_CALL_MAX_PATCHES,
-                max_num_tokens=VISION_CALL_MAX_PATCHES,
-                kv_cache_manager=None,
-            )
-            self._attn = (layer, FmhaManager(layer), md)
-        md = prepare_encoder_attn_metadata(seg_lens, self._attn[2], max_seq_len=max_seg)
+        host_lens = torch.tensor(seg_lens, dtype=torch.int32)
+        host_types = torch.zeros([num_segments], dtype=torch.int32)
+        host_total = torch.tensor([num_patches, 0], dtype=torch.int32)
+        dev_lens = host_lens.to(dev)
+        if self._ws is None:
+            self._ws = torch.empty([0], dtype=torch.int8, device=dev)
         cos, sin = _rope_tables(grid, self.merge, VISION_ROPE_THETA, self.head_dim, dev)
 
         V = self._w
@@ -331,7 +380,27 @@ class VisionTower:
             # The q|k prefix of each packed row, rotated in place; v is never addressed.
             qkv_heads = torch.reshape(qkv, [num_patches, 3 * self.heads, self.head_dim])
             vision_rope_2d_packed_qk(qkv_heads[:, : 2 * self.heads], cos, sin)
-            attn_out = self._attention(qkv, attn_out, md)
+            attn_out = thop_attention(
+                q=qkv,
+                output=attn_out,
+                workspace=self._ws,
+                sequence_length=dev_lens,
+                host_past_key_value_lengths=host_lens,
+                host_total_kv_lens=host_total,
+                context_lengths=dev_lens,
+                host_context_lengths=host_lens,
+                host_request_types=host_types,
+                max_num_requests=num_segments,
+                max_context_length=max_seg,
+                max_seq_len=max_seg,
+                attention_window_size=max_seg,
+                num_contexts=num_segments,
+                num_ctx_tokens=num_patches,
+                num_heads=self.heads,
+                num_kv_heads=self.heads,
+                head_size=self.head_dim,
+                **_VISION_CALL_CONSTANTS,
+            )
             h = torch.add(h, cublas_mm(attn_out, B.proj, B.proj_b))
             mlp = cublas_mm(layer_norm(h, B.n2_w, B.n2_b, VISION_NORM_EPS), B.fc1, B.fc1_b)
             # Non-gated MLP with the tanh GELU (not the merger's erf).

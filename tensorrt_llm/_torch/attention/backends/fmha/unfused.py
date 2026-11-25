@@ -25,7 +25,6 @@ from .phased import FmhaParams
 class UnfusedFmha(NativeFmha):
     """Unfused context attention over cuBLAS GEMMs and a masked softmax."""
 
-    supports_variable_window = True
     op_is_supported = staticmethod(thop.unfused_is_supported)
 
     @torch.compiler.disable

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <tuple>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -42,14 +43,15 @@ class MLA;
 ///
 /// Each library also provides `static bool isAvailable(AttentionBase const& key)`, which
 /// reads only the key and the device and decides whether the variant lists the library at
-/// all. The variant keeps its libraries in priority order; every call runs the first one
-/// whose `isSupported` is true.
+/// all. Python selects among enabled libraries via `FmhaManager`; the direct C++ entry points
+/// walk `fmhas()` in priority order and pick the first library whose `isSupported` is true
+/// (with `hasPerfGain` breaking ties against a later supported library).
 template <typename AttentionVariant>
 class PhasedFmha
 {
 public:
-    explicit PhasedFmha(AttentionBase const& attention)
-        : attention(attention)
+    explicit PhasedFmha(AttentionVariant const& attention)
+        : mAttention(attention)
     {
     }
 
@@ -61,9 +63,35 @@ public:
     PhasedFmha& operator=(PhasedFmha&&) = delete;
 
     /// Per call: whether this library serves this phase for these parameters. Reads `p`,
-    /// `isGen`, the key members of `attention`, and whether the phase's runner accepted
+    /// `isGen`, the key members of `mAttention`, and whether the phase's runner accepted
     /// the configuration at init.
     [[nodiscard]] virtual bool isSupported(FmhaParams const& p, bool isGen) const = 0;
+
+    /// Whether this library is preferred over a later library that also serves the call.
+    [[nodiscard]] virtual bool hasPerfGain(FmhaParams const& /*p*/) const
+    {
+        return true;
+    }
+
+    /// Ensures this library's runner for the phase has been initialized.
+    void ensureInitialized(AttentionVariant const& op, bool isGen)
+    {
+        if (!isGen && !mContextInitialized)
+        {
+            initContext(op);
+            mContextInitialized = true;
+        }
+        if (isGen && !mGenerationInitialized)
+        {
+            initGeneration(op);
+            mGenerationInitialized = true;
+        }
+    }
+
+    [[nodiscard]] bool isInitialized(bool isGen) const noexcept
+    {
+        return isGen ? mGenerationInitialized : mContextInitialized;
+    }
 
     /// Once per phase, before the first launch and outside CUDA graph capture. Builds the
     /// phase's runner and records whether it accepts the configuration. A library that
@@ -90,7 +118,11 @@ public:
 
 protected:
     /// The op that owns this library: its key members and op state.
-    AttentionBase const& attention;
+    AttentionVariant const& mAttention;
+
+private:
+    bool mContextInitialized = false;
+    bool mGenerationInitialized = false;
 };
 
 /// trtllm-gen kernels for both phases: the context FMHA, the GQA/MQA generation kernels and
@@ -99,7 +131,7 @@ template <typename AttentionVariant>
 class TrtllmGenFmha final : public PhasedFmha<AttentionVariant>
 {
 public:
-    explicit TrtllmGenFmha(AttentionBase const& attention)
+    explicit TrtllmGenFmha(AttentionVariant const& attention)
         : PhasedFmha<AttentionVariant>(attention)
     {
     }
@@ -142,7 +174,7 @@ template <typename AttentionVariant>
 class FmhaV2Fmha final : public PhasedFmha<AttentionVariant>
 {
 public:
-    explicit FmhaV2Fmha(AttentionBase const& attention)
+    explicit FmhaV2Fmha(AttentionVariant const& attention)
         : PhasedFmha<AttentionVariant>(attention)
     {
     }
@@ -178,7 +210,7 @@ template <typename AttentionVariant>
 class XqaFmha final : public PhasedFmha<AttentionVariant>
 {
 public:
-    explicit XqaFmha(AttentionBase const& attention)
+    explicit XqaFmha(AttentionVariant const& attention)
         : PhasedFmha<AttentionVariant>(attention)
     {
     }
@@ -194,37 +226,35 @@ public:
     /// Whether the XQA kernels serve this call, without weighing them against MMHA.
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
     /// Whether XQA is expected to outrun MMHA for this generation call's batch and history.
-    [[nodiscard]] bool hasPerfGain(FmhaParams const& p) const;
+    [[nodiscard]] bool hasPerfGain(FmhaParams const& p) const override;
     void initGeneration(AttentionVariant const& op) override;
     /// Generation bytes of the XQA kernels, sized from the batch bound (sum of beam widths),
     /// num_gen_tokens and the block-table width.
     [[nodiscard]] std::size_t getWorkspaceSize(
         AttentionVariant const& op, FmhaParams const& p, bool isGen) const override;
     void runGeneration(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream) override;
-    /// Compiles the XQA kernels this generation call would use, whichever library then runs it.
-    void prepareGeneration(AttentionVariant const& op, FmhaParams const& p);
 
 private:
     /// The XQA parameters of this call; false when T has no XQA kernels.
     template <typename T>
     bool fillParams(
-        AttentionVariant const& op, FmhaParams const& p, kernels::XQAParams& params, bool forConfigurePlugin) const;
+        AttentionVariant const& op, FmhaParams const& p, kernels::XQAParams& xqaParams, bool forConfigurePlugin) const;
     template <typename T>
     void runGenerationImpl(AttentionVariant const& op, FmhaParams const& p, cudaStream_t stream);
     /// Compiles the XQA kernels for a new execution mode or a wider beam than any prepared so far.
     template <typename T>
-    void prepare(AttentionVariant const& op, FmhaParams const& p);
+    void prepare(AttentionVariant const& op, FmhaParams const& p) const;
 
     std::unique_ptr<kernels::DecoderXQARunner> mRunner;
     using PrepareProfile = std::tuple<bool, bool, bool, std::int64_t, bool>;
-    std::map<PrepareProfile, std::int64_t> mPreparedBeamWidths;
+    mutable std::map<PrepareProfile, std::int64_t> mPreparedBeamWidths;
 };
 
 /// FlashMLA generation kernels (SM90, 64-token pages, 576-wide latent heads).
 class FlashMlaFmha final : public PhasedFmha<MLA>
 {
 public:
-    explicit FlashMlaFmha(AttentionBase const& attention)
+    explicit FlashMlaFmha(MLA const& attention)
         : PhasedFmha<MLA>(attention)
     {
     }
@@ -247,7 +277,7 @@ private:
 class MmhaFmha final : public PhasedFmha<MHA>
 {
 public:
-    explicit MmhaFmha(AttentionBase const& attention)
+    explicit MmhaFmha(MHA const& attention)
         : PhasedFmha<MHA>(attention)
     {
     }
@@ -272,7 +302,7 @@ private:
 class UnfusedFmha final : public PhasedFmha<MHA>
 {
 public:
-    explicit UnfusedFmha(AttentionBase const& attention)
+    explicit UnfusedFmha(MHA const& attention)
         : PhasedFmha<MHA>(attention)
     {
     }
@@ -295,11 +325,37 @@ private:
     std::unique_ptr<tensorrt_llm::common::CublasMMWrapper> mCublasWrapper;
 };
 
-/// Bytes the XQA kernels need for \p max_num_tokens query tokens.
+/// Bytes the XQA kernels need for \p maxNumTokens query tokens.
 [[nodiscard]] std::size_t xqaKernelWorkspaceSize(
-    int headSize, int numQHeads, int numKvHeads, bool isMLA, int max_num_tokens);
+    int headSize, int numQHeads, int numKvHeads, bool isMLA, int maxNumTokens);
 /// The alignment of the XQA kernel workspace.
 [[nodiscard]] int xqaKernelWorkspaceAlignment(int headSize, int numQHeads, int numKvHeads);
+
+// Host entry points exposed to Python via nanobind/thop/bindings.cpp.
+[[nodiscard]] bool fallbackIsSupported(FmhaParams& p, bool isGen);
+void fallbackRunContext(FmhaParams& p);
+void fallbackRunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool trtllmGenIsSupported(FmhaParams& p, bool isGen);
+void trtllmGenRunContext(FmhaParams& p);
+void trtllmGenRunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool fmhaV2IsSupported(FmhaParams& p, bool isGen);
+void fmhaV2RunContext(FmhaParams& p);
+void fmhaV2RunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool xqaIsSupported(FmhaParams& p, bool isGen);
+[[nodiscard]] std::optional<bool> xqaHasPerfGain(FmhaParams& p);
+void xqaRunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool flashMlaIsSupported(FmhaParams& p, bool isGen);
+void flashMlaRunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool mmhaIsSupported(FmhaParams& p, bool isGen);
+void mmhaRunGeneration(FmhaParams& p);
+
+[[nodiscard]] bool unfusedIsSupported(FmhaParams& p, bool isGen);
+void unfusedRunContext(FmhaParams& p);
 
 extern template class TrtllmGenFmha<MHA>;
 extern template class TrtllmGenFmha<MLA>;

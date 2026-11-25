@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the FP8 unified target's attention entries other than the dense attention: every
+"""GPU tests for the FP8 unified target's attention entries other than `thop_attention`: every
 certified cell against the entry's `reference` over the engine's paged state, plus the TP index
 split, captured stores, kernels without cells, the call sites and the FP8 KV range probe."""
 

@@ -55,9 +55,9 @@ from beam._components.six_layer_model.model import (  # noqa: E501
     prefill_context,
 )
 
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
-from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
     beam_logit_softcap,
 )
@@ -107,6 +107,7 @@ OPS = (
     cublas_mm,
     beam_neox_rope,
     beam_nope_query_scale,
+    thop_attention,
     beam_output_gate,
     beam_depth_residual,
     beam_grouped_topk_router,
@@ -178,7 +179,7 @@ def run(model, ids: torch.Tensor) -> torch.Tensor:
 
 @contextlib.contextmanager
 def recording(model):
-    """Log every catalog op and attention core call of the forward in order, with the block it ran in, its
+    """Log every catalog op call of the forward in order, with the block it ran in, its
     activation arguments and its output; and every block's entry and exit."""
     calls: list[dict] = []
     events: list = []
@@ -210,23 +211,6 @@ def recording(model):
             return entry["output"]
 
         cls.__call__ = logged
-    original_core = _attention.attention_core
-
-    def logged_core(qkv, md, *, layer, fmha_manager, window):
-        entry = {
-            "op": "AttentionCore",
-            "block": current[0],
-            "kwargs": {"attention_window_size": window},
-            "qkv": qkv.clone(),  # before the core appends from it
-        }
-        calls.append(entry)
-        entry["output"] = original_core(
-            qkv, md, layer=layer, fmha_manager=fmha_manager, window=window
-        )
-        entry["kwargs"]["local_layer_idx"] = layer.local_layer_idx
-        return entry["output"]
-
-    _attention.attention_core = logged_core
     handles = []
     for i, block in enumerate(model.layers):
 
@@ -245,7 +229,6 @@ def recording(model):
     finally:
         for h in handles:
             h.remove()
-        _attention.attention_core = original_core
         for cls, original in reversed(saved):
             cls.__call__ = original
 
@@ -262,12 +245,6 @@ def no_dispatch():
             raise AssertionError(f"{_name} dispatched before the input was rejected")
 
         cls.__call__ = refuse
-    original_core = _attention.attention_core
-
-    def refuse_core(*args, **kwargs):
-        raise AssertionError("the attention core ran before the input was rejected")
-
-    _attention.attention_core = refuse_core
     embedding = torch.nn.functional.embedding
 
     def refuse_embedding(*args, **kwargs):
@@ -278,7 +255,6 @@ def no_dispatch():
         yield
     finally:
         torch.nn.functional.embedding = embedding
-        _attention.attention_core = original_core
         for cls, original in reversed(saved):
             cls.__call__ = original
 
@@ -674,7 +650,7 @@ def test_forward_composes_the_six_blocks(seed, length) -> None:
     for i in range(6):
         block = [c for c in calls if c["block"] == i and c["op"] != "expert"]
         assert block[0]["op"] == "BeamRmsnormFp32"
-        attention = [c for c in block if c["op"] == "AttentionCore"]
+        attention = [c for c in block if c["op"] == "ThopAttention"]
         (att,) = attention
         assert att["kwargs"]["local_layer_idx"] == i
         assert att["kwargs"]["attention_window_size"] == (512 if i < 5 else 1024)
@@ -725,7 +701,7 @@ def test_layer5_query_scale_is_visible() -> None:
         torch.cuda.synchronize()
     block = [c for c in calls if c["block"] == 5]
     q_norm = [c for c in block if c["op"] == "FlashinferRmsnorm"][0]["output"].view(129, 48, 128)
-    (att,) = [c for c in block if c["op"] == "AttentionCore"]
+    (att,) = [c for c in block if c["op"] == "ThopAttention"]
     packed_q = att["qkv"][:, : 48 * 128].reshape(129, 48, 128)
     changed = (packed_q != q_norm).flatten(1).any(dim=1)
     assert not bool(changed[0]) and bool(changed[-1])

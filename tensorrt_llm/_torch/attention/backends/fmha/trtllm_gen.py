@@ -14,12 +14,18 @@
 # limitations under the License.
 """The trtllm-gen FMHA library of the native attention op."""
 
+from typing import TYPE_CHECKING
+
 import torch
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.bindings.internal import thop
 
 from .native import NativeFmha
 from .phased import FmhaParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
 
 class TrtllmGenFmha(NativeFmha):
@@ -27,6 +33,10 @@ class TrtllmGenFmha(NativeFmha):
 
     supports_variable_window = True
     op_is_supported = staticmethod(thop.trtllm_gen_is_supported)
+
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        return is_sm_100f() and super()._is_available(attn)
 
     @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
 )
@@ -47,7 +47,7 @@ def install_sliding_fi(draft_model: torch.nn.Module) -> int:
             continue
         if not M3DrafterSlidingFiFmha.is_available(backend):
             continue
-        at = next((i for i, lib in enumerate(libs) if isinstance(lib, FallbackFmha)), len(libs))
+        at = next((i for i, lib in enumerate(libs) if isinstance(lib, NATIVE_FMHA_LIBS)), len(libs))
         libs.insert(at, M3DrafterSlidingFiFmha(backend))
         count += 1
     return count

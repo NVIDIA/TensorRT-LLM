@@ -170,7 +170,11 @@ class Fmha(ABC):
             forward_args.variable_window_token_starts is not None
             or forward_args.variable_window_token_ends is not None
         )
-        if has_variable_window and not self.supports_variable_window:
+        if (
+            has_variable_window
+            and phase != FmhaPhase.GENERATION
+            and not self.supports_variable_window
+        ):
             logger.debug(f"{type(self).__name__} does not support variable-window attention.")
             return False
         if forward_args.sage_attn_smooth_v and not self.supports_sage_smooth_v:

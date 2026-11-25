@@ -43,8 +43,10 @@ from .registry import get_enabled_fmha_lib_classes, resolve_fmha_lib_classes
 from .xqa import XqaFmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 # Keep these general-purpose cache buckets aligned with the shape coverage used
@@ -345,7 +347,7 @@ class FmhaManager:
     """Own the FMHA libraries, dispatch policy, and selection cache for one attention layer."""
 
     def __init__(
-        self, attn: AttentionLayer, fmha_libs: Sequence[str | type[Fmha]] | None = None
+        self, attn: TrtllmAttention, fmha_libs: Sequence[str | type[Fmha]] | None = None
     ) -> None:
         """``fmha_libs`` lists this layer's libraries by name or class instead of TLLM_FMHA_LIBS."""
         self._cache: dict[_FmhaCacheKey, Fmha | object] = {}
@@ -406,8 +408,6 @@ class FmhaManager:
     def _make_cache_key(
         self,
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> _FmhaCacheKey:
@@ -492,7 +492,7 @@ class FmhaManager:
 
     def select(
         self,
-        attn: AttentionLayer,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -503,7 +503,7 @@ class FmhaManager:
         if not _is_fmha_cache_enabled():
             return self._select_uncached(attn, q, k, v, metadata, forward_args)
 
-        cache_key = self._make_cache_key(q, k, v, metadata, forward_args)
+        cache_key = self._make_cache_key(q, metadata, forward_args)
         fmha = self._cache.get(cache_key)
         if fmha is _XQA_PERF_GAIN_DEPENDENT:
             cache_key = self._with_xqa_perf_gain(cache_key, q, k, v, metadata, forward_args)
@@ -532,10 +532,13 @@ class FmhaManager:
                     )
             return fmha
 
-        fmha = self._select_uncached(attn, q, k, v, metadata, forward_args)
+        consulted_xqa_gain = [False]
+        fmha = self._select_uncached(
+            attn, q, k, v, metadata, forward_args, consulted_xqa_gain=consulted_xqa_gain
+        )
         if fmha is None:
             return None
-        if cache_key.xqa_has_perf_gain is None and self._reached_xqa(cache_key, fmha):
+        if cache_key.xqa_has_perf_gain is None and consulted_xqa_gain[0]:
             self._cache[cache_key] = _XQA_PERF_GAIN_DEPENDENT
             cache_key = self._with_xqa_perf_gain(cache_key, q, k, v, metadata, forward_args)
         self._cache[cache_key] = fmha
@@ -545,14 +548,6 @@ class FmhaManager:
                 q, k, v, metadata, forward_args
             )
         return fmha
-
-    def _reached_xqa(self, cache_key: _FmhaCacheKey, fmha: Fmha) -> bool:
-        """Whether selecting ``fmha`` consulted XQA's generation support."""
-        xqa = self._xqa
-        if xqa is None or cache_key.generation_seq_len_q == 0 or xqa not in self.fmha_libs:
-            return False
-        generation_fmha = fmha._get_generation_impl() if isinstance(fmha, CombinedFmha) else fmha
-        return self.fmha_libs.index(generation_fmha) >= self.fmha_libs.index(xqa)
 
     def _with_xqa_perf_gain(
         self,
@@ -570,25 +565,30 @@ class FmhaManager:
 
     def _select_uncached(
         self,
-        attn: AttentionLayer,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        *,
+        consulted_xqa_gain: list[bool] | None = None,
     ) -> Fmha | None:
+        memo: dict[tuple[int, FmhaPhase | None], bool] = {}
         if attn.is_mla_enable:
-            return self._select_mla(q, k, v, metadata, forward_args)
-        return self._select_non_mla(attn, q, k, v, metadata, forward_args)
+            return self._select_mla(q, k, v, metadata, forward_args, memo, consulted_xqa_gain)
+        return self._select_non_mla(attn, q, k, v, metadata, forward_args, memo, consulted_xqa_gain)
 
     def _select_non_mla(
         self,
-        attn: AttentionLayer,
+        attn: TrtllmAttention,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        memo: dict[tuple[int, FmhaPhase | None], bool] | None = None,
+        consulted_xqa_gain: list[bool] | None = None,
     ) -> Fmha | None:
         has_context = metadata.num_contexts > 0
         has_generation = metadata.num_generations > 0
@@ -598,17 +598,46 @@ class FmhaManager:
         context_fmha = None
         generation_fmha = None
         for fmha in self.fmha_libs:
-            if self._is_supported(fmha, q, k, v, metadata, forward_args):
+            if self._is_supported(
+                fmha,
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+                memo=memo,
+                consulted_xqa_gain=consulted_xqa_gain,
+            ):
                 return fmha
 
             if not isinstance(fmha, PhasedFmha):
                 continue
 
             if has_context and context_fmha is None:
-                if self._is_supported(fmha, q, k, v, metadata, forward_args, FmhaPhase.CONTEXT):
+                if self._is_supported(
+                    fmha,
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    FmhaPhase.CONTEXT,
+                    memo=memo,
+                    consulted_xqa_gain=consulted_xqa_gain,
+                ):
                     context_fmha = fmha
             if has_generation and generation_fmha is None:
-                if self._is_supported(fmha, q, k, v, metadata, forward_args, FmhaPhase.GENERATION):
+                if self._is_supported(
+                    fmha,
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    FmhaPhase.GENERATION,
+                    memo=memo,
+                    consulted_xqa_gain=consulted_xqa_gain,
+                ):
                     generation_fmha = fmha
 
             if has_context and context_fmha is None:
@@ -634,6 +663,8 @@ class FmhaManager:
         v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        memo: dict[tuple[int, FmhaPhase | None], bool] | None = None,
+        consulted_xqa_gain: list[bool] | None = None,
     ) -> Fmha | None:
         if forward_args.attention_input_type == AttentionInputType.context_only:
             phase = FmhaPhase.CONTEXT
@@ -643,7 +674,17 @@ class FmhaManager:
             return None
 
         for fmha in self.fmha_libs:
-            if self._is_supported(fmha, q, k, v, metadata, forward_args, phase):
+            if self._is_supported(
+                fmha,
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+                phase,
+                memo=memo,
+                consulted_xqa_gain=consulted_xqa_gain,
+            ):
                 return fmha
         return None
 
@@ -656,25 +697,49 @@ class FmhaManager:
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
         phase: FmhaPhase | None = None,
+        *,
+        memo: dict[tuple[int, FmhaPhase | None], bool] | None = None,
+        consulted_xqa_gain: list[bool] | None = None,
     ) -> bool:
         """Whether ``fmha`` serves the call, or its ``phase`` when it is phased.
 
         XQA without an expected perf gain yields to a later library that serves the same call,
         and keeps the call when none does.
         """
+        memo_key = (id(fmha), phase)
+        if memo is not None and memo_key in memo:
+            return memo[memo_key]
         if phase is not None and isinstance(fmha, PhasedFmha):
             supported = fmha.is_supported(q, k, v, metadata, forward_args, phase=phase)
         else:
             supported = fmha.is_supported(q, k, v, metadata, forward_args)
-        if not supported or not isinstance(fmha, XqaFmha):
-            return supported
-        if fmha.has_perf_gain(q, k, v, metadata, forward_args):
-            return True
-        later_fmha_libs = self.fmha_libs[self.fmha_libs.index(fmha) + 1 :]
-        return not any(
-            self._is_supported(later, q, k, v, metadata, forward_args, phase)
-            for later in later_fmha_libs
-        )
+        is_xqa = fmha is self._xqa or isinstance(fmha, XqaFmha)
+        if supported and is_xqa:
+            if (
+                consulted_xqa_gain is not None
+                and metadata.num_generations > 0
+                and phase != FmhaPhase.CONTEXT
+            ):
+                consulted_xqa_gain[0] = True
+            if not fmha.has_perf_gain(q, k, v, metadata, forward_args):
+                later_fmha_libs = self.fmha_libs[self.fmha_libs.index(fmha) + 1 :]
+                supported = not any(
+                    self._is_supported(
+                        later,
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase,
+                        memo=memo,
+                        consulted_xqa_gain=consulted_xqa_gain,
+                    )
+                    for later in later_fmha_libs
+                )
+        if memo is not None:
+            memo[memo_key] = supported
+        return supported
 
 
 __all__ = ["FmhaManager", "generation_selection_cell"]

@@ -21,7 +21,7 @@ exist yet. Two kinds of source feed the schema:
 * Schema dataclasses (``FmhaParams``, ``AttentionForwardArgs``, the sparse
   structs): every annotated field of a supported type crosses, ``cpp_metadata``
   renames, skips, or attaches a tensor dtype for a generated accessor.
-* Mirrored runtime classes (``AttentionLayer``, ``TrtllmAttentionMetadata``,
+* Mirrored runtime classes (``TrtllmAttention``, ``TrtllmAttentionMetadata``,
   ``RopeParams``): every typed member is collected from class-body annotations,
   ``self.x: T`` assignments in any method, ``self.x = param`` in ``__init__`` with
   an annotated parameter, and ``@property`` return annotations, walking base
@@ -60,7 +60,7 @@ NATIVE_STRUCT_NAMES = (
 
 # Runtime classes mirrored into native structs: Python class -> C++ struct.
 MIRRORED_CLASSES = {
-    "AttentionLayer": "AttentionLayerParams",
+    "TrtllmAttention": "AttentionLayerParams",
     "TrtllmAttentionMetadata": "AttentionMetadataParams",
     "RopeParams": "AttentionRopeParams",
 }
@@ -72,7 +72,6 @@ DEFAULT_MODULE_PATHS = (
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "phased.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "interface.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "trtllm.py",
-    REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "attention_layer.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "sparse" / "params.py",
 )
 

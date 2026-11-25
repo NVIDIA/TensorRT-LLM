@@ -181,11 +181,11 @@ def test_attention_rechecks_the_step_per_layer_only_when_needed(
 ) -> None:
     calls = []
 
-    class StopLayers(dict):
-        def __getitem__(self, layer: int) -> NoReturn:
-            raise _Stop()
+    def stop(md: object, layer: int) -> NoReturn:
+        raise _Stop()
 
     monkeypatch.setattr(bf16._attention, "check_batch_metadata", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(bf16._attention, "step_args", stop)
     component = SimpleNamespace(
         diagnostics=diagnostics,
         hidden=HIDDEN,
@@ -194,7 +194,6 @@ def test_attention_rechecks_the_step_per_layer_only_when_needed(
         local_kv_heads=2,
         head_dim=4,
         kv_cache_dtype=None,
-        _attn=StopLayers(),
         _check_usable=lambda layer=None: None,
     )
     h = torch.zeros(T, HIDDEN, dtype=torch.bfloat16)
