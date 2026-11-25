@@ -20,6 +20,7 @@ Ranks run as threads over an in-memory store.
 import os
 import pickle
 import threading
+import time
 
 import pytest
 from _torch.distributed.store_group_test_utils import InMemoryStore, Unpickled
@@ -27,8 +28,11 @@ from mpi4py import MPI
 
 from tensorrt_llm._torch.distributed import communicator
 from tensorrt_llm._torch.distributed.membership import SignedStore, StoreGroup, rendezvous
+from tensorrt_llm._torch.distributed.membership_mnnvl_memory import MembershipMnnvlMemory
 from tensorrt_llm._torch.distributed.startup_record import ReplacementCannotStart, StartupRecord
 from tensorrt_llm._torch.pyexecutor import hang_detector
+from tensorrt_llm._utils import set_thread_local_mpi_comm
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -156,6 +160,35 @@ def test_bcast_over_active_members(root):
     groups = {r: _group(store, r, range(4), active=active) for r in active}
     results = _run_ranks({r: lambda r=r: groups[r].bcast(f"from {r}", root) for r in groups})
     assert results == {r: f"from {root}" if root in active else None for r in active}
+
+
+def test_workspace_comm_barrier_waits_for_every_rank(monkeypatch):
+    """Check the barrier of the fault-tolerant MoE workspace's communicator over a ``StoreGroup``.
+
+    The workspace initializer calls ``MembershipMnnvlMemory.get_comm(mapping).barrier()``.
+    """
+    monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
+    store = InMemoryStore()
+    size = 4
+    last_rank_enters = threading.Event()
+
+    def initialize(rank):
+        # get_comm caches the communicator per class, so each rank gets its own class.
+        memory_cls = type(f"Rank{rank}Memory", (MembershipMnnvlMemory,), {})
+        mapping = Mapping(world_size=size, rank=rank, tp_size=size, moe_ep_size=size)
+        set_thread_local_mpi_comm(_group(store, rank, range(size)))
+        try:
+            comm = memory_cls.get_comm(mapping)
+            if rank == size - 1:
+                time.sleep(0.2)
+                last_rank_enters.set()
+            comm.barrier()
+            return comm.membership, last_rank_enters.is_set()
+        finally:
+            set_thread_local_mpi_comm(None)
+
+    results = _run_ranks({r: lambda r=r: initialize(r) for r in range(size)})
+    assert results == {r: (tuple(range(size)), True) for r in range(size)}
 
 
 def test_on_wait_error_fails_exchange():

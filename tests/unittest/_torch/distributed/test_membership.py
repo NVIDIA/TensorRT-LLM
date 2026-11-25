@@ -732,6 +732,28 @@ def test_startup_collective_hang_aborts(peer):
         assert authority.record.reason == "ranks [2] failed during the startup"
 
 
+@pytest.mark.parametrize("rank_2", ["stalls", "progresses"])
+def test_startup_stall_before_any_rank_started_aborts(rank_2):
+    """Abort when a connected rank that no rank waits on makes no startup progress for the timeout.
+
+    No rank has started, so no rank waits on another.
+    """
+    authority = Authority(WORLD, rendezvous_timeout_s=600.0)
+    for second in range(0, 1300, 10):
+        reports = {r: RankReport(received_s=second, progress=3 + second) for r in range(WORLD)}
+        reports[2] = RankReport(
+            received_s=second, progress=3 + (second if rank_2 == "progresses" else 0)
+        )
+        record = authority.tick(float(second), reports, ALL)
+        if second <= 600 or rank_2 == "progresses":
+            assert record is None
+    if rank_2 == "stalls":
+        assert authority.record.state == MembershipState.ABORTED
+        assert authority.record.reason == "ranks [2] failed during the startup"
+    else:
+        assert authority.record.state == MembershipState.STARTING
+
+
 def test_first_failover_cause_after_staggered_startup():
     """Give a hung rank's cause, not that it connected after the others during the startup."""
     cluster = Cluster(hang_timeout_s=1.0)

@@ -64,6 +64,13 @@ class MnnvlMappingError(MnnvlRanksError):
     """
 
 
+class MnnvlRollbackError(RuntimeError):
+    """Raised when undoing a failed mapping also failed, so some of its rows or handles may be live.
+
+    The mapping failure that started the rollback is the ``__cause__``.
+    """
+
+
 @runtime_checkable
 class MembershipComm(Protocol):
     """A communicator whose gathers return None for an inactive member, such as a ``StoreGroup``.
@@ -601,6 +608,7 @@ class MnnvlMemory:
         Raises:
             MnnvlPeerHandleError: An active peer's handle could not be imported.
             MnnvlMappingError: Some active rank could not export its handle.
+            MnnvlRollbackError: Mapping failed and undoing it failed too.
         """
         if members is None:
             members = range(comm.Get_size())
@@ -760,12 +768,13 @@ class MnnvlMemory:
                 mapped_rank_ptrs.append(rank_ptr)
                 _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [access_desc], 1))
             return mem_handles
-        except Exception:
+        except Exception as failure:
+            rollback_errors = []
             for rank_ptr in reversed(mapped_rank_ptrs):
                 try:
                     _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
                 except RuntimeError as error:
-                    logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
+                    rollback_errors.append(f"unmap {rank_ptr:#x}: {error}")
 
             handles_to_release = []
             for handle in [*mem_handles, local_handle, scratch_handle]:
@@ -779,7 +788,11 @@ class MnnvlMemory:
                 try:
                     _check_cu_result(cuda.cuMemRelease(handle))
                 except RuntimeError as error:
-                    logger.warning(f"Failed to release incomplete MNNVL allocation: {error}")
+                    rollback_errors.append(f"release: {error}")
+            if rollback_errors:
+                raise MnnvlRollbackError(
+                    "Failed to undo an incomplete MNNVL mapping:\n" + "\n".join(rollback_errors)
+                ) from failure
             raise
         finally:
             for pidfd in pidfds:

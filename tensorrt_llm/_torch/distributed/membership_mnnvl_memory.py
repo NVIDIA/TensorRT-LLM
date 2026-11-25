@@ -37,6 +37,7 @@ from .mnnvl_memory import (
     MnnvlMappingError,
     MnnvlMemory,
     MnnvlPeerHandleError,
+    MnnvlRollbackError,
     _MnnvlAllocationRecord,
     _MnnvlAllocationState,
 )
@@ -177,7 +178,7 @@ class MembershipMnnvlMemory(MnnvlMemory):
         handles, outcome, local_failure = None, (), None
 
         def release_after_failure() -> None:
-            """Unmap and release every row, and mark the allocation broken if that fails too."""
+            """Unmap and release every row, and mark the allocation broken if any row stays live."""
             if handles is not None:
                 record.mem_handles = handles
             try:
@@ -188,7 +189,12 @@ class MembershipMnnvlMemory(MnnvlMemory):
                 )
                 record.state = _MnnvlAllocationState.BROKEN
                 return
-            record.state = _MnnvlAllocationState.UNMAPPED
+            # A failed rollback leaves rows or handles live that the record does not list.
+            record.state = (
+                _MnnvlAllocationState.BROKEN
+                if isinstance(local_failure, MnnvlRollbackError)
+                else _MnnvlAllocationState.UNMAPPED
+            )
 
         # The handle exchange inside _create_and_map_handles is followed by an outcome exchange, so
         # that every active rank raises the same error if any of them failed to map.
@@ -206,13 +212,13 @@ class MembershipMnnvlMemory(MnnvlMemory):
             if own_row_fresh:
                 self._reset_own_row()
         except Exception as failure:
+            local_failure = failure
             # A failed handle exchange leaves the peers unreachable, and an error other than a
             # RuntimeError is a bug. Neither goes to the outcome exchange.
             exchange_failed = isinstance(comm, MembershipComm) and comm.exchange_failed
             if exchange_failed or not isinstance(failure, RuntimeError):
                 release_after_failure()
                 raise
-            local_failure = failure
             outcome = _mapping_outcome(failure, record.comm_membership[record.comm_rank])
         try:
             outcomes = dict(zip(record.comm_membership, comm.allgather(outcome)))
