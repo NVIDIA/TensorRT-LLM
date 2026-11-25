@@ -141,8 +141,8 @@ def plan(m: int, n: int, k: int, wide: int = 0) -> _Plan:
                 _fi_splitk.validate_tactic(_fi_splitk.SplitKTactic(*choice[1:]), m, n, k)
                 return _Plan("splitk", tuple(choice[1:]))
         if wide == 2 and (n, k) not in _WIDE:
-            t = _fi_splitk.default_tactic(m, n, k)
             try:
+                t = _fi_splitk.default_tactic(m, n, k)
                 _fi_splitk.validate_tactic(t, m, n, k)
             except Exception:  # noqa: BLE001 — any refusal of the shape keeps it on cuBLAS
                 return _Plan("cublas")
