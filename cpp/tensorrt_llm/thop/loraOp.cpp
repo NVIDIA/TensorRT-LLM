@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
@@ -145,10 +144,7 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     thread_local std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> cublasWrapper;
     if (cublasWrapper == nullptr)
     {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper
-            = std::make_shared<tensorrt_llm::common::CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+        cublasWrapper = makeCublasWrapperForCurrentThread();
     }
 
     int const inHiddenSize = input.sizes()[input.sizes().size() - 1];

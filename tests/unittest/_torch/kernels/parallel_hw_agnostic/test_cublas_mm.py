@@ -90,5 +90,28 @@ def test_cublas_mm_out_fp32(dtype, m, k_n):
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu(), atol=0.01, rtol=0.01)
 
 
+def test_cublas_mm_fp32_ignores_torch_tf32():
+    """The FP32 cuBLAS path stays in full FP32 after PyTorch puts the shared handle in TF32 mode."""
+    torch.random.manual_seed(0)
+    x = torch.randn((64, 4096), device="cuda")
+    w = torch.randn((256, 4096), device="cuda")
+    ref = (x.double() @ w.double().t()).float()
+    # Above FP32 rounding error at K=4096 and below TF32's: an FP32 GEMM passes, a TF32 one fails.
+    tol = dict(atol=5e-3, rtol=0)
+    previous_precision = torch.backends.cuda.matmul.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    try:
+        torch_out = torch.matmul(x, w.t())
+        # Puts the calling thread's PyTorch cuBLAS handle, which cublas_mm shares, in TF32 mode.
+        torch.cuda.current_blas_handle()
+        output = torch.ops.trtllm.cublas_mm(x, w.t(), bias=None, out_dtype=None)
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = previous_precision
+    assert not torch.allclose(torch_out, ref, **tol), (
+        "precondition: PyTorch's matmul did not run in TF32"
+    )
+    torch.testing.assert_close(output, ref, **tol)
+
+
 if __name__ == "__main__":
     test_cublas_mm(torch.float16, 12, (8192, 10240))

@@ -44,15 +44,6 @@ add_tllm_gtest(
   LABELS
   "unit;common;host")
 add_tllm_gtest(
-  cublasHandlePoolTest
-  OWNER
-  common
-  SOURCES
-  cublasHandlePoolTest.cpp
-  FULL_STACK
-  LABELS
-  "unit;full-stack;gpu")
-add_tllm_gtest(
   memoryUtilsTest
   OWNER
   common

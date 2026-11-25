@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -155,12 +155,6 @@ std::unordered_map<tensorrt_llm::DataType, ncclDataType_t>* getDtypeMap();
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
-
-//! Get the cuBLAS / cuBLASLt handle of the calling thread in the current CUDA context. When the last copy of the
-//! returned std::shared_ptr is released, the handle is kept for the next thread that asks in the same CUDA context
-//! instead of being destroyed; a cuBLAS handle is reset to the default stream and workspace before it is reused.
-std::shared_ptr<cublasHandle_t> getCublasHandle();
-std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 
 TRTLLM_NAMESPACE_END
 

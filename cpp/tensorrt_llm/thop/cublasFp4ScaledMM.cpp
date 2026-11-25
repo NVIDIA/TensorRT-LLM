@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -93,9 +93,7 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     auto& cublasWrapper = cublasWrappers[a.get_device()];
     if (!cublasWrapper)
     {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+        cublasWrapper = makeCublasWrapperForCurrentThread();
     }
 
     // Set FP4 configuration based on output tensor dtype
@@ -308,9 +306,7 @@ private:
 
             // Create cublas wrapper
             at::cuda::CUDAGuard deviceGuard(device);
-            auto cublasHandle = getCublasHandle();
-            auto cublasLtHandle = getCublasLtHandle();
-            auto cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+            auto cublasWrapper = makeCublasWrapperForCurrentThread();
 
             // Set FP4 configuration
             cudaDataType_t outType = mOutputDtype == at::ScalarType::Half
@@ -386,9 +382,7 @@ private:
         auto& cublasWrapper = cublasWrappers[a.get_device()];
         if (!cublasWrapper)
         {
-            auto cublasHandle = getCublasHandle();
-            auto cublasLtHandle = getCublasLtHandle();
-            cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+            cublasWrapper = makeCublasWrapperForCurrentThread();
         }
 
         // Set FP4 configuration with correct output type
