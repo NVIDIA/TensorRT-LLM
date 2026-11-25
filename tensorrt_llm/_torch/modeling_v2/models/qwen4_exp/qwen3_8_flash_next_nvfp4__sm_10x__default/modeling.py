@@ -502,6 +502,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_moe_renorm_cut
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (
     fp8_block_scale_moe_runner,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (
+    valid_tactics as fp8_moe_valid_tactics,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
 )
@@ -2032,6 +2035,63 @@ def _out_proj(core, x, weight_t, site: str, dense):
     return mid_mm_raw(x, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
 
 
+#: Switch, on by default: at a dep8 rank on SM103 (`_dp_decode_rank`, the draft layer's FP8
+#: experts in 64-wide windows) the draft MoE's trtllm-gen runner is entered at the tactic
+#: `_DRAFT_MOE_TACTICS` names for the call's gathered row count instead of the AutoTuner's cold
+#: fallback, which takes the widest valid token tile ([64, 0] at 96 rows, [128, 0] from 112):
+#: with about 2 tokens an expert those tiles are mostly padding. Every tactic of the runner
+#: computes the same sums in the same order, so the draft tokens are bitwise. GB300 micro (dep8
+#: window, us a call): 108.8 -> 72.0 at 96 rows, 171.3 -> 73.2 at 112, 186.8 -> 78.2 at 192;
+#: dep8 server step -0.083 ms at 14 requests a rank, -0.055 at 20. `0` keeps the AutoTuner's
+#: tactic. Read once, when the target is built.
+DP_DRAFT_MOE_TILE_ENV = "TRTLLM_QWEN4_EXP_DP_DRAFT_MOE_TILE"
+#: Local draft experts a rank -> `((first rows, last rows, (token tile, config)), ...)`: the
+#: gathered row counts of one runner call that take a tactic. Measured at dep8 only; 64..95 rows
+#: (10..11 requests a rank) measured no gain ([8, 8]: within noise) and keep the fallback.
+_DRAFT_MOE_TACTICS = {64: ((96, 192, (16, 8)),)}  # capacity: fixed: a dispatch table
+
+
+def _draft_moe_tactics_build(core, device) -> dict | None:
+    """`DP_DRAFT_MOE_TILE_ENV`, read once at build: `{}` (filled per row count on first use by
+    `_draft_moe_tactic`) at a dep8 rank on SM103 whose draft experts are the FP8 runner's, None
+    elsewhere. No collective, nothing compiled (the runner's kernels are precompiled cubins)."""
+    if not (
+        _switch(DP_DRAFT_MOE_TILE_ENV, default=True)
+        and core.mtp_enabled
+        and _dp_decode_rank(core, device)
+        and core.mtp_local_experts in _DRAFT_MOE_TACTICS
+        and getattr(core, "_mtp", None) is not None
+        and core._mtp.moe_gscale is None
+    ):
+        return None
+    rules = _DRAFT_MOE_TACTICS[core.mtp_local_experts]
+    logger.info(
+        f"draft MoE tactics: rank {core.dp_rank} of {core.dp_size}, "
+        + ", ".join(f"{list(t)} at {lo}..{hi} gathered rows" for lo, hi, t in rules)
+    )
+    return {}
+
+
+def _draft_moe_tactic(core, rows: int) -> tuple | None:
+    """`DP_DRAFT_MOE_TILE_ENV`'s tactic for a draft MoE runner call of `rows` gathered rows, or
+    None (the AutoTuner's). A table tactic the runner does not list valid at `rows` is not
+    taken. Host only; settled once per row count."""
+    memo = core._draft_moe_tactics
+    if memo is None:
+        return None
+    if rows not in memo:
+        tactic = next(
+            (t for lo, hi, t in _DRAFT_MOE_TACTICS[core.mtp_local_experts] if lo <= rows <= hi),
+            None,
+        )
+        if tactic is not None and list(tactic) not in fp8_moe_valid_tactics(
+            core.topk, core.hidden, core.moe_inter, core.mtp_local_experts, rows
+        ):
+            tactic = None
+        memo[rows] = tactic
+    return memo[rows]
+
+
 #: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
 #: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
 #: dep2 was never run with them; it keeps the stock forms.
@@ -2654,6 +2714,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.gdn_replay_map = False
         # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
         self._out_proj = None
+        # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
+        self._draft_moe_tactics = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
         # The trunk verify step's bitmap-union sparse GQA floor, 0 = off (`DP_GQA_BITMAP_ENV`).
@@ -2884,6 +2946,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.hc_tiles = _hc_tiles_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
             self._out_proj = _out_proj_build(self, device)
+            self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
@@ -4350,6 +4413,7 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
                     topk_ids=topk_ids,
                     act_type=_ACT_TYPE_SWIGLU,
                     gemm1_clamp_limit=None,
+                    tactic=_draft_moe_tactic(core, chunk.shape[0]),
                 )
             )
         return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
