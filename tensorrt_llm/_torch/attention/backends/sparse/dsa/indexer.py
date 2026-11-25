@@ -1503,7 +1503,7 @@ class Indexer(nn.Module):
                 gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, metadata.num_sms
             )
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if metadata.max_draft_tokens > 0:
+            if metadata.max_draft_tokens > 0 and not metadata.use_cute_dsl_paged_mqa_logits:
                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                     scheduler_context_lens.contiguous(),
                     _DG_SCHEDULE_BLOCK_KV,
@@ -1974,8 +1974,12 @@ class Indexer(nn.Module):
         scheduler_metadata_buffer: torch.Tensor,
         max_seq_len: int,
         q_scale: Optional[torch.Tensor],
+        page_mask: bool = False,
     ) -> torch.Tensor:
-        """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits; ``page_mask`` decodes masked
+        block-table entries (bits 31..30 = 01: -inf below the row's context length)."""
+        # Unmasked calls keep main's arguments.
+        mask_kwargs = {"page_mask": True} if page_mask else {}
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale),
@@ -1985,6 +1989,7 @@ class Indexer(nn.Module):
                 block_table,
                 scheduler_metadata_buffer,
                 max_seq_len,
+                **mask_kwargs,
             )
         return fp8_paged_mqa_logits(
             q_decode,
@@ -1994,6 +1999,7 @@ class Indexer(nn.Module):
             block_table,
             scheduler_metadata_buffer,
             max_seq_len,
+            **mask_kwargs,
         )
 
     def sparse_attn_indexer(
@@ -2006,12 +2012,17 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         q_scale: Optional[torch.Tensor] = None,
         is_generation: Optional[bool] = None,
+        decode_topk_start_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Run the indexer TopK kernel for one phase or the full batch.
 
         When ``is_generation`` is ``None``, the inputs contain the full mixed
         batch. Otherwise they contain only the selected context or generation
         phase. ``q_scale`` is only consumed by the FP4 dispatch.
+
+        ``decode_topk_start_event`` is waited on the current stream immediately
+        before decode Top-K, after logits computation. It does not delay prefill
+        Top-K, and its producer must enqueue the record before this call.
 
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
@@ -2477,6 +2488,8 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            if decode_topk_start_event is not None:
+                decode_topk_start_event.wait()
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],

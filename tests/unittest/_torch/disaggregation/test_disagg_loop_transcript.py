@@ -219,7 +219,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
         executor.scheduler.schedule_request.return_value = SimpleNamespace(
             fitting_disagg_gen_init_requests=[]
         )
-        executor.kv_cache_manager = Mock(spec=[])
+        executor.kv_cache_manager = Mock(spec=["prepare_expect_snapshot_points"])
     return executor
 
 
@@ -396,6 +396,7 @@ def test_overlap_close_out_stats_wait_for_a_deferred_previous_batch(
     executor._process_close_out_iter_stats = lambda stats, _start_time: calls.append(
         ("process_close_out_iter_stats", stats)
     )
+    executor._maybe_emit_quiescent_stats = Mock()
     deferred = previous_batch == "deferred"
     if deferred:
         executor.previous_batch = SimpleNamespace(

@@ -6,8 +6,9 @@ import pytest
 import torch
 
 skip_pre_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="The CuTe DSL query projection requires SM100/SM103",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="The CuTe DSL query projection requires SM100/SM103/SM107",
 )
 
 
@@ -200,3 +201,72 @@ def test_rescale_fp8_query_matches_direct_quantization(exponent):
     # A unit-scale subnormal is off by at most half its own 2**-9 step, scaled.
     error = (unit.float() - q.float() * 2.0**exponent).abs()
     assert bool((error[~normal] <= 2.0 ** (exponent - 10)).all())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 native CSA2 query projection",
+)
+@pytest.mark.parametrize("m", [1024, 1985, 2048])
+@pytest.mark.parametrize("with_amax", [False, True])
+@torch.inference_mode()
+def test_sm107_fp8_query_changed_input_graph_fp32_reference(m, with_amax):
+    """SM107's native Q-B, eager and replayed on changed inputs, against an FP32 reference."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import query_projection
+
+    heads = 64
+    inputs = _problem(m, heads, 1280, seed=m, nan_padding=True)
+    activation, activation_scale, weight, weight_scale, alpha, positions, rope = inputs
+    output = torch.empty(m, heads * 512, device="cuda", dtype=torch.float8_e4m3fn)
+    word = torch.zeros(1, device="cuda", dtype=torch.int32) if with_amax else None
+    assert query_projection.fp8_query_gemm(*inputs, output, word)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        if word is not None:
+            word.zero_()
+        assert query_projection.fp8_query_gemm(*inputs, output, word)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for phase in range(3):
+            updated = _problem(m, heads, 1280, seed=m + phase + 100, nan_padding=True)
+            for destination, source in zip(inputs, updated):
+                destination.copy_(source)
+            alpha.fill_((0.25, 1.0, 4.0)[phase])
+            graph.replay()
+            torch.cuda.synchronize()
+            captured = output.clone()
+            captured_word = word.clone() if word is not None else None
+            if word is not None:
+                word.zero_()
+            assert query_projection.fp8_query_gemm(*inputs, output, word)
+            assert torch.equal(captured.view(torch.uint8), output.view(torch.uint8))
+            if word is not None:
+                assert torch.equal(word, captured_word)
+            reference = (
+                (_dequantized_gemm(activation, activation_scale, weight, weight_scale) * alpha)
+                .to(torch.bfloat16)
+                .view(m, heads, 512)
+            )
+            torch.ops.trtllm.mla_rope_inplace(
+                reference, positions.int(), rope, heads, 448, 64, False, False
+            )
+            expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                reference.flatten(1), torch.ones(1, device="cuda")
+            )
+            assert torch.isfinite(captured.float()).all()
+            relative_l2 = (captured.float() - expected.float()).norm() / expected.float().norm()
+            assert relative_l2 < 0.005
+            if word is not None:
+                torch.testing.assert_close(
+                    word.view(torch.float32)[0],
+                    reference.float().abs().max(),
+                    atol=0.01,
+                    rtol=0.01,
+                )
+                high = (reference.float().abs().max() * 2).view(torch.int32)
+                word.copy_(high.reshape(1))
+                assert query_projection.fp8_query_gemm(*inputs, output, word)
+                assert torch.equal(word, high.reshape(1))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32

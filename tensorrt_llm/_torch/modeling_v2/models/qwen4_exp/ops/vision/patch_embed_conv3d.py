@@ -16,7 +16,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper, true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint: in_channels 3, kernel (temporal_patch_size 2, patch_size
 #: 16, 16), out_channels 1152 -- weight [1152, 3, 2, 16, 16], a 1536-pixel row.
@@ -40,7 +41,7 @@ class PatchEmbedConv3d(OpWrapper):
     caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: num_patches, dtype. The checkpoint's geometry, flat contiguous
     # rows and a bias: what the vision tower passes. The tower is replicated,

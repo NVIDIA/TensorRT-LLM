@@ -667,12 +667,22 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 def extract_router_config(server_cfg: dict) -> RouterConfig:
 
     args = server_cfg.pop("router", {})
-    router_type = args.pop("type", RouterConfig.type)
+    # create_router matches the type case-insensitively.
+    router_type = args.pop("type", RouterConfig.type).lower()
 
-    if router_type == "kv_cache_aware" and "model_path" not in args:
-        model_path = server_cfg.get("model")
-        if model_path is not None:
-            args["model_path"] = model_path
+    if router_type == "kv_cache_aware":
+        # The cache-aware router loads the servers' tokenizer and prompt renderer
+        # the way they do: from their model, at its revision, in their checkpoint
+        # format.
+        server_args = {
+            "model_path": server_cfg.get("model"),
+            "revision": server_cfg.get("revision",
+                                       server_cfg.get("hf_revision")),
+            "checkpoint_format": server_cfg.get("checkpoint_format"),
+        }
+        for key, value in server_args.items():
+            if value is not None:
+                args.setdefault(key, value)
 
     # add fields that are not specific to router
     extract_keys = [

@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 
 if TYPE_CHECKING:
-    from .mamba2_metadata import InforwardSnapshotSplit
+    from ..fla.gdn_metadata import InforwardSnapshotSplit
 
 # Elements per program along a row.
 _BLOCK = 4096

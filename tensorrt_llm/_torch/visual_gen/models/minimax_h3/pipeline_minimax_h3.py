@@ -398,6 +398,8 @@ class MiniMaxH3Pipeline(BasePipeline):
     @property
     def default_generation_params(self) -> dict:
         fastvideo_inference = getattr(self, "_fastvideo_inference", {})
+        dmd_steps = fastvideo_inference.get("dmd_denoising_steps")
+        default_steps = len(dmd_steps) + 1 if dmd_steps is not None else 50
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -405,7 +407,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
+            "num_inference_steps": int(
+                fastvideo_inference.get("num_inference_steps", default_steps)
+            ),
         }
 
     @property

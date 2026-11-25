@@ -17,45 +17,87 @@
 #       Upload the bundle to the branch-keyed path as a versioned copy, and (when
 #       promote_latest is "true", the default) also overwrite latest.tar.gz.
 #       Pass "false" (or set BOLT_PROMOTE_LATEST=false) to publish a versioned
-#       bundle for an OLD ref without repointing latest at it. Used by POSTMERGE.
+#       bundle for an OLD ref without repointing latest at it.
 #
 #   pull-latest <branch> <triple> <dest_dir>
 #       Download + extract a bundle for <branch>/<triple> into <dest_dir>.
 #       Honours BOLT_PROFILE_REF: when set, pulls the immutable
 #       bolt-profile-<ref>-<triple>.tar.gz instead of the mutable latest.tar.gz,
-#       so every consumer in a pipeline can be pinned to one bundle. Unset keeps
-#       today's behaviour.
+#       so every consumer in a pipeline can be pinned to one bundle.
+#       Exits 0 when the bundle is unpacked, 3 when neither location has it, and
+#       4 when the store could not be read.
 #
 #   resolve-latest <branch> <triple>
 #       Print the ref latest.tar.gz currently points at, for a caller that wants
-#       to pin the rest of a pipeline to it. Prints nothing if undeterminable.
+#       to pin the rest of a pipeline to it. Prints nothing when the store has no
+#       latest.tar.gz for <branch>/<triple>, or it names no ref; exits 0 either
+#       way, and 4 when the store could not be read.
 #
 # The premerge "override" case does NOT use promote: the gen recipe packages a
 # bundle locally and apply consumes it directly (run-scoped, never promoted).
 #
-# Artifactory layout (override via env):
-#   <REPO>/<PREFIX>/<branch>/<triple>/bolt-profile-<ref>-<triple>.tar.gz
-#   <REPO>/<PREFIX>/<branch>/<triple>/latest.tar.gz
-# Defaults match the BOLT profile store on urm.nvidia.com (sw-tensorrt-generic),
-# which jenkins/BoltProfileGen.groovy promotes to (PROFILE_PROMOTE_DIR).
+# Artifactory layout, the same in the repository of each location:
+#   <PREFIX>/<branch>/<triple>/bolt-profile-<ref>-<triple>.tar.gz
+#   <PREFIX>/<branch>/<triple>/latest.tar.gz
+# PREFIX is llm-artifacts/bolt-profiles unless BOLT_PROFILE_PREFIX replaces it.
+# CI's promotion (promoteBundle in jenkins/BoltProfileGen.groovy) writes this
+# layout cluster-side with curl, and labels latest.tar.gz with the properties
+# bolt.ref, bolt.branch, and bolt.triple in the request that uploads it.
 #
-# Auth:
-#   promote     -> `jf` (JFrog) CLI (write). If JF_URL + JF_ACCESS_TOKEN are set
-#                  this configures jf automatically; else assumes jf is
-#                  preconfigured. (The CI postmerge path in BoltProfileGen.groovy
-#                  instead uploads cluster-side via curl + urm-artifactory-creds.)
-#   pull-latest -> anonymous curl or wget (read) from the profile store on urm;
-#                  needs no creds and no jf, so it runs in a build pod as-is.
+# Reads (pull-latest, resolve-latest) go through the read helper,
+# jenkins/scripts/fetch_build_artifact.sh, found from the repository root
+# relative to this script. They ask for the legacy path
+# sw-tensorrt-generic/<PREFIX>/..., which the helper maps to each location: it
+# asks the primary location first and the other location only when the file is
+# absent there, never after a rejected request, and checks the SHA-1 of a
+# download. No read is anonymous on the aws location, and none goes around the
+# helper, so a caller provides what the helper reads from its environment:
+#   LLM_ARTIFACTS_PRIMARY      aws (the default) or urm
+#   ARTIFACTORY_NETRC          netrc file with the credential for the aws location
+#   ARTIFACTORY_CREDENTIAL_ID  name of the CI credential behind that file, which
+#                              the helper's message names when aws rejects it
+#
+# Writes:
+#   promote -> `jf` (JFrog) CLI, the developer path; CI does not use it. If
+#              JF_URL + JF_ACCESS_TOKEN are set this configures jf
+#              automatically; else assumes jf is preconfigured. Uploads to the
+#              repository BOLT_ARTIFACTORY_REPO (sw-tensorrt-llm-generic-local
+#              unless set) on the server jf is configured for.
 
 set -euo pipefail
 
-REPO="${BOLT_ARTIFACTORY_REPO:-sw-tensorrt-generic}"
+REPO="${BOLT_ARTIFACTORY_REPO:-sw-tensorrt-llm-generic-local}"
 PREFIX="${BOLT_PROFILE_PREFIX:-llm-artifacts/bolt-profiles}"
+# The repository name that starts a legacy path, as the read helper takes it.
+LEGACY_REPO="sw-tensorrt-generic"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts/bolt/internal
+FETCH_HELPER="$HERE/../../../jenkins/scripts/fetch_build_artifact.sh"
+
+# Exit statuses of the read helper, by the names the helper gives them.
+# tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
+FETCH_ABSENT=2
+FETCH_REJECTED=3
+FETCH_TRANSFER_FAILED=4
+FETCH_USAGE=64
+# Exit statuses of pull-latest and resolve-latest: neither location has the
+# bundle, and a read of the store was refused or failed.
+BOLT_NO_BUNDLE=3
+BOLT_STORE_UNREADABLE=4
 
 log()  { echo "[artifactory] $1" >&2; }
 die()  { echo "[artifactory][ERROR] $1" >&2; exit 2; }
+# fail <status> <message>: as die, with the exit status of a read.
+fail() { echo "[artifactory][ERROR] $2" >&2; exit "$1"; }
 
-promote_dir() { echo "${REPO}/${PREFIX}/$1/$2"; }   # <branch> <triple>
+# url_host <url>: prints the host, with its port, of a URL.
+url_host() {
+    local rest="${1#*://}"
+    echo "${rest%%/*}"
+}
+
+promote_dir() { echo "${REPO}/${PREFIX}/$1/$2"; }       # <branch> <triple>
+read_dir()    { echo "${LEGACY_REPO}/${PREFIX}/$1/$2"; }  # <branch> <triple>
 
 _ensure_jf() {
     command -v jf >/dev/null 2>&1 || die "jf (JFrog CLI) not found on PATH"
@@ -123,88 +165,149 @@ cmd_promote() {
     fi
 }
 
-# Print the ref that <branch>/<triple>'s latest.tar.gz currently points at, or
-# nothing when it cannot be determined. Read-only, anonymous, cheap.
-#
-# `promote` labels latest.tar.gz with a bolt.ref property in the same request that
-# uploads it, so the label and the bytes can never disagree. Bundles promoted
-# before that existed carry no property, hence the manifest fallback: download the
-# bundle (~1 MB) and read `ref` out of manifest.json. A caller that gets nothing
-# back should stay unpinned rather than guess.
-cmd_resolve_latest() {
-    local branch="${1:?resolve-latest: <branch> <triple>}"
-    local triple="${2:?triple required}"
-    local base="${BOLT_ARTIFACTORY_BASE:-https://urm.nvidia.com/artifactory}"
-    local path; path="$(promote_dir "$branch" "$triple")/latest.tar.gz"
+# Removes the directory that resolve-latest works in, however the script ends.
+WORK_DIR=""
+cleanup() {
+    if [[ -n "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT
 
-    local props ref=""
-    # --max-time as well as --connect-timeout: the caller runs this in
-    # preparation(), before any job launches, so a stalled transfer (connected,
-    # then silent) would hold the entire pipeline rather than fall back to
-    # unpinned. Bound the whole request, retries included.
-    props="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 --max-time 60 \
-                  "$base/api/storage/$path?properties" 2>/dev/null || true)"
-    # { "properties": { "bolt.ref": [ "<ref>" ] } } -- fixed, tiny shape, so a sed
-    # extraction avoids depending on python3 or jq, neither of which is guaranteed
-    # on every pod that might call this.
-    ref="$(printf '%s' "$props" \
-           | tr -d ' \n' \
-           | sed -n 's/.*"bolt\.ref":\["\([^"]*\)"\].*/\1/p')"
+# store_read [--properties] <path> <dest-file>, or store_read --exists <path>:
+# runs the read helper, which inherits its environment from the caller of this
+# script. Returns 0 when the helper wrote <dest-file>, and FETCH_ABSENT when
+# neither location has the file (with --properties: has properties for it).
+# Any other outcome ends the script with BOLT_STORE_UNREADABLE; the helper has
+# logged the cause by then, with the credential's name for a rejection. The
+# helper's stdout joins stderr, so that resolve-latest prints nothing but the
+# ref. With --exists the stdout is the answer, "<url> <sha1>" of the copy on
+# the first location that holds the file, so it is left alone; a caller that
+# captures it runs this in a subshell and has to end the script itself.
+store_read() {
+    local rc=0 reason
+    if [[ ! -f "$FETCH_HELPER" ]]; then
+        fail "$BOLT_STORE_UNREADABLE" "the read helper is missing: $FETCH_HELPER"
+    fi
+    if [[ "$1" == --exists ]]; then
+        bash "$FETCH_HELPER" "$@" || rc=$?
+    else
+        bash "$FETCH_HELPER" "$@" >&2 || rc=$?
+    fi
+    case "$rc" in
+        0 | "$FETCH_ABSENT") return "$rc" ;;
+        "$FETCH_REJECTED") reason="the primary location rejected the request" ;;
+        "$FETCH_TRANSFER_FAILED") reason="the transfer failed" ;;
+        "$FETCH_USAGE") reason="the read helper rejected its arguments or its environment" ;;
+        *) reason="the read helper ended unexpectedly" ;;
+    esac
+    fail "$BOLT_STORE_UNREADABLE" \
+        "the profile store could not be read: $reason (fetch_build_artifact.sh $* exited $rc)"
+}
+
+# Print the ref that <branch>/<triple>'s latest.tar.gz currently points at, or
+# nothing when the store has no latest.tar.gz or it names no ref.
+#
+# CI's promotion labels latest.tar.gz with a bolt.ref property in the same
+# request that uploads it, so the label and the bytes can never disagree. A
+# latest.tar.gz uploaded another way (`promote` here, for one) carries no
+# property, hence the manifest fallback: download the bundle (~1 MB) and read
+# `ref` out of manifest.json. A caller that gets nothing back should stay
+# unpinned rather than guess.
+#
+# The label has to be that of the copy that readers get. The helper asks the
+# primary location first, for the file and for its properties alike, but a
+# file without properties on the primary sends the properties lookup on to the
+# other location's copy. So the properties count only when they come from the
+# host that holds the file for readers; otherwise the manifest answers.
+#
+# No read has an overall time limit, so a caller that must not wait on a
+# stalled transfer bounds the call itself.
+cmd_resolve_latest() {
+    local usage="resolve-latest: <branch> <triple>"
+    local branch="${1:?$usage}"
+    shift
+    local triple="${1:?$usage}"
+    local path; path="$(read_dir "$branch" "$triple")/latest.tar.gz"
+    WORK_DIR="$(mktemp -d)"
+
+    local rc=0 ref="" held="" properties=""
+    held="$(store_read --exists "$path")" || rc=$?
+    if (( rc == FETCH_ABSENT )); then
+        log "no latest.tar.gz for $branch/$triple on either location"
+        return 0
+    elif (( rc != 0 )); then
+        exit "$rc"
+    fi
+
+    rc=0
+    store_read --properties "$path" "$WORK_DIR/properties.json" || rc=$?
+    if (( rc == 0 )); then
+        # { "properties": { "bolt.ref": [ "<ref>" ] }, "uri": "<storage URL>" } --
+        # fixed, tiny shape, so a sed extraction avoids depending on python3 or
+        # jq, neither of which is guaranteed on every pod that might call this.
+        properties="$(tr -d ' \n' < "$WORK_DIR/properties.json")"
+        if [[ "$(url_host "$(sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' <<<"$properties")")" \
+            == "$(url_host "${held%% *}")" ]]; then
+            ref="$(sed -n 's/.*"bolt\.ref":\["\([^"]*\)"\].*/\1/p' <<<"$properties")"
+        else
+            log "the properties of $path are another location's; not using them"
+        fi
+    fi
     if [[ -n "$ref" ]]; then
         printf '%s\n' "$ref"
         return 0
     fi
 
     log "no bolt.ref property on $path; falling back to the bundle manifest"
-    local tmp; tmp="$(mktemp -d)"
-    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 60 --max-time 300 \
-            -o "$tmp/latest.tar.gz" "$base/$path" 2>/dev/null \
-       && tar -xzf "$tmp/latest.tar.gz" -C "$tmp" manifest.json 2>/dev/null; then
-        ref="$(tr -d ' \n' < "$tmp/manifest.json" \
+    rc=0
+    store_read "$path" "$WORK_DIR/latest.tar.gz" || rc=$?
+    if (( rc == FETCH_ABSENT )); then
+        log "latest.tar.gz for $branch/$triple is no longer on either location"
+        return 0
+    fi
+    if tar -xzf "$WORK_DIR/latest.tar.gz" -C "$WORK_DIR" manifest.json 2>/dev/null; then
+        ref="$(tr -d ' \n' < "$WORK_DIR/manifest.json" \
                | sed -n 's/.*"ref":"\([^"]*\)".*/\1/p')"
     fi
-    rm -rf "$tmp"
-    [[ -n "$ref" ]] && printf '%s\n' "$ref"
+    if [[ -n "$ref" ]]; then
+        printf '%s\n' "$ref"
+    else
+        log "the manifest of $path names no ref"
+    fi
     return 0
 }
 
 cmd_pull_latest() {
-    local branch="${1:?pull-latest: <branch> <triple> <dest_dir>}"
-    local triple="${2:?triple required}"
-    local dest="${3:?dest_dir required}"
-    local base="${BOLT_ARTIFACTORY_BASE:-https://urm.nvidia.com/artifactory}"
-    # BOLT_PROFILE_REF pins this pull to one immutable bundle. Threaded as an env
-    # var rather than an argument so every existing call site keeps working: a
-    # caller opts into pinning by exporting it, and unset means today's behaviour.
-    local url
+    local usage="pull-latest: <branch> <triple> <dest_dir>"
+    local branch="${1:?$usage}"
+    shift
+    local triple="${1:?$usage}"
+    shift
+    local dest="${1:?$usage}"
+    # BOLT_PROFILE_REF pins this pull to one immutable bundle. It is an env var
+    # rather than an argument, so that a caller opts into pinning by exporting it
+    # and every call site that does not takes latest.tar.gz.
+    local path
     if [[ -n "${BOLT_PROFILE_REF:-}" ]]; then
-        url="$base/$(promote_dir "$branch" "$triple")/bolt-profile-${BOLT_PROFILE_REF}-${triple}.tar.gz"
+        path="$(read_dir "$branch" "$triple")/bolt-profile-${BOLT_PROFILE_REF}-${triple}.tar.gz"
         log "Pinned to ${BOLT_PROFILE_REF}"
     else
-        url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
+        path="$(read_dir "$branch" "$triple")/latest.tar.gz"
     fi
     mkdir -p "$dest"
-    log "Pulling $url -> $dest"
-    # Anonymous download: reading the profile store needs no creds, so this works in
-    # a build pod without a configured `jf`. Use curl if present, else fall back to
-    # wget -- the image-overlay build pod (BuildDockerImage.overlayBoltBundle) has no
-    # curl, so hard-requiring curl made the overlay fail (curl: command not found)
-    # even though the bundle existed. --retry rides out flaky links; a missing object
-    # 404s -> die (fatal for the premerge consumer).
-    if command -v curl >/dev/null 2>&1; then
-        curl -fSL --retry 5 --retry-all-errors --retry-delay 10 \
-             --connect-timeout 60 -o "$dest/latest.tar.gz" "$url" \
-            || die "no promoted bundle at $url (branch may have none yet)"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --tries=5 --waitretry=10 --timeout=60 \
-             -O "$dest/latest.tar.gz" "$url" \
-            || die "no promoted bundle at $url (branch may have none yet)"
-    else
-        die "neither curl nor wget is available to download $url"
+    log "Pulling $path -> $dest"
+    # The helper retries a transient failure itself, so one call decides: the
+    # bundle is here, neither location has it, or the store cannot be read.
+    local rc=0
+    store_read "$path" "$dest/latest.tar.gz" || rc=$?
+    if (( rc == FETCH_ABSENT )); then
+        fail "$BOLT_NO_BUNDLE" \
+            "no promoted bundle at $path on either location (branch may have none yet)"
     fi
     tar -xzf "$dest/latest.tar.gz" -C "$dest"
     rm -f "$dest/latest.tar.gz"
-    log "Extracted latest bundle into $dest"
+    log "Extracted the bundle into $dest"
 }
 
 case "${1:-}" in
