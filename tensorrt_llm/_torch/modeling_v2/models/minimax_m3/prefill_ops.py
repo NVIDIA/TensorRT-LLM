@@ -94,7 +94,8 @@ def run_prefill_attention(
         )
         if horizontal is None:
             raise RuntimeError(
-                f"MiniMax-M3 sparse layer {layer}: no compatible horizontal producer"
+                f"MiniMax-M3 sparse layer {layer}: the horizontal producer requires an FP8 or "
+                "NVFP4 HND pool with an FP8 index-K cache"
             )
         q, idx_q = horizontal
         k = v = None

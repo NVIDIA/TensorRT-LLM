@@ -2897,10 +2897,13 @@ def _draft_attention_boundary(qkv, output, draft_key: str) -> None:
 _draft_attention_eager = eager_on_graph(_draft_attention_boundary)
 
 
-def _prefill_routed_chunks(core, i: int, x, router_logits):
-    """The finalized routed experts of a prefill MoE from the bf16 activation over at most ``moe_max_num_tokens``
-    rows per runner call: the MoE scheduler's even split, even chunks on the MoE chunking stream. Compiled prefill
-    runs it inside ``prefill_routed_experts``."""
+def _run_routed_chunks(
+    core: MiniMaxM3Tp2ModelingV2, i: int, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    """Run finalized routed experts in balanced chunks limited by ``moe_max_num_tokens``.
+
+    Even chunks use the auxiliary MoE chunking stream when available.
+    """
     rows = x.shape[0]
     num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
     if num_chunks <= 1:
@@ -2944,7 +2947,7 @@ class PrefillTarget:
             _sparse_qkv_producer,
             _msa_attention_live,
             _fp8_index_qk_norm_rope,
-            _prefill_routed_chunks,
+            _run_routed_chunks,
         )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
@@ -3009,14 +3012,13 @@ class PrefillTarget:
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation in ``moe_max_num_tokens``-row runner calls
-        (``_prefill_routed_chunks``)."""
+    def _routed_chunks(self, i: int, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """Run routed experts, keeping the chunk loop outside the compiled graph."""
         core = self.core
         if is_torch_compiling() and core.moe_max_num_tokens < core.max_num_tokens:
             # One op for any number of chunks: the graph neither unrolls them nor guards on their count.
             return prefill_routed_experts(x, router_logits, self._core_key, i)
-        return _prefill_routed_chunks(core, i, x, router_logits)
+        return _run_routed_chunks(core, i, x, router_logits)
 
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: on ``ROUTER_TC_GEN``'s rows the TF32 tensor-core router with the
@@ -3708,35 +3710,6 @@ class DecodeTarget:
             act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call: the MoE
-        scheduler's even split, even chunks on the MoE chunking stream."""
-        core = self.core
-        rows = x.shape[0]
-        num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
-        if num_chunks <= 1:
-            return _routed_experts(core, i, x, None, router_logits, True)
-        sizes = _split_chunk(rows, num_chunks)
-        xs, logits = x.split(sizes), router_logits.split(sizes)
-        aux = core.aux_stream_moe_chunk
-        ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
-        outs: List[torch.Tensor] = []
-        for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
-                with torch.cuda.stream(aux):
-                    outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-            else:
-                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
-        return torch.cat(outs)
-
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: on ``ROUTER_TC_GEN``'s rows the TF32 tensor-core router with the
         experts' NVFP4 activation fused in (one runner call: the rows are within ``moe_max_num_tokens``), else the
@@ -3746,7 +3719,7 @@ class DecodeTarget:
         if fused is not None:
             logits, x_fp4, x_sf = fused
             return _routed_experts(core, i, x_fp4, x_sf, logits, True)
-        return self._routed_chunks(i, h, _decode_router_logits(core, i, h))
+        return _run_routed_chunks(core, i, h, _decode_router_logits(core, i, h))
 
     def _moe(self, i: int, h: torch.Tensor, *, return_parts: bool, push=None):
         """The MoE block of layer ``i`` without its reduction.

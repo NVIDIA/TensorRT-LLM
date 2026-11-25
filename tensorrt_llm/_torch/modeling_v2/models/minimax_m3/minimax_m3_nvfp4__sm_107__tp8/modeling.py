@@ -2754,10 +2754,13 @@ def _msa_attention_live(
     )
 
 
-def _prefill_routed_chunks(core, i: int, x, router_logits):
-    """The finalized routed experts of a prefill MoE from the bf16 activation over at most ``moe_max_num_tokens``
-    rows per runner call: the MoE scheduler's even split, even chunks on the MoE chunking stream. Compiled prefill
-    runs it inside ``prefill_routed_experts``."""
+def _run_routed_chunks(
+    core: MiniMaxM3Tp8ModelingV2, i: int, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    """Run finalized routed experts in balanced chunks limited by ``moe_max_num_tokens``.
+
+    Even chunks use the auxiliary MoE chunking stream when available.
+    """
     rows = x.shape[0]
     num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
     if num_chunks <= 1:
@@ -2797,7 +2800,7 @@ class PrefillTarget:
             _sparse_qkv_producer,
             _msa_attention_live,
             _fp8_index_qk_norm_rope,
-            _prefill_routed_chunks,
+            _run_routed_chunks,
         )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
@@ -2834,10 +2837,11 @@ class PrefillTarget:
     ):
         """``capture_target`` is the decode boundaries' (unused: no prefill boundary writes a capture norm)."""
         core = self.core
-        # The compiled path uses its own boundary even inside a breakable context.
+        # Check the compilation policy before reading the breakable graph context.
         if not is_torch_compiling() and is_in_breakable_cuda_graph():
             raise RuntimeError(
-                "this MiniMax-M3 target does not run under piecewise (breakable) prefill CUDA graphs"
+                "This MiniMax-M3 target does not support prefill_cuda_graph_backend='breakable'. "
+                "Use prefill_cuda_graph_backend='piecewise'."
             )
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
@@ -2867,14 +2871,13 @@ class PrefillTarget:
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation in ``moe_max_num_tokens``-row runner calls
-        (``_prefill_routed_chunks``)."""
+    def _routed_chunks(self, i: int, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """Run routed experts, keeping the chunk loop outside the compiled graph."""
         core = self.core
         if is_torch_compiling() and core.moe_max_num_tokens < core.max_num_tokens:
             # One op for any number of chunks: the graph neither unrolls them nor guards on their count.
             return prefill_routed_experts(x, router_logits, self._core_key, i)
-        return _prefill_routed_chunks(core, i, x, router_logits)
+        return _run_routed_chunks(core, i, x, router_logits)
 
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: the router logits and the experts quantizing their bf16 input
@@ -3160,7 +3163,8 @@ class DecodeTarget:
         else:
             if is_in_breakable_cuda_graph():
                 raise RuntimeError(
-                    "this MiniMax-M3 target does not run under piecewise (breakable) CUDA graphs"
+                    "This MiniMax-M3 target does not support prefill_cuda_graph_backend='breakable'. "
+                    "Use prefill_cuda_graph_backend='piecewise'."
                 )
             plan = None
             _record("decode", int(step["num_tokens"]), "generic")
@@ -3463,39 +3467,10 @@ class DecodeTarget:
             act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call: the MoE
-        scheduler's even split, even chunks on the MoE chunking stream."""
-        core = self.core
-        rows = x.shape[0]
-        num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
-        if num_chunks <= 1:
-            return _routed_experts(core, i, x, None, router_logits, True)
-        sizes = _split_chunk(rows, num_chunks)
-        xs, logits = x.split(sizes), router_logits.split(sizes)
-        aux = core.aux_stream_moe_chunk
-        ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
-        outs: List[torch.Tensor] = []
-        for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
-                with torch.cuda.stream(aux):
-                    outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-            else:
-                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
-        return torch.cat(outs)
-
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: the router logits (the TF32 tensor-core router on ``ROUTER_TC_GEN``'s
         rows, else the fp32 router) and the experts quantizing their bf16 input (chunked)."""
-        return self._routed_chunks(i, h, _decode_router_logits(self.core, i, h))
+        return _run_routed_chunks(self.core, i, h, _decode_router_logits(self.core, i, h))
 
     def _moe(self, i: int, h: torch.Tensor, *, return_parts: bool, push=None):
         """The MoE block of layer ``i`` without its reduction.
