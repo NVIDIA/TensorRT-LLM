@@ -15,6 +15,7 @@
 
 import importlib
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
 from dataclasses import dataclass
@@ -735,6 +736,11 @@ _QWEN3_MODEL_TYPES = frozenset({
     "qwen3_next",
 })
 
+# An empty, closed reasoning block, such as the "<think>\n\n</think>" that
+# Qwen3-Reranker prefills, opens no reasoning. "\\n" is a newline escaped in a
+# Jinja string literal.
+_EMPTY_THINK_BLOCK = re.compile(r"<think>(?:\s|\\n)*</think>")
+
 # DeepSeek types that 'auto' maps to "deepseek-r1" only when the model name
 # contains "R1"; their other checkpoints cannot be detected.
 DEEPSEEK_R1_ONLY_MODEL_TYPES = frozenset({"deepseek_v3", "deepseek_v32"})
@@ -826,7 +832,8 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
       always injects ``<think>`` in the generation prompt without any toggle.
       → use the ``"deepseek-r1"`` parser (``reasoning_at_start=True``).
     - **Forced-non-thinking** (e.g. Qwen3-235B-A22B-Instruct-2507): the
-      template never injects ``<think>``.
+      template never injects ``<think>``, or only an empty, closed
+      ``<think></think>`` block (e.g. Qwen3-Reranker).
       → no reasoning parser needed.
 
     Only a template that was actually read can establish the last case; a
@@ -847,7 +854,7 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
         # Hybrid model: has enable_thinking toggle.
         return AutoReasoningParserResult("qwen3")
 
-    if "<think>" in chat_template:
+    if "<think>" in _EMPTY_THINK_BLOCK.sub("", chat_template):
         # Forced-thinking model: always injects <think> tag.
         logger.info(
             "Detected forced-thinking Qwen3 model (no enable_thinking "
@@ -855,10 +862,11 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
             "Using 'deepseek-r1' reasoning parser.", )
         return AutoReasoningParserResult("deepseek-r1")
 
-    # Forced-non-thinking model: no <think> tag at all.
+    # Forced-non-thinking model: no <think> tag, or only empty blocks.
     logger.info(
-        "Detected forced-non-thinking Qwen3 model (no <think> tag in "
-        "chat template). No reasoning parser needed.", )
+        "Detected forced-non-thinking Qwen3 model (no <think> tag other "
+        "than empty <think></think> blocks in chat template). No reasoning "
+        "parser needed.", )
     return AutoReasoningParserResult(None, no_parser_needed=True)
 
 

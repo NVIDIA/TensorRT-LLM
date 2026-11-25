@@ -981,16 +981,16 @@ def test_auto_detect_qwen3_named_templates(tmp_path):
                                 "chat_template": [
                                     {
                                         "name": "tool_use",
-                                        "template": _FORCED_THINKING_TEMPLATE
+                                        "template": _HYBRID_TEMPLATE
                                     },
                                     {
                                         "name": "default",
-                                        "template": _HYBRID_TEMPLATE
+                                        "template": _FORCED_THINKING_TEMPLATE
                                     },
                                 ]
                             })
 
-    assert resolve_auto_reasoning_parser(model_dir) == "qwen3"
+    assert resolve_auto_reasoning_parser(model_dir) == "deepseek-r1"
 
 
 def test_auto_detect_qwen3_template_in_chat_template_json(tmp_path):
@@ -1002,6 +1002,20 @@ def test_auto_detect_qwen3_template_in_chat_template_json(tmp_path):
         chat_template_json={"chat_template": _FORCED_THINKING_TEMPLATE})
 
     assert resolve_auto_reasoning_parser(model_dir) == "deepseek-r1"
+
+
+def test_detect_qwen3_tokenizer_config_precedes_chat_template_json(tmp_path):
+    """tokenizer_config.json wins over chat_template.json."""
+    model_dir = str(tmp_path / "Qwen3-precedence")
+    _write_qwen3_checkpoint(
+        model_dir,
+        "qwen3_moe",
+        tokenizer_config={"chat_template": _FORCED_NON_THINKING_TEMPLATE},
+        chat_template_json={"chat_template": _FORCED_THINKING_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None, no_parser_needed=True)
+    assert resolve_auto_reasoning_parser(model_dir) is None
 
 
 def test_auto_detect_qwen3_no_chat_template_anywhere(tmp_path):
@@ -1076,6 +1090,33 @@ def test_detect_qwen3_forced_non_thinking_needs_no_parser(tmp_path, files):
     detected = detect_auto_reasoning_parser(model_dir)
     assert detected == AutoReasoningParserResult(None, no_parser_needed=True)
     assert resolve_auto_reasoning_parser(model_dir) is None
+
+
+# Qwen3-Reranker layout: chat_template.jinja prefills an empty, closed
+# reasoning block, and tokenizer_config.json keeps the hybrid template.
+_EMPTY_THINK_PREFILL_TEMPLATE = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+@pytest.mark.parametrize(("jinja", "expected"), [
+    pytest.param(_EMPTY_THINK_PREFILL_TEMPLATE, None, id="newlines"),
+    pytest.param("{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}",
+                 None,
+                 id="escaped_newlines"),
+    pytest.param(_EMPTY_THINK_PREFILL_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="with_open_block"),
+])
+def test_detect_qwen3_empty_think_prefill(tmp_path, jinja, expected):
+    """An empty, closed <think></think> block does not open reasoning."""
+    model_dir = str(tmp_path / "Qwen3-Reranker")
+    _write_qwen3_checkpoint(
+        model_dir,
+        jinja=jinja,
+        tokenizer_config={"chat_template": _HYBRID_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        expected, no_parser_needed=expected is None)
+    assert resolve_auto_reasoning_parser(model_dir) == expected
 
 
 @pytest.mark.parametrize(("name", "model_type"), [
