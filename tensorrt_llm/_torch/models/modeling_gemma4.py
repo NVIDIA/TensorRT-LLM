@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import functools
 import math
+import os
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
@@ -77,6 +78,7 @@ from ..modules.linear import (
     WeightsLoadingConfig,
 )
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
@@ -1443,6 +1445,11 @@ class Gemma4TextModel(DecoderModel):
         for prev_layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
             object.__setattr__(prev_layer, "_next_input_layernorm", next_layer.input_layernorm)
             object.__setattr__(prev_layer, "_next_qkv_proj", next_layer.self_attn.qkv_proj)
+        # The KV-shared layers trail the stack; without any, this is the layer count.
+        self.num_kv_writing_layers = next(
+            (idx for idx, layer in enumerate(self.layers) if layer.is_kv_shared_layer),
+            len(self.layers),
+        )
 
         self.norm = RMSNorm(
             hidden_size=pretrained.hidden_size,
@@ -1554,10 +1561,34 @@ class Gemma4TextModel(DecoderModel):
         local_variable_window_token_starts: Optional[torch.Tensor] = None,
         local_variable_window_token_ends: Optional[torch.Tensor] = None,
         ple_input_ids: Optional[torch.IntTensor] = None,
+        last_rows_only: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        """Run the decoder layers and the final norm.
+
+        Args:
+            last_rows_only: Return the last row of every sequence only. The KV-shared layers,
+                which write no K/V, then run on those rows alone. It needs causal attention, a
+                step that ``attn_metadata.can_present_last_rows()`` holds for, and a model
+                whose trailing layers, but not all layers, are KV-shared.
+
+        Returns:
+            Normalized hidden states [num_tokens, hidden_size]; [num_seqs, hidden_size] with
+            ``last_rows_only``.
+        """
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        num_layers = len(self.layers)
+        num_full_layers = self.num_kv_writing_layers if last_rows_only else num_layers
+        if last_rows_only and (
+            not 0 < num_full_layers < num_layers
+            or local_attention_mask_data is not None
+            or local_variable_window_token_starts is not None
+        ):
+            raise ValueError(
+                "last_rows_only needs causal attention and trailing, but not only, "
+                "KV-shared layers."
+            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1575,8 +1606,74 @@ class Gemma4TextModel(DecoderModel):
         ple_ids = ple_input_ids if ple_input_ids is not None else input_ids
         per_layer_inputs = self._compute_per_layer_inputs(ple_ids, hidden_states)
 
-        pre_normed = None
-        for i, decoder_layer in enumerate(self.layers):
+        hidden_states, pre_normed = self._forward_layers(
+            range(num_full_layers),
+            hidden_states,
+            None,
+            attn_metadata,
+            position_ids,
+            per_layer_inputs,
+            local_attention_mask_data,
+            local_variable_window_token_starts,
+            local_variable_window_token_ends,
+            **kwargs,
+        )
+        if last_rows_only:
+            # The K/V that the KV-shared layers read is written: they compute the last row of
+            # every sequence from the same rows of their inputs.
+            last_rows = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            hidden_states = hidden_states.index_select(0, last_rows)
+            if pre_normed is not None:
+                # An FP8 input norm does not follow the rows: the layer computes its own.
+                pre_normed = (
+                    pre_normed.index_select(0, last_rows)
+                    if pre_normed.dtype == hidden_states.dtype
+                    else None
+                )
+            if per_layer_inputs is not None:
+                per_layer_inputs = per_layer_inputs.index_select(0, last_rows)
+            if position_ids is not None:
+                position_ids = position_ids[..., last_rows]
+            with attn_metadata.presented_last_rows() as last_rows_metadata:
+                hidden_states, _ = self._forward_layers(
+                    range(num_full_layers, num_layers),
+                    hidden_states,
+                    pre_normed,
+                    last_rows_metadata,
+                    position_ids,
+                    per_layer_inputs,
+                    **kwargs,
+                )
+
+        if hidden_states.dtype != self.dtype:
+            hidden_states = hidden_states.to(self.dtype)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def _forward_layers(
+        self,
+        layer_indices: range,
+        hidden_states: torch.Tensor,
+        pre_normed: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        position_ids: Optional[torch.IntTensor],
+        per_layer_inputs: Optional[torch.Tensor],
+        local_attention_mask_data: Optional[torch.Tensor] = None,
+        local_variable_window_token_starts: Optional[torch.Tensor] = None,
+        local_variable_window_token_ends: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run the layers of ``layer_indices`` on rows that ``attn_metadata`` describes.
+
+        Args:
+            pre_normed: The first layer's input norm of ``hidden_states``, if already computed.
+            per_layer_inputs: [num_rows, num_layers, ple_dim], or None without per-layer inputs.
+
+        Returns:
+            The hidden states and, from a fused layer tail, the input norm of the next layer.
+        """
+        for i in layer_indices:
+            decoder_layer = self.layers[i]
             per_layer_input = per_layer_inputs[:, i, :] if per_layer_inputs is not None else None
 
             layer_out = decoder_layer(
@@ -1602,11 +1699,7 @@ class Gemma4TextModel(DecoderModel):
                 hidden_states, pre_normed = layer_out
             else:
                 hidden_states, pre_normed = layer_out, None
-
-        if hidden_states.dtype != self.dtype:
-            hidden_states = hidden_states.to(self.dtype)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states, pre_normed
 
 
 @register_auto_model("Gemma4ForCausalLM")
@@ -1637,6 +1730,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         )
         super().__init__(Gemma4TextModel(model_config), model_config)
         self.logits_processor.allow_context_logits_plan = False
+        # Opt-in: prefill runs the KV-shared layers on the last row of every sequence only
+        # (see _reads_last_rows_only).
+        self.kv_shared_last_rows_enabled = (
+            os.environ.get("TRTLLM_GEMMA4_KV_SHARED_LAST_ROWS_ENABLED", "0") == "1"
+        )
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -1838,6 +1936,40 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             metadata=attn_metadata,
         )
 
+    def _reads_last_rows_only(
+        self,
+        attn_metadata: AttentionMetadata,
+        return_context_logits: bool,
+        spec_metadata: Optional[SpecMetadata],
+        has_local_mask: bool,
+        has_lora: bool,
+    ) -> bool:
+        """Whether a step reads only the last row of every sequence from the KV-shared layers.
+
+        Such a step runs them on those rows alone (``Gemma4TextModel.forward`` with
+        ``last_rows_only``), where ``TRTLLM_GEMMA4_KV_SHARED_LAST_ROWS_ENABLED=1`` enabled it.
+        Every row is needed for context logits, by a speculative decoding worker and for its
+        captured hidden states. A step with LoRA adapters, with attention DP, with a
+        bidirectional mask or under a compiled or captured forward keeps every row as well:
+        their inputs are laid out for the full rows.
+        """
+        return (
+            self.kv_shared_last_rows_enabled
+            and 0 < self.model.num_kv_writing_layers < len(self.model.layers)
+            and attn_metadata.num_contexts > 0
+            and attn_metadata.num_tokens > attn_metadata.num_seqs
+            and not return_context_logits
+            and self.spec_worker is None
+            and spec_metadata is None
+            and not has_local_mask
+            and not has_lora
+            and attn_metadata.padded_num_tokens is None
+            and not self.model_config.mapping.enable_attention_dp
+            and not is_torch_compiling()
+            and not is_in_breakable_cuda_graph()
+            and attn_metadata.can_present_last_rows()
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1889,6 +2021,13 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                     effective_sliding_window=self.config.sliding_window,
                 )
 
+        last_rows_only = self._reads_last_rows_only(
+            attn_metadata,
+            return_context_logits,
+            spec_metadata,
+            has_local_mask=needs_bidir,
+            has_lora=bool(kwargs.get("lora_params")),
+        )
         output = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1898,6 +2037,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             local_variable_window_token_starts=local_variable_window_token_starts,
             local_variable_window_token_ends=local_variable_window_token_ends,
             ple_input_ids=kwargs.pop("ple_input_ids", None),
+            last_rows_only=last_rows_only,
             **kwargs,
         )
 
@@ -1921,7 +2061,8 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             output,
             self.lm_head,
             attn_metadata,
-            return_context_logits,
+            # With last_rows_only the model returned the last row of every sequence already.
+            return_context_logits or last_rows_only,
         )
 
         # Logit softcapping

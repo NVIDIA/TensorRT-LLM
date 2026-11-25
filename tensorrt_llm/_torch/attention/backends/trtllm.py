@@ -1376,6 +1376,51 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def can_present_last_rows(self) -> bool:
+        """Whether ``presented_last_rows`` can present this prepared step.
+
+        It needs a paged KV cache and one query token per generation request,
+        and leaves out the layouts whose generation calls read more than the KV
+        lengths and block tables: CUDA graphs, beam search, speculative
+        decoding, Helix and locality domains.
+        """
+        return (self.kv_cache_manager is not None and not self.is_cross
+                and not self.is_cuda_graph and self.beam_width == 1
+                and not self.use_spec_decoding and not self.enable_helix
+                and not self.locality_domain_enabled and
+                self.num_tokens - self.num_ctx_tokens == self.num_generations)
+
+    @contextlib.contextmanager
+    def presented_last_rows(self) -> Iterator["TrtllmAttentionMetadata"]:
+        """Temporarily present every sequence as a generation request of one query token, its last.
+
+        prepare() left the KV length and the block table of every sequence as
+        this step leaves them, and a generation call reads exactly those, so
+        only the phase split changes: no context request and ``num_seqs``
+        generation requests. This metadata itself is yielded and restored on
+        exit.
+        """
+        num_seqs = self.num_seqs
+        saved = (self._num_contexts, self._num_generations,
+                 self._num_ctx_tokens, self._num_tokens,
+                 self.host_request_types_runtime, self.host_total_kv_lens)
+        try:
+            # The public setters call on_update(), which would recompute the
+            # token counts from seq_lens.
+            self._num_contexts = 0
+            self._num_generations = num_seqs
+            self._num_ctx_tokens = 0
+            self._num_tokens = num_seqs
+            self.host_request_types_runtime = torch.ones_like(
+                self.host_request_types_runtime)
+            self.host_total_kv_lens = torch.tensor(
+                [0, int(self.host_total_kv_lens.sum())], dtype=torch.int)
+            yield self
+        finally:
+            (self._num_contexts, self._num_generations, self._num_ctx_tokens,
+             self._num_tokens, self.host_request_types_runtime,
+             self.host_total_kv_lens) = saved
+
     def _upload_to_device(self, key: str, destination: torch.Tensor,
                           value: torch.Tensor, engine_staging: bool) -> bool:
         """Copy host ``value`` into ``destination`` through the runner's uploader, unless the

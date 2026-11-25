@@ -469,6 +469,30 @@ draft-cap allocation width. Ragged generation is not supported with FlashMLA:
 its tile schedule uses a request-major scalar query width, so the backend
 rejects that combination before scheduling or dispatch.
 
+#### 3.1.2 Last-row presentation
+
+A layer that writes no K/V (a Q-only layer over the K/V of another layer, such
+as a Gemma4 KV-shared layer) can compute only the last output row of every
+sequence of a prepared step. `AttentionMetadata.presented_last_rows()` yields
+the metadata for that call: a generation-only step in which every sequence,
+context or generation, is one request with one query token and the KV length
+the step leaves it with. The caller passes the last row of every sequence as
+the query, after the layers that write the K/V have run on the step's own
+metadata, and only where `can_present_last_rows()` holds. Gemma4 does so for
+the prefill of its KV-shared layers when
+`TRTLLM_GEMMA4_KV_SHARED_LAST_ROWS_ENABLED=1` is set.
+
+`TrtllmAttentionMetadata` presents itself in place: `prepare()` already holds
+the KV lengths and block tables a generation call reads, so only the phase
+split (`num_contexts`, `num_generations`, the token counts and the host request
+types) changes inside the `with` block. `FlashInferAttentionMetadata` plans
+decode calls from the page table of its generation requests, so it prepares a
+second metadata object over the same KV cache manager, created on first use.
+Neither presents CUDA graph metadata, cross attention, or a step whose
+generation requests carry more than one query token; TRTLLM also leaves out
+beam search, speculative decoding, Helix and locality domains, and FlashInfer
+draft views, reservation-width page tables and mixed-precision staging.
+
 ### 3.2 KV-cache and decode-time semantics
 
 The main question is not just "does the backend read K and V?" but:

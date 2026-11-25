@@ -19,20 +19,28 @@ transformers>=5.5.0 Gemma4 support.
 """
 
 import math
+import os
+import statistics
 import tempfile
+import time
 import unittest
 import unittest.mock
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
-from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends import (
+    AttentionMetadata,
+    FlashInferAttention,
+    FlashInferAttentionMetadata,
+)
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -60,10 +68,14 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
+    from transformers.cache_utils import DynamicCache
+
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 _FLASHINFER_WORKSPACE_BYTES = 320 * 1024 * 1024
 _TRTLLM_GEN_TOKENS_PER_BLOCK = 32
+# "1" opts a Gemma4ForCausalLM built under it into the KV-shared row pruning.
+_KV_SHARED_LAST_ROWS_ENV = "TRTLLM_GEMMA4_KV_SHARED_LAST_ROWS_ENABLED"
 
 # ---------------------------------------------------------------------------
 # Small test configs
@@ -1163,6 +1175,32 @@ GEMMA4_26B_REAL_DIMS_CONFIG = {
     "attention_k_eq_v": True,
 }
 
+# E2B/E4B layer pattern at real head dims: PLE, and KV sharing with the double-wide MLP. Layers
+# 8-11 read the K/V of layer 7 (sliding) and layer 5 (full).
+GEMMA4_KV_SHARED_PLE_CONFIG = {
+    **GEMMA4_E2B_REAL_DIMS_CONFIG,
+    "num_hidden_layers": 12,
+    "num_kv_shared_layers": 4,
+    "hidden_size_per_layer_input": 32,
+    "vocab_size_per_layer_input": 1024,
+    "use_double_wide_mlp": True,
+}
+
+# Text geometry of google/gemma-4-E4B-it with a small vocabulary: 42 layers, the last 18 of
+# them KV-shared. About 4 billion parameters.
+GEMMA4_E4B_GEOMETRY_CONFIG = {
+    **GEMMA4_E2B_REAL_DIMS_CONFIG,
+    "hidden_size": 2560,
+    "intermediate_size": 10240,
+    "num_hidden_layers": 42,
+    "num_key_value_heads": 2,
+    "max_position_embeddings": 4096,
+    "sliding_window": 512,
+    "num_kv_shared_layers": 18,
+    "hidden_size_per_layer_input": 256,
+    "vocab_size_per_layer_input": 1024,
+}
+
 
 class TestGemma4HeterogeneousKVCacheLayout(unittest.TestCase):
     """Regression tests for Transformers per-layer config KV geometry."""
@@ -1290,6 +1328,92 @@ def _build_gemma4_kv_cache_manager(
         mapping=mapping,
         dtype=kv_dtype,
     )
+
+
+class _LayerRows(NamedTuple):
+    """Row counts of one decoder layer call; None for an input the layer did not receive."""
+
+    is_kv_shared: bool
+    hidden_states: int
+    per_layer_input: int | None
+    pre_normed: int | None
+    output: int
+    # Whether the layer's fused tail also returned the input norm of the next layer.
+    returns_next_input_norm: bool
+
+
+@contextmanager
+def _record_decoder_layer_rows(model: Gemma4ForCausalLM) -> Iterator[list[_LayerRows]]:
+    """Record the row counts every decoder layer of ``model`` receives and returns, in call order."""
+    records: list[_LayerRows] = []
+
+    def record(layer: Gemma4DecoderLayer, args: tuple, kwargs: dict, output: object) -> None:
+        def rows(tensor: torch.Tensor | None) -> int | None:
+            return None if tensor is None else tensor.shape[0]
+
+        hidden_states = output[0] if isinstance(output, tuple) else output
+        records.append(
+            _LayerRows(
+                is_kv_shared=layer.is_kv_shared_layer,
+                hidden_states=kwargs["hidden_states"].shape[0],
+                per_layer_input=rows(kwargs.get("per_layer_input")),
+                pre_normed=rows(kwargs.get("pre_normed")),
+                output=hidden_states.shape[0],
+                returns_next_input_norm=isinstance(output, tuple),
+            )
+        )
+
+    hooks = [layer.register_forward_hook(record, with_kwargs=True) for layer in model.model.layers]
+    try:
+        yield records
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def _prepare_gemma4_step(
+    attn_backend: str,
+    kv_cache_manager: "KVCacheManagerV2",
+    request_ids: list[int],
+    token_ids: list[torch.Tensor],
+    num_cached_tokens: list[int],
+    num_contexts: int,
+    prompt_lens: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, AttentionMetadata]:
+    """Build the inputs of one step and its attention metadata; call ``prepare()`` before a forward.
+
+    Args:
+        token_ids: The new tokens of every sequence, context sequences first.
+        num_cached_tokens: The tokens every sequence already holds in the KV cache.
+        num_contexts: The number of context sequences.
+        prompt_lens: The prompt length of every sequence; by default its number of new tokens.
+
+    Returns:
+        (input_ids [num_tokens], position_ids [1, num_tokens], attention metadata).
+    """
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+
+    seq_lens = [ids.numel() for ids in token_ids]
+    device = token_ids[0].device
+    position_ids = torch.cat(
+        [
+            torch.arange(cached, cached + seq_len, dtype=torch.int32, device=device)
+            for cached, seq_len in zip(num_cached_tokens, seq_lens, strict=True)
+        ]
+    ).unsqueeze(0)
+    attn_metadata = get_attention_backend(attn_backend).Metadata(
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+        num_contexts=num_contexts,
+        kv_cache_params=KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=list(num_cached_tokens)
+        ),
+        max_num_requests=len(request_ids),
+        max_num_tokens=max(8192, sum(seq_lens)),
+        kv_cache_manager=kv_cache_manager,
+        request_ids=list(request_ids),
+        prompt_lens=list(prompt_lens if prompt_lens is not None else seq_lens),
+    )
+    return torch.cat(token_ids), position_ids, attn_metadata
 
 
 class TestGemma4HFComparison(unittest.TestCase):
@@ -1975,6 +2099,427 @@ class TestGemma4HFComparison(unittest.TestCase):
         pool buffers, causing out-of-bounds access.
         """
         self._run_full_model_comparison(deepcopy(GEMMA4_E4B_LIKE_CONFIG))
+
+    # ---- KV-shared row pruning: the KV-shared layers run on the last row of every sequence ----
+
+    @staticmethod
+    def _row_pruning_backends() -> list[str]:
+        """Attention backends that serve Q-only KV-shared layers on this GPU."""
+        return ["FLASHINFER", "TRTLLM"] if is_sm_100f() else ["FLASHINFER"]
+
+    @staticmethod
+    def _token_ids(*token_ids: int) -> torch.Tensor:
+        return torch.tensor(token_ids, dtype=torch.int32, device="cuda")
+
+    def _make_row_pruning_models(
+        self, config_dict: dict, attn_backend: str
+    ) -> tuple[torch.nn.Module, Gemma4ForCausalLM, Gemma4TextConfig]:
+        """Paired HF and TRT-LLM models, the TRT-LLM one opted into the row pruning.
+
+        Its layer scalars are FP32, as a loaded checkpoint leaves them: the fused layer tails
+        then hand the next layer its input norm.
+        """
+        with unittest.mock.patch.dict(os.environ, {_KV_SHARED_LAST_ROWS_ENV: "1"}):
+            hf, trt, config = self._make_hf_and_trt_models(config_dict, attn_backend=attn_backend)
+        self.assertTrue(trt.kv_shared_last_rows_enabled)
+        for layer in trt.model.layers:
+            layer.layer_scalar = layer.layer_scalar.float()
+        return hf, trt, config
+
+    def _run_step(
+        self,
+        model: Gemma4ForCausalLM,
+        attn_backend: str,
+        kv_cache_manager: "KVCacheManagerV2",
+        request_ids: list[int],
+        token_ids: list[torch.Tensor],
+        num_cached_tokens: list[int],
+        num_contexts: int,
+        prompt_lens: list[int] | None = None,
+        *,
+        return_context_logits: bool = False,
+    ) -> tuple[torch.Tensor, list[_LayerRows]]:
+        """Run one step of ``model`` (see ``_prepare_gemma4_step``).
+
+        Returns:
+            The logits and the row counts of every decoder layer call.
+        """
+        input_ids, position_ids, attn_metadata = _prepare_gemma4_step(
+            attn_backend,
+            kv_cache_manager,
+            request_ids,
+            token_ids,
+            num_cached_tokens,
+            num_contexts,
+            prompt_lens,
+        )
+        with torch.inference_mode(), _record_decoder_layer_rows(model) as layer_rows:
+            attn_metadata.prepare()
+            logits = model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attn_metadata=attn_metadata,
+                return_context_logits=return_context_logits,
+            )
+        return logits, layer_rows
+
+    def _assert_layer_rows(
+        self, layer_rows: list[_LayerRows], num_tokens: int, num_kv_shared_rows: int
+    ) -> None:
+        """Every KV-writing layer ran on ``num_tokens`` rows and every KV-shared layer on
+        ``num_kv_shared_rows``."""
+        self.assertEqual([rows.is_kv_shared for rows in layer_rows], [False] * 8 + [True] * 4)
+        has_input_norm = False
+        for layer_idx, rows in enumerate(layer_rows):
+            expected = num_kv_shared_rows if rows.is_kv_shared else num_tokens
+            with self.subTest(layer_idx=layer_idx):
+                self.assertEqual(rows.hidden_states, expected)
+                self.assertEqual(rows.per_layer_input, expected)
+                # The input norm that the previous layer handed over follows the rows.
+                self.assertEqual(rows.pre_normed, expected if has_input_norm else None)
+                self.assertEqual(rows.output, expected)
+            has_input_norm = rows.returns_next_input_norm
+
+    def _hf_last_token_logits(
+        self,
+        hf_model: torch.nn.Module,
+        hf_cache: "DynamicCache",
+        token_ids: torch.Tensor,
+        num_cached_tokens: int,
+    ) -> torch.Tensor:
+        """HF logits [1, vocab] of the last of ``token_ids``, appended to ``hf_cache``."""
+        position_ids = torch.arange(
+            num_cached_tokens,
+            num_cached_tokens + token_ids.numel(),
+            dtype=torch.int32,
+            device=token_ids.device,
+        ).unsqueeze(0)
+        with torch.inference_mode():
+            hf_out = hf_model(
+                input_ids=token_ids.unsqueeze(0),
+                position_ids=position_ids,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
+        return hf_out.logits[:, -1].float()
+
+    @torch.no_grad()
+    def test_kv_shared_row_pruning_context_then_generation(self):
+        """Two context sequences of different lengths, then a generation step: logits match HF."""
+        from transformers.cache_utils import DynamicCache
+
+        prompts = [
+            self._token_ids(100, 200, 300, 400, 500, 600, 700, 800, 150, 250, 350),
+            self._token_ids(101, 201, 301, 401, 501, 601, 701),
+        ]
+        prompt_lens = [ids.numel() for ids in prompts]
+        next_tokens = [self._token_ids(900), self._token_ids(901)]
+        for attn_backend in self._row_pruning_backends():
+            with self.subTest(attn_backend=attn_backend):
+                torch.random.manual_seed(42)
+                hf, trt, config = self._make_row_pruning_models(
+                    deepcopy(GEMMA4_KV_SHARED_PLE_CONFIG), attn_backend
+                )
+                kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=8, batch_size=2)
+                try:
+                    kv_cache_manager.add_dummy_requests([1, 2], [n + 1 for n in prompt_lens])
+                    hf_caches = [DynamicCache(), DynamicCache()]
+
+                    logits, layer_rows = self._run_step(
+                        trt, attn_backend, kv_cache_manager, [1, 2], prompts, [0, 0], 2
+                    )
+                    self._assert_layer_rows(layer_rows, sum(prompt_lens), 2)
+                    self.assertEqual(logits.shape, (2, config.vocab_size))
+                    for i, prompt in enumerate(prompts):
+                        self._assert_most_elems_close(
+                            logits[i : i + 1],
+                            self._hf_last_token_logits(hf, hf_caches[i], prompt, 0),
+                        )
+
+                    logits, layer_rows = self._run_step(
+                        trt,
+                        attn_backend,
+                        kv_cache_manager,
+                        [1, 2],
+                        next_tokens,
+                        prompt_lens,
+                        0,
+                        prompt_lens,
+                    )
+                    self._assert_layer_rows(layer_rows, 2, 2)
+                    for i, next_token in enumerate(next_tokens):
+                        self._assert_most_elems_close(
+                            logits[i : i + 1],
+                            self._hf_last_token_logits(
+                                hf, hf_caches[i], next_token, prompt_lens[i]
+                            ),
+                        )
+                finally:
+                    kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_kv_shared_row_pruning_mixed_batch(self):
+        """A context sequence batched with a generation sequence: both logits match HF."""
+        from transformers.cache_utils import DynamicCache
+
+        prompt_a = self._token_ids(100, 200, 300, 400, 500, 600, 700, 800, 150)
+        prompt_b = self._token_ids(101, 201, 301, 401, 501, 601)
+        next_token_a = self._token_ids(900)
+        for attn_backend in self._row_pruning_backends():
+            with self.subTest(attn_backend=attn_backend):
+                torch.random.manual_seed(42)
+                hf, trt, config = self._make_row_pruning_models(
+                    deepcopy(GEMMA4_KV_SHARED_PLE_CONFIG), attn_backend
+                )
+                kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=8, batch_size=2)
+                try:
+                    kv_cache_manager.add_dummy_requests(
+                        [1, 2], [prompt_a.numel() + 1, prompt_b.numel()]
+                    )
+                    hf_cache_a, hf_cache_b = DynamicCache(), DynamicCache()
+                    # Prefill A in both models.
+                    self._run_step(trt, attn_backend, kv_cache_manager, [1], [prompt_a], [0], 1)
+                    self._hf_last_token_logits(hf, hf_cache_a, prompt_a, 0)
+
+                    # Context B first, then generation A.
+                    logits, layer_rows = self._run_step(
+                        trt,
+                        attn_backend,
+                        kv_cache_manager,
+                        [2, 1],
+                        [prompt_b, next_token_a],
+                        [0, prompt_a.numel()],
+                        1,
+                        [prompt_b.numel(), prompt_a.numel()],
+                    )
+                    self._assert_layer_rows(layer_rows, prompt_b.numel() + 1, 2)
+                    self.assertEqual(logits.shape, (2, config.vocab_size))
+                    self._assert_most_elems_close(
+                        logits[0:1], self._hf_last_token_logits(hf, hf_cache_b, prompt_b, 0)
+                    )
+                    self._assert_most_elems_close(
+                        logits[1:2],
+                        self._hf_last_token_logits(hf, hf_cache_a, next_token_a, prompt_a.numel()),
+                    )
+                finally:
+                    kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_kv_shared_row_pruning_keeps_every_row_where_read(self):
+        """Context logits, a direct ``Gemma4TextModel.forward`` and a model that is not opted in
+        send every token through every layer; last-token logits of an opted-in model send one row
+        per sequence through the KV-shared layers."""
+        prompts = [
+            self._token_ids(100, 200, 300, 400, 500, 600, 700, 800, 150, 250, 350),
+            self._token_ids(101, 201, 301, 401, 501, 601, 701),
+        ]
+        num_tokens = sum(ids.numel() for ids in prompts)
+        for attn_backend in self._row_pruning_backends():
+            with self.subTest(attn_backend=attn_backend):
+                torch.random.manual_seed(42)
+                _, trt, config = self._make_row_pruning_models(
+                    deepcopy(GEMMA4_KV_SHARED_PLE_CONFIG), attn_backend
+                )
+                kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=8, batch_size=2)
+                try:
+                    kv_cache_manager.add_dummy_requests([1, 2], [ids.numel() for ids in prompts])
+                    step = (trt, attn_backend, kv_cache_manager, [1, 2], prompts, [0, 0], 2)
+
+                    logits, layer_rows = self._run_step(*step)
+                    self._assert_layer_rows(layer_rows, num_tokens, 2)
+                    self.assertEqual(logits.shape, (2, config.vocab_size))
+                    # The fused tail of the last KV-writing layer hands the first KV-shared layer
+                    # its input norm, and the row selection covers it.
+                    self.assertTrue(layer_rows[7].returns_next_input_norm)
+                    self.assertEqual(layer_rows[8].pre_normed, 2)
+
+                    logits, layer_rows = self._run_step(*step, return_context_logits=True)
+                    self._assert_layer_rows(layer_rows, num_tokens, num_tokens)
+                    self.assertEqual(logits.shape, (num_tokens, config.vocab_size))
+
+                    # Gemma4AssistantForCausalLM.forward_draft_step calls the text model this way.
+                    input_ids, position_ids, attn_metadata = _prepare_gemma4_step(*step[1:])
+                    with torch.inference_mode(), _record_decoder_layer_rows(trt) as layer_rows:
+                        attn_metadata.prepare()
+                        hidden_states = trt.model(
+                            attn_metadata=attn_metadata,
+                            input_ids=input_ids,
+                            position_ids=position_ids,
+                        )
+                    self._assert_layer_rows(layer_rows, num_tokens, num_tokens)
+                    self.assertEqual(hidden_states.shape, (num_tokens, config.hidden_size))
+
+                    # The row pruning is opt-in: a model built without the variable keeps every row.
+                    with unittest.mock.patch.dict(os.environ):
+                        os.environ.pop(_KV_SHARED_LAST_ROWS_ENV, None)
+                        _, default_trt, _ = self._make_hf_and_trt_models(
+                            deepcopy(GEMMA4_KV_SHARED_PLE_CONFIG), attn_backend=attn_backend
+                        )
+                    self.assertFalse(default_trt.kv_shared_last_rows_enabled)
+                    logits, layer_rows = self._run_step(default_trt, *step[1:])
+                    self._assert_layer_rows(layer_rows, num_tokens, num_tokens)
+                    self.assertEqual(logits.shape, (2, config.vocab_size))
+                finally:
+                    kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    def test_kv_shared_row_pruning_matches_full_path(self):
+        """Last-token logits of the row-pruned path equal the last rows of the full path's context
+        logits, for a context-only step, a mixed step and a context step over cached tokens.
+
+        The prompts span several KV cache pages, and one config has a sliding window shorter than
+        them: the last row then reads a window that ends in the tokens of its own step.
+        """
+        prompt_a = self._token_ids(*((7 + 37 * i) % 1000 for i in range(70)))
+        prompt_b = self._token_ids(*((11 + 41 * i) % 1000 for i in range(45)))
+        next_token_a = self._token_ids(900)
+        prompt_c = self._token_ids(*((13 + 43 * i) % 1000 for i in range(70)))
+        num_cached_c = 40
+        # (request_ids, token_ids, num_cached_tokens, num_contexts, prompt_lens) of the steps under
+        # comparison, in run order: request 1 prefills in the first and generates in the second.
+        steps = {
+            "context_only": ([1, 2], [prompt_a, prompt_b], [0, 0], 2, None),
+            "mixed": (
+                [3, 1],
+                [prompt_b, next_token_a],
+                [0, prompt_a.numel()],
+                1,
+                [prompt_b.numel(), prompt_a.numel()],
+            ),
+            "cached_context": ([4], [prompt_c[num_cached_c:]], [num_cached_c], 1, None),
+        }
+        for attn_backend in self._row_pruning_backends():
+            for use_double_wide_mlp, sliding_window in ((True, 128), (False, 128), (True, 16)):
+                config_dict = deepcopy(GEMMA4_KV_SHARED_PLE_CONFIG)
+                config_dict["use_double_wide_mlp"] = use_double_wide_mlp
+                config_dict["sliding_window"] = sliding_window
+                torch.random.manual_seed(42)
+                _, trt, config = self._make_row_pruning_models(config_dict, attn_backend)
+                kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=16, batch_size=4)
+                try:
+                    kv_cache_manager.add_dummy_requests(
+                        [1, 2, 3, 4],
+                        [
+                            prompt_a.numel() + 1,
+                            prompt_b.numel(),
+                            prompt_b.numel(),
+                            prompt_c.numel(),
+                        ],
+                    )
+                    # The first part of prompt C is in the KV cache before its second part runs.
+                    self._run_step(
+                        trt, attn_backend, kv_cache_manager, [4], [prompt_c[:num_cached_c]], [0], 1
+                    )
+                    for name, step in steps.items():
+                        token_ids = step[1]
+                        num_tokens = sum(ids.numel() for ids in token_ids)
+                        seq_lens = torch.tensor([ids.numel() for ids in token_ids], device="cuda")
+                        last_rows = seq_lens.cumsum(0) - 1
+                        with self.subTest(
+                            attn_backend=attn_backend,
+                            use_double_wide_mlp=use_double_wide_mlp,
+                            sliding_window=sliding_window,
+                            step=name,
+                        ):
+                            # Both runs write the same K/V: the KV-shared layers write none.
+                            full_logits, layer_rows = self._run_step(
+                                trt,
+                                attn_backend,
+                                kv_cache_manager,
+                                *step,
+                                return_context_logits=True,
+                            )
+                            self._assert_layer_rows(layer_rows, num_tokens, num_tokens)
+                            pruned_logits, layer_rows = self._run_step(
+                                trt, attn_backend, kv_cache_manager, *step
+                            )
+                            self._assert_layer_rows(layer_rows, num_tokens, len(token_ids))
+                            torch.testing.assert_close(
+                                pruned_logits, full_logits[last_rows], atol=0.05, rtol=0.05
+                            )
+                finally:
+                    kv_cache_manager.shutdown()
+
+    @pytest.mark.high_cuda_memory
+    @torch.no_grad()
+    def test_kv_shared_row_pruning_prefill_speedup(self):
+        """A context step of 8 x 2048 tokens at the E4B geometry is at least 1.4 times faster with
+        the row pruning than with every token passing through the 18 KV-shared layers."""
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        num_seqs, seq_len, warmup_steps, timed_steps = 8, 2048, 3, 10
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        attn_backend = Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"]
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E4B_GEOMETRY_CONFIG))
+        torch.random.manual_seed(42)
+        with unittest.mock.patch.dict(os.environ, {_KV_SHARED_LAST_ROWS_ENV: "1"}):
+            model = Gemma4ForCausalLM(
+                ModelConfig(pretrained_config=config, attn_backend=attn_backend)
+            ).cuda()
+        for parameter in model.parameters():
+            if parameter.ndim >= 2:
+                torch.nn.init.normal_(parameter, std=0.02)
+            else:
+                parameter.uniform_(0.5, 1.5)
+        num_layers, num_kv_shared_layers = config.num_hidden_layers, config.num_kv_shared_layers
+        num_tokens = num_seqs * seq_len
+
+        kv_cache_manager = self._get_kv_cache_manager(
+            config,
+            num_blocks=num_seqs * (seq_len // _TRTLLM_GEN_TOKENS_PER_BLOCK + 1),
+            tokens_per_block=_TRTLLM_GEN_TOKENS_PER_BLOCK,
+            batch_size=num_seqs,
+        )
+        self.addCleanup(kv_cache_manager.shutdown)
+        request_ids = list(range(num_seqs))
+        kv_cache_manager.add_dummy_requests(request_ids, [seq_len] * num_seqs)
+        token_ids = list(
+            torch.randint(
+                0, config.vocab_size, (num_seqs, seq_len), dtype=torch.int32, device="cuda"
+            )
+        )
+        input_ids, position_ids, attn_metadata = _prepare_gemma4_step(
+            attn_backend, kv_cache_manager, request_ids, token_ids, [0] * num_seqs, num_seqs
+        )
+
+        def run_step(row_pruning: bool) -> tuple[float, list[_LayerRows]]:
+            """Seconds of one context step that returns last-token logits, and its layer rows."""
+            model.kv_shared_last_rows_enabled = row_pruning
+            with torch.inference_mode(), _record_decoder_layer_rows(model) as rows:
+                attn_metadata.prepare()
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                logits = model.forward(
+                    input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+                )
+                torch.cuda.synchronize()
+                seconds = time.perf_counter() - start
+            self.assertEqual(logits.shape, (num_seqs, config.vocab_size))
+            return seconds, rows
+
+        for _ in range(warmup_steps):
+            _, pruned_rows = run_step(row_pruning=True)
+            _, full_rows = run_step(row_pruning=False)
+        num_kv_writing_layers = num_layers - num_kv_shared_layers
+        self.assertEqual(
+            [rows.hidden_states for rows in pruned_rows],
+            [num_tokens] * num_kv_writing_layers + [num_seqs] * num_kv_shared_layers,
+        )
+        self.assertEqual([rows.hidden_states for rows in full_rows], [num_tokens] * num_layers)
+
+        pruned_seconds, full_seconds = [], []
+        for _ in range(timed_steps):
+            full_seconds.append(run_step(row_pruning=False)[0])
+            pruned_seconds.append(run_step(row_pruning=True)[0])
+        full_median = statistics.median(full_seconds)
+        pruned_median = statistics.median(pruned_seconds)
+        speedup = full_median / pruned_median
+        print(
+            f"\nkv_shared_row_pruning prefill, {attn_backend}, {num_seqs} x {seq_len} tokens, "
+            f"median of {timed_steps} steps: row pruning off {full_median * 1e3:.2f} ms, "
+            f"on {pruned_median * 1e3:.2f} ms, off / on {speedup:.3f}"
+        )
+        self.assertGreaterEqual(speedup, 1.4)
 
     # ---- VSWA (Variable Sliding Window Attention) page index tests ----
 
