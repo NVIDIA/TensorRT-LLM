@@ -83,6 +83,19 @@ class ReplayHistory:
     candidate_x: torch.Tensor | None = None  # [B_capacity, T_capacity, 3*H*128], BF16
     old_lengths: torch.Tensor | None = None  # [B_capacity], immutable verification snapshot
     arrivals: torch.Tensor | None = None  # [B_capacity], int32 zeros; decode row arrival counters
+    workspace: torch.Tensor | None = None  # replay_workspace(): large-batch decode scratch
+
+
+def replay_workspace(device: torch.device | str) -> torch.Tensor:
+    """Zero-initialized int32 scratch for ``replay``.
+
+    Large batches decode in a persistent kernel whose work counters and
+    per-row commit flags live here. Every replay returns the counters to
+    zero, so one workspace serves all layers that replay in one stream.
+    """
+    from ...custom_ops.cute_dsl_kda_2fp4_replay import REPLAY_WORKSPACE_INT32
+
+    return torch.zeros(REPLAY_WORKSPACE_INT32, dtype=torch.int32, device=device)
 
 
 @triton.jit
@@ -241,7 +254,8 @@ def replay(
     ``replay_indices`` (int32, one replay slot per batch row). Projection row strides are preserved. The FP32 A_log
     and dt_bias contain H and H*128 values, respectively. The optional
     BF16 output [B,H,128] is written directly, including BCG output views.
-    ``history.arrivals`` holds persistent int32 zero counters for every row.
+    ``history.arrivals`` holds persistent int32 zero counters for every row,
+    and ``history.workspace`` the scratch from ``replay_workspace``.
     The kernel prefetches this layer's checkpoint, history and Conv rows
     before its PDL wait, so it must not directly follow another replay of
     the same layer in a stream.
@@ -302,6 +316,8 @@ def replay(
     arrivals = history.arrivals
     if arrivals is None or arrivals.numel() < batch or arrivals.dtype != torch.int32:
         raise ValueError("KDA replay requires persistent int32 arrival counters for every row.")
+    if history.workspace is None:
+        raise ValueError("KDA replay requires the scratch from replay_workspace().")
     fused_replay(
         x,
         conv_state,
@@ -324,6 +340,7 @@ def replay(
         norm_eps,
         output,
         arrivals,
+        history.workspace,
     )
     return output
 

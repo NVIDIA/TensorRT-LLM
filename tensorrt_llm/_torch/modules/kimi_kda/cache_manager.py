@@ -1409,6 +1409,7 @@ class KDA2Fp4ReplayState(KDAReplayState):
         self.candidate_x: torch.Tensor | None = None
         self.old_lengths: torch.Tensor | None = None
         self.arrivals: torch.Tensor | None = None
+        self.workspace: torch.Tensor | None = None
         self._commit_descriptors: torch.Tensor | None = None
 
     @property
@@ -1459,11 +1460,15 @@ class KDA2Fp4ReplayState(KDAReplayState):
     @override
     def external_gpu_bytes(self, context: MambaStateLayout) -> int:
         """DSpark's candidate rows, saved lengths and commit descriptors, or the
-        decode arrival counters, live outside the pools."""
+        decode arrival counters and scratch, live outside the pools."""
         if not context.mamba_pp_layers:
             return 0
         if not self.verifies_drafts:
-            return context.max_batch_size * torch.int32.itemsize
+            from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_replay import (
+                REPLAY_WORKSPACE_INT32,
+            )
+
+            return (context.max_batch_size + REPLAY_WORKSPACE_INT32) * torch.int32.itemsize
         from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_mtp_commit import DESC_FIELDS
 
         layers = len(context.mamba_pp_layers)
@@ -1479,7 +1484,7 @@ class KDA2Fp4ReplayState(KDAReplayState):
         ssm_states: list[torch.Tensor],
         conv_states: list[torch.Tensor],
     ) -> None:
-        from .kda_2fp4 import ReplayHistory, commit_descriptor
+        from .kda_2fp4 import ReplayHistory, commit_descriptor, replay_workspace
 
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
@@ -1502,8 +1507,10 @@ class KDA2Fp4ReplayState(KDAReplayState):
                 [layers, context.max_batch_size], dtype=torch.int32, device=device
             )
         else:
-            # Shared by the layers: a row's last CTA resets its counter.
+            # Shared by the layers: a row's last CTA resets its counter, and every
+            # replay returns the scratch counters to zero.
             self.arrivals = torch.zeros(context.max_batch_size, dtype=torch.int32, device=device)
+            self.workspace = replay_workspace(device)
         self.histories = [
             ReplayHistory(
                 k=layer["kda_2fp4_k"],
@@ -1513,6 +1520,7 @@ class KDA2Fp4ReplayState(KDAReplayState):
                 candidate_x=None if self.candidate_x is None else self.candidate_x[offset],
                 old_lengths=None if self.old_lengths is None else self.old_lengths[offset],
                 arrivals=self.arrivals,
+                workspace=self.workspace,
             )
             for offset, layer in enumerate(self.pool_layers)
         ]
@@ -1657,6 +1665,7 @@ class KDA2Fp4ReplayState(KDAReplayState):
         self.candidate_x = None
         self.old_lengths = None
         self.arrivals = None
+        self.workspace = None
         self._commit_descriptors = None
 
 

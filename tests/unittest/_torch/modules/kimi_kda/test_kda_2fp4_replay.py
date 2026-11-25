@@ -195,7 +195,12 @@ def _paged_history(
             torch.empty(batch, dtype=torch.int32, device="cuda"),
         )
     return ops.ReplayHistory(
-        k, u, g, length, arrivals=torch.zeros(batch, dtype=torch.int32, device="cuda")
+        k,
+        u,
+        g,
+        length,
+        arrivals=torch.zeros(batch, dtype=torch.int32, device="cuda"),
+        workspace=ops.replay_workspace("cuda"),
     )
 
 
@@ -389,6 +394,7 @@ def test_dspark_native_verify_acceptance_and_rollover(
         history.g[:, :, : ops.HISTORY_SIZE].contiguous(),
         history.length.clone(),
         arrivals=torch.zeros(batch, dtype=torch.int32, device="cuda"),
+        workspace=ops.replay_workspace("cuda"),
     )
     next_raw = raw.reshape(batch, tokens, -1)[:, 0]
     kwargs = dict(
@@ -875,6 +881,7 @@ def _dense(history: ops.ReplayHistory) -> ops.ReplayHistory:
         history.candidate_x,
         history.old_lengths,
         history.arrivals,
+        history.workspace,
     )
 
 
@@ -936,3 +943,80 @@ def test_paged_and_dense_histories_match(dspark: bool) -> None:
         )
     for paged_result, dense_result in zip(*results, strict=True):
         assert torch.equal(paged_result, dense_result)
+
+
+_LAUNCH_VARIANTS = {
+    "mid_grid": {"_MID_ITEMS": 0},
+    "persistent": {"_PERSISTENT_MIN_ITEMS": 0, "_L2_PREFETCH_MAX_ITEMS": 0},
+    "persistent_dynamic_tail": {
+        "_PERSISTENT_MIN_ITEMS": 0,
+        "_DYNAMIC_TAIL_ITEMS": 0,
+        "_COMMIT_MANY_ITEMS": 0,
+    },
+    "persistent_fused_commit": {"_PERSISTENT_MIN_ITEMS": 0, "_SEPARATE_COMMIT_MAX_ROWS": 0},
+}
+
+
+@pytest.mark.parametrize("variant", sorted(_LAUNCH_VARIANTS))
+def test_launch_variants_match_small_grid_kernel(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """Production picks the launch variant by grid size; all compute the same results.
+
+    The dispatch thresholds are lowered so that a small batch takes the variant.
+    Outputs, Conv windows, histories and lengths must match the small-grid kernel
+    exactly over a full window rollover, with a padding row. The separate commit
+    kernel of the persistent variants folds the current token inside its BF16
+    MMA, so the committed state may differ in the last bit of the outer scale.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kda_2fp4_replay as replay_ops
+
+    batch, heads = 4, 3
+
+    def run(patches: dict[str, int]) -> list[torch.Tensor]:
+        with monkeypatch.context() as patch:
+            for name, value in patches.items():
+                patch.setattr(replay_ops, name, value)
+            pool, slots, history, _ = _fixture(batch, heads)
+            torch.manual_seed(7)
+            fused = _fused_inputs(batch, heads)
+            replay = _replay_indices(batch)
+            a_log = torch.full((heads,), -2.0, device="cuda")
+            bias = torch.full((heads, 128), -1.0, device="cuda")
+            dummy = torch.tensor([False, False, True, False], device="cuda")
+            outputs = []
+            for _ in range(18):
+                raw = torch.randn((batch, 3 * heads * 128), device="cuda", dtype=torch.bfloat16)
+                gate = torch.randn((batch, heads * 128), device="cuda", dtype=torch.bfloat16)
+                beta = torch.randn((batch, heads), device="cuda", dtype=torch.bfloat16)
+                outputs.append(
+                    ops.replay(
+                        raw,
+                        **fused,
+                        gate=gate,
+                        beta=beta,
+                        pool=pool,
+                        slots=slots,
+                        replay_indices=replay,
+                        dummy=dummy,
+                        history=history,
+                        A_log=a_log,
+                        dt_bias=bias,
+                        lower_bound=-5.0,
+                        norm_eps=1e-6,
+                    ).clone()
+                )
+            assert torch.count_nonzero(history.workspace[-2:]) == 0
+            assert torch.count_nonzero(history.arrivals) == 0
+            state = [fused["conv_state"], history.k, history.u, history.g, history.length]
+            checkpoint = ops.materialize_checkpoint(pool, slots, ~dummy)
+            return outputs + [tensor.clone() for tensor in state], pool.clone(), checkpoint
+
+    expected, expected_pool, expected_state = run({})
+    actual, actual_pool, actual_state = run(_LAUNCH_VARIANTS[variant])
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    if variant in ("persistent", "persistent_dynamic_tail"):
+        torch.testing.assert_close(actual_state, expected_state, atol=0, rtol=1e-5)
+    else:
+        assert torch.equal(actual_pool, expected_pool)

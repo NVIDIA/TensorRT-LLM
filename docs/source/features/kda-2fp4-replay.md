@@ -46,13 +46,21 @@ history window is 16; rollover reconstructs both checkpoint terms and
 commits the cached updates. Each request keeps its histories in its own slot
 of the KV cache's replay region, which stays with the request while it is
 suspended. A finished request's partial history is discarded: V2 makes only
-prefill-phase recurrent state reusable. One CuTe DSL launch per layer fuses Conv4, Q/K
-normalization, replay, and output RMSNorm/gating without changing their
-calculations. The same launch commits a full window: the CTA that appends
-the sixteenth entry of a head repacks that head's checkpoint, and the last
-CTA of each batch row advances its history length. Batch size, slot-pool
-capacity, and cache/projection row strides are runtime parameters. With
-PDL, checkpoint and history loads overlap the preceding kernel.
+prefill-phase recurrent state reusable. Below 1,536 (row, head) items per
+layer, one CuTe DSL launch per layer fuses Conv4, Q/K normalization, replay,
+and output RMSNorm/gating without changing their calculations. The same
+launch commits a full window: the CTA that appends the sixteenth entry of a
+head repacks that head's checkpoint, and the last CTA of each batch row
+advances its history length. Larger grids run a persistent decode kernel.
+For up to 1,024 rows, a second persistent kernel then repacks the
+checkpoints of the rows whose window filled; above that, the decode kernel
+commits inline. Their work counters and per-row commit flags live in a small
+workspace (`replay_workspace()`) that the cache manager allocates once; every
+launch returns it to zero. All launch variants produce the same outputs and
+histories; the separate commit kernel can round the repacked checkpoint's
+outer scale differently in the last bit. Batch size, slot-pool capacity, and
+cache/projection row strides are runtime parameters. With PDL, checkpoint
+and history loads overlap the preceding kernel.
 
 ## DSpark decoding
 

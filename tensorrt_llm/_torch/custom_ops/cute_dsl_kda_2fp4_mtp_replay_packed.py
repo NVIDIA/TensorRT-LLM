@@ -16,6 +16,11 @@ from cutlass._mlir import ir as mlir_ir
 from cutlass._mlir.dialects import nvvm as nvvm_raw
 from cutlass.cutlass_dsl import T as MT
 from cutlass.experimental import primitives as prims
+from cutlass.experimental.cuda.tensor_map import (
+    TensorMap,
+    TensorMapSwizzle,
+    create_tensor_map_tiled,
+)
 
 from ..flashinfer_utils import get_env_enable_pdl
 from .cute_dsl_kda_2fp4_commit import STATE_BYTES
@@ -26,9 +31,10 @@ NT = 128  # threads per CTA
 ASTR = 136  # padded bf16 row stride for dot-product operands (272 B, conflict-free)
 CTSTR = 24  # padded bf16 row stride of the transposed history coefficients (48 B, conflict-free)
 LOG2E = 1.4426950408889634
-QSCALE = 128.0**-0.5
 INV2688 = 1.0 / (6 * 448)
 GMEM = cutlass.AddressSpace.gmem
+# packed launches with more CTAs copy only the live history rows (length-dependent copies)
+LIVE_MIN_GRID = 0
 TMEM_COLS = 32  # [0,16) accumulator, [16,24) SFA (2 k-blocks x 4 cols), [24,32) SFB
 
 
@@ -46,6 +52,22 @@ createpolicy.fractional.L2::evict_last.b64 pol, 1.0;
 ld.global.L2::cache_hint.b8 t, [{$r0}], pol;
 cvt.u32.u16 {$w0}, t;
 }"""
+
+
+def _evict_first_policy():
+    # L2 policy for streaming data (checkpoint / history rows read once): keep the producer's
+    # projections (read by later CTAs) resident instead
+    return cute.arch.inline_ptx(
+        "createpolicy.fractional.L2::evict_first.b64 {$w0}, 1.0;", write_only_types=[Int64]
+    )
+
+
+def _cp_async16_ef(dst, src, nbytes, pol):
+    # 16 B cp.async.cg with an L2 cache policy (zero-fills when nbytes < 16)
+    cute.arch.inline_ptx(
+        "cp.async.cg.shared.global.L2::cache_hint [{$r0}], [{$r1}], 16, {$r2}, {$r3};",
+        read_only_args=[Int32(dst.toint()), Int64(src.toint()), Int32(nbytes), Int64(pol)],
+    )
 
 
 def _ld_keep_s32(addr):
@@ -82,55 +104,107 @@ def _rcpf(x):
     return cute.arch.rcp_approx(Float32(x))
 
 
-# Bit-exact replica of the reference's libdevice SiLU: x * rcp_rn(1 + __nv_expf(-x)), with the
-# same ftz flags and no mul/add contraction (the reference is compiled with fp fusion disabled).
-_SILU_PTX = """{
-.reg .b32 xn, xt, xj, xs, xf, xe, xd, xr, xq, xm;
-.reg .pred xp;
-neg.f32 xn, {$r0};
-fma.rn.ftz.f32 xt, xn, 0f3BBB989D, 0f3F000000;
-cvt.ftz.sat.f32.f32 xt, xt;
-fma.rm.ftz.f32 xj, xt, 0f437C0000, 0f4B400001;
-add.rn.f32 xs, xj, 0fCB40007F;
-neg.f32 xs, xs;
-fma.rn.ftz.f32 xf, xn, 0f3FB8AA3B, xs;
-fma.rn.ftz.f32 xf, xn, 0f32A57060, xf;
-shl.b32 xj, xj, 23;
-ex2.approx.ftz.f32 xe, xf;
-mul.rn.f32 xe, xe, xj;
-add.rn.f32 xd, xe, 0f3F800000;
-rcp.approx.ftz.f32 xr, xd;
-neg.f32 xm, xd;
-fma.rn.ftz.f32 xq, xm, xr, 0f3F800000;
-fma.rn.ftz.f32 xr, xr, xq, xr;
-setp.eq.f32 xp, xd, 0f7F800000;
-selp.f32 xr, 0f00000000, xr, xp;
-mul.rn.f32 {$w0}, xr, {$r0};
+def _rcp_ge1_n(ds):
+    # correctly rounded 1/d (== div.rn(1, d)) for every d >= 1 of the list: the hardware fast path
+    # (MUFU.RCP + one fused Newton step) for all of them; only when some lane of the warp holds a
+    # d >= 2^126 (subnormal/zero quotient, +inf) the IEEE divisions run, behind a warp-uniform
+    # branch (a predicated div.rn is expanded unconditionally: ~13 extra instructions per gate).
+    n = len(ds)
+    regs = ", ".join(f"gr{i}, gq{i}, gn{i}" for i in range(n))
+    lines = ["{", f".reg .b32 gm, {regs};", ".reg .pred gp, ga;"]
+    for i in range(n):
+        lines += [
+            f"rcp.approx.ftz.f32 gr{i}, {{$r{i}}};",
+            f"neg.f32 gn{i}, {{$r{i}}};",
+            f"fma.rn.ftz.f32 gq{i}, gn{i}, gr{i}, 0f3F800000;",
+            f"fma.rn.ftz.f32 {{$w{i}}}, gr{i}, gq{i}, gr{i};",
+        ]
+    lines.append("mov.b32 gm, {$r0};")
+    for i in range(1, n):
+        lines.append(f"max.f32 gm, gm, {{$r{i}}};")
+    lines += [
+        "setp.ge.f32 gp, gm, 0f7E800000;",
+        "vote.sync.any.pred ga, gp, 0xffffffff;",
+        "@!ga bra.uni GATE_RCP_DONE;",
+    ]
+    for i in range(n):
+        lines += [
+            f"setp.ge.f32 gp, {{$r{i}}}, 0f7E800000;",
+            f"@gp div.rn.f32 {{$w{i}}}, 0f3F800000, {{$r{i}}};",
+        ]
+    lines += ["GATE_RCP_DONE:", "}"]
+    res = cute.arch.inline_ptx(
+        "\n".join(lines), write_only_types=[Float32] * n, read_only_args=[Float32(d) for d in ds]
+    )
+    if n == 1:
+        return [res]
+    return list(res)
+
+
+# a / b == div.rn(a, b) (Markstein: q = a * RN(1/b), q' = q + RN(1/b) * (a - q b), residual exact
+# via FMA) for 2^-100 <= b < 2^100; other b (and only then) take the IEEE division behind a branch
+# that is uniform over the active lanes.
+def _div_scale_ptx(label):
+    return "\n".join(
+        [
+            "{",
+            ".reg .b32 dr, dq, de, dn, dt, dm;",
+            ".reg .pred dp, da;",
+            "rcp.approx.ftz.f32 dr, {$r1};",
+            "neg.f32 dn, {$r1};",
+            "fma.rn.ftz.f32 dt, dn, dr, 0f3F800000;",
+            "fma.rn.ftz.f32 dr, dr, dt, dr;",
+            "mul.rn.f32 dq, {$r0}, dr;",
+            "fma.rn.f32 de, dn, dq, {$r0};",
+            "fma.rn.f32 {$w0}, de, dr, dq;",
+            "setp.lt.f32 dp, {$r1}, 0f0D800000;",
+            "setp.ge.or.f32 dp, {$r1}, 0f71800000, dp;",
+            "activemask.b32 dm;",
+            "vote.sync.any.pred da, dp, dm;",
+            f"@!da bra.uni {label};",
+            "@dp div.rn.f32 {$w0}, {$r0}, {$r1};",
+            f"{label}:",
+            "}",
+        ]
+    )
+
+
+def _div_scale(a, b, label):
+    return cute.arch.inline_ptx(
+        _div_scale_ptx(label), write_only_types=[Float32], read_only_args=[Float32(a), Float32(b)]
+    )
+
+
+# RN(1/x) for 2^-126 < x < 2^126 (fast path of rcp.rn: MUFU.RCP + one fused Newton step)
+_RCP_FAST_PTX = """{
+.reg .b32 fr, fn, ft;
+rcp.approx.ftz.f32 fr, {$r0};
+neg.f32 fn, {$r0};
+fma.rn.ftz.f32 ft, fn, fr, 0f3F800000;
+fma.rn.ftz.f32 {$w0}, fr, ft, fr;
 }"""
 
 
-# rcp.rn of xd >= 1 is the hardware fast path above (MUFU.RCP + one fused Newton step, exactly
-# what rcp.rn compiles to for in-range operands) without the slow-path range check; xd = inf -> 0.
-# d >= 2^126 (subnormal or zero quotient) and +inf take the predicated IEEE division.
-_RCP_GE1_PTX = """{
-.reg .b32 rr, rm, rq;
-.reg .pred pb;
-rcp.approx.ftz.f32 rr, {$r0};
-neg.f32 rm, {$r0};
-fma.rn.ftz.f32 rq, rm, rr, 0f3F800000;
-fma.rn.ftz.f32 {$w0}, rr, rq, rr;
-setp.ge.f32 pb, {$r0}, 0f7E800000;
-@pb div.rn.f32 {$w0}, 0f3F800000, {$r0};
+def _rcp_fast(x):
+    return cute.arch.inline_ptx(
+        _RCP_FAST_PTX, write_only_types=[Float32], read_only_args=[Float32(x)]
+    )
+
+
+# UE4M3 scale byte (low byte of the cvt result) -> exact f32 value (e4m3 -> f16 -> f32)
+_E4M3_F32_PTX = """{
+.reg .b32 eh;
+.reg .b16 el, eu;
+cvt.rn.f16x2.e4m3x2 eh, {$r0};
+mov.b32 {el, eu}, eh;
+cvt.f32.f16 {$w0}, el;
 }"""
 
 
-def _rcp_ge1(d):
-    # correctly rounded 1/d (== div.rn(1, d)) for d >= 1
-    return cute.arch.inline_ptx(_RCP_GE1_PTX, write_only_types=[Float32], read_only_args=[d])
-
-
-def _silu_ref(x):
-    return cute.arch.inline_ptx(_SILU_PTX, write_only_types=[Float32], read_only_args=[x])
+def _e4m3_f32(w16):
+    return cute.arch.inline_ptx(
+        _E4M3_F32_PTX, write_only_types=[Float32], read_only_args=[cutlass.Int16(w16)]
+    )
 
 
 def _mul_rn(a, b):
@@ -156,14 +230,6 @@ def _mul_qscale_rn(a):
         write_only_types=[Float32],
         read_only_args=[Float32(a)],
     )
-
-
-def _div_mk(x, d, r):
-    # x / d correctly rounded (== div.rn) for normal-range operands, given r = RN(1/d):
-    # Markstein correction q' = RN(q + r * RN(x - q*d)) with the residual exact via FMA.
-    q = x * r
-    e = cute.fma(-q, d, x)
-    return cute.fma(e, r, q)
 
 
 def _add1_rn(a):
@@ -374,6 +440,51 @@ def _silu2_ref(a, b):
     )
 
 
+def _tree_reduce(vals, offs, lane):
+    """Transposed xor-butterfly over the lane bits ``offs`` (in order) for an arbitrary number of
+    values.  Every value's partial sums are combined over exactly the same lane pairs, in the same
+    order, as a plain xor butterfly (bit-identical sums); pairs are only formed inside groups of
+    values that share their lane-index structure, so no padding values are shuffled.
+    Returns [(value, idx_const, {offset: coef}, plain_mask)]: the lane holds the full sum of value
+    index idx_const + sum(coef * lane_bit(offset)); lanes with any plain_mask bit set hold a
+    duplicate (store only from (lane & plain_mask) == 0)."""
+    cur = [(v, j, (), 0) for j, v in enumerate(vals)]
+    for o in offs:
+        up = (lane & o) != 0
+        groups = {}
+        order = []
+        for e in cur:
+            key = (e[3], e[2])
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(e)
+        nxt = []
+        for key in order:
+            g = groups[key]
+            p = len(g) // 2
+            for i in range(p):
+                a = g[i]
+                bb = g[i + p]
+                snd = Float32(cutlass.select_(up, a[0], bb[0]))
+                kep = Float32(cutlass.select_(up, bb[0], a[0]))
+                v = kep + cute.arch.shuffle_sync_bfly(snd, offset=o)
+                nxt.append((v, a[1], a[2] + ((o, bb[1] - a[1]),), a[3]))
+            if len(g) % 2 == 1:
+                e = g[-1]
+                v = e[0] + cute.arch.shuffle_sync_bfly(e[0], offset=o)
+                nxt.append((v, e[1], e[2], e[3] | o))
+        cur = nxt
+    return cur
+
+
+def _tree_idx(e, lane):
+    idx = Int32(e[1])
+    for o, cf in e[2]:
+        idx = idx + ((lane // o) % 2) * cf
+    return idx
+
+
 # Two adjusted history keys k_j * exp2((anchor - g_j) * log2e) (ex2.approx.ftz), lane-paired.
 _ADJ2_PTX = """{
 .reg .b64 A, G, L, X, K;
@@ -426,15 +537,116 @@ def _sig2(z0, z1):
     )
 
 
-def _history_row(p_ridx, b64, p_hist, slot_stride, dtype, row):
-    """Pointer to ``row`` of the batch row's replay slot in one history plane.
+def _history_row_s(replay, p_hist, slot_stride, dtype, row):
+    """Pointer to ``row`` of the replay slot in one history plane (replay slot read from smem)."""
+    return cutlass.inttoptr(p_hist + Int64(replay) * slot_stride, GMEM, dtype) + row
 
-    The T > 4 variant reloads the replay slot here instead of keeping per-slot
-    plane pointers live across the kernel, which would push it past its
-    register budget (``min_blocks_per_mp=6``).
-    """
-    replay = Int64((cutlass.inttoptr(p_ridx, GMEM, Int32) + b64).load())
-    return cutlass.inttoptr(p_hist + replay * slot_stride, GMEM, dtype) + row
+
+@cute.jit
+def _coef_tiles_t(
+    lane,
+    length,
+    s_A,
+    s_R,
+    s_coefT,
+    s_coefn,
+    T: cutlass.Constexpr,
+    N2: cutlass.Constexpr,
+    NROWS: cutlass.Constexpr,
+    MMA_N: cutlass.Constexpr,
+):
+    """C^T[16 x 24] = R[16 x 128] A[24 x 128]^T on one warp: m16 = relative pair rows n (clamped to
+    N2 - 1), three n8 tiles over the A rows r (0..15 history, 16.. new tokens; clamped to NROWS - 1).
+    The products / k16 grouping / even-odd accumulator chains are those of the C = A R^T tiles."""
+    gid = lane // 4
+    tig = lane % 4
+    lmj = lane // 8
+    arow = (lmj % 2) * 8 + lane % 8
+    if cutlass.const_expr(N2 < 16):
+        arow = arow if arow < N2 else Int32(N2 - 1)
+    pla = s_R.data_ptr() + (arow * ASTR + (lmj // 2) * 8)
+    plbs = []
+    for t in cutlass.range_constexpr(3):
+        brow = 8 * t + lane % 8
+        if cutlass.const_expr(8 * t + 8 > NROWS):
+            brow = brow if brow < NROWS else Int32(NROWS - 1)
+        plbs.append(s_A.data_ptr() + (brow * ASTR + (lmj // 2) * 16 + (lmj % 2) * 8))
+    ces = [None, None, None]
+    cos = [None, None, None]
+    bfr = [None, None, None]
+    for ks in cutlass.range_constexpr(KD // 16):
+        afrag = prims.ldmatrix(pla + 16 * ks, 4, prims.MMALayout.ROW)
+        if cutlass.const_expr(ks % 2 == 0):
+            for t in cutlass.range_constexpr(3):
+                bfr[t] = prims.ldmatrix(plbs[t] + 16 * ks, 4, prims.MMALayout.ROW)
+        for t in cutlass.range_constexpr(3):
+            fb0 = bfr[t][2 * (ks % 2)]
+            fb1 = bfr[t][2 * (ks % 2) + 1]
+            if cutlass.const_expr(ks < 2):
+                acc4 = cute.arch.inline_ptx(
+                    "{\n.reg .f32 zz;\nmov.f32 zz, 0f00000000;\n"
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{{$w0}, {$w1}, {$w2}, {$w3}}, {{$r0}, {$r1}, {$r2}, {$r3}}, {{$r4}, {$r5}}, "
+                    "{zz, zz, zz, zz};\n}",
+                    write_only_types=[Float32, Float32, Float32, Float32],
+                    read_only_args=[afrag[0], afrag[1], afrag[2], afrag[3], fb0, fb1],
+                )
+            else:
+                prev4 = ces[t] if cutlass.const_expr(ks % 2 == 0) else cos[t]
+                acc4 = cute.arch.inline_ptx(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{{$w0}, {$w1}, {$w2}, {$w3}}, {{$r0}, {$r1}, {$r2}, {$r3}}, {{$r4}, {$r5}}, "
+                    "{{$r6}, {$r7}, {$r8}, {$r9}};",
+                    write_only_types=[Float32, Float32, Float32, Float32],
+                    read_only_args=[
+                        afrag[0],
+                        afrag[1],
+                        afrag[2],
+                        afrag[3],
+                        fb0,
+                        fb1,
+                        prev4[0],
+                        prev4[1],
+                        prev4[2],
+                        prev4[3],
+                    ],
+                )
+            if cutlass.const_expr(ks % 2 == 0):
+                ces[t] = acc4
+            else:
+                cos[t] = acc4
+    for t in cutlass.range_constexpr(3):
+        d0 = ces[t][0] + cos[t][0]
+        d1 = ces[t][1] + cos[t][1]
+        d2 = ces[t][2] + cos[t][2]
+        d3 = ces[t][3] + cos[t][3]
+        # fragment: (n = gid, r = 8 t + 2 tig + {0, 1}) and (n = gid + 8, same r)
+        r0 = 8 * t + 2 * tig
+        if cutlass.const_expr(t < 2):
+            ok0 = r0 < length
+            ok1 = r0 + 1 < length
+            v01 = cutlass.Vector.from_elements(
+                (BFloat16(d0 if ok0 else Float32(0.0)), BFloat16(d1 if ok1 else Float32(0.0))),
+                BFloat16,
+            )
+            v23 = cutlass.Vector.from_elements(
+                (BFloat16(d2 if ok0 else Float32(0.0)), BFloat16(d3 if ok1 else Float32(0.0))),
+                BFloat16,
+            )
+            (s_coefT.data_ptr() + (gid * CTSTR + r0)).store(v01, alignment=4)
+            (s_coefT.data_ptr() + ((gid + 8) * CTSTR + r0)).store(v23, alignment=4)
+        else:
+            s0 = 2 * tig
+            if s0 < T:
+                if gid < N2:
+                    s_coefn[s0 * MMA_N + gid] = d0
+                if gid + 8 < N2:
+                    s_coefn[s0 * MMA_N + gid + 8] = d2
+            if s0 + 1 < T:
+                if gid < N2:
+                    s_coefn[(s0 + 1) * MMA_N + gid] = d1
+                if gid + 8 < N2:
+                    s_coefn[(s0 + 1) * MMA_N + gid + 8] = d3
 
 
 @cute.kernel
@@ -459,6 +671,7 @@ def _replay_kernel(
     p_out: Int64,
     p_cand: Int64,
     p_oldlen: Int64,
+    ck_desc: cutlass.GridConstant[TensorMap],
     candidate_bs: Int64,
     lower: Float32,
     eps: Float32,
@@ -483,13 +696,13 @@ def _replay_kernel(
     hu_ss: cutlass.Constexpr[int],
     hg_ss: cutlass.Constexpr[int],
     hl_ss: cutlass.Constexpr[int],
+    EPS_FTZ: cutlass.Constexpr[int],
 ):
     N2 = 2 * T
     MMA_N: cutlass.Constexpr[int] = 8 if cutlass.const_expr(T <= 4) else 16
     NROWS = HROWS + T
     # padded (power of two) value counts of the transposed warp reductions
     RV1: cutlass.Constexpr[int] = 1 << (N2 - 1).bit_length()
-    RVT: cutlass.Constexpr[int] = 1 << (T - 1).bit_length()
     tid, _, _ = cute.arch.thread_idx()
     h, b, _ = cute.arch.block_idx()
     warp = tid // 32
@@ -512,7 +725,9 @@ def _replay_kernel(
     s_coefn = cutlass.Array(Float32, (T * MMA_N,), space=cutlass.AddressSpace.smem, alignment=16)
     # SFB staging in the UTCCP 32x128b atom image: [k-block][row L][4 words], word 0 = 4 scales
     s_sfb = cutlass.Array(Uint32, (2 * 128,), space=cutlass.AddressSpace.smem, alignment=128)
-    s_red1 = cutlass.Array(Float32, (RV1 * 16,), space=cutlass.AddressSpace.smem, alignment=16)
+    # row pitch 18 floats: the transposed-butterfly partial stores (8 rows x 4 groups per warp) are
+    # bank-conflict free (pitch 16 put a warp's 32 stores into 4 banks)
+    s_red1 = cutlass.Array(Float32, (RV1 * 18,), space=cutlass.AddressSpace.smem, alignment=16)
     s_red2 = cutlass.Array(Float32, (4 * 16,), space=cutlass.AddressSpace.smem, alignment=16)
     s_dr = cutlass.Array(Float32, (32,), space=cutlass.AddressSpace.smem, alignment=16)
     # per-token product of the operand outer scale and the checkpoint outer scale, duplicated
@@ -522,8 +737,21 @@ def _replay_kernel(
     s_bsig = cutlass.Array(Float32, (8,), space=cutlass.AddressSpace.smem, alignment=16)
     s_z = cutlass.Array(BFloat16, (T * KD,), space=cutlass.AddressSpace.smem, alignment=16)
     s_tmem = cutlass.Array(Int32, (1,), space=cutlass.AddressSpace.smem, alignment=16)
+    s_rep = cutlass.Array(Int32, (4,), space=cutlass.AddressSpace.smem, alignment=16)
     s_mbar = cutlass.Array(Int64, (1,), space=cutlass.AddressSpace.smem, alignment=8)
+    # completion barrier of the G history bulk copy (large launches)
+    s_mbar_g = cutlass.Array(Int64, (1,), space=cutlass.AddressSpace.smem, alignment=8)
+    # completion barrier of the checkpoint TMA tile copy (16 B aligned pool rows)
+    s_mbar_a = cutlass.Array(Int64, (1,), space=cutlass.AddressSpace.smem, alignment=8)
+    # native-MMA descriptors, built once at CTA start (rebuilding them after the post-quantization
+    # barrier costs the issuing warp ~240 cycles of dependent uniform-datapath ops)
+    s_desc = cutlass.Array(Int64, (4,), space=cutlass.AddressSpace.smem, alignment=16)
 
+    # TMEM allocation + permit release first: the next CTA on this SM is only launched once this
+    # one has relinquished its allocation permit
+    if warp == 0:
+        prims.tcgen05_alloc(s_tmem, TMEM_COLS, group=prims.CTAGroup.CTA_1)
+        prims.tcgen05_relinquish_alloc_permit(group=prims.CTAGroup.CTA_1)
     out_ptr = cutlass.inttoptr(p_out, GMEM, BFloat16)
     cand_ptr = cutlass.inttoptr(p_cand, GMEM, BFloat16)
     oldlen_ptr = cutlass.inttoptr(p_oldlen, GMEM, Int32)
@@ -535,6 +763,9 @@ def _replay_kernel(
     # it is only dereferenced on live rows
     is_dummy = _ld_keep_u8(p_dummy + b64)
     slot = _ld_keep_s32(p_slots + b64 * 4)
+    # the replay slot index is row metadata (not a slot dereference): fetch it in the same round
+    # trip so that the length -> history chain starts one round trip earlier
+    replay_slot = _ld_keep_s32(p_ridx + b64 * 4)
 
     raw_ptr = cutlass.inttoptr(p_raw, GMEM, BFloat16)
     z_ptr = cutlass.inttoptr(p_z, GMEM, BFloat16)
@@ -548,15 +779,66 @@ def _replay_kernel(
     a_log = (cutlass.inttoptr(p_a_log, GMEM, Float32) + h).load()
     nw = (cutlass.inttoptr(p_nw, GMEM, BFloat16) + tid).load()
 
-    s_sfb[tid] = Uint32(0)
-    s_sfb[tid + NT] = Uint32(0)
-    # Begin TMEM allocation and barrier initialization while row-local loads are in flight.
-    if warp == 0:
-        prims.tcgen05_alloc(s_tmem, TMEM_COLS, group=prims.CTAGroup.CTA_1)
-        prims.tcgen05_relinquish_alloc_permit(group=prims.CTAGroup.CTA_1)
+    if cutlass.const_expr(MMA_N != 8 and N2 <= 12):
+        # warps 0..2 own every async-proxy operand write (SFB, B codes, padding rows), so only they
+        # need the proxy fence before the MMA (warp 3's MEMBAR is off the coefficient path)
+        if tid < 96:
+            s_sfb[tid] = Uint32(0)
+            s_sfb[tid + 96] = Uint32(0)
+            if tid < 64:
+                s_sfb[tid + 192] = Uint32(0)
+    else:
+        s_sfb[tid] = Uint32(0)
+        s_sfb[tid + NT] = Uint32(0)
+    if cutlass.const_expr(MMA_N != 8 and N2 <= 12):
+        # descriptor-visible padding operand rows N2..15 are exact zeros (the quantization phase
+        # then only writes live rows)
+        if tid < (MMA_N - N2) * 16:
+            sB[N2 * 16 + tid] = Uint32(0)
     if tid == 0:
         prims.mbarrier_init(s_mbar, 1)
+        prims.mbarrier_init(s_mbar_g, 1)
+        prims.mbarrier_init(s_mbar_a, 1)
         prims.fence_mbarrier_init()
+        s_desc[0] = Int64(
+            prims.Tcgen05SmemDesc.build(
+                sA,
+                leading_byte_offset=16,
+                stride_byte_offset=512,
+                base_offset=0,
+                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
+            )
+        )
+        s_desc[1] = Int64(
+            prims.Tcgen05SmemDesc.build(
+                sB,
+                leading_byte_offset=16,
+                stride_byte_offset=512,
+                base_offset=0,
+                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
+            )
+        )
+        s_desc[2] = Int64(
+            prims.Tcgen05SmemDesc.build(
+                s_sfb,
+                leading_byte_offset=16,
+                stride_byte_offset=128,
+                base_offset=0,
+                layout=prims.Tcgen05SmemSwizzle.NONE,
+            )
+        )
+        s_desc[3] = Int64(
+            Int32(
+                prims.Tcgen05MxOmmaInstrDesc.build(
+                    a_dtype=cutlass.Float4E2M1FN,
+                    b_dtype=cutlass.Float4E2M1FN,
+                    scale_format=0,
+                    n_dim=MMA_N,
+                    m_dim=128,
+                    sparsity_version=0,
+                )
+            )
+        )
 
     if is_dummy != Int32(0):
         if cutlass.const_expr(PDL != 0):
@@ -590,21 +872,19 @@ def _replay_kernel(
     else:
         # ---- slot-dependent loads ----
         slot64 = Int64(slot)
-        replay_slot = _ld_keep_s32(p_ridx + b64 * 4)
         pool_row = p_pool + slot64 * pool_ss + h64 * STATE_BYTES
         pool_u8 = cutlass.inttoptr(pool_row, GMEM, Uint8)
         # state primary values -> SW64 K-major smem tile (8 rows x 64B atoms, chunk ^= (row>>1)&3)
         sfa = []
         if cutlass.const_expr(POOL_VEC != 0):
-            # 16B-aligned slot stride: async 16B copies + vector scale loads
-            for k in cutlass.range_constexpr(4):
-                q = tid + NT * k
-                r = q // 4
-                c = q % 4
-                dst = r * 64 + ((c ^ ((r >> 1) & 3)) * 16)
-                prims.cp_async_shared_global(
-                    sA.data_ptr() + dst, pool_u8 + (r * 64 + c * 16), 16, "cg"
-                )
+            # 16B-aligned slot stride: one TMA tile copy (64 B x 128 rows, SWIZZLE_64B = the same
+            # chunk ^= (row >> 1) & 3 image) + vector scale loads.  The TMA writes bypass the LSU
+            # pipe (4 cp.async per thread cost ~170 shared-memory wavefronts per CTA).
+            # (the TMA copy itself is issued after the history copies: the launch start is
+            # DRAM-bandwidth bound and the checkpoint is only needed at the MMA)
+            # (keep the history-staging loop variables type-stable across branches)
+            q = tid
+            r = q // 16
             for j in cutlass.range_constexpr(4):
                 m = lane + 32 * j
                 v = cutlass.inttoptr(pool_row + 16384 + m * 8, GMEM, Uint32).load(
@@ -638,6 +918,8 @@ def _replay_kernel(
         # byte strides: pool pages); each slot's payload is dense.
         replay64 = Int64(replay_slot)
         length = _ld_keep_s32(p_hlen + replay64 * hl_ss)
+        if tid == 0:
+            s_rep[0] = replay_slot
         hrow = h64 * CAP  # row index of (h, 0) within the replay slot
         hk_ptr = cutlass.inttoptr(p_hk + replay64 * hk_ss, GMEM, BFloat16)
         hu_ptr = cutlass.inttoptr(p_hu + replay64 * hu_ss, GMEM, BFloat16)
@@ -645,46 +927,6 @@ def _replay_kernel(
         hk_base = hk_ptr + hrow * KD
         hu_base = hu_ptr + hrow * KD
         hg_base = hg_ptr + hrow * KD
-        gdx, gdy, _ = cute.arch.grid_dim()
-        if gdx * gdy <= 1024:
-            # K/G coefficients are masked later. U must be zero outside the
-            # accepted prefix: zero coefficients do not suppress NaN operands.
-            for k in cutlass.range_constexpr(2):
-                q = tid + NT * k
-                r = q // 16
-                prims.cp_async_shared_global(
-                    s_A.data_ptr() + (q * 8 + r * 8), hk_base + q * 8, 16, "cg"
-                )
-                prims.cp_async_shared_global(
-                    s_uh.data_ptr() + (q * 8 + r * 8),
-                    hu_base + q * 8,
-                    16,
-                    "cg",
-                    cp_size=Int32(16) if r < length else Int32(0),
-                )
-            for k in cutlass.range_constexpr(4):
-                q = tid + NT * k
-                prims.cp_async_shared_global(s_gh.data_ptr() + q * 4, hg_base + q * 4, 16, "cg")
-        else:
-            # large launch: only the live rows (bandwidth bound)
-            for k in cutlass.range_constexpr(2):
-                q = tid + NT * k
-                r = q // 16
-                nbytes = Int32(16) if r < length else Int32(0)
-                prims.cp_async_shared_global(
-                    s_A.data_ptr() + (q * 8 + r * 8), hk_base + q * 8, 16, "cg", cp_size=nbytes
-                )
-                prims.cp_async_shared_global(
-                    s_uh.data_ptr() + (q * 8 + r * 8), hu_base + q * 8, 16, "cg", cp_size=nbytes
-                )
-            for k in cutlass.range_constexpr(4):
-                q = tid + NT * k
-                r = q // 32
-                nbytes = Int32(16) if r < length else Int32(0)
-                prims.cp_async_shared_global(
-                    s_gh.data_ptr() + q * 4, hg_base + q * 4, 16, "cg", cp_size=nbytes
-                )
-        prims.cp_async_commit_group()
         # ---- current-step projections (behind the PDL wait; everything above only
         # depends on earlier steps) ----
         if cutlass.const_expr(PDL != 0):
@@ -712,28 +954,66 @@ def _replay_kernel(
             g_row = g_row + g_rs
         tb = tid if tid < T else Int32(0)
         beta_t = (beta_ptr + (b64 * beta_bs + h64 + tb * beta_rs)).load()
-        if cutlass.const_expr(Z_VEC != 0):
-            # separate, later-waited group: the history wait below does not wait for z
-            zt = tid // 16
-            if zt < T:
-                zc = (tid % 16) * 8
+        # history staging (state of earlier launches) is issued after the projection loads: a CTA
+        # that starts after the producer has finished does not delay them behind the length
+        # round trip, and the history is only needed after the norms
+        gdx, gdy, _ = cute.arch.grid_dim()
+        if gdx * gdy <= LIVE_MIN_GRID:
+            # K/G coefficients are masked later. U must be zero outside the
+            # accepted prefix: zero coefficients do not suppress NaN operands.
+            for k in cutlass.range_constexpr(2):
+                q = tid + NT * k
+                r = q // 16
                 prims.cp_async_shared_global(
-                    s_z.data_ptr() + (zt * KD + zc),
-                    z_ptr + (b64 * z_bs + h64 * KD + zt * z_rs + zc),
+                    s_A.data_ptr() + (q * 8 + r * 8), hk_base + q * 8, 16, "cg"
+                )
+                prims.cp_async_shared_global(
+                    s_uh.data_ptr() + (q * 8 + r * 8),
+                    hu_base + q * 8,
                     16,
                     "cg",
+                    cp_size=Int32(16) if r < length else Int32(0),
                 )
-            prims.cp_async_commit_group()
+            for k in cutlass.range_constexpr(4):
+                q = tid + NT * k
+                prims.cp_async_shared_global(s_gh.data_ptr() + q * 4, hg_base + q * 4, 16, "cg")
+        else:
+            # large launch: only the live rows (bandwidth bound); streaming L2 policy
+            hpol = _evict_first_policy()
+            for k in cutlass.range_constexpr(2):
+                q = tid + NT * k
+                r = q // 16
+                nbytes = Int32(16) if r < length else Int32(0)
+                _cp_async16_ef(s_A.data_ptr() + (q * 8 + r * 8), hk_base + q * 8, nbytes, hpol)
+                _cp_async16_ef(s_uh.data_ptr() + (q * 8 + r * 8), hu_base + q * 8, nbytes, hpol)
+            # G rows (dense 512 B rows in global and shared): one bulk copy of the live rows; rows
+            # past the length stay stale (the Adj loop masks them by selects)
+            if tid == 0:
+                prims.mbarrier_arrive_expect_tx(s_mbar_g, length * 512)
+                if length > 0:
+                    prims.cp_async_bulk_shared_cluster_global(
+                        s_gh.data_ptr(),
+                        hg_base,
+                        s_mbar_g,
+                        length * 512,
+                        l2_cache_hint=_evict_first_policy(),
+                    )
+        prims.cp_async_commit_group()
 
         # ---- gates (Triton-pinned elementary ops) ----
         rate = _exp_tl(a_log)
         gates = []
-        for t in cutlass.range_constexpr(T):
-            shifted = Float32(gs[t]) + dtb
-            if cutlass.const_expr(BOUNDED != 0):
-                dgate = _add1_rn(_expf(_mul_rn(shifted, -rate)))
-                gates.append(_mul_rn(lower, _rcp_ge1(dgate)))
-            else:
+        if cutlass.const_expr(BOUNDED != 0):
+            dgates = []
+            for t in cutlass.range_constexpr(T):
+                shifted = Float32(gs[t]) + dtb
+                dgates.append(_add1_rn(_expf(_mul_rn(shifted, -rate))))
+            rgates = _rcp_ge1_n(dgates)
+            for t in cutlass.range_constexpr(T):
+                gates.append(_mul_rn(lower, rgates[t]))
+        else:
+            for t in cutlass.range_constexpr(T):
+                shifted = Float32(gs[t]) + dtb
                 spv = cute.log(Float32(1.0) + _exp_tl(shifted))
                 sp = spv if shifted <= Float32(20.0) else shifted
                 gates.append(-rate * sp)
@@ -794,35 +1074,13 @@ def _replay_kernel(
         # xor 2,4,1 butterfly inside 8-lane groups and the group butterfly runs from smem.
         # Transposed butterfly: every level pairs exactly the same lanes as the plain xor 2,4,1
         # butterfly (so each sum is bit-identical) but halves the values a lane carries.
-        cur1 = []
-        for i in cutlass.range_constexpr(RV1):
-            if cutlass.const_expr(i < N2):
-                cur1.append(sq[i])
-            else:
-                cur1.append(Float32(0.0))
-        base1 = Int32(0)
-        plain1 = 0
-        for lvl in cutlass.range_constexpr(3):
-            o1 = (2, 4, 1)[lvl]
-            if cutlass.const_expr(len(cur1) > 1):
-                h1 = len(cur1) // 2
-                up1 = (lane & o1) != 0
-                nxt1 = []
-                for i in cutlass.range_constexpr(h1):
-                    snd = cur1[i] if up1 else cur1[i + h1]
-                    kep = cur1[i + h1] if up1 else cur1[i]
-                    nxt1.append(kep + cute.arch.shuffle_sync_bfly(snd, offset=o1))
-                cur1 = nxt1
-                base1 = base1 + ((lane // o1) % 2) * h1
-            else:
-                cur1 = [cur1[0] + cute.arch.shuffle_sync_bfly(cur1[0], offset=o1)]
-                plain1 = plain1 + o1
-        if (lane & plain1) == 0:
-            for j in cutlass.range_constexpr(len(cur1)):
-                s_red1[(base1 + j) * 16 + warp * 4 + lane // 8] = cur1[j]
+        red1 = _tree_reduce(sq, (2, 4, 1), lane)
+        for e1 in red1:
+            if (lane & e1[3]) == 0:
+                s_red1[_tree_idx(e1, lane) * 18 + warp * 4 + lane // 8] = e1[0]
         prims.barrier_cta_sync(0)
         if tid < N2:
-            tgv = (s_red1.data_ptr() + tid * 16).load(alignment=16, count=16)
+            tgv = (s_red1.data_ptr() + tid * 18).load(alignment=8, count=16)
             ug = []
             for m in cutlass.range_constexpr(8):
                 ug.append(tgv[m] + tgv[m + 8])
@@ -848,8 +1106,7 @@ def _replay_kernel(
         prims.tcgen05_st(
             "32x32b", cutlass.inttoptr(tmem_base + ((warp * 32) << 16) + 16, 6, Int32), sfa_vec
         )
-        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        # (its completion is awaited before the pre-quantization barrier)
         qn = []
         kn = []
         for t in cutlass.range_constexpr(T):
@@ -861,11 +1118,34 @@ def _replay_kernel(
             kn.append(_bf(kd))
 
         # ---- history staged ----
-        if cutlass.const_expr(Z_VEC != 0):
-            prims.cp_async_wait_group(1)
-        else:
-            prims.cp_async_wait_group(0)
+        prims.cp_async_wait_group(0)
         prims.barrier_cta_sync(0)
+        if cutlass.const_expr(POOL_VEC != 0):
+            if tid == 0:
+                prims.mbarrier_arrive_expect_tx(s_mbar_a, 8192)
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    sA.data_ptr(),
+                    ck_desc.get_ptr(),
+                    [Int32(0), Int32(0), h, slot],
+                    s_mbar_a,
+                    l2_cache_hint=_evict_first_policy(),
+                )
+        if cutlass.const_expr(Z_VEC != 0):
+            # output-gate rows (needed in the epilogue) only now: the early bandwidth goes to the
+            # critical x / history loads
+            zt = tid // 16
+            if zt < T:
+                zc = (tid % 16) * 8
+                prims.cp_async_shared_global(
+                    s_z.data_ptr() + (zt * KD + zc),
+                    z_ptr + (b64 * z_bs + h64 * KD + zt * z_rs + zc),
+                    16,
+                    "cg",
+                )
+            prims.cp_async_commit_group()
+        if gdx * gdy > LIVE_MIN_GRID:
+            while not prims.mbarrier_try_wait_parity(s_mbar_g, 0):
+                pass
         aidx = (length - 1) if length > 0 else Int32(0)
         anchor_ld = s_gh[aidx * KD + tid]
         anchor = anchor_ld if length > 0 else Float32(0.0)
@@ -906,31 +1186,13 @@ def _replay_kernel(
             ecum = _exp_tl(cum[t])
             s_gh[(2 * t) * KD + qoff] = _mul_rn(kn[t], ecum)
             s_gh[(2 * t + 1) * KD + qoff] = _mul_rn(qn[t], ecum)
-        cur2 = []
-        for t in cutlass.range_constexpr(RVT):
-            if cutlass.const_expr(t < T):
-                cur2.append(kn[t] * qn[t])
-            else:
-                cur2.append(Float32(0.0))
-        base2 = Int32(0)
-        plain2 = 0
-        for lvl in cutlass.range_constexpr(5):
-            o2 = 16 >> lvl
-            if cutlass.const_expr(len(cur2) > 1):
-                h2 = len(cur2) // 2
-                up2 = (lane & o2) != 0
-                nxt2 = []
-                for i in cutlass.range_constexpr(h2):
-                    snd2 = cur2[i] if up2 else cur2[i + h2]
-                    kep2 = cur2[i + h2] if up2 else cur2[i]
-                    nxt2.append(kep2 + cute.arch.shuffle_sync_bfly(snd2, offset=o2))
-                cur2 = nxt2
-                base2 = base2 + ((lane // o2) % 2) * h2
-            else:
-                cur2 = [cur2[0] + cute.arch.shuffle_sync_bfly(cur2[0], offset=o2)]
-                plain2 = plain2 + o2
-        if (lane & plain2) == 0:
-            s_red2[base2 * 4 + warp] = cur2[0]
+        kqp = []
+        for t in cutlass.range_constexpr(T):
+            kqp.append(kn[t] * qn[t])
+        red2 = _tree_reduce(kqp, (16, 8, 4, 2, 1), lane)
+        for e2 in red2:
+            if (lane & e2[3]) == 0:
+                s_red2[_tree_idx(e2, lane) * 4 + warp] = e2[0]
 
         # relative pair (B operand of history/new-token coefficient products) and
         # adjusted new keys; adjusted history keys.
@@ -943,17 +1205,19 @@ def _replay_kernel(
 
         # ---- persistent writes that need no further math ----
         if cutlass.const_expr(T > 4):
-            hk_w = _history_row(p_ridx, b64, p_hk, hk_ss, BFloat16, (hrow + length) * KD + tid)
+            hk_w = _history_row_s(s_rep[0], p_hk, hk_ss, BFloat16, (hrow + length) * KD + tid)
         else:
             hk_w = hk_ptr + ((hrow + length) * KD + tid)
         if cutlass.const_expr(T > 4):
-            hg_w = _history_row(p_ridx, b64, p_hg, hg_ss, Float32, (hrow + length) * KD + tid)
+            hg_w = _history_row_s(s_rep[0], p_hg, hg_ss, Float32, (hrow + length) * KD + tid)
         else:
             hg_w = hg_ptr + ((hrow + length) * KD + tid)
         for t in cutlass.range_constexpr(T):
             (hk_w + t * KD).store(BFloat16(kn[t]))
             (hg_w + t * KD).store(cum[t])
 
+        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         prims.barrier_cta_sync(0)
         # ---- T <= 4 (N8): warps 2..3 form the coefficient products while warps 0..1 quantize;
         # the post-quantization barrier then also publishes s_coefT / s_coefn ----
@@ -1065,127 +1329,212 @@ def _replay_kernel(
                                 s_coefn[(gid + 8) * MMA_N + cn + 1] = d3
         # ---- quantize operand rows to E2M1 + UE4M3 block-16 scales ----
         e4m3 = mlir_ir.TypeAttr.get(cutlass.Float8E4M3FN.mlir_type)
-        e2m1 = mlir_ir.TypeAttr.get(cutlass.Float4E2M1FN.mlir_type)
         # one thread per (operand row n = 2t + p, 16-key block): no shuffles, one scale per block
         qrow = tid // 8
         qblk = tid % 8
         qphys = qrow * 64 + (((qblk // 2) ^ ((qrow >> 1) & 3)) * 16) + (qblk % 2) * 8
-        if qrow < N2:
-            # Each token occupies one 16-lane half-warp (two operand rows x eight blocks).
-            # On odd-T tail warps, exclude the inactive upper half from synchronizing shuffles.
-            if cutlass.const_expr(T % 2 == 1):
-                qmask = Int32(0x0000FFFF) if warp == T // 2 else Int32(-1)
-            else:
-                qmask = Int32(-1)
-            qbase = s_gh.data_ptr() + qrow * KD
-            qv4 = []
-            for i in cutlass.range_constexpr(4):
-                qg = (qblk * 4 + i) ^ qblk
-                qv4.append((qbase + 4 * qg).load(alignment=16, count=4))
-            vals = []
-            for i in cutlass.range_constexpr(16):
-                vals.append(qv4[i // 4][i % 4])
-            bmx = _amax16(vals)
-            tmx = bmx
-            for o in cutlass.range_constexpr(4):
-                tmx = cute.arch.fmax(
-                    tmx, cute.arch.shuffle_sync_bfly(tmx, offset=8 >> o, mask=qmask)
+        if cutlass.const_expr(MMA_N != 8 and N2 <= 12):
+            # N16 with T <= 6: every operand row lives in warps 0..2; warp 3 writes the padding
+            # rows 12..15 and forms the coefficient products (below)
+            if warp < 3:
+                # one 16-lane half-warp per token (two operand rows x eight blocks); padding rows
+                # read row 0 and contribute 0 to the token maxima
+                qrow_c = qrow if qrow < N2 else Int32(0)
+                qbase = s_gh.data_ptr() + qrow_c * KD
+                qv4 = []
+                for i in cutlass.range_constexpr(4):
+                    qg = (qblk * 4 + i) ^ qblk
+                    qv4.append((qbase + 4 * qg).load(alignment=16, count=4))
+                vals = []
+                for i in cutlass.range_constexpr(16):
+                    vals.append(qv4[i // 4][i % 4])
+                bmx = _amax16(vals)
+                bmx = bmx if qrow < N2 else Float32(0.0)
+                # per-half-warp max as two full-warp reductions (exact; values are >= 0)
+                lo_in = bmx if lane < 16 else Float32(0.0)
+                hi_in = Float32(0.0) if lane < 16 else bmx
+                tmx_lo = cute.arch.inline_ptx(
+                    "redux.sync.max.f32 {$w0}, {$r0}, 0xffffffff;",
+                    write_only_types=[Float32],
+                    read_only_args=[lo_in],
                 )
-            outer = tmx * Float32(INV2688)
-            safe = Float32(1.0) if outer == Float32(0.0) else outer
-            den = Float32(6.0) * safe
-            sc = cute.arch.fmin(Float32(448.0), bmx / den)
-            w16 = prims.dialect.convert_f32x2_to_f8x2(
-                MT.i16(),
-                Float32(0.0),
-                sc,
-                e4m3,
-                rnd=nvvm_raw.FPRoundingMode.RN,
-                sat=nvvm_raw.SaturationMode.SATFINITE,
-            )
-            sbyte = Int32(cutlass.Int16(w16)) & Int32(0xFF)
-            sfw = sbyte | (cute.arch.shuffle_sync_down(sbyte, offset=1, mask=qmask) << 8)
-            sfw = sfw | (cute.arch.shuffle_sync_down(sfw, offset=2, mask=qmask) << 16)
-            if tid % 16 == 0:
-                oscv = outer * outer_s
-                (s_osc.data_ptr() + qrow).store(
-                    cutlass.Vector.from_elements((oscv, oscv), Float32), alignment=8
+                tmx_hi = cute.arch.inline_ptx(
+                    "redux.sync.max.f32 {$w0}, {$r0}, 0xffffffff;",
+                    write_only_types=[Float32],
+                    read_only_args=[hi_in],
                 )
-            if qblk % 4 == 0:
-                s_sfb[(qblk // 4) * 128 + qrow * 4] = Uint32(sfw)
-            ex = sbyte >> 3
-            mn = sbyte & 7
-            nrm_bits = ((ex + 120) << 23) | (mn << 20)
-            scf_n = nrm_bits.bitcast(Float32)
-            scf_s = Float32(mn) * Float32(0.001953125)
-            scf = scf_n if ex > 0 else scf_s
-            expd = scf * outer
-            if expd >= Float32(7.888609052210118e-31):
-                # normal-range scale (>= 2^-100): one correctly rounded reciprocal shared by the
-                # 16 elements, Markstein-corrected quotients (bit-identical to div.rn)
-                rexp = Float32(1.0) / expd
-                nexp = -expd
-                qw0 = _quant8(vals[0:8], nexp, rexp)
-                qw1 = _quant8(vals[8:16], nexp, rexp)
-                (sB.data_ptr() + qphys // 4).store(
-                    cutlass.Vector.from_elements((Uint32(qw0), Uint32(qw1)), Uint32), alignment=8
-                )
-            else:
-                zexp = expd == Float32(0.0)
-                words2 = []
-                for wi in cutlass.range_constexpr(2):
-                    qword2 = Int32(0)
-                    for bi in cutlass.range_constexpr(4):
-                        e0 = 8 * wi + 2 * bi
-                        n0 = Float32(0.0) if zexp else vals[e0] / expd
-                        n1 = Float32(0.0) if zexp else vals[e0 + 1] / expd
-                        c8 = prims.dialect.convert_f32x2_to_f4x2(n1, n0, e2m1)
-                        qword2 = qword2 | ((Int32(cutlass.Int8(c8)) & Int32(0xFF)) << (8 * bi))
-                    words2.append(qword2)
-                sB[qphys // 4] = Uint32(words2[0])
-                sB[qphys // 4 + 1] = Uint32(words2[1])
+                tmx = tmx_lo if lane < 16 else tmx_hi
+                if qrow < N2:
+                    outer = tmx * Float32(INV2688)
+                    safe = Float32(1.0) if outer == Float32(0.0) else outer
+                    den = Float32(6.0) * safe
+                    sc = cute.arch.fmin(Float32(448.0), _div_scale(bmx, den, "QSC_DIV_N16"))
+                    w16 = prims.dialect.convert_f32x2_to_f8x2(
+                        MT.i16(),
+                        Float32(0.0),
+                        sc,
+                        e4m3,
+                        rnd=nvvm_raw.FPRoundingMode.RN,
+                        sat=nvvm_raw.SaturationMode.SATFINITE,
+                    )
+                    sbyte = Int32(cutlass.Int16(w16)) & Int32(0xFF)
+                    # SFB staging image: one byte store per block
+                    sfb8 = cutlass.inttoptr(
+                        s_sfb.data_ptr().toint(), cutlass.AddressSpace.smem, Uint8
+                    )
+                    (sfb8 + (((qblk // 4) * 128 + qrow * 4) * 4 + (qblk % 4))).store(Uint8(sbyte))
+                    if tid % 16 == 0:
+                        oscv = outer * outer_s
+                        (s_osc.data_ptr() + qrow).store(
+                            cutlass.Vector.from_elements((oscv, oscv), Float32), alignment=8
+                        )
+                    # decoded scale: hardware e4m3 -> f16 -> f32 (exact)
+                    expd = _e4m3_f32(w16) * outer
+                    if expd >= Float32(7.888609052210118e-31) and expd < Float32(
+                        8.507059173023462e37
+                    ):
+                        rexp = _rcp_fast(expd)
+                        nexp = -expd
+                        qw0 = _quant8(vals[0:8], nexp, rexp)
+                        qw1 = _quant8(vals[8:16], nexp, rexp)
+                        (sB.data_ptr() + qphys // 4).store(
+                            cutlass.Vector.from_elements((Uint32(qw0), Uint32(qw1)), Uint32),
+                            alignment=8,
+                        )
+                    elif expd == Float32(0.0):
+                        (sB.data_ptr() + qphys // 4).store(
+                            cutlass.Vector.from_elements((Uint32(0), Uint32(0)), Uint32),
+                            alignment=8,
+                        )
+                    elif expd < Float32(7.888609052210118e-31):
+                        ed = expd * Float32(18446744073709551616.0)
+                        rexs = Float32(1.0) / ed
+                        vsc = [v * Float32(18446744073709551616.0) for v in vals]
+                        qws0 = _quant8(vsc[0:8], -ed, rexs)
+                        qws1 = _quant8(vsc[8:16], -ed, rexs)
+                        (sB.data_ptr() + qphys // 4).store(
+                            cutlass.Vector.from_elements((Uint32(qws0), Uint32(qws1)), Uint32),
+                            alignment=8,
+                        )
+                    else:
+                        # expd >= 2^126 or NaN: plain IEEE reciprocal (as before)
+                        rexh = Float32(1.0) / expd
+                        qwh0 = _quant8(vals[0:8], -expd, rexh)
+                        qwh1 = _quant8(vals[8:16], -expd, rexh)
+                        (sB.data_ptr() + qphys // 4).store(
+                            cutlass.Vector.from_elements((Uint32(qwh0), Uint32(qwh1)), Uint32),
+                            alignment=8,
+                        )
         else:
-            # Only descriptor-visible padding rows need packed zeros.  SFB was cleared in full
-            # before this phase, so its padding scales remain exact zero without extra stores.
-            if qrow < MMA_N:
-                sB[qphys // 4] = Uint32(0)
-                sB[qphys // 4 + 1] = Uint32(0)
-        prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+            if qrow < N2:
+                # Each token occupies one 16-lane half-warp (two operand rows x eight blocks).
+                # On odd-T tail warps, exclude the inactive upper half from synchronizing shuffles.
+                if cutlass.const_expr(T % 2 == 1):
+                    qmask = Int32(0x0000FFFF) if warp == T // 2 else Int32(-1)
+                else:
+                    qmask = Int32(-1)
+                qbase = s_gh.data_ptr() + qrow * KD
+                qv4 = []
+                for i in cutlass.range_constexpr(4):
+                    qg = (qblk * 4 + i) ^ qblk
+                    qv4.append((qbase + 4 * qg).load(alignment=16, count=4))
+                vals = []
+                for i in cutlass.range_constexpr(16):
+                    vals.append(qv4[i // 4][i % 4])
+                bmx = _amax16(vals)
+                tmx = bmx
+                for o in cutlass.range_constexpr(4):
+                    tmx = cute.arch.fmax(
+                        tmx, cute.arch.shuffle_sync_bfly(tmx, offset=8 >> o, mask=qmask)
+                    )
+                outer = tmx * Float32(INV2688)
+                safe = Float32(1.0) if outer == Float32(0.0) else outer
+                den = Float32(6.0) * safe
+                sc = cute.arch.fmin(Float32(448.0), bmx / den)
+                w16 = prims.dialect.convert_f32x2_to_f8x2(
+                    MT.i16(),
+                    Float32(0.0),
+                    sc,
+                    e4m3,
+                    rnd=nvvm_raw.FPRoundingMode.RN,
+                    sat=nvvm_raw.SaturationMode.SATFINITE,
+                )
+                sbyte = Int32(cutlass.Int16(w16)) & Int32(0xFF)
+                sfw = sbyte | (cute.arch.shuffle_sync_down(sbyte, offset=1, mask=qmask) << 8)
+                sfw = sfw | (cute.arch.shuffle_sync_down(sfw, offset=2, mask=qmask) << 16)
+                if tid % 16 == 0:
+                    oscv = outer * outer_s
+                    (s_osc.data_ptr() + qrow).store(
+                        cutlass.Vector.from_elements((oscv, oscv), Float32), alignment=8
+                    )
+                if qblk % 4 == 0:
+                    s_sfb[(qblk // 4) * 128 + qrow * 4] = Uint32(sfw)
+                ex = sbyte >> 3
+                mn = sbyte & 7
+                nrm_bits = ((ex + 120) << 23) | (mn << 20)
+                scf_n = nrm_bits.bitcast(Float32)
+                scf_s = Float32(mn) * Float32(0.001953125)
+                scf = scf_n if ex > 0 else scf_s
+                expd = scf * outer
+                if expd >= Float32(7.888609052210118e-31):
+                    # normal-range scale (>= 2^-100): one correctly rounded reciprocal shared by the
+                    # 16 elements, Markstein-corrected quotients (bit-identical to div.rn)
+                    rexp = Float32(1.0) / expd
+                    nexp = -expd
+                    qw0 = _quant8(vals[0:8], nexp, rexp)
+                    qw1 = _quant8(vals[8:16], nexp, rexp)
+                    (sB.data_ptr() + qphys // 4).store(
+                        cutlass.Vector.from_elements((Uint32(qw0), Uint32(qw1)), Uint32),
+                        alignment=8,
+                    )
+                elif expd == Float32(0.0):
+                    # all-zero block scale (underflowed operand block): every code is +0, no division
+                    (sB.data_ptr() + qphys // 4).store(
+                        cutlass.Vector.from_elements((Uint32(0), Uint32(0)), Uint32), alignment=8
+                    )
+                else:
+                    # tiny nonzero scale: rescale numerator and denominator by 2^64 (exact), so the
+                    # Markstein quotients stay bit-identical to div.rn without the IEEE slow path
+                    ed = expd * Float32(18446744073709551616.0)
+                    rexs = Float32(1.0) / ed
+                    vsc = [v * Float32(18446744073709551616.0) for v in vals]
+                    qws0 = _quant8(vsc[0:8], -ed, rexs)
+                    qws1 = _quant8(vsc[8:16], -ed, rexs)
+                    (sB.data_ptr() + qphys // 4).store(
+                        cutlass.Vector.from_elements((Uint32(qws0), Uint32(qws1)), Uint32),
+                        alignment=8,
+                    )
+            else:
+                # Only descriptor-visible padding rows need packed zeros.  SFB was cleared in full
+                # before this phase, so its padding scales remain exact zero without extra stores.
+                if qrow < MMA_N:
+                    sB[qphys // 4] = Uint32(0)
+                    sB[qphys // 4 + 1] = Uint32(0)
+        if cutlass.const_expr(MMA_N != 8 and N2 <= 12):
+            # N16 with T <= 6: warp 3 has no operand row to quantize -> it forms all four
+            # coefficient tiles meanwhile; the post-quantization barrier publishes them
+            if warp == 3:
+                _coef_tiles_t(lane, length, s_A, s_R, s_coefT, s_coefn, T, N2, NROWS, MMA_N)
+        if cutlass.const_expr(MMA_N != 8 and N2 <= 12):
+            if warp < 3:
+                prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+        else:
+            prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
         prims.barrier_cta_sync(0)
 
         # ---- native NVFP4 MMA: D[128 x 16] = S(E2M1,UE4M3) x [k_t;q_t](E2M1,UE4M3)^T ----
         if warp == 0:
+            if cutlass.const_expr(POOL_VEC != 0):
+                while not prims.mbarrier_try_wait_parity(s_mbar_a, 0):
+                    pass
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            idesc = prims.Tcgen05MxOmmaInstrDesc.build(
-                a_dtype=cutlass.Float4E2M1FN,
-                b_dtype=cutlass.Float4E2M1FN,
-                scale_format=0,
-                n_dim=MMA_N,
-                m_dim=128,
-                sparsity_version=0,
-            )
-            desc_a = prims.Tcgen05SmemDesc.build(
-                sA,
-                leading_byte_offset=16,
-                stride_byte_offset=512,
-                base_offset=0,
-                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
-            )
-            desc_b = prims.Tcgen05SmemDesc.build(
-                sB,
-                leading_byte_offset=16,
-                stride_byte_offset=512,
-                base_offset=0,
-                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_64B,
-            )
+            dv01 = (s_desc.data_ptr()).load(alignment=16, count=2)
+            dv23 = (s_desc.data_ptr() + 2).load(alignment=16, count=2)
+            desc_a = prims.Tcgen05SmemDesc(dv01[0])
+            desc_b = prims.Tcgen05SmemDesc(dv01[1])
+            desc_sf = prims.Tcgen05SmemDesc(dv23[0])
+            idesc = prims.Tcgen05MxOmmaInstrDesc(Int32(dv23[1]))
             d_ptr = cutlass.inttoptr(tmem_base, 6, Float32)
-            desc_sf = prims.Tcgen05SmemDesc.build(
-                s_sfb,
-                leading_byte_offset=16,
-                stride_byte_offset=128,
-                base_offset=0,
-                layout=prims.Tcgen05SmemSwizzle.NONE,
-            )
             sf_shape, sf_mc = prims.S2TCopyMode.S2T_32x128b_WARPX4
             if prims.elect_sync():
                 for kb in cutlass.range_constexpr(2):
@@ -1213,7 +1562,7 @@ def _replay_kernel(
                     )
                 prims.tcgen05_commit(s_mbar, group=prims.CTAGroup.CTA_1)
 
-        if cutlass.const_expr(MMA_N != 8):
+        if cutlass.const_expr(MMA_N != 8 and N2 > 12):
             # ---- coefficient products on warp tensor cores (bf16 x bf16 -> fp32) ----
             # C[32 x 16] = A[32 x 128] R[16 x 128]^T; rows 0..15 history (bf16-rounded result),
             # rows 16..16+T-1 new tokens (fp32).  Warp w: m-tile w // 2, n-tile w % 2, 8 k16 steps.
@@ -1358,16 +1707,31 @@ def _replay_kernel(
                 c4 = 2 * nq + tq // 2
                 hr0 = 16 * mq + gq
                 hr1 = hr0 + 8
-                (hsc + (hr0 * 16 + (c4 ^ ((hr0 >> 1) & 3)) * 4 + 2 * (tq % 2))).store(
-                    cutlass.Vector.from_elements((h0, h1), Float32), alignment=8
-                )
-                (hsc + (hr1 * 16 + (c4 ^ ((hr1 >> 1) & 3)) * 4 + 2 * (tq % 2))).store(
-                    cutlass.Vector.from_elements((h2, h3), Float32), alignment=8
-                )
+                (
+                    hsc
+                    + (
+                        hr0 * 16
+                        + (c4 ^ ((((hr0 >> 1) & 1) << 1) | ((hr0 >> 2) & 1))) * 4
+                        + 2 * (tq % 2)
+                    )
+                ).store(cutlass.Vector.from_elements((h0, h1), Float32), alignment=8)
+                (
+                    hsc
+                    + (
+                        hr1 * 16
+                        + (c4 ^ ((((hr1 >> 1) & 1) << 1) | ((hr1 >> 2) & 1))) * 4
+                        + 2 * (tq % 2)
+                    )
+                ).store(cutlass.Vector.from_elements((h2, h3), Float32), alignment=8)
         cute.arch.sync_warp()
         hist = []
         for c in cutlass.range_constexpr(MMA_N // 4):
-            hv = (hsc + (lane * 16 + (c ^ ((lane >> 1) & 3)) * 4)).load(alignment=16, count=4)
+            # chunk swizzle x(r) = bit-swapped (r >> 1) & 3: conflict-free for both the half-warp STS.64
+            # fragment stores (rows of equal parity in distinct chunk pairs) and these quarter-warp
+            # LDS.128 row reads
+            hv = (
+                hsc + (lane * 16 + (c ^ ((((lane >> 1) & 1) << 1) | ((lane >> 2) & 1))) * 4)
+            ).load(alignment=16, count=4)
             for e in cutlass.range_constexpr(4):
                 hist.append(hv[e])
 
@@ -1416,31 +1780,13 @@ def _replay_kernel(
             u = bsigs[t] * (vv[t] - pk)
             us.append(u)
             cores.append(_bf(pq + u * kqs[t]))
-        cur3 = []
-        for t in cutlass.range_constexpr(RVT):
-            if cutlass.const_expr(t < T):
-                cur3.append(cores[t] * cores[t])
-            else:
-                cur3.append(Float32(0.0))
-        base3 = Int32(0)
-        plain3 = 0
-        for lvl in cutlass.range_constexpr(5):
-            o3 = 16 >> lvl
-            if cutlass.const_expr(len(cur3) > 1):
-                h3 = len(cur3) // 2
-                up3 = (lane & o3) != 0
-                nxt3 = []
-                for i in cutlass.range_constexpr(h3):
-                    snd3 = cur3[i] if up3 else cur3[i + h3]
-                    kep3 = cur3[i + h3] if up3 else cur3[i]
-                    nxt3.append(kep3 + cute.arch.shuffle_sync_bfly(snd3, offset=o3))
-                cur3 = nxt3
-                base3 = base3 + ((lane // o3) % 2) * h3
-            else:
-                cur3 = [cur3[0] + cute.arch.shuffle_sync_bfly(cur3[0], offset=o3)]
-                plain3 = plain3 + o3
-        if (lane & plain3) == 0:
-            s_red3[base3 * 4 + warp] = cur3[0]
+        csq = []
+        for t in cutlass.range_constexpr(T):
+            csq.append(cores[t] * cores[t])
+        red3 = _tree_reduce(csq, (16, 8, 4, 2, 1), lane)
+        for e3 in red3:
+            if (lane & e3[3]) == 0:
+                s_red3[_tree_idx(e3, lane) * 4 + warp] = e3[0]
         if cutlass.const_expr(Z_VEC != 0):
             prims.cp_async_wait_group(0)
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1453,7 +1799,7 @@ def _replay_kernel(
             prims.griddepcontrol("launch_dependents")
         nwf = Float32(nw)
         if cutlass.const_expr(T > 4):
-            hu_w = _history_row(p_ridx, b64, p_hu, hu_ss, BFloat16, (hrow + length) * KD + tid)
+            hu_w = _history_row_s(s_rep[0], p_hu, hu_ss, BFloat16, (hrow + length) * KD + tid)
         else:
             hu_w = hu_ptr + ((hrow + length) * KD + tid)
         o_row2 = out_ptr + ((b64 * T * H + h64) * KD + tid)
@@ -1463,7 +1809,17 @@ def _replay_kernel(
         for t in cutlass.range_constexpr(T):
             rv4 = (s_red3.data_ptr() + t * 4).load(alignment=16, count=4)
             tot = rv4[0] + rv4[1] + rv4[2] + rv4[3]
-            rss.append(cute.rsqrt(tot * Float32(1.0 / 128.0) + eps))
+            if cutlass.const_expr(EPS_FTZ != 0):
+                # eps is a normal float -> the operand is never subnormal: the .ftz form is identical
+                rss.append(
+                    cute.arch.inline_ptx(
+                        "rsqrt.approx.ftz.f32 {$w0}, {$r0};",
+                        write_only_types=[Float32],
+                        read_only_args=[tot * Float32(1.0 / 128.0) + eps],
+                    )
+                )
+            else:
+                rss.append(cute.rsqrt(tot * Float32(1.0 / 128.0) + eps))
             if cutlass.const_expr(Z_VEC != 0):
                 zfs.append(Float32(s_z[t * KD + tid]))
             else:
@@ -1511,6 +1867,7 @@ def _replay_launch(
     p_cand: Int64,
     p_oldlen: Int64,
     B: Int32,
+    n_slots: Int32,
     candidate_bs: Int64,
     lower: Float32,
     eps: Float32,
@@ -1536,7 +1893,28 @@ def _replay_launch(
     hu_ss: cutlass.Constexpr[int],
     hg_ss: cutlass.Constexpr[int],
     hl_ss: cutlass.Constexpr[int],
+    EPS_FTZ: cutlass.Constexpr[int],
 ):
+    # checkpoint primary values: [slot][head][row 0..127][64 B] (pool_ss / STATE_BYTES byte strides)
+    if cutlass.const_expr(POOL_VEC != 0):
+        ck_desc = create_tensor_map_tiled(
+            global_address=p_pool,
+            dtype=cutlass.Uint8,
+            global_dims=[64, 128, H, n_slots],
+            global_strides=[64 // 16, STATE_BYTES // 16, pool_ss // 16],
+            box_dims=[64, 128, 1, 1],
+            swizzle=TensorMapSwizzle.s64b,
+        )
+    else:
+        # unused (byte-granular checkpoint path): any 16 B aligned address
+        ck_desc = create_tensor_map_tiled(
+            global_address=(p_pool // 16) * 16,
+            dtype=cutlass.Uint8,
+            global_dims=[64, 128, 1, 1],
+            global_strides=[64 // 16, 8192 // 16, 8192 // 16],
+            box_dims=[64, 128, 1, 1],
+            swizzle=TensorMapSwizzle.s64b,
+        )
     _replay_kernel(
         p_raw,
         p_conv,
@@ -1558,6 +1936,7 @@ def _replay_launch(
         p_out,
         p_cand,
         p_oldlen,
+        ck_desc,
         candidate_bs,
         lower,
         eps,
@@ -1582,6 +1961,7 @@ def _replay_launch(
         hu_ss,
         hg_ss,
         hl_ss,
+        EPS_FTZ,
     ).launch(
         grid=(H, B, 1),
         block=(NT, 1, 1),
@@ -1640,6 +2020,7 @@ def _get_compiled(
     pool_ss,
     pdl,
     history_strides,
+    eps_ftz,
 ):
     # Specialize only stable model topology and layout metadata.  Request shape B,
     # accepted lengths, slots, masks and every tensor value remain runtime inputs.
@@ -1663,13 +2044,14 @@ def _get_compiled(
         pool_ss,
         pdl,
         history_strides,
+        eps_ftz,
     )
     fn = _compiled.get(key)
     if fn is None:
         z64 = Int64(0)
         # Runtime ABI: 20 pointers, B, candidate stride, lower, eps and stream. Every argument
         # following stream is a compile-time topology/layout constant.
-        args = [z64] * 20 + [Int32(1), Int64(0), Float32(0.0), Float32(0.0)]
+        args = [z64] * 20 + [Int32(1), Int32(1), Int64(0), Float32(0.0), Float32(0.0)]
         fn = cute.compile(
             _replay_launch,
             *args,
@@ -1692,6 +2074,7 @@ def _get_compiled(
             z_vec,
             pdl,
             *history_strides,
+            eps_ftz,
         )
         _compiled[key] = fn
     return fn
@@ -1784,6 +2167,7 @@ def fused_replay(
             hg.stride(0) * hg.element_size(),
             lengths.stride(0) * lengths.element_size(),
         ),
+        int(float(norm_eps) >= 1.1754943508222875e-38),
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
@@ -1808,6 +2192,7 @@ def fused_replay(
         candidate_x.data_ptr(),
         old_lengths.data_ptr(),
         batch,
+        pool.shape[0],
         candidate_x.stride(0),
         float(lower_bound) if lower_bound is not None else 0.0,
         float(norm_eps),
