@@ -29,6 +29,7 @@ here. Tracked as a follow-up PR; see PR #13926 review thread
 
 import sys
 from contextlib import contextmanager
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -288,11 +289,119 @@ class TestStorageNbytes:
         # 10 fp32 occupies more than 10 bf16
         assert _storage_nbytes(t_f32) > _storage_nbytes(t_bf16)
 
-    def test_shape_independent_for_views(self):
-        # Storage size should reflect the underlying buffer, not the view.
-        base = torch.empty(100, dtype=torch.float32)
-        view = base.view(10, 10)
-        assert _storage_nbytes(view) == _storage_nbytes(base)
+
+class TestMoveUntrackedParams:
+    def test_shared_storage_views_preserved(self, monkeypatch):
+        # Real CPU storage exercises the migration bookkeeping without a GPU or daemon.
+        class CudaParameter(torch.nn.Parameter):
+            @property
+            def is_cuda(self) -> bool:
+                return True
+
+        source = torch.arange(1, 101, dtype=torch.float32)
+        assert _storage_nbytes(source.view(10, 10)) == _storage_nbytes(source)
+        model = torch.nn.Module()
+        model.first = CudaParameter(source[3:11], requires_grad=False)
+        model.second = CudaParameter(source[20:40:2], requires_grad=False)
+        model.overlap = CudaParameter(source[5:9], requires_grad=False)
+        model.bytes_view = CudaParameter(source.view(torch.uint8)[7:13], requires_grad=False)
+        model.tied = model.first
+        model.cpu_parameter = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        buffer = source.as_subclass(CudaParameter)
+        model.register_buffer("buffer", buffer)
+        buffer_storage_ptr = buffer.untyped_storage().data_ptr()
+        expected = {
+            name: (parameter.clone(), parameter.stride(), parameter.storage_offset())
+            for name, parameter in model.named_parameters()
+        }
+        for parameter in (model.first, model.second, model.bytes_view):
+            assert _storage_nbytes(parameter) == _storage_nbytes(source)
+
+        allocations = {}
+        client = MagicMock()
+        client._mappings = {}
+
+        def create_mapping(size: int, tag: str) -> int:
+            allocation = torch.zeros(size, dtype=torch.uint8)
+            ptr = allocation.data_ptr()
+            allocations[ptr] = allocation
+            client._mappings[ptr] = SimpleNamespace(va=ptr, size=size)
+            return ptr
+
+        def tensor_from_pointer(ptr, shape, stride, dtype, device_index) -> torch.Tensor:
+            return torch.empty(0, dtype=dtype).set_(
+                allocations[ptr].untyped_storage(), 0, shape, stride
+            )
+
+        def iter_tensors(module):
+            for name, parameter in module.named_parameters(remove_duplicate=False):
+                yield name, parameter, "parameter"
+            for name, buffer in module.named_buffers():
+                yield name, buffer, "buffer"
+
+        module = ModuleType("gpu_memory_service.client.torch.module")
+        module._iter_module_tensors = iter_tensors
+        tensor_module = ModuleType("gpu_memory_service.client.torch.tensor")
+        tensor_module._tensor_from_pointer = tensor_from_pointer
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        monkeypatch.setitem(sys.modules, tensor_module.__name__, tensor_module)
+        client.create_mapping.side_effect = create_mapping
+        backend = GMSBackend(socket_path="/tmp/fake-gms.sock", mapping=MagicMock())
+        backend._client = client
+        backend.move_untracked_params(model)
+
+        assert len(allocations) == 1
+        client.create_mapping.assert_called_once_with(
+            size=_storage_nbytes(source), tag=backend._tag
+        )
+        mapped = next(iter(allocations.values()))
+        # Includes the prefix, gaps and tail outside every parameter view.
+        assert torch.equal(mapped, source.view(torch.uint8))
+        for name, parameter in model.named_parameters():
+            value, stride, offset = expected[name]
+            assert torch.equal(parameter, value), name
+            assert parameter.dtype == value.dtype, name
+            assert parameter.stride() == stride, name
+            assert parameter.storage_offset() == offset, name
+            if parameter.is_cuda:
+                assert parameter.untyped_storage().data_ptr() == mapped.data_ptr()
+                assert _storage_nbytes(parameter) == mapped.numel()
+        assert model.first is model.tied
+        # This sweep only migrates parameters. The buffer retains the original
+        # allocation and no longer aliases the migrated parameter storage.
+        assert model.buffer is buffer
+        assert model.buffer.untyped_storage().data_ptr() == buffer_storage_ptr
+        assert buffer_storage_ptr != mapped.data_ptr()
+        model.first[2] = 123
+        assert model.overlap[0].item() == 123
+        backend.move_untracked_params(model)
+        assert client.create_mapping.call_count == 1
+
+        model.empty_weight = CudaParameter(torch.empty(0), requires_grad=False)
+        with pytest.raises(
+            ValueError, match="GMS cannot register CUDA parameter 'empty_weight'.*zero-byte"
+        ):
+            backend.move_untracked_params(model)
+        assert client.create_mapping.call_count == 1
+        del model.empty_weight
+
+        for view in (source._neg_view(), source.to(torch.complex64).conj()):
+            model.unsupported_view = CudaParameter(view, requires_grad=False)
+            with pytest.raises(ValueError, match="'unsupported_view'.*lazy conjugate/negative"):
+                backend.move_untracked_params(model)
+            assert client.create_mapping.call_count == 1
+        del model.unsupported_view
+
+        # Separate wrappers can expose different extents of the same address.
+        aliases = torch.nn.Module()
+        aliases.small = CudaParameter(
+            torch.frombuffer(source.numpy(), dtype=source.dtype, count=4), requires_grad=False
+        )
+        aliases.large = CudaParameter(source, requires_grad=False)
+        assert aliases.small.untyped_storage().data_ptr() == buffer_storage_ptr
+        with pytest.raises(ValueError, match="'large'.*storage size 400.*mapping size 16"):
+            backend.move_untracked_params(aliases)
+        assert aliases.large.untyped_storage().data_ptr() == buffer_storage_ptr
 
 
 # ---------------------------------------------------------------------------

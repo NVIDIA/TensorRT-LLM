@@ -19,11 +19,11 @@
 #include "tensorrt_llm/common/config.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
-#include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <algorithm>
 #include <utility>
@@ -168,7 +168,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
         return 0;
     }
 
-    auto const typeSize = tensorrt_llm::runtime::BufferDataType(mType).getSize();
+    auto const typeSize = tensorrt_llm::common::getDTypeSize(mType);
     setGemmConfig();
 
     int64_t GemmWorkSpaceSize = getGemmWorkSpaceSize(numTokens, mNumLoraModules, mMaxLowRank, mSplitKSlices);

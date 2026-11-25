@@ -13,7 +13,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
     cu_seqlens_from_seq_lens as op,
 )
 

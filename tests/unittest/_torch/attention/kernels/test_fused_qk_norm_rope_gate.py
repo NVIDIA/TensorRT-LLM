@@ -24,6 +24,7 @@ import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _kernel_
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_qkv_gemma_rmsnorm_rope_gate,
+    fused_sigmoid_mul_fp8,
     fused_sigmoid_mul_inplace,
 )
 
@@ -297,6 +298,32 @@ def test_output_gate_fallback_flattens_fused_gate():
     expected = attention * torch.sigmoid(gate.reshape_as(attention))
     actual = Attention.apply_output_gate(None, attention, gate)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+# 2e-3 takes most gated values past the E4M3 maximum (448), so the saturation is compared too.
+@pytest.mark.parametrize("scale", (0.13, 32.0, 2e-3))
+@pytest.mark.parametrize("num_tokens", (1, 37, 1024, 2049))
+@pytest.mark.parametrize("strided_gate", (False, True))
+def test_fused_sigmoid_mul_fp8_matches_gate_then_static_quantize(scale, num_tokens, strided_gate):
+    """The FP8-output gate writes the bytes of the in-place gate followed by o_proj's static quantization."""
+    torch.manual_seed(num_tokens)
+    num_heads, head_dim = 8, 256
+    attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
+    if strided_gate:
+        gate = torch.randn(
+            (num_tokens, num_heads, 2 * head_dim), dtype=torch.bfloat16, device="cuda"
+        )[..., :head_dim]
+    else:
+        gate = torch.randn_like(attention)
+    input_scale = torch.tensor([scale], dtype=torch.float32, device="cuda")
+
+    gated = attention.clone()
+    fused_sigmoid_mul_inplace(gated, gate)
+    expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(gated, input_scale)
+    actual = fused_sigmoid_mul_fp8(attention, gate, input_scale)
+
+    assert actual.dtype == torch.float8_e4m3fn
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 def test_fused_sigmoid_mul_inplace_supports_flat_gate():
@@ -583,3 +610,191 @@ def test_qkv_rope_tiling_batch_boundaries(
             torch.testing.assert_close(
                 prefix[0][:, v_start:], reference[0][:, v_start:], atol=0, rtol=0
             )
+
+
+# The two output-gate kernels as they were before they became one kernel with an OUT_FP8 flag (verbatim bodies).
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+import triton.language.extra.libdevice as tldevice  # noqa: E402
+
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber  # noqa: E402
+
+
+@triton.jit
+def _separate_sigmoid_mul_kernel(
+    output_ptr,
+    attention_ptr,
+    gate_ptr,
+    output_stride_token,
+    attention_stride_token,
+    gate_stride_token,
+    gate_stride_head,
+    hidden_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr = False,
+) -> None:
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    token = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    offsets = block * block_size + tl.arange(0, block_size)
+    mask = offsets < hidden_size
+    head = offsets // head_dim
+    dim = offsets - head * head_dim
+    if LAUNCH_WITH_PDL:
+        gdc_wait_with_memory_clobber()
+
+    attention = tl.load(
+        attention_ptr + token * attention_stride_token + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + token * gate_stride_token + head * gate_stride_head + dim,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        output_ptr + token * output_stride_token + offsets,
+        attention * tl.sigmoid(gate),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _separate_sigmoid_mul_fp8_kernel(
+    output_ptr,
+    attention_ptr,
+    gate_ptr,
+    scale_ptr,
+    output_stride_token,
+    attention_stride_token,
+    gate_stride_token,
+    gate_stride_head,
+    hidden_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr = False,
+) -> None:
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    token = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    offsets = block * block_size + tl.arange(0, block_size)
+    mask = offsets < hidden_size
+    head = offsets // head_dim
+    dim = offsets - head * head_dim
+    if LAUNCH_WITH_PDL:
+        gdc_wait_with_memory_clobber()
+
+    attention = tl.load(
+        attention_ptr + token * attention_stride_token + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + token * gate_stride_token + head * gate_stride_head + dim,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    y = (attention * tl.sigmoid(gate)).to(attention_ptr.dtype.element_ty).to(tl.float32)
+    y *= tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
+    tl.store(
+        output_ptr + token * output_stride_token + offsets,
+        y.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _separate_gate_launch(output, attention, gate, scale):
+    """The former launch of the two kernels: (grid, num_warps) and the launch itself."""
+    num_tokens, hidden_size = attention.shape
+    if gate.dim() == 3:
+        head_dim, g_tok, g_head = gate.shape[2], gate.stride(0), gate.stride(1)
+    else:
+        head_dim, g_tok, g_head = hidden_size, gate.stride(0), hidden_size
+    block_size = min(triton.next_power_of_2(hidden_size), 1024 if num_tokens < 1024 else 2048)
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    pdl = (
+        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
+        if _kernel_module._sigmoid_mul_pdl(attention.device.index)
+        else {}
+    )
+    common = dict(hidden_size=hidden_size, head_dim=head_dim, block_size=block_size, num_warps=4)
+    if scale is None:
+        _separate_sigmoid_mul_kernel[grid](
+            output,
+            attention,
+            gate,
+            output.stride(0),
+            attention.stride(0),
+            g_tok,
+            g_head,
+            **common,
+            **pdl,
+        )
+    else:
+        _separate_sigmoid_mul_fp8_kernel[grid](
+            output,
+            attention,
+            gate,
+            scale,
+            output.stride(0),
+            attention.stride(0),
+            g_tok,
+            g_head,
+            **common,
+            **pdl,
+        )
+    return grid, common["block_size"], common["num_warps"]
+
+
+@pytest.mark.parametrize("num_tokens", (1, 37, 1023, 1024, 2049))
+@pytest.mark.parametrize("gate_layout", ("flat", "heads", "strided_heads"))
+@pytest.mark.parametrize("fp8", (False, True), ids=("bf16_inplace", "fp8_out"))
+def test_one_gate_kernel_matches_the_separate_kernels(num_tokens, gate_layout, fp8):
+    """The OUT_FP8-flagged gate kernel writes the bytes of the former in-place and FP8-output kernels, with their
+    grid, block and warp count (the Qwen3.5 context FP8 gate runs from 1024 rows; 2048-wide blocks from there)."""
+    torch.manual_seed(num_tokens)
+    num_heads, head_dim = 8, 256
+    attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
+    if gate_layout == "flat":
+        gate = torch.randn_like(attention)
+    elif gate_layout == "heads":
+        gate = torch.randn((num_tokens, num_heads, head_dim), dtype=torch.bfloat16, device="cuda")
+    else:
+        gate = torch.randn(
+            (num_tokens, num_heads, 2 * head_dim), dtype=torch.bfloat16, device="cuda"
+        )[..., :head_dim]
+    scale = torch.tensor([0.13], dtype=torch.float32, device="cuda") if fp8 else None
+    out_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    if fp8:
+        expected = torch.empty_like(attention, dtype=out_dtype)
+        ref_launch = _separate_gate_launch(expected, attention, gate, scale)
+    else:
+        # The in-place kernel reads and writes the same tensor.
+        expected = attention.clone()
+        ref_launch = _separate_gate_launch(expected, expected, gate, None)
+
+    launches = []
+    real = _kernel_module._fused_sigmoid_mul_kernel
+
+    class _Recorder:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs["block_size"], kwargs["num_warps"]))
+                return real[grid](*args, **kwargs)
+
+            return launch
+
+    with patch.object(_kernel_module, "_fused_sigmoid_mul_kernel", _Recorder()):
+        if fp8:
+            actual = fused_sigmoid_mul_fp8(attention, gate, scale)
+        else:
+            actual = attention.clone()
+            fused_sigmoid_mul_inplace(actual, gate)
+    torch.cuda.synchronize()
+    assert launches == [ref_launch]
+    assert actual.dtype == out_dtype
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))

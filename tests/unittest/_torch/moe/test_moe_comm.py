@@ -47,16 +47,18 @@ Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
 import atexit
+import contextlib
 import os
 import pickle
 import sys
 import threading
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import MagicMock
+from typing import ContextManager, Dict, List, Optional, Set, Tuple
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import pytest
@@ -73,7 +75,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_CFT_ENV,
+    SENTINEL_MAX_TOKENS_ENV,
+    SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
@@ -86,7 +89,15 @@ from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_version,
 )
-from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    nccl_window_tensor_scope,
+)
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -296,8 +307,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -335,8 +346,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
 
@@ -1192,8 +1203,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         traceback.print_exc()
         raise
     finally:
-        # A CFT workspace holds a process-global binding only destroy() frees,
-        # and the cache does not survive to the next pool task.
+        # The cache does not survive to the next pool task.
         _destroy_cached_worker_comm()
 
 
@@ -1209,11 +1219,17 @@ def _nccl_ep_replay_slots(
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
-def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: torch.dtype) -> dict:
-    """Capture LL dispatch, change routing, and verify replay sees the change."""
+def _worker_nccl_ep_cuda_graph_replay(
+    config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool | None = None
+) -> dict:
+    """Verify routing replay; a non-None fallback flag also requires the selected window path."""
+    # Keep torch.ops out of the globals serialized by cloudpickle.
+    import torch
+
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
+    graph = pool = None
     try:
         mapping = Mapping(
             rank=rank,
@@ -1248,21 +1264,47 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             experts_per_rank=experts_per_rank,
         )
 
-        with nccl_window_tensor_scope(hidden_states):
-            # Initialize the context and handle eagerly. Capture is intentionally
-            # rejected before this point, matching production graph setup.
-            comm.dispatch(
+        # Release the warmup lease before capture claims its graph-owned window.
+        with discard_nccl_window_tensor_outputs(hidden_states):
+            warmup_recv, *_ = comm.dispatch(
                 hidden_states,
                 None,
                 local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-            torch.cuda.synchronize()
+            warmup_uses_window = warmup_recv.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+        torch.cuda.synchronize()
 
+        availability = MPI.COMM_WORLD.allgather((comm._ctx.zerocopy_enabled, warmup_uses_window))
+        zerocopy_enabled = availability[0][0]
+        assert all(enabled == zerocopy_enabled for enabled, _ in availability), availability
+        if force_window_fallback is not None:
+            assert zerocopy_enabled, "Window-specific replay requires NCCL-EP zero-copy support"
+        if force_window_fallback is False:
+            assert all(available for _, available in availability), availability
+
+        allocate = torch.ops.trtllm.allocate_output_with_nccl_window
+
+        def refuse_window(
+            input_tensor: torch.Tensor, _kind: int, group: list[int]
+        ) -> tuple[torch.Tensor, int, int]:
+            """Use the native plain allocator to inject an ordinary window refusal."""
+            return allocate(input_tensor, int(BufferKind.DEFAULT), group)
+
+        allocation_context = (
+            patch.object(
+                torch.ops.trtllm, "allocate_output_with_nccl_window", side_effect=refuse_window
+            )
+            if force_window_fallback and zerocopy_enabled
+            else nullcontext()
+        )
+
+        with nccl_window_tensor_scope(hidden_states):
             static_routes = local_routes.clone()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            pool = torch.cuda.graph_pool_handle()
+            with allocation_context as refused, nccl_window_graph_capture(graph, pool):
                 recv_hs, _, recv_slots, recv_scales = comm.dispatch(
                     hidden_states,
                     None,
@@ -1272,7 +1314,22 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 )
             torch.cuda.synchronize()
 
-            assert recv_scales.dtype == routing_dtype
+            uses_window = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+            capture_states = MPI.COMM_WORLD.allgather(
+                (
+                    uses_window,
+                    refused.call_count if refused is not None else 0,
+                    recv_scales.dtype == routing_dtype,
+                )
+            )
+            # Validate on every rank before any rank enters collective replay.
+            if force_window_fallback is not None:
+                assert all(
+                    window == (not force_window_fallback) and calls == int(force_window_fallback)
+                    for window, calls, _ in capture_states
+                ), capture_states
+            assert all(dtype_matches for _, _, dtype_matches in capture_states), capture_states
+            output_ptr = recv_hs.data_ptr()
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
@@ -1280,6 +1337,8 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 valid = recv_slots[:, 0] >= 0
                 received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
                 return {
+                    "pointer_stable": recv_hs.data_ptr() == output_ptr,
+                    "uses_persistent_output": output_ptr == comm._ctx.output_tokens_buf.data_ptr(),
                     "valid_count": int(valid.sum().item()),
                     "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
                     "weights_match": bool(
@@ -1293,11 +1352,22 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             static_routes.copy_(peer_routes)
             weights.fill_(0.25)
             peer_result = replay_and_check(peer_rank, 0.25)
-            return {"rank": rank, "local": local_result, "peer": peer_result}
+            return {
+                "rank": rank,
+                "zerocopy_enabled": zerocopy_enabled,
+                "uses_window": uses_window,
+                "local": local_result,
+                "peer": peer_result,
+            }
     except Exception:
         traceback.print_exc()
         raise
     finally:
+        torch.cuda.synchronize()
+        if graph is not None:
+            graph.reset()
+        if pool is not None:
+            release_nccl_window_graph_owner(pool)
         if comm is not None:
             comm.destroy()
 
@@ -2444,7 +2514,9 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(
+    mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
+) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2460,14 +2532,22 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.
         pytest.skip(skip_reason)
 
     futures = [
-        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config, routing_dtype)
+        mpi_pool_executor.submit(
+            _worker_nccl_ep_cuda_graph_replay, config, routing_dtype, force_window_fallback
+        )
         for _ in range(config.ep_size)
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
     for result in results:
         rank = result["rank"]
+        if force_window_fallback is not None:
+            assert result["zerocopy_enabled"], result
+            assert result["uses_window"] == (not force_window_fallback), result
         for replay_name in ("local", "peer"):
             replay = result[replay_name]
+            assert replay["pointer_stable"], result
+            if force_window_fallback:
+                assert replay["uses_persistent_output"], result
             valid_count = replay["valid_count"]
             assert valid_count == 16, (
                 f"rank {rank}: {replay_name} replay received {valid_count} valid rows, expected 16"
@@ -2584,9 +2664,33 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+# These two use torch only through a local import: this module is pickled by value, and a function
+# that names torch.ops next to the global torch makes cloudpickle serialize the ops namespace.
+def _sentinel_available() -> bool:
+    import torch as _torch
+
+    return bool(_torch.ops.trtllm.moe_a2a_sentinel_available())
+
+
+def _record_sentinel_steps(steps: List[bool]) -> ContextManager:
+    """Patch moe_a2a_dispatch to append whether each launch takes the sentinel transport."""
+    from unittest import mock
+
+    import torch as _torch
+
+    dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
+
+    def record_dispatch(*args, **kwargs):
+        steps.append(bool(kwargs.get("use_sentinel", False)))
+        return dispatch_op(*args, **kwargs)
+
+    return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+
+
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
+    any_allocation_is_mapped = None
     worker_inputs = _prepare_worker_inputs(rank, config)
     _, local_slot_start, local_slot_end = _compute_ep_partition(
         config.num_experts, config.ep_size, rank
@@ -2649,6 +2753,11 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def any_allocation_is_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
+    sentinel_steps: List[bool] = []
+    if config.comm_type == COMM_NVLINK_ONE_SIDED and _sentinel_available():
+        # The default policy carries these small steps on the sentinel transport.
+        assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
+
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]
         communication.checkpoint_prepare()
@@ -2671,9 +2780,20 @@ def _exercise_mnnvl_checkpoint_graph_replay(
             )
         assert restored_addresses == stable_addresses
 
-        with torch.inference_mode():
+        sentinel_steps.clear()
+        record = (
+            _record_sentinel_steps(sentinel_steps)
+            if config.comm_type == COMM_NVLINK_ONE_SIDED
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), record:
             worker_inputs.hs.add_(cycle + 1)
             expected = forward().clone()
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            # The step after restore takes the transport the instance selects for it.
+            assert sentinel_steps == [
+                communication.sentinel_max_tokens >= max(config.all_num_tokens)
+            ]
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_output, expected)
@@ -2692,9 +2812,9 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         world_size=config.ep_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
@@ -2729,9 +2849,9 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         world_size=world_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()
@@ -3015,11 +3135,14 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize(
+        "force_window_fallback", [None, False, True], ids=["routing", "window", "fallback"]
+    )
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
-        self, mpi_pool_executor, routing_dtype: torch.dtype
+        self, mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool | None
     ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype, force_window_fallback)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(

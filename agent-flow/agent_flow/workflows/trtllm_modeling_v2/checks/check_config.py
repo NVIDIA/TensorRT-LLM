@@ -19,6 +19,7 @@ import yaml
 
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
+from ..spec.derive import SPEC_DEC_ALGO
 from ..spec.task_schema import (
     TaskSchemaError,
     assembly_units,
@@ -116,76 +117,6 @@ def parse_runtime_flags(flags: Sequence[str]) -> tuple[dict[str, Any], dict[str,
         if batches is not None:
             options["cuda_graph_config"]["batch_sizes"] = batches
     return options, sampling, chat
-
-
-def declared_engine(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Requested fields, never evidence that a worker actually applied them."""
-    declared = {}
-    names = {
-        "modeling_v2": "modeling_v2",
-        "max_seq_len": "max_seq_len",
-        "max_batch_size": "max_batch_size",
-        "max_num_tokens": "max_num_tokens",
-        "enable_chunked_prefill": "chunked_prefill",
-        "tensor_parallel_size": "tp",
-        "pipeline_parallel_size": "pp",
-        "moe_expert_parallel_size": "ep",
-        "enable_attention_dp": "attention_dp",
-    }
-    for key, field in names.items():
-        if key in options:
-            declared[field] = options[key]
-    if "disable_overlap_scheduler" in options:
-        declared["overlap_scheduler"] = not options["disable_overlap_scheduler"]
-    kv = options.get("kv_cache_config") or {}
-    for key, field in (
-        ("enable_block_reuse", "block_reuse"),
-        ("dtype", "kv_cache_dtype"),
-        ("mamba_ssm_cache_dtype", "mamba_ssm_cache_dtype"),
-    ):
-        if key in kv:
-            declared[field] = kv[key]
-    if "mamba_state_config" in kv:
-        state = kv["mamba_state_config"] or {}
-        declared["mamba_snapshot"] = {
-            "periodic_snapshot_interval": state.get("periodic_snapshot_interval", 0),
-            "additional_snapshot_offsets_from_start": state.get(
-                "additional_snapshot_offsets_from_start", []
-            ),
-            "additional_snapshot_offsets_from_end": state.get(
-                "additional_snapshot_offsets_from_end", []
-            ),
-        }
-    if "cuda_graph_config" in options:
-        graph = options["cuda_graph_config"]
-        declared["cuda_graph"] = (
-            None
-            if graph is None
-            else {
-                **(
-                    {"batch_sizes": sorted(graph["batch_sizes"])}
-                    if graph.get("batch_sizes")
-                    else {}
-                ),
-                **(
-                    {"max_batch_size": graph["max_batch_size"]}
-                    if graph.get("max_batch_size")
-                    else {}
-                ),
-                "enable_padding": graph.get("enable_padding", False),
-            }
-        )
-    if "speculative_config" in options:
-        spec = options["speculative_config"]
-        declared["speculative"] = (
-            None
-            if spec is None
-            else {
-                "algorithm": spec["decoding_type"],
-                "max_draft_len": spec.get("max_draft_len", spec.get("num_nextn_predict_layers", 1)),
-            }
-        )
-    return declared
 
 
 #: The checks' explicit scheduler-token default.
@@ -376,7 +307,7 @@ def speculation_flags(features: Any, *, max_draft_len: int = 1) -> list[str]:
     weights drafts garbage that verification rejects, which passes accuracy.
     """
     names = {str(f).lower() for f in (features or ())}
-    for feature, algo in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSPARK")):
+    for feature, algo in SPEC_DEC_ALGO.items():
         if feature in names:
             return [f"--spec_decode_algo={algo}", f"--spec_decode_max_draft_len={max_draft_len}"]
     return []
@@ -429,7 +360,7 @@ def load_llm_api_options(path: str | Path | None) -> dict[str, Any]:
 # ------------------------------------------------------------ CUDA-graph capture
 #
 # All checks receive the same public configuration. These CPU-only previews
-# support preflight and planning; only worker observations attest actual capture.
+# support preflight and planning; they are not what an engine captured.
 
 #: The capture limit ``CudaGraphConfig`` uses when neither ``batch_sizes`` nor
 #: ``max_batch_size`` is set (``BaseCudaGraphConfig.validate_base_cuda_graph_config``).
@@ -695,22 +626,6 @@ def launch_kv_caches(task_data: Mapping[str, Any]) -> list[LaunchKvCache]:
     return launches
 
 
-def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[str, Any]:
-    """The exact public options sent to the engine, separate from actual facts."""
-    options = dict(config["llm"])
-    if mode:
-        options["modeling_v2"] = mode
-    return declared_engine(options)
-
-
-def llm_api_block_reuse(options: Mapping[str, Any]) -> bool:
-    """Whether LLM-API ``options`` ask for KV-cache block reuse (``enable_block_reuse``, default on)."""
-    kv_cache = options.get("kv_cache_config")
-    if not isinstance(kv_cache, Mapping):
-        return True
-    return bool(kv_cache.get("enable_block_reuse", True))
-
-
 def check_configuration(
     task_data: Mapping[str, Any],
     environment: RunEnvironment,
@@ -774,10 +689,7 @@ def check_configuration(
             features_through(task_data, actual_unit) if actual_unit else task_data.get("features")
         )
     names = {str(f).lower() for f in features or ()}
-    algorithm = next(
-        (a for f, a in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSpark")) if f in names),
-        None,
-    )
+    algorithm = next((a for f, a in SPEC_DEC_ALGO.items() if f in names), None)
     if algorithm:
         speculative = options.setdefault("speculative_config", {})
         if speculative is None:
@@ -803,80 +715,24 @@ def check_configuration(
     return {"llm": options, "sampling": sampling, "apply_chat_template": chat}
 
 
-#: The runtime input flag each engine field is set by, as a variant's runtime block names it.
-_FLAG_FIELDS: dict[str, str] = {
-    "--kv_cache_dtype": "kv_cache_dtype",
-    "--mamba_ssm_cache_dtype": "mamba_ssm_cache_dtype",
-    "--max_num_tokens": "max_num_tokens",
-    "--enable_chunked_prefill": "chunked_prefill",
-    "--max_batch_size": "max_batch_size",
-    "--disable_kv_cache_reuse": "block_reuse",
-    "--use_cuda_graph": "cuda_graph",
-    "--cuda_graph_batch_sizes": "cuda_graph",
-    "--cuda_graph_padding_enabled": "cuda_graph",
-    "--spec_decode_algo": "speculative",
-    "--spec_decode_max_draft_len": "speculative",
-}
-
-
-#: The runtime-block switch each engine field is set by.
-_SWITCH_FIELDS: dict[str, str] = {
-    "chunked_prefill": "chunked_prefill",
-    "kv_cache_reuse": "block_reuse",
-    "cuda_graph": "cuda_graph",
-    "overlap_scheduler": "overlap_scheduler",
-}
-
-
-#: The LLM-API option each engine field is set by; ``kv_cache_config`` by key.
-_OPTION_FIELDS: dict[str, str] = {
-    "max_num_tokens": "max_num_tokens",
-    "enable_chunked_prefill": "chunked_prefill",
-    "max_batch_size": "max_batch_size",
-    "speculative_config": "speculative",
-    "cuda_graph_config": "cuda_graph",
-    "disable_overlap_scheduler": "overlap_scheduler",
-}
-
-
-_KV_FIELDS: dict[str, str] = {
-    "dtype": "kv_cache_dtype",
-    "mamba_ssm_cache_dtype": "mamba_ssm_cache_dtype",
-    "enable_block_reuse": "block_reuse",
-    "mamba_state_config": "mamba_snapshot",
-}
-
-
-#: What a variant setting this module cannot place is listed as.
-UNKNOWN = "?"
-
-
-def subject_fields(task_data: Mapping[str, Any], unit: str | None) -> tuple[str, ...]:
-    """The engine fields a configuration variant is about: those its overlay sets.
-
-    A setting no field expresses is listed as :data:`UNKNOWN`. A unit that is not a
-    variant is about none.
-    """
+def sets_chunking(task_data: Mapping[str, Any], unit: str | None) -> bool:
+    """Whether a configuration variant's overlay sets chunked prefill or ``max_num_tokens``."""
     if not is_variant(task_data, unit):
-        return ()
+        return False
     entry = variants(task_data)[str(unit)]
-    found: list[str] = []
     runtime = entry.get("runtime") or {}
-    for key in runtime:
-        if key != "extra_flags":
-            found.append(_SWITCH_FIELDS.get(str(key), UNKNOWN))
-    for flag in runtime.get("extra_flags") or ():
-        name = str(flag).split("=", 1)[0].split()[0] if str(flag).strip() else ""
-        found.append(_FLAG_FIELDS.get(name, UNKNOWN))
+    flags = {
+        str(f).split("=", 1)[0].split()[0]
+        for f in runtime.get("extra_flags") or ()
+        if str(f).strip()
+    }
     options = entry.get("llm_api_options") or {}
-    for key, value in options.items():
-        if key == "kv_cache_config" and isinstance(value, Mapping):
-            found.extend(_KV_FIELDS.get(str(k), UNKNOWN) for k in value)
-        else:
-            found.append(_OPTION_FIELDS.get(str(key), UNKNOWN))
-    if entry.get("env"):
-        found.append(UNKNOWN)
-    return tuple(dict.fromkeys(found))
+    return (
+        "chunked_prefill" in runtime
+        or bool(flags & {"--max_num_tokens", "--enable_chunked_prefill"})
+        or "max_num_tokens" in options
+        or "enable_chunked_prefill" in options
+    )
 
 
 def _per_unit(key: str, value: Any, name: str, chosen: Any) -> dict[str, Any]:
@@ -990,18 +846,14 @@ __all__ = [
     "LaunchCapture",
     "LaunchKvCache",
     "REMOTE_CODE_FILES",
-    "UNKNOWN",
     "check_configuration",
     "checkpoint_remote_code",
-    "declared_engine",
-    "engine_declaration",
     "format_batches",
     "has_snapshot_policy",
     "launch_captures",
     "launch_conflicts",
     "launch_kv_caches",
     "llm_api_batch_sizes",
-    "llm_api_block_reuse",
     "load_llm_api_options",
     "member_llm_api_overlay",
     "merge_options",
@@ -1012,5 +864,5 @@ __all__ = [
     "resolve_max_draft_len",
     "resolve_runtime",
     "speculation_flags",
-    "subject_fields",
+    "sets_chunking",
 ]

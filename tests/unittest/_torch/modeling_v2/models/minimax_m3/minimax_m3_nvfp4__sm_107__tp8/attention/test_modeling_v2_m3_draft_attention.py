@@ -15,7 +15,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_draft_attention import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_draft_attention import (  # noqa: E501
     m3_draft_attention as op,
 )
 
@@ -67,18 +67,7 @@ def _rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     )
 
 
-# Non-paged context FMHA on SM107 does not apply RoPE (this fixture's path; the served drafter runs the paged context
-# FMHA, which rotates): the context cell is a strict expected failure until the runtime rotates there too.
-_UNROTATED_CONTEXT = pytest.mark.xfail(
-    strict=True,
-    reason="non-paged context FMHA on SM107 does not apply RoPE (shared runtime)",
-)
-_CELLS = [
-    pytest.param(c, marks=_UNROTATED_CONTEXT) if c.spec.get("context") else c for c in op.CELLS
-]
-
-
-@pytest.mark.parametrize("cell", _CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     spec = cell.spec
     context = spec.get("context")

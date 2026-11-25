@@ -232,6 +232,7 @@ def test_cpu_tests_selection():
     ]
     for target in expected_new_files:
         assert target in targets, f"the serve CPU runner must select {target}"
+        assert targets.count(target) == 1, f"the serve CPU runner selects {target} twice"
     assert "unittest/llmapi/apps/test_anthropic_routes.py" in targets
     for target in targets:
         file_part = target.split("::")[0]
@@ -250,6 +251,17 @@ def test_cpu_tests_selection_keeps_node_ids(tmp_path):
     kept, notes = select_entries(cpu_list)
     assert [entry.targets for entry in kept] == [(node,)], kept
     assert not notes, notes
+
+    for ignore in (
+        "--ignore=unittest/serve/api/visual_gen",
+        "--ignore unittest/serve/api/visual_gen",
+    ):
+        cpu_list.write_text(f"l0_cpu:\n- tests:\n  - unittest/serve {ignore}\n")
+        kept, notes = select_entries(cpu_list)
+        targets = [target for entry in kept for target in entry.targets]
+        assert "unittest/serve/test_agents_md.py" in targets
+        assert not any(target.startswith("unittest/serve/api/visual_gen/") for target in targets)
+        assert not notes, notes
 
 
 # ---------------------------------------------------------------------------

@@ -109,6 +109,15 @@ DOMAIN_PRIMING = """\
 - For MoE work, read
   `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
   across routing, expert parallelism, quantization, and fused-kernel contracts.
+- For weight loading and post-load work, follow "Adding a Model Family" in
+  `docs/source/features/model-express.md`: structural wiring goes in
+  `setup_aliases()`, one-shot tensor transforms in `transform_weights()`
+  guarded by `_weights_transformed`, and derived Python state in
+  `cache_derived_state()`. Staged receivers of already-transformed weights
+  skip `load_weights()`, `transform_weights()`, and every
+  `post_load_weights()`, so keep real work out of direct
+  `post_load_weights()` overrides and non-tensor state out of
+  `load_weights()`.
 - Use `KVCacheManagerV2` for new-model bring-up. The TRTLLM and FlashInfer
   attention backends are both valid targets when the plan tests the selected
   backend with `KVCacheManagerV2`.

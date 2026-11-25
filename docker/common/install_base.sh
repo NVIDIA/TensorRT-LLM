@@ -87,6 +87,14 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
+  # Packages only needed by CI/dev images; NGC release images (IS_NGC_RELEASE=1, set by the
+  # NGC release build in jenkins/BuildDockerImage.groovy) skip them.
+  local ci_only_packages=()
+  if [ "${IS_NGC_RELEASE:-0}" != "1" ]; then
+    ci_only_packages+=(
+      git-lfs
+    )
+  fi
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
@@ -94,7 +102,7 @@ init_ubuntu() {
     pkg-config \
     ccache \
     gdb \
-    git-lfs \
+    "${ci_only_packages[@]}" \
     clang \
     graphviz \
     lld \
@@ -110,7 +118,11 @@ init_ubuntu() {
     pigz \
     libzmq3-dev \
     libssl3t64 \
-    openssl
+    openssl \
+    apt \
+    apt-utils \
+    libbrotli1 \
+    libapt-pkg6.0t64
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -136,6 +148,25 @@ init_ubuntu() {
     apt-get remove --purge -y tensorrt*
   fi
   pip3 uninstall -y tensorrt
+}
+
+disable_ubi_repos_rockylinux() {
+  # The CUDA Rocky Linux 8 base image also enables Red Hat UBI 8 repositories.
+  # Only some UBI repositories are enabled, so dnf can pick a newer UBI package
+  # whose dependencies exist in neither the enabled UBI repositories nor the Rocky
+  # ones, and the install fails. The Rocky repositories carry the same packages,
+  # so install from them only. The setting persists for later build steps.
+  local ubi_repos
+  ubi_repos=$(
+    set -o pipefail
+    dnf repolist --enabled | awk '$1 ~ /^ubi-8-/ {print $1}'
+  )
+  if [ -z "${ubi_repos}" ]; then
+    return
+  fi
+  dnf install -y --disablerepo='ubi-8-*' dnf-plugins-core
+  # shellcheck disable=SC2086 # one repository id per word
+  dnf config-manager --set-disabled ${ubi_repos}
 }
 
 install_python_rockylinux() {
@@ -211,6 +242,7 @@ case "$ID" in
     install_boost
     ;;
   rocky)
+    disable_ubi_repos_rockylinux
     install_python_rockylinux $1
     install_pyp_rockylinux
     install_gcctoolset_rockylinux

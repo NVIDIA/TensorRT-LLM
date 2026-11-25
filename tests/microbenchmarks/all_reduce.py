@@ -142,7 +142,10 @@ def profile_allreduce(
         ).to(input.device)
         torch.nn.init.normal_(linear.weight, mean=0.0, std=0.02)
 
+    output = None
+
     def func(x, loop_num=inner_loop):
+        output = None
         for _ in range(loop_num):
             with discard_nccl_window_tensor_outputs((x, residual)):
                 if profile_gemm_allreduce:
@@ -452,6 +455,7 @@ def _profile_ub(mapping,
     ub_input = copy_to_userbuffers(input)
 
     def func(loop_num=inner_loop):
+        output = None
         for _ in range(loop_num):
             output = allreduce(ub_input, all_reduce_params=allreduce_params)
         return output

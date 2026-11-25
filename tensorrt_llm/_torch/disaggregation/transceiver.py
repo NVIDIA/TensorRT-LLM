@@ -58,6 +58,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorker,
     TransferWorkerConfig,
     TxSession,
+    _validate_rank_info_auth_key,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -362,10 +363,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
     _gen_idle_poll_skip: bool = False
     _gen_idle_agreed: bool = False
+    # Helix GEN idle probe; _init_sync_policy sets the instance value.
+    _gen_idle_probe: bool = False
     _gen_deferred_receives: int = 0
+    _pending_rank_info_admissions: Optional[dict[int, tuple[LlmRequest, Optional[str]]]] = None
+    _rank_info_start_failures: Optional[dict[int, LlmRequest]] = None
 
     @property
     def consumes_transfer_buffer(self) -> bool:
+        return False
+
+    @property
+    def reads_unique_tokens(self) -> bool:
         return False
 
     def __init__(
@@ -404,6 +413,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
+        _validate_rank_info_auth_key(cache_transceiver_config._rank_info_auth_key)
         (
             enforce_physical_ownership,
             self._context_first_ownership,
@@ -449,6 +459,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # arena shared by send and receive); 0 disables it.
                 agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
             )
         )
         if enforce_physical_ownership:
@@ -492,6 +503,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+        # Keyed multi-rank receives agree on admission before publication.
+        self._pending_rank_info_admissions = (
+            {}
+            if cache_transceiver_config._rank_info_auth_key is not None and self._gen_need_sync
+            else None
+        )
 
     @staticmethod
     def _gen_idle_poll_skip_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
@@ -619,16 +636,50 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The PP loop does not, so _check_compatible rejects attention-DP
             # with both helix CP and pp_size > 1.
             #
-            # Non-DP tp x cp gathers over the world behind the same predicate and
-            # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # Non-DP TP x CP gathers over the world. Its scheduling loop aligns
+            # admission over both TP and CP before entering receive_gen_init.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
             self._gen_need_sync = m.world_size > 1
             self._gen_allgather = self._dist.allgather
         self._init_gen_idle_poll(self._gen_idle_poll_skip_applies(m, self._gen_need_sync))
+        self._gen_idle_probe = self._gen_idle_probe_applies(m, self._gen_need_sync)
+
+    @staticmethod
+    def _gen_idle_probe_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether an idle non-blocking status poll is decided by one int64 allgather.
+
+        For context parallelism (helix), where the idle-poll skip does not
+        apply: without attention DP and with one PP stage the status consensus
+        spans the world, which is the TP x CP group the int64 allgather spans,
+        so every rank takes the same branch. The probe is a collective every
+        round, so ranks one round apart never split on entering one.
+        """
+        return (
+            gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and mapping.cp_size > 1
+            and mapping.world_size == mapping.tp_size * mapping.cp_size
+        )
+
+    def _any_rank_has_recv_sessions(self) -> bool:
+        """Whether any rank of the group has a receive in progress.
+
+        Counts what the full consensus would act on, as the idle-poll skip does
+        (_consensus_outcome's local_session_count): sessions, receives admitted
+        but not started yet, RankInfo admissions that start their session only
+        inside _poll_rank_info_admissions, and coordinated start failures.
+        """
+        local = (
+            len(self._recv_sessions)
+            + self._gen_deferred_receives
+            + len(self._pending_rank_info_admissions or {})
+            + len(self._rank_info_start_failures or {})
+        )
+        counts = self._dist.tp_cp_allgather_int64([local])
+        return bool(counts.any())
 
     def _dp_group_allgather(self, obj):
         """Allgather over the CP ranks, then the PP ranks, of this DP group.
@@ -694,26 +745,42 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"waiting_for_peer_info={len(self._wait_reqs)}"
         )
 
+    def _get_shutdown_lock(self) -> threading.Lock:
+        """Return the shutdown lock, including after partial initialization."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._shutdown_lock = lock
+        return lock
+
+    def prepare_shutdown(self) -> None:
+        """Retire sessions and stop transfers without deregistering the KV pools."""
+        with self._get_shutdown_lock():
+            if getattr(self, "_shutdown_complete", False):
+                return
+            self._close_sessions_for_shutdown()
+            self._transfer_worker.prepare_shutdown()
+
     def shutdown(self) -> None:
-        shutdown_lock = getattr(self, "_shutdown_lock", None)
-        if shutdown_lock is None:
-            shutdown_lock = threading.Lock()
-            self._shutdown_lock = shutdown_lock
-        with shutdown_lock:
+        with self._get_shutdown_lock():
             self._shutdown_once()
 
     def _shutdown_once(self) -> None:
         if getattr(self, "_shutdown_complete", False):
             return
+        self._close_sessions_for_shutdown()
+        self._transfer_worker.shutdown()
+        # Record completion only after every owner and worker has shut down.
+        # A refusal leaves shutdown retryable after the physical operation drains.
+        self._shutdown_complete = True
+
+    def _close_sessions_for_shutdown(self) -> None:
         # Preflight may refuse closure while DMA remains active. Start the
-        # bounded drain before that refusal, not only in worker.shutdown().
+        # bounded drain before that refusal, not only in worker.prepare_shutdown().
         self._transfer_worker.request_shutdown()
         for rid in list(getattr(self, "_cancelled_receive_fences", {})):
             if not self._retire_cancelled_receive_fence(rid):
                 raise RuntimeError(f"Unpublished receive {rid} still owns destination memory")
-        # This flag records completed teardown, not an attempted shutdown. If
-        # an active owner refuses closure, leave it false so shutdown can be
-        # retried after the physical operation drains.
         # Close receive owners before touching send-side or worker state. The
         # separate drain snapshot would not be sufficient: late evidence can make an
         # owner unretirable before close() acquires its lock.
@@ -729,8 +796,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
-        self._transfer_worker.shutdown()
-        self._shutdown_complete = True
+        if self._pending_rank_info_admissions is not None:
+            self._pending_rank_info_admissions.clear()
+        self._rank_info_start_failures = None
 
     def __enter__(self):
         return self
@@ -796,7 +864,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
-                slot = self._get_mamba_slot_for_request(req)
+                slot = self._get_mamba_slot_for_request(req) if lg.pool_views else None
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
@@ -988,11 +1056,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # every participating rank has drained its local physical accessor.
         locally_retirable = []
         for rid in to_process:
-            session = self._recv_sessions[rid]
-            if not self._ownership_blocks_retirement(session):
+            # A coordinated start failure may precede session creation on this rank.
+            session = self._recv_sessions.get(rid)
+            if not self._retirement_blocked(session):
                 locally_retirable.append(rid)
         idle_skip = self._gen_idle_poll_skip
         deferred = self._gen_deferred_receives
+        pending_admissions = len(self._pending_rank_info_admissions or {})
         outcome = self._consensus_outcome(
             to_process,
             cancelled,
@@ -1002,7 +1072,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._gen_need_sync,
             locally_retirable,
             locally_verified,
-            local_session_count=len(self._recv_sessions) + deferred if idle_skip else None,
+            local_session_count=(
+                len(self._recv_sessions) + deferred + pending_admissions if idle_skip else None
+            ),
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         if idle_skip:
@@ -1103,6 +1175,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                                 f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
                             )
                     continue
+                if self._retirement_blocked(session):
+                    continue
                 failed.append(rid)
         return completed, failed
 
@@ -1164,6 +1238,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return False
         resources_drained = getattr(session, "resources_drained", None)
         return resources_drained is None or not resources_drained()
+
+    @classmethod
+    def _retirement_blocked(cls, session: object) -> bool:
+        """Whether a terminal session must stay open for an accessor that may still be active.
+
+        Besides ownership-held resources, this covers a failed receive whose
+        other writers have not all reported yet (see
+        ``RxSession.failed_receive_awaits_writers``).
+        """
+        if cls._ownership_blocks_retirement(session):
+            return True
+        return isinstance(session, RxSession) and session.failed_receive_awaits_writers()
 
     def _close_session_or_raise(self, session: object, rid: int, outcome: str) -> None:
         """Close one terminal session or fail-stop instead of diverging locally."""
@@ -1296,6 +1382,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or rid in getattr(self, "_cancelled_receive_fences", {})
         )
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        # Waiting until every peer rank's REQUEST_DATA has arrived (receiver_ready),
+        # even while the ranks that already asked are being written. A retired,
+        # cancelled or failed send is not waiting and must time out normally.
+        session = self._send_sessions.get(get_unique_rid(req))
+        if session is None or session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            return False
+        return not session.receiver_ready
+
+    def context_transfer_peer_ready_time(self, req: LlmRequest) -> Optional[float]:
+        session = self._send_sessions.get(get_unique_rid(req))
+        return None if session is None else getattr(session, "peer_ready_time", None)
+
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether req's send session was torn down before its last slice."""
         return req.py_kv_send_session_retired and get_unique_rid(req) not in self._send_sessions
@@ -1410,6 +1509,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Before anything that can return or raise: every rank requests the
         # same receives, so they all resume status polling together.
         self._gen_idle_agreed = False
+        if self._pending_rank_info_admissions is not None:
+            # Synchronous receives enter in the same admitted-request order on
+            # every generation rank, without rank-local CUDA-fence deferral.
+            # Agree before publication: a rejected rank cannot supply its shard.
+            error = None
+            try:
+                self._transfer_worker.prepare_rank_info(req)
+            except Exception as exc:
+                error = str(exc)
+            errors = self._gen_allgather(error)
+            if any(error is not None for error in errors):
+                logger.error(f"Synchronous RankInfo admission failed: {errors}")
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                return
         if not self._validate_bridge_req(req, synchronous=True):
             return
         rid = get_unique_rid(req)
@@ -1537,6 +1650,67 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
             )
             return
+        pending = self._pending_rank_info_admissions
+        if pending is not None:
+            if rid not in pending:
+                error = None
+                try:
+                    self._transfer_worker.prepare_rank_info(req)
+                except Exception as exc:
+                    # Network/decoding failures must also reach the symmetric
+                    # poll instead of skipping a collective on this rank.
+                    error = str(exc)
+                pending[rid] = (req, error)
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            return
+        self._start_async_receive(req)
+
+    def _poll_rank_info_admissions(self, local_done: list[int]) -> tuple[list[int], list[int]]:
+        pending = self._pending_rank_info_admissions
+        if pending is None:
+            return self._gen_consensus(local_done), []
+        # Piggyback on the existing status collective, including ranks whose
+        # CUDA fence has not admitted any local receive yet.
+        votes = self._gen_allgather(
+            (local_done, {rid: error for rid, (_, error) in pending.items()})
+        )
+        done = _find_consensus_request_ids([vote[0] for vote in votes], len(votes))
+        admissions = [vote[1] for vote in votes]
+        ready = set.intersection(*(set(vote) for vote in admissions))
+        failed = []
+        started = {}
+        start_errors = {}
+        for rid in sorted(ready):
+            req, _ = pending.pop(rid)
+            error = next((vote[rid] for vote in admissions if vote[rid] is not None), None)
+            if error is not None:
+                logger.error(f"RankInfo admission failed for request {rid}: {error}")
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                failed.append(rid)
+            else:
+                started[rid] = req
+                try:
+                    self._start_async_receive(req)
+                except Exception as exc:
+                    start_errors[rid] = str(exc)
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        if started:
+            # Every rank starts the same admitted IDs. Even a failure before session
+            # creation must reach this vote and the subsequent outcome collective.
+            errors_by_rank = self._gen_allgather(start_errors)
+            for rid in sorted(set().union(*(errors.keys() for errors in errors_by_rank))):
+                error = next(errors[rid] for errors in errors_by_rank if rid in errors)
+                logger.error(f"Receive start failed for request {rid}: {error}")
+                if self._rank_info_start_failures is None:
+                    self._rank_info_start_failures = {}
+                self._rank_info_start_failures[rid] = started[rid]
+                session = self._recv_sessions.get(rid)
+                if session is not None:
+                    session.fail_admission(RuntimeError(error))
+        return done, failed
+
+    def _start_async_receive(self, req: LlmRequest) -> None:
+        rid = get_unique_rid(req)
         extent = self._create_cache_extent(req)
         paged_bytes, state_bytes = _chunk_bytes_by_kind(self._page_table, extent.local)
         req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, paged_bytes, state_bytes)
@@ -1732,6 +1906,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # since (that clears the flag on all ranks in the same iteration):
             # this round's consensus would be empty everywhere.
             return GenTransferStatus([], [], [])
+        if (
+            self._gen_idle_probe
+            and at_least_request_num == 0
+            and not self._any_rank_has_recv_sessions()
+        ):
+            # No receive session on any rank: the consensus would gather empty
+            # lists and return three empty lists without side effects. Only the
+            # non-blocking poll is short-circuited; blocking and at-least-N
+            # calls keep their pacing.
+            return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
@@ -1739,19 +1923,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        consensus, admission_failed = self._poll_rank_info_admissions(
+            local_completed + local_failed
+        )
         to_process = self._build_to_process(
             self._recv_sessions,
-            self._gen_consensus(local_completed + local_failed),
+            consensus,
             0 if need_progress else wait_num,
             block_all,
         )
+        start_failures = self._rank_info_start_failures or {}
+        to_process = list(dict.fromkeys([*to_process, *start_failures]))
 
         completed, failed, cancelled = [], [], []
         for rid in to_process:
+            if rid in start_failures:
+                session = self._recv_sessions.get(rid)
+                if session is not None and self._retirement_blocked(session):
+                    session.notify_cancel()
+                    continue
+                failed.append(rid)
+                continue
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                if self._ownership_blocks_retirement(session):
+                # A cancel after a failure must not free pages a writer is still writing.
+                if self._retirement_blocked(session):
                     continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
@@ -1767,10 +1964,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 # RxSession.wait_complete() already withholds FAILED while an
-                # ownership-enabled accessor remains active. Keep the caller
-                # boundary fail-closed as well so alternate/test session
+                # accessor may remain active. Keep the caller boundary
+                # fail-closed as well so alternate/test session
                 # implementations cannot authorize request retirement early.
-                if self._ownership_blocks_retirement(session):
+                if self._retirement_blocked(session):
                     continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
@@ -1849,7 +2046,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid, req, session in failed_records:
                 self._emit_transfer_settled("gen", rid, req, session, "failed")
 
-        return GenTransferStatus(completed, failed, cancelled_reqs)
+        for rid in failed:
+            req = start_failures.pop(rid, None)
+            if req is not None:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._recv_reqs.pop(rid, None)
+        return GenTransferStatus(completed, failed + admission_failed, cancelled_reqs)
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(
@@ -1971,12 +2173,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session is None or session.status != SessionStatus.ERROR
         )
 
+    def supports_logical_context_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Whether this request has independently retained context-transfer ownership.
+
+        Args:
+            req: The request to check, or None to check the runtime capability.
+
+        Returns:
+            True only for the qualified, immutable-ID context-first profile.
+        """
+        if getattr(self, "_context_first_ownership", False) is not True:
+            return False
+        if req is None:
+            return True
+        params = req.py_disaggregated_params
+        return (
+            req.is_context_only_request
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            and type(params.disagg_request_id) is int
+            and params.disagg_request_id >= 0
+        )
+
+    def request_logical_context_cancellation(self, req: LlmRequest) -> bool:
+        """Close context admission without releasing an outstanding transfer.
+
+        Args:
+            req: The exact context request to cancel.
+
+        Returns:
+            Whether cancellation was accepted. This does not authorize resource
+            release; the normal send reaper must still observe safe retirement.
+        """
+        if not self.supports_logical_context_cancellation(req):
+            return False
+        rid = get_unique_rid(req)
+        session = self._send_sessions.get(rid)
+        if session is None:
+            # No publication exists, or the previous session already retired.
+            # Do not let a later executor pass create another send for this ID.
+            req.py_kv_send_session_retired = True
+            return True
+        if not getattr(session, "_enforce_physical_ownership", False):
+            return False
+        session.cancel()
+        # Keep both the native session and its request root until every physical
+        # operation settles. Repeated cancellation joins the same drain window.
+        return True
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False while a session or cancelled admission fence may access
-        request memory; caller must retry next iteration. Returns True only
-        after transfer and local CUDA claims settle, permitting resource release.
+        Returns False while physical access or qualified context group retirement
+        is pending; caller must keep progressing and retry. Returns True when
+        this transceiver no longer holds the request's resources.
         """
         rid = get_unique_rid(req)
 
@@ -1996,6 +2246,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         instance=self._instance_name,
                         dp_rank=self._dp_rank,
                     )
+
+        # A pending admission has not published any destination.
+        if self._pending_rank_info_admissions is not None:
+            self._pending_rank_info_admissions.pop(rid, None)
+
+        if self.supports_logical_context_cancellation(req):
+            # Local quiescence cannot remove a TP participant's retirement vote.
+            # Keep the session until the normal send reaper agrees across ranks.
+            accepted = self.request_logical_context_cancellation(req)
+            return accepted and rid not in self._send_sessions
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
@@ -2178,6 +2438,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def commit_blocks_for_reuse(self, req) -> None:
+        # Without block reuse nothing is committed, so nothing needs verifying.
+        if not self._reuse_adapter.enable_block_reuse:
+            return
         # Verified-range admission (fail-closed): commit the received range
         # to the reuse tree only when every published destination byte has
         # attested write coverage on every rank. Transfer SUCCESS alone is

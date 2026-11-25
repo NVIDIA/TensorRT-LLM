@@ -9,11 +9,10 @@ an actual MLA (SELFKONLY, kv_factor=1) KVCacheManagerV2 and a prepared
 TrtllmAttentionMetadata — then checks the kernel effects against a torch
 fp32 reference.
 
-One surface. The op also has a bf16-pool path (`quant_mode=0`), where the
-roped q lands in fused_q's tail instead of in a quant_q_buffer; nothing
-here drives it, so the entry does not claim it. `_MlaEnv` still knows how
-to allocate that pool — it is the scaffolding a driver would need, not
-evidence that one exists.
+Two surfaces. The op's own cells are the fp8 pool below. The bf16-pool path
+(`quant_mode=0`), where the roped q lands in fused_q's tail instead of in a
+quant_q_buffer, is driven at the Kimi K3 targets' cells (`TARGET_CELLS`)
+and at the other head counts and widths of `test_bf16_identity_rope_other_shapes`.
 
 1. fp8-e4m3 latent pool (`quant_mode=128`) at the DeepSeek-R1-0528 cell —
    H = 128, tokens_per_block = 32, C/R/nope/v = 512/64/128/128,
@@ -48,16 +47,14 @@ from typing import List, NamedTuple, Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
-    MlaRopeGeneration,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (  # noqa: E501
-    mla_rope_generation as op,
-)
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_generation import MlaRopeGeneration
+from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_generation import (  # noqa: E501
+    mla_rope_generation as op,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -583,26 +580,32 @@ def _run_and_check_bf16(
     num_contexts: int,
     cached_lens: List[int],
     q_lora_rank: int,
+    tokens_per_seq: int = 1,
+    predicted_tokens_per_seq: int = 1,
 ) -> None:
-    """One P = 1 generation step over a bf16 latent pool, as the bf16 path
-    of the contract states it: the roped q in fused_q's tail, fused_q's head
-    and both inputs bitwise untouched, [compressed_kv | rope(k_pe)] appended
-    at each sequence's position and nothing else in the pool moved, the
-    scheduler buffers filled."""
+    """One generation step of `tokens_per_seq` rows per sequence over a bf16
+    latent pool, as the bf16 path of the contract states it: the roped q in
+    fused_q's tail, fused_q's head and both inputs bitwise untouched,
+    [compressed_kv | rope(k_pe)] appended at each row's position and nothing
+    else in the pool moved, the scheduler buffers filled. The op is handed
+    `predicted_tokens_per_seq` (which need not be `tokens_per_seq`: the
+    Kimi K3 target passes 1 whatever its verify width, as the built-in MLA
+    does)."""
     gen_ids = request_ids[num_contexts:]
     num_gen = len(gen_ids)
-    assert seq_lens[num_contexts:] == [1] * num_gen
+    assert seq_lens[num_contexts:] == [tokens_per_seq] * num_gen
+    rows = num_gen * tokens_per_seq
     num_heads = env.num_heads
     for rid in gen_ids:
         cache = env.kv_cache_manager.kv_cache_map[rid]
-        assert cache.resize(cache.capacity + 1)
+        assert cache.resize(cache.capacity + tokens_per_seq)
     metadata = env.prepare_metadata(request_ids, seq_lens, num_contexts, cached_lens)
     kv_lens = [c + s for c, s in zip(cached_lens, seq_lens)]
-    positions = _positions(kv_lens, num_contexts, num_gen, 1)
+    positions = _positions(kv_lens, num_contexts, num_gen, tokens_per_seq)
 
-    fused_q = torch.randn(num_gen, num_heads, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
-    q_pe = _make_q_pe(num_gen, num_heads, contiguous=False)
-    latent_cache = torch.randn(num_gen, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    fused_q = torch.randn(rows, num_heads, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    q_pe = _make_q_pe(rows, num_heads, contiguous=False)
+    latent_cache = torch.randn(rows, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
     fused_q_orig = fused_q.clone()
     q_pe_orig = q_pe.clone()
     latent_orig = latent_cache.clone()
@@ -612,52 +615,53 @@ def _run_and_check_bf16(
     pool = env.pool_tensor()
     pool_before = pool.clone()
 
-    op(
-        fused_q,
-        q_pe,
-        latent_cache,
-        env.rotary_cos_sin,
-        cu_q_seqlens,
-        cu_kv_seqlens,
-        fmha_scheduler_counter,
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
-        metadata.kv_lens_cuda_runtime,
-        metadata.kv_lens_runtime,
-        metadata.prompt_lens_cpu_runtime,
-        num_contexts,
-        metadata.kv_cache_block_offsets,
-        env.kv_cache_manager.kv_cache_pool_pointers,
-        env.kv_cache_manager.kv_cache_pool_mapping,
-        None,  # kv_scale_orig_quant
-        None,  # kv_scale_quant_orig
-        None,  # kv_cache_scale_orig_quant
-        None,  # out_scale
-        None,  # block_ids_per_seq
-        [None, None],  # helix_tensor_params
-        1,  # predicted_tokens_per_seq
-        0,  # layer_idx
-        num_heads,
-        1,  # num_kv_heads
-        GEN_HEAD_SIZE,
-        0,  # residual_dim
-        env.tokens_per_block,
-        MAX_SEQ_LEN,  # attention_window_size
-        1,  # beam_width
-        0,  # quant_mode
-        1.0,  # q_scaling
-        q_lora_rank,
-        KV_LORA_RANK,
-        QK_NOPE_HEAD_DIM,
-        QK_ROPE_HEAD_DIM,
-        V_HEAD_DIM,
-        True,  # rope_append
-    )
+    with validating(op):
+        op(
+            fused_q,
+            q_pe,
+            latent_cache,
+            env.rotary_cos_sin,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            None,  # mla_bmm1_scale
+            None,  # mla_bmm2_scale
+            None,  # quant_q_buffer
+            metadata.kv_lens_cuda_runtime,
+            metadata.kv_lens_runtime,
+            metadata.prompt_lens_cpu_runtime,
+            num_contexts,
+            metadata.kv_cache_block_offsets,
+            env.kv_cache_manager.kv_cache_pool_pointers,
+            env.kv_cache_manager.kv_cache_pool_mapping,
+            None,  # kv_scale_orig_quant
+            None,  # kv_scale_quant_orig
+            None,  # kv_cache_scale_orig_quant
+            None,  # out_scale
+            None,  # block_ids_per_seq
+            [None, None],  # helix_tensor_params
+            predicted_tokens_per_seq,
+            0,  # layer_idx
+            num_heads,
+            1,  # num_kv_heads
+            GEN_HEAD_SIZE,
+            0,  # residual_dim
+            env.tokens_per_block,
+            MAX_SEQ_LEN,  # attention_window_size
+            1,  # beam_width
+            0,  # quant_mode
+            1.0,  # q_scaling
+            q_lora_rank,
+            KV_LORA_RANK,
+            QK_NOPE_HEAD_DIM,
+            QK_ROPE_HEAD_DIM,
+            V_HEAD_DIM,
+            True,  # rope_append
+        )
     torch.cuda.synchronize()
 
     # 1. The roped q in fused_q's tail; its absorbed-q head and both inputs untouched.
-    roped_q = torch.stack([env.rope_ref(q_pe_orig[n], positions[n]) for n in range(num_gen)])
+    roped_q = torch.stack([env.rope_ref(q_pe_orig[n], positions[n]) for n in range(rows)])
     _assert_bytes_equal(fused_q[..., KV_LORA_RANK:], roped_q, "fused_q roped tail")
     _assert_bytes_equal(
         fused_q[..., :KV_LORA_RANK], fused_q_orig[..., :KV_LORA_RANK], "fused_q head"
@@ -665,9 +669,12 @@ def _run_and_check_bf16(
     _assert_bytes_equal(q_pe, q_pe_orig, "q_pe")
     _assert_bytes_equal(latent_cache, latent_orig, "latent_cache")
 
-    # 2. The appended rows, and nothing else in the pool.
-    for n in range(num_gen):
-        rid = gen_ids[n]
+    # 2. The appended rows, and nothing else in the pool. The entry's reference (bf16 store, no scale) and this
+    # file's agree first.
+    half = QK_ROPE_HEAD_DIM // 2
+    table = env.rotary_cos_sin.view(-1, QK_ROPE_HEAD_DIM, 2)
+    for n in range(rows):
+        rid = gen_ids[n // tokens_per_seq]
         row = env.cache_row(rid, positions[n])
         want = torch.cat(
             [
@@ -675,10 +682,19 @@ def _run_and_check_bf16(
                 env.rope_ref(latent_orig[n, KV_LORA_RANK:], positions[n]),
             ]
         )
+        entry_ref = op.reference(
+            latent_orig[n],
+            table[positions[n], :half, 0],
+            table[positions[n], :half, 1],
+            QK_ROPE_HEAD_DIM,
+            None,
+            torch.bfloat16,
+        )
+        _assert_bytes_equal(entry_ref, want, f"references disagree, row {n}")
         _assert_bytes_equal(row, want, f"appended row (request {rid}, position {positions[n]})")
     changed = (pool.view(torch.int16) != pool_before.view(torch.int16)).nonzero().cpu()
     got_slots = set(zip(changed[:, 0].tolist(), changed[:, 2].tolist()))
-    expected_slots = {env.slot(gen_ids[n], positions[n]) for n in range(num_gen)}
+    expected_slots = {env.slot(gen_ids[n // tokens_per_seq], positions[n]) for n in range(rows)}
     assert got_slots <= expected_slots, (
         f"op touched pool slots {sorted(got_slots - expected_slots)} outside {sorted(expected_slots)}"
     )
@@ -691,29 +707,32 @@ def _run_and_check_bf16(
         num_gen,
         num_heads,
         kv_lens[num_contexts:],
-        1,
+        tokens_per_seq,
     )
 
 
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
-)
-def test_kimi_k3_bf16_page64_identity_rope() -> None:
-    """Kimi K3's generation call: bf16 latent pool (quant_mode=0, every fp8 and
+def _run_bf16_identity_rope(
+    num_heads: int, tokens_per_seq: int, predicted_tokens_per_seq: int
+) -> None:
+    """A Kimi K3 generation call: bf16 latent pool (quant_mode=0, every fp8 and
     scale buffer None), page 64, q_lora_rank 1536, q_scaling 1.0, q_pe a
-    strided view of the packed q, the per-rank head counts 6 / 12 / 24 / 96,
-    and its NoPE rope table (every (cos, sin) pair (1, 0)): the "rotation" is a
-    copy, so fused_q's tail is q_pe and each appended row is its latent_cache
-    row, bit for bit. A context sequence leads the batch; the generation
-    slots sit at positions 63 (page 0's last slot), 64 (page 1's first), 127
-    and 500."""
-    torch.manual_seed(27)
-    for heads in (6, 12, 24, 96):
-        env = _MlaEnv(tokens_per_block=TOKENS_PER_BLOCK, num_heads=heads)
-        try:
-            table = env.rotary_cos_sin.reshape(-1)
-            table[0::2] = 1.0
-            table[1::2] = 0.0
+    strided view of the packed q, and its NoPE rope table (every (cos, sin)
+    pair (1, 0)): the "rotation" is a copy, so fused_q's tail is q_pe and each
+    appended row is its latent_cache row, bit for bit.
+
+    One row per sequence: a context sequence leads the batch, and the
+    generation slots sit at positions 63 (page 0's last slot), 64 (page 1's
+    first), 127 and 500. Eight rows per sequence (DSpark's token and 7 drafts
+    on the generic path): three generation sequences whose rows land at 56..63,
+    57..64 (straddling pages 0 and 1) and 493..500; the scheduler buffers count
+    8 rows per sequence whatever ``predicted_tokens_per_seq`` the op is
+    handed."""
+    env = _MlaEnv(tokens_per_block=TOKENS_PER_BLOCK, num_heads=num_heads)
+    try:
+        table = env.rotary_cos_sin.reshape(-1)
+        table[0::2] = 1.0
+        table[1::2] = 0.0
+        if tokens_per_seq == 1:
             env.kv_cache_manager.add_dummy_requests(
                 [0, 1, 2, 3, 4], token_nums=[40, 63, 64, 127, 500]
             )
@@ -724,9 +743,42 @@ def test_kimi_k3_bf16_page64_identity_rope() -> None:
                 num_contexts=1,
                 cached_lens=[0, 63, 64, 127, 500],
                 q_lora_rank=1536,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
             )
-        finally:
-            env.shutdown()
+        else:
+            env.kv_cache_manager.add_dummy_requests([0, 1, 2], token_nums=[56, 57, 493])
+            _run_and_check_bf16(
+                env,
+                request_ids=[0, 1, 2],
+                seq_lens=[tokens_per_seq] * 3,
+                num_contexts=0,
+                cached_lens=[56, 57, 493],
+                q_lora_rank=1536,
+                tokens_per_seq=tokens_per_seq,
+                predicted_tokens_per_seq=predicted_tokens_per_seq,
+            )
+    finally:
+        env.shutdown()
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0),
+    reason="the bf16-pool shapes are certified on sm_100",
+)
+@pytest.mark.parametrize(
+    "num_heads,tokens_per_seq,predicted_tokens_per_seq",
+    [(12, 1, 1), (24, 1, 1), (96, 1, 1), (6, 8, 8)],
+    ids=["12 heads", "24 heads", "96 heads", "6 heads 8 rows P=8"],
+)
+def test_bf16_identity_rope_other_shapes(
+    num_heads: int, tokens_per_seq: int, predicted_tokens_per_seq: int
+) -> None:
+    """The bf16-pool path at shapes no shipped target calls: the per-rank head
+    counts of attention TP 8, 4 and 1, and the 8-row verify handed
+    predicted_tokens_per_seq 8 (the width itself) instead of the 1 the Kimi K3
+    targets pass."""
+    torch.manual_seed(27 + num_heads + predicted_tokens_per_seq)
+    _run_bf16_identity_rope(num_heads, tokens_per_seq, predicted_tokens_per_seq)
 
 
 def _fp8_env(
@@ -1444,6 +1496,29 @@ def test_fp8_kv_mtp_append_race_control() -> None:
         env.shutdown()
 
 
+# Kimi K3's bf16-pool generation call at attention TP16 (6 heads per rank):
+# page 64, no scales, q_scaling 1.0, the NoPE (identity) rope table. The
+# targets hand the op predicted_tokens_per_seq 1 at every verify width.
+_K3 = dict(
+    tokens_per_block=TOKENS_PER_BLOCK,
+    q_scaling=1.0,
+    write_scale=None,
+    read_scale=None,
+    num_heads=6,
+    kv_lora_rank=KV_LORA_RANK,
+    qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+    qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+    quant_mode=0,
+)
+_K3_DECODE = Cell(
+    why="kimi k3 bf16 decode: 6 heads, page 64, one row per sequence",
+    spec=dict(_K3, predicted_tokens_per_seq=1, tokens_per_seq=1),
+)
+_K3_VERIFY = Cell(
+    why="kimi k3 bf16 DSpark verify: 8 rows per sequence, handed P=1",
+    spec=dict(_K3, predicted_tokens_per_seq=1, tokens_per_seq=8),
+)
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -1471,6 +1546,8 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4": (_K3_DECODE, _K3_VERIFY),
+    "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1": (_K3_DECODE,),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -1493,6 +1570,12 @@ def test_certified_cells(cell) -> None:
     spec = cell.spec
     p = spec["predicted_tokens_per_seq"]
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    if spec["quant_mode"] == 0:
+        # A bf16-pool cell (Kimi K3's): the bf16 path's checks, no fp8 scales to cross-check.
+        if torch.cuda.get_device_capability() != (10, 0):
+            pytest.skip("the bf16-pool cells are certified on sm_100")
+        _run_bf16_identity_rope(spec["num_heads"], spec["tokens_per_seq"], p)
+        return
 
     env = _MlaEnv(
         max_batch_size=4,

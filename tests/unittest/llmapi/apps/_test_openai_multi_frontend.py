@@ -15,13 +15,17 @@
 """trtllm-serve with 8 frontend processes on one engine.
 
 Each connection may land on any frontend (SO_REUSEPORT), so every request opens
-its own. Server-wide state must not depend on which frontend answers.
+its own. Server-wide state must not depend on which frontend answers, and the
+attached frontends serve without creating a CUDA context.
 """
 
+import http.client
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import psutil
+import pynvml
 import pytest
 import requests
 
@@ -86,6 +90,13 @@ def _success_total(server: RemoteOpenAIServer) -> float:
     )
 
 
+def _num_measured_records(server: RemoteOpenAIServer) -> int:
+    """Iteration records one poll of /metrics returns, without the heartbeats
+    an idle engine keeps reporting once a second."""
+    rows = requests.get(server.url_for("metrics"), timeout=30).json()
+    return sum(not row.get("isQueueSnapshot") for row in rows)
+
+
 def test_frontends_share_one_engine(server: RemoteOpenAIServer, model_path: str):
     with ThreadPoolExecutor(16) as pool:
         finish_reasons = list(
@@ -99,9 +110,81 @@ def test_frontends_share_one_engine(server: RemoteOpenAIServer, model_path: str)
     # Only the launcher drains the engine's stats (every second), so the first
     # poll gets all of them, whichever frontend answers.
     time.sleep(3)
-    polls = [len(requests.get(server.url_for("metrics"), timeout=30).json()) for _ in range(16)]
+    polls = [_num_measured_records(server) for _ in range(16)]
     assert polls[0] > 0 and not any(polls[1:]), polls
 
     # Every scrape counts the requests of all frontends.
     totals = [_success_total(server) for _ in range(NUM_FRONTENDS)]
     assert totals == [NUM_REQUESTS + NUM_STREAMS] * NUM_FRONTENDS, totals
+
+
+def _connection_to(process: psutil.Process, port: int) -> http.client.HTTPConnection:
+    """Open keep-alive connections until one is accepted by the given frontend process."""
+    for _ in range(256):
+        conn = http.client.HTTPConnection("localhost", port, timeout=120)
+        conn.request("GET", "/health")
+        conn.getresponse().read()
+        client_port = conn.sock.getsockname()[1]
+        if any(
+            c.laddr.port == port and c.raddr and c.raddr.port == client_port
+            for c in process.net_connections(kind="tcp")
+        ):
+            return conn
+        conn.close()
+    raise AssertionError(f"process {process.pid} accepted none of 256 connections")
+
+
+def _complete(conn: http.client.HTTPConnection, model: str) -> str:
+    body = {
+        "model": model,
+        "prompt": "The capital of France is",
+        "max_tokens": 16,
+        "temperature": 0.0,
+    }
+    conn.request("POST", "/v1/completions", json.dumps(body), {"Content-Type": "application/json"})
+    response = conn.getresponse()
+    payload = response.read()
+    assert response.status == 200, payload
+    return json.loads(payload)["choices"][0]["text"]
+
+
+def _gpu_compute_pids() -> set[int]:
+    pynvml.nvmlInit()
+    try:
+        return {
+            proc.pid
+            for index in range(pynvml.nvmlDeviceGetCount())
+            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(
+                pynvml.nvmlDeviceGetHandleByIndex(index)
+            )
+        }
+    finally:
+        pynvml.nvmlShutdown()
+
+
+# After test_frontends_share_one_engine: its request counts must not include these requests.
+def test_attached_frontends_serve_without_cuda_context(
+    server: RemoteOpenAIServer, model_path: str, process_gpu_memory_info_available: bool
+):
+    if not process_gpu_memory_info_available:
+        pytest.skip("NVML cannot attribute GPU contexts to processes here")
+    launcher = psutil.Process(server.proc.pid)
+    frontends = [
+        child
+        for child in launcher.children(recursive=True)
+        if "TLLM_EXECUTOR_FRONTEND_ID" in child.environ()
+    ]
+    assert len(frontends) == NUM_FRONTENDS - 1
+    assert all(frontend.environ().get("CUDA_VISIBLE_DEVICES") == "" for frontend in frontends)
+
+    expected = _complete(_connection_to(launcher, server.port), model_path)
+    assert expected
+    for frontend in frontends:
+        assert _complete(_connection_to(frontend, server.port), model_path) == expected
+
+    frontend_pids = {
+        proc.pid
+        for frontend in frontends
+        for proc in (frontend, *frontend.children(recursive=True))
+    }
+    assert not frontend_pids & _gpu_compute_pids()

@@ -278,6 +278,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         metrics = self.collective_rpc("get_startup_metrics", target_ranks=0)
         return metrics[0] if metrics and isinstance(metrics[0], dict) else {}
 
+    def get_engine_config(self) -> dict:
+        """Get resolved engine config metadata from rank 0."""
+        config = self.collective_rpc("get_engine_config", target_ranks=0)
+        return config[0] if config and isinstance(config[0], dict) else {}
+
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
         Low-level API to the executor. Return a "future" GenerationResult
@@ -290,9 +295,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        with nvtx_range_debug("rpc_submit"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Register the result BEFORE the fire-and-forget send (see
+        # RpcExecutorMixin.submit): the response loop drops responses for
+        # client_ids that are not registered yet, and a request that
+        # completes before this thread reaches the registration would lose
+        # its final response and hang the caller.
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -300,6 +307,13 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
         self._results[request.id] = result
+
+        try:
+            with nvtx_range_debug("rpc_submit"):
+                self.rpc_client.submit(request).remote(need_response=False)
+        except Exception:
+            self._results.pop(request.id, None)
+            raise
 
         return result
 

@@ -30,6 +30,8 @@ from tensorrt_llm.commands._serve_stability import (
     stability_option,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_help_info_includes_tag():
     out = help_info_with_stability_tag("Port of the server.", "beta")

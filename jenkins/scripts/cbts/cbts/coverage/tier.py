@@ -34,6 +34,8 @@ from cbts.blocks import (
     _entry_in_filter_subtree,
     _estimate_entries_seconds,
     block_matches_stage,
+    find_context_files,
+    write_context_file,
 )
 from cbts.coverage.selection.selector import (  # noqa: F401
     DEFAULT_NO_DATA_POLICY,
@@ -238,10 +240,8 @@ def apply_coverage_tier(
     removed, dropped, must_run_reasons = _build_narrowing(
         cov, stages, yaml_index, rule_block_filters, known, untrusted
     )
-    # exclude multi-GPU and post-merge stages from the drop set (not coverage's to decide)
+    # Multi-GPU stages are outside coverage selection; Groovy controls stage scheduling.
     dropped = {s for s in dropped if not _is_multi_gpu(s)}
-    if not pr.post_merge:
-        dropped = {s for s in dropped if "Post-Merge" not in s}
 
     n_impacted = sum(len(v) for v in cov.impacted.values())
     n_removed = sum(len(v) for v in removed.values())
@@ -293,9 +293,10 @@ def write_coverage_test_db(
     # Clear first: a leftover YAML from an earlier run would ship in the artifact.
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
+    context_files = find_context_files(src_dir)
     for stem in sorted({stem for stem, _ in removed}):
-        src = src_dir / f"{stem}.yml"
-        if not src.exists():
+        src = context_files.get(stem)
+        if src is None:
             continue
         data = yaml.safe_load(src.read_text()) or {}
         blocks = data.get(stem)
@@ -308,9 +309,7 @@ def write_coverage_test_db(
             if not rm:
                 continue
             block_data["tests"] = [t for t in (block_data.get("tests") or []) if t not in rm]
-        (out_dir / src.name).write_text(
-            yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-        )
+        write_context_file(out_dir, data, stem, blocks)
 
 
 def compute_coverage_stage_counts(

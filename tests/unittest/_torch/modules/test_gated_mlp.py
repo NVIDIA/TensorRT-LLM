@@ -3,7 +3,7 @@
 
 from types import SimpleNamespace
 from typing import Callable
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -243,3 +243,186 @@ def test_deepseek_dense_layer_enables_locality_domain_bf16_mlp(
     call = gated_mlp_constructor.call_args
     assert call.kwargs["config"] is config
     assert call.kwargs["enable_locality_domain_bf16_linear"] is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="needs SM100/SM103/SM107",
+)
+@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("backend", ["deep_gemm", "cute_dsl", "disable_deep_gemm"])
+@torch.inference_mode()
+def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
+    """A tuned shared-expert-sized FP8 MLP is at least as close to the exact product as its
+    untuned forward."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if backend != "deep_gemm" and (
+        torch.cuda.get_device_capability() != (10, 7) or not IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    ):
+        pytest.skip("The CuTe DSL candidate requires Rubin helpers on SM107")
+    torch.manual_seed(0)
+    hidden, intermediate = 5120, 1152
+    config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    )
+    mlp = GatedMLP(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=config,
+        use_cute_dsl_blockscaling_mm=backend == "cute_dsl",
+    ).cuda()
+    if backend == "disable_deep_gemm":
+        for linear in (mlp.gate_up_proj, mlp.down_proj):
+            linear.disable_deep_gemm = True
+
+    def block_scaled(out_features, in_features):
+        weight = torch.randn(out_features, in_features) * in_features**-0.5
+        blocks = weight.view(out_features // 128, 128, in_features // 128, 128)
+        scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax((1, 3)) / 448)))
+        quantized = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn)
+        dequantized = (quantized.double() * scale[:, None, :, None]).view(out_features, in_features)
+        return {
+            "weight": quantized.view(out_features, in_features),
+            "weight_scale_inv": scale,
+        }, dequantized.cuda()
+
+    gate, gate_ref = block_scaled(intermediate, hidden)
+    up, up_ref = block_scaled(intermediate, hidden)
+    down, down_ref = block_scaled(hidden, intermediate)
+    mlp.gate_up_proj.load_weights([gate, up])
+    mlp.down_proj.load_weights([down])
+    for linear in (mlp.gate_up_proj, mlp.down_proj):
+        linear.use_fp8_small_m_gemm = True
+        linear.post_load_weights()
+    x = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    reference = (F.silu(x.double() @ gate_ref.t()) * (x.double() @ up_ref.t())) @ down_ref.t()
+
+    def rms_error(output):
+        return (output.double() - reference).square().mean().sqrt().item()
+
+    AutoTuner.get().clear_cache()
+    plain = mlp(x)
+    with autotune():
+        mlp(x)
+    cache = AutoTuner.get().profiling_cache
+    with patch.object(cache, "search_cache", wraps=cache.search_cache) as cache_search:
+        tuned = mlp(x)
+    # Whichever kernels win, the tuned forward is at least as close to the exact product.
+    assert rms_error(tuned) <= 1.05 * rms_error(plain)
+
+    def activation_group_size(width: int, cache_calls, *, fused_swiglu: bool = False) -> int:
+        operation = (
+            torch_custom_ops._FP8_BLOCK_SCALE_SWIGLU_GEMM_AUTOTUNED_OP
+            if fused_swiglu
+            else torch_custom_ops._FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP
+        )
+        calls = [
+            call
+            for call in cache_calls
+            if call.args[0] == operation and call.args[2][0][-1] == width
+        ]
+        if calls:
+            hit, _, tactic, _ = cache.search_cache(*calls[-1].args, **calls[-1].kwargs)
+            if hit:
+                return 0 if tactic == 0 else 128
+        if not fused_swiglu:
+            linear = mlp.gate_up_proj if width == hidden else mlp.down_proj
+            if linear.fp8_low_m_gemm.serves(x):
+                return 32
+        return 128
+
+    def quantized_activation(value: torch.Tensor, group_size: int) -> torch.Tensor:
+        blocks = value.float().reshape(rows, -1, group_size)
+        scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448)))
+        quantized = (blocks / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        return (quantized.double() * scale.double().unsqueeze(-1)).reshape_as(value)
+
+    def check_precision(output, cache_calls):
+        gate_group_size = activation_group_size(hidden, cache_calls)
+        down_group_size = 0
+        if mlp._can_fuse_swiglu_fp8_quant():
+            down_group_size = activation_group_size(
+                2 * intermediate, cache_calls, fused_swiglu=True
+            )
+        if not down_group_size:
+            down_group_size = activation_group_size(intermediate, cache_calls)
+        precision_reference = reference
+        if gate_group_size or down_group_size:
+            gate_input = quantized_activation(x, gate_group_size) if gate_group_size else x.double()
+            gate_product = gate_input @ gate_ref.t()
+            up_product = gate_input @ up_ref.t()
+            if down_group_size:
+                gate_product = gate_product.to(torch.bfloat16).float()
+                up_product = up_product.to(torch.bfloat16).float()
+            activation_reference = F.silu(gate_product) * up_product
+            if down_group_size:
+                activation_reference = quantized_activation(
+                    activation_reference.to(torch.bfloat16), down_group_size
+                )
+            precision_reference = activation_reference @ down_ref.t()
+        absolute_error = (output.double() - precision_reference).square().mean().sqrt().item()
+        limit = 2e-2 * precision_reference.square().mean().sqrt().item()
+        assert absolute_error <= limit, (
+            f"gate/down activation groups {gate_group_size}/{down_group_size}: "
+            f"RMS error {absolute_error:.3e} > {limit:.3e}"
+        )
+        return gate_group_size, down_group_size
+
+    check_precision(tuned, cache_search.call_args_list)
+
+    tuned_operations = (
+        torch_custom_ops._FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP,
+        torch_custom_ops._FP8_BLOCK_SCALE_SWIGLU_GEMM_AUTOTUNED_OP,
+    )
+
+    def checked_forward(*, expect_cache_miss=False):
+        with patch.object(cache, "search_cache", wraps=cache.search_cache) as controlled_search:
+            output = mlp(x)
+        if expect_cache_miss:
+            for call in controlled_search.call_args_list:
+                if call.args[0] in tuned_operations:
+                    hit, _, _, _ = cache.search_cache(*call.args, **call.kwargs)
+                    assert not hit, f"cache-miss control hit a tuned entry for {call.args[0]}"
+        return check_precision(output, controlled_search.call_args_list)
+
+    cache_keys = set()
+    tactic_overrides = {}
+    has_gate_tactic = False
+    for call in cache_search.call_args_list:
+        operation, runners, shapes, tuning_config = call.args[:4]
+        if operation not in tuned_operations:
+            continue
+        for runner in runners:
+            cache_keys.add(cache.get_cache_key(operation, runner, shapes, tuning_config))
+        hit, runner_id, _, _ = cache.search_cache(*call.args, **call.kwargs)
+        if not hit:
+            continue
+        cache_key = cache.get_cache_key(operation, runners[runner_id], shapes, tuning_config)
+        gate_lookup = shapes[0][-1] == hidden
+        has_gate_tactic = has_gate_tactic or gate_lookup
+        tactic_overrides[cache_key] = (runner_id, 0 if gate_lookup else -1, 0.0)
+    if has_gate_tactic:
+        with patch.dict(cache.cache, tactic_overrides):
+            assert checked_forward() == (0, 128)
+    if cache_keys:
+        with patch.dict(cache.cache):
+            for cache_key in cache_keys:
+                cache.cache.pop(cache_key, None)
+            fallback_groups = checked_forward(expect_cache_miss=True)
+            assert all(fallback_groups), f"cache-miss activation groups {fallback_groups}"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mlp(x)
+    x.copy_(torch.randn_like(x))
+    expected = mlp(x)
+    graph.replay()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

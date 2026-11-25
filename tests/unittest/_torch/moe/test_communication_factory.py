@@ -31,6 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -420,19 +421,25 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     assert not strategy.use_low_precision_combine
 
 
-def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A rejected NCCL window must not replace the buffer written by dispatch."""
+@pytest.mark.parametrize("window_available", [False, True])
+def test_nccl_ep_dispatch_window(monkeypatch: pytest.MonkeyPatch, window_available: bool) -> None:
+    """Dispatch uses a registered window or the persistent output on allocation refusal."""
 
     class FakeTensor:
-        def __init__(self, tensor, **_):
+        def __init__(self, tensor: torch.Tensor, **kwargs: object) -> None:
             self.tensor = tensor
+            self.__dict__.update(kwargs)
 
     class FakeHandle:
-        def dispatch(self, _, outputs, **__):
-            assert outputs is context.dispatch_outputs
-            context.output_tokens_buf.fill_(7)
+        def dispatch(self, _: object, outputs: SimpleNamespace, **__: object) -> None:
+            """Check dispatch's selected destination and emulate its output write."""
+            if window_available:
+                assert outputs.tokens.window.handle == 123
+                assert outputs.tokens.window_offset == 0
+                outputs.tokens.tensor.fill_(7)
+            else:
+                assert outputs is context.dispatch_outputs
+                context.output_tokens_buf.fill_(7)
 
     fake_ep = SimpleNamespace(
         DispatchInputs=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -467,16 +474,18 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     comm.max_tokens_per_rank = comm.max_recv_tokens = 1
     comm.hidden_size = 4
     comm.use_fp8 = comm.uses_internal_fp8_dispatch = False
-    comm.use_external_fp8 = comm.use_external_nvfp4 = False
+    comm._ctx = None
+    comm.set_quant_config(None)
     comm._dispatch_state = {}
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    fallback_tokens = torch.zeros_like(persistent_tokens)
+    window_tokens = torch.zeros_like(persistent_tokens)
+    window_kind = int(BufferKind.NCCL_WINDOW if window_available else BufferKind.DEFAULT)
+    allocate = Mock(return_value=(window_tokens, window_kind, 123 if window_available else 0))
     monkeypatch.setattr(
         torch.ops.trtllm,
         "allocate_output_with_nccl_window",
-        lambda *_: (fallback_tokens, 0, 0),
+        allocate,
     )
 
     recv_hs, *_ = comm.dispatch(
@@ -488,6 +497,10 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     )
 
     assert torch.equal(recv_hs, torch.full_like(recv_hs, 7))
+    allocate.assert_called_once()
+    expected = window_tokens if window_available else persistent_tokens
+    assert recv_hs.data_ptr() == expected.data_ptr()
+    assert context.output_tokens_buf is persistent_tokens
 
 
 def test_forced_nccl_ep_forwards_low_precision_combine(
@@ -717,3 +730,63 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+def test_nccl_ep_rejects_format_change_after_context_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allocated context cannot switch to a different transport format."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=4096,
+    )
+    context = comm._ctx = object()
+    comm.set_quant_config(QuantConfig())  # An unchanged transport remains valid.
+    with pytest.raises(RuntimeError, match="after context initialization"):
+        comm.set_quant_config(QuantConfig(quant_algo=QuantAlgo.NVFP4))
+    assert comm._ctx is context
+    assert not comm.supports_post_quant_dispatch()
+
+
+@pytest.mark.parametrize(
+    ("quant_algo", "version_supported", "hidden_size", "reason"),
+    [
+        (QuantAlgo.FP8, False, 4096, "libnccl_ep >= 0.2"),
+        (QuantAlgo.NVFP4, False, 4096, "libnccl_ep >= 0.2"),
+        (QuantAlgo.NVFP4, True, 384, "hidden_size divisible by 256"),
+    ],
+)
+def test_nccl_ep_falls_back_for_unsupported_quantized_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    version_supported: bool,
+    hidden_size: int,
+    reason: str,
+) -> None:
+    """Unsupported quantized transport keeps BF16 dispatch and disables LP combine."""
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: version_supported)
+    warning = Mock()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep.logger.warning", warning
+    )
+    comm = NcclEP(
+        mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
+        num_slots=32,
+        hidden_size=hidden_size,
+        use_low_precision_combine=True,
+    )
+    comm.set_quant_config(QuantConfig(quant_algo=quant_algo))
+    assert not comm.supports_post_quant_dispatch()
+    assert not comm.use_low_precision_combine
+    warning.assert_called_once()
+    assert reason in warning.call_args.args[0]
+    assert "falling back to BF16" in warning.call_args.args[0]
+
+    # Reapplying a config that resolves to the same transport preserves the context.
+    context = comm._ctx = object()
+    comm.set_quant_config(QuantConfig(quant_algo=quant_algo))
+    assert comm._ctx is context

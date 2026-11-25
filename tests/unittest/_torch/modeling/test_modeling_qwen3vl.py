@@ -16,30 +16,41 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
-from transformers import Qwen3VLConfig
+from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
+from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5InputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
     vision_normalization_from_processor,
 )
+from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
+    Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.sampling_params import SamplingParams
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -937,6 +948,416 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     assert processor.get_mm_max_tokens_per_item() == expected_max_tokens_per_item
 
 
+def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
+    """Return a small Qwen-VL family input processor and its embedding width."""
+    hidden_size = 8
+    vision_config = SimpleNamespace(
+        spatial_merge_size=2, temporal_patch_size=2, tokens_per_second=2
+    )
+    if model == "qwen3":
+        vision_config.deepstack_visual_indexes = [0]
+    processor_cls = {
+        "qwen2": modeling_qwen2vl.Qwen2VLInputProcessorBase,
+        "qwen2.5": modeling_qwen2vl.Qwen2_5VLInputProcessorBase,
+        "qwen3": Qwen3VLInputProcessorBase,
+        "exaone4_5": Exaone4_5InputProcessor,
+    }[model]
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        text_config=SimpleNamespace(hidden_size=hidden_size, vocab_size=100, dtype=torch.float32),
+        vision_config=vision_config,
+        image_token_id=12,
+        video_token_id=14,
+        vision_start_token_id=11,
+        vision_end_token_id=13,
+    )
+    tokenizer = MagicMock()
+    tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
+    with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.return_value = MagicMock(mm_special_token_ids=None)
+        processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
+    # A Qwen3-VL embedding row also holds one deepstack level.
+    width = hidden_size * (2 if model == "qwen3" else 1)
+    return processor, width
+
+
+def _make_qwen_media_processor(model):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import (
+        PreTrainedTokenizerFast,
+        Qwen2_5_VLProcessor,
+        Qwen2VLImageProcessor,
+        Qwen2VLVideoProcessor,
+        Qwen3VLProcessor,
+        Qwen3VLVideoProcessor,
+    )
+
+    image_token, video_token = "<|image_pad|>", "<|video_pad|>"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        pad_token="[UNK]",
+        additional_special_tokens=[image_token, video_token, "<|vision_start|>", "<|vision_end|>"],
+    )
+    cls = Qwen3VLProcessor if model == "qwen3" else Qwen2_5_VLProcessor
+    video_cls = Qwen3VLVideoProcessor if model == "qwen3" else Qwen2VLVideoProcessor
+    hf = cls(
+        image_processor=Qwen2VLImageProcessor(patch_size=16),
+        video_processor=video_cls(patch_size=16),
+        tokenizer=tokenizer,
+    )
+    processor, _ = _make_qwen_vl_embedding_processor(model, [])
+    processor._processor = hf
+    return processor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize(
+    "image_kind,video_kind",
+    [
+        ("pil", "uint8"),
+        ("tensor", "uint8"),
+        ("tensor_with_options", "uint8"),
+        ("scaled_array", "tensor"),
+        ("tensor", "scaled_array"),
+    ],
+)
+def test_qwen_mixed_media_rescale(model, image_kind, video_kind):
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    processor = _make_qwen_media_processor(model)
+    frames = np.random.default_rng(42).integers(0, 256, (4, 64, 64, 3), dtype=np.uint8)
+    image = Image.fromarray(frames[0])
+    video = frames
+    options = {}
+    reference = {}
+    if image_kind != "pil":
+        image = frames[0].astype(np.float32) / 255
+        if image_kind != "scaled_array":
+            image = torch.from_numpy(image).permute(2, 0, 1)
+        reference["images_kwargs"] = {"do_rescale": False}
+    if image_kind == "tensor_with_options":
+        options = {"images_kwargs": {"do_normalize": False}}
+        reference["images_kwargs"]["do_normalize"] = False
+    if video_kind != "uint8":
+        video = frames.astype(np.float32) / 255
+        if video_kind == "tensor":
+            video = [torch.from_numpy(frame).permute(2, 0, 1) for frame in video]
+        reference = {"do_rescale": False}
+    metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+    if model == "qwen3":
+        reference["video_metadata"] = [dict(metadata)]
+    prompt = (
+        "<|vision_start|><|image_pad|><|vision_end|><|vision_start|><|video_pad|><|vision_end|>"
+    )
+    actual = processor._preprocess(
+        prompt, {"image": [image], "video": [VideoData(video, metadata)]}, options
+    )
+    expected = processor.processor(
+        text=[prompt],
+        images=[image],
+        videos=[video],
+        padding=True,
+        return_tensors="pt",
+        **reference,
+    )
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "input_ids",
+        "image_grid_thw",
+        "video_grid_thw",
+    ):
+        assert torch.equal(actual[key], expected[key])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dark_image_first", [True, False])
+def test_qwen_raw_float_array_batch_rescale(dark_image_first):
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    processor = _make_qwen_media_processor("qwen2.5")
+    dark = np.zeros((4, 64, 64, 3), dtype=np.float32)
+    bright = np.full_like(dark, 255)
+    clips = [bright, dark] if dark_image_first else [dark, bright]
+    images = [clip[0] for clip in reversed(clips)]
+    prompt = "<|vision_start|><|image_pad|><|vision_end|>" * 2
+    prompt += "<|vision_start|><|video_pad|><|vision_end|>" * 2
+    actual = processor._preprocess(
+        prompt, {"image": images, "video": [VideoData(clip, {}) for clip in clips]}, {}
+    )
+    expected = processor.processor(
+        text=[prompt],
+        images=images,
+        videos=clips,
+        padding=True,
+        return_tensors="pt",
+        do_rescale=True,
+    )
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "input_ids",
+    ):
+        assert torch.equal(actual[key], expected[key])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [(1920, 1080)],
+        [(1080, 1920)],
+        [(1280, 720)],
+        [(1000, 1000)],
+        # Two images with the same row count but swapped h and w. A grid used
+        # for the wrong image passes the row check; only the positions show it.
+        [(1920, 1080), (1080, 1920)],
+        [(1080, 1920), (1920, 1080)],
+    ],
+    ids=[
+        "1920x1080",
+        "1080x1920",
+        "1280x720",
+        "1000x1000",
+        "1920x1080+1080x1920",
+        "1080x1920+1920x1080",
+    ],
+)
+def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
+    """Embeddings + image_grid_thw give the same ids and mRoPE as raw images."""
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    # One <vision_start> <image> <vision_end> per image.
+    processor, width = _make_qwen_vl_embedding_processor(
+        model, [7] + [11, 12, 13] * len(sizes) + [8]
+    )
+    # The image processor settings of the Qwen2.5-VL and Qwen3-VL checkpoints.
+    image_processor = Qwen2VLImageProcessor(
+        patch_size=14 if model == "qwen2.5" else 16,
+        temporal_patch_size=2,
+        merge_size=2,
+        size={"shortest_edge": 3136, "longest_edge": 12845056}
+        if model == "qwen2.5"
+        else {"shortest_edge": 65536, "longest_edge": 16777216},
+    )
+    images = [Image.new("RGB", size) for size in sizes]
+    image_inputs = image_processor(images=images, return_tensors="pt")
+    grids = image_inputs["image_grid_thw"]
+    rows = [int(grid.prod()) // 4 for grid in grids]
+
+    def hf_processor_outputs(text, mm_data, mm_processor_kwargs):
+        # Like the HF processor: one image token per merged patch.
+        ids = [7]
+        for image_rows in rows:
+            ids += [11] + [12] * image_rows + [13]
+        ids.append(8)
+        return {
+            "input_ids": torch.tensor([ids]),
+            "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+            "pixel_values": image_inputs["pixel_values"],
+            "image_grid_thw": grids,
+        }
+
+    processor._preprocess = hf_processor_outputs
+    ref_ids, ref = processor.call_with_text_prompt(
+        {"prompt": "Describe this image.", "multi_modal_data": {"image": images}},
+        SamplingParams(),
+    )
+
+    def attach(image_grids):
+        items = [
+            {"mm_embeddings": torch.zeros(image_rows, width), "image_grid_thw": grid}
+            for image_rows, grid in zip(rows, image_grids)
+        ]
+        return processor.attach_multimodal_embeddings(
+            {"prompt": "Describe this image."}, {"image": items}, SamplingParams()
+        )
+
+    ids, extra = attach(grids)
+
+    assert ids == ref_ids
+    ref_mrope = ref["multimodal_data"]["mrope_config"]
+    mrope = extra["multimodal_data"]["mrope_config"]
+    torch.testing.assert_close(mrope["mrope_position_ids"], ref_mrope["mrope_position_ids"])
+    torch.testing.assert_close(mrope["mrope_position_deltas"], ref_mrope["mrope_position_deltas"])
+    if len(sizes) > 1:
+        # Negative control: swapped grids also pass the row check, but give
+        # other positions. So this test fails if an image gets the wrong grid.
+        _, swapped = attach(grids.flip(0))
+        assert not torch.equal(
+            swapped["multimodal_data"]["mrope_config"]["mrope_position_ids"],
+            ref_mrope["mrope_position_ids"],
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+@pytest.mark.parametrize("as_dict", [False, True], ids=["tensor", "dict"])
+def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 8])
+    image = torch.zeros(6, width)
+    if as_dict:
+        image = {"mm_embeddings": image}
+    with pytest.raises(ValueError, match="has no image_grid_thw"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"}, {"image": [image]}, SamplingParams()
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "grid",
+    # The last two pass a row check alone: an image has t == 1, and
+    # [1, 4.9, 6.9] truncated to integers is [1, 4, 6].
+    [[1, 6, 6], [1, 3, 8], [4, 6], [2, 2, 6], [1, 4.9, 6.9]],
+)
+def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid):
+    processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 12, 8])
+    with pytest.raises(ValueError, match="does not match image embedding 0"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"},
+            {"image": [{"mm_embeddings": torch.zeros(6, width), "image_grid_thw": grid}]},
+            SamplingParams(),
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2", "exaone4_5"])
+def test_qwen_vl_embeddings_on_model_without_support_raise(model):
+    """A model that takes no embeddings says so; it does not ask for a grid."""
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 8])
+    with pytest.raises(NotImplementedError, match="does not support external multimodal"):
+        processor.attach_multimodal_embeddings(
+            {"prompt": "p"}, {"image": [torch.zeros(6, width)]}, SamplingParams()
+        )
+
+
+_QWEN_VL_ENCODERS = pytest.mark.parametrize(
+    "encoder_cls",
+    [modeling_qwen2vl.Qwen2VisionModelBase, Qwen3VisionModelBase, Cosmos3EdgeVisionEncoder],
+    ids=["qwen2.5", "qwen3", "cosmos3_edge"],
+)
+
+
+def _qwen_vl_item_grid_case(encoder_cls):
+    """Return one request's processed data, a stub encoder and the expected grids.
+
+    The input processor records each item's grid in prompt order (the runner
+    returns it as handle metadata), and the encoder returns rows in the same order.
+    """
+    # A landscape and a portrait image, so a swapped h and w shows.
+    expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
+    prompt = [11, 12, 13, 11, 12, 13]
+    model = "qwen2.5"
+    if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
+        # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
+        expected.insert(0, {"video_grid_thw": [2, 4, 4]})
+        prompt = [11, 14, 13] + prompt
+        model = "qwen3"
+    data = {}
+    for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
+        grid_key = f"{modality}_grid_thw"
+        grids = [item[grid_key] for item in expected if grid_key in item]
+        if grids:
+            # Each patch holds its item's grid, so a row shows which item it comes from.
+            pixels = [
+                torch.tensor(grid, dtype=torch.float32).expand(int(np.prod(grid)), 3)
+                for grid in grids
+            ]
+            data[modality] = {pixel_key: torch.cat(pixels), grid_key: torch.tensor(grids)}
+    processor, _ = _make_qwen_vl_embedding_processor(model, prompt)
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata(prompt, data)
+    lengths = [int(np.prod(grid)) // 4 for item in expected for grid in item.values()]
+
+    grid_devices = []
+
+    def vit(pixel_values, grid_thw):
+        # One row per 2x2 merged patch, like the real encoder. It does not read the grid.
+        grid_devices.append(grid_thw.device.type)
+        return pixel_values[::4]
+
+    # Skip the real vision tower; forward only needs the ViT call.
+    encoder = encoder_cls.__new__(encoder_cls)
+    torch.nn.Module.__init__(encoder)
+    encoder.visual = vit
+    encoder.encode_batched = vit
+    return data, lengths, expected, encoder, grid_devices
+
+
+def _assert_rows_hold_item_grids(embedding, lengths, expected):
+    """Rows come in prompt order, like the metadata: each item's rows hold its own grid."""
+    assert embedding.shape[0] == sum(lengths)
+    for rows, item in zip(embedding.split(lengths), expected, strict=True):
+        (grid,) = item.values()
+        assert torch.equal(rows, torch.tensor(grid, dtype=rows.dtype).expand_as(rows))
+
+
+@pytest.mark.cpu_only
+@_QWEN_VL_ENCODERS
+def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
+    """Each item gets its grid, in prompt order, with its embedding rows.
+
+    A caller that caches encoder outputs passes this grid back with the
+    embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
+    """
+    data, lengths, expected, encoder, _ = _qwen_vl_item_grid_case(encoder_cls)
+    assert data["multimodal_embedding_metadata"] == expected
+    _assert_rows_hold_item_grids(
+        torch.cat(encoder.forward([MultimodalParams(multimodal_data=data)])), lengths, expected
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@_QWEN_VL_ENCODERS
+def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
+    """The standalone runner moves every tensor to the GPU, grids too.
+
+    Its forward must still return each item's grid without a device sync.
+    """
+    from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
+    from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
+
+    data, lengths, expected, encoder, grid_devices = _qwen_vl_item_grid_case(encoder_cls)
+    # Like a real standalone encoder, so a forward that branches on it runs that branch.
+    encoder.model_config = SimpleNamespace(mm_encoder_only=True)
+    request = SimpleNamespace(
+        py_multimodal_data=data,
+        py_multimodal_params=MultimodalParams(multimodal_data=data),
+        multimodal_lengths=None,
+        get_num_tokens=lambda _: sum(lengths),
+    )
+
+    def forward(multimodal_params):
+        # Any device-to-host copy, like tolist() on a CUDA tensor, raises here.
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            return encoder.forward(multimodal_params)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_mode)
+
+    runner = MultimodalEncoderRunner(
+        SimpleNamespace(extra_attrs={}, forward=forward),
+        encoder_cache_enabled=False,
+        moe_load_balancer=None,
+    )
+    result = runner.forward(
+        ScheduledInputs(batch=SimpleNamespace(context_requests=[request])),
+        resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
+    )
+
+    assert set(grid_devices) == {"cuda"}
+    assert result["mm_embedding_metadata"] == [expected]
+    (embedding,) = result["mm_embeddings"]
+    _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
+
+
 # ---------------------------------------------------------------------------
 # Accuracy tests for the fused Triton bilinear position-embedding kernel used
 # by the Qwen3-VL vision tower. Mirrors vLLM's
@@ -1622,8 +2043,16 @@ def test_normalization_startup_follows_encoder_dtype(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [None, False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "enabled,dtype",
+    [
+        (None, torch.bfloat16),
+        (False, torch.bfloat16),
+        (True, torch.bfloat16),
+        (True, torch.float16),
+        (True, torch.float32),
+    ],
+)
 @pytest.mark.parametrize(
     "input_kind",
     [
@@ -1728,7 +2157,9 @@ def test_normalization_processor_uses_config(
         "default_float64",
     )
     assert bool(processed.get("vision_normalization")) is expected
-    assert hf_processor.call_args.kwargs["do_rescale"] is overrides.get("do_rescale", not expected)
+    call_kwargs = hf_processor.call_args.kwargs
+    rescale = call_kwargs.get("images_kwargs", {}).get("do_rescale", call_kwargs.get("do_rescale"))
+    assert rescale is overrides.get("do_rescale", not expected and input_kind != "float")
     assert hf_processor.call_args.kwargs.get("do_normalize") is (
         False if expected else overrides.get("do_normalize")
     )
@@ -1777,8 +2208,16 @@ def test_normalization_metadata_survives_processor_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
 @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("worker_dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("scalar_statistics", [False, True])
-@pytest.mark.parametrize("do_rescale,do_normalize", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "do_rescale,do_normalize,scalar_statistics",
+    [
+        (True, True, False),
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+    ],
+)
 def test_normalization_enabled_operations(
     dtype, default_dtype, worker_dtype, scalar_statistics, do_rescale, do_normalize
 ):
@@ -2024,7 +2463,6 @@ def test_normalization_transport_item_selection(declared: bool, modality: str) -
     from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
         MultimodalItemPartition,
     )
 
@@ -2175,7 +2613,6 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
         MultimodalItemPartition,
     )
 
@@ -2218,3 +2655,75 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     encoder.assert_not_called()
     assert torch.equal(attached[0], params.multimodal_data["multimodal_embedding"])
     assert params.multimodal_data["image"]["vision_normalization"] is spec
+
+
+class _RecordingVisionEncoder(torch.nn.Module):
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("decoder_backend", "override"),
+    [("TRTLLM", None), ("TRTLLM", "VANILLA"), ("FLASHINFER", "VANILLA")],
+)
+def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: str | None) -> None:
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            text_config=PretrainedConfig(dtype=torch.float32),
+            vision_config=PretrainedConfig(),
+        ),
+        attn_backend=decoder_backend,
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+    config._frozen = True
+    encoder = Qwen3VisionModelBase(config, _RecordingVisionEncoder)
+    assert encoder.visual.model_config.attn_backend == (override or decoder_backend)
+    assert encoder.model_config.extra_attrs is config.extra_attrs
+    assert encoder.model_config._frozen
+    if override is None:
+        assert encoder.model_config is config
+    assert config.attn_backend == decoder_backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, "VANILLA", "FLASHINFER"])
+def test_qwen2_5_vl_encoder_override_drops_decoder_kv_cache_quant(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(modeling_qwen2vl, "Qwen2_5_VisionModel", _RecordingVisionEncoder)
+    pretrained_config = PretrainedConfig(vision_config=PretrainedConfig(num_heads=1))
+    pretrained_config.torch_dtype = torch.float32
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+
+    encoder = modeling_qwen2vl.Qwen2VisionModelBase(config, _RecordingVisionEncoder)
+
+    vision = encoder.visual.model_config
+    assert vision.attn_backend == (override or "TRTLLM")
+    # The default keeps today's config. An override drops the decoder's FP8
+    # KV-cache setting, which FlashInfer rejects without a KV cache.
+    assert vision.quant_config.kv_cache_quant_algo == (None if override else QuantAlgo.FP8)
+    assert config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+@pytest.mark.cpu_only
+def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
+    public_backends = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
+    for model_cls in (Qwen2_5_VLModel, Qwen3VLModel, Qwen3MoeVLModel):
+        assert model_cls.supported_encoder_attention_backends == {"vision": public_backends}
+    assert Qwen2VLModel.supported_encoder_attention_backends == {"vision": frozenset()}
+    with pytest.raises(ValueError, match="vision.*cannot be changed"):
+        _validate_encoder_attention_backend_support(
+            Qwen2VLModel,
+            MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+        )

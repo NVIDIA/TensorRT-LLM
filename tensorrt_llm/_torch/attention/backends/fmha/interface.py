@@ -15,12 +15,14 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, Optional, final
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -35,6 +37,19 @@ class FmhaPhase(str, Enum):
 
     CONTEXT = "context"
     GENERATION = "generation"
+
+
+@dataclass(frozen=True)
+class FmhaPrewarmConfig:
+    """Resolved static inputs for optional FMHA module initialization."""
+
+    dtype: torch.dtype
+    kv_cache_dtype: DataType
+    tokens_per_block: int
+    extra_tokens_per_block: frozenset[int] = frozenset()
+    context: bool = True
+    generation: bool = True
+    helix: bool = False
 
 
 class Fmha(ABC):
@@ -60,6 +75,14 @@ class Fmha(ABC):
         if attn is None:
             raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
         return attn
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Whether this layer can use the optional module built by ``prewarm``."""
+        return False
+
+    @staticmethod
+    def prewarm() -> None:
+        """Initialize a library-wide JIT module; libraries without one do nothing."""
 
     @classmethod
     @final

@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "kubernetes": {
+    "context": "example-context",
+    "namespace": "inference",
+    "kubectl": "kubectl"
+  },
+  "grafana": {
+    "url": "http://127.0.0.1:3000",
+    "namespace": "monitoring",
+    "api_namespace": "default",
+    "auth": {
+      "token_env": "GRAFANA_TOKEN"
+    },
+    "publication": "api",
+    "configmap": "inference-dashboards",
+    "dashboard_keys": {
+      "metrics": "metrics.json",
+      "logs": "logs.json"
+    },
+    "sidecar_labels": {
+      "grafana_dashboard": "1"
+    },
+    "api_version": "v2"
+  },
+  "dashboard": {
+    "title": "Inference",
+    "metrics_uid": "inference-metrics",
+    "logs_uid": "inference-logs",
+    "refresh": "1m",
+    "counter_lookback": "1m",
+    "include_logs": false,
+    "unique_sessions": {
+      "enabled": false,
+      "default_window": "30m",
+      "windows": [
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "60m"
+      ]
+    }
+  },
+  "datasources": {
+    "prometheus": "prometheus",
+    "loki": "loki"
+  },
+  "workload": {
+    "prefill_pod_regex": "inference-prefill-.*",
+    "decode_pod_regex": "inference-decode-.*",
+    "frontend_pod_regex": "inference-frontend-.*",
+    "all_pod_regex": "inference-.*",
+    "metric_job_regex": "inference-.*-metrics",
+    "metric_role_label": "workload_role",
+    "decode_metric_role_value": "decode",
+    "engine_endpoint": "engine",
+    "engine_container": "engine",
+    "frontend_container": "frontend",
+    "log_job": "inference",
+    "log_role_label": "role",
+    "prefill_log_role_value": "prefill",
+    "decode_log_role_value": "decode",
+    "log_containers": [
+      "engine",
+      "frontend"
+    ],
+    "trace_pvc": null
+  },
+  "scrape": {
+    "enabled": false,
+    "monitor_namespace": "monitoring",
+    "service_monitor_labels": {
+      "release": "prometheus"
+    },
+    "interval": "15s",
+    "timeout": "10s",
+    "roles": [
+      {
+        "name": "prefill",
+        "selector": {
+          "app": "inference",
+          "component": "prefill"
+        },
+        "metric_role_value": "prefill",
+        "endpoints": [
+          {
+            "name": "engine",
+            "port": 8001,
+            "path": "/prometheus/metrics"
+          }
+        ]
+      },
+      {
+        "name": "decode",
+        "selector": {
+          "app": "inference",
+          "component": "decode"
+        },
+        "metric_role_value": "decode",
+        "endpoints": [
+          {
+            "name": "engine",
+            "port": 8001,
+            "path": "/prometheus/metrics"
+          }
+        ]
+      },
+      {
+        "name": "frontend",
+        "selector": {
+          "app": "inference",
+          "component": "frontend"
+        },
+        "metric_role_value": "frontend",
+        "endpoints": [
+          {
+            "name": "frontend",
+            "port": 8000,
+            "path": "/metrics"
+          }
+        ]
+      }
+    ]
+  }
+}

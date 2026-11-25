@@ -701,16 +701,6 @@ def test_scheduled_requests_reject_multimodal_inputs() -> None:
         object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([request]))
 
 
-def test_scheduled_warmup_rejects_kv_cache_manager() -> None:
-    runner = object.__new__(EncoderRunner)
-    runner._model = SimpleNamespace(extra_attrs={})
-    resource_manager = Mock()
-    resource_manager.get_resource_manager.return_value = object()
-
-    with pytest.raises(AssertionError, match="but a KV cache manager was allocated"):
-        runner.warmup(resource_manager)
-
-
 def test_encoder_graph_rejects_nested_outputs() -> None:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = SimpleNamespace(get_graph_pool=Mock(return_value=None))

@@ -383,6 +383,17 @@ class MistralConfigLoader(BaseConfigLoader):
             )
 
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
+        if kwargs.get("moe_tactic") is not None:
+            # As from_pretrained does: build the model for the family the tactic implies.
+            # The literal model code is built for, derived from the tactic as
+            # ModelConfig.from_pretrained derives it (see MoEImplRequest.backend_for).
+            architectures = pretrained_config.architectures
+            kwargs["moe_backend"] = ModelConfig.pinned_moe_backend(
+                kwargs["moe_tactic"],
+                quant_config,
+                layer_quant_config,
+                architecture=architectures[0] if architectures else "",
+            )
         model_config = ModelConfig(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -395,10 +406,11 @@ class MistralConfigLoader(BaseConfigLoader):
         # Native (mistral-format) checkpoints are served through the
         # mistral-common tokenizer/processor, which applies its own chat
         # template. Tag the config with a dedicated serving model_type so the
-        # serving layer resolves the PASSTHROUGH placeholder/chat-template
-        # metadata (registered under "mistral_common" in modeling_mistral.py)
-        # via the normal config path - i.e. resolve_top_level_model_type() -
-        # instead of having to inspect the live input processor.
+        # serving layer resolves the mistral-common renderer and the
+        # placeholder metadata (registered under "mistral_common" in
+        # modeling_mistral.py) via the normal config path - i.e.
+        # resolve_top_level_model_type() - instead of having to inspect the
+        # live input processor.
         model_config.pretrained_config.input_processor_type = "mistral_common"
         model_config.pretrained_config.model_type = "mistral_common"
         model_config._frozen = True

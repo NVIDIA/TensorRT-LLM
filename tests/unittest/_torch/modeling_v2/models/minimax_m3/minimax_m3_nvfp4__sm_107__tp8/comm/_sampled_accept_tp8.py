@@ -29,7 +29,7 @@ if any(capability != (10, 7) for capability in _capabilities):
         raise RuntimeError(f"expected SM 10.7 on every rank, got {_capabilities}")
     pytest.skip("the TP8 exchange requires SM 10.7 on every rank", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E402,E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E402,E501
     m3_sampled_accept as sa,
 )
 
