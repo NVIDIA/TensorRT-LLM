@@ -126,10 +126,7 @@ class _ImageInputProcessor(BaseMultimodalInputProcessor):
         raise NotImplementedError
 
     def get_preferred_media_io_kwargs(self):
-        return {
-            "image": {"format": "np"},
-            "video": {"format": "np", "num_frames": 4},
-        }
+        return {"video": {"num_frames": 4}}
 
 
 class _AudioInputProcessor:
@@ -1294,14 +1291,25 @@ async def test_token_ids_are_rejected_when_the_processor_does_not_consume_them()
         await request_mapping._input_from_request(request, llm)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_defaults", [None, {"format": "np"}])
-async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(
-    image_llm, monkeypatch, model_defaults
-):
+@pytest.mark.parametrize("source", ["request", "model"])
+def test_media_io_rejects_representation_overrides(image_llm, monkeypatch, source):
     llm, _ = image_llm
-    if model_defaults is None:
-        monkeypatch.delattr(_ImageInputProcessor, "get_preferred_media_io_kwargs")
+    options = {"audio": {"device": "cpu"}}
+    request = generation_pb2.GenerateRequest(prompt="hello")
+    with pytest.raises(ValueError, match=r"media_io_kwargs\.audio\.device"):
+        if source == "request":
+            request.extra.update({"media_io_kwargs": options})
+            request_mapping._prepare_input_from_request(request, llm)
+        else:
+            monkeypatch.setattr(
+                llm.input_processor, "get_preferred_media_io_kwargs", lambda: options
+            )
+            request_mapping._media_io_for_model(llm, "image", media_io.ImageMediaIO)
+
+
+@pytest.mark.asyncio
+async def test_image_sources_preserve_order_and_uuid(image_llm, monkeypatch):
+    llm, _ = image_llm
     created_with = []
 
     class _ImageIo:
@@ -1344,7 +1352,7 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(
 
     mapped = await request_mapping._input_from_request(request, llm)
 
-    assert created_with == [(model_defaults, None)]
+    assert created_with == [(None, None)]
     assert mapped["prompt"] == request.prompt
     assert mapped["multi_modal_data"] == {
         "image": [
@@ -1430,10 +1438,10 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
     assert len(created_with) == 3
     video_modality, video_defaults, video_runtime = created_with[0]
     assert video_modality == "video"
-    assert video_defaults == {"format": "np", "num_frames": 4}
+    assert video_defaults == {"num_frames": 4}
     assert set(video_runtime) == {"decoded_memory_reserver"}
     assert callable(video_runtime["decoded_memory_reserver"])
-    assert created_with[1] == ("image", {"format": "np"}, None)
+    assert created_with[1] == ("image", None, None)
     audio_modality, audio_defaults, audio_runtime = created_with[2]
     assert audio_modality == "audio"
     assert audio_defaults is None

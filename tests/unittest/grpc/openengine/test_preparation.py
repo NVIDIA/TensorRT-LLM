@@ -326,7 +326,7 @@ def test_prepared_decode_rejects_different_processor_settings(monkeypatch, field
         monkeypatch.setattr(
             llm.input_processor,
             "get_preferred_media_io_kwargs",
-            lambda: {"image": {"format": "np"}},
+            lambda: {"video": {"num_frames": 5}},
         )
     else:
         llm.input_processor._processor = SimpleNamespace(

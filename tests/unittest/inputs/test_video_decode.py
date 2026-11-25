@@ -24,7 +24,12 @@ from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
 from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
-from tensorrt_llm.inputs.utils import async_load_video, load_base64_video, load_video  # noqa: E402
+from tensorrt_llm.inputs.utils import (  # noqa: E402
+    async_load_video,
+    default_multimodal_input_loader,
+    load_base64_video,
+    load_video,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,6 +52,25 @@ def test_np_format_returns_stacked_uint8_ndarray(sample_video_path: str) -> None
     assert video.frames.shape == (10, 64, 64, 3)
     assert video.frames.dtype == np.uint8
     assert video.frames.flags["C_CONTIGUOUS"]
+
+
+def test_offline_video_default_and_explicit_tensor(sample_video_path: str) -> None:
+    kwargs = dict(
+        tokenizer=None,
+        model_dir="",
+        model_type="llava_llama",
+        modality="video",
+        prompts=["Describe the video."],
+        media=[sample_video_path],
+        num_frames=2,
+    )
+    default = default_multimodal_input_loader(**kwargs)[0]["multi_modal_data"]["video"][0]
+    explicit = default_multimodal_input_loader(**kwargs, image_data_format="pt")[0][
+        "multi_modal_data"
+    ]["video"][0]
+    assert isinstance(default.frames, np.ndarray) and default.frames.shape == (2, 64, 64, 3)
+    assert default.frames.dtype == np.uint8
+    assert isinstance(explicit.frames[0], torch.Tensor) and explicit.frames[0].shape == (3, 64, 64)
 
 
 def test_pt_format_returns_list_of_chw_tensors(sample_video_path: str) -> None:
@@ -225,6 +249,12 @@ def test_offline_loaders_match_serve_video_hash(
     offline = load_video(source, num_frames=10)
     offline_async = asyncio.run(async_load_video(source, num_frames=10))
 
+    for video in (serve, offline, offline_async):
+        assert isinstance(video.frames, np.ndarray)
+        assert video.frames.dtype == np.uint8
+        assert video.frames.shape == (10, 64, 64, 3)
+        np.testing.assert_array_equal(video.frames, serve.frames)
+        assert video.metadata == serve.metadata
     assert serve.raw_bytes_hash == default_hasher(encoded).hexdigest()
     assert offline.raw_bytes_hash == serve.raw_bytes_hash
     assert offline_async.raw_bytes_hash == serve.raw_bytes_hash
