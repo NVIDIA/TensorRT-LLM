@@ -132,6 +132,100 @@ def test_dispatch(monkeypatch):
     assert got[0] is mid_out and all(g is dense_out for g in got[1:])
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value, rowslo", [(None, None), ("0", None), ("5", 5), ("16", 16)])
+def test_rowslo_value(monkeypatch, value, rowslo):
+    if value is None:
+        monkeypatch.delenv(M.DP_OUT_PROJ_BF16_ROWSLO_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_OUT_PROJ_BF16_ROWSLO_ENV, value)
+    assert M._out_proj_rowslo() == rowslo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value", ["17", "on", "-1"])
+def test_rowslo_rejects_another_value(monkeypatch, value):
+    monkeypatch.setenv(M.DP_OUT_PROJ_BF16_ROWSLO_ENV, value)
+    with pytest.raises(ValueError, match=M.DP_OUT_PROJ_BF16_ROWSLO_ENV):
+        M._out_proj_rowslo()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "value, attn_rows", [("1", [48, 80, 96]), ("all", [8, 12, 16, 28, 48, 80, 96, 144])]
+)
+def test_build_with_rowslo(monkeypatch, value, attn_rows):
+    """`DP_OUT_PROJ_BF16_ROWSLO_ENV=5`: graph rows 8 / 12 / 16 take the first entry too (the GDN
+    site always, the attention site under `all`); 4 rows stay on the entry."""
+    monkeypatch.setenv(M.DP_OUT_PROJ_BF16_ROWSLO_ENV, "5")
+    core = _core(
+        model_config=SimpleNamespace(cuda_graph_batch_sizes=[1, 2, 3, 4, 7, 12, 20, 24, 36])
+    )
+    table, _ = _build(monkeypatch, value, core)
+    first = (M._OUT_PROJ_TABLE[0][2], M._OUT_PROJ_TABLE[0][3])
+    assert sorted(table["gdn_out"]) == [8, 12, 16, 28, 48, 80, 96, 144]
+    assert all(table["gdn_out"][r] == first for r in (8, 12, 16, 28))
+    assert sorted(table["attn_o"]) == attn_rows
+
+
+def _draft_core(**over):
+    core = _core(
+        mtp_enabled=True,
+        mtp_layer_idx=3,
+        _out_proj={"gdn_out": {}, "attn_o": {}},
+        model_config=SimpleNamespace(cuda_graph_batch_sizes=[1, 2, 3, 8, 32, 40]),
+    )
+    core.w["l3_mtp_o_w"] = torch.zeros(2560, 6144, dtype=torch.bfloat16)
+    for k, v in over.items():
+        setattr(core, k, v)
+    return core
+
+
+@pytest.mark.cpu_only
+def test_draft_o_build(monkeypatch):
+    monkeypatch.setenv(M.DP_DRAFT_O_MID_ENV, "1")
+    compiled = []
+    monkeypatch.setattr(M, "mid_mm_raw", lambda x, w, plan, mpad=None, **k: compiled.append(mpad))
+    rows = M._draft_o_build(_draft_core(), torch.device("cpu"))
+    first = (M._OUT_PROJ_TABLE[0][2], M._OUT_PROJ_TABLE[0][3])
+    assert rows == {b: first for b in (1, 2, 3, 8, 32)} and compiled == [first[0]]
+    monkeypatch.delenv(M.DP_DRAFT_O_MID_ENV)
+    assert M._draft_o_build(_draft_core(), torch.device("cpu")) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"_out_proj": None},  # the output projections are not engaged
+        {"mtp_enabled": False},
+        {"model_config": SimpleNamespace(cuda_graph_batch_sizes=[40, 48])},
+    ],
+    ids=["no-out-proj", "no-draft", "no-rows"],
+)
+def test_draft_o_build_declines(monkeypatch, over):
+    monkeypatch.setenv(M.DP_DRAFT_O_MID_ENV, "1")
+    warned = []
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    assert M._draft_o_build(_draft_core(**over), torch.device("cpu")) is None
+    assert len(warned) == 1 and M.DP_DRAFT_O_MID_ENV in warned[0]
+
+
+@pytest.mark.cpu_only
+def test_draft_o_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        M, "mid_mm_raw", lambda x, w, plan, pdl=True, mpad=None: calls.append(("mid", mpad))
+    )
+    monkeypatch.setattr(M, "cublas_mm", lambda a, b: calls.append(("cublas", a.shape[0])))
+    weight_t = torch.zeros(2560, 6144, dtype=torch.bfloat16).t()
+    core = SimpleNamespace(_draft_o={3: (32, M.MidPlan(12, 2, 8, 2))})
+    M._draft_o(core, torch.zeros(3, 6144), weight_t)
+    M._draft_o(core, torch.zeros(4, 6144), weight_t)
+    M._draft_o(SimpleNamespace(_draft_o=None), torch.zeros(3, 6144), weight_t)
+    assert calls == [("mid", 32), ("cublas", 4), ("cublas", 3)]
+
+
 _GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
     reason="the tcgen05 mid-rows GEMM serves SM10x",
@@ -162,3 +256,26 @@ def test_table_plans_on_the_gemm(lo, hi, mpad, plan):
         ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 7)
         excess = ((got.double() - ref).abs() - 0.5 * ulp).clamp_min(0) / absref.clamp_min(1e-30)
         assert excess.max().item() < 1e-5, f"{rows} rows: {excess.max().item():.2e}"
+
+
+@_GPU
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 12, 16])
+def test_first_entry_below_its_rows(rows):
+    """`DP_OUT_PROJ_BF16_ROWSLO_ENV` and `DP_DRAFT_O_MID_ENV` run the table's first entry below
+    its first row count: bitwise the op's own MMA N there, and within one bf16 rounding of the
+    fp64 product."""
+    dev = "cuda"
+    _, _, mpad, plan = M._OUT_PROJ_TABLE[0]
+    gen = torch.Generator(device=dev).manual_seed(4300 + rows)
+    n, k = M._OUT_PROJ_GEOM
+    w = (torch.randn(n, k, generator=gen, device=dev) * k**-0.5).to(torch.bfloat16)
+    x = torch.randn(rows, k, generator=gen, device=dev).to(torch.bfloat16)
+    got = M.mid_mm_raw(x, w, plan, pdl=True, mpad=mpad)
+    own = M.mid_mm_raw(x, w, plan, pdl=True)
+    torch.cuda.synchronize()
+    assert torch.equal(got, own)
+    ref = x.double() @ w.double().t()
+    absref = x.double().abs() @ w.double().abs().t()
+    ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 7)
+    excess = ((got.double() - ref).abs() - 0.5 * ulp).clamp_min(0) / absref.clamp_min(1e-30)
+    assert excess.max().item() < 1e-5

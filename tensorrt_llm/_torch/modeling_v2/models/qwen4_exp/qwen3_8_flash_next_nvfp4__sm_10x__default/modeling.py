@@ -1963,6 +1963,28 @@ _OUT_PROJ_GEOM = (2560, 6144)
 _OUT_PROJ_ATTN_ROWS = (29, 96)  # capacity: fixed: dispatch thresholds
 
 
+#: Off by default (class S, as `DP_OUT_PROJ_BF16_ENV`). `<lo>` (1..16) with the output
+#: projections engaged: `lo`..16 rows a rank also take the table's first entry (MMA N 32, plan
+#: (12, 2, 8, 2)), at the GDN site and, under `all`, the attention site. Measured on dep8 with
+#: `lo` 5 at 3 requests a rank (8 / 12 rows), where it was part of a -0.33 ms step together with
+#: forms not ported here; it was never run at the other caps' lower batches, hence its own
+#: switch. Read once, when the target is built.
+DP_OUT_PROJ_BF16_ROWSLO_ENV = "TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16_ROWSLO"
+
+
+def _out_proj_rowslo() -> int | None:
+    """`DP_OUT_PROJ_BF16_ROWSLO_ENV`: the lowest row count, or None (unset, empty, off)."""
+    raw = os.environ.get(DP_OUT_PROJ_BF16_ROWSLO_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return None
+    if value.isdigit() and 1 <= int(value) < _OUT_PROJ_TABLE[0][0]:
+        return int(value)
+    raise ValueError(
+        f"{DP_OUT_PROJ_BF16_ROWSLO_ENV}={raw!r}: expected 0 or 1..{_OUT_PROJ_TABLE[0][0] - 1}"
+    )
+
+
 def _out_proj_mode() -> str:
     """`DP_OUT_PROJ_BF16_ENV`: "" (unset, empty, an off spelling), "1", "gdn" or "all"."""
     raw = os.environ.get(DP_OUT_PROJ_BF16_ENV, "")
@@ -1976,8 +1998,12 @@ def _out_proj_mode() -> str:
     raise ValueError(f"{DP_OUT_PROJ_BF16_ENV}={raw!r}: expected 0, 1, gdn or all")
 
 
-def _out_proj_shape(rows: int) -> tuple | None:
-    """`(MMA N, plan)` of `_OUT_PROJ_TABLE` at `rows`, None outside it."""
+def _out_proj_shape(rows: int, rowslo: int | None = None) -> tuple | None:
+    """`(MMA N, plan)` of `_OUT_PROJ_TABLE` at `rows`, None outside it; with `rowslo`
+    (`DP_OUT_PROJ_BF16_ROWSLO_ENV`) the first entry also from `rowslo` rows."""
+    first = _OUT_PROJ_TABLE[0]
+    if rowslo is not None and rowslo <= rows < first[0]:
+        return first[2], first[3]
     for lo, hi, mpad, plan in _OUT_PROJ_TABLE:
         if lo <= rows <= hi:
             return mpad, plan
@@ -2010,9 +2036,11 @@ def _out_proj_build(core, device) -> dict | None:
             f"weights without another decode copy ({len(bad)} are not)"
         )
         return None
+    rowslo = _out_proj_rowslo()
     gdn = {}
-    for rows in _graph_rows(core, _OUT_PROJ_TABLE[0][0], _OUT_PROJ_TABLE[-1][1]):
-        shape = _out_proj_shape(rows)
+    first = _OUT_PROJ_TABLE[0][0] if rowslo is None else rowslo
+    for rows in _graph_rows(core, first, _OUT_PROJ_TABLE[-1][1]):
+        shape = _out_proj_shape(rows, rowslo)
         if shape is not None:
             gdn[rows] = shape
     lo, hi = _OUT_PROJ_ATTN_ROWS
@@ -2032,6 +2060,62 @@ def _out_proj_build(core, device) -> dict | None:
         f"{core.dp_rank} of {core.dp_size}, GDN rows {sorted(gdn)}, attention rows {sorted(attn)}"
     )
     return {"gdn_out": gdn, "attn_o": attn}
+
+
+#: Off by default (class S, as `DP_OUT_PROJ_BF16_ENV`, which it needs engaged). The draft
+#: layer's attention output projection (`_mtp_tail`, one row a request) runs the output
+#: projections' bf16 mid-rows GEMM at the table's first entry (MMA N 32, plan (12, 2, 8, 2))
+#: at the CUDA-graph batch sizes up to 32 rows, instead of cuBLAS. dep8 at 3 requests a rank:
+#: -0.019 ms a step. Read once, when the target is built.
+DP_DRAFT_O_MID_ENV = "TRTLLM_QWEN4_EXP_DP_DRAFT_O_MID"
+
+
+def _draft_o_build(core, device) -> dict | None:
+    """`DP_DRAFT_O_MID_ENV`, read once at build after `_out_proj_build`: `{rows: (MMA N, plan)}`
+    of the draft output projection, its GEMM compiled here; None where it is off. Set where it
+    cannot apply: one warning, None."""
+    if not _switch(DP_DRAFT_O_MID_ENV):
+        return None
+    name = f"l{getattr(core, 'mtp_layer_idx', -1)}_mtp_o_w"
+    w = core.w[name] if getattr(core, "mtp_enabled", False) and name in core.w else None
+    why = None
+    if core._out_proj is None:
+        why = f"it rides on {DP_OUT_PROJ_BF16_ENV}, which is not engaged"
+    elif w is None:
+        why = "there is no draft layer"
+    elif (
+        w.dtype != torch.bfloat16
+        or tuple(w.shape) != _OUT_PROJ_GEOM
+        or not w.is_contiguous()
+        or w.data_ptr() % 16
+    ):
+        why = f"{name} is {tuple(w.shape)} {w.dtype}, not a contiguous bf16 {_OUT_PROJ_GEOM}"
+    _, _, mpad, plan = _OUT_PROJ_TABLE[0]
+    sizes = sorted(
+        {int(b) for b in (getattr(core.model_config, "cuda_graph_batch_sizes", None) or ())}
+    )
+    rows = {b: (mpad, plan) for b in sizes if 1 <= b <= mpad}
+    if why is None and not rows:
+        why = f"no CUDA-graph batch size is in 1..{mpad}"
+    if why is not None:
+        logger.warning(f"{DP_DRAFT_O_MID_ENV} is set but ignored: {why}")
+        return None
+    mid_mm_raw(torch.zeros(1, w.shape[1], dtype=w.dtype, device=device), w, plan, mpad=mpad)
+    logger.info(
+        f"draft output projection on the bf16 mid-rows GEMM ({DP_DRAFT_O_MID_ENV}=1): rank "
+        f"{core.dp_rank} of {core.dp_size}, rows {sorted(rows)}"
+    )
+    return rows
+
+
+def _draft_o(core, attn, weight_t):
+    """The draft layer's attention output projection: `DP_DRAFT_O_MID_ENV`'s GEMM at a row count
+    it serves (`attn` contiguous and 16-byte aligned), else cuBLAS."""
+    table = getattr(core, "_draft_o", None)
+    ent = None if table is None else table.get(attn.shape[0])
+    if ent is None or not attn.is_contiguous() or attn.data_ptr() % 16:
+        return cublas_mm(attn, weight_t)
+    return mid_mm_raw(attn, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
 
 
 def _out_proj(core, x, weight_t, site: str, dense):
@@ -2749,6 +2833,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._out_proj = None
         # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
         self._draft_moe_tactics = None
+        # `DP_DRAFT_O_MID_ENV` (opt-in): the draft output projection's rows, built after load.
+        self._draft_o = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
         # The trunk verify step's bitmap-union sparse GQA floor, 0 = off (`DP_GQA_BITMAP_ENV`).
@@ -2980,6 +3066,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.hc_first_x2 = _hc_first_x2_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
             self._out_proj = _out_proj_build(self, device)
+            self._draft_o = _draft_o_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
         # Built after the decode target, whose layer views it checks; a collective-free build.
@@ -4550,7 +4637,7 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Ten
     logit) * shared` and its injection are one launch (`mtp_moe_combine_inject`, as the FP8
     target runs them), bitwise the two launches it replaces."""
     x, normed = qwen4_exp_hc_inject_norm(
-        x, core.tp_sum(cublas_mm(attn, M.o)), inject, M.mhc_norm, core.eps, core.hc_count
+        x, core.tp_sum(_draft_o(core, attn, M.o)), inject, M.mhc_norm, core.eps, core.hc_count
     )
     mixed, inject = _hc_mixer(core, normed, M.mhc_first, M.mhc_up, True)
     routed = _mtp_moe_block(core, M, mixed, pad_rows, routed_only=True)
