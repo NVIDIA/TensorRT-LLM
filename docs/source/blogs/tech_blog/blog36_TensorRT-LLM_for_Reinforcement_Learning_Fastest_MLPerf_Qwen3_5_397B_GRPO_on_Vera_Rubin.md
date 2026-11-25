@@ -53,9 +53,7 @@ On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine 
 </figure>
 </div>
 
-<p align="center"><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.<sup>1</sup></em></p>
-
-The other performance numbers in this post, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements. They are not MLPerf results and have not been verified by MLCommons.
+<p align="center"><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.<sup>1</sup></em></p>
 
 ## Inference in RL: A Different Optimization Problem
 
@@ -69,6 +67,8 @@ In RL, a rollout is one attempt by the model to solve a task in an environment, 
 </figure>
 </div>
 <p align="center"><em>Figure 3: One training step in the 56-GPU recipe. Training pulls trajectories from the replay buffer while rollout keeps generating in the background, and a weight refit connects the two at every step.</em></p>
+
+The other performance numbers in this post, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements. They are not MLPerf results and have not been verified by MLCommons.
 
 ### RL Rollout vs. Online Serving
 
