@@ -2960,6 +2960,29 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         return final, hc
 
 
+#: Verify rows an attention-DP rank gathers for its heads in one `embed_rows` launch (a copy:
+#: bitwise `nn.functional.embedding`): PyTorch's small-index gather runs 4-9 us a call at 4-16
+#: rows, and switches to its vectorized kernel itself from 32 rows.
+_VERIFY_ROWS_GATHER_MAX = 31  # capacity: fixed: a dispatch threshold
+
+
+def _head_rows(core, final: torch.Tensor, gather_ids: torch.Tensor) -> torch.Tensor:
+    """The rows of `final` the verify head reads (`gather_ids`): under attention DP up to
+    `_VERIFY_ROWS_GATHER_MAX` of them on `embed_rows`, else `nn.functional.embedding`."""
+    if (
+        gather_ids.dim() == 1
+        and gather_ids.shape[0] <= _VERIFY_ROWS_GATHER_MAX
+        and gather_ids.is_contiguous()
+        and gather_ids.dtype in (torch.int32, torch.int64)
+        and final.dim() == 2
+        and final.stride(1) == 1
+        and final.is_cuda
+        and core.dp_size > 1
+    ):
+        return embed_rows(gather_ids, final, 1, False)
+    return nn.functional.embedding(gather_ids, final)
+
+
 # --------------------------------------------------------------- weight views ---
 
 
@@ -9598,7 +9621,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 self.spec_worker, spec_metadata
             )
             logits = self.logits_processor.forward(
-                nn.functional.embedding(spec_metadata.gather_ids, final),
+                _head_rows(self.model, final, spec_metadata.gather_ids),
                 self.lm_head,
                 attn_metadata,
                 True,
@@ -9608,7 +9631,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # This rank's vocabulary shard for a greedy or temperature-only batch (the worker
             # marks `spec_metadata.sharded_target_logits`), else the gathered fp32 logits.
             logits = self.spec_worker.target_logits(
-                nn.functional.embedding(spec_metadata.gather_ids, final),
+                _head_rows(self.model, final, spec_metadata.gather_ids),
                 self.lm_head,
                 self.logits_processor,
                 attn_metadata,
@@ -9617,7 +9640,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             )
         else:
             logits = self.logits_processor.forward(
-                nn.functional.embedding(spec_metadata.gather_ids, final),
+                _head_rows(self.model, final, spec_metadata.gather_ids),
                 self.lm_head,
                 attn_metadata,
                 True,
