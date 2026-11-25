@@ -326,6 +326,30 @@ def test_pinned_tactic_is_bitwise_the_autotuner_call(tokens):
         assert torch.equal(pinned, cold), f"tactic {tactic} at {tokens} rows changed the result"
 
 
+@pytest.mark.parametrize("tokens", [24, 96, 112, 192])
+def test_logits_routed_is_bitwise_renorm_then_prerouted(tokens):
+    """The runner's own Renormalize routing from the bf16 router logits is bitwise
+    `renorm_moe_routing_op` + the pre-routed entry over a dep8 window, at the AutoTuner's tactic
+    and at the pinned [16, 8] (the NVFP4 target's draft MoE under `DP_DRAFTPACK_ENV`'s `route`:
+    dep8 draft passes gather 24..224 rows)."""
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+        renorm_moe_routing_op,
+    )
+
+    a = _args(tokens, **CKPT, local_expert_offset=192, local_num_experts=64, seed=11)
+    g = torch.Generator(device=DEV).manual_seed(tokens)
+    logits = torch.randn(tokens, 512, device=DEV, generator=g).to(torch.bfloat16)
+    ids, weights = renorm_moe_routing_op(logits, topk=10, output_dtype=torch.bfloat16)
+    pre = dict(a, topk_ids=ids.contiguous(), topk_weights=weights.contiguous())
+    own = dict(a, routing_logits=logits, topk_ids=None, topk_weights=None)
+    for tactic in [None] + ([(16, 8)] if 96 <= tokens <= 192 else []):
+        pinned = {} if tactic is None else dict(tactic=tactic)
+        want = op(**pre, **pinned)
+        with validating(op):
+            got = op(**own, **pinned)
+        assert torch.equal(got, want), f"{tokens} rows, tactic {tactic}: the routing differs"
+
+
 # ── the guards ────────────────────────────────────────────────────────────
 
 

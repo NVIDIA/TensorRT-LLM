@@ -451,8 +451,10 @@ _DEP8 = dict(
 # the host-indexed Lamport round trip; SM103 only). Then the whole attention-DP stack the AgentX
 # front points run, every opt-in form together on top of the default ones (host-indexed Lamport
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
-# widest on the bitmap-union verify kernel, the e4m3 index anchors, and the dep follow-ups'
-# forms above; SM103 only), at dep4 and at dep8 (two nodes of one rack; there with the
+# widest on the bitmap-union verify kernel, the e4m3 index anchors, the dep follow-ups' forms
+# above, and the draft runner's own routing (`TRTLLM_QWEN4_EXP_DP_DRAFTPACK=all`; the fused
+# reduce-scatter with the finalize folded in and the draft combine are on by default over the
+# Lamport transport); SM103 only), at dep4 and at dep8 (two nodes of one rack; there with the
 # heads' group over the NVLink domain, the low-row floors at 2 requests a rank, and the dep8
 # front's decode fusions:
 # the MoE-side site folded into the output projection at every row count with the 6-way plan at
@@ -467,6 +469,7 @@ _DP_FRONT_STACK = dict(
     dp_bitmap=True,
     dp_opt_in=True,
     index_key_fp8=True,
+    draftpack="all",
     topk_cowrite=True,
 )
 _DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True, dp_fuse=True)
@@ -1051,6 +1054,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("topk_cowrite"):
             # the generation cluster top-k's coalesced write (opt-in, the same selection)
             env["TRTLLM_QWEN4_EXP_DP_TOPK_NARROW"] = "1"
+        if variant.get("draftpack"):
+            env["TRTLLM_QWEN4_EXP_DP_DRAFTPACK"] = variant["draftpack"]
         if variant.get("tep_opt_in"):
             for name in (
                 "DRAFT_LAYER",

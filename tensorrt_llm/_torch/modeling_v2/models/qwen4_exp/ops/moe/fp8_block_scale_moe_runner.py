@@ -336,8 +336,9 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     AutoTuner (a tuned entry or the cold fallback, the widest valid tile). Every tactic
     computes the same sums in the same order: bitwise the AutoTuner's call (GB300: all 26
     valid tactics at 8..192 rows of a 64-expert window, and the pinned [16, 8] at 64..256
-    rows in both the pre-routed and the logits-routed forms). Pre-routed calls only; the
-    AutoTuner is never consulted, so the tactic needs no profiling cache.
+    rows in both the pre-routed and the logits-routed forms). Either form (the NVFP4 target's
+    dep8 draft enters the logits-routed one under `DP_DRAFTPACK_ENV`'s `route`); the AutoTuner is
+    never consulted, so the tactic needs no profiling cache.
 
     Not certified (measured, but not re-driven by the test): a window past the
     routing space's end, repeated or
@@ -573,10 +574,10 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
             "(512 for a 128-expert window of 512), not the window's count"
         )
         # A pinned tactic the runner does not list for this token count reads past its
-        # workspaces; only the pre-routed path was measured pinned.
+        # workspaces; both routing forms were measured pinned.
         if tactic is not None:
-            assert topk_ids is not None and routing_logits is None, (
-                "tactic= enters the pre-routed path only"
+            assert (topk_ids is None) != (routing_logits is None), (
+                "tactic= enters with the router logits or the pre-routed ids, one of them"
             )
             listed = valid_tactics(
                 top_k,

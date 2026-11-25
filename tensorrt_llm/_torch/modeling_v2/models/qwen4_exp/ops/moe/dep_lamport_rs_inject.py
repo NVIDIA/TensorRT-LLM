@@ -64,8 +64,10 @@ Slots, by the workspace's protocol (`DepRoundTrip.steps`):
   vectors and record 0. Every receive issues its first probe of every peer before it waits on any.
 
 Collective: every rank of the group launches a reduce-scatter (this one, its `fin` form or the
-plain one) at the same point with the same row count; every CTA of the launch must be resident at
-once on every rank (`streams_per_cta` keeps the grid under its layout's CTA limit).
+plain one) at the same point with the same row count. The plain launch publishes from its `c == 0`
+CTAs, which come first in launch order, so a grid past its resident wave (`streams_per_cta`'s
+second layout) still progresses; every CTA of a `fin` row publishes, so a `fin` launch is served
+only where its whole grid is resident at once (`fin_resident`).
 """
 
 from __future__ import annotations
@@ -684,6 +686,20 @@ def streams_per_cta(rows: int, hc_count: int, layouts) -> int:
     return hc_count
 
 
+#: CTAs of a `fin` launch one SM holds: 320 threads at up to 96 registers (79 / 91 / 96 at 1 / 2 /
+#: 4 streams a CTA, sm_103a, CuTe DSL 4.8.0), two of them in the 64K register file.
+FIN_CTAS_PER_SM = 2
+
+
+def fin_resident(rows: int, hc_count: int, layouts, sm_count: int) -> bool:
+    """Whether the `fin` launch at `rows` rows is one resident wave on `sm_count` SMs. Every CTA of
+    a `fin` row publishes to some peers (peer ordinal `j` goes to CTA `(j - 1) % (C / SPP)`), so a
+    CTA that is not resident holds up its row on every peer; the plain launch publishes from the
+    `c == 0` CTAs only, which the hardware dispatches first. Host arithmetic on the row count."""
+    spp = streams_per_cta(rows, hc_count, layouts)
+    return rows * (hc_count // spp) <= FIN_CTAS_PER_SM * sm_count
+
+
 def parse_layouts(raw: str) -> tuple:
     """`"1:304,2:608"` -> `((1, 304), (2, 608))`; ValueError on another spelling."""
     try:
@@ -904,6 +920,9 @@ class DepLamportRsInject(OpWrapper):
             (8, 12, True, False, "dep8 3 requests a rank, 4 CTAs a row"),
             (8, 72, True, False, "dep8 18 requests a rank: 4 CTAs a row only under dep8's layouts"),
             (8, 112, True, False, "dep8 28 requests a rank, 2 streams a CTA"),
+            (4, 12, True, True, "dep4 3 requests a rank, the finalize folded in (a tray runs it)"),
+            (4, 12, False, True, "dep4 3 requests a rank, finalize folded in, device counter"),
+            (4, 128, True, True, "dep4 32 requests a rank, finalize folded in, 2 streams a CTA"),
             (8, 12, True, True, "dep8 3 requests a rank, the runner's finalize folded in"),
             (8, 112, True, True, "dep8 28 requests a rank, finalize folded in, 2 streams a CTA"),
         )

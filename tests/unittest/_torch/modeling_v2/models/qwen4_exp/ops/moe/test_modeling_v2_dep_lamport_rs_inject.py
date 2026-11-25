@@ -222,6 +222,16 @@ def test_layouts_pick_a_resident_grid():
             spp = op.streams_per_cta(rows, HC, layouts)
             limit = dict(layouts).get(spp)
             assert limit is None or rows * (HC // spp) <= limit
+    # The finalize form needs its whole grid resident (2 CTAs an SM, GB300's 152 SMs): every
+    # front row count of dep8 (up to 112 rows a rank), and dep4 up to 152 (F1's 160..208 keep the
+    # runner's finalize).
+    for world, ok, past in ((8, (12, 72, 76, 112, 152), 153), (4, (12, 48, 128, 152), 160)):
+        layouts = op.LAYOUTS[world]
+        assert all(op.fin_resident(r, HC, layouts, 152) for r in ok)
+        assert not op.fin_resident(past, HC, layouts, 152)
+    for c in CELLS:
+        if c.spec["fin"]:
+            assert op.fin_resident(c.spec["rows"], HC, op.LAYOUTS[c.spec["world"]], 152), c.why
     assert op.parse_layouts("1:304,2:608") == ((1, 304), (2, 608))
     for bad in ("", "3:100", "1:x", "1"):
         with pytest.raises(ValueError):

@@ -460,6 +460,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inje
     qwen4_exp_post_inject,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
+    dep_lamport_rs_inject as _rs_inject_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
     moe_decode_front__decode as _decode_front,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
@@ -2950,6 +2953,385 @@ def _draft_moe_tactic(core, rows: int) -> tuple | None:
     return memo[rows]
 
 
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 whose MoE round trip is the Lamport
+#: transport (`DP_MOE_COMM_ENV`), a trunk MoE block of a captured generation-only step ends with ONE
+#: launch where it had two: the Lamport reduce-scatter also forms the block output (`routed +
+#: sigmoid(gate) * shared`), injects it into the hyper-connection streams and takes the next site's
+#: grouped norm (`ops/moe/dep_lamport_rs_inject`), so the next site launches no
+#: `qwen4_exp_hc_inject_norm` (site A of the next layer, or the stack-final site). Never the layer
+#: before the PLE layer (its pending block is added explicitly), an eager or a padded step, or a row
+#: count outside `_DP_RS_INJECT_ROWS`. The same bytes travel as with the plain reduce-scatter, and
+#: `hc_out` / `normed` are bitwise what the two launches write: the launch runs the reduce-scatter's
+#: and the inject-norm kernel's own instructions. The build compiles every layout, then checks every
+#: row count on every rank against the two launches (three reduce-scatters a row count, collective)
+#: and keeps the row counts that hold on every rank. GB300: -0.10..-0.14 ms a step at dep4 and dep8
+#: (the launch and its HBM round trip, 47 sites a step). `0` keeps the two launches. Read once,
+#: after load.
+DP_RS_INJECT_ENV = "TRTLLM_QWEN4_EXP_DP_RS_INJECT"
+#: With `DP_RS_INJECT_ENV`: the `(streams a CTA, CTA limit)` table the fused launch picks its grid
+#: from (`dep_lamport_rs_inject.streams_per_cta`), as `1:304,2:608`. Unset: the measured table of the
+#: group size (`dep_lamport_rs_inject.LAYOUTS`: dep8 keeps four CTAs a row up to 76 rows, dep4 up
+#: to 48). Any table reads the same bytes and computes the same bits. For A/Bs.
+DP_RS_INJECT_LAYOUTS_ENV = "TRTLLM_QWEN4_EXP_DP_RS_INJECT_LAYOUTS"
+#: Rows a rank the fused launch serves (4 rows a request under MTP-3): the micro's range.
+_DP_RS_INJECT_ROWS = (4, 256)  # capacity: fixed: dispatch thresholds
+#: Switch, on by default, with `DP_RS_INJECT_ENV`: where the decode route front serves the
+#: gathered rows (`DP_ROUTE_FRONT_ENV`), the trtllm-gen runner is entered without its finalize and
+#: the fused launch forms each partial itself from the permuted FC2 rows, the routing weights and
+#: the expanded -> permuted map, with the finalize's statements (slot-order fp32 fma from +0,
+#: skipping -1, one rounding): the finalize launch and the `[W * R, H]` store and reload go. Same
+#: bytes exchanged, bitwise (checked at build with the fused launch). Only at row counts whose
+#: finalize grid is one resident wave (`dep_lamport_rs_inject.fin_resident`: up to 152 rows a rank
+#: on GB300 at dep4 and dep8), since every CTA of its rows publishes. GB300 dep8: -0.103 ms a step
+#: at 12 requests a rank. `0` keeps the finalize. Read once, after load.
+DP_MOE_FIN_RS_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_FIN_RS"
+#: Switch, on by default (and only with PDL on, `TRTLLM_ENABLE_PDL`): the finalize form launches
+#: with programmatic dependent launch. Its `griddepcontrol.wait` is its first statement and every
+#: load of the runner's output is coherent, so nothing is read before the runner completes; the
+#: launch and its CTA ramp overlap the runner's tail. `0`: a plain launch.
+DP_MOE_FIN_RS_PDL_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_FIN_RS_PDL"
+#: The draft layer's MoE under attention DP, by parts, on a dep4 / dep8 rank's captured draft
+#: passes (with `DP_LAUNCH_ORDER_ENV`, the side-stream form of the draft MoE). A comma list of:
+#: - `combine`: the draft MoE's Lamport reduce-scatter is the fused launch of `DP_RS_INJECT_ENV`
+#:   over the draft residual with the draft head's grouped norm: it forms `routed + sigmoid(gate) *
+#:   shared`, injects it and normalizes, in place of the reduce-scatter and
+#:   `mtp_moe_combine_inject` (bitwise: the same combine and injection instructions). Needs
+#:   `DP_RS_INJECT_ENV` built; the pass's row count must be one the build checked.
+#: - `headnorm` (with `combine`): the draft head (`_mtp_head_final`) takes that norm instead of
+#:   launching `qwen4_exp_hc_inject_norm` again, when its rows are the combine's output tensor.
+#: - `route`: the FP8 draft runner routes from the router logits itself (its Renormalize routing)
+#:   instead of `renorm_moe_routing_op` + the pre-routed entry: one launch less. The runner's
+#:   in-kernel routing is not certified by the op (measured bitwise on dep4), so opt-in.
+#: Unset: `combine,headnorm`; `1` or `all`: every part; `0`: none. GB300 dep4 at 12 requests a rank:
+#: the three with the draft glue -0.17 ms a step. Read once, after load.
+DP_DRAFTPACK_ENV = "TRTLLM_QWEN4_EXP_DP_DRAFTPACK"
+_DP_DRAFTPACK_PARTS = ("combine", "headnorm", "route")
+_DP_DRAFTPACK_DEFAULT = frozenset({"combine", "headnorm"})
+
+
+class _RsInjected(NamedTuple):
+    """What a MoE block hands the next site under `DP_RS_INJECT_ENV` instead of its routed rows:
+    the residual with the block injected, and that site's grouped norm of it."""
+
+    hc: torch.Tensor
+    normed: torch.Tensor
+
+
+class _Unfinalized(NamedTuple):
+    """The runner's output without its finalize over the group's gathered rows
+    (`DP_MOE_FIN_RS_ENV`): permuted FC2 rows, routing weights, the expanded -> permuted map."""
+
+    g2: torch.Tensor
+    w: torch.Tensor
+    e2p: torch.Tensor
+
+
+class _DpRsInject:
+    """What `DP_RS_INJECT_ENV` built (`_dp_rs_inject_build`): the compiled launches (`rs`), the row
+    counts a rank its trunk blocks take them at (`rows`) and of those the finalize form's
+    (`fin_rows`), the draft passes' row counts (`draft_rows`), and the draft head's stash."""
+
+    def __init__(self, rs, rows: frozenset, fin_rows: frozenset, draft_rows: frozenset) -> None:
+        self.rs = rs
+        self.rows = rows
+        self.fin_rows = fin_rows
+        self.draft_rows = draft_rows
+        #: The draft combine's `_RsInjected` of the pass in flight (`headnorm`), host state.
+        self.stash: _RsInjected | None = None
+
+
+def _dp_draftpack_parts(core, rsi, device) -> frozenset:
+    """`DP_DRAFTPACK_ENV`, read once at build: the parts this rank's captured draft passes take."""
+    raw = os.environ.get(DP_DRAFTPACK_ENV, "").strip().lower()
+    if not raw:
+        parts, explicit = set(_DP_DRAFTPACK_DEFAULT), False
+    elif raw in _SWITCH_OFF:
+        return frozenset()
+    elif raw in _SWITCH_ON or raw == "all":
+        parts, explicit = set(_DP_DRAFTPACK_PARTS), True
+    else:
+        parts, explicit = {p.strip() for p in raw.split(",") if p.strip()}, True
+        if not parts <= set(_DP_DRAFTPACK_PARTS) or (
+            "headnorm" in parts and "combine" not in parts
+        ):
+            raise ValueError(
+                f"{DP_DRAFTPACK_ENV}={raw!r}: expected 0, 1, all or a comma list of "
+                f"{', '.join(_DP_DRAFTPACK_PARTS)} (headnorm only with combine)"
+            )
+    why = ""
+    if not (core.mtp_enabled and getattr(core, "dp_launch_order", False)):
+        why = f"it serves the draft MoE's side-stream form ({DP_LAUNCH_ORDER_ENV}) with MTP on"
+    elif getattr(core, "_mtp", None) is None or core._mtp.moe_gscale is not None:
+        why = "the draft experts are not the FP8 block-scale runner's"
+    if why:
+        if explicit:
+            logger.warning(f"{DP_DRAFTPACK_ENV}={raw} is set but ignored: {why}")
+        return frozenset()
+    if rsi is None and parts & {"combine", "headnorm"}:
+        if explicit:
+            logger.warning(
+                f"{DP_DRAFTPACK_ENV}: parts combine / headnorm are set but ignored: the fused "
+                f"reduce-scatter ({DP_RS_INJECT_ENV}) is not built"
+            )
+        parts -= {"combine", "headnorm"}
+    return frozenset(parts)
+
+
+def _dp_rs_inject_operands(core, rows: int, gen, device) -> tuple:
+    """Random site operands of `rows` rows in the layouts the decode step hands the launch:
+    `(hc, inject, norm weight, shared, gate logits)`, the gate a column of a wider buffer."""
+    bf = torch.bfloat16
+    width = core.hc_count * core.hidden
+    hc = torch.randn([rows, width], generator=gen, device=device).to(bf)
+    inject = torch.randn([rows, core.hc_count], generator=gen, device=device).to(bf)
+    norm = (0.1 * torch.randn([width], generator=gen, device=device)).to(bf)
+    shared = torch.randn([rows, core.hidden], generator=gen, device=device).to(bf)
+    gate = torch.randn([rows, 3], generator=gen, device=device).to(bf)[:, 1:2]
+    return hc, inject, norm, shared, gate
+
+
+def _bitwise(got: torch.Tensor, want: torch.Tensor) -> bool:
+    return got.shape == want.shape and torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+def _dp_rs_inject_check(core, rs, rows: int, fin: bool, gen, device, draft: bool = False) -> tuple:
+    """At `rows` rows a rank, eagerly: three reduce-scatters of the workspace, each a collective
+    every rank of the group launches in the same order -- the plain one (then
+    `qwen4_exp_hc_inject_norm`: the reference), the fused launch on the same partials, and with
+    `fin` the finalize form over the runner's output of the gathered rows those partials are the
+    finalized form of (else the fused launch again: a peer may run its finalize form, and this
+    rank's result then shows whether that peer's partials were the finalized ones). A launch that
+    raises on this rank is replaced by the plain reduce-scatter, which exchanges the same bytes, so
+    no peer waits; so is the finalize form when forming the runner's output raised here (before
+    any launch: the partials are then random rows). With `draft` (a draft pass's row count,
+    `DP_DRAFTPACK_ENV`) the fused launch is also held, locally, to the draft path it replaces:
+    `mtp_moe_combine_inject` and the draft head's `qwen4_exp_hc_inject_norm` without injection.
+    Returns `(fused differs, third launch differs, draft path differs)`, each "" when bitwise."""
+    trip = core._lamport_trip
+    g = trip.world * rows
+    hc, inject, norm, shared, gate = _dp_rs_inject_operands(core, rows, gen, device)
+    unfin, prep = None, ""
+    if fin:
+        try:
+            st, L = core._route_front, core._decode._layers[0]
+            x = torch.randn([g, core.hidden], generator=gen, device=device).to(torch.bfloat16)
+            logits = _decode_router(x, L.router)
+            partial = _route_front_run(core, st, x, L, 0, logits)[0]
+            fc2, _, _, _, wts = _route_front_run(core, st, x, L, 0, logits, finalize=False)
+            unfin = _Unfinalized(fc2, wts, st.views[g][0][0].view(g, core.topk))
+        except Exception as e:  # noqa: BLE001 -- before any launch; the peers still need 3
+            prep = f"finalize: the runner's output: {type(e).__name__}: {e}"
+            unfin = None
+    if unfin is None:
+        partial = torch.randn([g, core.hidden], generator=gen, device=device).to(torch.bfloat16)
+        partial[:, ::97] = -0.0
+    routed = dep_lamport_round_trip(partial, trip, True)
+    ref = qwen4_exp_hc_inject_norm(hc, routed, inject, norm, core.eps, core.hc_count, shared, gate)
+    out, fused_out = [], None
+    for form in ("fused", "finalize"):
+        try:
+            if form == "finalize" and unfin is not None:
+                why = rs.fin_operands_refuse(rows, *unfin)
+                if why:
+                    raise RuntimeError(f"the runner's output: {why}")
+                got = rs.run_fin(*unfin, hc, inject, norm, core.eps, shared, gate)
+            else:
+                got = rs.run(partial, hc, inject, norm, core.eps, shared, gate)
+        except Exception as e:  # noqa: BLE001 -- the peers' launch still needs this rank's bytes
+            dep_lamport_round_trip(partial, trip, True)
+            out.append(f"{form}: {type(e).__name__}: {e}")
+            continue
+        if form == "fused":
+            fused_out = got
+        bad = [
+            n
+            for n, a, b in (("hc_out", got[0], ref[0]), ("normed", got[1], ref[1]))
+            if not _bitwise(a, b)
+        ]
+        out.append(f"{form}: {', '.join(bad)} differ" if bad else "")
+    out[1] = out[1] or prep
+    drafted = ""
+    if draft:
+        try:
+            if fused_out is None:
+                raise RuntimeError("the fused launch raised")
+            want_hc = mtp_moe_combine_inject(hc, routed, gate, shared, inject)
+            _, want_n = qwen4_exp_hc_inject_norm(want_hc, None, None, norm, core.eps, core.hc_count)
+            bad = [
+                n
+                for n, a, b in (("hc", fused_out[0], want_hc), ("head norm", fused_out[1], want_n))
+                if not _bitwise(a, b)
+            ]
+            drafted = f"draft: {', '.join(bad)} differ" if bad else ""
+        except Exception as e:  # noqa: BLE001 -- local; the collectives above all ran
+            drafted = f"draft: {type(e).__name__}: {e}"
+    torch.cuda.synchronize(device)
+    return out[0], out[1], drafted
+
+
+def _dp_rs_inject_build(core, device) -> "_DpRsInject | None":
+    """`DP_RS_INJECT_ENV` (+ `DP_MOE_FIN_RS_ENV`, `DP_MOE_FIN_RS_PDL_ENV`,
+    `DP_RS_INJECT_LAYOUTS_ENV`), read once at build (`post_load_weights`, after the route and
+    router fronts). None where it is off or cannot take
+    effect: not a dep4 / dep8 rank on SM103 on the Lamport transport, another geometry, no
+    CUDA-graph row count in range. Otherwise every layout's launch is compiled now (no serving step
+    or capture meets a compile), the group agrees the compiles, and every row count is checked
+    (`_dp_rs_inject_check`, collective) and agreed: a row count that differs on any rank is dropped
+    on every rank, with one warning. Collective: every rank of the group runs it."""
+    if not _switch(DP_RS_INJECT_ENV, default=True):
+        return None
+    trip = core._lamport_trip
+    if trip is None or not _dp_decode_rank(core, device):
+        if os.environ.get(DP_RS_INJECT_ENV, "").strip():
+            logger.warning(
+                f"{DP_RS_INJECT_ENV} is set but ignored: it serves a dep4 / dep8 rank on SM103 on "
+                f"the Lamport transport ({DP_MOE_COMM_ENV})"
+            )
+        return None
+    if not _rs_inject_op.supported(core.hidden, core.hc_count):
+        logger.warning(
+            f"{DP_RS_INJECT_ENV} is set but ignored: the fused launch is written for a hidden in "
+            f"(2048, 4096] and up to 8 streams (this model: {core.hidden} x {core.hc_count})"
+        )
+        return None
+    raw = os.environ.get(DP_RS_INJECT_LAYOUTS_ENV, "").strip()
+    layouts = _rs_inject_op.parse_layouts(raw) if raw else _rs_inject_op.LAYOUTS[core.dp_size]
+    lo, hi = _DP_RS_INJECT_ROWS
+    hi = min(hi, trip.max_rows, _rs_inject_op.MAX_ROWS)
+    trunk = set(_graph_rows(core, lo, hi))
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    draft = {int(b) for b in sizes if lo <= int(b) <= hi} if core.mtp_enabled else set()
+    if not trunk | draft:
+        return None
+    st = core._route_front
+    fin = (
+        _switch(DP_MOE_FIN_RS_ENV, default=True)
+        and st is not None
+        and any(trip.world * r in st.tactics for r in trunk)
+    )
+    sms = torch.cuda.get_device_properties(device).multi_processor_count if fin else 0
+
+    def fin_at(r: int) -> bool:
+        # The route front serves the gathered rows and the finalize grid is one resident wave
+        # (`fin_resident`: dep8 up to 152 rows a rank, dep4 up to 152; F1's 160..208 keep the
+        # runner's finalize, as F1 ran).
+        return (
+            fin
+            and trip.world * r in st.tactics
+            and _rs_inject_op.fin_resident(r, core.hc_count, layouts, sms)
+        )
+
+    fin = fin and any(fin_at(r) for r in trunk)
+    pdl = fin and _switch(DP_MOE_FIN_RS_PDL_ENV, default=True) and bool(get_env_enable_pdl())
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    dist = Distributed.get(core.mapping)
+    rs, error = None, ""
+    try:
+        with torch.cuda.device(device):
+            rs = _rs_inject_op.build(trip, core.hc_count, layouts, fin, core.topk, pdl)
+    except Exception as e:  # noqa: BLE001 -- every rank decides together below
+        error = f"{type(e).__name__}: {e}"
+    errors = [e for e in dist.tp_allgather(error) if e]
+    if errors:
+        logger.warning(
+            f"{DP_RS_INJECT_ENV}: not engaged at rank {core.dp_rank}: the fused launch did not "
+            f"compile on {len(errors)} rank(s): {errors[0]}"
+        )
+        return None
+    gen = torch.Generator(device=device).manual_seed(20261126)
+    bad = []
+    with torch.cuda.device(device):
+        for rows in sorted(trunk | draft):
+            fin_here = rows in trunk and fin_at(rows)
+            bad.append(
+                (rows, *_dp_rs_inject_check(core, rs, rows, fin_here, gen, device, rows in draft))
+            )
+    every = dist.tp_allgather(bad)
+    off = {r for rank_bad in every for r, fused, _, _ in rank_bad if fused}
+    fin_off = {r for rank_bad in every for r, fused, final, _ in rank_bad if fused or final}
+    draft_off = {r for rank_bad in every for r, fused, _, drafted in rank_bad if fused or drafted}
+    for r, fused, final, drafted in (x for rank_bad in every for x in rank_bad):
+        if fused or final:
+            logger.warning(f"{DP_RS_INJECT_ENV}: {r} rows a rank stay unfused: {fused or final}")
+        if drafted and not fused:
+            logger.warning(f"{DP_DRAFTPACK_ENV}: {r} draft rows keep the draft combine: {drafted}")
+    rows = frozenset(trunk - off)
+    fin_rows = frozenset(r for r in rows if fin_at(r) and r not in fin_off)
+    built = _DpRsInject(rs, rows, fin_rows, frozenset(draft - draft_off))
+    logger.info(
+        f"DP rs inject: rank {core.dp_rank} of {core.dp_size}, the trunk MoE reduce-scatter injects "
+        f"and normalizes for the next site at rows {sorted(rows)} a rank, the finalize folded in at "
+        f"{sorted(fin_rows)} (PDL {pdl}), draft rows {sorted(built.draft_rows)}; layouts "
+        f"{list(layouts)}"
+    )
+    return built
+
+
+def _dp_rs_inject_next(
+    core, captured: bool, pad_rows: int, rows: int, i: int, layers, final_norm, hc, inject
+):
+    """`DP_RS_INJECT_ENV`: what trunk layer `i`'s MoE block injects and normalizes for the site
+    behind it -- `(hc, inject, norm weight)`, the weight of layer `i + 1`'s site A or, behind the
+    last layer, the stack-final site's -- or None where the block keeps its plain reduce-scatter:
+    not built, an eager or padded step, a row count the build did not keep, and the layer before
+    the PLE layer (its pending block is added explicitly). Host values, the same on every rank."""
+    rsi = getattr(core, "_rs_inject", None)
+    if rsi is None or not captured or pad_rows or rows not in rsi.rows or i + 1 == core.ple_layer:
+        return None
+    return hc, inject, layers[i + 1].ahc_norm if i + 1 < len(layers) else final_norm
+
+
+#: `(rows, why)` the fused launch refused in this process (one warning each).
+_RS_INJECT_REFUSED: set = set()
+
+
+def _rs_inject_tail(core, rsi: _DpRsInject, site, operands, main, side):
+    """The launch the round trip makes in place of its reduce-scatter (`tail(partial)`): it joins
+    the side stream first (the fused kernel reads the shared expert's output and gate logit
+    before it polls) and returns `_RsInjected`, or None where this call's operands are not in the
+    kernel's layout (the plain reduce-scatter then runs: the same bytes travel). `site` is the
+    next site's `(hc, inject, norm weight)`, `operands()` the shared expert's `(shared, gate
+    logits)` once the window has launched it. With an `_Unfinalized` partial (`DP_MOE_FIN_RS_ENV`,
+    chosen by the window after `refuses_fin`) it runs the finalize form."""
+    hc, inject, norm = site
+
+    def tail(partial):
+        shared, gate = operands()
+        if isinstance(partial, _Unfinalized):
+            why = rsi.rs.fin_operands_refuse(hc.shape[0], *partial)
+            if why is not None:
+                raise RuntimeError(f"{DP_MOE_FIN_RS_ENV}: the runner's output: {why}")
+            main.wait_stream(side)
+            return _RsInjected(*rsi.rs.run_fin(*partial, hc, inject, norm, core.eps, shared, gate))
+        why = rsi.rs.refuses(partial, hc, inject, norm, shared, gate)
+        if why is not None:
+            if (hc.shape[0], why) not in _RS_INJECT_REFUSED:
+                _RS_INJECT_REFUSED.add((hc.shape[0], why))
+                logger.warning(
+                    f"{DP_RS_INJECT_ENV}: {hc.shape[0]} rows keep the plain reduce-scatter: {why}"
+                )
+            return None
+        main.wait_stream(side)
+        return _RsInjected(*rsi.rs.run(partial, hc, inject, norm, core.eps, shared, gate))
+
+    return tail
+
+
+def _route_front_unfinalized(core, rows, L: _LayerWeights, router_mm) -> "_Unfinalized | None":
+    """`_route_front_experts` without the runner's finalize (`DP_MOE_FIN_RS_ENV`): the gathered
+    `rows`' route front and the runner's permuted FC2 rows, weights and index map, or None where
+    the route front does not serve them."""
+    st = core._route_front
+    g = rows.shape[0]
+    layer = st.layers.get(L.fc1_w.data_ptr()) if st is not None else None
+    if layer is None or g not in st.tactics or rows.stride(1) != 1 or rows.stride(0) != core.hidden:
+        return None
+    logits = _tep_front_logits(st, rows, L, router_mm)
+    fc2, _, _, _, wts = _route_front_run(core, st, rows, L, layer, logits, None, finalize=False)
+    return _Unfinalized(fc2, wts, st.views[g][layer][0].view(g, core.topk))
+
+
 #: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
 #: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
 #: dep2 was never run with them; it keeps the stock forms.
@@ -3186,6 +3568,7 @@ def _decode_forms(core) -> str:
     head = f"decode forms: rank {core.mapping.tp_rank} of {core.mapping.tp_size}"
     if core.dp_size > 1:
         router, inproj, out = core._router_front, core._inproj_release, core._out_proj
+        rsi = getattr(core, "_rs_inject", None)
         forms = {
             "moe comm": _dp_moe_comm() if core._lamport_trip is not None else "nccl",
             "route front gathered rows": rows(route.tactics if route else None),
@@ -3207,6 +3590,10 @@ def _decode_forms(core) -> str:
             "draft moe tile": getattr(core, "_draft_moe_tactics", None) is not None,
             "launch order": getattr(core, "dp_launch_order", False),
             "index key fp8": getattr(core, "index_key_fp8", False),
+            "rs inject rows": rows(getattr(rsi, "rows", None)),
+            "fin rs rows": rows(getattr(rsi, "fin_rows", None)),
+            "fin rs pdl": bool(rsi is not None and rsi.rs.pdl),
+            "draftpack": sorted(getattr(core, "dp_draftpack", ())),
             "scores early": getattr(core, "dp_scores_early", False),
             "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
@@ -3699,6 +4086,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._lamport_steps: LamportSteps | None = None
         # The router front (`DP_ROUTER_FRONT_ENV`), built after the route front.
         self._router_front: "_DpRouterFront | None" = None
+        # The fused reduce-scatter (`DP_RS_INJECT_ENV`), built once a load after the router front,
+        # and the draft MoE's parts that ride on it (`DP_DRAFTPACK_ENV`).
+        self._rs_inject: "_DpRsInject | None" = None
+        self.dp_draftpack: frozenset = frozenset()
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
@@ -3909,6 +4300,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Collective (the group agrees); once a load.
         if self._router_front is None and device.type == "cuda":
             self._router_front = _dp_router_front_build(self, self._decode._layers, device)
+        # Collective (every rank checks the same row counts and the group agrees); once a load.
+        if self._rs_inject is None and device.type == "cuda":
+            self._rs_inject = _dp_rs_inject_build(self, device)
+        if device.type == "cuda" and _dp_decode_rank(self, device):
+            self.dp_draftpack = _dp_draftpack_parts(self, self._rs_inject, device)
         # Collective where set: every rank of the group agrees on its row counts.
         _tep_decode_front_build(self, self._route_front, self._decode._layers, device)
         # Collective; once a load (the post-load walk reaches this hook again).
@@ -4055,7 +4451,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         lamport = self._dp_lamport(group) if _dp_moe_comm() != "nccl" else None
         group_size = len(group)
 
-        def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
+        def round_trip(run, x: torch.Tensor, pad_rows: int, tail=None) -> torch.Tensor:
             rows = x.shape[0]
             padded = x if not pad_rows else nn.functional.pad(x, [0, 0, 0, pad_rows])
             if lamport is not None and lamport.takes(padded.shape[0], padded):
@@ -4064,6 +4460,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 front = getattr(self, "_router_front", None)
                 release = front is not None and padded.shape[0] * group_size in front.release_rows
                 partial = run(dep_lamport_round_trip(padded, lamport, False, release))
+                if tail is not None and not pad_rows:
+                    # `DP_RS_INJECT_ENV` (`_rs_inject_tail`): the reduce-scatter with the next
+                    # site's injection and norm, an `_RsInjected`; None keeps the plain one (the
+                    # same bytes travel either way).
+                    fused = tail(partial)
+                    if fused is not None:
+                        return fused
                 mine = dep_lamport_round_trip(partial, lamport, True)
                 return mine if not pad_rows else mine[:rows]
             gathered = allgather(padded, None, group, process_group)
@@ -5321,7 +5724,14 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
 
 
 def _mtp_moe_block(
-    core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False, before_window=None
+    core,
+    M: _MtpWeights,
+    x,
+    pad_rows: int = 0,
+    routed_only=False,
+    before_window=None,
+    tail=None,
+    route=False,
 ) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
     block-scale or native NVFP4 routed experts over this rank's window,
@@ -5335,7 +5745,12 @@ def _mtp_moe_block(
     (`core.expert_sum`), `pad_rows` padding this rank's (`_draft_pad_rows`). The routing,
     the quantization and the runner are row-wise and run on the rows the window sees, in
     chunks of at most `_MTP_MOE_MAX_ROWS`: one chunk at a TP rank's rows, several over the
-    rows an attention-DP group gathers."""
+    rows an attention-DP group gathers.
+
+    Under attention DP (`DP_DRAFTPACK_ENV`): `tail` is the round trip's fused reduce-scatter
+    (`_rs_inject_tail`; with `routed_only`, which then may return an `_RsInjected`), and `route`
+    enters the FP8 runner with the router logits (its own Renormalize routing) instead of
+    `renorm_moe_routing_op` + the pre-routed entry."""
 
     def run(rows: torch.Tensor) -> torch.Tensor:
         if before_window is not None:
@@ -5347,13 +5762,16 @@ def _mtp_moe_block(
                 parts.append(_mtp_routed_nvfp4(core, M, chunk))
                 continue
             logits = cublas_mm(chunk, M.router)
-            topk_ids, topk_w = renorm_moe_routing_op(
-                logits, topk=core.topk, output_dtype=chunk.dtype
-            )
+            if route:
+                topk_ids = topk_w = None
+            else:
+                topk_ids, topk_w = renorm_moe_routing_op(
+                    logits, topk=core.topk, output_dtype=chunk.dtype
+                )
             xq, xsf = fp8_quantize_1x128(chunk, use_ue8m0=_MTP_MOE_USE_UE8M0)
             parts.append(
                 fp8_block_scale_moe_runner(
-                    routing_logits=None,
+                    routing_logits=logits if route else None,
                     routing_bias=None,
                     hidden_states=xq,
                     hidden_states_scale=xsf,
@@ -5382,8 +5800,11 @@ def _mtp_moe_block(
 
     if core.dp_size == 1:
         routed = core.tp_sum(run(x))
-    else:
+    elif tail is None:
         routed = core.expert_sum(run, x, pad_rows)
+    else:
+        assert routed_only, "the fused reduce-scatter hands back the injected residual"
+        routed = core.expert_sum(run, x, pad_rows, tail)
     if routed_only:
         return routed
     return fused_sigmoid_gate_mul_add(routed, *_mtp_shared_expert(core, M, x))
@@ -5494,7 +5915,35 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Ten
                 with torch.cuda.stream(side):
                     forked.append(_mtp_shared_expert(core, M, mixed))
 
-        routed = _mtp_moe_block(core, M, mixed, pad_rows, True, shared_expert)
+        # `DP_DRAFTPACK_ENV` (captured passes): `combine` makes the round trip's reduce-scatter
+        # the fused launch over this residual with the draft head's norm, `route` the runner's
+        # own routing.
+        parts = getattr(core, "dp_draftpack", frozenset())
+        rsi = getattr(core, "_rs_inject", None)
+        captured = bool(parts) and torch.cuda.is_current_stream_capturing()
+        tail = None
+        if (
+            "combine" in parts
+            and rsi is not None
+            and captured
+            and not pad_rows
+            and mixed.shape[0] in rsi.draft_rows
+        ):
+
+            def operands():
+                gate_logits, shared = forked[0]
+                return shared, gate_logits
+
+            tail = _rs_inject_tail(core, rsi, (x, inject, M.fhc_norm), operands, main, side)
+        kw = {"tail": tail} if tail is not None else {}
+        if "route" in parts and captured:
+            kw["route"] = True
+        routed = _mtp_moe_block(core, M, mixed, pad_rows, True, shared_expert, **kw)
+        if type(routed) is _RsInjected:
+            # Injected and normalized for the draft head (`headnorm`: `_mtp_head_final`).
+            if "headnorm" in parts:
+                rsi.stash = routed
+            return routed.hc
         shared_expert()  # a round trip that never called its window
         main.wait_stream(side)
         gate_logits, shared = forked[0]
@@ -6954,7 +7403,14 @@ def _shared_expert(core, x, L: _LayerWeights, decode_gemm=None) -> tuple:
 
 
 def _moe_block(
-    core, x, L: _LayerWeights, pad_rows: int, fp4=None, router_mm=cublas_mm, decode_gemm=None
+    core,
+    x,
+    L: _LayerWeights,
+    pad_rows: int,
+    fp4=None,
+    router_mm=cublas_mm,
+    decode_gemm=None,
+    rs_next=None,
 ) -> tuple:
     """One MoE layer: NVFP4 routed experts plus the replicated bf16 shared expert, left
     uncombined. Returns `(routed, gate_logits, shared)`: the next `qwen4_exp_hc_inject_norm`
@@ -6968,7 +7424,12 @@ def _moe_block(
     MoE-site mixer output and `fp4` its NVFP4 form (`_hc_moe_mixer`): present only under
     attention TP, where the window runs on `x`'s own rows. `router_mm` is the step's
     router projection (`_routed_experts`). `decode_gemm` is a decode step's bf16 projection
-    entry, under which the shared expert reads the dense FP8 mode's copies when they exist."""
+    entry, under which the shared expert reads the dense FP8 mode's copies when they exist.
+
+    `rs_next` (`_dp_rs_inject_next`, None unless `DP_RS_INJECT_ENV` engages): the next site's
+    `(hc, inject, norm weight)`. The round trip's reduce-scatter is then the fused launch, behind
+    the join, and this returns `(_RsInjected, None, None)`; at a row count of its finalize form
+    (`DP_MOE_FIN_RS_ENV`) the window enters the runner without its finalize."""
     main = torch.cuda.current_stream()
     side = core._side_stream
     fin = getattr(core, "_tep_finar", None)
@@ -7003,13 +7464,31 @@ def _moe_block(
     if fin is not None:
         routed = _tep_finar_routed(core, fin, x, L, fp4, router_mm, quarter)
     if routed is None:
+        rsi = getattr(core, "_rs_inject", None) if rs_next is not None else None
 
         def window(rows: torch.Tensor) -> torch.Tensor:
             if not forked:
                 shared_expert()
+            if (
+                rsi is not None
+                and x.shape[0] in rsi.fin_rows
+                and torch.cuda.is_current_stream_capturing()
+                and rsi.rs.refuses_fin(*rs_next, *forked[0]) is None
+            ):
+                # `DP_MOE_FIN_RS_ENV`: the fused launch forms the partials from this.
+                unfinalized = _route_front_unfinalized(core, rows, L, router_mm)
+                if unfinalized is not None:
+                    return unfinalized
             return _routed_experts(core, rows, L, fp4, router_mm)
 
-        routed = core.expert_sum(window, x, pad_rows)
+        if rsi is None:
+            routed = core.expert_sum(window, x, pad_rows)
+        else:
+            tail = _rs_inject_tail(core, rsi, rs_next, lambda: forked[0], main, side)
+            routed = core.expert_sum(window, x, pad_rows, tail)
+            if type(routed) is _RsInjected:
+                # Joined in front of the fused launch; nothing is left for the next site.
+                return routed, None, None
     if not forked:
         shared_expert()
     main.wait_stream(side)
@@ -10612,19 +11091,25 @@ class DecodeTarget:
         mixed, inject, fp4 = _hc_moe_mixer(core, normed, L)
         return hc, mixed, inject, fp4
 
-    def _moe(self, x, L: _LayerWeights, pad_rows: int, fp4, fold: bool, captured: bool) -> tuple:
+    def _moe(
+        self, x, L: _LayerWeights, pad_rows: int, fp4, fold: bool, captured: bool, rs_next=None
+    ) -> tuple:
         """One decode MoE block, left uncombined for the next site: `(routed, (gate_logits,
         shared, topk_weights, topk_rows))`. With `fold` (one rank, where the window is the whole
         layer and needs no sum) the runner skips its finalize: `routed` is its permuted FC2 rows
         and the top-k pair its routing weights and index map, which the next site's first kernel
         gathers; otherwise the pair is None and `routed` the finalized rows (`_moe_block`).
-        `captured` is the step's CUDA-graph state, which picks the router (`_decode_router_mid`)."""
+        `captured` is the step's CUDA-graph state, which picks the router (`_decode_router_mid`).
+        `rs_next` (`_dp_rs_inject_next`, never with `fold`): the block injects and normalizes for
+        the next site itself where it can, and this then returns `(_RsInjected, None)`."""
         core = self.core
         router_mm = _decode_router_mid(core, L, captured)
         if not fold:
             routed, gate_logits, shared = _moe_block(
-                core, x, L, pad_rows, fp4, router_mm, core.decode_mm
+                core, x, L, pad_rows, fp4, router_mm, core.decode_mm, rs_next
             )
+            if type(routed) is _RsInjected:
+                return routed, None
             return routed, (gate_logits, shared, None, None)
         main = torch.cuda.current_stream()
         side = core._side_stream
@@ -11092,10 +11577,13 @@ class DecodeTarget:
         # after an MoE block with its combine (and at one rank its finalize, `fold`); before
         # the PLE layer the pending block is added here, the PLE tail taking the site's norm.
         block_out = inject = moe = None
+        # `DP_RS_INJECT_ENV`: the next site's norm, which the last MoE block's fused
+        # reduce-scatter already formed (nothing else is pending then).
+        rs_normed = None
         # A tep4 rank's PLE front runs beside the layers before the PLE layer.
         ple_front = self._ple_fork(input_ids, ple_state, is_verify) if self._ple_forks() else None
         for i, L in enumerate(layers):
-            normed = None
+            normed, rs_normed = rs_normed, None
             if i == core.ple_layer:
                 if block_out is not None:
                     if moe is not None:
@@ -11143,10 +11631,17 @@ class DecodeTarget:
                 fp4,
                 core.moe_fold and i + 1 != core.ple_layer,
                 md.is_cuda_graph,
+                _dp_rs_inject_next(
+                    core, md.is_cuda_graph, pad_rows, num_tokens, i, layers, S.fhc_norm, hc, inject
+                ),
             )
+            if type(block_out) is _RsInjected:
+                # The block's reduce-scatter injected and normalized for the next site.
+                hc, rs_normed = block_out
+                block_out = inject = moe = None
         # The stack-final site with no injection weight: its mix *is* the final norm.
         hc, final, _ = self._hc_site(
-            hc, block_out, inject, S.fhc_norm, S.fhc_first, S.fhc_up, False, moe=moe
+            hc, block_out, inject, S.fhc_norm, S.fhc_first, S.fhc_up, False, rs_normed, moe
         )
         if spec_metadata is None:
             return final
@@ -11221,6 +11716,10 @@ class DecodeTarget:
             f"{md.num_tokens} tokens; the QSA row mapping covers the second"
         )
         pad_rows = _draft_pad_rows(core, all_rank_num_tokens, rows)
+        rsi = getattr(core, "_rs_inject", None)
+        if rsi is not None:
+            # `DP_DRAFTPACK_ENV` `headnorm`: no earlier pass's combine reaches this pass's head.
+            rsi.stash = None
         # The trunk's dense/sparse decision from the same host buffer: the worker advances
         # only the device KV lengths through the draft loop, so every draft step of one engine
         # forward takes the branch its trunk took, in the graph family the runner chose.
@@ -11475,11 +11974,30 @@ def _mtp_head_final(core, hidden_states: torch.Tensor) -> torch.Tensor:
     """The MTP module's head input: its stack-final hyper-connection mixer over the grouped norm of
     `hidden_states` (the module's un-collapsed residual), `[rows, hidden]`."""
     M = core._mtp
-    _, normed = qwen4_exp_hc_inject_norm(
-        hidden_states, None, None, M.fhc_norm, core.eps, core.hc_count
-    )
+    # `DP_DRAFTPACK_ENV` `headnorm`: the draft combine of this pass already formed the norm of
+    # exactly these rows (the stash holds its output, so no other tensor can share its storage).
+    rsi = getattr(core, "_rs_inject", None)
+    stash = None
+    if rsi is not None:
+        stash, rsi.stash = rsi.stash, None
+    if stash is not None and _same_tensor(hidden_states, stash.hc):
+        normed = stash.normed
+    else:
+        _, normed = qwen4_exp_hc_inject_norm(
+            hidden_states, None, None, M.fhc_norm, core.eps, core.hc_count
+        )
     final, _ = _hc_mixer(core, normed, M.fhc_first, M.fhc_up, False)
     return final
+
+
+def _same_tensor(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether `a` is a view of exactly `b`'s elements (storage, shape, strides, dtype)."""
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+    )
 
 
 #: Opt-in: under attention DP (a dep4 / dep8 rank on SM103) the vocabulary projection of the
