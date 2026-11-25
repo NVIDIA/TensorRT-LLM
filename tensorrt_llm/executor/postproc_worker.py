@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Union)
@@ -102,6 +103,8 @@ class PostprocWorker:
         avg_decoded_tokens_per_iter: Optional[float] = None
         cached_tokens: int = 0
 
+    _MAX_LOCALLY_FINISHED_CLIENT_IDS = 1024
+
     def __init__(
         self,
         pull_pipe_addr: tuple[str, Optional[bytes]],
@@ -124,6 +127,8 @@ class PostprocWorker:
         '''
 
         self._records: Dict[int, GenerationResult] = {}
+        self._locally_finished_client_ids: OrderedDict[int,
+                                                       None] = OrderedDict()
         self._record_creator = record_creator
         self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
                                       is_async=True,
@@ -243,6 +248,20 @@ class PostprocWorker:
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
+            locally_finished = self.__dict__.setdefault(
+                "_locally_finished_client_ids", OrderedDict())
+            if client_id in locally_finished:
+                if inp.sampling_params is not None:
+                    locally_finished.pop(client_id, None)
+                else:
+                    if isinstance(inp.rsp, ErrorResponse):
+                        locally_finished.pop(client_id, None)
+                        return
+                    response_result = inp.rsp.result if is_llm_response(
+                        inp.rsp) else None
+                    if response_result is None or response_result.is_final:
+                        locally_finished.pop(client_id, None)
+                    return
             # ErrorResponse has no 'result' attribute; pass it through
             # directly so the proxy handles it via its ErrorResponse path.
             if isinstance(inp.rsp, ErrorResponse):
@@ -252,7 +271,9 @@ class PostprocWorker:
             try:
                 response_result = inp.rsp.result if is_llm_response(
                     inp.rsp) else None
-                is_final = response_result.is_final if response_result else True
+                engine_is_final = (response_result.is_final
+                                   if response_result else True)
+                is_final = engine_is_final
                 res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
                     inp)
                 record = self._records.get(client_id)
@@ -288,6 +309,12 @@ class PostprocWorker:
                     ))
                 if is_final:
                     self._records.pop(client_id, None)
+                    if not engine_is_final:
+                        locally_finished[client_id] = None
+                        locally_finished.move_to_end(client_id)
+                        while len(locally_finished
+                                  ) > self._MAX_LOCALLY_FINISHED_CLIENT_IDS:
+                            locally_finished.popitem(last=False)
             except Exception as e:
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"

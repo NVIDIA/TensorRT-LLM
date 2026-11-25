@@ -444,6 +444,494 @@ def test_a_streamed_chat_reply_reports_its_call_and_no_stop_the_server_added():
     assert "｜DSML｜" not in "".join(choice["delta"].get("content") or "" for choice in choices)
 
 
+def test_streaming_n2_single_call_stop_finishes_only_the_matching_choice():
+    """With n=2 streaming, stopping choice 0 on a DSML stop leaves choice 1 running."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    vocab = {
+        1: "Checking.\n\n<｜DSML｜ calls>\n",
+        2: WEATHER_INVOKE + "\n",
+        3: "Second.\n\n<｜DSML｜ calls>\n",
+        4: WEATHER_INVOKE.replace("NYC", "SFO") + "\n",
+        5: " trailing-after-stop",
+    }
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=7,
+        sampling_params=sampling_params,
+        tokenizer=_FakeTokenizer(),
+        streaming=True,
+    )
+    args = _chat_args()
+    args.num_choices = 2
+
+    def _response(seq_idx, token_ids, finish_reason, is_final=False):
+        return SimpleNamespace(
+            has_error=lambda: False,
+            result=SimpleNamespace(
+                is_final=is_final,
+                context_phase_params=None,
+                decoding_iter=1,
+                cached_tokens=0,
+                avg_decoded_tokens_per_iter=1.0,
+                finish_reasons=[finish_reason],
+                output_token_ids=[token_ids],
+                request_perf_metrics=None,
+                sequence_index=seq_idx,
+                cum_log_probs=None,
+                log_probs=None,
+                per_pos_drafted=None,
+                per_pos_accepted=None,
+                spec_dec_totals=None,
+                generation_logits=None,
+                additional_context_outputs=None,
+                additional_generation_outputs=None,
+                time_breakdown_metrics=None,
+                context_logits=None,
+            ),
+        )
+
+    frames = []
+    # Step 1: choice 0 hits the injected DSML stop; choice 1 has only started.
+    result._handle_response(_response(0, [1, 2], tllm.FinishReason.NOT_FINISHED, is_final=False))
+    assert result.outputs[0].finish_reason == "stop"
+    assert result.outputs[0].stop_reason == V41_STOPS[0]
+    assert result.outputs[1].finish_reason is None
+    assert not result._done
+    frames += chat_stream_post_processor(result, args)
+
+    result._handle_response(_response(1, [3], tllm.FinishReason.NOT_FINISHED, is_final=False))
+    assert result.outputs[1].finish_reason is None
+    assert not result._done
+    frames += chat_stream_post_processor(result, args)
+
+    # Extra tokens arriving for already-stopped choice 0 do not unfreeze it or inflate token_ids.
+    result._handle_response(_response(0, [5], tllm.FinishReason.NOT_FINISHED, is_final=False))
+    assert result.outputs[0].text == STOPPED_REPLY
+    assert result.outputs[0].text_diff == ""
+    assert result.outputs[0].token_ids == [1, 2]
+    assert not result._done
+    frames += chat_stream_post_processor(result, args)
+
+    # Step 2: choice 1 hits the injected DSML stop on a later step -> now whole result is done.
+    result._handle_response(_response(1, [4], tllm.FinishReason.NOT_FINISHED, is_final=False))
+    assert result.outputs[1].finish_reason == "stop"
+    assert result.outputs[1].stop_reason == V41_STOPS[0]
+    assert result._done
+    assert result._aborted
+    frames += chat_stream_post_processor(result, args)
+
+    by_index = {0: [], 1: []}
+    for frame in frames:
+        for choice in json.loads(frame[len("data: ") :])["choices"]:
+            by_index[choice["index"]].append(choice)
+
+    for idx, expected_loc in [(0, "NYC"), (1, "SFO")]:
+        deltas = [c for ch in by_index[idx] for c in ch["delta"].get("tool_calls") or []]
+        assert [d["function"]["name"] for d in deltas if d["function"].get("name")] == [
+            "get_weather"
+        ]
+        assert json.loads("".join(d["function"].get("arguments") or "" for d in deltas)) == {
+            "location": expected_loc
+        }
+        finish_reasons = [ch["finish_reason"] for ch in by_index[idx] if ch.get("finish_reason")]
+        assert finish_reasons == ["tool_calls"]
+        assert all(ch.get("stop_reason") is None for ch in by_index[idx])
+
+
+def _make_llm_response(seq_idx, token_ids, finish_reason, is_final=False, cum_log_probs=None):
+    return SimpleNamespace(
+        has_error=lambda: False,
+        result=SimpleNamespace(
+            is_final=is_final,
+            context_phase_params=None,
+            decoding_iter=1,
+            cached_tokens=0,
+            avg_decoded_tokens_per_iter=1.0,
+            finish_reasons=finish_reason if isinstance(finish_reason, list) else [finish_reason],
+            output_token_ids=token_ids
+            if (token_ids and isinstance(token_ids[0], list))
+            else [token_ids],
+            request_perf_metrics=None,
+            sequence_index=seq_idx,
+            cum_log_probs=cum_log_probs,
+            log_probs=None,
+            per_pos_drafted=None,
+            per_pos_accepted=None,
+            spec_dec_totals=None,
+            generation_logits=None,
+            additional_context_outputs=None,
+            additional_generation_outputs=None,
+            time_breakdown_metrics=None,
+            context_logits=None,
+        ),
+    )
+
+
+def test_streaming_n2_incremental_decoder_does_not_refeed_other_choice():
+    """Incremental detokenization only feeds token_ids_diff for the responding sequence_index."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    vocab = {
+        1: "Alpha ",
+        2: "Beta ",
+        3: "Gamma\n" + V41_STOPS[0] + "\n",
+        4: "Delta\n" + V41_STOPS[0] + "\n",
+    }
+
+    class _IncrementalTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode_incrementally(
+            self, token_ids, prev_text="", states=None, flush=False, **_kwargs
+        ):
+            self.calls.append((list(token_ids), prev_text, flush))
+            return prev_text + "".join(vocab[t] for t in token_ids), states or {"seen": True}
+
+    tok = _IncrementalTokenizer()
+    sampling_params = SamplingParams(n=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(tok, hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=8, sampling_params=sampling_params, tokenizer=tok, streaming=True
+    )
+
+    result._handle_response(_make_llm_response(0, [1], tllm.FinishReason.NOT_FINISHED))
+    assert result.outputs[0].text == "Alpha "
+    assert result.outputs[1].text == ""
+
+    # Responding on seq 1 must NOT re-feed seq 0's previous token_ids_diff ([1])
+    # and must clear seq 0's stale token_ids_diff / logprobs_diff.
+    result._handle_response(_make_llm_response(1, [2], tllm.FinishReason.NOT_FINISHED))
+    assert result.outputs[0].text == "Alpha "
+    assert result.outputs[0].text_diff == ""
+    assert result.outputs[0].token_ids_diff == []
+    assert result.outputs[0].logprobs_diff == []
+    assert result.outputs[1].text == "Beta "
+    assert len(tok.calls) == 2
+
+    # Seq 0 stops on string stop; seq 1 continues and finishes via engine EOS.
+    result._handle_response(_make_llm_response(0, [3], tllm.FinishReason.NOT_FINISHED))
+    assert result.outputs[0].finish_reason == "stop"
+    assert not result._done
+
+    result._handle_response(_make_llm_response(1, [4], tllm.FinishReason.END_ID, is_final=False))
+    assert result.outputs[1].finish_reason == "stop"
+    assert result._done
+    assert result._aborted
+
+
+def test_request_output_from_generation_result_aborts_when_all_choices_string_stop():
+    """RequestOutput constructed via _from_generation_result (__new__) handles per-choice string stops."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import GenerationResult
+    from tensorrt_llm.llmapi.llm import RequestOutput
+
+    vocab = {1: "ok" + V41_STOPS[0], 2: "more"}
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    aborted = []
+
+    class _FakeExecutor:
+        def abort_request(self, req_id):
+            aborted.append(req_id)
+
+    sampling_params = SamplingParams(n=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    gen_req = SimpleNamespace(
+        id=42,
+        sampling_params=sampling_params,
+        postproc_params=None,
+        streaming=True,
+        trace_headers=None,
+        multimodal_params=None,
+        prompt_token_ids=[10, 11],
+    )
+    executor = _FakeExecutor()
+    gen_result = GenerationResult(gen_req, executor=executor)
+    req_out = RequestOutput._from_generation_result(gen_result, tokenizer=_FakeTokenizer())
+
+    req_out._handle_response(_make_llm_response(0, [1], tllm.FinishReason.NOT_FINISHED))
+    assert req_out.outputs[0].finish_reason == "stop"
+    assert not req_out._done
+    assert aborted == []
+
+    req_out._handle_response(_make_llm_response(1, [1], tllm.FinishReason.NOT_FINISHED))
+    assert req_out.outputs[1].finish_reason == "stop"
+    assert req_out._done
+    assert aborted == [42]
+
+
+def test_best_of_greater_than_n_waits_for_all_underlying_candidates():
+    """With best_of > n, provisional candidates are buffered until all best_of finish."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    vocab = {
+        1: "Checking.\n\n<｜DSML｜ calls>\n" + WEATHER_INVOKE + "\n",
+        2: "Plain winning answer.",
+    }
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=1, best_of=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=9, sampling_params=sampling_params, tokenizer=_FakeTokenizer(), streaming=True
+    )
+    args = _chat_args()
+    args.num_choices = 1
+
+    # Candidate 0 leads temporarily and hits a DSML tool-call stop, while
+    # candidate 1 is still unfinished. Streaming must not emit candidate 0's
+    # provisional tool call or finish_reason yet.
+    result._handle_response(
+        _make_llm_response(0, [1], tllm.FinishReason.NOT_FINISHED, cum_log_probs=[-0.5])
+    )
+    assert result._outputs[0].finish_reason == "stop"
+    assert result._outputs[1].finish_reason is None
+    assert not result._done
+    step1_frames = chat_stream_post_processor(result, args)
+    step1_choices = [
+        ch for frame in step1_frames for ch in json.loads(frame[len("data: ") :])["choices"]
+    ]
+    assert all(ch.get("finish_reason") is None for ch in step1_choices)
+    assert all(not ch["delta"].get("tool_calls") for ch in step1_choices)
+    assert all(not ch["delta"].get("content") for ch in step1_choices)
+
+    # Candidate 1 finishes with plain text and a higher cumulative logprob,
+    # overtaking candidate 0. Only candidate 1's plain text and finish_reason="stop"
+    # (not candidate 0's tool_calls) are emitted.
+    result._handle_response(
+        _make_llm_response(1, [2], tllm.FinishReason.END_ID, is_final=False, cum_log_probs=[-0.1])
+    )
+    assert result._outputs[1].finish_reason == "stop"
+    assert result._done
+    assert result._aborted
+    step2_frames = chat_stream_post_processor(result, args)
+    step2_choices = [
+        ch for frame in step2_frames for ch in json.loads(frame[len("data: ") :])["choices"]
+    ]
+    assert (
+        "".join(ch["delta"].get("content") or "" for ch in step2_choices) == "Plain winning answer."
+    )
+    assert all(not ch["delta"].get("tool_calls") for ch in step2_choices)
+    assert [ch["finish_reason"] for ch in step2_choices if ch.get("finish_reason")] == ["stop"]
+
+
+def test_beam_search_hidden_beam_does_not_terminate_visible_answer():
+    """With multi-beam search (n=1, best_of=2), a hidden beam matching a stop string must not end the request."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    vocab = {1: "beam0", 2: "beam1" + V41_STOPS[0]}
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=1, best_of=2, use_beam_search=True)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=10, sampling_params=sampling_params, tokenizer=_FakeTokenizer(), streaming=False
+    )
+    result._handle_response(
+        _make_llm_response(
+            0,
+            [[1], [2]],
+            [tllm.FinishReason.NOT_FINISHED, tllm.FinishReason.NOT_FINISHED],
+            is_final=False,
+        )
+    )
+    assert result._str_stopped_outputs == {}
+    assert not result._done
+    assert result.outputs[0].finish_reason is None
+
+
+def test_completion_stream_n2_emits_finish_reason_once_per_choice():
+    """On /v1/completions with n=2, a string-stopped choice does not repeat its finish chunk."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+    from tensorrt_llm.serve.postprocess_handlers import (
+        CompletionPostprocArgs,
+        completion_stream_post_processor,
+    )
+
+    vocab = {1: "first" + V41_STOPS[0], 2: "second", 3: " done" + V41_STOPS[0]}
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=11, sampling_params=sampling_params, tokenizer=_FakeTokenizer(), streaming=True
+    )
+    args = CompletionPostprocArgs(model="m", num_choices=2, num_prompt_tokens=3)
+
+    frames = []
+    result._handle_response(_make_llm_response(0, [1], tllm.FinishReason.NOT_FINISHED))
+    frames += completion_stream_post_processor(result, args)
+    result._handle_response(_make_llm_response(1, [2], tllm.FinishReason.NOT_FINISHED))
+    frames += completion_stream_post_processor(result, args)
+    result._handle_response(_make_llm_response(1, [3], tllm.FinishReason.NOT_FINISHED))
+    frames += completion_stream_post_processor(result, args)
+
+    finishes = {0: [], 1: []}
+    for frame in frames:
+        for ch in json.loads(frame[len("data: ") :])["choices"]:
+            if ch.get("finish_reason") is not None:
+                finishes[ch["index"]].append(ch["finish_reason"])
+    assert finishes == {0: ["stop"], 1: ["stop"]}
+
+
+def test_postproc_worker_discards_late_inflight_responses_after_local_stop():
+    """After a local string stop pops a PostprocWorker record, late engine responses are discarded."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.postproc_worker import PostprocWorker
+
+    vocab = {1: "ok" + V41_STOPS[0], 2: "late"}
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=1, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    def _rsp(token_ids, finish_reason, is_final=False):
+        r = _make_llm_response(0, token_ids, finish_reason, is_final=is_final)
+        r.client_id = 77
+        return r
+
+    # Drive PostprocWorker._mainloop with 3 queued inputs:
+    # 1) triggers local string stop (is_final=False from engine -> record popped, client marked locally finished)
+    # 2) late in-flight response without sampling_params (must be silently dropped, no ErrorResponse)
+    # 3) engine's final CANCELLED response (clears the discard marker)
+    inputs = [
+        [
+            PostprocWorker.Input(
+                rsp=_rsp([1], tllm.FinishReason.NOT_FINISHED, is_final=False),
+                sampling_params=sampling_params,
+                streaming=True,
+            ),
+            PostprocWorker.Input(
+                rsp=_rsp([2], tllm.FinishReason.NOT_FINISHED, is_final=False),
+                sampling_params=None,
+                streaming=True,
+            ),
+            PostprocWorker.Input(
+                rsp=_rsp([], tllm.FinishReason.CANCELLED, is_final=True),
+                sampling_params=None,
+                streaming=True,
+            ),
+        ],
+        None,
+    ]
+
+    class _FakePullPipe:
+        async def get_async(self):
+            return inputs.pop(0)
+
+    from collections import OrderedDict
+
+    worker = object.__new__(PostprocWorker)
+    worker._records = {}
+    worker._locally_finished_client_ids = OrderedDict()
+    worker._record_creator = PostprocWorker.default_record_creator
+    worker._pull_pipe = _FakePullPipe()
+    worker._tokenizer = _FakeTokenizer()
+    worker._post_processor_hook = None
+    worker._to_stop = asyncio.Event()
+
+    async def _collect():
+        batches = []
+        async for batch in worker._mainloop():
+            if batch is None:
+                break
+            batches.append(batch)
+        return batches
+
+    batches = asyncio.run(_collect())
+    assert len(batches) == 1
+    assert len(batches[0]) == 1
+    out = batches[0][0]
+    assert isinstance(out, PostprocWorker.Output)
+    assert out.is_final is True
+    assert out.should_abort is True
+    assert worker._records == {}
+    assert len(worker._locally_finished_client_ids) == 0
+
+
 # ---------------------------------------------------------------------------
 # Responses
 # ---------------------------------------------------------------------------

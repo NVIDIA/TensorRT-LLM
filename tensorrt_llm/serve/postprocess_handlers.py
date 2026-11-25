@@ -112,6 +112,7 @@ class ChatPostprocArgs(PostprocArgs):
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
+    finish_reason_sent: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
     # Per-output flag tracking whether the streaming forced-call path has
     # already emitted the opening delta (with id and function name). The id is
@@ -218,6 +219,13 @@ def _build_spec_decode_stats(
         acceptance_histogram=histogram,
         num_spec_tokens=num_spec_tokens,
     )
+
+
+def _has_stable_output_ranks(rsp: Any) -> bool:
+    sp = getattr(rsp, "sampling_params", None)
+    if not isinstance(sp, SamplingParams):
+        return True
+    return not sp.use_beam_search and sp.n == sp.best_of
 
 
 def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
@@ -440,7 +448,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         return data
 
     res: List[str] = []
-    finish_reason_sent = [False] * args.num_choices
+    ranks_stable = _has_stable_output_ranks(rsp)
+    finish_reason_sent = args.finish_reason_sent if ranks_stable else {}
     # num_prompt_tokens stays None until a prompt length is recorded, and only
     # the usage branches below consume it, so offset it only once it exists.
     prompt_tokens = args.num_prompt_tokens
@@ -477,20 +486,23 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 )
         args.first_iteration = False
 
+    if not ranks_stable and not rsp._done:
+        return res
+
     for output in rsp.outputs:
         i = output.index
 
-        if finish_reason_sent[i]:
+        if finish_reason_sent.get(i, False):
             continue
 
-        has_token_delta = bool(output.token_ids_diff)
-        delta_text = output.text_diff
+        emit_finish = (ranks_stable or rsp._done) and (output.finish_reason
+                                                       is not None)
+        token_ids = output.token_ids_diff if ranks_stable else output.token_ids
+        logprobs = output.logprobs_diff if ranks_stable else output.logprobs
+        has_token_delta = bool(token_ids)
+        delta_text = output.text_diff if ranks_stable else output.text
         delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args,
-            i,
-            delta_text,
-            True,
-            finished=(output.finish_reason is not None))
+            args, i, delta_text, True, finished=emit_finish)
 
         forced_tool = _forced_tool_choice(args)
         if forced_tool and not _forced_choice_uses_tool_parser(args):
@@ -543,7 +555,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             # budget, abort) would otherwise report "tool_calls" with no call.
             if args.forced_tool_name_sent.get(i, False):
                 args.has_tool_call[i] = True
-            if not tool_calls and not output.finish_reason and not has_token_delta:
+            if not tool_calls and not emit_finish and not has_token_delta:
                 continue
             delta_message = DeltaMessage(
                 tool_calls=tool_calls if tool_calls else None)
@@ -552,8 +564,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                   i,
                                                   delta_text,
                                                   True,
-                                                  finished=(output.finish_reason
-                                                            is not None))
+                                                  finished=emit_finish)
             if forced_tool and calls:
                 forced_name = _forced_call_name(calls,
                                                 forced_tool.function.name)
@@ -589,8 +600,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             # here; the forced branch above builds its own and must not have
             # it rebuilt with ``content``, since a forced call produces no
             # assistant text.
-            if (tool_calls or delta_text or reasoning_delta_text
-                    or output.finish_reason or has_token_delta):
+            if (tool_calls or delta_text or reasoning_delta_text or emit_finish
+                    or has_token_delta):
                 delta_message = DeltaMessage(
                     content=delta_text,
                     reasoning_content=reasoning_delta_text,
@@ -606,15 +617,14 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
                 getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
-            stop_reason=_client_stop_reason(output.stop_reason, args),
+                output.finish_reason if emit_finish else None),
+            stop_reason=_client_stop_reason(output.stop_reason, args)
+            if emit_finish else None,
         )
         if args.return_logprobs:
-            logprobs = output.logprobs_diff
-            token_ids = output.token_ids_diff
             choice.logprobs = create_logprobs(token_ids, args.tokenizer,
                                               logprobs, args.top_logprobs)
-        if output.finish_reason is not None:
+        if emit_finish:
             if output.finish_reason == "stop" and args.has_tool_call.get(
                     i, False):
                 choice.finish_reason = "tool_calls"
@@ -827,6 +837,7 @@ class CompletionPostprocArgs(PostprocArgs):
     # id and created timestamp instead of regenerating them for each chunk.
     stream_response_id: Optional[str] = None
     stream_created: Optional[int] = None
+    finish_reason_sent: dict[int, bool] = field(default_factory=dict)
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -879,6 +890,8 @@ def create_completion_logprobs(token_ids: List[int],
 def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                      args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
+    ranks_stable = _has_stable_output_ranks(rsp)
+    finish_reason_sent = args.finish_reason_sent if ranks_stable else {}
     prompt_tokens = args.num_prompt_tokens
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
@@ -890,28 +903,39 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         include_usage = False
         include_continuous_usage = False
 
+    if not ranks_stable and not rsp._done:
+        return res
+
     for output in rsp.outputs:
-        delta_text = output.text_diff
+        i = output.index
+        if finish_reason_sent.get(i, False):
+            continue
+        emit_finish = (ranks_stable or rsp._done) and (output.finish_reason
+                                                       is not None)
+        delta_text = output.text_diff if ranks_stable else output.text
+        token_ids = output.token_ids_diff if ranks_stable else output.token_ids
+        logprobs = output.logprobs_diff if ranks_stable else output.logprobs
+        text_offset = output._last_text_len if ranks_stable else 0
         if args.echo and args.first_iteration:
             delta_text = args.prompt + delta_text
         choice = CompletionResponseStreamChoice(
-            index=args.prompt_idx * args.num_choices + output.index,
+            index=args.prompt_idx * args.num_choices + i,
             text=delta_text if args.detokenize else "",
-            token_ids=None if args.detokenize else output.token_ids_diff,
-            finish_reason=output.finish_reason,
-            stop_reason=output.stop_reason,
+            token_ids=None if args.detokenize else token_ids,
+            finish_reason=output.finish_reason if emit_finish else None,
+            stop_reason=output.stop_reason if emit_finish else None,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
                 getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
+                output.finish_reason if emit_finish else None),
         )
+        if emit_finish:
+            finish_reason_sent[i] = True
         if args.return_logprobs:
-            logprobs = output.logprobs_diff
-            token_ids = output.token_ids_diff
             choice.logprobs = create_completion_logprobs(
-                token_ids, args.tokenizer, logprobs, output._last_text_len)
+                token_ids, args.tokenizer, logprobs, text_offset)
 
         chunk = CompletionStreamResponse(model=args.model,
                                          choices=[choice],
