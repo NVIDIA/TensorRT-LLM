@@ -125,6 +125,8 @@ class PrefixWaitPlanner:
             and req.py_request_id not in self._kv_cache_manager.kv_cache_map
             and not req.is_dummy_request
             and req.multimodal_hashes is None
+            # Embedding rows key the blocks, so equal ids are no shared prefix.
+            and req.py_prompt_embeds is None
         )
 
     def _drop_finished_owners(self) -> None:

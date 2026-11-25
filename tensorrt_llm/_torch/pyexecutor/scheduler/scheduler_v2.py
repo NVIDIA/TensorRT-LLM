@@ -2997,6 +2997,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # the durable marker. Partial-context requests still retain replay data.
         if req.is_generation_in_progress_state and req.py_multimodal_data is not None:
             return False
+        # A disaggregated generation request keeps only the identity of its prompt_embeds.
+        prompt_embeds = req.py_prompt_embeds
+        if prompt_embeds is not None and not prompt_embeds.prefillable:
+            return False
         return self._is_started_request(req)
 
     def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:

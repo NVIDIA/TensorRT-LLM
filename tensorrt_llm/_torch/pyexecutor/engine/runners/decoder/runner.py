@@ -1014,6 +1014,28 @@ class DecoderRunner(ScheduledModelRunner):
         with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
+    @nvtx_range("_apply_prompt_embeds_overlay")
+    def _apply_prompt_embeds_overlay(
+        self, inputs: dict[str, Any], dst_rows: torch.Tensor, src_rows: torch.Tensor
+    ) -> dict[str, Any]:
+        """Overwrite ``input_ids`` rows ``dst_rows`` ([K] int64) with ``src_rows`` ([K, H]).
+
+        Runs after ``preprocess_inputs`` so overlap-scheduler tokens are already in
+        ``input_ids``.
+        """
+        if getattr(self._model, "fuses_prompt_embeds", False):
+            # Multimodal wrappers write the rows after fusing image rows.
+            return {**inputs, "prompt_embeds_overlay": (dst_rows, src_rows)}
+        input_ids = inputs["input_ids"]
+        embeds = self._model.embed_prompt_tokens(input_ids)
+        embeds.index_copy_(0, dst_rows, src_rows.to(embeds.dtype))
+        return {
+            **inputs,
+            **self._model.prompt_embeds_model_inputs(input_ids, dst_rows),
+            "input_ids": None,
+            "inputs_embeds": embeds,
+        }
+
     @nvtx_range("_forward_step")
     def _forward_step(
         self,
@@ -1033,6 +1055,10 @@ class DecoderRunner(ScheduledModelRunner):
                 getattr(self._model, "model", None), "mark_prologue_start", None
             ),
         )
+        prompt_embeds_overlay = inputs.pop("prompt_embeds_overlay", None)
+        # Later pipeline stages receive hidden states, not embeddings.
+        if prompt_embeds_overlay is not None and self._mapping.is_first_pp_rank():
+            inputs = self._apply_prompt_embeds_overlay(inputs, *prompt_embeds_overlay)
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
 
