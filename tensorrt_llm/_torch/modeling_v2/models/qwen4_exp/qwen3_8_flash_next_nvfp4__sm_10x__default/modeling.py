@@ -3375,21 +3375,38 @@ def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
     """At `rows` rows a rank, eagerly: one packed gather (a collective every rank launches) of rows
     and logits every rank draws from the same per-rank seeds, against `fp4_quantize` of the
     group's sanitized rows and the sanitized logits, and the routing-only front against the route
-    front over the gathered logits (experts, weights, tables). "" when bitwise."""
+    front over the gathered logits (experts, weights, tables). "" when bitwise.
+
+    The gather is the check's only collective, so every rank launches it: a rank whose inputs
+    fail to build (an allocation that raises on that rank alone) launches it over zeros and
+    reports the failure, instead of leaving its peers polling for its rows."""
     trip = core._lamport_trip
     g = trip.world * rows
     L = core._decode._layers[0]
-    xs, lgs = [], []
-    for p in range(trip.world):
-        gen = torch.Generator(device=device).manual_seed(20261127 + 1009 * p + rows)
-        x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
-        x[:, ::131] = -0.0
-        xs.append(x)
-        lgs.append(
-            torch.randn([rows, core.num_experts], generator=gen, device=device).to(torch.bfloat16)
-        )
     me = core.dp_rank
-    xq, xsf, lg = pk.gather(xs[me], lgs[me].contiguous(), L.moe_gscale)
+    xs, lgs, failed = [], [], ""
+    try:
+        for p in range(trip.world):
+            gen = torch.Generator(device=device).manual_seed(20261127 + 1009 * p + rows)
+            x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
+            x[:, ::131] = -0.0
+            xs.append(x)
+            lgs.append(
+                torch.randn([rows, core.num_experts], generator=gen, device=device).to(
+                    torch.bfloat16
+                )
+            )
+        mine = (xs[me], lgs[me].contiguous())
+    except Exception as e:  # noqa: BLE001 -- reported below, after the collective
+        failed = f"inputs raised {type(e).__name__}: {e}"
+        mine = (
+            torch.zeros([rows, core.hidden], dtype=torch.bfloat16, device=device),
+            torch.zeros([rows, core.num_experts], dtype=torch.bfloat16, device=device),
+        )
+    xq, xsf, lg = pk.gather(*mine, L.moe_gscale)
+    if failed:
+        torch.cuda.synchronize(device)
+        return failed
     gathered = torch.cat([dep_lamport_sanitized(x) for x in xs])
     rxq, rxsf = fp4_quantize(gathered, L.moe_gscale, _SF_VEC, False, False)
     bad = [

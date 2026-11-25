@@ -211,3 +211,31 @@ def test_build_off_ignored_and_agreed(monkeypatch):
     monkeypatch.setattr(comm, "Distributed", SimpleNamespace(get=lambda m: dist), raising=False)
     built = M._dp_pack_build(core, "cuda")
     assert built.rows == frozenset({96}) and built.mid_rows == frozenset()
+
+
+def test_check_launches_the_gather_when_its_inputs_raise(monkeypatch):
+    """A rank whose check inputs fail to build still launches the packed gather (the check's
+    only collective, which its peers poll for), over zeros, and reports the failure."""
+    launched = []
+
+    class _Gather:
+        def __call__(self, x, logits, gs):
+            launched.append((tuple(x.shape), tuple(logits.shape), bool(x.any()), gs))
+            return "xq", "xsf", "lg"
+
+    def raising_randn(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(M.torch, "randn", raising_randn)
+    monkeypatch.setattr(M.torch.cuda, "synchronize", lambda device=None: None)
+    core = SimpleNamespace(
+        _lamport_trip=SimpleNamespace(world=8),
+        _decode=SimpleNamespace(_layers=[SimpleNamespace(moe_gscale="gs")]),
+        dp_rank=3,
+        hidden=16,
+        num_experts=32,
+    )
+    pk = M._DpPack(_Gather(), frozenset({16}), {}, frozenset())
+    what = M._dp_pack_check(core, pk, None, 2, "cpu")
+    assert launched == [((2, 16), (2, 32), False, "gs")]
+    assert what.startswith("inputs raised RuntimeError") and "out of memory" in what
