@@ -231,6 +231,10 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
         return self.llm.model.embed_tokens
 
     @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.text_embedding_layer.weight.dtype
+
+    @property
     def mm_encoder(self) -> nn.Module | None:
         """The first local tower for runtime checks that use the single-encoder attribute."""
         return next(iter(self.mm_encoders.values()), None)
@@ -292,21 +296,17 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
 
     def load_weights(self, weights, weight_mapper=None) -> None:
         """Route checkpoint keys by tower prefix, skipping values for disabled towers in this mapping."""
-        encoder_weights = {name: {} for name in self.mm_encoders}
         encoder_keys = set()
-        for key in weights.keys():
-            for name, spec in type(self).mm_encoders.items():
-                if key.startswith(spec.weight_prefix):
-                    encoder_keys.add(key)
-                    if name in encoder_weights:
-                        encoder_weights[name][key] = weights[key]
-                    break
-        for name, tower in self.mm_encoders.items():
-            tower.load_weights(encoder_weights.pop(name))
-        if isinstance(weights, ConsumableWeightsDict):
-            # Shard-aware decoders need the loader's checkpoint metadata and handles.
-            weights.mark_consumed_keys(encoder_keys)
-        else:
+        for name, spec in type(self).mm_encoders.items():
+            keys = [key for key in weights.keys() if key.startswith(spec.weight_prefix)]
+            if name in self.mm_encoders:
+                self.mm_encoders[name].load_weights({key: weights[key] for key in keys})
+            if isinstance(weights, ConsumableWeightsDict):
+                weights.mark_consumed_keys(keys)
+            else:
+                encoder_keys.update(keys)
+        # Shard-aware decoders need the loader's checkpoint metadata and handles.
+        if not isinstance(weights, ConsumableWeightsDict):
             weights = {key: weights[key] for key in weights.keys() if key not in encoder_keys}
         if (
             weight_mapper is not None

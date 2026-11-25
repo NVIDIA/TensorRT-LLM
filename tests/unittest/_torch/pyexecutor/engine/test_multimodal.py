@@ -742,7 +742,8 @@ def test_item_encoder_closes_window_scope_before_request_errors(
 @pytest.mark.parametrize("invalid_output", ["rows", "width", "dtype", "rank", "type"])
 def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -> None:
     class _Model(MultimodalModelMixin):
-        embedding_dtype = torch.bfloat16
+        model_config = SimpleNamespace(torch_dtype=torch.bfloat16)
+        text_embedding_layer = torch.nn.Embedding(1, 4, dtype=torch.float32)
 
         def prepare_multimodal_encoder_inputs(
             self, _: Sequence[tuple[MultimodalParams, int]]
@@ -771,7 +772,8 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
         "type": "NoneType",
     }[invalid_output]
     scheduler = bare_mm_item_scheduler(_Model())
-    scheduler.bytes_per_embedding = 8
+    scheduler.bytes_per_embedding = resolve_bytes_per_mm_encoder_embedding(scheduler.model)
+    assert scheduler.bytes_per_embedding == 8
     producers = [make_mm_request(request_id, [4]) for request_id in (1, 2, 3)]
     for request in producers:
         _bind_items(scheduler, request)

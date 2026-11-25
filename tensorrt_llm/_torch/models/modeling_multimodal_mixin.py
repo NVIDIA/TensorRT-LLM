@@ -72,6 +72,14 @@ class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
 
 
+def resolve_mm_encoder_embedding_dtype(model: "MultimodalModelMixin") -> torch.dtype:
+    """Use the configured dtype on workers without encoder embedding metadata."""
+    try:
+        return model.embedding_dtype
+    except (AttributeError, NotImplementedError):
+        return model.model_config.torch_dtype
+
+
 def _assemble_multimodal_encoder_embeddings(
     item_tensors: Dict[int, torch.Tensor], total_items: int
 ) -> torch.Tensor:
@@ -730,7 +738,7 @@ class MultimodalModelMixin:
     @property
     def embedding_dtype(self) -> torch.dtype:
         """Dtype of a multimodal embedding stored in the encoder cache."""
-        return self.text_embedding_layer.weight.dtype
+        return self.model_config.torch_dtype
 
     @property
     def _has_local_encoder(self) -> bool:
@@ -1343,7 +1351,7 @@ class MultimodalModelMixin:
         )
         try:
             embedding_dim = self.embedding_dim
-            embedding_dtype = self.embedding_dtype
+            embedding_dtype = resolve_mm_encoder_embedding_dtype(self)
         except (AttributeError, NotImplementedError):
             logger.info(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
@@ -1351,9 +1359,7 @@ class MultimodalModelMixin:
                 "embedding_dim and embedding_dtype."
             )
         else:
-            bytes_per_embedding_row = (
-                embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
-            )
+            bytes_per_embedding_row = embedding_dim * embedding_dtype.itemsize
             max_embedding_rows = max_bytes // bytes_per_embedding_row
             logger.info(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "

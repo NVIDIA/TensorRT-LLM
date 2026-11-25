@@ -88,7 +88,7 @@ def test_profiling_inputs_fill_the_item_budget_with_legal_frames():
 @pytest.mark.parametrize("vision", [fp8_vision, nvfp4_vision], ids=["fp8", "nvfp4"])
 @torch.inference_mode()
 def test_qwen4_exp_grouped_tower_matches_independent_items(vision, monkeypatch):
-    from .test_vision_warm_up import _tower
+    from .test_vision_warm_up import _VISION, _tower
 
     tower = _tower(vision)
     # The final video frame shares a call with the next image.
@@ -103,4 +103,6 @@ def test_qwen4_exp_grouped_tower_matches_independent_items(vision, monkeypatch):
         [tower(item, torch.tensor([shape])) for item, shape in zip(pixels, grid, strict=True)]
     )
     grouped = tower(torch.cat(pixels), torch.tensor(grid))
+    num_tokens = sum(t * h * w for t, h, w in grid) // _VISION["spatial_merge_size"] ** 2
+    assert grouped.shape == independent.shape == (num_tokens, _VISION["out_hidden_size"])
     assert torch.isfinite(independent).all() and torch.equal(grouped, independent)

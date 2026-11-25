@@ -425,9 +425,14 @@ def test_member_covers_the_checkpoint(stored, configs, id_space, member, mtp, mo
     """Each tensor is read or predicted unread, never both; each expert's tensors by one rank and
     the rest by every rank; the windows tile the 512 experts; and `load` fills every parameter."""
     everything = set(stored)
-    vision = WT.VISION_WEIGHTS.manifest(WT.vision_dims(configs[1], torch.bfloat16))
+    vision_dims = WT.vision_dims(configs[1], torch.bfloat16)
+    vision = WT.VISION_WEIGHTS.manifest(vision_dims)
     vision_keys = {key for values in vision.values() for key, _, _, _ in values}
     assert vision_keys == {key for key in stored if key.startswith("model.visual.")}
+    if member == "tp1":
+        with torch.device("meta"):
+            tower = SimpleNamespace(dims=vision_dims, w=WT.VISION_WEIGHTS.declare(vision_dims))
+        WT.VISION_WEIGHTS.load(tower, {key: _HeaderEntry(*stored[key]) for key in vision_keys})
     read_by = collections.Counter()
     seen = []
     for rank in range(_world(member)):

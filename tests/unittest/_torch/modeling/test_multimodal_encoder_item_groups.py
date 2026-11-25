@@ -383,20 +383,21 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
 
 
-@pytest.mark.parametrize("empty_record", [False, True])
-def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: bool) -> None:
+@pytest.mark.parametrize("lengths,output_count", [(None, 2), ([], 2), ([2], 1), ([2], 3)])
+def test_grouped_encoder_rejects_invalid_item_layout(lengths: list[int] | None, output_count: int):
     model = _GroupedEncoderModel()
-    data = {"image": {"pixel_values": torch.ones(2, HIDDEN)}}
-    if empty_record:
+    data = {"image": {"pixel_values": torch.ones(output_count, HIDDEN)}}
+    if lengths is not None:
         data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-            [], output_embedding_lengths=[]
+            [("image", i) for i in range(len(lengths))], output_embedding_lengths=lengths
         )
     params = MultimodalParams(multimodal_data=data)
 
-    with pytest.raises(MultimodalEncoderContractError, match="metadata.*grouped encoding"):
+    match = f"returned {output_count} embeddings" if lengths else "metadata.*grouped encoding"
+    with pytest.raises(MultimodalEncoderContractError, match=match):
         model.encode_multimodal_inputs([params])
 
-    assert model.encoder_calls == []
+    assert model.encoder_calls == ([output_count] if lengths else [])
 
 
 @pytest.mark.parametrize(

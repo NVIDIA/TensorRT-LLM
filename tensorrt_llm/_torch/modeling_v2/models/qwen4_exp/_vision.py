@@ -13,6 +13,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     _qwen3vl_build_batched_input,
 )
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
 _MEDIA_KEYS = {
@@ -60,8 +61,10 @@ def _project_items(op, inputs, lengths, *weights):
 def _item_attention_args(grid, device):
     """Prepare encoder-only lengths once; each item keeps its own attention launch shape."""
     frame_lengths = [h * w for t, h, w in grid for _ in range(t)]
-    host_lengths = torch.tensor(frame_lengths, dtype=torch.int32, device="cpu")
-    device_lengths = host_lengths.to(device)
+    host_lengths = torch.tensor(
+        frame_lengths, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+    )
+    device_lengths = host_lengths.to(device, non_blocking=True)
     host_types = torch.zeros_like(host_lengths)
     totals = torch.tensor([[t * h * w, 0] for t, h, w in grid], dtype=torch.int32, device="cpu")
     items = []

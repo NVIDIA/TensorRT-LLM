@@ -21,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEnc
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    resolve_mm_encoder_embedding_dtype,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -320,24 +321,19 @@ def setup_mm_encoder_attn_metadata(
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
     """Bytes occupied by one multimodal encoder output embedding.
 
-    The mixin defaults to the text embedding layer. Models can override the width and
-    dtype for packed encoder outputs. Fall back to the weight or config when a worker
-    cannot expose the embedding metadata.
+    Models can override the width and dtype for packed encoder outputs. Fall back to
+    the text width when a worker cannot expose the encoder embedding width.
     """
+    element_size = resolve_mm_encoder_embedding_dtype(model).itemsize
     embedding_dim = None
     try:
         embedding_dim = model.embedding_dim
     except (AttributeError, NotImplementedError):
         pass
     if embedding_dim is not None:
-        try:
-            embedding_dtype = model.embedding_dtype
-        except (AttributeError, NotImplementedError):
-            embedding_dtype = model.model_config.torch_dtype
-        return embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+        return embedding_dim * element_size
     try:
-        weight = model.text_embedding_layer.weight
-        return weight.shape[-1] * weight.element_size()
+        return model.text_embedding_layer.weight.shape[-1] * element_size
     except (AttributeError, NotImplementedError):
         pass
     pretrained = model.model_config.pretrained_config
@@ -351,7 +347,6 @@ def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
             "text_embedding_layer, and its pretrained config exposes "
             "no (text_config.)hidden_size"
         )
-    element_size = model.model_config.torch_dtype.itemsize
     return hidden_size * element_size
 
 
@@ -727,18 +722,7 @@ class MultimodalItemScheduler:
 
     def _embedding_dtype_and_width(self) -> tuple[torch.dtype, int]:
         """Return the dtype and row width of one MM encoder output."""
-        model_cls = type(self.model)
-        if getattr(
-            model_cls, "embedding_dtype", None
-        ) is MultimodalModelMixin.embedding_dtype and not hasattr(model_cls, "mm_encoders"):
-            # Legacy encoders without an explicit output dtype use the outer model dtype.
-            # Their decoder's text embedding weights can have a different dtype.
-            expected_dtype = self.model.model_config.torch_dtype
-        else:
-            try:
-                expected_dtype = self.model.embedding_dtype
-            except (AttributeError, NotImplementedError):
-                expected_dtype = self.model.model_config.torch_dtype
+        expected_dtype = resolve_mm_encoder_embedding_dtype(self.model)
         return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
 
     def build_multimodal_data_for_llm(
