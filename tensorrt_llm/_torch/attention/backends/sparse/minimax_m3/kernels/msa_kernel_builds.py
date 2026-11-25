@@ -15,7 +15,8 @@ it. The variants found build on the rank's worker processes (:func:`build_varian
 directory and under the file lock the package's own lookup uses, and the run goes on once they
 are built: its lookups load them. The plan, split-KV reduction and sparse top-k modules, and the
 k2q CSR extension the sparse prefill loads, need nothing from a call: they build with the
-variants of the first run in build mode.
+variants of the first run in build mode. A variant or module the package loads built ahead of
+time (``BUILD_MSA_AOT``, its ``_prebuilt``) is not built.
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ _MODULES = (
     ("sparse_topk", "sparse_topk_select.so", "_do_compile_sparse_topk"),
 )
 # The package module that compiles the sparse prefill's k2q CSR extension on import.
-_K2Q_CSR_MODULE = "src.sm100.build_k2q_csr"
+_K2Q_CSR_MODULE = "fmha_sm100.cute.src.sm100.build_k2q_csr"
 
 # Where the worker processes find the build functions below.
 _HERE = __name__
@@ -122,7 +123,13 @@ class _Package:
         # Checked here so that a package without them is left alone.
         for name in ("_compile_only", "_load_templates", "_loaded", "_ensure_all_module"):
             getattr(self.manager, name)
-        for name in ("_built_dir", "_jit_base", "_acquire_file_lock", "_release_file_lock"):
+        for name in (
+            "_built_dir",
+            "_jit_base",
+            "_acquire_file_lock",
+            "_release_file_lock",
+            "_prebuilt",
+        ):
             getattr(jit, name)
         for _, _, compile_fn in _MODULES:
             getattr(jit, compile_fn)
@@ -148,6 +155,7 @@ class _Package:
         builds = [
             (name, BuildTask(f"{_HERE}:build_module", (name, library, compile_fn)), _CONFIG)
             for name, library, compile_fn in _MODULES
+            if self.jit._prebuilt(f"{name}/{library}") is None
         ]
         builds.append((_K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG))
         return builds
@@ -228,13 +236,14 @@ class _Package:
                     logger.debug(f"[KernelBuilder] {_OP}: no variant for {shape}: {e}")
         finally:
             _replay.found = None
-        # Variants in the package's bundled module need no build.
+        # Variants built ahead of time or in the package's bundled module need no build.
         self.manager._ensure_all_module()
         bundled = self.manager._all_module
         return self._module_builds() + [
             (name, BuildTask(f"{_HERE}:build_variant", (name, params)))
             for name, params in found.items()
-            if bundled is None or not hasattr(bundled, f"run_{name}")
+            if self.jit._prebuilt(f"{name}/{name}.so") is None
+            and (bundled is None or not hasattr(bundled, f"run_{name}"))
         ]
 
     def get_variant(self, *args):

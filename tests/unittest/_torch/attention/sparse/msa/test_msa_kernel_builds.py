@@ -6,6 +6,7 @@ A stand-in package picks one of two variants by the longest query segment, so no
 compiled and no build reaches a worker process.
 """
 
+import importlib.util
 import os
 import types
 
@@ -24,10 +25,12 @@ _SHORT, _LONG = "v64_0", "v128_0"
 @pytest.fixture
 def package(monkeypatch, tmp_path):
     """The stand-in package's module, routed through this process's KernelBuilder, with the
-    package's own variant lookups recorded in order (``events``), and the query length at which
-    a plan raises (``fail``)."""
+    package's own variant lookups recorded in order (``events``), the query length at which a
+    plan raises (``fail``), and the libraries built ahead of time (``prebuilt``, paths relative
+    to their directory)."""
     events = []
     fail = {"qo_len": None}
+    prebuilt = set()
     manager = types.SimpleNamespace(
         _compile_only=None,
         _load_templates=None,
@@ -45,6 +48,7 @@ def package(monkeypatch, tmp_path):
         _do_compile_plan=None,
         _do_compile_reduction=None,
         _do_compile_sparse_topk=None,
+        _prebuilt=lambda relative: tmp_path / "libs" / relative if relative in prebuilt else None,
     )
     api = types.SimpleNamespace(
         _prefill_qlen_threshold=lambda sparse: 1024,
@@ -70,7 +74,9 @@ def package(monkeypatch, tmp_path):
     monkeypatch.setattr(KernelBuilder, "_instance", builder)
     # Workers take builds; none is started here.
     monkeypatch.setattr(BuildPool, "accepting", lambda self: True)
-    return types.SimpleNamespace(module=module, builder=builder, events=events, fail=fail)
+    return types.SimpleNamespace(
+        module=module, builder=builder, events=events, fail=fail, prebuilt=prebuilt
+    )
 
 
 def _call(module, longest):
@@ -113,6 +119,16 @@ def test_a_run_in_build_mode_builds_the_variants_of_the_query_lengths_it_sweeps(
     count = len(build_mode)
     _call(package.module, 100)
     assert len(build_mode) == count
+
+
+def test_a_run_in_build_mode_skips_what_the_package_has_built_ahead_of_time(package, build_mode):
+    """A variant or module the package loads from its ahead-of-time build (BUILD_MSA_AOT) is not
+    built in the warmup."""
+    package.prebuilt.update({f"{_SHORT}/{_SHORT}.so", "plan/fmha_sm100_plan.so"})
+    _call(package.module, 100)
+    assert _variants(build_mode) == {_LONG}
+    modules = {key for key, task, _ in build_mode if task.function.endswith(":build_module")}
+    assert modules == {"reduction", "sparse_topk"}
 
 
 def test_a_replay_that_raises_leaves_the_kernels_to_their_first_use(package, build_mode):
@@ -168,3 +184,6 @@ def test_the_packaged_fmha_sm100_has_what_the_builds_ahead_use() -> None:
     from fmha_sm100 import api, jit
 
     msa_kernel_builds._Package(fmha_sm100, api, jit)
+    # A worker imports the k2q CSR extension's module by this name: found without importing it,
+    # which would compile the extension.
+    assert importlib.util.find_spec(msa_kernel_builds._K2Q_CSR_MODULE) is not None
