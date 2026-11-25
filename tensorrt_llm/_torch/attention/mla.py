@@ -950,14 +950,26 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, partial_o.shape[0])
-            # Token-sparse MLA: a row whose Top-K kept nothing on this rank
-            # attends to no local KV either.
-            sparse_empty_rows = getattr(attn_metadata, "helix_sparse_empty_rows", None)
-            if getattr(attn_backend, "sparse_params", None) is not None and sparse_empty_rows:
-                empty = sparse_empty_rows(partial_o.shape[0])
-                if empty is not None:
-                    zero_kv_mask = empty if zero_kv_mask is None else zero_kv_mask | empty
+            num_rows = partial_o.shape[0]
+            token_sparse = getattr(attn_backend, "sparse_params", None) is not None
+            # Token-sparse MLA, generation call: the Top-K merge of these rows may already have written every
+            # row this rank contributes nothing to (no local KV, or a Top-K that kept none of its keys).
+            noop_rows = getattr(attn_metadata, "helix_gen_noop_rows", None)
+            zero_kv_mask = None
+            if (
+                token_sparse
+                and noop_rows
+                and kwargs.get("attention_input_type") == AttentionInputType.generation_only
+            ):
+                zero_kv_mask = noop_rows(num_rows)
+            if zero_kv_mask is None:
+                zero_kv_mask = helix_gen_zero_kv_mask(attn_metadata, num_rows)
+                # A row whose Top-K kept nothing on this rank attends to no local KV either.
+                sparse_empty_rows = getattr(attn_metadata, "helix_sparse_empty_rows", None)
+                if token_sparse and sparse_empty_rows:
+                    empty = sparse_empty_rows(num_rows)
+                    if empty is not None:
+                        zero_kv_mask = empty if zero_kv_mask is None else zero_kv_mask | empty
             value_dim = kv_lora_rank
             if helix_v_up:
                 partial_o = self._helix_project_v_partials(partial_o)

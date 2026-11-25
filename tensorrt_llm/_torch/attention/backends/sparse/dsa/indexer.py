@@ -2270,6 +2270,10 @@ class Indexer(nn.Module):
         """
         # Set by the generation Top-K below when it wrote paged-pool indices (Indexer.gvr_paged_remap).
         self.decode_topk_paged = False
+        # Only a merge of this call vouches for its rows' Helix mask (see _key_shard_decode).
+        invalidate_noop_rows = getattr(metadata, "invalidate_helix_noop_rows", None)
+        if invalidate_noop_rows is not None:
+            invalidate_noop_rows()
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
         # 128 (FP8 path) or 32 (MXFP4 path); both round-trip to the same
         # 4-byte scale word per token at index_head_dim=128, so the slot
@@ -2515,6 +2519,16 @@ class Indexer(nn.Module):
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                 num_generations,
                 q_scale[token_offset : token_offset + num_gen_tokens] if self.use_fp4 else None,
+                # A generation-only call whose rows nothing below reads as token indices (the gate of the TopK
+                # paged_remap): the backend then takes them as the sparse attention's paged indices.
+                allow_paged=(
+                    self.gvr_paged_remap
+                    and is_generation is True
+                    and not has_prefill
+                    and gvr_prior_indices is None
+                    and not metadata.in_mtp_draft_loop
+                    and metadata.shared_topk_indices is None
+                ),
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
@@ -2908,12 +2922,16 @@ class Indexer(nn.Module):
         decode_rows: torch.Tensor,
         num_generations: int,
         q_scale_decode: Optional[torch.Tensor] = None,
+        allow_paged: bool = False,
     ) -> None:
         """Score this rank's key blocks, take the local Top-K and merge the exact global Top-K into ``decode_rows``.
 
         Every TP rank holds the whole index-K cache; rank ``r`` scores the 64-token blocks ``b % tp == r`` through a
         compacted block table, so the logits kernel reads 1/tp of the keys. Local rows are bounded by their causal
         length over the owned blocks.
+
+        ``allow_paged``: the caller reads ``decode_rows`` only as the sparse attention's input, so the Helix merge
+        may write paged-pool indices there (it then sets ``decode_topk_paged``, like the TopK ``paged_remap``).
         """
         next_n = metadata.key_shard_next_n
         rows = decode_rows.shape[0]
@@ -2976,8 +2994,21 @@ class Indexer(nn.Module):
         # The sparse MLA of a Helix rank reads only its own winners, as local token indices; the merge writes them
         # (kept first, then -1) and their counts, the rows' lengths for the token-sparse MLA.
         counts = metadata.helix_sparse_row_lens_out(rows)
-        merge.merge_owned(decode_rows, counts)
-        if helix_key_shard_verify_enabled() and not torch.cuda.is_current_stream_capturing():
+        # With the counts the merge also writes which rows keep nothing and, when allowed, the winners as
+        # paged-pool indices: no remap kernel follows it, and no mask kernel when the rows carry Helix KV bounds
+        # (see below). The owner-row merge writes neither.
+        empty = (
+            None
+            if counts is None or merge.owner_rows
+            else metadata.helix_sparse_row_empty_out(rows)
+        )
+        verify = helix_key_shard_verify_enabled()
+        paged = None
+        if allow_paged and counts is not None and not merge.owner_rows and not verify:
+            paged = self._helix_paged_remap(metadata, rows)
+        merge.merge_owned(decode_rows, counts, empty, paged)
+        self.decode_topk_paged = paged is not None
+        if verify and not torch.cuda.is_current_stream_capturing():
             full = None
             if helix_key_shard_verify_full():
                 full = (q_decode, weights_decode, q_scale_decode, k_cache)
@@ -2987,7 +3018,30 @@ class Indexer(nn.Module):
         if counts is None:
             metadata.set_helix_sparse_row_lens(decode_rows)
         else:
-            metadata.mark_helix_sparse_row_lens_set()
+            # The rows were bounded by their Helix KV bounds when the step carries them: a row this rank holds
+            # no KV for then keeps nothing, and the flags are the whole mask of the Helix combine.
+            metadata.mark_helix_sparse_row_lens_set(
+                num_empty_rows=rows if empty is not None else 0,
+                covers_zero_kv=metadata.helix_spec_row_kv_lens(rows) is not None,
+            )
+
+    def _helix_paged_remap(
+        self, metadata: DSAtrtllmAttentionMetadata, rows: int
+    ) -> Optional[tuple]:
+        """``merge_owned`` ``paged`` arguments of this layer's generation rows (see ``_decode_paged_remap``)."""
+        remap = self._decode_paged_remap(metadata)
+        req_idx = metadata._cached_req_idx_gen
+        if remap is None or req_idx is None:
+            return None
+        block_table, tokens_per_block, page_stride, layer_offset = remap
+        if (
+            tokens_per_block != metadata.key_shard_merge.tokens_per_block
+            or req_idx.dtype != torch.int32
+            or not req_idx.is_contiguous()
+            or req_idx.shape[0] < rows
+        ):
+            return None
+        return (req_idx, block_table, page_stride, layer_offset * tokens_per_block)
 
     def _verify_helix_key_shard(
         self,

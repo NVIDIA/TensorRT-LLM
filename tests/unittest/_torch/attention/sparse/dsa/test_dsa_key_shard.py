@@ -221,16 +221,21 @@ def _run_owned(ks, world, rows, local_k, owner_rows, calls=2):
             merges[r].pack(local, lens)
         outs = [torch.full((R, K), -7, dtype=torch.int32, device="cuda") for _ in range(world)]
         counts = [torch.full((R,), -7, dtype=torch.int32, device="cuda") for _ in range(world)]
+        # The "keeps nothing" flags as bytes, preset to a value the merge never writes and one row longer than
+        # the merge: it must write every row (0 or 1) and leave the extra one alone.
+        flag_bytes = [
+            torch.full((R + 1,), 2, dtype=torch.uint8, device="cuda") for _ in range(world)
+        ]
         if owner_rows:
             # Every owner publishes its rows' thresholds before any rank selects (the ranks run concurrently in a
-            # real group; here one GPU runs them in turn).
+            # real group; here one GPU runs them in turn). The owner-row merge writes no flags.
             for r in range(world):
                 merges[r].merge_owned_begin(R)
             for r in range(world):
                 merges[r].merge_owned_end(outs[r], counts[r])
         else:
             for r in range(world):
-                merges[r].merge_owned(outs[r], counts[r])
+                merges[r].merge_owned(outs[r], counts[r], flag_bytes[r].view(torch.bool))
         total = torch.zeros(R, dtype=torch.int64, device="cuda")
         for r in range(world):
             out, count = outs[r], counts[r]
@@ -238,6 +243,11 @@ def _run_owned(ks, world, rows, local_k, owner_rows, calls=2):
             assert torch.equal(nvalid.int(), count), (
                 f"rank {r}: counts differ from the kept entries"
             )
+            if not owner_rows:
+                assert torch.equal(flag_bytes[r][:R], (count == 0).to(torch.uint8)), (
+                    f"rank {r}: empty-row flags"
+                )
+                assert int(flag_bytes[r][R]) == 2, f"rank {r}: wrote past the rows"
             prefix = torch.arange(K, device="cuda")[None, :] < nvalid[:, None]
             assert torch.equal(out >= 0, prefix) and bool((out[~prefix] == -1).all())
             for i in range(R):
@@ -280,6 +290,220 @@ def test_key_shard_merge_owned_more_rows_than_sms():
     stats = _run_owned(ks, 8, _make_rows("normal", lens, gen), 512, owner_rows=False, calls=1)
     assert all(s[3] == 0 for s in stats), "spin timeout"
     assert all(s[1] == 0 for s in stats), "epoch ticket not reset"
+
+
+@skip_no_sm90
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize("local_k", [512, 32])
+def test_key_shard_merge_owned_paged(world, local_k):
+    """``merge_owned`` with ``paged`` (and ``empty``, as the Helix indexer calls it): the kept entries as
+    paged-pool indices, i.e. the local token indices of a plain ``merge_owned`` put through the Top-K remap
+    kernel (page of the row's request * page stride + layer base + token in page, ``-1`` for a missing page),
+    on both the candidate path and the exact re-selection (2 ranks, or ``local_k`` 32)."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import key_shard as ks
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.kernels import (
+        triton_convert_req_index_to_global_index,
+    )
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(world * 31 + local_k)
+    # Two rows per request, as two verify rows of one sequence.
+    lens = [0, 1, 130, 131, 2049, 3000, 20000, 20001, 70000, 70000]
+    rows = _make_rows("hotspot", lens, gen)
+    R = len(rows)
+    width = max(-(-max(lens) // (TPB * world)) * TPB, 4)
+    need = ks.KeyShardTopKMerge.bytes_needed(R, K, world, local_k, width)
+    bufs = [torch.zeros(need, dtype=torch.uint8, device="cuda") for _ in range(world)]
+    merges = [
+        ks.KeyShardTopKMerge(bufs, r, R, K, width, local_k=local_k, max_spin=1 << 20, pdl=False)
+        for r in range(world)
+    ]
+    pages = width // TPB
+    page_stride, layer_base = 93 * TPB, 17 * TPB
+    req_idx = (torch.arange(R, device="cuda") // 2).int()
+    tables = []
+    for r in range(world):
+        table = torch.randperm(4096, device="cuda", generator=gen)[: (R // 2) * pages].int()
+        table = table.view(R // 2, pages).contiguous()
+        table[2, 0] = -1  # a missing page of the third request
+        tables.append(table)
+    local = [torch.full((R, K), -7, dtype=torch.int32, device="cuda") for _ in range(world)]
+    paged = [torch.full((R, K), -7, dtype=torch.int32, device="cuda") for _ in range(world)]
+    counts = [torch.full((2, R), -7, dtype=torch.int32, device="cuda") for _ in range(world)]
+    flag_bytes = [torch.full((R + 1,), 2, dtype=torch.uint8, device="cuda") for _ in range(world)]
+    for call, outs in enumerate((local, paged)):
+        for r in range(world):
+            logits = merges[r].local_logits[:R]
+            logits.fill_(-1.0)
+            cand = torch.full((R, local_k), -1, dtype=torch.int32, device="cuda")
+            row_lens = torch.zeros(R, dtype=torch.int32, device="cuda")
+            for i, s in enumerate(rows):
+                pos = _local_positions(s.numel(), r, world)
+                logits[i, : pos.numel()] = s[pos]
+                row_lens[i] = pos.numel()
+                sel = _top(s[pos], torch.arange(pos.numel(), device="cuda"), local_k)
+                cand[i, : sel.numel()] = sel.int()
+            merges[r].pack(cand, row_lens)
+        for r in range(world):
+            if call:
+                merges[r].merge_owned(
+                    outs[r],
+                    counts[r][call],
+                    flag_bytes[r].view(torch.bool),
+                    (req_idx, tables[r], page_stride, layer_base),
+                )
+            else:
+                merges[r].merge_owned(outs[r], counts[r][call])
+    stats = [m.stats() for m in merges]
+    assert all(s[3] == 0 for s in stats), "spin timeout"
+    if local_k * world < K:
+        assert stats[0][2] > 0, "the exact re-selection did not run"
+    kept_any = 0
+    for r in range(world):
+        assert torch.equal(counts[r][0], counts[r][1])
+        assert torch.equal(flag_bytes[r][:R], (counts[r][1] == 0).to(torch.uint8)), f"rank {r}"
+        assert int(flag_bytes[r][R]) == 2
+        # The remap the backend runs on token indices (dsa/kernels.py, the integers of the C++ remap).
+        want = triton_convert_req_index_to_global_index(
+            req_idx,
+            tables[r],
+            local[r],
+            TPB,
+            K,
+            stride_factor=page_stride,
+            layer_id=layer_base // TPB,
+        ).view(R, K)
+        assert torch.equal(paged[r], want), f"rank {r}"
+        kept_any += int((local[r] >= 0).sum())
+    assert kept_any == sum(min(K, n) for n in lens)
+    # The missing page is hit: some kept entry of the third request maps to -1.
+    assert any(bool(((local[r][4:6] >= 0) & (paged[r][4:6] < 0)).any()) for r in range(world))
+
+
+def test_helix_noop_rows_flags():
+    """Which mask the Helix combine reads: the merge-written rows only for the rows of the call that wrote them
+    and only when they also cover the rows without local KV, and never rows left over from another producer, an
+    earlier Top-K call or an earlier step."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata as Meta,
+    )
+
+    meta = SimpleNamespace(
+        num_contexts=1,
+        num_generations=0,
+        _helix_num_rows=7,
+        _helix_rows_set=False,
+        _helix_rows_empty_count=0,
+        _helix_rows_empty_cover_zero_kv=False,
+        helix_row_kv_lens_cuda=torch.tensor([9, 0, 3, 0, 5, 1, 2], dtype=torch.int32),
+        # Deliberately not "lens == 0": shows which buffer a mask comes from.
+        helix_row_empty_cuda=torch.tensor([False, True, True, True, False, False, False]),
+    )
+    from_counts = [True, False, True, False, False, False]
+    from_flags = [True, True, True, False, False, False]
+
+    # Nothing written yet.
+    assert Meta.helix_sparse_empty_rows(meta, 6) is None
+    assert Meta.helix_gen_noop_rows(meta, 6) is None
+    assert Meta.helix_sparse_row_empty_out(meta, 6).data_ptr() == (
+        meta.helix_row_empty_cuda[1:].data_ptr()
+    )
+
+    # Counts only: the empty rows come from the counts, and the caller still adds its zero-KV mask.
+    Meta.mark_helix_sparse_row_lens_set(meta)
+    assert Meta.helix_sparse_empty_rows(meta, 6).tolist() == from_counts
+    assert Meta.helix_gen_noop_rows(meta, 6) is None
+
+    # Counts and flags, rows not bounded by the Helix KV bounds: the flags replace only the count compare.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=6)
+    assert Meta.helix_sparse_empty_rows(meta, 6).tolist() == from_flags
+    assert Meta.helix_sparse_empty_rows(meta, 4).tolist() == from_flags[:4]
+    assert Meta.helix_gen_noop_rows(meta, 6) is None
+
+    # Bounded rows: the flags are the whole mask of exactly those rows, read without a kernel.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=6, covers_zero_kv=True)
+    noop = Meta.helix_gen_noop_rows(meta, 6)
+    assert noop.data_ptr() == meta.helix_row_empty_cuda[1:].data_ptr() and noop.shape == (6,)
+    # A call with another row count is not the call the flags were written for.
+    assert Meta.helix_gen_noop_rows(meta, 5) is None
+    assert Meta.helix_gen_noop_rows(meta, 7) is None
+    # Rows beyond the flagged ones are compared by their counts.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=3, covers_zero_kv=True)
+    assert Meta.helix_sparse_empty_rows(meta, 6).tolist() == from_counts
+    # covers_zero_kv means nothing without the flags.
+    Meta.mark_helix_sparse_row_lens_set(meta, covers_zero_kv=True)
+    assert Meta.helix_gen_noop_rows(meta, 6) is None
+
+    # The next Top-K call takes the whole-mask claim back and keeps the flags of the kept counts.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=6, covers_zero_kv=True)
+    Meta.invalidate_helix_noop_rows(meta)
+    assert Meta.helix_gen_noop_rows(meta, 6) is None
+    assert Meta.helix_sparse_empty_rows(meta, 6).tolist() == from_flags
+
+    # A producer that writes only the lengths invalidates earlier flags.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=6, covers_zero_kv=True)
+    Meta.set_helix_sparse_row_lens(meta, torch.tensor([[3, -1], [-1, -1]], dtype=torch.int32))
+    assert meta.helix_row_kv_lens_cuda.tolist() == [9, 1, 0, 0, 5, 1, 2]
+    assert Meta.helix_gen_noop_rows(meta, 2) is None
+    assert Meta.helix_sparse_empty_rows(meta, 2).tolist() == [False, True]
+
+    # A new step starts without rows and without flags.
+    Meta.mark_helix_sparse_row_lens_set(meta, num_empty_rows=6, covers_zero_kv=True)
+    Meta._prepare_helix_sparse_rows(meta, None)
+    assert meta._helix_num_rows == 0 and meta._helix_rows_empty_count == 0
+    assert meta._helix_rows_empty_cover_zero_kv is False
+
+
+def test_helix_paged_remap_arguments():
+    """``Indexer._helix_paged_remap``: the merge's paged arguments from the TopK paged_remap's, and None (the
+    remap kernel then runs as before) without them or with request indices the merge kernel cannot read."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
+
+    table = torch.zeros(3, 8, dtype=torch.int32)
+    req = torch.zeros(12, dtype=torch.int32)
+
+    def paged(remap, req_idx, rows=12):
+        indexer = SimpleNamespace(_decode_paged_remap=lambda metadata: remap)
+        metadata = SimpleNamespace(
+            _cached_req_idx_gen=req_idx, key_shard_merge=SimpleNamespace(tokens_per_block=TPB)
+        )
+        return Indexer._helix_paged_remap(indexer, metadata, rows)
+
+    # (block table, tokens per block, page stride, layer offset) -> layer base in tokens.
+    got = paged((table, TPB, 93 * TPB, 17), req)
+    assert got[0] is req and got[1] is table and got[2:] == (93 * TPB, 17 * TPB)
+    assert paged(None, req) is None
+    assert paged((table, TPB, 93 * TPB, 17), None) is None
+    assert paged((table, 32, 93 * 32, 17), req) is None
+    assert paged((table, TPB, 93 * TPB, 17), req.long()) is None
+    assert paged((table, TPB, 93 * TPB, 17), torch.zeros(24, dtype=torch.int32)[::2]) is None
+    assert paged((table, TPB, 93 * TPB, 17), req, rows=13) is None
+
+
+@skip_no_sm90
+def test_key_shard_owner_rows_serve_token_indices_only():
+    """The owner-row merge writes token indices and counts; it rejects the two outputs of the plain merge
+    before any launch."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import key_shard as ks
+
+    world, rows, width = 2, 4, 256
+    need = ks.KeyShardTopKMerge.bytes_needed(rows, K, world, 512, width)
+    bufs = [torch.zeros(need, dtype=torch.uint8, device="cuda") for _ in range(world)]
+    merge = ks.KeyShardTopKMerge(bufs, 0, rows, K, width, local_k=512, owner_rows=True, pdl=False)
+    out = torch.empty((rows, K), dtype=torch.int32, device="cuda")
+    counts = torch.empty((rows,), dtype=torch.int32, device="cuda")
+    flags = torch.zeros(rows, dtype=torch.bool, device="cuda")
+    req = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    table = torch.zeros((1, width // TPB), dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError, match="owner-row"):
+        merge.merge_owned(out, counts, flags)
+    with pytest.raises(AssertionError, match="owner-row"):
+        merge.merge_owned(out, counts, None, (req, table, TPB, 0))
+    assert merge.stats() == [0, 0, 0, 0]
 
 
 @pytest.mark.parametrize(

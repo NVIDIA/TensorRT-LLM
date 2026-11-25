@@ -21,7 +21,8 @@ reuses its path: logits over the local pages into the merge workspace, an exact 
 the pack / merge over the CP group instead of ``merge_helix_topk`` (all-gather of every rank's full
 local Top-K plus a Top-K over ``cp * K`` candidates per row and layer). ``merge_owned`` writes this
 rank's winners as local token indices (the rows ``merge`` followed by :func:`keep_owned_local_rows`
-would give), which is what the Helix sparse MLA reads.
+would give), or directly as the paged-pool indices the Helix sparse MLA reads, with their count per
+row and whether a row keeps nothing.
 
 A Kimi K3.1 generation server takes this path by default (``TRTLLM_DSA_HELIX_KEY_SHARD=0``
 restores ``merge_helix_topk``); every other server keeps ``merge_helix_topk`` unless
