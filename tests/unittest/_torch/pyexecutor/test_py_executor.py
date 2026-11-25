@@ -772,7 +772,7 @@ def test_sparse_offload_admission_fails_only_prefill_request(
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
 
-    def validate_request(request) -> None:
+    def validate_request(request: types.SimpleNamespace) -> None:
         if request.request_id == 1:
             raise ValueError("frame too large")
 
@@ -795,7 +795,7 @@ def test_failed_parent_fails_its_child_sequences() -> None:
     parent, child, other = (_make_admission_request(i) for i in (1, 10, 2))
     parent.child_requests = [child]
 
-    def validate_request(request) -> None:
+    def validate_request(request: types.SimpleNamespace) -> None:
         if request.request_id == 1:
             raise ValueError("over budget")
 
@@ -808,6 +808,40 @@ def test_failed_parent_fails_its_child_sequences() -> None:
     executor._handle_errors.assert_called_once_with(
         "over budget", requests=[parent, child], charge_budget=False
     )
+
+
+def test_failed_sequence_group_gets_one_error_response() -> None:
+    def sequence(request_id: int, parent_id: int | None) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            py_request_id=request_id,
+            is_child=parent_id is not None,
+            parent_request_id=parent_id,
+            py_client_id=7,
+            context_remaining_length=0,
+        )
+
+    parent, child = sequence(1, None), sequence(10, 1)
+    executor = MagicMock(
+        enable_attention_dp=False,
+        kv_connector_manager=None,
+        _fatal_error=None,
+        active_requests=[parent, child],
+        _pending_transfer_responses=[],
+        _pending_response_terminations=[],
+    )
+    executor._transfer_owns_request_blocks.return_value = False
+
+    PyExecutor._handle_errors(
+        executor, "over budget", requests=[parent, child], charge_budget=False
+    )
+
+    ((responses,), _) = executor._enqueue_responses.call_args
+    assert [req_id for req_id, _ in responses] == [1]
+    assert executor.active_requests == []
+    assert [call.args[0] for call in executor._terminate_request.call_args_list] == [
+        parent,
+        child,
+    ]
 
 
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
