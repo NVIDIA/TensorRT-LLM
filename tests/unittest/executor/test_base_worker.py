@@ -8,6 +8,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from queue import Queue
 from threading import Event, Lock
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -15,7 +16,8 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest, LlmResponse,
+                                                        LlmResult, PyResult)
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
@@ -28,6 +30,8 @@ from utils.util import skip_single_gpu
 
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.rank_failure_requests import RankFailureError
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
@@ -1123,3 +1127,53 @@ def test_worker_gives_engine_its_outstanding_requests(monkeypatch,
         recovery.set_outstanding_requests.assert_called_once()
         outstanding, = recovery.set_outstanding_requests.call_args.args
         assert outstanding() == {100: 7}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("route",
+                         ["error_queue", "postprocessing", "in_process"])
+def test_rank_failure_error_after_final_response_is_dropped(monkeypatch, route):
+    """Check that a rank failure error that follows a request's final response is dropped.
+
+    Rank 0 fails the requests that no active rank holds after a rank failure,
+    including request 7, whose final response the worker thread has not handled
+    yet. That response comes first and ends request 7; request 8 had none.
+    """
+    worker, helper = _ipc_worker(monkeypatch)
+    _submit(worker, 7)
+    _submit(worker, 8)
+    final = LlmResponse(request_id=100,
+                        result=LlmResult(b"",
+                                         PyResult(prompt_len=1,
+                                                  max_new_tokens=1),
+                                         is_final=True),
+                        client_id=7)
+    responses = [
+        final,
+        LlmResponse(request_id=100, error_msg=RankFailureError(), client_id=7),
+        LlmResponse(request_id=101, error_msg=RankFailureError(), client_id=8),
+    ]
+    if route == "in_process":
+        worker.result_queue = None
+        queues = [Queue(), Queue()]
+        worker._results[7].queue, worker._results[8].queue = queues
+        helper.handle_for_worker(responses)
+        delivered = [
+            queue.get_nowait() for queue in queues for _ in range(queue.qsize())
+        ]
+    else:
+        if route == "postprocessing":
+            worker.result_queue = None
+        helper.handle_for_ipc_batched(responses)
+        queues = [*worker.postproc_queues, worker.result_queue]
+        delivered = [
+            item.rsp if isinstance(item, PostprocWorker.Input) else item
+            for queue in queues if queue is not None
+            for call in queue.put.call_args_list for item in call.args[0]
+        ]
+
+    delivered.sort(key=lambda response: response.client_id)
+    assert [response.client_id for response in delivered] == [7, 8]
+    assert delivered[0] is final
+    assert isinstance(delivered[1].error_msg, RankFailureError)
+    assert worker.outstanding_requests() == {}

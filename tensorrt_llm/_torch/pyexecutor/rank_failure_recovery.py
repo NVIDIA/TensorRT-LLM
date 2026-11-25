@@ -731,8 +731,9 @@ class RankFailureRecovery:
         if not record.is_joining(self.rank):
             self._executor.retire_inflight_batch()
         # Publish the responses staged for the next GPU wait. The worker thread ends the requests
-        # whose final response they hold later, so the read below may still list them; the commit
-        # reads the outstanding requests again and does not count those requests as lost.
+        # whose final response they hold later, so the read below may still list them. The commit
+        # reads the outstanding requests again, and the worker thread drops the error of a request
+        # whose final response it handles after the commit.
         self._executor.flush_staged_responses()
         recomputed = self._recompute_interrupted_requests()
         if record.joining_mask:
@@ -798,7 +799,8 @@ class RankFailureRecovery:
         """Resume serving after the commit and fail the requests that no active rank holds.
 
         A request counts as lost only while it is still outstanding at the commit, so a final
-        response that the worker handled during the install does not make it count.
+        response that the worker handled during the install does not make it count. The error
+        follows any final response still queued, and the worker drops it.
         """
         self._set_phase(_Phase.SERVING, f"generation {record.generation} is committed")
         # The joining ranks read their epoch before they replied INSTALLED.
