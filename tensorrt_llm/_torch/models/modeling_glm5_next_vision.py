@@ -70,7 +70,7 @@ else:  # pragma: no cover - CPU / no-flashinfer environments
     flashinfer_apply_rope_with_cos_sin_cache_inplace = None
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
-from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
@@ -523,11 +523,11 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
 
         cos, sin = self.rot_pos_emb(grid_rows)
         hidden_states = self.patch_embed(pixel_values.to(device=self.device))
-        self.attn_metadata = prepare_encoder_attn_metadata(
-            seq_lens, self.attn_metadata, max_seq_len=self._fixed_max_seq_len
-        )
         hidden_states = self._run_blocks(
-            {"x": hidden_states, "cos": cos, "sin": sin}, self.attn_metadata
+            {"x": hidden_states, "cos": cos, "sin": sin},
+            self.attn_metadata,
+            seq_lengths=seq_lens,
+            max_seq_len=self._fixed_max_seq_len,
         )["x"]
         return self.project_merged(hidden_states)
 

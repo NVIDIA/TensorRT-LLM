@@ -445,7 +445,9 @@ def test_packed_automatic_budgets(cap: int, count: int, contexts: int) -> None:
     assert budgets[-1] == cap
     if cap >= 512:
         assert budgets[:5] == [256, 320, 384, 448, 512]
-    assert {bucket.num_contexts for bucket in runner._buckets} == {contexts}
+    assert [bucket.num_contexts for bucket in runner._buckets] == [
+        min(contexts, max(1, budget // 128)) for budget in budgets
+    ]
 
 
 @pytest.mark.cpu_only

@@ -499,36 +499,35 @@ def test_qwen3vl_init_preserves_caller_quant_config():
     assert model.mm_encoder.model_config.quant_config.quant_algo is None
 
 
-def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fixed_max_seq_len = 65_536
-    seq_lens = [256, 1024]
-    metadata = object()
-    calls = []
-
-    def capture_prepare_attn_metadata(
-        actual_seq_lens: List[int],
-        actual_metadata: object,
-        *,
-        max_seq_len: int,
-    ) -> object:
-        calls.append((actual_seq_lens, actual_metadata, max_seq_len))
-        return actual_metadata
-
-    monkeypatch.setattr(
-        modeling_qwen3vl,
-        "prepare_encoder_attn_metadata",
-        capture_prepare_attn_metadata,
-    )
+@pytest.mark.cpu_only
+def test_qwen3_vision_replay_defers_eager_metadata_and_preserves_length_limit() -> None:
     model = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(model)
-    model.set_attn_max_seq_len(fixed_max_seq_len)
+    model.set_attn_max_seq_len(1024)
+    runner = model._blocks_graph_runner = MagicMock()
+    metadata = MagicMock(is_cuda_graph=False, seq_lens_cuda=torch.empty(0, dtype=torch.int32))
+    model._encoder_graph_fn = lambda inputs, _: inputs
+    inputs = {"x": torch.ones(1)}
+    lengths = [256, 512]
 
-    result = model.prepare_attn_metadata(seq_lens, metadata)
+    def run(seq_lengths: list[int]):
+        return model._run_blocks(
+            inputs, metadata, seq_lengths=seq_lengths, max_seq_len=model._fixed_max_seq_len
+        )
 
-    assert result is metadata
-    assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
+    assert run(lengths) is runner.maybe_run.return_value
+    runner.maybe_run.assert_called_once_with(inputs=inputs, seq_lengths=lengths)
+    metadata.prepare_encoder_only.assert_not_called()
+
+    runner.maybe_run.return_value = None
+    assert run(lengths) is inputs
+    assert metadata.seq_lens.tolist() == lengths
+    assert metadata.max_seq_len == model._fixed_max_seq_len
+    metadata.prepare_encoder_only.assert_called_once()
+
+    runner.maybe_run.return_value = inputs
+    with pytest.raises(ValueError, match="exceeds the configured maximum"):
+        run([1025])
 
 
 @pytest.mark.cpu_only
@@ -552,7 +551,8 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
     vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(vision)
     vision.patch_embed = patch_embed
-    vision.attn_metadata = object()
+    vision.attn_metadata = MagicMock(is_cuda_graph=False, seq_lens_cuda=torch.empty(0))
+    vision.set_attn_max_seq_len(64)
     vision._blocks_graph_runner = None
     vision._rope_position_ids_buffer = None
     vision.rot_pos_emb = lambda grid: (
@@ -560,7 +560,6 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
         torch.empty(6, 0),
     )
     vision.fast_pos_embed_interpolate = lambda grid: torch.zeros_like(expected)
-    vision.prepare_attn_metadata = lambda seq_lens, metadata: metadata
 
     class AddOne(torch.nn.Module):
         def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
@@ -577,6 +576,7 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
 
     actual, deepstack = vision(pixel_values, torch.tensor([[1, 2, 3]]))
 
+    assert vision.attn_metadata.max_seq_len == 64
     torch.testing.assert_close(actual, expected + 2)
     torch.testing.assert_close(deepstack[0], expected + 1)
     torch.testing.assert_close(deepstack[1], (expected + 2) * 2)

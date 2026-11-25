@@ -219,7 +219,10 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
     def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
         if not self._enable_padding:
             return super().capture_buckets(max_batch_size, max_num_tokens)
-        return [EncoderGraphKey(t, max_batch_size) for t in _token_budgets(max_num_tokens)]
+        return [
+            EncoderGraphKey(t, min(max_batch_size, max(1, t // 128)))
+            for t in _token_budgets(max_num_tokens)
+        ]
 
     def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
         if not self._enable_padding:

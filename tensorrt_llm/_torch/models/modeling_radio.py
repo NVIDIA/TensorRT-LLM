@@ -22,8 +22,8 @@ from tensorrt_llm._torch.attention.backends import \
     interface as attention_interface
 from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
-    MultimodalEncoderMixin, prepare_encoder_attn_metadata)
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -806,12 +806,10 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         else:
             seq_lengths = [shape[1]] * shape[0]
 
-        attn_metadata = prepare_encoder_attn_metadata(
-            seq_lengths,
-            self.attn_metadata,
-            max_seq_len=self._fixed_max_seq_len)
-
-        x = self._run_blocks({"x": x.flatten(0, 1)}, attn_metadata)["x"]
+        x = self._run_blocks({"x": x.flatten(0, 1)},
+                             self.attn_metadata,
+                             seq_lengths=seq_lengths,
+                             max_seq_len=self._fixed_max_seq_len)["x"]
         return self.norm(x.reshape(shape))
 
     def _encoder_graph_fn(

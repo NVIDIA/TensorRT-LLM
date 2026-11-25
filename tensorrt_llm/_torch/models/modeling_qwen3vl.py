@@ -62,7 +62,7 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalModelMixin,
@@ -1240,20 +1240,6 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             return pieces[0]
         return torch.cat(pieces, dim=0)
 
-    def prepare_attn_metadata(
-        self,
-        seq_lens: List[int],
-        attn_metadata: Optional[AttentionMetadata] = None,
-    ) -> AttentionMetadata:
-        if attn_metadata is None:
-            raise RuntimeError(
-                "Vision encoder AttentionMetadata is not initialized. "
-                "It must be set up before the encoder forward runs."
-            )
-        return prepare_encoder_attn_metadata(
-            seq_lens, attn_metadata, max_seq_len=self._fixed_max_seq_len
-        )
-
     def _encoder_graph_fn(
         self, inputs: TypingMapping[str, torch.Tensor], attn_metadata: AttentionMetadata
     ) -> dict[str, torch.Tensor]:
@@ -1284,7 +1270,6 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         seq_lens: List[int] = []
         for t, h, w in grid_rows:
             seq_lens.extend([h * w] * t)
-        self.attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
         # `rot_pos_emb` returns (cos, sin) gathered from the pre-computed
         # cos/sin buffers -- no `.cos()`/`.sin()` kernels in forward.
@@ -1330,6 +1315,8 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                 "rope_position_ids": rope_position_ids,
             },
             self.attn_metadata,
+            seq_lengths=seq_lens,
+            max_seq_len=self._fixed_max_seq_len,
         )
         # Features follow block order; merger weights follow the checkpoint's index order.
         deepstack = [

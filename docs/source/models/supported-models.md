@@ -218,8 +218,11 @@ to the range 1–32.
 
 With padding enabled, packed encoders share each token budget across context counts.
 The budgets start at 256 (or the cap if smaller), grow through 320, 384, 448, 512, 640,
-and continue with the same three significant binary digits up to the cap. Parakeet pads
-the item and time axes separately so convolutions stay within a clip.
+and continue with the same three significant binary digits up to the cap. Each automatic
+budget `T` fits up to `min(max_batch_size, max(1, T // 128))` contexts. A video with
+many short frames may need a larger budget to fit its frame count. Use an explicit
+bucket to capture that frame count at a smaller token budget. Parakeet pads the item
+and time axes separately so convolutions stay within a clip.
 
 To choose capacities explicitly, set `buckets` to pairs of real token and context
 capacities, for example `[[256, 1], [512, 2]]`. Explicit buckets replace the automatic

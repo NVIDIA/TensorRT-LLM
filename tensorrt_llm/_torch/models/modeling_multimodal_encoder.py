@@ -191,19 +191,37 @@ class MultimodalEncoderMixin:
             f"{type(self).__name__} does not support encoder CUDA graphs")
 
     def _run_blocks(
-            self, inputs: dict[str, torch.Tensor],
-            attn_metadata: AttentionMetadata | None) -> dict[str, torch.Tensor]:
+        self,
+        inputs: dict[str, torch.Tensor],
+        attn_metadata: AttentionMetadata | None,
+        *,
+        seq_lengths: list[int] | None = None,
+        max_seq_len: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        """Packed towers can pass host lengths to prepare eager metadata only on a miss."""
         with torch_compiling(False):
-            if self._blocks_graph_runner is not None:
-                if attn_metadata is None:
-                    batch, time = next(iter(inputs.values())).shape[:2]
-                    seq_lengths = [time] * batch
-                else:
-                    seq_lengths = attn_metadata.seq_lens.tolist()
-                outputs = self._blocks_graph_runner.maybe_run(
-                    seq_lengths=seq_lengths, inputs=inputs)
+            runner = self._blocks_graph_runner
+            if runner is not None and (seq_lengths is None or
+                                       (seq_lengths
+                                        and max(seq_lengths) <= max_seq_len)):
+                lengths = seq_lengths
+                if lengths is None:
+                    if attn_metadata is None:
+                        batch, time = next(iter(inputs.values())).shape[:2]
+                        lengths = [time] * batch
+                    else:
+                        lengths = attn_metadata.seq_lens.tolist()
+                outputs = runner.maybe_run(seq_lengths=lengths, inputs=inputs)
                 if outputs is not None:
                     return outputs
+            if seq_lengths is not None:
+                if attn_metadata is None:
+                    raise RuntimeError(
+                        "Encoder attention metadata must be initialized before forward"
+                    )
+                prepare_encoder_attn_metadata(seq_lengths,
+                                              attn_metadata,
+                                              max_seq_len=max_seq_len)
             return self._encoder_graph_fn(inputs, attn_metadata)
 
     def _build_blocks_graph_runner(
@@ -267,8 +285,9 @@ class MultimodalEncoderMixin:
         run_blocks = self._run_blocks
 
         def observe_blocks(
-                inputs: dict[str, torch.Tensor],
-                attn_metadata: AttentionMetadata | None
+            inputs: dict[str, torch.Tensor],
+            attn_metadata: AttentionMetadata | None,
+            **kwargs,
         ) -> dict[str, torch.Tensor]:
             nonlocal runner, device
             if runner is None:
@@ -276,7 +295,7 @@ class MultimodalEncoderMixin:
                     config, inputs, attn_metadata)
                 if device is None:
                     device = next(iter(inputs.values())).device
-            return run_blocks(inputs, attn_metadata)
+            return run_blocks(inputs, attn_metadata, **kwargs)
 
         # Observe the eager prelude only during this encode. Serving has no pending capture state.
         self._run_blocks = observe_blocks
