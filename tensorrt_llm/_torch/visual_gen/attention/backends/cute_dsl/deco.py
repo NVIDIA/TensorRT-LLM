@@ -22,6 +22,8 @@ like any other backend.
 
 * Kernel calls: one sequence attending itself, bfloat16 q, k and v of one shape
   ``[B, S, H, 128]`` on a CUDA device, at least ``MIN_SEQ_LEN`` rows, no mask other than padding.
+  The backend runs the kernel package's default compensation rank of 32.
+  ``QuantAttentionConfig`` does not offer a rank field yet.
 * VANILLA calls (unquantized): every other call, that is cross-attention, a causal
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
