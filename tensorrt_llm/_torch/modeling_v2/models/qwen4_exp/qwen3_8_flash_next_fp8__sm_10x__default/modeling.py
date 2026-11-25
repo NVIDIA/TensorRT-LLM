@@ -6879,6 +6879,10 @@ class ModelingV2Qwen38FlashNextFp8Sm10xDefault(
     # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
     supports_nvfp4_kv_cache = True
 
+    #: PLE seeds a fresh request's n-gram history and conv state in its prefill only, so the
+    #: engine must not run a one-token prompt as a decode row.
+    resets_recurrent_state_in_context = True
+
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:
         """V2: the only KV cache manager with PLE state and QSA's index and position planes."""

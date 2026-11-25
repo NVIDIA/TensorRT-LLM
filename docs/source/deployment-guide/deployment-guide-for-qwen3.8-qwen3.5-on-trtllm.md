@@ -183,6 +183,10 @@ decode, enables MTP with six draft tokens on decode, and offloads the KV cache
 to host memory. The earlier Qwen3.5 general-deployment profile and the Qwen3.8
 profiles above target different workloads and checkpoints.
 
+For the newer TensorRT LLM 1.4 and Dynamo 1.8 profiles with the remote KV cache
+level, see
+[Qwen3.5 GB300 NVL72 AgentX Disaggregated Serving with Remote KV Cache](#qwen35-gb300-nvl72-agentx-disaggregated-serving-with-remote-kv-cache).
+
 The serving settings come from [InferenceX #4195](https://github.com/SemiAnalysisAI/InferenceX/pull/4195)
 at commit `76fde8ec76a8573c350b553f7c2583088bf6558f`. Its
 [sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39016296529)
@@ -435,6 +439,388 @@ use, and natural MTP acceptance on your own traffic before selecting a topology.
 InferenceX runner setup, benchmark-client placement, trace selection, concurrency
 sweeps, Enroot configuration, and synthetic acceptance are not required to run
 these production serving commands.
+
+## Qwen3.5 GB300 NVL72 AgentX Disaggregated Serving with Remote KV Cache
+
+Use these profiles for long, multi-turn agentic **text** conversations with
+`nvidia/Qwen3.5-397B-A17B-NVFP4-V2` on GB300 NVL72 with TensorRT LLM 1.4 and
+Dynamo 1.8. Every profile runs TEP2 prefill workers with MTP1 and decode workers
+with MTP6. Most profiles add the
+[remote KV cache level](../features/kvcache.md#remote-cache-level-in-donated-host-memory-prototype):
+decode ranks donate host memory they do not use, and prefill ranks keep more
+reusable conversation prefixes in it, below their own host cache.
+
+The serving settings come from [InferenceX #5147](https://github.com/SemiAnalysisAI/InferenceX/pull/5147)
+(config `qwen3.5-fp4-gb300-dynamo-trt-agentic-disagg`), tested at commit
+`3735ed9e27233597c1bb62508a5e3ceb2717bd99`. Its performance jobs use synthetic
+speculative acceptance; these production commands leave acceptance to the model.
+Those throughput results do not establish production throughput with natural
+acceptance, or validate these Docker/MPI launch commands. To reproduce the
+published points exactly, use the InferenceX harness at that commit.
+
+### AgentX Profiles
+
+Three profiles cover the operating range. Each has a prefill and a decode
+engine-argument file in `examples/configs/curated`:
+
+| Profile | Files | Prefill | Decode | KV cache below GPU | Admission and routing | Four-GPU nodes |
+|---|---|---|---|---|---|---:|
+| Remote-KV TEP8 | `qwen3.5-gb300-agentx-tep8-{prefill,decode}.yaml` | 1 × TEP2 | 1 × TEP8 (TP8, MoE TP2/EP4), batch 16 | Prefill: 168 GiB host per rank plus a 200 GiB remote level; decode donates 160 GiB per rank (fabric transport) | Priority by predicted reply length | 3 |
+| High-throughput DEP8 | `qwen3.5-gb300-agentx-dep8-{prefill,decode}.yaml` | 4 × TEP2 | 1 × DEP8 (attention DP, EP8), batch 48 | Prefill: 168 GiB host per rank plus a 160 GiB remote level; decode donates 176 GiB per rank (NIXL transport) | First come, first served; least-loaded decode routing | 4 |
+| Low-latency TEP16 | `qwen3.5-gb300-agentx-tep16-{prefill,decode}.yaml` | 1 × TEP2 | 1 × TEP16 (TP16, MoE TP2/EP8), batch 1 | 128 GiB host per rank on both roles; no remote level | Priority by predicted reply length | 5 |
+
+All prefill workers use `tensor_parallel_size: 2` and
+`moe_expert_parallel_size: 2` without attention DP, a 16384-token
+`max_num_tokens`, breakable prefill CUDA graphs captured from 1 through 16384
+tokens (`prefill_cuda_graph_backend: breakable`), `allreduce_strategy: TWOSHOT`,
+the `CUTEDSL` MoE backend, NVFP4 GEMM backends restricted to `cutlass`,
+`cublaslt`, `cutedsl`, and `cuda_core`, the `MAX_UTILIZATION` capacity scheduler
+with `shortest_uncached_first` context scheduling, FP8 KV cache with 64-token
+blocks and `pool_ratio: [0.2, 0.8]`, KV cache manager V2, and block reuse per
+conversation with three retained turns and branch snapshots. They disable
+generation CUDA graphs (`cuda_graph_config: null`) because they only run
+context requests.
+
+Decode workers keep `GUARANTEED_NO_EVICT` scheduling, padded CUDA graphs for
+every batch size up to `max_batch_size` (a coarser list on DEP8),
+`stream_interval: 20`, `replicate_embedding: true`, `max_seq_len: 262148`, and
+`kv_cache_config.avg_seq_len: 102150`, a cache-sizing input for the source
+traffic; revisit it when your conversation lengths differ. The TEP decode
+workers use the `TRTLLM` MoE backend with low-precision combine and keep the
+explicit transfer budget `cache_transceiver_config.max_tokens_in_buffer:
+4194304`; without it, the generation side skips its transfer window. The DEP8
+worker uses the `CUTEDSL` MoE backend, LM-head TP in attention DP, and
+`free_gpu_memory_fraction: 0.85`. With priority admission
+(`waiting_queue_policy: priority`), a request that has waited
+`waiting_queue_max_wait_s` goes ahead of newer ones; keep that value at or below
+the prefill `kv_transfer_timeout_ms` (600 s). Those profiles also release
+finished requests' KV cache one step later, overlapping the release with GPU work
+(`defer_generation_only_release: true`).
+
+### AgentX Runtime and Host-Memory Budget
+
+Use the exact versions together:
+
+| Component | Version |
+|---|---|
+| TensorRT LLM container | `nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4.dev202611170009` |
+| `ai-dynamo` and `ai-dynamo-runtime` wheels | `1.8.0.dev20261119` |
+| Checkpoint | `nvidia/Qwen3.5-397B-A17B-NVFP4-V2` |
+
+The configuration files must come from your TensorRT LLM checkout; the container
+does not bundle them. Requalify the checkpoint, configuration, and transport
+together when upgrading.
+
+Host memory bounds these profiles. Each rank reserves its host cache, and each
+donating rank holds its donation for the life of its process:
+
+| Node role | Reservation per four-GPU node |
+|---|---:|
+| Two TEP2 prefill workers, 168 GiB host cache per rank | 672 GiB |
+| TEP8 decode ranks donating 160 GiB each | 640 GiB |
+| DEP8 decode ranks donating 176 GiB each | 704 GiB |
+| Host-cache profile ranks, 128 GiB each | 512 GiB |
+
+The source system allocates 898 GiB of host memory to each four-GPU node, so the
+remainder covers weights, loading, transfer staging, the frontend, and the
+operating system. A prefill rank's remote level lives in the donors' memory, not
+on its own node, but the donors' published memory must cover every claim. Check
+the budget of your own nodes before raising a cache size or a donation.
+
+Use a GB300 NVL72 system with working GPU peer access and NIXL/UCX transport. The
+fabric transport needs prefill and decode nodes in the same multi-node NVLink
+domain. The DEP8 profile uses the NIXL transport (RDMA) for the remote level
+instead: on the source cluster, host-memory fabric handles exported from some
+nodes could not be imported, and its 4P1D layout has too little spare donation
+to lose one decode node's donors. Every rank that shares a rendezvous directory
+must use the same transport. Have reachable etcd and NATS services before
+starting Dynamo; see the
+[Dynamo CLI installation guide](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/cli/installation/install-dynamo.mdx).
+
+The remote level is a prototype. Prefill workers use tensor parallelism without
+attention DP, so if a donor process exits, the claiming prefill workers stop
+with `RemoteMemError`. Start and stop the prefill and decode workers that share
+a rendezvous directory together, without independent restarts or scale-down of
+the donating workers. See the
+[failure behavior](../features/kvcache.md#remote-cache-level-in-donated-host-memory-prototype)
+of the remote level before deploying it.
+
+### Prepare the AgentX Container
+
+Download the exact V2 checkpoint into a local directory on every node. Run the
+following from the TensorRT LLM checkout on each node, replacing `MODEL_DIR` and
+`SHARED_DIR`. `SHARED_DIR` must be a directory on a file system that every node
+sees and that only you can write:
+
+```bash
+export MODEL_DIR=/absolute/path/to/Qwen3.5-397B-A17B-NVFP4-V2
+export SHARED_DIR=/absolute/shared/path/qwen35-agentx
+docker run --rm -it --name qwen35-agentx \
+    --gpus all --network host --ipc host --ulimit memlock=-1 \
+    --mount type=bind,src="$MODEL_DIR",dst=/models/qwen35,readonly \
+    --mount type=bind,src="$PWD",dst=/opt/trtllm-recipes,readonly \
+    --mount type=bind,src="$SHARED_DIR",dst=/shared \
+    nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc4.dev202611170009 \
+    /bin/bash
+```
+
+Inside each container, install the matching public wheels:
+
+```bash
+python3 -m pip install --pre \
+    --index-url https://pypi.org/simple --extra-index-url https://pypi.nvidia.com \
+    ai-dynamo==1.8.0.dev20261119 ai-dynamo-runtime==1.8.0.dev20261119
+python3 -c 'import importlib.metadata as m; print({p: m.version(p) for p in ("tensorrt-llm", "ai-dynamo", "ai-dynamo-runtime")})'
+```
+
+On one node, write the Dynamo router policy that the frontend and the decode
+workers of the priority-admission profiles share:
+
+```bash
+cat > /shared/router-policy.yaml <<'EOF'
+request_classifier:
+  type: output_length_prediction
+EOF
+```
+
+With it, the Dynamo KV router predicts each request's reply length and forwards
+it as the request's TensorRT LLM priority, which decode workers with
+`waiting_queue_policy: priority` admit by.
+
+Open a shell in the container for each of the frontend, prefill, and decode
+commands below with `docker exec -it qwen35-agentx /bin/bash`. Run this setup in
+**each shell**, and replace the service endpoints when they run on another host:
+
+```bash
+export MODEL_PATH=/models/qwen35
+export CONFIG_DIR=/opt/trtllm-recipes/examples/configs/curated
+export ETCD_ENDPOINTS=http://127.0.0.1:2379
+export NATS_SERVER=nats://127.0.0.1:4222
+export DYN_NAMESPACE=qwen35-agentx
+export DYN_DISCOVERY_BACKEND=etcd
+export DYN_REQUEST_PLANE=tcp
+export KV_RENDEZVOUS_DIR=/shared/kv-rendezvous/deployment-001
+source "$CONFIG_DIR/qwen3.5-gb300-agentx.env"
+```
+
+`remote_cache_config.directory` in the configuration files is
+`${KV_RENDEZVOUS_DIR}`; TensorRT LLM expands it and refuses to start when it is
+unset. Use a new directory for each deployment, shared by exactly the workers that
+start and stop together. Donor files hold memory registration keys or fabric
+handles, so TensorRT LLM creates the directory with mode 0700 and rejects one that
+another user owns or can write.
+
+The [worker environment](../../../examples/configs/curated/qwen3.5-gb300-agentx.env)
+sets the source profile's allocator, CUDA launch, garbage-collection,
+weight-staging, transfer, MPI collective, and UCX polling settings. It includes
+an intentionally empty `MIMALLOC_PURGE_DELAY`. Keep the draft head and its
+precision as shipped with the V2 checkpoint. Never set
+`TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` in production or accuracy runs.
+
+On the source nodes, GPU dma-buf registration failed because each GPU and NIC
+sat in different IOMMU groups. If NIXL fails to register GPU memory on your
+system for that reason, also export `UCX_IB_DIRECT_NIC=n` and
+`UCX_CUDA_COPY_DMABUF=no` in the worker shells, so that UCX registers GPU memory
+through `nvidia_peermem` instead. Leave them unset on systems where dma-buf
+registration works.
+
+### Start the AgentX Frontend and Workers
+
+The commands below start the remote-KV TEP8 profile. In the frontend shell:
+
+```bash
+export ETCD_LEASE_TTL=120
+export DYN_TOKENIZER_CACHE=1
+export DYN_TOKENIZER_CACHE_BYTES=8000000000
+export DYN_TOKENIZER=fastokens
+export DYN_TOKEN_IDS_AS_BYTES=1
+python3 -m dynamo.frontend --http-port 8000 \
+    --router-mode kv --router-session-affinity-ttl-secs 14400 \
+    --router-policy-config /shared/router-policy.yaml
+```
+
+The frontend builds its router plugins from its own policy at startup, so start
+it with the policy before the decode workers that advertise the classifier.
+
+In the prefill shell, on a prefill node:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export DYN_SYSTEM_PORT=8081
+export TRTLLM_DISAGG_ROLE=context
+export CUDA_SCALE_LAUNCH_QUEUES=4x
+export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
+export NCCL_MIN_NCHANNELS=64
+export NCCL_MAX_NCHANNELS=64
+export UCX_RC_VERBS_TIMEOUT=4s
+export UCX_KEEPALIVE_INTERVAL=60s
+export DYN_ENGINE_CONV_AFFINITY=1
+export DYN_ROUTER_MODE=kv
+export DYN_ROUTER_SESSION_AFFINITY_TTL_SECS=14400
+mpirun --allow-run-as-root -np 2 --bind-to none \
+    trtllm-llmapi-launch python3 -m dynamo.trtllm \
+    --model "$MODEL_PATH" --disaggregation-mode prefill \
+    --extra-engine-args "$CONFIG_DIR/qwen3.5-gb300-agentx-tep8-prefill.yaml" \
+    --publish-metrics
+```
+
+In the decode shell, for one TEP8 worker across two decode nodes:
+
+```bash
+export DYN_SYSTEM_PORT=8082
+export UCX_RC_VERBS_TIMEOUT=4s
+export UCX_KEEPALIVE_INTERVAL=60s
+export DYN_ROUTER_MODE=kv
+export DYN_ROUTER_POLICY_CONFIG=/shared/router-policy.yaml
+mpirun --allow-run-as-root -np 8 --bind-to none \
+    trtllm-llmapi-launch python3 -m dynamo.trtllm \
+    --model "$MODEL_PATH" --disaggregation-mode decode \
+    --extra-engine-args "$CONFIG_DIR/qwen3.5-gb300-agentx-tep8-decode.yaml" \
+    --publish-metrics
+```
+
+`TRTLLM_DISAGG_ROLE=context` is required on every prefill worker of these
+profiles. Ranks started by `trtllm-llmapi-launch` do not receive a server role;
+without it, a prefill worker with MTP also reserves the GDN replay-state region
+that only decode uses, and with `pool_ratio` set, startup fails with
+`initial_pool_ratio length must match number of layer groups`.
+`CUDA_SCALE_LAUNCH_QUEUES`, `TRTLLM_SKIP_KV_CACHE_ESTIMATION`, and the NCCL
+channel counts are prefill-only settings of the source profile.
+`DYN_ENGINE_CONV_AFFINITY=1` forces the TensorRT LLM worker's
+conversation-affinity routing on regardless of engine-config detection. The UCX keep-alive and RC timeout settings apply to the
+remote-KV profiles; the source does not set them on the host-cache profile.
+
+The decode workers' `DYN_ROUTER_MODE` advertises a router configuration that
+overrides the frontend's routing for the decode worker set only; the frontend
+itself always runs with `--router-mode kv`. `DYN_ROUTER_POLICY_CONFIG` must match
+the frontend's `--router-policy-config`: a decode worker set that advertises the
+classifier fails to register unless the frontend has built it too, so set both or
+neither. Start the donating decode workers
+and the claiming prefill workers together. A claimant waits up to 900 seconds
+(`level.donor_wait_timeout_s`) for the donors in `level.expected`, and fails at
+once when the reported donors cannot cover the claims.
+
+The container runs as root; omit `--allow-run-as-root` when using a non-root user.
+The rank count of each worker must match
+`tensor_parallel_size * pipeline_parallel_size`; launch a separate MPI group for
+each replica, and do not combine replicas into a single MPI group. Use disjoint
+GPU masks and distinct system ports for colocated workers. Run each TP8 worker
+across two four-GPU nodes and each TP16 worker across four, with one rank per
+GPU, and start every rank with the same mounts and environment, for example with
+a cluster launcher that propagates the environment or Open MPI's `-x NAME` for
+each exported variable. Replicas share the discovery endpoints, namespace, served
+model name, and frontend.
+
+The source launcher runs each worker rank on the CPUs of its GPU's NUMA node and
+prefers that node's memory (`numactl --cpunodebind=<node> --preferred=<node>`),
+and keeps `TLLM_NUMA_AWARE_WORKER_AFFINITY=1`. To do the same, prefix
+`trtllm-llmapi-launch` with a per-rank wrapper that resolves the node from the
+rank's GPU, for example:
+
+```bash
+cat > /shared/numa-preferred.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+IFS=, read -ra gpus <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+gpu=${gpus[${OMPI_COMM_WORLD_LOCAL_RANK:-0}]}
+bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$gpu")
+node=$(cat "/sys/bus/pci/devices/$(printf '%04x:%s' "0x${bus%%:*}" "${bus#*:}" | tr 'A-F' 'a-f')/numa_node")
+exec numactl --cpunodebind="$node" --preferred="$node" "$@"
+EOF
+chmod +x /shared/numa-preferred.sh
+```
+
+Check the NUMA topology of your system before applying that binding.
+
+Both roles use `--publish-metrics` with `enable_iter_perf_stats: true`,
+`iter_perf_stats_interval: 40`, and
+`kv_cache_config.iteration_stats_interval: 40`. Keep `return_perf_metrics: false`
+and `kv_cache_config.event_buffer_max_size: 0`; metrics publication does not
+require KV event publication. These profiles use session affinity with KV events
+off. Send a stable `x-dynamo-session-id` for every turn of a conversation. The
+router's idle TTL is 14400 seconds; reuse requires the retained cache entries to
+remain available.
+
+To run the other profiles, replace the configuration files and apply these
+role differences:
+
+* **High-throughput DEP8:** use `qwen3.5-gb300-agentx-dep8-{prefill,decode}.yaml`,
+  start four TEP2 prefill workers, two per prefill node, and one eight-rank decode
+  worker across two nodes. Start the frontend with `--router-mode kv` and without
+  `--router-policy-config`, and set `DYN_ROUTER_MODE=least-loaded` without
+  `DYN_ROUTER_POLICY_CONFIG` on the decode worker, which overrides the frontend's
+  KV routing for the decode worker set. Both roles use the 2048 MiB transfer-agent bounce buffer
+  (`kv_cache_bounce_size_mb: 2048`) with
+  `agent_bounce_params.max_average_descriptor_size: 64KB`.
+* **Low-latency TEP16:** use `qwen3.5-gb300-agentx-tep16-{prefill,decode}.yaml`,
+  start one TEP2 prefill worker and one sixteen-rank decode worker across four
+  nodes, and leave `UCX_RC_VERBS_TIMEOUT` and `UCX_KEEPALIVE_INTERVAL` unset on
+  both roles. `KV_RENDEZVOUS_DIR` is not used.
+
+### Map the InferenceX Points
+
+InferenceX #5147 measured thirteen points. Each one uses the files of the
+profile listed below with the stated changes; unlisted settings match the
+profile's files. "Base graphs" means CUDA graph batch sizes 1 through 16, then
+even sizes through 32, then 40, 48, 56, and 64. On remote points, set the
+prefill `kv_cache_config.remote_cache_config.level.expected` to the job's
+donating rank count and the total claim of all prefill ranks shown (the source
+rounded each 200 GiB claim up to 203 GiB and each 160 GiB claim to 162 GiB).
+
+| Point (prefill × TEP2, decode workers) | InferenceX concurrency | Profile files | Decode `max_batch_size` and CUDA graphs | Decode admission | `level.expected` (`num_donors`, `claim_size`) | Nodes |
+|---|---:|---|---|---|---|---:|
+| 1P1D, 1 × TEP8 | 240 | TEP8, unchanged | 16, sizes 1-16 | Priority, 120 s cap | 8, 435939180544 | 3 |
+| 1P2D, 2 × TEP8 | 48 | TEP8 | 4, sizes 1-4 | Priority, 60 s cap | 16, 435939180544 | 5 |
+| 1P2D, 2 × TEP8 | 200 | TEP8 | 5, sizes 1-5 | Priority, 120 s cap | 16, 435939180544 | 5 |
+| 2P1D, 1 × TEP8 | 192 | TEP8 | 64, base graphs | FCFS, least-loaded, no deferred release | 8, 871878361088 | 3 |
+| 2P1D, 1 × TEP8 | 352 | TEP8 | 64, base graphs | Priority, 60 s cap, no deferred release | 8, 871878361088 | 3 |
+| 2P1D, 1 × TEP8 | 416 | TEP8 | 64, base graphs | Priority, 60 s cap, no deferred release | 8, 871878361088 | 3 |
+| 2P3D, 3 × TEP8 | 384 | TEP8 | 8, sizes 1-8 | Priority, 60 s cap | 24, 871878361088 | 7 |
+| 3P2D, 2 × TEP8 | 456 | TEP8 | 64, base graphs | FCFS, least-loaded, no deferred release | 16, 1307817541632 | 6 |
+| 3P2D, 2 × TEP8 | 512 | TEP8 | 32, base graphs through 32 | FCFS, least-loaded, no deferred release | 16, 1307817541632 | 6 |
+| 4P1D, 1 × DEP8 | 840 | DEP8, unchanged | 48, as in the file | FCFS, least-loaded | 8, 1391569403904 | 4 |
+| 1P1D, 1 × TEP16 | 32 | TEP16, unchanged | 1, size 1 | Priority, 120 s cap | Not used | 5 |
+| 1P2D, 2 × TEP8 | 96 | TEP8 decode, TEP16 prefill | 2, sizes 1-2 | Priority, 120 s cap | Not used | 5 |
+| 1P4D, 4 × TEP8 | 96 | TEP8 decode, TEP16 prefill | 1, size 1 | Priority, 60 s cap | Not used | 9 |
+
+"FCFS" removes `waiting_queue_policy` and `waiting_queue_max_wait_s`; "no
+deferred release" removes `defer_generation_only_release`. On FCFS points, start
+the frontend with `--router-mode kv` and without `--router-policy-config`, and set
+`DYN_ROUTER_MODE=least-loaded` without `DYN_ROUTER_POLICY_CONFIG` on the decode
+workers, which overrides the frontend's KV routing for the decode worker set. On the last two points, the decode workers replace
+`remote_cache_config` with `host_cache_size: 137438953472` (128 GiB) and leave
+the UCX keep-alive and RC timeout variables unset, as in the TEP16 profile.
+Two TEP2 prefill workers share a node; the node counts exclude the frontend,
+which shares a decode node. Per-point engine-argument and environment files
+generated from the InferenceX recipe are proposed in
+[#20788](https://github.com/NVIDIA/TensorRT-LLM/pull/20788) (pending).
+
+### Verify the AgentX Deployment
+
+Wait for worker initialization and model registration. Check readiness and the
+registered model, then issue a chat request through Dynamo:
+
+```bash
+curl --fail http://localhost:8000/health
+curl --fail http://localhost:8000/v1/models
+curl --fail http://localhost:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -H 'x-dynamo-session-id: qwen35-agentx-example-session' \
+    -d '{"model":"nvidia/Qwen3.5-397B-A17B-NVFP4-V2","messages":[{"role":"user","content":"Write a Python function that adds two integers."}],"max_tokens":256}'
+curl --fail http://localhost:8081/metrics
+curl --fail http://<decode-leader-node>:8082/metrics
+```
+
+After traffic, verify that both worker endpoints expose
+`trtllm_kv_cache_utilization` metrics. With `TLLM_LOG_LEVEL=INFO`, each rank logs
+the KV cache tiers it built: decode ranks of remote profiles log their donation,
+for example `KV cache manager v2 donates 160.00GiB of host memory to remote cache
+levels`, and prefill ranks log `KV cache manager v2 remote cache quota set to
+200.00GiB`. Send the full conversation history and the same session header on
+subsequent turns. Measure latency, throughput, host-memory use, and natural MTP
+acceptance on your own traffic before selecting a profile. InferenceX runner
+setup, benchmark-client placement, trace selection, concurrency sweeps, and
+synthetic acceptance are not required to run these production serving commands.
 
 ## Testing API Endpoint
 

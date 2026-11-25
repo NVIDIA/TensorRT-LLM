@@ -871,7 +871,8 @@ class TestGetNumTokensPerVideoTemporal:
         proc.video_target_num_patches = 256
         proc.video_maintain_aspect_ratio = True
 
-        frames = [Image.new("RGB", self.FRAME_SIZE) for _ in range(8)]
+        frames = np.zeros((8, h, w, 3), dtype=np.uint8)
+        frames.setflags(write=False)
 
         # Predicted count (used for token budget accounting).
         predicted = proc.get_num_tokens_per_video(video=frames)
@@ -879,6 +880,7 @@ class TestGetNumTokensPerVideoTemporal:
         # Actual count from the preprocessing pipeline.
         preprocessed = proc._process_videos_frames([frames])
         video_size_lst = preprocessed["video_size"]
+        assert proc._compute_video_shape_descriptor(frames) == video_size_lst[0]
         actual_tokens_per_frame_lst = proc._compute_token_numbers_per_video(video_size_lst)
         T = proc.video_temporal_patch_size
         num_tubelets = math.ceil(len(frames) / T) if T > 1 else len(frames)
