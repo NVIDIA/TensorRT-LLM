@@ -42,9 +42,9 @@ _OPTIONS_WITH_ARGUMENT = frozenset(("-W", "-X", "--check-hash-based-pycs"))
 
 
 def launch_target() -> tuple[Optional[str], Optional[str]]:
-    """How this interpreter was started, as ``(module, script_basename)``.
+    """How this interpreter was started, as ``(module, script_path)``.
 
-    Exactly one is set: ``module`` for ``-m pkg.mod``, ``script_basename`` for a
+    Exactly one is set: ``module`` for ``-m pkg.mod``, ``script_path`` for a
     script or console-script path. Both are ``None`` for ``-c`` and for a bare
     REPL. Parsing stops at the launch target, so a program's own arguments can
     never be mistaken for the interpreter's.
@@ -63,7 +63,7 @@ def launch_target() -> tuple[Optional[str], Optional[str]]:
         if token.startswith("-"):
             index += 1
             continue
-        return None, os.path.basename(token)
+        return None, token
     return None, None
 
 
@@ -78,7 +78,7 @@ def is_dependency_build_process() -> bool:
         return module.split(".", 1)[0] in {"pip", "build", "pyproject_hooks", "setuptools"}
     if script is None:
         return False
-    script = script.lower()
+    script = os.path.basename(script).lower()
     return script in {
         "pip",
         "pip3",
@@ -117,7 +117,12 @@ def is_ray_infra_process() -> bool:
         return module == "ray" or module.startswith(
             ("ray.autoscaler.", "ray.dashboard.", "ray._private.")
         )
-    return script in {"default_worker.py", "setup_worker.py"}
+    if script is None:
+        return False
+    if os.path.basename(script) in {"default_worker.py", "setup_worker.py"}:
+        return True
+    parts = os.path.normpath(script).split(os.sep)
+    return parts[-5:] == ["ray", "_private", "runtime_env", "agent", "main.py"]
 
 
 def is_mpi_pool_worker() -> bool:

@@ -65,6 +65,7 @@ from .schema import GIB, Group, Placement, signed_gib
 from .settings import full_mode
 
 __all__ = [
+    "KvSizingBudget",
     "MemoryPlan",
     "Reading",
     "RegionSample",
@@ -107,6 +108,79 @@ class StageSample:
 
 
 @dataclass(frozen=True)
+class KvSizingBudget:
+    """Device-wide inputs and applied deductions, in bytes, for one rank."""
+
+    #: Device capacity reported by CUDA.
+    device_total: int
+    #: Peak PyTorch allocation during the profiling forward pass.
+    torch_peak: int
+    #: Estimated device usage outside the PyTorch allocator during profiling.
+    outside_torch: int
+    #: Temporary KV pools credited back to the sizing budget.
+    temporary_kv: int
+    #: Multimodal encoder memory reserved before applying the fraction.
+    encoder: int
+    #: Fixed attention workspace reserved before applying the fraction.
+    attention: int
+    #: Sampler penalty workspace reserved before applying the fraction.
+    penalty: int
+    #: Configured share of the available memory assigned to KV.
+    fraction: float
+    #: Available bytes after the temporary pool credit and pre-fraction reserves.
+    before_fraction: int
+    #: Bytes assigned to KV by applying the fraction, before further deductions.
+    fraction_budget: int
+    #: PyTorch headroom reserved for the context-KV-only drafter.
+    drafter: int
+    #: Indexer logits workspace deducted from the fraction budget.
+    indexer: int
+    #: Whole bytes deducted for the context-MLA staging workspace.
+    context_mla: int
+    #: Balance after workspace deductions and before sizing applies user limits.
+    before_limits: int
+    #: Configured max_gpu_total_bytes passed to the KV cache manager.
+    final_budget: int
+
+    @property
+    def profiled_peak(self) -> int:
+        return self.torch_peak + self.outside_torch
+
+    @property
+    def non_kv_peak(self) -> int:
+        # Drafter tensors are already in the profiled peak; their reserve protects PyTorch headroom.
+        return self.device_total - self.before_fraction + self.indexer + self.context_mla
+
+    def render(self) -> list[str]:
+        other = (
+            self.device_total
+            - self.profiled_peak
+            + self.temporary_kv
+            - self.encoder
+            - self.attention
+            - self.penalty
+            - self.before_fraction
+        )
+        other_reserve = f", other {other / GIB:.3f}" if other else ""
+        return [
+            "  KV sizing budget (GiB):",
+            f"    Device total {self.device_total / GIB:.3f}; profiled peak {self.profiled_peak / GIB:.3f} "
+            f"(PyTorch allocated peak {self.torch_peak / GIB:.3f} + estimated outside PyTorch "
+            f"{self.outside_torch / GIB:.3f}); temporary KV added back {self.temporary_kv / GIB:.3f}",
+            f"    Reserves before fraction: multimodal encoder {self.encoder / GIB:.3f}, "
+            f"fixed attention {self.attention / GIB:.3f}, sampler penalty {self.penalty / GIB:.3f}{other_reserve}",
+            f"    Available {self.before_fraction / GIB:.3f} x {self.fraction:.6g} "
+            f"= {self.fraction_budget / GIB:.3f} for KV "
+            f"({(self.before_fraction - self.fraction_budget) / GIB:.3f} held back)",
+            f"    Reserves after fraction: drafter headroom {self.drafter / GIB:.3f}, "
+            f"indexer logits {self.indexer / GIB:.3f}, context MLA {self.context_mla / GIB:.3f}",
+            f"    Before sizing limits {self.before_limits / GIB:.3f}; deducted during sizing "
+            f"{(self.before_limits - self.final_budget) / GIB:.3f}; max_gpu_total_bytes passed to KV manager "
+            f"{self.final_budget / GIB:.3f} ({self.final_budget} bytes)",
+        ]
+
+
+@dataclass(frozen=True)
 class MemoryPlan:
     """KV cache sizing's plan, device-wide."""
 
@@ -114,6 +188,7 @@ class MemoryPlan:
     non_kv_peak: int
     #: PyTorch allocations made by the profiled forward pass, if profiled.
     activation: int | None
+    budget: KvSizingBudget | None = None
 
 
 @dataclass(frozen=True)
@@ -312,10 +387,14 @@ def baseline() -> dict[Group, int | None] | None:
     return _baseline
 
 
-def record_memory_plan(non_kv_peak: int, activation: int | None) -> None:
+def record_memory_plan(
+    non_kv_peak: int, activation: int | None, budget: KvSizingBudget | None = None
+) -> None:
     global _plan
     if _on():
-        _plan = MemoryPlan(non_kv_peak=int(non_kv_peak), activation=activation or None)
+        _plan = MemoryPlan(
+            non_kv_peak=int(non_kv_peak), activation=activation or None, budget=budget
+        )
 
 
 def stages() -> tuple[StageSample, ...]:
@@ -420,6 +499,8 @@ def render_plan_lines(
             f"  Usage exceeds the startup plan by {over / GIB:.2f} GiB: the workload needs more "
             "than profiling measured, or another process grew."
         )
+    if _plan.budget is not None:
+        out.extend(_plan.budget.render())
     return out
 
 

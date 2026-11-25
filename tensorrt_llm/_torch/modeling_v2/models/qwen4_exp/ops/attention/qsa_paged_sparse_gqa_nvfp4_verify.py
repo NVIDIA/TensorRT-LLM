@@ -64,7 +64,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
     MAX_SPLITS,
     _bf2_hi,
@@ -1609,7 +1610,7 @@ def reachable_plans(max_groups: int, kv_heads: int, width: int, num_sms: int) ->
 
 def _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request):
     """(splits, layout) of the grouped kernel for this call, or None where the per-row kernel
-    takes it: fewer than `MIN_GROUPS` groups, one row a request, not SM103, or no shared-memory
+    takes it: fewer than `MIN_GROUPS` groups, one row a request, not SM103/SM107, or no shared-memory
     plan (more than six rows a request, or a block table wider than the union scratch holds:
     612 pages of 32 tokens at four rows a request).
     """
@@ -1617,7 +1618,7 @@ def _plan(q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_r
     rpr = int(rows_per_request)
     if rpr < 2 or -(-rows // rpr) < MIN_GROUPS or head_dim != HEAD_DIM:
         return None
-    if torch.cuda.get_device_capability(q.device) != (10, 3):
+    if not archs.fast_path("qsa_nvfp4_verify", torch.cuda.get_device_capability(q.device)):
         return None
     kv_heads = k_cache.shape[1]
     width = selected_tokens.shape[1]
@@ -1937,7 +1938,7 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
     Selection, the K/V append and q's projection, norm and RoPE are not inside.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = archs.SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -2021,7 +2022,7 @@ class QsaPagedSparseGqaNvfp4Verify(OpWrapper):
     rows. Draft-layer and one-row-a-request calls stay on `qsa_paged_sparse_gqa_nvfp4_decode`.
 
     Routing (`takes_grouped`, host-side, on shapes only): the grouped kernel from
-    `MIN_GROUPS` (8) groups of T >= 2 rows up, on SM103, where its shared-memory plan fits
+    `MIN_GROUPS` (8) groups of T >= 2 rows up, on SM103/SM107, where its shared-memory plan fits
     (T <= 6; a block table of at most 612 pages of 32 tokens at T = 4, 892 at T = 3, 1364 at
     T = 2); the per-row kernel otherwise. Launch (`plan_launch`): within one wave of
     (group, KV head) units every unit takes the same splits, filling the GPU once (one CTA an
