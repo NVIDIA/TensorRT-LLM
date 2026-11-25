@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -38,6 +39,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2 import _router_index
 from tensorrt_llm._torch.modeling_v2._router_index import (
     _RESOLVED_MODES,
     _ROUTES,
@@ -235,6 +237,29 @@ def _qwen4_exp_config(**vision_overrides):
 _MTP3 = MTPDecodingConfig(max_draft_len=3)
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
 _TEP4 = dict(_DEP4, enable_attention_dp=False)
+
+
+@pytest.mark.parametrize("builtin", [None, object])
+def test_auto_refusal_explains_missing_fallback(monkeypatch, builtin) -> None:
+    arch = "RefusedTestForCausalLM"
+
+    def refuse(config, llm_args, sm):
+        raise NoTarget("unsupported test deployment")
+
+    monkeypatch.setitem(registered_routes(), arch, refuse)
+    monkeypatch.setattr(AutoModelForCausalLM, "_resolve_class", lambda config: builtin)
+    log = Mock()
+    monkeypatch.setattr(_router_index, "logger", log)
+    config = _model_config(PretrainedConfig(architectures=[arch]))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    if builtin is None:
+        message = log.warning.call_args.args[0]
+        assert arch in message and "unsupported test deployment" in message
+        assert "no built-in implementation" in message
+        log.info.assert_not_called()
+    else:
+        log.warning.assert_not_called()
+        assert "using the built-in implementation" in log.info.call_args.args[0]
 
 
 def test_off_resolves_nothing():

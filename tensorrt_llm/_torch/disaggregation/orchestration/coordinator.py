@@ -11,7 +11,7 @@ reached through the ``interfaces`` Protocols.
 import os
 import time
 import traceback
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
@@ -129,7 +129,7 @@ class DisaggTransferCoordinator:
         self._pending_ctx_transfer_failures: Set[int] = set()
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
-        self._pending_timed_out_requests: List[LlmRequest] = []
+        self._pending_timed_out_requests: Dict[int, LlmRequest] = {}
         # Retire attempts whose legacy cancel could not yet prove page release;
         # retried only every second poll so an idle decode worker's re-poll
         # loop (pace_idle sleeps ~1 ms) does not hammer transceivers that
@@ -280,7 +280,7 @@ class DisaggTransferCoordinator:
         if self.inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
-        else:
+        elif getattr(self._dist, "pp_size", 1) == 1:
             self._retire_legacy_timed_out_gen_transfers()
 
     def _retire_legacy_timed_out_gen_transfers(self) -> None:
@@ -299,6 +299,12 @@ class DisaggTransferCoordinator:
         self._legacy_retire_poll_index = poll_index + 1
         for request in list(self._registry.active_requests()):
             if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
+                continue
+            if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                # The receive poll agreed on completion across the replica. A
+                # deadline observed on just one rank cannot undo that decision.
+                request.py_kv_transfer_timed_out = False
+                self._legacy_retire_retry.pop(request.py_request_id, None)
                 continue
             if request.is_disagg_generation_transmission_in_progress:
                 self._flag_transfer_timeout(request, "generation", timeout_ms)
@@ -552,6 +558,28 @@ class DisaggTransferCoordinator:
             and uses_async_gen_transfer()
             and self._transceiver.supports_idle_request_cancellation() is not True
         )
+
+    def agree_pp_handoff_stops(
+        self, cancellations: Set[int], timeouts: Set[int], ready: Set[int]
+    ) -> Tuple[Set[int], Set[int], Set[int]]:
+        """Agree on stop reasons and intersect retirement votes across a PP replica.
+
+        Called before scheduling even by stages with no local deadline or abort.
+        Attention-DP lanes own independent requests.
+        """
+        vote = (cancellations, timeouts, ready)
+        if self._enable_attention_dp:
+            local = self._dist.cp_allgather(vote) if self._dist.cp_size > 1 else [vote]
+            votes = [v for stage in self._dist.pp_allgather(local) for v in stage]
+        else:
+            votes = self._dist.allgather(vote)
+        aborted = set().union(*(v[0] for v in votes))
+        expired = set().union(*(v[1] for v in votes)) - aborted
+        drained = set.intersection(*(v[2] for v in votes))
+        # A timeout vote does not certify the connector checks for a client abort.
+        # Let any such stage retry with the agreed stop reason.
+        drained -= aborted - set.intersection(*(v[0] for v in votes))
+        return aborted, expired, drained
 
     def align_gen_cancellation(
         self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
@@ -887,6 +915,11 @@ class DisaggTransferCoordinator:
         self.reap_context_sends(0)
 
     # -- batch execution -----------------------------------------------------
+
+    @property
+    def started_gen_receives(self) -> Collection[LlmRequest]:
+        """Receives posted by this coordinator and still awaiting handoff."""
+        return self._started_gen_receives.values()
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         """Generation requests in the batch whose KV receive has completed, in batch order.
@@ -1316,7 +1349,7 @@ class DisaggTransferCoordinator:
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if self._enable_attention_dp and self._dist.world_size != 1:
-            self._pending_timed_out_requests.extend(requests)
+            self._pending_timed_out_requests.update((req.py_request_id, req) for req in requests)
             return
         for req in requests:
             self._effects.fail_requests(
@@ -1331,8 +1364,7 @@ class DisaggTransferCoordinator:
         """
         if not (self._enable_attention_dp and self._dist.world_size != 1):
             return
-        timed_out = self._pending_timed_out_requests
-        self._pending_timed_out_requests = []
+        timed_out = self.take_pending_timed_out()
         any_timed_out = bool(self._dist.tp_allgather_int64([bool(timed_out)]).any())
         if any_timed_out:
             self._effects.fail_requests(
@@ -1348,8 +1380,8 @@ class DisaggTransferCoordinator:
         ``fail_timed_out_synced`` -- the same action ``handle_timeouts_synced``
         takes after its own collective.
         """
-        timed_out = self._pending_timed_out_requests
-        self._pending_timed_out_requests = []
+        timed_out = list(self._pending_timed_out_requests.values())
+        self._pending_timed_out_requests.clear()
         return timed_out
 
     def fail_timed_out_synced(self, requests: List[LlmRequest]) -> None:
@@ -1520,6 +1552,8 @@ class DisaggTransferCoordinator:
     def _is_error_cleanup_blocked(self, request: LlmRequest) -> bool:
         """Whether a failed request must wait: the cancel path owns it, or a
         transfer owner still holds its context blocks."""
+        if getattr(request, "py_pp_handoff_stop", None) in ("cancel", "timeout"):
+            return True
         if self._vote_id(request) in self._registry.canceled_request_ids():
             return True
         return (
@@ -1595,6 +1629,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def requires_gen_cancellation_consensus(self) -> bool:
         return False
 
+    def agree_pp_handoff_stops(
+        self, cancellations: Set[int], timeouts: Set[int], ready: Set[int]
+    ) -> Tuple[Set[int], Set[int], Set[int]]:
+        return cancellations, timeouts, ready
+
     def align_gen_cancellation(
         self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
     ) -> Tuple[List[LlmRequest], Set[int], Set[int]]:
@@ -1610,6 +1649,10 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
 
     def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
         return None
+
+    @property
+    def started_gen_receives(self) -> Collection[LlmRequest]:
+        return ()
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         return []

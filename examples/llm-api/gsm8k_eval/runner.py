@@ -1,0 +1,718 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""One evaluation run: verify, (optionally) serve, ask, record and judge.
+
+A run verifies the pinned dataset items, then asks every not yet completed selected question
+through ``/v1/chat/completions`` with at most ``concurrency`` requests in flight, writing each
+reply to ``results.jsonl`` as it arrives, and finally writes ``summary.json``. The endpoint is
+either an existing server (endpoint mode: never started, stopped or signalled here) or a
+``trtllm-serve`` process this run launches and owns (managed mode: always stopped on success,
+failure, timeout or interruption). Running again with the same output directory and run
+identity resumes; a different identity is refused. The replies of a run all come from one
+served model name: before its first request an attempt records the name it resolved, and a
+different name is refused without asking anything. Endpoint resume trusts the operator to
+keep weights, server build and serving settings unchanged behind that name.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import fcntl
+import json
+import math
+import os
+import platform
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable, ContextManager, Iterator, Mapping, Optional
+
+import aiohttp
+import requests
+from lm_eval.models.openai_completions import LocalChatCompletion
+
+from . import protocol, records, server
+
+READINESS_POLL_S = 0.5
+REQUEST_POLL_S = 5.0
+CONNECT_TIMEOUT_S = 10.0
+#: Upper bound on managed-server startup (model load) inside the run's budget.
+STARTUP_LIMIT_S = 3600.0
+
+
+class EvaluationError(RuntimeError):
+    """The run cannot start or resume (inputs, identity or results directory)."""
+
+
+class ServerError(RuntimeError):
+    """The server did not come up or stopped serving."""
+
+
+class _ModelListNotReady(ServerError):
+    """The endpoint is waiting for a model-serving worker to register."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ManagedServer:
+    """A ``trtllm-serve`` launch this run owns.
+
+    Args:
+        argv: The launch command without ``--host``, ``--port`` and ``--report_addr``.
+        env: The complete launch environment.
+        gpu_ids: GPU indices whose used memory is polled while the server lives (optional).
+        settings: Recorded launch settings (e.g. the rendered config's digest).
+        generated_config: Optional YAML to save and launch with after the resume check.
+    """
+
+    argv: tuple[str, ...]
+    env: Mapping[str, str]
+    gpu_ids: tuple[str, ...] = ()
+    settings: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    generated_config: Optional[str] = None
+
+
+async def _post(client, url, *, json, timeout):
+    async with client.post(url, json=json, timeout=timeout) as response:
+        return response.status, await response.text(errors="replace")
+
+
+@dataclasses.dataclass
+class RunDeps:
+    """Process, HTTP and clock entry points of a run (fakes replace them in unit tests)."""
+
+    launch: Callable[..., ContextManager[Any]] = server.launch
+    wait_for_addr: Callable[..., tuple[str, int]] = server.wait_for_addr
+    memory_poller: Callable[..., ContextManager[Any]] = server.gpu_memory_poller
+    get: Callable[..., Any] = requests.get
+    post: Callable[..., Any] = _post
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+
+
+class _ExternalEndpoint:
+    """An existing endpoint: it is never polled for an exit code and never stopped."""
+
+    @staticmethod
+    def poll() -> None:
+        return None
+
+
+@contextmanager
+def _setup_errors() -> Iterator[None]:
+    """Classify input/resource failures before evaluation as refusals."""
+    try:
+        yield
+    except (OSError, ImportError) as error:
+        raise EvaluationError(f"cannot prepare evaluation: {error}") from error
+
+
+@contextmanager
+def _output_lock(path: Path) -> Iterator[None]:
+    """Own an output directory until all server and result work has stopped."""
+    with _setup_errors():
+        path.mkdir(parents=True, exist_ok=True)
+        lock = (path / ".lock").open("a")
+    with lock:
+        with _setup_errors():
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise EvaluationError(f"{path} is already in use by another evaluation") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _write_json(path: Path, data: Any) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        tmp = Path(stream.name)
+        try:
+            stream.write(json.dumps(data, indent=1, sort_keys=False) + "\n")
+            stream.close()
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def _read_json(path: Path) -> Optional[dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as error:
+        raise EvaluationError(f"cannot read run manifest {path}: {error}") from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("identity_sha256"), str)
+        or not isinstance(data.get("identity"), dict)
+        or not isinstance(data.get("protocol_id"), str)
+        or not isinstance(data.get("attempts"), list)
+        or any(not isinstance(attempt, dict) for attempt in data["attempts"])
+    ):
+        raise EvaluationError(f"malformed run manifest {path}; use a fresh output directory")
+    for attempt in data["attempts"]:
+        timing = attempt.get("timing", {})
+        if not isinstance(timing, dict):
+            raise EvaluationError(f"malformed attempt timing in {path}")
+        hours = timing.get("monitored_gpu_hours")
+        if hours is not None and (
+            type(hours) not in (int, float) or not math.isfinite(hours) or hours < 0
+        ):
+            raise EvaluationError(f"invalid monitored GPU hours in {path}")
+    return data
+
+
+def served_model_ids(base: str, deps: RunDeps) -> Optional[list[str]]:
+    """The model ids an OpenAI-compatible endpoint lists at ``/v1/models``.
+
+    ``None`` when the endpoint has no such route (HTTP 404). HTTP 503 means the
+    endpoint is not ready to list models yet.
+    """
+    reply = deps.get(f"{base}/v1/models", timeout=CONNECT_TIMEOUT_S)
+    if reply.status_code == 404:
+        return None
+    if reply.status_code == 503:
+        raise _ModelListNotReady("/v1/models answered HTTP 503")
+    if reply.status_code != 200:
+        raise ServerError(f"/v1/models answered HTTP {reply.status_code}")
+    try:
+        return [entry["id"] for entry in reply.json()["data"]]
+    except (ValueError, KeyError, TypeError) as error:
+        raise ServerError(f"malformed /v1/models reply: {error}") from error
+
+
+def resolve_model(base: str, requested: Optional[str], deps: RunDeps) -> tuple[str, bool]:
+    """The served model to ask and whether the endpoint listed it.
+
+    ``requested`` if listed, else the endpoint's only model; an endpoint that lists no models
+    is asked for ``requested``, which must then be given.
+    """
+    ids = served_model_ids(base, deps)
+    if ids is None:
+        if requested is None:
+            raise ServerError(
+                "the endpoint does not list its models (/v1/models answered HTTP 404); "
+                "name the model with --served-model-name"
+            )
+        return requested, False
+    if requested is not None:
+        if requested not in ids:
+            raise ServerError(f"the endpoint serves {ids}, not {requested!r}")
+        return requested, True
+    if len(ids) != 1:
+        raise ServerError(f"/v1/models lists {ids}; name the model with --served-model-name")
+    return ids[0], True
+
+
+def _wait_ready(
+    base: str,
+    process: Any,
+    limit: float,
+    requested: Optional[str],
+    deps: RunDeps,
+    *,
+    check_health: bool = True,
+) -> tuple[str, bool]:
+    """Wait for model discovery, also polling health for a managed server."""
+    while True:
+        code = process.poll()
+        if code is not None:
+            raise ServerError(f"trtllm-serve exited with code {code} before it was ready")
+        if deps.monotonic() >= limit:
+            raise ServerError("trtllm-serve was not ready within its startup budget")
+        try:
+            if (
+                not check_health
+                or deps.get(f"{base}/health", timeout=CONNECT_TIMEOUT_S).status_code == 200
+            ):
+                return resolve_model(base, requested, deps)
+        except (_ModelListNotReady, requests.exceptions.RequestException):
+            pass
+        deps.sleep(min(READINESS_POLL_S, max(0.0, limit - deps.monotonic())))
+
+
+@dataclasses.dataclass
+class _Session:
+    """What one asking session sends and records."""
+
+    pending: list[protocol.Problem]
+    ledger: records.Ledger
+    identity: str
+    attempt: int
+    max_seq_len: Optional[int]
+    concurrency: int
+    deadline: float
+    request_timeout_s: Optional[float]
+    request_fields: dict[str, Any]
+
+
+class PinnedChatCompletion(LocalChatCompletion):
+    def request_body(self, prompt, request_fields):
+        fields = request_fields.copy()
+        seed = fields.pop("seed")
+        body = self._create_payload(
+            [{"role": "user", "content": prompt}], gen_kwargs=dict(fields, until=[]), seed=seed
+        )
+        # The pinned endpoint contract omits stop strings and uses the server's EOS.
+        del body["stop"]
+        return body
+
+    async def amodel_call(
+        self, session, sem, messages, *, cache_keys, record_reply, request_fields, **kwargs
+    ):
+        # lm-eval batches one prompt per chat request. Its default parser drops finish_reason
+        # and usage, which the gate needs to distinguish a complete answer from truncation.
+        async with sem:
+            await record_reply(
+                session, cache_keys[0], self.request_body(messages[0], request_fields)
+            )
+
+
+def _ask(session: _Session, base: str, model: str, process: Any, deps: RunDeps) -> dict[str, Any]:
+    """Ask every pending question; each reply is recorded before the next result is read."""
+    url = f"{base}/v1/chat/completions"
+    asked_ids = set()
+
+    async def ask(client, problem, body):
+        begin = deps.monotonic()
+        if begin >= session.deadline or process.poll() is not None:
+            return
+        started_at = records.utc_now()
+        remaining = session.deadline - begin
+        read_timeout = min(remaining, session.request_timeout_s or remaining)
+        timeout = aiohttp.ClientTimeout(
+            total=remaining, sock_connect=CONNECT_TIMEOUT_S, sock_read=read_timeout
+        )
+        try:
+            http_status, text = await deps.post(client, url, json=body, timeout=timeout)
+            status, error, fields = records.interpret_reply(
+                http_status, text, max_seq_len=session.max_seq_len
+            )
+        except asyncio.CancelledError:
+            if deps.monotonic() < session.deadline:
+                raise
+            status, error, fields = records.TIMEOUT, "evaluation deadline reached", {}
+        except asyncio.TimeoutError as exc:
+            status, error, fields = (
+                records.TIMEOUT,
+                f"no reply within {read_timeout:.0f} s: {exc}",
+                {},
+            )
+        except aiohttp.ClientError as exc:
+            status, error, fields = records.ERROR, f"request failed: {exc}", {}
+        session.ledger.append(
+            records.make_record(
+                problem,
+                body,
+                status,
+                error,
+                fields,
+                identity=session.identity,
+                attempt=session.attempt,
+                started_at=started_at,
+                finished_at=records.utc_now(),
+                latency_s=deps.monotonic() - begin,
+            )
+        )
+        asked_ids.add(problem.id)
+
+    async def dispatch():
+        client = PinnedChatCompletion(
+            model=model,
+            base_url=url,
+            num_concurrent=session.concurrency,
+            max_retries=1,
+            tokenizer_backend=None,
+        )
+        batch = asyncio.create_task(
+            client.get_batched_requests(
+                [problem.prompt for problem in session.pending],
+                session.pending,
+                record_reply=ask,
+                request_fields=session.request_fields,
+            )
+        )
+        while not batch.done():
+            remaining = session.deadline - deps.monotonic()
+            if remaining <= 0 or process.poll() is not None:
+                # asyncio.run cancels and joins all pending requests before the ledger unlocks.
+                return
+            await asyncio.wait({batch}, timeout=min(remaining, REQUEST_POLL_S))
+        await batch
+
+    first = deps.monotonic()
+    if session.pending:
+        asyncio.run(dispatch())
+    return {
+        "evaluation_s": deps.monotonic() - first,
+        "asked": len(asked_ids),
+        "not_asked": [p.id for p in session.pending if p.id not in asked_ids],
+        "server_exit_code_during_evaluation": process.poll(),
+    }
+
+
+def _admit_and_ask(
+    session: _Session,
+    base: str,
+    model: str,
+    listed: bool,
+    process: Any,
+    admit: Callable[[str], Optional[str]],
+    deps: RunDeps,
+) -> dict[str, Any]:
+    timing = {"served_model": model, "served_model_listed": listed}
+    refusal = admit(model)
+    if refusal is not None:
+        timing["refused"] = refusal
+    else:
+        timing.update(_ask(session, base, model, process, deps))
+    return timing
+
+
+def _serve_and_ask(
+    session: _Session,
+    managed: ManagedServer,
+    argv: list[str],
+    requested_model: Optional[str],
+    files: Mapping[str, Path],
+    admit: Callable[[str], Optional[str]],
+    deps: RunDeps,
+) -> dict[str, Any]:
+    """One owned server session: launch, wait until ready, ask, stop; returns its timings.
+
+    ``admit`` receives the served model before any question is asked and returns why the run
+    refuses that model, if it does; the server is then stopped without asking.
+    """
+    timing: dict[str, Any] = {"startup_error": None}
+    files["addr"].unlink(missing_ok=True)
+    with deps.memory_poller(files["memory"], list(managed.gpu_ids)):
+        launched = deps.monotonic()
+        stopping: Optional[float] = None
+        process = None
+        try:
+            with deps.launch(argv, managed.env, files["log"]) as process:
+                try:
+                    limit = min(session.deadline, launched + STARTUP_LIMIT_S)
+                    try:
+                        host, port = deps.wait_for_addr(
+                            files["addr"], max(1.0, limit - deps.monotonic()), process
+                        )
+                        timing["address_s"] = deps.monotonic() - launched
+                        base = f"http://{host}:{port}"
+                        model, listed = _wait_ready(base, process, limit, requested_model, deps)
+                    except (RuntimeError, TimeoutError) as error:
+                        timing["startup_error"] = f"{type(error).__name__}: {error}"
+                    else:
+                        timing["startup_s"] = deps.monotonic() - launched
+                        timing.update(
+                            _admit_and_ask(session, base, model, listed, process, admit, deps)
+                        )
+                finally:
+                    stopping = deps.monotonic()
+        finally:
+            # Leaving deps.launch stopped the server; record how it ended.
+            ended = deps.monotonic()
+            timing["server_exit_code"] = process.poll() if process is not None else None
+            timing["teardown_s"] = ended - stopping if stopping is not None else None
+            timing["server_lifetime_s"] = ended - launched
+    return timing
+
+
+def _report(summary: Mapping[str, Any], timing: Mapping[str, Any]) -> str:
+    def seconds(key: str) -> str:
+        value = timing.get(key)
+        return "n/a" if value is None else f"{value:.1f} s"
+
+    memory = timing.get("gpu_memory") or {}
+    lines = [
+        f"GSM8K (first {summary['total']} questions, "
+        f"{summary['verdict']['mode']} mode, {summary['transport']} transport): "
+        f"{summary['correct']}/{summary['total']} correct",
+        f"  served model: {summary['served_model']}",
+        f"  completed {summary['distinct_completed']}/{summary['total']}; parse failures "
+        f"{len(summary['parse_failures'])}; errors {len(summary['errors'])}; timeouts "
+        f"{len(summary['timeouts'])}; truncations {len(summary['truncated'])}; missing "
+        f"{len(summary['missing'])}",
+        f"  attempt {summary['attempt']}: verification {seconds('verification_s')}, startup "
+        f"{seconds('startup_s')}, evaluation {seconds('evaluation_s')}, teardown "
+        f"{seconds('teardown_s')}, total {seconds('total_s')}",
+    ]
+    if memory:
+        lines.append(
+            f"  peak GPU memory {memory.get('max_peak_used_mib')} MiB (largest GPU); monitored-device GPU-hours "
+            f"{timing.get('monitored_gpu_hours')}"
+        )
+    lines.append(f"  results: {summary['results_dir']}")
+    return "\n".join(lines)
+
+
+def check_max_seq_len(value: Optional[int]) -> None:
+    """Reject a known context limit that leaves no room for the prompt."""
+    if value is not None and (type(value) is not int or value <= protocol.MAX_TOKENS):
+        raise EvaluationError(
+            f"max_seq_len must exceed the {protocol.MAX_TOKENS}-token output allowance "
+            f"to leave room for prompt tokens, got {value!r}"
+        )
+
+
+def run(
+    *,
+    dataset_dir: str | os.PathLike,
+    output_dir: str | os.PathLike,
+    num_questions: int = protocol.DEFAULT_NUM_QUESTIONS,
+    concurrency: int,
+    time_budget_s: float,
+    endpoint: Optional[str] = None,
+    served_model: Optional[str] = None,
+    managed: Optional[ManagedServer] = None,
+    max_seq_len: Optional[int] = None,
+    min_correct: Optional[int] = None,
+    request_timeout_s: Optional[float] = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+    identity_extra: Optional[Mapping[str, Any]] = None,
+    attempt_extra: Optional[Mapping[str, Any]] = None,
+    manifest_path: str | os.PathLike = protocol.MANIFEST_PATH,
+    deps: Optional[RunDeps] = None,
+    print_report: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Run or resume one evaluation and return its summary (with ``verdict``).
+
+    Exactly one of ``endpoint`` (an existing server's base URL) and ``managed`` (a server
+    this run launches and owns) is given. Raises EvaluationError when the inputs, the run
+    identity, the results directory or the served model refuse the run; nothing is asked in
+    that case, and a refused served model is recorded with its attempt in the run manifest.
+    """
+    deps = deps or RunDeps()
+    started = deps.monotonic()
+    started_at = records.utc_now()
+    if (endpoint is None) == (managed is None):
+        raise EvaluationError("give exactly one of an existing endpoint or a managed server")
+    try:
+        protocol.check_count(num_questions)
+        records.check_min_correct(min_correct, num_questions)
+    except ValueError as error:
+        raise EvaluationError(str(error)) from error
+    if type(concurrency) is not int or concurrency < 1:
+        raise EvaluationError(f"concurrency must be a positive integer, got {concurrency!r}")
+    for name, value in (("time_budget_s", time_budget_s), ("request_timeout_s", request_timeout_s)):
+        if value is None and name == "request_timeout_s":
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise EvaluationError(f"{name} must be finite and positive, got {value!r}")
+    check_max_seq_len(max_seq_len)
+    deadline = started + float(time_budget_s)
+    try:
+        manifest_sha256 = protocol.sha256_file(manifest_path)
+        manifest = protocol.load_manifest(manifest_path)
+        problems, dataset_files = protocol.load_problems(dataset_dir, manifest, num_questions)
+    except (OSError, ValueError, ImportError) as error:
+        raise EvaluationError(
+            f"the dataset is not usable: {type(error).__name__}: {error}"
+        ) from error
+
+    transport = "endpoint" if endpoint is not None else "managed"
+    request_fields = protocol.request_fields(chat_template_kwargs)
+    protocol_id = (
+        protocol.PROTOCOL_ID if request_fields == protocol.SAMPLING_FIELDS else "gsm8k-chat-v1"
+    )
+    identity = {
+        "protocol_id": protocol_id,
+        "manifest_sha256": manifest_sha256,
+        "selection": protocol.selection(num_questions),
+        "request_fields": request_fields,
+        "transport": transport,
+        "endpoint": endpoint.rstrip("/") if endpoint is not None else None,
+        "served_model": served_model,
+        "max_seq_len": max_seq_len,
+        **(identity_extra or {}),
+    }
+    if managed is not None and managed.generated_config is not None:
+        identity["generated_config_sha256"] = protocol.sha256_text(managed.generated_config)
+    identity_sha256 = protocol.sha256_text(protocol.canonical_json(identity))
+    results_dir = Path(output_dir)
+    with _output_lock(results_dir):
+        with _setup_errors():
+            manifest_file = results_dir / "run_manifest.json"
+            run_manifest = _read_json(manifest_file)
+            if run_manifest and run_manifest["identity_sha256"] != identity_sha256:
+                raise EvaluationError(
+                    f"{results_dir} holds a run with identity {run_manifest['identity_sha256']}, not "
+                    f"{identity_sha256} (changed protocol, selection, endpoint, inputs or settings); "
+                    "use a fresh output directory"
+                )
+            ledger = records.Ledger(
+                results_dir / "results.jsonl",
+                identity_sha256,
+                {problem.id: (problem.index, problem.prompt_sha256) for problem in problems},
+            )
+            try:
+                state = ledger.load()
+            except records.LedgerError as error:
+                raise EvaluationError(f"cannot resume {results_dir}: {error}") from error
+            asked_models = state.served_models()
+            if len(asked_models) > 1:
+                raise EvaluationError(
+                    f"cannot resume {results_dir}: its replies were asked of more than one model "
+                    f"({', '.join(map(repr, asked_models))}); use a fresh output directory"
+                )
+            pending = [problem for problem in problems if problem.id not in state.completed]
+
+            if run_manifest is None:
+                run_manifest = {
+                    "protocol_id": protocol_id,
+                    "identity_sha256": identity_sha256,
+                    "identity": identity,
+                    "attempts": [],
+                }
+            attempt = len(run_manifest["attempts"]) + 1
+            attempt_info: dict[str, Any] = {
+                "attempt": attempt,
+                "transport": transport,
+                "started_at": started_at,
+                "time_budget_s": time_budget_s,
+                "concurrency": concurrency,
+                "request_timeout_s": request_timeout_s,
+                "min_correct": min_correct,
+                "dataset_files": dataset_files,
+                "python": platform.python_version(),
+                "already_completed": len(problems) - len(pending),
+                "pending": len(pending),
+                "quarantined_partial_writes": state.quarantined,
+                **(attempt_extra or {}),
+            }
+            if managed is not None:
+                files = {
+                    "addr": results_dir / f"server-attempt-{attempt}.addr",
+                    "log": results_dir / f"server-attempt-{attempt}.log",
+                    "memory": results_dir / f"gpu-memory-attempt-{attempt}.csv",
+                }
+                argv = server.serve_argv(managed.argv, files["addr"])
+                if managed.generated_config is not None:
+                    config_path = results_dir / f"recipe-attempt-{attempt}.yaml"
+                    config_path.write_text(managed.generated_config, encoding="utf-8")
+                    argv.extend(["--config", str(config_path)])
+                attempt_info["server_command"] = argv
+                attempt_info["server_settings"] = dict(managed.settings)
+            run_manifest["attempts"].append(attempt_info)
+            _write_json(manifest_file, run_manifest)
+
+        def admit(model: str) -> Optional[str]:
+            """Record the served model before the attempt's first request; why it is refused, if so."""
+            attempt_info["served_model"] = model
+            if asked_models and asked_models != [model]:
+                return (
+                    f"{results_dir} holds replies of model {asked_models[0]!r}, but {model!r} is "
+                    "served now; a run never mixes models: use a fresh output directory"
+                )
+            with _setup_errors():
+                _write_json(manifest_file, run_manifest)
+            return None
+
+        timing: dict[str, Any] = {"verification_s": deps.monotonic() - started}
+        if pending:
+            session = _Session(
+                pending=pending,
+                ledger=ledger,
+                identity=identity_sha256,
+                attempt=attempt,
+                max_seq_len=max_seq_len,
+                concurrency=concurrency,
+                deadline=deadline,
+                request_timeout_s=request_timeout_s,
+                request_fields=request_fields,
+            )
+            if managed is not None:
+                timing.update(
+                    _serve_and_ask(session, managed, argv, served_model, files, admit, deps)
+                )
+                if files["memory"].exists():
+                    timing["gpu_memory"] = records.gpu_memory_peaks(files["memory"].read_text())
+            else:
+                process = _ExternalEndpoint()
+                base = endpoint.rstrip("/")
+                try:
+                    model, listed = _wait_ready(
+                        base,
+                        process,
+                        min(deadline, deps.monotonic() + STARTUP_LIMIT_S),
+                        served_model,
+                        deps,
+                        check_health=False,
+                    )
+                except (ServerError, requests.exceptions.RequestException) as error:
+                    timing["startup_error"] = f"{type(error).__name__}: {error}"
+                else:
+                    timing.update(
+                        _admit_and_ask(session, base, model, listed, process, admit, deps)
+                    )
+        timing["total_s"] = deps.monotonic() - started
+        # Monitored devices may be a subset or superset of the server's devices.
+        timing.update(gpu_hours=None, server_gpu_hours=None, monitored_gpu_hours=None)
+        lifetime = timing.get("server_lifetime_s")
+        if managed is not None and managed.gpu_ids and lifetime is not None:
+            timing["monitored_gpu_hours"] = records.gpu_hours(len(set(managed.gpu_ids)), lifetime)
+        monitored_hours = [
+            a.get("timing", {}).get("monitored_gpu_hours") for a in run_manifest["attempts"][:-1]
+        ] + [timing["monitored_gpu_hours"]]
+        attempt_info.update(finished_at=records.utc_now(), timing=timing)
+        if "refused" in timing:
+            _write_json(manifest_file, run_manifest)
+            raise EvaluationError(timing["refused"])
+
+        try:
+            final_state = ledger.load()
+        except records.LedgerError as error:
+            raise RuntimeError(
+                f"cannot read evaluation results in {results_dir}: {error}"
+            ) from error
+        summary = records.summarize(final_state, problems, protocol_id)
+        summary.update(
+            transport=transport,
+            served_model=next(iter(final_state.served_models()), None),
+            run_identity=identity_sha256,
+            attempt=attempt,
+            results_dir=str(results_dir),
+            timing=timing,
+            cost={
+                "gpu_hours_all_attempts": None,
+                "server_gpu_hours_all_attempts": None,
+                "monitored_gpu_hours_all_attempts": round(sum(monitored_hours), 4)
+                if all(hours is not None for hours in monitored_hours)
+                else None,
+            },
+        )
+        summary["verdict"] = records.verdict(summary, min_correct)
+        if timing.get("startup_error"):
+            failed = (
+                "server startup failed" if managed is not None else "the endpoint is not usable"
+            )
+            summary["verdict"]["problems"].insert(0, f"{failed}: {timing['startup_error']}")
+            summary["verdict"]["passed"] = False
+            summary["verdict"]["operational_ok"] = False
+        attempt_info["verdict"] = summary["verdict"]
+        _write_json(manifest_file, run_manifest)
+        _write_json(results_dir / "summary.json", summary)
+        print_report(_report(summary, timing))
+        return summary

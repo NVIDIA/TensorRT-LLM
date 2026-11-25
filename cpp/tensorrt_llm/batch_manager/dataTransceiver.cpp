@@ -1379,7 +1379,8 @@ public:
             auto const& commState = llmRequest.getDataTransceiverState().getCommState();
             if (!commState.has_value())
             {
-                TLLM_LOG_WARNING("Cannot cancel request %zu: the request has no data-transceiver communication state",
+                TLLM_LOG_WARNING_ONCE("receive_cancel_missing_comm_state",
+                    "Cannot cancel request %zu: the request has no data-transceiver communication state",
                     llmRequest.mRequestId);
                 return false;
             }
@@ -1389,7 +1390,8 @@ public:
         auto const resourceIt = mInstanceToAsyncResource.find(processInfo);
         if (resourceIt == mInstanceToAsyncResource.end())
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu: receive worker %s is not registered", llmRequest.mRequestId,
+            TLLM_LOG_WARNING_ONCE("receive_cancel_unregistered_worker",
+                "Cannot cancel request %zu: receive worker %s is not registered", llmRequest.mRequestId,
                 processInfo.c_str());
             return false;
         }
@@ -1443,7 +1445,7 @@ public:
         }
         if (!isCancelled)
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            TLLM_LOG_WARNING_ONCE("receive_cancel_unavailable", "Cannot cancel request %zu", llmRequest.mRequestId);
         }
         return isCancelled;
     }

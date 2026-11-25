@@ -2166,9 +2166,8 @@ def test_cancel_does_not_free_a_failed_receive_before_its_writers_stop(
     """A cancel after one writer's FAILED keeps the hold until the other writer stops.
 
     A client abort or a generation-side timeout (``cancel_request``), or a
-    peer's CANCEL_SESSION, overrides the failure; it must not free pages rank 4
-    is still writing. Before the FAILED reply existed, such a receive stayed
-    TRANSFERRING and ``cancel_request`` refused to free it; it still does.
+    peer's CANCEL_SESSION, must retain the destination while rank 4 is still
+    writing. Legacy FAILED from rank 3 cannot prove that its write stopped.
     """
     monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
     rid = 118
@@ -2192,13 +2191,13 @@ def test_cancel_does_not_free_a_failed_receive_before_its_writers_stop(
             4, rid, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
         ),
     )
-    assert not session.has_transferring_tasks()
-    if canceller == "local":
-        assert transceiver.cancel_request(request) is True
-    else:
-        assert transceiver.check_gen_transfer_status(None) == ([], [], [request])
-    assert rid not in receiver._sessions
-    assert transceiver._recv_sessions == {}
+    # Legacy FAILED is also used when a submitted write cannot be fenced. Even
+    # after the sibling succeeds, cancellation must quarantine this destination.
+    assert session.has_transferring_tasks()
+    assert not session.close()
+    assert not transceiver.cancel_request(request)
+    assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+    assert rid in receiver._sessions
 
 
 @pytest.mark.cpu_only

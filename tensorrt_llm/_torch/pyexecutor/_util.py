@@ -27,6 +27,7 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.disagg_utils import get_shared_draft_kv_setting
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -1532,7 +1533,10 @@ class KvCacheCreator:
                     kv_cache_config)
             extra_kwargs.update(
                 shared_draft_block_width=self._unified_drafter_block_width())
-        if not is_draft:
+        # Plain V2's explicit specs already carry every target and draft window.
+        # Applying the target-only ratio check here would warn about valid combined ratios.
+        if not is_draft and not (manager_cls is KVCacheManagerV2
+                                 and extra_kwargs.get("layer_specs")):
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
             if derived_windows is not None:
@@ -2678,11 +2682,15 @@ class KvCacheCreator:
             num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
+        final_build = not estimating_kv_cache
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         self._check_shared_draft_kv_request()
         unified_layer_specs = None
         shared_draft_block_width = None
-        if self._should_unify_dflash_kv_cache():
+        is_dflash = (self._speculative_config is not None
+                     and self._speculative_config.spec_dec_mode.is_dflash())
+        private_reason = self._private_draft_kv_reason()
+        if private_reason is None:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 kv_cache_config)
             shared_draft_block_width = self._unified_drafter_block_width()
@@ -2691,15 +2699,14 @@ class KvCacheCreator:
                 "share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
             )
-        elif (self._is_disagg and
+        elif (self._is_disagg and not is_dflash and
               os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in ("1", "auto")):
             # The request check above only rejects the variable set to 1 with a
             # drafter that can share; everything else resolves quietly.
             logger.info(
                 f"TRTLLM_DISAGG_SHARED_DRAFT_KV="
                 f"{os.environ['TRTLLM_DISAGG_SHARED_DRAFT_KV']} resolved to a "
-                f"separate draft KV cache, because {self._dflash_unify_blocker()}."
-            )
+                f"separate draft KV cache, because {private_reason}.")
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -2745,6 +2752,18 @@ class KvCacheCreator:
             if kv_cache_manager is not None:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
+        if (final_build and kv_cache_manager is not None and self._is_disagg
+                and is_dflash and private_reason is not None
+                and not getattr(self._model_engine.model,
+                                "transfers_draft_kv_cache", False)):
+            # Standalone workers may accept generation requests without a declared role.
+            role = os.environ.get("TRTLLM_DISAGG_ROLE", "").lower()
+            if not role or role.startswith("gen"):
+                logger.warning_once(
+                    f"DFlash keeps the draft KV private because {private_reason}. "
+                    "The generation worker drafts without the prefill worker's "
+                    "prompt context, which can lower draft-token acceptance.",
+                    key="dflash_disagg_private_draft_kv")
         return kv_cache_manager
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
@@ -2864,8 +2883,10 @@ class KvCacheCreator:
                 else "DFlash")
 
     def _should_unify_dflash_kv_cache(self) -> bool:
-        """Whether this run can place target and DFlash or standalone DSpark
-        layers in one V2 manager.
+        return self._private_draft_kv_reason() is None
+
+    def _private_draft_kv_reason(self) -> Optional[str]:
+        """Return None for a unified layout or the reason for a private draft cache.
 
         Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
         is "1" or "auto". Unset, it is "auto" for a manager that hosts explicit
@@ -2873,14 +2894,15 @@ class KvCacheCreator:
         manager's disaggregated workers must all decide alike, so a setting
         each worker sets on its own raises here instead of falling back.
         """
+        setting = get_shared_draft_kv_setting() if self._is_disagg else None
         blocker, worker_local = self._dflash_unify_blocker_and_scope()
         if blocker is not None:
-            if (worker_local and self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0"):
+            sharing_requested = setting in ("1", "auto") or (
+                setting is None and self._kv_cache_manager_hosts_draft_layers())
+            if worker_local and self._is_disagg and sharing_requested:
                 raise ValueError(
                     f"{self._unified_drafter_name()}: disaggregated workers "
-                    "keep the draft KV in the target's KV cache manager "
-                    "unless TRTLLM_DISAGG_SHARED_DRAFT_KV=0, but on this "
+                    "are configured to share draft KV, but on this "
                     f"worker {blocker}. Change that setting, or set "
                     "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker to keep "
                     "a separate draft KV cache.")
@@ -2891,11 +2913,27 @@ class KvCacheCreator:
                     f"{self._unified_drafter_name()}: keeping a separate draft "
                     f"KV cache: {blocker}.",
                     key="dflash_hosting_manager_blocker")
-            return False
-        default = "auto" if self._kv_cache_manager_hosts_draft_layers(
-        ) else None
-        return not (self._is_disagg and os.environ.get(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV", default) not in ("1", "auto"))
+            return blocker
+        if self._is_disagg:
+            if setting == "0":
+                return "TRTLLM_DISAGG_SHARED_DRAFT_KV='0' does not enable sharing"
+            if setting is None and not self._kv_cache_manager_hosts_draft_layers(
+            ):
+                return "this cache manager requires opting in to shared draft KV"
+        elif (self._kv_cache_manager_cls is KVCacheManagerV2
+              and self._speculative_config.spec_dec_mode.is_dflash()):
+            setting = os.environ.get("TRTLLM_AGG_SHARED_DRAFT_KV")
+            if setting not in (None, "0", "1"):
+                raise ValueError(
+                    f"Invalid TRTLLM_AGG_SHARED_DRAFT_KV={setting!r}: "
+                    "expected '0', '1', or an unset variable.")
+            if setting == "0":
+                return "TRTLLM_AGG_SHARED_DRAFT_KV='0' selects a separate draft cache"
+            if setting is None and not getattr(self._model_engine.model,
+                                               "transfers_draft_kv_cache",
+                                               False):
+                return "the target has not opted in to shared draft KV"
+        return None
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:
         """Whether the target's specialized manager accepts explicit draft layer specs."""
@@ -2918,23 +2956,43 @@ class KvCacheCreator:
             and DFLASH_FOLDED_DECODE_LOWERING in lowerings())
 
     def _check_shared_draft_kv_request(self) -> None:
-        """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
-        if (not self._is_disagg
-                or os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1"
-                or self._speculative_config is None
-                or self._unified_drafter_attention_backend() is None):
+        """Fail when required sharing is impossible or a local schedule alone disables automatic sharing."""
+        if not self._is_disagg:
             return
-        blocker = self._dflash_unify_blocker()
-        if blocker is not None:
-            raise ValueError(
-                "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
-                f"KV layers to share one KV cache manager, but {blocker}.")
+        setting = get_shared_draft_kv_setting()
+        spec = self._speculative_config
+        if setting == "0" or spec is None or self._unified_drafter_attention_backend(
+        ) is None:
+            return
+        if setting == "1":
+            blocker = self._dflash_unify_blocker()
+            if blocker is not None:
+                raise ValueError(
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
+                    f"KV layers to share one KV cache manager, but {blocker}.")
+        elif (
+                spec.spec_dec_mode.is_dflash()
+                and spec.draft_len_schedule is not None and
+            (setting == "auto" or self._kv_cache_manager_hosts_draft_layers())):
+            # A peer without this schedule would share if the layout is otherwise eligible.
+            blocker, _ = self._dflash_unify_blocker_and_scope(
+                ignore_draft_schedule=True)
+            if blocker is None:
+                raise ValueError(
+                    "DFlash draft_len_schedule prevents sharing draft KV with the other "
+                    "disaggregated worker. Set TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both "
+                    "workers to use private KV, or remove the schedule (including one "
+                    "derived from max_concurrency) and set TRTLLM_DISAGG_SHARED_DRAFT_KV=1 "
+                    "on both workers to require sharing.")
 
     def _dflash_unify_blocker(self) -> Optional[str]:
         """The reason target and drafter layers cannot share one manager, or None."""
         return self._dflash_unify_blocker_and_scope()[0]
 
-    def _dflash_unify_blocker_and_scope(self) -> tuple[Optional[str], bool]:
+    def _dflash_unify_blocker_and_scope(
+            self,
+            *,
+            ignore_draft_schedule: bool = False) -> tuple[Optional[str], bool]:
         """The unify blocker, and whether a worker-local setting causes it.
 
         For a manager hosting draft layers, settings every disaggregated worker
@@ -2945,14 +3003,31 @@ class KvCacheCreator:
         """
         hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
         blocker = self._dflash_shared_unify_blocker(
-            defer_worker_local=hosts_draft_layers)
-        if blocker is not None or not hosts_draft_layers:
+            defer_worker_local=hosts_draft_layers,
+            ignore_draft_schedule=ignore_draft_schedule)
+        if blocker is not None:
             return blocker, False
+        if getattr(self._kv_cache_config, "enable_swa_scratch_reuse", False):
+            return (
+                "enable_swa_scratch_reuse requires a separate draft KV cache "
+                "because managed draft context cannot read SWA scratch pages"
+            ), True
+        if not hosts_draft_layers:
+            # Hybrid managers size their own layer groups. The plain manager
+            # builds explicit target and draft specs with the same reuse policy.
+            if (self._kv_cache_manager_cls is KVCacheManagerV2
+                    and getattr(self, "_pool_ratio_in", None) is not None):
+                blocker = self._draft_pool_ratio_blocker(
+                    self._unified_target_windows(self._kv_cache_config,
+                                                 self._unification_max_seq_len),
+                    self._unified_draft_windows())
+            return blocker, blocker is not None
         blocker = self._hosting_worker_local_blocker()
         return blocker, blocker is not None
 
-    def _dflash_shared_unify_blocker(self, *,
-                                     defer_worker_local: bool) -> Optional[str]:
+    def _dflash_shared_unify_blocker(
+            self, *, defer_worker_local: bool,
+            ignore_draft_schedule: bool) -> Optional[str]:
         """The unify blocker, skipping worker-local settings if deferred."""
         spec_config = self._speculative_config
         if spec_config is None:
@@ -2976,7 +3051,7 @@ class KvCacheCreator:
                     f"tokens_per_block={self._tokens_per_block}")
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
-        if spec_config.draft_len_schedule is not None:
+        if not ignore_draft_schedule and spec_config.draft_len_schedule is not None:
             return "draft_len_schedule is set"
         if self._draft_config is None:
             return "there is no draft model config"
@@ -2987,7 +3062,7 @@ class KvCacheCreator:
                          and self._unified_drafter_reads_helix_pages())):
             return (f"context_parallel_size is {self._mapping.cp_size} and the "
                     "drafter does not read a helix-sharded context")
-        if self._llm_args.attn_backend != "TRTLLM":
+        if self._llm_args.attn_backend.upper() != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
                 self._model_engine.model.model_config):
@@ -3119,6 +3194,31 @@ class KvCacheCreator:
                     "only with the HND K/V layout")
         return None
 
+    def _unified_target_windows(self, kv_cache_config: KvCacheConfig,
+                                max_seq_len: int) -> List[Optional[int]]:
+        target = self._model_engine.model.model_config
+        windows = kv_cache_config.max_attention_window
+        if windows is None:
+            if self._kv_cache_manager_cls is KVCacheManagerV2:
+                # A single configured pool keeps the target's full-window default,
+                # even while estimation clears pool_ratio. A multi-pool ratio
+                # sizes the combined specs; checking its arity on the target
+                # alone would discard valid SWA groups before adding the drafter.
+                ratio = getattr(self, "_pool_ratio_in", None)
+                target_ratio = ratio if ratio is not None and len(
+                    ratio) == 1 else None
+                if getattr(kv_cache_config, "pool_ratio", None) != target_ratio:
+                    kv_cache_config = copy.copy(kv_cache_config)
+                    kv_cache_config.pool_ratio = target_ratio
+            windows = _derive_v2_layer_type_attention_windows(
+                kv_cache_config, self._kv_cache_manager_cls, target,
+                max_seq_len)
+        local_layers = list(
+            self._mapping.pp_layers(
+                int(target.pretrained_config.num_hidden_layers)))
+        return _resolve_v2_max_attention_window_vec(windows, max_seq_len,
+                                                    local_layers)
+
     def _hosting_worker_local_blocker(self) -> Optional[str]:
         """Why a hosting manager would refuse this worker's own settings, or None."""
         blocker = self._parallelism_or_kv_format_blocker()
@@ -3127,30 +3227,26 @@ class KvCacheCreator:
         draft_windows = self._unified_draft_windows()
         if len(set(draft_windows)) > 1:
             return "the draft layers use different attention windows"
-        target_model_config = self._model_engine.model.model_config
-        target_window_config = self._kv_cache_config.max_attention_window
-        if target_window_config is None:
-            target_window_config = _derive_v2_layer_type_attention_windows(
-                self._kv_cache_config, self._kv_cache_manager_cls,
-                target_model_config, self._unification_max_seq_len)
-        target_windows = _resolve_v2_max_attention_window_vec(
-            target_window_config, self._unification_max_seq_len,
-            list(
-                self._mapping.pp_layers(
-                    int(target_model_config.pretrained_config.num_hidden_layers)
-                )))
+        target_windows = self._unified_target_windows(
+            self._kv_cache_config, self._unification_max_seq_len)
         # Layer specs carry no sinks and share one reuse policy, so equal
         # windows put draft and target layers in one lifecycle.
         if set(draft_windows) & set(target_windows):
             return ("the draft layers would share a KV cache lifecycle with "
                     "target layers")
+        return self._draft_pool_ratio_blocker(target_windows, draft_windows)
+
+    def _draft_pool_ratio_blocker(
+            self, target_windows: Sequence[Optional[int]],
+            draft_windows: Sequence[Optional[int]]) -> Optional[str]:
         # The configured ratio, not the one estimation may clear meanwhile.
         pool_ratio = getattr(self, "_pool_ratio_in", None)
-        num_lifecycles = len(set(target_windows)) + len(set(draft_windows))
+        num_lifecycles = len(set(target_windows).union(draft_windows))
         if pool_ratio is not None and len(pool_ratio) != num_lifecycles:
             return (
                 f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, "
-                f"not one per lifecycle ({num_lifecycles})")
+                f"not one per lifecycle ({num_lifecycles}) across target and draft layers"
+            )
         return None
 
     @staticmethod
@@ -3254,19 +3350,8 @@ class KvCacheCreator:
         target_heads, target_head_dim, target_dtype, target_k_only = (
             self._dflash_kv_layout(target_model_config,
                                    self._model_engine.model.config.torch_dtype))
-        target_window_config = kv_cache_config.max_attention_window
-        if target_window_config is None:
-            target_window_config = _derive_v2_layer_type_attention_windows(
-                kv_cache_config,
-                self._kv_cache_manager_cls,
-                target_model_config,
-                self._max_seq_len,
-            )
-        target_windows = _resolve_v2_max_attention_window_vec(
-            target_window_config,
-            self._max_seq_len,
-            target_local_ids,
-        )
+        target_windows = self._unified_target_windows(kv_cache_config,
+                                                      self._max_seq_len)
 
         specs = [
             KVCacheLayerSpec(
@@ -3421,6 +3506,15 @@ class KvCacheCreator:
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
+            return effective_draft_config
+        # A drafter that writes and reads FP8 codes with its own per-layer scales
+        # (DFlashForCausalLM.set_kv_cache_scales) keeps the fp8 algo: its pool is FP8.
+        draft_model = getattr(getattr(self._model_engine, "model", None),
+                              "draft_model", None)
+        if getattr(draft_model, "kv_cache_storage_dtype",
+                   None) == torch.float8_e4m3fn:
+            logger.info("External drafter KV pool is FP8: the drafter stores "
+                        "and reads it with its own per-layer scales.")
             return effective_draft_config
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
@@ -3603,7 +3697,12 @@ class KvCacheCreator:
         if estimating_kv_cache and uses_vswa_kv_cache_layout(
                 max_attention_window):
             max_attention_window = None
-        update = {"max_attention_window": max_attention_window}
+        # Scratch pages belong to target prefill; the private draft manager
+        # needs persistent pages for its managed context.
+        update = {
+            "max_attention_window": max_attention_window,
+            "enable_swa_scratch_reuse": False
+        }
         if (kv_cache_config.mixed_precision_kv is not None and
                 not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
             # MTP layers use mixed-precision KV like the target; a drafter with
@@ -4851,7 +4950,9 @@ def _create_kv_cache_manager(
     # Keep estimation storage full-context unless distinct page layouts require
     # windowed storage (Gemma4). Enable automatic windowing for the final manager.
     derived_windows = None
-    if (not is_draft and kv_cache_type
+    if (not is_draft
+            and not (kv_cache_manager_cls is KVCacheManagerV2 and layer_specs)
+            and kv_cache_type
             == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
             and (not estimating_kv_cache
                  or _has_variable_kv_cache_geometry(_model_config))):
@@ -4952,6 +5053,9 @@ def _create_kv_cache_manager(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
+    if is_draft and issubclass(kv_cache_manager_cls, KVCacheManager):
+        manager_extra_kwargs[
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -5941,13 +6045,58 @@ def create_py_executor_resources(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A model that declares a disaggregated handoff contributes its semantic cache
+    # identity and the record it freezes for each finished context request. Its draft
+    # layers must share the target manager so all required pages travel together.
+    # Generic unified DFlash uses the auxiliary record to attest the draft store.
+    transfer_kwargs = {}
+    cache_identity_fn = getattr(model_engine.model, "disagg_cache_identity",
+                                None)
+    if (cache_identity_fn is not None and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        transfer_kwargs["cache_identity"] = cache_identity_fn()
+        transfer_kwargs["context_state_exporter"] = getattr(
+            model_engine.model, "export_disagg_context_request", None)
+        transfer_kwargs["context_state_validator"] = getattr(
+            model_engine.model, "validate_disagg_generation_request", None)
+        # The drafter's context travels only in draft layers the target's KV cache
+        # manager owns; they move with the target's pages.
+        get_draft_view = getattr(kv_cache_manager, "get_draft_kv_cache_view",
+                                 None)
+        if (getattr(model_engine.model, "transfers_draft_kv_cache", False)
+                and (get_draft_view is None
+                     or get_draft_view() is not kv_cache_manager)):
+            raise ValueError(
+                "the model's disaggregated handoff carries the drafter's context, "
+                "which needs the drafter's KV layers in the target's KV cache "
+                "manager; this engine keeps a separate draft KV cache. Run DFlash "
+                "with attention_backend TRTLLM and without "
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both workers.")
+    elif (cache_transceiver_config is not None
+          and cache_transceiver_config.backend is not None
+          and cache_transceiver_config.transceiver_runtime == "PYTHON"
+          and model_engine.spec_config is not None
+          and model_engine.spec_config.spec_dec_mode.is_dflash()):
+        from ..speculative.dflash import DFlashWorker
+
+        worker = getattr(model_engine.model, "spec_worker", None)
+        get_draft_view = getattr(kv_cache_manager, "get_draft_kv_cache_view",
+                                 None)
+        if (isinstance(worker, DFlashWorker) and get_draft_view is not None
+                and get_draft_view() is kv_cache_manager):
+            worker.generic_disagg_handoff_enabled = True
+            transfer_kwargs["context_state_exporter"] = (
+                worker.export_generic_disagg_context)
+            transfer_kwargs["context_state_validator"] = (
+                worker.validate_generic_disagg_context)
+
     # Disaggregated serving's KV transfer buffers are allocated in C++ with
     # no size exposed to Python; the memory monitor names them by measuring.
     with monitor_startup.region(monitor_names.REGION_KV_TRANSFER_BUFFERS,
                                 per_executor=True):
         kv_cache_transceiver = create_kv_cache_transceiver(
             mapping, dist, kv_cache_manager, attention_type,
-            cache_transceiver_config, mamba_cache_manager)
+            cache_transceiver_config, mamba_cache_manager, **transfer_kwargs)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

@@ -1042,6 +1042,15 @@ class DecoderCudaGraphs:
         if self.mapping.has_cp_helix():
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
+        spec_worker = getattr(self.model, "spec_worker", None)
+        resolve_limit = getattr(spec_worker, "draft_cache_graph_position_limit", None)
+        if resolve_limit is not None:
+            manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+            position_limit = resolve_limit(manager, getattr(self.model, "draft_model", None))
+            if position_limit is not None:
+                # Capture a managed draft row at a length that can actually replay.
+                effective_max_seq_len = min(effective_max_seq_len, max(1, position_limit - 1))
+
         short_long_seq_len_threshold = self.cuda_graph_runner.short_long_seq_len_threshold
         if short_long_seq_len_threshold is not None:
             # For short sequences, subtract the maximum runtime tokens consumed

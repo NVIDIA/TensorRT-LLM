@@ -93,8 +93,11 @@ def test_zero_size_aux_buffer_is_skipped() -> None:
     assert [d[0] for d in _registered_descs(worker)] == [0x1000]
 
 
-def test_real_empty_draft_buffer_is_skipped_during_registration() -> None:
-    aux_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+@pytest.mark.parametrize("handoff", [False, True])
+def test_real_empty_draft_buffer_is_skipped_during_registration(handoff: bool) -> None:
+    aux_buffer = AuxBuffer(
+        max_slot_num=2, beam_width=1, max_draft_len=0, transfer_handoff_aux=handoff
+    )
     worker = SimpleNamespace(_aux_buffer=aux_buffer, _agent=Mock(), _registered_mem=[])
 
     TransferWorker._register_aux_buffer(worker)
@@ -104,7 +107,7 @@ def test_real_empty_draft_buffer_is_skipped_during_registration() -> None:
         "aux_buffer_ptr_0",
         "aux_buffer_ptr_2",
         "aux_buffer_ptr_3",
-    ]
+    ] + (["aux_buffer_ptr_4"] if handoff else [])
     assert all(int(d[0]) != 0 and int(d[1]) > 0 for d in descs)
     assert len(worker._registered_mem) == 1
 

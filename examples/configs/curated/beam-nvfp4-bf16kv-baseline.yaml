@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+modeling_v2: require
+checkpoint_format: beam_nvfp4
+reasoning_parser: beam_harmony_text
+tensor_parallel_size: 4
+max_batch_size: 1
+max_num_tokens: 8192
+cuda_graph_config: null
+disable_overlap_scheduler: true
+kv_cache_config:
+  dtype: auto
+  tokens_per_block: 32

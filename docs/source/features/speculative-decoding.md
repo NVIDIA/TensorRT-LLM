@@ -175,9 +175,13 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 
 #### DFlash draft KV cache
 
-With `attention_backend="TRTLLM"`, TRTLLM target attention, and the default
-`KVCacheManagerV2`, the drafter's layers are allocated in the target's KV cache
-manager. Target and draft layers share one page table, so one KV budget covers
+In aggregated serving with TRTLLM target and draft attention and the plain
+`KVCacheManagerV2`, DFlash uses a separate draft manager by default. Targets
+that declare they transfer draft KV, including Beam with DFlash2, default to
+sharing. Set `TRTLLM_AGG_SHARED_DRAFT_KV=0` to select separate managers or
+`=1` to allow sharing when the layout is compatible.
+
+When sharing, the target manager allocates distinct layers for the drafter. One KV budget covers
 both and each request's draft pages are allocated, padded and freed with its
 target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
 cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache, unless

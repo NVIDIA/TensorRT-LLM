@@ -10033,22 +10033,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
-                if (self.cache_transceiver_config is not None
-                        and self.cache_transceiver_config.backend is not None):
-                    # The transceiver moves the target KV cache, but the
-                    # drafter's context is built from target hidden states
-                    # during prefill and is not transferred with it, so a
-                    # generation server drafts without the prompt. Drafts are
-                    # verified against the target, so this costs acceptance
-                    # rather than correctness: warn, do not reject.
-                    logger.warning(
-                        "DFlash acceptance is degraded under disaggregated "
-                        "serving: the cache transceiver moves the target KV "
-                        "cache, but the drafter's context is built during "
-                        "prefill and is not transferred, so a generation "
-                        "server drafts without the prompt context. Output is "
-                        "unaffected; expect a lower acceptance rate than the "
-                        "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
@@ -10243,6 +10227,15 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = CheckpointFormat.HF
 
+        beam_loader = self.checkpoint_format == "beam_nvfp4"
+        if self.checkpoint_loader is not None:
+            from tensorrt_llm._torch.models.checkpoints.beam.checkpoint_loader import \
+                BeamNvfp4CheckpointLoader
+            beam_loader = isinstance(self.checkpoint_loader,
+                                     BeamNvfp4CheckpointLoader)
+        if beam_loader and self.modeling_v2 != "require":
+            raise ValueError(
+                "Beam NVFP4 checkpoint loading requires modeling_v2='require'")
         return self
 
     @model_validator(mode="after")

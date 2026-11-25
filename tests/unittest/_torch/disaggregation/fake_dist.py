@@ -130,6 +130,9 @@ class FakeDistRank:
         self.tp_rank = rank % group.tp_size
         self.calls: List[Tuple[str, Any]] = []
 
+    def allgather(self, obj) -> list:
+        return self._gather(self._group.world_rendezvous(), "allgather", obj)
+
     def tp_allgather(self, obj, *, small_payload: bool = False) -> list:
         return self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather", obj)
 

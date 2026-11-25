@@ -30,7 +30,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -43,7 +43,8 @@ _SHARED_DRAFT_KV_ENV = "TRTLLM_DISAGG_SHARED_DRAFT_KV"
 
 @pytest.fixture(autouse=True)
 def _shared_draft_kv_allowed(monkeypatch):
-    # Tests of the layout rules assume a launcher that allows sharing.
+    # Exercise layout eligibility with sharing enabled in both serving modes.
+    monkeypatch.setenv("TRTLLM_AGG_SHARED_DRAFT_KV", "1")
     monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "1")
 
 
@@ -117,6 +118,49 @@ def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
     return creator
 
 
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+@pytest.mark.parametrize("model_opt_in", [False, True])
+def test_aggregated_dflash_cache_policy(monkeypatch, setting, model_opt_in):
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_AGG_SHARED_DRAFT_KV")
+    else:
+        monkeypatch.setenv("TRTLLM_AGG_SHARED_DRAFT_KV", setting)
+    # Cover the reviewer's mixed FP8/BF16 layout as well as Beam's matched FP8 caches.
+    target = _model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8)
+    draft = _model_config(
+        kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8 if model_opt_in else None
+    )
+    creator = _creator(is_disagg=False, target=target, draft=draft)
+    if model_opt_in:
+        creator._model_engine.model.transfers_draft_kv_cache = True
+        target.pretrained_config.num_hidden_layers = 52
+        draft.pretrained_config.num_hidden_layers = 5
+        creator._mapping.tp_size = 4
+        creator._max_seq_len = creator._unification_max_seq_len = 8192
+        draft.pretrained_config.layer_types = ["sliding_attention"] * 5
+        draft.pretrained_config.sliding_window = 4096
+        # Use the checkpoint's window through the production resolver.
+        del creator._get_draft_max_attention_window
+    shared = model_opt_in if setting is None else setting == "1"
+    creator._sparse_attention_config = None
+    creator._speculative_config._use_shared_kv_cache = False
+    creator._speculative_config.spec_dec_mode.use_one_engine = lambda: True
+    creator._speculative_config.spec_dec_mode.is_sa = lambda: False
+    assert creator._should_unify_dflash_kv_cache() is shared
+    assert creator._should_create_separate_draft_kv_cache() is (not shared)
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    if shared:
+        n_target = target.pretrained_config.num_hidden_layers
+        n_draft = draft.pretrained_config.num_hidden_layers
+        assert [spec.global_layer_id for spec in specs] == list(range(n_target + n_draft))
+        if model_opt_in:
+            assert [spec.sliding_window_size for spec in specs[n_target:]] == [4096] * n_draft
+        draft_dtype = DataType.FP8 if model_opt_in else DataType.BF16
+        assert [spec.dtype for spec in specs] == [DataType.FP8] * n_target + [draft_dtype] * n_draft
+    else:
+        assert specs == ()
+
+
 @pytest.mark.parametrize("is_disagg", [False, True])
 def test_matching_draft_layout_unifies(is_disagg):
     target = _model_config(kv_heads=8, head_dim=128)
@@ -128,6 +172,174 @@ def test_matching_draft_layout_unifies(is_disagg):
     specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
     assert [spec.global_layer_id for spec in specs] == [0, 1, 2, 3]
     assert [spec.dtype for spec in specs] == [DataType.BF16] * 4
+
+
+def test_aggregated_nvfp4_target_builds_native_buffers_with_bf16_draft() -> None:
+    creator = _creator(
+        is_disagg=False,
+        target=_model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.NVFP4),
+        draft=_model_config(kv_heads=8, head_dim=128),
+    )
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    assert [spec.dtype for spec in specs] == [DataType.NVFP4] * 2 + [DataType.BF16] * 2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_attention_window_vec = [creator._max_seq_len] * len(specs)
+    groups = []
+    for i, spec in enumerate(specs):
+        layer = manager._explicit_layer_config(i, spec, creator._tokens_per_block)
+        groups.append({buffer.role: buffer.coalescing_group for buffer in layer.buffers})
+    target_groups = {Role.KEY: 1, Role.VALUE: 1, Role.KEY_BLOCK_SCALE: 2, Role.VALUE_BLOCK_SCALE: 2}
+    draft_groups = {Role.KEY: 0, Role.VALUE: 0}
+    assert groups == [target_groups, target_groups, draft_groups, draft_groups]
+
+
+def test_swa_scratch_stays_on_the_target_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=False, target=layout, draft=layout)
+    creator._kv_cache_config = KvCacheConfig(enable_swa_scratch_reuse=True)
+    config = creator._kv_cache_config
+    assert "enable_swa_scratch_reuse" in creator._private_draft_kv_reason()
+    assert creator._build_unified_dflash_layer_specs(config) == ()
+    draft_config = creator._get_one_model_draft_kv_cache_config(config, creator._max_seq_len)
+    assert not draft_config.enable_swa_scratch_reuse
+    assert config.enable_swa_scratch_reuse
+
+    creator._is_disagg = True
+    for setting in ("auto", "1"):
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+        with pytest.raises(ValueError, match="enable_swa_scratch_reuse"):
+            creator._should_unify_dflash_kv_cache()
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    assert not creator._should_unify_dflash_kv_cache()
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize(
+    "ratio,draft_window,expected",
+    [
+        ([1.0], 69632, [None] * 4),  # Configured single full-window pool.
+        ([0.25, 0.75], 4096, []),  # Beam target only: 512 and full.
+        ([0.25, 0.75], 512, [512, None, 512, 512]),  # Draft joins the existing 512 group.
+        ([0.25, 0.5, 0.25], 4096, [512, None, 4096, 4096]),  # All three groups have a share.
+    ],
+)
+def test_beam_draft_pool_ratio_across_estimation_and_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    ratio: list[float],
+    draft_window: int,
+    expected: list[int | None],
+) -> None:
+    target = _model_config(kv_heads=8, head_dim=128)
+    target.pretrained_config.layer_types = ["sliding_attention", "full_attention"]
+    target.pretrained_config.sliding_window = 512
+    creator = _creator(
+        is_disagg=False,
+        target=target,
+        draft=_model_config(kv_heads=8, head_dim=128),
+        draft_windows=[draft_window],
+    )
+    creator._max_seq_len = creator._unification_max_seq_len = 69632
+    creator._pool_ratio_in = ratio
+    config = creator._kv_cache_config
+    for live_ratio in (None, ratio):
+        config.pool_ratio = live_ratio
+        assert creator._should_unify_dflash_kv_cache() is bool(expected)
+        specs = creator._build_unified_dflash_layer_specs(config)
+        assert [spec.sliding_window_size for spec in specs] == expected
+        assert config.pool_ratio == live_ratio
+
+    if not expected:
+        creator._is_disagg = True
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "auto")
+        with pytest.raises(ValueError, match=r"pool_ratio has 2 entries.*3.*draft"):
+            creator._should_unify_dflash_kv_cache()
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+        assert not creator._should_unify_dflash_kv_cache()
+
+
+def _configure_manager_creation(creator, monkeypatch):
+    creator._kv_cache_config = KvCacheConfig()
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 4
+    creator._max_num_tokens = 4096
+    creator._max_beam_width = 1
+    creator._sparse_attention_config = None
+    creator._kv_connector_manager = None
+    creator._execution_stream = None
+    creator._disable_overlap_scheduler = True
+    creator._skip_est = True
+    creator._llm_args.kv_cache_config = creator._kv_cache_config
+    monkeypatch.setattr(creator, "_get_model_kv_cache_manager_cls", lambda *args: KVCacheManagerV2)
+    monkeypatch.setattr(creator, "_enable_kv_cache_stats", lambda: False)
+
+
+@pytest.mark.parametrize(
+    "setting, restriction, role, disagg, estimating, shared, warning_reason",
+    [
+        ("auto", None, "generation", True, False, True, None),
+        ("auto", "schedule", "generation", True, False, None, None),
+        ("0", "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        (None, "schedule", "generation", True, False, False, "draft_len_schedule is set"),
+        ("auto", "schedule_and_pp", "generation", True, False, False, "draft_len_schedule is set"),
+        ("auto", "page_size", "generation", True, False, False, "tokens_per_block=128"),
+        ("0", None, "gen0", True, False, False, "TRTLLM_DISAGG_SHARED_DRAFT_KV='0'"),
+        (None, None, None, True, False, False, "requires opting in"),
+        ("auto", "schedule", "context", True, False, None, None),
+        ("auto", "schedule", "generation", True, True, None, None),
+        ("auto", "schedule", None, False, False, False, None),
+        ("1", "schedule", "generation", True, False, None, None),
+    ],
+)
+def test_dflash_private_kv_warning_follows_allocated_layout(
+    monkeypatch, setting, restriction, role, disagg, estimating, shared, warning_reason
+):
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    for key, value in ((_SHARED_DRAFT_KV_ENV, setting), ("TRTLLM_DISAGG_ROLE", role)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    layout.is_generation = True
+    creator = _creator(is_disagg=disagg, target=layout, draft=layout)
+    spec = creator._speculative_config
+    if restriction == "schedule_and_pp":
+        creator._mapping.pp_size = 2
+    if restriction in ("schedule", "schedule_and_pp"):
+        spec.draft_len_schedule = {4: 2}
+    spec.max_draft_len = 2
+    spec._use_shared_kv_cache = False
+    spec.spec_dec_mode.use_one_engine = lambda: True
+    spec.spec_dec_mode.is_sa = lambda: False
+    _configure_manager_creation(creator, monkeypatch)
+    if restriction == "page_size":
+        creator._tokens_per_block = 128
+    allocate = Mock(return_value=SimpleNamespace(max_seq_len=4096))
+    warn_once = Mock()
+    monkeypatch.setattr(_util, "_create_kv_cache_manager", allocate)
+    monkeypatch.setattr(_util.logger, "warning_once", warn_once)
+
+    if shared is None:
+        error = (
+            "requires.*draft_len_schedule"
+            if setting == "1"
+            else "draft_len_schedule.*TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on both.*TRTLLM_DISAGG_SHARED_DRAFT_KV=1"
+        )
+        with pytest.raises(ValueError, match=error):
+            creator._create_kv_cache_manager(estimating_kv_cache=estimating)
+        allocate.assert_not_called()
+    else:
+        creator._create_kv_cache_manager(estimating_kv_cache=estimating)
+        assert (allocate.call_args.kwargs["layer_specs"] is not None) is shared
+    if warning_reason is None:
+        warn_once.assert_not_called()
+    else:
+        warn_once.assert_called_once()
+        assert warning_reason in warn_once.call_args.args[0]
+        assert warn_once.call_args.kwargs["key"] == "dflash_disagg_private_draft_kv"
 
 
 @pytest.mark.parametrize("is_disagg", [False, True])
@@ -148,19 +360,7 @@ def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
     creator._model_engine.model.draft_model = SimpleNamespace(
         shift_label=shift_label, reads_managed_ctx_pages=lambda tokens_per_block: True
     )
-    creator._kv_cache_config = KvCacheConfig()
-    creator._tokens_per_block = 32
-    creator._max_batch_size = 4
-    creator._max_num_tokens = 4096
-    creator._max_beam_width = 1
-    creator._sparse_attention_config = None
-    creator._kv_connector_manager = None
-    creator._execution_stream = None
-    creator._disable_overlap_scheduler = True
-    creator._skip_est = True
-    creator._llm_args.kv_cache_config = creator._kv_cache_config
-    monkeypatch.setattr(creator, "_get_model_kv_cache_manager_cls", lambda *args: KVCacheManagerV2)
-    monkeypatch.setattr(creator, "_enable_kv_cache_stats", lambda: False)
+    _configure_manager_creation(creator, monkeypatch)
 
     class RecordingManager(KVCacheManagerV2):
         get_cache_size_per_token = Mock(return_value=(1, 0))
@@ -469,16 +669,57 @@ def test_launcher_rejects_shared_cache_for_ineligible_config(
         _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers)
 
 
-def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path):
-    spec = {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}
-
+@pytest.mark.parametrize("target_backend", ["TRTLLM", "trtllm"])
+def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path, target_backend):
+    config = {
+        "speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"},
+        "enable_attention_dp": True,
+        "attn_backend": target_backend,
+    }
     with pytest.raises(_StopLauncher):
-        _launch_from_disagg_config(
-            monkeypatch,
-            tmp_path,
-            {"speculative_config": spec, "enable_attention_dp": True},
-            {"speculative_config": spec, "enable_attention_dp": True},
-        )
+        _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "1"
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout)
+    creator._llm_args.attn_backend = target_backend
+    assert creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("setting", ["", "true", "2"])
+def test_invalid_shared_draft_setting_rejected_by_launcher_and_worker(
+    monkeypatch, tmp_path, setting
+):
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+    config = {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}}
+    error = "TRTLLM_DISAGG_SHARED_DRAFT_KV=.*expected '0', '1', 'auto'"
+    with pytest.raises(click.UsageError, match=error):
+        _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout)
+    with pytest.raises(ValueError, match=error):
+        creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("setting", ["0", "1", "auto"])
+def test_asymmetric_pipeline_parallelism_respects_shared_draft_setting(
+    monkeypatch, tmp_path, setting
+):
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, setting)
+    gen = {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}}
+    ctx = {**gen, "pipeline_parallel_size": 2}
+    if setting == "1":
+        with pytest.raises(click.UsageError, match="pipeline_parallel_size 1"):
+            _launch_from_disagg_config(monkeypatch, tmp_path, ctx, gen)
+        assert os.environ[_SHARED_DRAFT_KV_ENV] == "1"
+        return
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, ctx, gen)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"
+    layout = _model_config(kv_heads=8, head_dim=128)
+    for pp in (2, 1):
+        creator = _creator(is_disagg=True, target=layout, draft=layout)
+        creator._mapping.pp_size = pp
+        assert not creator._should_unify_dflash_kv_cache()
 
 
 def test_launcher_shares_attention_dp_mla_drafter_across_tp(monkeypatch, tmp_path):
@@ -522,6 +763,10 @@ def test_launcher_shares_the_cutedsl_drafter_with_helix_generation(monkeypatch, 
 def test_launcher_preserves_opt_out_and_allows_layout_fallback(
     monkeypatch, tmp_path, request_mode, draft_heads, expected_mode
 ) -> None:
+    from tensorrt_llm.commands import serve
+
+    warning = Mock()
+    monkeypatch.setattr(serve.logger, "warning_once", warning)
     if request_mode is None:
         monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
     else:
@@ -532,6 +777,10 @@ def test_launcher_preserves_opt_out_and_allows_layout_fallback(
         _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
 
     assert os.environ[_SHARED_DRAFT_KV_ENV] == expected_mode
+    assert any(
+        call.kwargs.get("key") == "shared_draft_kv_launcher_opt_out"
+        for call in warning.call_args_list
+    ) is (request_mode == "0")
     creator = _creator(
         is_disagg=True,
         target=_model_config(kv_heads=8, head_dim=128),
@@ -802,9 +1051,43 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         assert not creator._should_unify_dflash_kv_cache()
 
 
+def test_independent_workers_with_schedule_only_on_generation(monkeypatch):
+    # This manager shares eligible draft layers by default even without the env setting.
+    class HostingManager(KVCacheManagerV2):
+        hosts_unified_draft_layers = True
+
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    target = _model_config(kv_heads=8, head_dim=128)
+    draft = _model_config(kv_heads=8, head_dim=128)
+    draft.pretrained_config.sliding_window = 128
+    ctx, gen = (
+        _creator(is_disagg=True, target=target, draft=draft, draft_windows=[128]) for _ in range(2)
+    )
+    for worker in (ctx, gen):
+        worker._kv_cache_manager_cls = HostingManager
+        worker._kv_cache_config.max_attention_window = [1024]
+        worker._sparse_attention_config = None
+    gen._speculative_config.draft_len_schedule = {1: 7, 8: 3}
+    ctx._check_shared_draft_kv_request()
+    assert ctx._should_unify_dflash_kv_cache()
+    with pytest.raises(ValueError, match="draft_len_schedule.*TRTLLM_DISAGG_SHARED_DRAFT_KV=0"):
+        gen._check_shared_draft_kv_request()
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    for worker in (ctx, gen):
+        worker._check_shared_draft_kv_request()
+        assert not worker._should_unify_dflash_kv_cache()
+
+
 @pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"decoding_type": "DSpark", "attention_backend": "TRTLLM"},
+        {"decoding_type": "DFlash", "attention_backend": "TRTLLM", "draft_len_schedule": {1: 7}},
+    ],
+)
 def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None, spec: dict
 ) -> None:
     """A context-only config (a DWDP context world) cannot see how generation is launched.
 
@@ -815,7 +1098,6 @@ def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
         monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
     else:
         monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
-    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
     with pytest.raises(_StopLauncher):
         _launch_from_disagg_config(monkeypatch, tmp_path, {"speculative_config": spec}, None)
 

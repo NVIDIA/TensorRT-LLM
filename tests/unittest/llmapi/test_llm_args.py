@@ -863,8 +863,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
 @pytest.mark.parametrize("backend",
                          ["DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"])
 @pytest.mark.parametrize("dict_config", [False, True])
-def test_dflash_disagg_warns_about_degraded_acceptance(
-        tmp_path: Path, backend: str, dict_config: bool) -> None:
+def test_dflash_disagg_config_allowed(tmp_path: Path, backend: str,
+                                      dict_config: bool) -> None:
     speculative_config = DFlashDecodingConfig(max_draft_len=2,
                                               use_rejection_sampling=False)
     cache_transceiver_config = CacheTransceiverConfig(backend=backend)
@@ -872,17 +872,13 @@ def test_dflash_disagg_warns_about_degraded_acceptance(
         speculative_config = speculative_config.model_dump()
         cache_transceiver_config = cache_transceiver_config.model_dump()
 
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = TorchLlmArgs(model=tmp_path,
-                            gpus_per_node=1,
-                            speculative_config=speculative_config,
-                            cache_transceiver_config=cache_transceiver_config)
+    args = TorchLlmArgs(model=tmp_path,
+                        gpus_per_node=1,
+                        speculative_config=speculative_config,
+                        cache_transceiver_config=cache_transceiver_config)
 
-    # Accepted, not rejected: the configuration runs, only acceptance suffers.
     assert isinstance(args.speculative_config, DFlashDecodingConfig)
     assert args.cache_transceiver_config.backend == backend
-    assert any("DFlash acceptance is degraded" in call.args[0]
-               for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -892,17 +888,14 @@ def test_dflash_disagg_warns_about_degraded_acceptance(
 def test_dflash_aggregated_config_allowed(
         tmp_path: Path,
         cache_transceiver_config: CacheTransceiverConfig | dict | None) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = TorchLlmArgs(model=tmp_path,
-                            gpus_per_node=1,
-                            speculative_config=DFlashDecodingConfig(
-                                max_draft_len=2, use_rejection_sampling=False),
-                            cache_transceiver_config=cache_transceiver_config)
+    args = TorchLlmArgs(model=tmp_path,
+                        gpus_per_node=1,
+                        speculative_config=DFlashDecodingConfig(
+                            max_draft_len=2, use_rejection_sampling=False),
+                        cache_transceiver_config=cache_transceiver_config)
     assert isinstance(args.speculative_config, DFlashDecodingConfig)
     assert (args.cache_transceiver_config is None
             or args.cache_transceiver_config.backend is None)
-    assert not any("DFlash acceptance is degraded" in call.args[0]
-                   for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -910,16 +903,13 @@ def test_dflash_aggregated_config_allowed(
                          [None, NGramDecodingConfig(max_draft_len=2)])
 def test_disagg_config_without_dflash_allowed(
         tmp_path: Path, speculative_config: NGramDecodingConfig | None) -> None:
-    with patch.object(llm_args_mod.logger, "warning") as warning:
-        args = TorchLlmArgs(
-            model=tmp_path,
-            gpus_per_node=1,
-            speculative_config=speculative_config,
-            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
+    args = TorchLlmArgs(
+        model=tmp_path,
+        gpus_per_node=1,
+        speculative_config=speculative_config,
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
     assert args.speculative_config == speculative_config
     assert args.cache_transceiver_config.backend == "NIXL"
-    assert not any("DFlash acceptance is degraded" in call.args[0]
-                   for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only

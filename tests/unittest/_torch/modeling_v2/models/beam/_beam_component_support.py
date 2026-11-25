@@ -668,3 +668,17 @@ def generate_small_model_state(
         t = torch.rand(shape, generator=g, device="cuda", dtype=torch.float32)
         state[name] = (t.mul_(2.0 * half).sub_(half).add_(offset)).to(dtype)
     return state
+
+
+def checkpoint_config() -> dict:
+    from tensorrt_llm._torch.modeling_v2.models.beam._constants import SUPPORTED_CONFIG
+
+    return dict(
+        SUPPORTED_CONFIG,
+        layer_types=["sliding_attention"] * 51 + ["full_attention"],
+        mlp_layer_types=["dense"] * 3 + ["sparse"] * 49,
+        rope_parameters={
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+            "full_attention": None,
+        },
+    )

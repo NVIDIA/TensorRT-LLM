@@ -88,6 +88,7 @@ def test_aux_buffer_meta_property():
     assert len(meta.ptrs) == 4
     assert len(meta.size) == 4
     assert len(meta.item_sizes) == 4
+    assert buf.get_slot_handoff(buf.alloc_slot().id) is None
     assert meta.device == "cpu"
     # Verify sizes are positive
     assert all(s > 0 for s in meta.size)
@@ -105,6 +106,7 @@ def test_fill_slot_get_slot_tokens_round_trip():
     mock_request.prompt_len = 128
     mock_request.cached_tokens = 9
     mock_request.py_disaggregated_params = None
+    mock_request.py_disagg_handoff = None
 
     buf.fill_slot(slot.id, mock_request)
     first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
@@ -151,6 +153,7 @@ def test_aux_buffer_zero_max_draft_len_round_trip():
     mock_request.prompt_len = 16
     mock_request.cached_tokens = 0
     mock_request.py_disaggregated_params = None
+    mock_request.py_disagg_handoff = None
 
     buf.fill_slot(slot.id, mock_request)
     first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
@@ -178,7 +181,7 @@ def test_aux_transfer_layout_ctx_no_spec_gen_sa():
     gen = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=2, device="cpu")
     layout = build_aux_transfer_layout(ctx.meta, gen.meta)
 
-    # Buffer order: [first_tokens, draft_tokens, token_counts, prompt_token_counts];
+    # Buffer order: first tokens, draft tokens, token counts, prompt counts.
     # the draft_tokens entry (index 1) is dropped.
     expected_keep = [0, 2, 3]
     np.testing.assert_array_equal(layout.src_item_sizes, ctx.meta.item_sizes[expected_keep])

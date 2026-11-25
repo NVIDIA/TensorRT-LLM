@@ -143,13 +143,17 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # ModelingV2 routing, sharding and Beam component, diagnostic and checkpoint-layout
-  # checks run on CPU. Mixed CPU/GPU modules select only cpu_only-marked cases here.
+  # ModelingV2 and Beam CPU checks cover routing, components, checkpoints and serving.
+  # Mixed CPU/GPU modules select only cpu_only-marked cases here.
   - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py
   - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py
+  - unittest/_torch/modeling_v2/models/beam/test_engine_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_target_contracts.py
   - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
   - unittest/_torch/modeling_v2/models/beam/test_component_support.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py
   - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
   - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
@@ -223,6 +227,12 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/models/test_minimax_m3.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_cache_contract.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving_cli.py
+  - unittest/_torch/modeling_v2/models/beam/test_routing.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/test_component_support.py
   # MiniMax-M3.1-Flash sm_107 tp8 target: its device-free (cpu_only) tests; the stage's -m cpu_only collects
   # only them. The comm tests run 2 to 8 ranks.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/*
@@ -461,6 +471,7 @@ l0_cpu:
   - unittest/llmapi/test_mpi_stop.py
   - unittest/llmapi/test_mpi_stop_launcher.py
   - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_beam_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
   - unittest/llmapi/test_rlhf_utils.py

@@ -53,6 +53,138 @@ def test_eagle3_one_model_still_gets_a_separate_draft_kv_cache():
 
 
 @pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        pytest.param({}, "managed", id="contiguous-cursor"),
+        pytest.param(None, "private", id="absent-record"),
+        pytest.param({"draft": None}, "private", id="skipped-store"),
+        pytest.param({"version": 0}, "reject", id="wrong-version"),
+        pytest.param({"identity": "0" * 32}, "reject", id="wrong-protocol"),
+        pytest.param({"transfer_id": 43}, "reject", id="wrong-transfer"),
+        pytest.param({"prompt_len": 76}, "reject", id="wrong-prompt"),
+        pytest.param(
+            {"draft": {"draft_ctx_len": 76, "next_position": 77}}, "reject", id="partial-store"
+        ),
+    ],
+)
+def test_generic_disagg_cursor_validation_and_binding(change: dict | None, expected: str) -> None:
+    from tensorrt_llm._torch.disaggregation.native.auxiliary import (
+        decode_handoff_record,
+        encode_handoff_record,
+    )
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_buf_inited = worker._ctx_unified_cache = True
+    worker._ctx_has_position_cap = False
+    worker._max_ctx = 4096
+    worker.generic_disagg_handoff_enabled = True
+    worker._req_to_slot = {42: 0}
+    worker._req_ctx_pos = {42: 77}
+    worker._ctx_len_host = [77]
+    worker._private_tail_requests = set()
+    worker._untrusted_disagg_contexts = set()
+    worker._pending_disagg_imports = {}
+    worker.mapping = SimpleNamespace(enable_attention_dp=False, tp_size=1)
+    source = SimpleNamespace(
+        py_request_id=42, request_id=42, prompt_len=77, py_disaggregated_params=None
+    )
+    exported = worker.export_generic_disagg_context(source)
+    assert exported["draft"] == {"draft_ctx_len": 77, "next_position": 77}
+    worker._ctx_len_host[0] = 76
+    assert worker.export_generic_disagg_context(source)["draft"] is None
+    worker._req_to_slot.clear()
+    worker._req_ctx_pos.clear()
+
+    record = None if change is None else {**exported, **change}
+    request = SimpleNamespace(
+        py_request_id=123,
+        prompt_len=77,
+        context_phase_params=SimpleNamespace(req_id=42),
+        py_disagg_handoff=decode_handoff_record(encode_handoff_record(record)),
+    )
+    error = worker.validate_generic_disagg_context(request)
+    if expected == "reject":
+        assert error is not None
+        assert not worker._pending_disagg_imports and not worker._untrusted_disagg_contexts
+        return
+    assert error is None
+    worker.prepare_generic_disagg_generation(request)
+    if expected == "managed":
+        assert worker._pending_disagg_imports == {123: (77, 77)}
+        assert not worker._untrusted_disagg_contexts
+    else:
+        assert not worker._pending_disagg_imports
+        assert worker._untrusted_disagg_contexts == {123}
+    worker.release_request_state(123)
+    assert not worker._pending_disagg_imports and not worker._untrusted_disagg_contexts
+
+
+@pytest.mark.parametrize(
+    "generic_handoff",
+    [pytest.param(True, id="composed"), pytest.param(False, id="model-owned")],
+)
+def test_disagg_generation_keeps_model_and_worker_lifecycle_hooks(
+    monkeypatch: pytest.MonkeyPatch, generic_handoff: bool
+) -> None:
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor import py_executor
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    request = SimpleNamespace(
+        py_request_id=123,
+        py_beam_width=1,
+        context_phase_params=SimpleNamespace(first_gen_tokens=[2], draft_tokens=[3]),
+    )
+    worker = SimpleNamespace(
+        generic_disagg_handoff_enabled=generic_handoff,
+        prepare_generic_disagg_generation=Mock(),
+        release_request_state=Mock(),
+        release_private_tail=Mock(),
+    )
+    model = SimpleNamespace(
+        spec_worker=worker, prepare_disagg_generation_request=Mock(), release_request_state=Mock()
+    )
+    disagg = Mock()
+    disagg.completed_gen_receives.return_value = [request]
+    disagg.try_finish_gen_receive.return_value = True
+    resource_manager = Mock()
+    resource_manager.resource_managers = {ResourceManagerType.SEQ_SLOT_MANAGER: Mock()}
+    executor = SimpleNamespace(
+        disagg=disagg,
+        resource_manager=resource_manager,
+        model_engine=SimpleNamespace(model=model, max_total_draft_tokens=1),
+        draft_model_engine=None,
+        sampler=Mock(),
+        enable_attention_dp=False,
+        enable_spec_decode=True,
+        _prefetched_request_ids=set(),
+        _setup_sampler_step=Mock(),
+        _update_sampler_state_for_disagg_gen_request=Mock(return_value=True),
+        _maybe_prepend_logprobs_and_logits=Mock(),
+    )
+    monkeypatch.setattr(py_executor, "_rebuild_disagg_imported_cache", Mock())
+    monkeypatch.setattr(py_executor, "_import_first_gen_tokens", Mock())
+    monkeypatch.setattr(
+        py_executor.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False
+    )
+
+    py_executor.PyExecutor._prepare_disagg_gen_transmission_complete(executor, object())
+    py_executor.PyExecutor._free_request_resources(executor, request)
+
+    model.prepare_disagg_generation_request.assert_called_once_with(request)
+    model.release_request_state.assert_called_once_with(123)
+    if generic_handoff:
+        worker.prepare_generic_disagg_generation.assert_called_once_with(request)
+        worker.release_request_state.assert_called_once_with(123)
+    else:
+        worker.prepare_generic_disagg_generation.assert_not_called()
+        worker.release_request_state.assert_not_called()
+    worker.release_private_tail.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("bound_to_pool", "reuse_addressable", "reads_rebased_view", "cur", "first_pos", "expected"),
     [
         # Managed pool: the block table is indexed by target position, so a
@@ -112,12 +244,20 @@ def test_slot_from_zero_cannot_store_a_chunk_past_the_trail_on_a_windowed_pool(
     assert worker._ctx_store_start(cur, first_pos) == expected
 
 
-def test_slot_from_zero_skips_a_context_store_past_the_trail(
+@pytest.mark.parametrize(
+    ("capped_unified", "first_pos", "slen"),
+    [
+        pytest.param(False, 8192, 4, id="unaddressable-window"),
+        pytest.param(True, 0, 8192, id="oversized-prompt"),
+        pytest.param(True, 2047, 1, id="unverified-reused-prefix"),
+    ],
+)
+def test_skipped_prefill_does_not_publish_draft_history(
     monkeypatch: pytest.MonkeyPatch,
+    capped_unified: bool,
+    first_pos: int,
+    slen: int,
 ) -> None:
-    """A Kimi K3 style worker whose request lost its slot mid-prompt skips that
-    chunk's context store and releases the slot, with a warning, instead of
-    failing the batch."""
     import collections
 
     import torch
@@ -129,9 +269,13 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     worker._ctx_block_tables = object()
     worker._ctx_block_counts = torch.tensor([300])
     worker._ctx_page_size = 64
-    worker._max_ctx = 1 << 17
-    worker._ctx_reuse_addressable = False
-    worker._ctx_reads_rebased_view = False
+    worker._max_ctx = 4096 if capped_unified else 1 << 17
+    worker._ctx_unified_cache = capped_unified
+    worker._ctx_has_position_cap = capped_unified
+    worker._ctx_buf_inited = True
+    worker._private_tail_requests = set()
+    worker._ctx_reuse_addressable = capped_unified
+    worker._ctx_reads_rebased_view = capped_unified
     worker._ctx_pool_windowed = True
     worker._ctx_pool_trail = 64
     worker._req_ctx_pos = {}
@@ -144,7 +288,6 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
     warnings = []
     monkeypatch.setattr(dflash.logger, "warning", warnings.append)
 
-    slen, first_pos = 4, 8192
     draft_model = SimpleNamespace(
         fc=object(), hidden_norm=object(), project_target_hidden=lambda hs: hs
     )
@@ -164,9 +307,15 @@ def test_slot_from_zero_skips_a_context_store_past_the_trail(
         slen,
     )
 
+    assert worker._ctx_len_host[2] == 0 and worker._ctx_len.tolist()[2] == 0
+    assert worker.export_disagg_context(7) is None
+    if capped_unified:
+        assert worker._private_tail_requests == {7}
+        assert worker._req_ctx_pos[7] == first_pos + slen
+        return
+
     assert 7 not in worker._req_to_slot and 7 not in worker._req_ctx_pos
     assert list(worker._free_slots) == [2]
-    assert worker._ctx_len_host[2] == 0 and worker._ctx_len.tolist()[2] == 0
     assert len(warnings) == 1
     assert "skipping its context store" in warnings[0]
     assert "drafts nothing" not in warnings[0]

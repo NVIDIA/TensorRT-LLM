@@ -317,6 +317,7 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
+        self.spec_cache_graph_eligible: Optional[Callable[..., bool]] = None
         # Called just before each replay, after the static input buffers are
         # filled. For state a model computes inside its own forward and a graph
         # therefore captures the address of: a replay runs no Python, so nothing
@@ -1039,6 +1040,10 @@ class CUDAGraphRunner:
             self._can_run_cuda_graph_batch(batch) and
             (spec_metadata is None or self.config.sampling_variants is None or
              sampling_variant(spec_metadata) in self.config.sampling_variants))
+        if (self.enabled and can_run_cuda_graph and enable_spec_decode
+                and self.spec_cache_graph_eligible is not None):
+            can_run_cuda_graph = self.spec_cache_graph_eligible(
+                batch, attn_metadata, promoted_context_request_ids)
         if can_run_cuda_graph and getattr(
                 attn_metadata, "beam_shared_prefix_enabled", False) is True:
             # A beam longer than the library's captured tail runs this step eagerly.

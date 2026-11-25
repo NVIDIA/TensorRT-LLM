@@ -842,6 +842,10 @@ accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accu
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[dep2_nvfp4_kv] TIMEOUT (60)
 accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_disaggregated_dep2 TIMEOUT (90)
 
+# ModelingV2 Beam NVFP4: GSM8K first 100 on four GB300 GPUs.
+accuracy/modeling_v2/beam/full_model_nvfp4__sm_103__tp4/test_accuracy.py::TestModelingV2BeamFullModelNvfp4Sm103Tp4::test_gsm8k_first100 TIMEOUT (45)
+accuracy/test_nvfp4_serving_gsm8k.py::test_gsm8k_first100 TIMEOUT (45)
+
 # Dense FP4 MLA accuracy
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[unchunked]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla[chunked]
