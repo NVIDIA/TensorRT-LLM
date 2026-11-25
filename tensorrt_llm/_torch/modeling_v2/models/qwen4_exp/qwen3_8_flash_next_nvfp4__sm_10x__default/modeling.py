@@ -474,9 +474,15 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_gat
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (
     cute_dsl_nvfp4_grouped_gemm,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_pack_gather import (
+    PackGather as _PackGather,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
     LamportSteps,
     dep_lamport_round_trip,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
+    _sanitized as dep_lamport_sanitized,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.dep_lamport_round_trip import (
     buffers_from_pointers as dep_lamport_buffers_from_pointers,
@@ -534,6 +540,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__d
     moe_route_front,
     table_sizes,
     table_views,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    route_front_only as _route_front_only,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_sort import moe_sort
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_unpermute_inplace import (
@@ -3332,6 +3341,212 @@ def _route_front_unfinalized(core, rows, L: _LayerWeights, router_mm) -> "_Unfin
     return _Unfinalized(fc2, wts, st.views[g][layer][0].view(g, core.topk))
 
 
+#: Opt-in (class S). At a dep8 rank on SM103 on the host-index Lamport transport
+#: (`DP_MOE_COMM_ENV=lamport_step`) with the route front, a captured decode step's trunk MoE block
+#: gathers each row's NVFP4 form and its router logits (1,232 lanes a row) instead of its bf16 form
+#: (2,560): the router runs over the rank's OWN rows, the packed gather
+#: (`ops/moe/dep_lamport_pack_gather`) quantizes them inside the launch, and the route front's
+#: routing cluster alone (`route_front_only`) routes the gathered logits before the same pre-routed
+#: runner call. The codes and scales are the route front's bits over the same rows; the logits come
+#: from the router GEMM over R rows instead of the group's W R, which may pick another kernel and
+#: move a logit's last bit (a near-tie of the top-10 can flip; every rank routes the owner's bits,
+#: so the group agrees on every row's experts). GB300 dep8: -0.015 / -0.028 / -0.044 / -0.047 ms a
+#: step at 8 / 10 / 11 / 12 requests a rank. Read once, after load.
+DP_MOE_PACK_GATHER_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_PACK_GATHER"
+#: With `DP_MOE_PACK_GATHER_ENV`: `mid` runs the owner's router on `mid_rows_mm`'s bf16 kernel (a
+#: PDL launch that streams the router weight before its wait; checked at build against the fp32
+#: product, one bf16 ulp), else the decode router. Opt-in (class S, as the router front).
+DP_MOE_PACK_ROUTER_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_PACK_ROUTER"
+
+
+class _DpPack:
+    """What `DP_MOE_PACK_GATHER_ENV` built (`_dp_pack_build`): the packed gather, the gathered row
+    counts whose routing-only front compiled and checked (`rows`), and with `mid` each layer's
+    router weight (`mids`, by its pointer) and the own row counts it serves (`mid_rows`)."""
+
+    def __init__(self, gather, rows: frozenset, mids: dict, mid_rows: frozenset) -> None:
+        self.gather = gather
+        self.rows = rows
+        self.mids = mids
+        self.mid_rows = mid_rows
+
+
+def _dp_pack_check(core, pk: _DpPack, st, rows: int, device) -> str:
+    """At `rows` rows a rank, eagerly: one packed gather (a collective every rank launches) of rows
+    and logits every rank draws from the same per-rank seeds, against `fp4_quantize` of the
+    group's sanitized rows and the sanitized logits, and the routing-only front against the route
+    front over the gathered logits (experts, weights, tables). "" when bitwise."""
+    trip = core._lamport_trip
+    g = trip.world * rows
+    L = core._decode._layers[0]
+    xs, lgs = [], []
+    for p in range(trip.world):
+        gen = torch.Generator(device=device).manual_seed(20261127 + 1009 * p + rows)
+        x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
+        x[:, ::131] = -0.0
+        xs.append(x)
+        lgs.append(
+            torch.randn([rows, core.num_experts], generator=gen, device=device).to(torch.bfloat16)
+        )
+    me = core.dp_rank
+    xq, xsf, lg = pk.gather(xs[me], lgs[me].contiguous(), L.moe_gscale)
+    gathered = torch.cat([dep_lamport_sanitized(x) for x in xs])
+    rxq, rxsf = fp4_quantize(gathered, L.moe_gscale, _SF_VEC, False, False)
+    bad = [
+        name
+        for name, a, b in (
+            ("codes", xq, rxq),
+            ("scales", xsf, rxsf.reshape(g, -1)),
+            ("logits", lg, torch.cat([dep_lamport_sanitized(t) for t in lgs])),
+        )
+        if not torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
+    ]
+    tile = int(st.tactics[g][0])
+    flat = st.flats[g][0].clone()
+    ids, wts = _route_front_only(
+        lg, flat, tile, core.expert_offset, core.local_experts, core.hidden, g in st.fast2
+    )
+    _, rxq2, _, rids, rwts = _route_front_run(core, st, gathered, L, 0, lg)
+    if not torch.equal(ids, rids) or not torch.equal(wts.view(torch.int16), rwts.view(torch.int16)):
+        bad.append("routing")
+    if not torch.equal(flat, st.flats[g][0]):
+        bad.append("tables")
+    torch.cuda.synchronize(device)
+    return ", ".join(bad)
+
+
+def _dp_pack_build(core, device) -> "_DpPack | None":
+    """`DP_MOE_PACK_GATHER_ENV` (+ `DP_MOE_PACK_ROUTER_ENV`), read once at build (after the route
+    front and the fused reduce-scatter). None where it is off or cannot take effect (one warning):
+    not a dep8 rank on SM103 on the host-index Lamport transport with the route front. Otherwise
+    the packed gather, each routing-only front and with `mid` each own-row router are compiled, the
+    group agrees the builds, every row count is checked (`_dp_pack_check`, one collective each)
+    and a row count that differs on any rank is dropped on every rank. Collective."""
+    if not _switch(DP_MOE_PACK_GATHER_ENV):
+        return None
+    trip, st = core._lamport_trip, core._route_front
+    mode = os.environ.get(DP_MOE_PACK_ROUTER_ENV, "").strip().lower()
+    if mode not in ("", "mid"):
+        raise ValueError(f"{DP_MOE_PACK_ROUTER_ENV}={mode!r}: expected unset or mid")
+    why = ""
+    if core.dp_size != 8 or trip is None or trip.steps is None or not _dp_decode_rank(core, device):
+        why = (
+            f"it serves a dep8 rank on SM103 on the host-index Lamport transport "
+            f"({DP_MOE_COMM_ENV}=lamport_step)"
+        )
+    elif st is None or not st.tactics:
+        why = f"it needs the dep8 route front ({DP_ROUTE_FRONT_ENV})"
+    if why:
+        logger.warning(f"{DP_MOE_PACK_GATHER_ENV} is set but ignored: {why}")
+        return None
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    dist = Distributed.get(core.mapping)
+    pk, error = None, ""
+    try:
+        with torch.cuda.device(device):
+            gather = _PackGather(trip, core.hidden, core.num_experts)
+            rows = set()
+            for g in sorted(st.tactics):
+                tile = int(st.tactics[g][0])
+                if _route_front_compile(
+                    g, core.hidden, core.hidden, core.local_experts, tile, g in st.fast2, True
+                ):
+                    rows.add(g)
+            mids, mid_rows = {}, set()
+            if mode == "mid":
+                layers = core._decode._layers
+                for L in layers:
+                    mids[L.router.data_ptr()] = MidWeight(L.router.t())
+                own = sorted({g // trip.world for g in rows if g // trip.world <= _MID_ROWS_MAX})
+                if own:
+                    mw = mids[layers[0].router.data_ptr()]
+                    mid_rows_precompile(mw, min(own), max(own))
+                    gen = torch.Generator(device=device).manual_seed(20261127)
+                    for r in own:
+                        if _dp_router_front_check(mw, r, gen, device) == 0:
+                            mid_rows.add(r)
+            pk = _DpPack(gather, frozenset(rows), mids, frozenset(mid_rows))
+    except Exception as e:  # noqa: BLE001 -- every rank decides together below
+        error = f"{type(e).__name__}: {e}"
+    errors = [e for e in dist.tp_allgather(error) if e]
+    if errors:
+        logger.warning(
+            f"{DP_MOE_PACK_GATHER_ENV} is set but not engaged at rank {core.dp_rank}: "
+            f"{len(errors)} rank(s) failed the build: {errors[0]}"
+        )
+        return None
+    every = dist.tp_allgather(sorted(pk.rows))
+    rows = sorted(set.intersection(*(set(r) for r in every)))
+    bad = []
+    with torch.cuda.device(device):
+        for g in rows:
+            try:
+                what = _dp_pack_check(core, pk, st, g // trip.world, device)
+            except Exception as e:  # noqa: BLE001 -- recorded; the launch itself ran or raised early
+                what = f"{type(e).__name__}: {e}"
+            bad.append((g, what))
+    off = {g for rank_bad in dist.tp_allgather(bad) for g, what in rank_bad if what}
+    every_mid = dist.tp_allgather(sorted(pk.mid_rows))
+    pk.rows = frozenset(g for g in rows if g not in off)
+    pk.mid_rows = frozenset(set.intersection(*(set(r) for r in every_mid))) if mode else frozenset()
+    for g, what in bad:
+        if what:
+            logger.warning(
+                f"{DP_MOE_PACK_GATHER_ENV}: {g} gathered rows keep the bf16 gather: {what}"
+            )
+    logger.info(
+        f"DP packed MoE gather: rank {core.dp_rank} of {core.dp_size}, gathered rows "
+        f"{sorted(pk.rows)}, owner router "
+        + (f"mid_rows_mm at own rows {sorted(pk.mid_rows)}" if pk.mid_rows else "the decode router")
+    )
+    return pk if pk.rows else None
+
+
+def _dp_pack_block(core, pk: _DpPack, x, L, rs_next, shared_expert, forked, main, side):
+    """`_moe_block` over the packed gather (`DP_MOE_PACK_GATHER_ENV`): the owner's router, the
+    packed gather, the shared expert on the side stream, the routing-only front, the pre-routed
+    runner (without its finalize at the fused reduce-scatter's finalize rows) and the
+    reduce-scatter (the fused one with `rs_next`). Returns `(routed or _RsInjected, joined)` or
+    None where this block keeps the bf16 gather. Host values, the same on every rank."""
+    st = core._route_front
+    rows = x.shape[0]
+    g = rows * core.dp_size
+    layer = st.layers.get(L.fc1_w.data_ptr())
+    if g not in pk.rows or layer is None or not pk.gather.takes(rows, x):
+        return None
+    if rows in pk.mid_rows:
+        logits = mid_rows_mm_op(x, pk.mids[L.router.data_ptr()])
+    else:
+        logits = _decode_router(x, L.router)
+    xq, xsf, lg = pk.gather(x, logits.contiguous(), L.moe_gscale)
+    if not forked:
+        shared_expert()
+    tile = int(st.tactics[g][0])
+    ids, wts = _route_front_only(
+        lg,
+        st.flats[g][layer],
+        tile,
+        core.expert_offset,
+        core.local_experts,
+        core.hidden,
+        g in st.fast2,
+    )
+    rsi = getattr(core, "_rs_inject", None) if rs_next is not None else None
+    fin = (
+        rsi is not None
+        and rows in rsi.fin_rows
+        and rsi.rs.refuses_fin(*rs_next, *forked[0]) is None
+    )
+    out = _route_front_run(core, st, None, L, layer, None, None, not fin, (xq, xsf, ids, wts))
+    partial = _Unfinalized(out[0], wts, st.views[g][layer][0].view(g, core.topk)) if fin else out[0]
+    if rsi is not None:
+        fused = _rs_inject_tail(core, rsi, rs_next, lambda: forked[0], main, side)(partial)
+        if fused is not None:
+            return fused, True
+    return dep_lamport_round_trip(partial, core._lamport_trip, True), False
+
+
 #: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
 #: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
 #: dep2 was never run with them; it keeps the stock forms.
@@ -3594,6 +3809,7 @@ def _decode_forms(core) -> str:
             "fin rs rows": rows(getattr(rsi, "fin_rows", None)),
             "fin rs pdl": bool(rsi is not None and rsi.rs.pdl),
             "draftpack": sorted(getattr(core, "dp_draftpack", ())),
+            "pack gather rows": rows(getattr(getattr(core, "_dp_pack", None), "rows", None)),
             "scores early": getattr(core, "dp_scores_early", False),
             "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
@@ -4090,6 +4306,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # and the draft MoE's parts that ride on it (`DP_DRAFTPACK_ENV`).
         self._rs_inject: "_DpRsInject | None" = None
         self.dp_draftpack: frozenset = frozenset()
+        # The packed MoE gather (`DP_MOE_PACK_GATHER_ENV`, opt-in), built once a load after it.
+        self._dp_pack: "_DpPack | None" = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
@@ -4305,6 +4523,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._rs_inject = _dp_rs_inject_build(self, device)
         if device.type == "cuda" and _dp_decode_rank(self, device):
             self.dp_draftpack = _dp_draftpack_parts(self, self._rs_inject, device)
+        # Collective where set (the group agrees and checks); once a load.
+        if self._dp_pack is None and device.type == "cuda":
+            self._dp_pack = _dp_pack_build(self, device)
         # Collective where set: every rank of the group agrees on its row counts.
         _tep_decode_front_build(self, self._route_front, self._decode._layers, device)
         # Collective; once a load (the post-load walk reaches this hook again).
@@ -6303,18 +6524,30 @@ def _tep_route_front_tactic(runner, core, rows: int) -> tuple | None:
 
 
 def _route_front_run(
-    core, st: _RouteFront, x, L: _LayerWeights, layer: int, logits, fp4=None, finalize=True
+    core,
+    st: _RouteFront,
+    x,
+    L: _LayerWeights,
+    layer: int,
+    logits,
+    fp4=None,
+    finalize=True,
+    routed=None,
 ):
     """The route front and the pre-routed runner over rows `x` (a built row count) and their
     router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered from
     0 on `fp4` (the MoE site's NVFP4 codes, the same bits as the front's) or the front's own
     codes; `out` is its finalized output, or with `finalize` False its FC2 rows in the tables'
     permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`).
-    `logits` None (`_tep_front_logits`): the decode front forms them in its own launch."""
-    rows = x.shape[0]
+    `logits` None (`_tep_front_logits`): the decode front forms them in its own launch. `routed`
+    (`DP_MOE_PACK_GATHER_ENV`, `x` None): the gathered rows' `(xq, xsf, ids, wts)` the packed
+    gather and the routing-only front formed; the runner alone runs."""
+    rows = x.shape[0] if routed is None else routed[2].shape[0]
     tactic = st.tactics[rows]
     tile = int(tactic[0])
-    if logits is None:
+    if routed is not None:
+        xq, xsf, ids, wts = routed
+    elif logits is None:
         _, xq, xsf, ids, wts = _decode_front.moe_decode_front(
             x,
             L.router.t(),
@@ -7463,6 +7696,19 @@ def _moe_block(
     routed = None
     if fin is not None:
         routed = _tep_finar_routed(core, fin, x, L, fp4, router_mm, quarter)
+    pk = getattr(core, "_dp_pack", None)
+    if (
+        routed is None
+        and pk is not None
+        and not pad_rows
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        # `DP_MOE_PACK_GATHER_ENV`: the packed gather in place of the bf16 one (None: not here).
+        packed = _dp_pack_block(core, pk, x, L, rs_next, shared_expert, forked, main, side)
+        if packed is not None:
+            routed, joined = packed
+            if joined:
+                return routed, None, None
     if routed is None:
         rsi = getattr(core, "_rs_inject", None) if rs_next is not None else None
 

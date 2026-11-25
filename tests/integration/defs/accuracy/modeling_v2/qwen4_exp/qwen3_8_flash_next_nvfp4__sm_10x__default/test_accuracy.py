@@ -455,8 +455,8 @@ _DEP8 = dict(
 # above, and the draft runner's own routing (`TRTLLM_QWEN4_EXP_DP_DRAFTPACK=all`; the fused
 # reduce-scatter with the finalize folded in and the draft combine are on by default over the
 # Lamport transport); SM103 only), at dep4 and at dep8 (two nodes of one rack; there with the
-# heads' group over the NVLink domain, the low-row floors at 2 requests a rank, and the dep8
-# front's decode fusions:
+# heads' group over the NVLink domain, the low-row floors at 2 requests a rank, the packed MoE
+# gather with the owner's router on the bf16 mid-rows GEMM, and the dep8 front's decode fusions:
 # the MoE-side site folded into the output projection at every row count with the 6-way plan at
 # MMA N 32, and the trunk verify's index scores launched early behind a PDL anchor convert; as
 # the dep8 front ran them). FP8 at dep4 once more with those fusions alone on top of the bf16
@@ -472,7 +472,7 @@ _DP_FRONT_STACK = dict(
     draftpack="all",
     topk_cowrite=True,
 )
-_DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True, dp_fuse=True)
+_DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True, pack=True, dp_fuse=True)
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -1054,6 +1054,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("topk_cowrite"):
             # the generation cluster top-k's coalesced write (opt-in, the same selection)
             env["TRTLLM_QWEN4_EXP_DP_TOPK_NARROW"] = "1"
+        if variant.get("pack"):
+            env["TRTLLM_QWEN4_EXP_DP_MOE_PACK_GATHER"] = "1"
+            env["TRTLLM_QWEN4_EXP_DP_MOE_PACK_ROUTER"] = "mid"
         if variant.get("draftpack"):
             env["TRTLLM_QWEN4_EXP_DP_DRAFTPACK"] = variant["draftpack"]
         if variant.get("tep_opt_in"):

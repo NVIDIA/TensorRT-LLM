@@ -294,7 +294,10 @@ class MoeRouteFrontKernel:
     the cluster's count vectors; after routing each CTA bulk-copies its counts into every peer's receive buffer
     (instead of the cluster barrier + 8 remote loads) and sums the 8 vectors in slot order, the same integer sums.
     It releases its dependent (FC1) at kernel start: FC1's grid is resident while this kernel runs, and its
-    ``griddepcontrol.wait`` still waits for this grid's completion."""
+    ``griddepcontrol.wait`` still waits for this grid's completion.
+
+    ``route_only``: only cluster 0 is launched (the routing, the tables); the caller has the NVFP4 rows already
+    (no CTA waits for another cluster, so the routing cluster runs alone unchanged)."""
 
     @staticmethod
     def supports(**kw: Union[int, bool]) -> bool:
@@ -319,6 +322,7 @@ class MoeRouteFrontKernel:
         cluster: int = ROUTE_CLUSTER,
         lean: bool = False,
         fast2: bool = False,
+        route_only: bool = False,
     ) -> None:
         err = _shape_error(
             num_rows=num_rows,
@@ -353,7 +357,8 @@ class MoeRouteFrontKernel:
         # of both on the full per-lane sort (`_route_warp`): the same bits, fewer issued sorts.
         self.fast2 = fast2 and self.tpw == 2
         self.quant_clusters = quant_clusters
-        self.ctas = cluster * (1 + quant_clusters)
+        self.route_only = route_only
+        self.ctas = cluster if route_only else cluster * (1 + quant_clusters)
         self.q_ctas = cluster * quant_clusters
         self.blocks = num_rows * (k_extent // 16)
         self.q_passes = -(-self.blocks // (self.q_ctas * threads))

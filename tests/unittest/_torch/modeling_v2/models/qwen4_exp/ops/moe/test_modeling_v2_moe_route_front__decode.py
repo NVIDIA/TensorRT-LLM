@@ -103,6 +103,27 @@ def test_fast2_is_bitwise_the_two_token_sort(rows, local):
     _assert_matches(spec, logits, x, global_scale, fast_tables, fast)
 
 
+@_GPU
+@pytest.mark.parametrize("cell", op.moe_route_front.CELLS, ids=lambda c: c.why[:40])
+def test_route_only_is_the_full_launchs_routing(cell):
+    """`route_front_only` (the routing cluster alone, for rows the packed gather quantized) writes
+    the experts, weights and tables of the full launch over the same logits, bit for bit."""
+    spec, device = cell.spec, torch.device("cuda")
+    seed = zlib.crc32(cell.why.encode()) % 2**31 + 17
+    logits, x, global_scale, tables = _operands(spec, seed, device)
+    fast2 = spec.get("fast2", False)
+    rows, hidden = spec["rows"], spec["hidden"]
+    assert op.compile_front(rows, hidden, x.stride(0), spec["num_local"], spec["tile"], fast2)
+    assert op.compile_front(rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True)
+    args = (spec["tile"], spec["local_offset"], spec["num_local"])
+    full_tables = tables.clone()
+    _, _, ids, wts = op.moe_route_front(logits, x, global_scale, full_tables, *args, fast2)
+    ids2, wts2 = op.route_front_only(logits, tables, *args, hidden, fast2)
+    torch.cuda.synchronize()
+    assert torch.equal(ids2, ids) and torch.equal(wts2.view(torch.int16), wts.view(torch.int16))
+    assert torch.equal(tables, full_tables)
+
+
 def _tables(ids: torch.Tensor, local_offset: int, num_local: int, tile: int) -> list:
     """The pre-routed tables the runner reads, built in plain torch: each expert's slots in
     token order from its first CTA's first row, whole tiles a CTA."""
