@@ -351,8 +351,8 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000' in label:
         update(max_seq_len=9216, enable_chunked_prefill=True)
 
-    if any(f'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:{batch_size}-maxnt:2048-input_output_len:8000,1000'
-           in label for batch_size in (512, 1)):
+    if ('minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-maxnt:2048-'
+            'input_output_len:8000,1000' in label):
         update(max_seq_len=9216)
 
     if 'gemma_4_' in label:
@@ -421,9 +421,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         # See NVBug 5832481 for the throughput variant.
         update(**_eagle3('gpt_oss/gpt-oss-120b-Eagle3-throughput'),
                disable_overlap_scheduler=True)
-
-    if 'gemma_3' in label:
-        update(attn_backend='FLASHINFER')
 
     if any(pattern in label
            for pattern in ('nemotron_3_nano_30b', 'nemotron_3_nano_4b')):
