@@ -126,7 +126,7 @@ Muse Spark serve cases use `musespark-open.yaml`, and the 24-session AgentX case
 `musespark-open-agentic-balanced.yaml`. Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
 Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases select
 `cuda_graph_config.max_batch_size=128` for their larger CUDA graphs. The Spark streaming
-benchmarks select their MoE backend with `moe:` and omit MTP with `speculative_config=default`.
+benchmarks select their MoE backend with `moe_config.backend` in the `cfg:` suffix and omit MTP with `speculative_config=default`.
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
@@ -139,8 +139,9 @@ lets bench derive capture sizes from the case's batch size.
 For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
 `speculative_config`. The two Nemotron Lightning cases share their MTP, streaming and KV cache
 settings in the Python model rule so their original test and metric names stay stable.
-Use the existing `moe:`, `kv_frac:`
-and `kv_cache_dtype:` labels for the MoE backend, KV memory fraction and KV dtype.
+When updating an existing case, keep its full original name as the database matching prefix.
+Append configuration changes after a final `-cfg:`, for example
+`-cfg:stream_interval=10,moe_config.backend=DEEPGEMM,kv_cache_config.dtype=fp8`.
 The Nemotron Super MTP cases select `decoding_type=MTP,num_nextn_predict_layers=3`
 to retain the layer count used by this variant.
 Draft checkpoint paths are resolved from the model root at run time.

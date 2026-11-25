@@ -115,6 +115,12 @@ def get_perf_config_preset(selection: str) -> dict:
             parsed = int(value)
         elif field == 'decoding_type' and value in ('MTP', 'DSpark'):
             parsed = value
+        elif field == 'moe_config.backend' and value in ('CUTEDSL', 'CUTLASS',
+                                                         'DEEPGEMM',
+                                                         'MEGAMOE_DEEPGEMM'):
+            parsed = value
+        elif field == 'kv_cache_config.dtype' and value == 'fp8':
+            parsed = value
         elif field == 'kv_cache_config.mamba_ssm_cache_dtype' and value in (
                 'auto', 'float16', 'bfloat16', 'float32'):
             parsed = value
@@ -196,6 +202,12 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config={'dtype': 'fp8'},
                speculative_config=_speculative('DSpark', 3, block_size=3))
 
+    if 'qwen3.8_max_fp4_mtp-serve-pytorch' in label:
+        update(max_seq_len=8192,
+               cuda_graph_config={'max_batch_size': 32},
+               kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
+               moe_config={'backend': 'TRTLLM'},
+               speculative_config=_speculative('MTP', 3))
     if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
         update(
             modeling_v2='require',
@@ -357,6 +369,11 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(kv_cache_config={'mamba_ssm_cache_dtype': 'float32'})
     if nano_30b or nano_omni:
         update(moe_config={'backend': 'CUTLASS'})
+    if nano_omni:
+        update(enable_chunked_prefill=True,
+               cuda_graph_config={'max_batch_size': 1},
+               kv_cache_config={'free_gpu_memory_fraction': 0.8})
+
     lightning = (model in ('nemotron_3.5_lightning_30b_nvfp4_mtp',
                            'nemotron_3.5_lightning_30b_bf16_mtp')
                  and case.startswith('serve-pytorch-streaming-'))
