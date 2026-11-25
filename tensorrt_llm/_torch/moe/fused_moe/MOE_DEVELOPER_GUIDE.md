@@ -464,7 +464,7 @@ to 128 at construction, and `run_moe` pads the activation to match.
   (`_takes_triton_path`), and the parent's fused op otherwise; on SM120/121,
   with BF16 activations, `trtllm.triton.grouped_gemm.fp8_block_scales`, a Triton
   grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build
-  gate) and runs SwiGLU/GeGLU only, with no expert bias and no activation
+  gate) and runs SwiGLU/GeGLU/Relu2, with no expert bias and no activation
   constant but a uniform pre-SiLU SwiGLU clamp. All stay in the family because
   the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/121. The two
   SM90 leaves overlap: the opt-in Triton FP8-activation leaf ranks first and
@@ -1080,7 +1080,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 |---|---|---|---|---|---|---|---|---|---|---|
 | Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
+| FP8 Block Scales | Y (SM90, SM120/121) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | NVFP4_PLUS (E2M1, UE5M3 per 32, no global scale) | N | N | N | N | Y (SM107, SwiGLU)※ | N | N | N | N | N |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121, BF16, via `FlashinferCutedslW4a16Nvfp4Impl`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
@@ -1226,9 +1226,9 @@ their respective dequant scales.
 `clamp_after_silu=True` is a separate execution capability rather than a
 register shape. The resolver declines a backend unless its declaration opts in,
 and materialization enforces the same contract. The CUTLASS grouped-GEMM leaves
-opt in because their SwiGLU adaptor consumes the mode. The SM120
+opt in because their SwiGLU adaptor consumes the mode. The SM120/SM121
 FP8-block-scale leaf runs a Triton kernel that clamps before the SiLU only and
-takes the clamp by value, so it declares `kinds={Swiglu, Geglu}` with
+takes the clamp by value, so it declares `kinds={Swiglu, Geglu, Relu2}` with
 `limit=UNIFORM_SCALAR` and nothing else.
 
 With `USING_OSS_CUTLASS_MOE_GEMM=OFF`, the Torch runner uses the bundled
@@ -1480,7 +1480,8 @@ and belongs in an override or a leaf-declared attribute. `TrtllmGenFusedMoEBase`
 keeps only flags read off the class at resolution (`supports_gptoss_style`,
 `supports_situ`) and turns the rest into hooks; `CutlassFusedMoEBase` takes its
 per-format kernel configuration as `FUSED_MOE_OP_FLAGS`, its padding as
-`pad_hidden_and_intermediate_to`, and its build requirements as
+`pad_hidden_and_intermediate_to` / `pad_intermediate_on_single_tp_rank_to`,
+and its build requirements as
 `requires_oss_cutlass_build` / `uses_dynamic_fc2_scale`; `CuteDslFusedMoEBase`
 reaches what only one format needs through its `_init_format_state` hook and,
 from `CuteDslLocalityDomainMixin`, the `_locality_domain_scale_shard` hook and
