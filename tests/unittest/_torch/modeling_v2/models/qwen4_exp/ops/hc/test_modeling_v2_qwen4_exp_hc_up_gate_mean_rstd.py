@@ -12,17 +12,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (
     Fp4Quantize,
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
     gate_ratio,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (  # noqa: E501
     qwen4_exp_hc_up_gate_mean_rstd as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (  # noqa: E501
     qwen4_exp_hc_up_gate_mean_rstd_fp4 as op4,
 )
 

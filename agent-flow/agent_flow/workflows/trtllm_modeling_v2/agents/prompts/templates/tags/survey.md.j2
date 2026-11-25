@@ -116,7 +116,7 @@ The validator reports every structural error at once. What it cannot check:
   `note` for it. Untagged rows block `core`; when unsure, leave it untagged.
 - `depends_on` is for real ordering only: a spurious one serializes work.
 - A `verify` row states its `cells`: one mapping per cell, the entry's spec
-  keys with values from the runtime facts. The kernel writer certifies each
+  keys with the values the engines run. The kernel writer certifies each
   cell, so cover each axis of the envelope, not their product: every dtype
   each variant runs, each call site's rows per request at the smallest and
   the largest captured batch (and where the entry's code switches path),

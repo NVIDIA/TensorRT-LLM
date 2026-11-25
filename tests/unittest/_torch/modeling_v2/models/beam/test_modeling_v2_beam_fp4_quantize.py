@@ -5,10 +5,8 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize as op
 
 __extra_import_path__ = ["../../quantization", "../.."]
 import test_modeling_v2_fp4_quantize as shared  # noqa: E402

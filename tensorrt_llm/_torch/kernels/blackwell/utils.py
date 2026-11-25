@@ -57,6 +57,8 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+# A memory clobber, as in CUTLASS C++: no memory access moves across the asm.
+_PDL_ASM_CONSTRAINTS = "~{memory}"
 
 
 # WAR for CuTeDSL make_ptr implementation
@@ -444,6 +446,22 @@ def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_zero_v4(addr, loc=None, ip=None):
+    """16 zero bytes at an Int64 global address (plain ``st.global.v4.b32``)."""
+    llvm.inline_asm(
+        None,
+        [addr.ir_value()],
+        "st.global.v4.b32 [$0], {0, 0, 0, 0};",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def griddepcontrol_wait(*, loc=None, ip=None) -> None:
     """
     This instruction is used to wait for the previous kernel's grid ending
@@ -455,7 +473,7 @@ def griddepcontrol_wait(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.wait;",
-        constraints="",
+        constraints=_PDL_ASM_CONSTRAINTS,
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -475,7 +493,7 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.launch_dependents;",
-        constraints="",
+        constraints=_PDL_ASM_CONSTRAINTS,
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,

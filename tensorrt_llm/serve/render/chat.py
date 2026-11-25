@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -42,6 +42,7 @@ from tensorrt_llm.inputs.tokenization import tokenize_prompt
 from tensorrt_llm.inputs.utils import (
     apply_chat_template,
     async_apply_chat_template,
+    renders_from_loaded_media,
     uses_tokenizer_native_renderer,
 )
 from tensorrt_llm.sampling_params import SamplingParams
@@ -105,8 +106,9 @@ def _template_kwargs(
     chat_template_kwargs: Optional[Dict[str, Any]],
     injected_chat_template_kwargs: Any,
     enable_tokenize: bool,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return dict(
+    kwargs = dict(
         model_type=res.model_type or "",
         tokenizer=res.tokenizer,
         processor=res.processor,
@@ -120,6 +122,9 @@ def _template_kwargs(
         injected_chat_template_kwargs=injected_chat_template_kwargs,
         enable_tokenize=enable_tokenize,
     )
+    if mm_data is not None:
+        kwargs["mm_data"] = mm_data
+    return kwargs
 
 
 def _prompt_is_native_ids(
@@ -199,8 +204,12 @@ def _finish(
     encode_rendered: Optional[Callable[[str, Any], List[int]]],
 ) -> RenderedPrompt:
     if not isinstance(rendered, str):
-        # A native renderer that tokenizes for itself returns ids.
-        return RenderedPrompt(token_ids=list(rendered))
+        # A native renderer that tokenizes for itself returns ids; truncation keeps their
+        # last ``truncate_prompt_tokens``, as it does a text prompt's.
+        token_ids = list(rendered)
+        if truncate_prompt_tokens is not None:
+            token_ids = token_ids[-truncate_prompt_tokens:]
+        return RenderedPrompt(token_ids=token_ids)
     template_text = rendered
     prefix_applied = False
     if forced_prefix is not None:
@@ -241,6 +250,7 @@ async def render_conversation(
     add_special_tokens: bool = False,
     truncate_prompt_tokens: Optional[int] = None,
     encode_rendered: Optional[Callable[[str, Any], List[int]]] = None,
+    mm_data: Optional[Dict[str, Any]] = None,
 ) -> RenderedPrompt:
     """Render an already-parsed conversation without blocking the event loop.
 
@@ -248,6 +258,11 @@ async def render_conversation(
     the text itself (with ``add_special_tokens`` and ``truncate_prompt_tokens``): it returns the
     tokenizer-native renderer's own ids when they are the prompt (see
     :func:`_prompt_is_native_ids`), and the text otherwise.
+
+    ``mm_data`` is the loaded media, for a renderer that needs it (see
+    ``renders_from_loaded_media``); others render without it. Such a renderer returns
+    token ids, which ``truncate_prompt_tokens`` truncates even when ``tokenize`` is off; a
+    truncation that would cut the media's tokens raises ``ValueError``.
     """
     native_ids = (tokenize or prefer_native_ids) and _prompt_is_native_ids(
         res,
@@ -268,8 +283,19 @@ async def render_conversation(
             chat_template_kwargs=chat_template_kwargs,
             injected_chat_template_kwargs=injected_chat_template_kwargs,
             enable_tokenize=native_ids,
+            mm_data=mm_data,
         )
     )
+    if (
+        truncate_prompt_tokens is not None
+        and not isinstance(rendered, str)
+        and len(rendered) > truncate_prompt_tokens
+        and any(mm_data.values() if mm_data else ())
+    ):
+        raise ValueError(
+            f"truncate_prompt_tokens={truncate_prompt_tokens} would cut a prompt of "
+            f"{len(rendered)} tokens that carries media; its media tokens cannot be truncated."
+        )
     if tokenize:
         # Tokenization is CPU work that scales with the prompt; keep it off the loop.
         return await asyncio.to_thread(
@@ -291,6 +317,32 @@ async def render_conversation(
         truncate_prompt_tokens=truncate_prompt_tokens,
         encode_rendered=encode_rendered,
     )
+
+
+async def render_conversation_with_media(
+    res: RenderResources, mm_coroutines: Awaitable[Tuple[Any, Any]], **render_kwargs: Any
+) -> Tuple[RenderedPrompt, Tuple[Any, Any]]:
+    """Render a parsed conversation and load its media.
+
+    Returns ``(rendered, (mm_data, mm_embeddings))``. Rendering overlaps the media
+    loading, unless the model's renderer needs the loaded media (see
+    ``renders_from_loaded_media``); it then renders afterwards, from the
+    loaded media, which rules out precomputed embeddings. ``render_kwargs`` are
+    those of :func:`render_conversation`.
+    """
+    if not renders_from_loaded_media(res.model_type):
+        rendered, media = await asyncio.gather(
+            render_conversation(res, **render_kwargs), mm_coroutines
+        )
+        return rendered, media
+    mm_data, mm_embeddings = await mm_coroutines
+    if mm_embeddings:
+        raise ValueError(
+            "This model renders its prompt from the loaded media, so it cannot take "
+            "multimodal embeddings."
+        )
+    rendered = await render_conversation(res, mm_data=mm_data, **render_kwargs)
+    return rendered, (mm_data, mm_embeddings)
 
 
 _MEDIA_PART_MARKERS = ("image", "video", "audio")

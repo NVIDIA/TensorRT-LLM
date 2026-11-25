@@ -139,7 +139,7 @@ def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatc
 
     def fake_build_generator(model, config_path):
         assert model == "generator"
-        assert config_path == str(generator_config)
+        assert config_path == {"generation_params": {"seed": 123}}
         return generator, object()
 
     def fake_build_evaluator(evaluator_model, evaluator_options):

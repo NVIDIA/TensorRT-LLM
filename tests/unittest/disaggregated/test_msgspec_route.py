@@ -22,6 +22,8 @@ from pydantic import BaseModel
 from tensorrt_llm.serve.openai_client import MSGPACK_HEADERS, _msgpack_encoder
 from tensorrt_llm.serve.openai_server import _MsgspecRequest, _MsgspecRoute
 
+pytestmark = pytest.mark.cpu_only
+
 PAYLOAD = {
     "model": "m",
     "prompt": [1, 2, 3],

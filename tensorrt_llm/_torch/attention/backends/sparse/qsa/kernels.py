@@ -34,7 +34,7 @@ def _qsa_pdl_enabled(rows: int) -> bool:
     return rows <= 4 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_unscale_block_table_kernel(
     scaled_block_table,
     block_table,
@@ -104,7 +104,7 @@ def triton_qsa_unscale_block_table(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_decode_token_mapping_kernel(
     kv_lens,
     seq_lens,
@@ -295,7 +295,7 @@ def triton_qsa_generation_token_mapping(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_paged_kv_store_kernel(
     k,
     v,
@@ -1045,7 +1045,9 @@ def triton_qsa_prefill_compress(
     )
 
 
-@triton.jit
+# Callers pass row-metadata views that start at any row (request, rank or chunk boundaries): keep
+# their alignment out of the cache key, here and in the two index-score kernels below.
+@triton.jit(do_not_specialize_on_alignment=["query_positions", "sequence_lengths"])
 def _expand_qsa_block_indices_kernel(
     block_indices,
     query_positions,
@@ -1198,7 +1200,7 @@ def triton_expand_qsa_block_indices(
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["query_positions", "request_indices"])
 def _qsa_paged_index_scores_kernel(
     q,
     index_cache,
@@ -1403,7 +1405,10 @@ def _qsa_paged_index_scores_prefetch_tile(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_rows"],
+    do_not_specialize_on_alignment=["query_positions", "request_indices"],
+)
 def _qsa_paged_index_scores_qtile_kernel(
     q,
     index_cache,
@@ -1878,7 +1883,7 @@ def _qsa_paged_sparse_gqa_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_paged_sparse_gqa_splitk_kernel(
     q,
     k_cache,
@@ -2051,7 +2056,7 @@ def _qsa_paged_sparse_gqa_splitk_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output,
     partial_lse,

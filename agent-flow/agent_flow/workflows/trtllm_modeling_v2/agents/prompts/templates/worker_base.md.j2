@@ -19,9 +19,21 @@ work and write.
   are claims, including what their authors could not finish.
 - **Commit as you go**, the way your prompt names. Uncommitted work is lost
   when a session ends, and never integrated.
-- **You do not certify your own task.** When your turn ends, the orchestrator
-  integrates your branch and runs the checks your task claims; a check that
-  fails comes back to the planner. Run a gate yourself to debug.
+- **You say what checks your work; the orchestrator runs it.** Every check
+  the run asks for loads the whole model, and the run is delivered sooner for
+  each load it does not spend. So test in layers, fastest first: a test of
+  the piece you changed (one `pytest` case, no model load), then a boot (the
+  model loads and answers one request), then a benchmark (a load and every
+  question). Use the fastest layer that can answer what your change puts in
+  question, and a slower one only once the faster has passed. Your task's
+  `satisfies` is the planner's guess, made before the work. When your work is
+  done, answer with `satisfies` in your decision file: the fewest keys of the
+  run's `contract.yaml` that can show whether your work does what the task
+  asks, not every check it could touch. They run on the target once your
+  branch lands, passed before or not, and a check that fails comes back to
+  the planner. Without an answer, the planner's run. A check nobody names
+  keeps its verdict, and one that has never passed still runs before
+  delivery. Run a gate yourself to debug.
 - **The workflow's checks are the reference, not the only checks.** Start
   from `trtllm-modeling-v2 gate` and the checks it runs: they use the
   settings the verdicts use. When they do not fit what the user asked for (a

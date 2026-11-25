@@ -80,6 +80,45 @@ class TestResourceGovernor:
         assert expected.text.startswith("SERVER:")
         assert ids == expected.token_ids
 
+    @pytest.mark.asyncio
+    async def test_a_derived_kwarg_the_template_does_not_read_is_dropped(self, tokenizer) -> None:
+        """A message-based truncation renders a request-level field as the chat route does.
+
+        Muse Spark's extension turns ``reasoning_effort`` into a chat-template kwarg it lists
+        as injected, so a server template that does not read the kwarg renders without it.
+        """
+        from queue import Queue
+
+        from tensorrt_llm.serve.openai_protocol import KVCacheTruncateRequest
+        from tensorrt_llm.serve.resource_governor import ResourceGovernor
+
+        model_type = "muse_spark"
+        messages = [{"role": "user", "content": "hello world"}]
+        queue = Queue()
+        governor = ResourceGovernor(
+            queue,
+            tokenizer,
+            SimpleNamespace(model_type=model_type),
+            chat_template=SERVER_TEMPLATE,
+        )
+
+        response = await governor._truncate_kv_cache(
+            KVCacheTruncateRequest(model="m", messages=messages, reasoning_effort="high")
+        )
+
+        assert response.status_code == 200, response.body
+        expected = render_chat(
+            chat_request(messages=messages, reasoning_effort="high"),
+            RenderResources.from_parts(
+                tokenizer=tokenizer,
+                model_type=model_type,
+                hf_config=None,
+                default_chat_template=SERVER_TEMPLATE,
+            ),
+            tokenize=True,
+        )
+        assert queue.get_nowait().messages == expected.token_ids
+
 
 class _Router:
     """A KV-aware router whose tokenizer is the test tokenizer."""
@@ -774,14 +813,12 @@ class TestCountTokens:
 
     def test_a_passthrough_model_with_its_own_input_processor_is_counted(self, tokenizer) -> None:
         # A passthrough model carries its own input processor; the count uses the text tokenizer.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         class OwnProcessor:
             tokenizer = None
 
-        client = self._client(
-            tokenizer, model_type="mistral_common", input_processor=OwnProcessor()
-        )
+        client = self._client(tokenizer, model_type="llava_llama", input_processor=OwnProcessor())
 
         response = client.post("/v1/messages/count_tokens", json=self.BODY)
 
@@ -854,14 +891,12 @@ class TestKimiK3MessagesAndCountTokens:
     }
 
     @pytest.fixture
-    def k3_server(self, monkeypatch):
+    def k3_server(self, monkeypatch, tmp_path):
         from unittest.mock import AsyncMock
 
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
+        from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
         from tensorrt_llm.serve import chat_utils
-        from tensorrt_llm.serve.openai_server import OpenAIServer
         from tensorrt_llm.serve.postprocess_handlers import chat_response_post_processor
         from tensorrt_llm.tokenizer import TransformersTokenizer
 
@@ -877,31 +912,6 @@ class TestKimiK3MessagesAndCountTokens:
             executed = inputs.get("prompt_token_ids") or tokenizer(inputs["prompt"]).input_ids
             engine["executed"] = executed
             return SimpleNamespace(request_id=1, prompt_token_ids=executed, finished=True)
-
-        server = object.__new__(OpenAIServer)
-        server.model = "m"
-        server.allow_request_chat_template = False
-        server.model_config = SimpleNamespace(model_type="kimi_k3", vocab_size=len(tokenizer))
-        server.processor = None
-        server.tokenizer = TransformersTokenizer(tokenizer)
-        server.chat_template = None
-        server.tool_parser = None
-        server.tool_call_id_type = "random"
-        server.multimodal_server_config = None
-        server._input_proc_executor = None
-        server.generator = SimpleNamespace(
-            args=SimpleNamespace(
-                gather_generation_logits=False,
-                reasoning_parser="kimi_k3",
-                backend="pytorch",
-                guided_decoding_backend=None,
-                num_postprocess_workers=0,
-            ),
-            # kimi_k3 tokenizes text through its own multimodal input processor.
-            input_processor=object(),
-            generate_async=generate_async,
-        )
-        server.await_disconnected = AsyncMock()
 
         async def create_chat_response(promise, postproc_params, raw_request, *args):
             # The real chat post-processor computes the usage the reply bills.
@@ -920,13 +930,23 @@ class TestKimiK3MessagesAndCountTokens:
             )
             return chat_response_post_processor(result, postproc_params.postproc_args)
 
-        server._create_chat_response = create_chat_response
-        app = FastAPI()
-        app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
-        app.add_api_route(
-            "/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"]
-        )
-        return TestClient(app), server, tokenizer, engine
+        with isolated_serve_env(tmp_path) as env:
+            server = env.build_openai_server(AggConfig(model_name="m", reasoning_parser="kimi_k3"))
+            server.allow_request_chat_template = False
+            server.model_config = SimpleNamespace(model_type="kimi_k3", vocab_size=len(tokenizer))
+            server.processor = None
+            server.tokenizer = TransformersTokenizer(tokenizer)
+            server.chat_template = None
+            server.tool_parser = None
+            server.tool_call_id_type = "random"
+            server.multimodal_server_config = None
+            # kimi_k3 tokenizes text through its own multimodal input processor.
+            server.generator.input_processor = object()
+            server.generator.preprocess = None
+            server.generator.generate_async = generate_async
+            server.await_disconnected = AsyncMock()
+            server._create_chat_response = create_chat_response
+            yield env.client(server.app), server, tokenizer, engine
 
     @pytest.mark.parametrize(
         "fields",

@@ -19,6 +19,16 @@ limitations under the License.
 Scope: this directory and its descendants. Supplements the repository-root
 `AGENTS.md`.
 
+## CPU-only pytest thread budget
+
+Keep `TESTER_CPU_ONLY_CORES` as the single CPU-only worker budget: it controls
+both the test container's CPU requests/limits and the pytest process's
+`OMP_NUM_THREADS` / `MKL_NUM_THREADS`, inherited by unittest subprocesses.
+Keep this setting a positive whole-number CPU count, not a millicore value such
+as `1500m`: it is also passed directly to the native thread-count variables.
+Apply these startup limits only to `CPU-` test stages. GPU-stage thread policy
+is outside this setting's scope; a shared pod CPU limit is not a per-rank budget.
+
 ## Stage maintenance
 
 - Edit `jenkins/config/maintenance_stages.txt`. Blank lines and `#` comments
@@ -29,7 +39,7 @@ Scope: this directory and its descendants. Supplements the repository-root
 
   ```text
   Reason: The affected H100 resource is temporarily unavailable.
-  H100_PCIe-PyTorch-1
+  DGX_H100-PyTorch-1
   ```
 
 - The following DGX B200 names and patterns are illustrative examples, not
@@ -64,6 +74,16 @@ Scope: this directory and its descendants. Supplements the repository-root
   tests pass on the latest PR head before merging the maintenance removal.
 
 ## Path-valued pytest options
+
+- Shard collection runs through `scripts/collect_pytest.py`: each attempt has a
+  30-minute deadline and only timed-out attempts get up to two retries. Ordinary
+  pytest failures and user cancellation must not retry. The enclosing Pipeline
+  deadline still applies. Keep attempt stdout/stderr under the stage result
+  directory so the normal result upload preserves them on failure. Only the
+  successful attempt's `output.txt` is parsed into the shard list.
+  The collection child disables mpi4py auto-initialization and TensorRT-LLM
+  library initialization. Keep these environment overrides local to that child;
+  normal test execution must retain its original runtime configuration.
 
 - For new or modified long pytest options that take a single file or directory
   path, use `--option=value` when supported. Keep the option and value in one

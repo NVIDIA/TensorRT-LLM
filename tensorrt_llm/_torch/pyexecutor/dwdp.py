@@ -430,6 +430,11 @@ class DwdpManager:
         return self.dwdp_size > 1
 
     @property
+    def weight_manager(self) -> Optional[DWDPWeightManager]:
+        """The expert weight manager, or None before setup and after cleanup."""
+        return self._weight_manager
+
+    @property
     def dense_manager(self) -> DenseDwdpManager:
         """The attached dense DWDP manager, registered globally while this manager is entered."""
         return self._dense_manager
