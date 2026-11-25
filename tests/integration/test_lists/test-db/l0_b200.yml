@@ -198,6 +198,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_module.py::test_dspark_draft_fused_route_quant_matches_separate_launches
   - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
   - unittest/_torch/modules/test_embedding_vocab_slice.py
+  - unittest/_torch/modules/mamba/test_gdn_mtp_replay.py
   - unittest/_torch/distributed/test_ll_allgather.py
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_deferred_gen_receive
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
@@ -587,8 +588,6 @@ l0_b200:
   - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
   - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
   - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
-  # ------------- Host perf E2E regression tests (reuse perf_sanity with host-overhead-dominant configs) ---------------
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256]
 - condition:
     ranges:
       system_gpu_count:

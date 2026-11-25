@@ -184,15 +184,13 @@ def _fmt_summary(
     subject: str,
     files: list[str],
     result: dict,
-    post_merge: bool,
     tests_only: bool,
 ) -> str:
-    trigger = "/bot run --post-merge" if post_merge else "/bot run"
     lines = [
         f"PR:                {pr_url}",
         f"Subject:           {subject}",
         f"SHA:               {sha}",
-        f"Trigger:           {trigger} (post_merge={post_merge})",
+        "Stage scope:       all candidates (Jenkins applies command scope downstream)",
         f"Tests-only:        {tests_only}",
         f"Files changed ({len(files)}):",
     ]
@@ -291,7 +289,6 @@ def _cbts_for_snapshot(
     tip_sha: str,
     files: list[str],
     diffs: dict[str, str],
-    post_merge: bool,
     pr_dir: Path,
     coverage_db: Optional[str] = None,
 ) -> dict:
@@ -304,7 +301,7 @@ def _cbts_for_snapshot(
     """
     if not files:
         return {"_error": "no files changed"}
-    payload = {"changed_files": files, "diffs": diffs, "post_merge": post_merge}
+    payload = {"changed_files": files, "diffs": diffs}
     with tempfile.TemporaryDirectory() as td:
         wt = Path(td) / "wt"
         _git(repo, "worktree", "add", "--detach", str(wt), tip_sha)
@@ -325,7 +322,6 @@ def _replay_one(
     repo: Path,
     sha: str,
     out_dir: Path,
-    post_merge: bool,
     coverage_db: Optional[str] = None,
 ) -> tuple[str, str, list[str], str, dict, bool]:
     subject = _git(repo, "log", "-1", "--pretty=%s", sha).stdout.strip()
@@ -334,9 +330,9 @@ def _replay_one(
     tests_only = _is_tests_only(files)
     pr_dir = _prep_pr_dir(out_dir, label)
     diffs = {f: _file_diff(repo, sha, f) for f in files}
-    result = _cbts_for_snapshot(repo, sha, files, diffs, post_merge, pr_dir, coverage_db)
+    result = _cbts_for_snapshot(repo, sha, files, diffs, pr_dir, coverage_db)
     (pr_dir / "summary.txt").write_text(
-        _fmt_summary(pr_url, sha, subject, files, result, post_merge, tests_only)
+        _fmt_summary(pr_url, sha, subject, files, result, tests_only)
     )
     return label, pr_url, files, subject, result, tests_only
 
@@ -345,7 +341,6 @@ def _replay_range(
     repo: Path,
     range_expr: str,
     out_dir: Path,
-    post_merge: bool,
     coverage_db: Optional[str] = None,
 ) -> tuple[str, str, list[str], str, dict, bool]:
     """Replay the cumulative diff of a git range as a single CBTS run.
@@ -365,9 +360,9 @@ def _replay_range(
     pr_url = f"range {range_expr} (base={base_disp}, tip={tip_sha[:8]})"
     pr_dir = _prep_pr_dir(out_dir, label)
     diffs = {f: _file_diff_range(repo, diff_arg, f) for f in files}
-    result = _cbts_for_snapshot(repo, tip_sha, files, diffs, post_merge, pr_dir, coverage_db)
+    result = _cbts_for_snapshot(repo, tip_sha, files, diffs, pr_dir, coverage_db)
     (pr_dir / "summary.txt").write_text(
-        _fmt_summary(pr_url, tip_sha, subject, files, result, post_merge, tests_only)
+        _fmt_summary(pr_url, tip_sha, subject, files, result, tests_only)
     )
     return label, pr_url, files, subject, result, tests_only
 
@@ -378,7 +373,6 @@ def _write_index(
     ref: str,
     window: int,
     filter_mode: str,
-    post_merge: bool,
     range_expr: Optional[str] = None,
 ) -> None:
     counts: dict[Optional[str], int] = {}
@@ -392,18 +386,11 @@ def _write_index(
         category = result.get("coverage_decline_category") or "none"
         decline_counts[category] = decline_counts.get(category, 0) + 1
 
-    trigger = "/bot run --post-merge" if post_merge else "/bot run"
     if range_expr:
-        source_line = (
-            f"Range: `{range_expr}` (cumulative diff), simulated as "
-            f"`{trigger}` (post_merge={post_merge})."
-        )
+        source_line = f"Range: `{range_expr}` (cumulative diff), all stage candidates."
         detail_line = "Replayed as a single cumulative CBTS run."
     else:
-        source_line = (
-            f"Source ref: `{ref}` (last {window} commits), simulated as "
-            f"`{trigger}` (post_merge={post_merge})."
-        )
+        source_line = f"Source ref: `{ref}` (last {window} commits), all stage candidates."
         detail_line = f"Filter: `{filter_mode}` — replayed commits: **{len(rows)}**"
     lines = [
         "# CBTS dry-run results",
@@ -480,7 +467,6 @@ def _positive_int(ctx, param, value):
     "(e.g. 'main..HEAD', 'origin/main...HEAD', or a bare SHA); "
     "ignores --ref/--window/--filter/--sha/--limit",
 )
-@click.option("--post-merge", "post_merge", is_flag=True, help="set post_merge=True")
 @click.option(
     "--coverage-db",
     default=None,
@@ -500,7 +486,6 @@ def main(
     limit,
     shas_opt,
     range_expr,
-    post_merge,
     coverage_db,
     out,
     repo_root,
@@ -520,7 +505,6 @@ def main(
             limit,
             list(shas_opt),
             range_expr,
-            post_merge,
             coverage_db,
             out,
             repo_root,
@@ -536,7 +520,6 @@ def _run(
     limit,
     shas_arg,
     range_expr,
-    post_merge,
     coverage_db,
     out,
     repo_root,
@@ -575,7 +558,7 @@ def _run(
     if range_expr:
         print(f"Replaying cumulative range: {range_expr}", file=sys.stderr)
         try:
-            row = _replay_range(repo, range_expr, out_dir, post_merge, coverage_db)
+            row = _replay_range(repo, range_expr, out_dir, coverage_db)
         except subprocess.CalledProcessError as e:
             print(f"git error: {e.stderr.strip()}", file=sys.stderr)
             return 1
@@ -603,7 +586,7 @@ def _run(
             )
         for sha in shas:
             try:
-                row = _replay_one(repo, sha, out_dir, post_merge, coverage_db)
+                row = _replay_one(repo, sha, out_dir, coverage_db)
             except subprocess.CalledProcessError as e:
                 print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
                 continue
@@ -618,7 +601,6 @@ def _run(
         ref,
         window,
         filter_mode,
-        post_merge,
         range_expr=range_expr,
     )
 

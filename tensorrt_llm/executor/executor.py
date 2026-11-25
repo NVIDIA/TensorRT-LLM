@@ -500,6 +500,10 @@ class GenerationExecutor(ABC):
         """Return startup metrics, or ``None`` when temporarily unavailable."""
         return {}
 
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,

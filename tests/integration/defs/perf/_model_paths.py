@@ -131,15 +131,14 @@ MODEL_PATH_DICT = {
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
     # Nemotron-Ultra-V3 (550B-A55B) mixed NVFP4 weights + FP8 KV + fp16 Mamba
-    # cache. Synced locally under llm_models_root() (llm-models repo) -- distinct
-    # from the HF-download `nemotron_3_ultra_550b_nvfp4` entry in HF_MODEL_PATH.
+    # cache. Distinct from the public HF checkpoint synced below.
     "nemotron_ultra_v3_fp4": "Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k",
+    # Public HF submodule synced locally by the llm-models repo.
+    "nemotron_3_ultra_550b_nvfp4": "NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
 }
 
 # Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).
-HF_MODEL_PATH = {
-    "nemotron_3_ultra_550b_nvfp4": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
-}
+HF_MODEL_PATH = {}
 
 LORA_MODEL_PATH = {
     "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
