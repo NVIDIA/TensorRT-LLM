@@ -110,6 +110,8 @@ class PrometheusExposure:
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
             trtllm_kv_cache_disk_prefetch_blocks_total
+            trtllm_kv_cache_alignment_forfeited_connector_tokens_total
+            trtllm_kv_cache_alignment_forfeited_recomputed_tokens_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -394,6 +396,26 @@ class PrometheusExposure:
                 "Process-lifetime total V2 KV-cache blocks migrated from disk "
                 "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_alignment_forfeited_connector_tokens_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_alignment_forfeited_connector_tokens_total",
+            documentation=(
+                "Process-lifetime total locally reusable prompt tokens that a "
+                "whole-block KV connector's alignment gave up, and that the "
+                "connector then served. Reported only when a connector requires "
+                "block-aligned reuse. Resets only when the serving process "
+                "restarts."),
+            labelnames=iteration_labelnames)
+        self.kv_cache_alignment_forfeited_recomputed_tokens_total = Counter(
+            name=self.metric_prefix +
+            "kv_cache_alignment_forfeited_recomputed_tokens_total",
+            documentation=
+            ("Process-lifetime total locally reusable prompt tokens that a "
+             "whole-block KV connector's alignment gave up, and that were "
+             "recomputed because the connector did not serve them. Reported "
+             "only when a connector requires block-aligned reuse. Resets only "
+             "when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -1366,6 +1388,15 @@ class PrometheusExposure:
             iteration_stats.get("kvCacheLevelTiers"), rank)
         self._log_connector_cached_tokens(
             iteration_stats.get("iterConnectorCachedTokens"), rank)
+        for key, counter in (
+            ("iterAlignmentForfeitedConnectorTokens",
+             self.kv_cache_alignment_forfeited_connector_tokens_total),
+            ("iterAlignmentForfeitedRecomputedTokens",
+             self.kv_cache_alignment_forfeited_recomputed_tokens_total),
+        ):
+            count = iteration_stats.get(key)
+            if count:
+                self._log_counter(counter, rank_labels, count)
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(

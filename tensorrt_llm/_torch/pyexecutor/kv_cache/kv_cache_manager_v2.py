@@ -3596,6 +3596,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._allocated_draft_lens: dict[int, int] = {}
         self._retained_generation_allocations: dict[int, int] = {}
+        # Local reuse that a whole-block connector's alignment gave up, since the last
+        # iteration stats: tokens the connector then served, and tokens recomputed.
+        self._alignment_forfeited_served_tokens = 0
+        self._alignment_forfeited_recomputed_tokens = 0
 
         # Draft widths of generation allocations that update_resources has not
         # reconciled yet, oldest first. Under the overlap scheduler step N+1 is
@@ -8205,7 +8209,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     req, reservation.start, reservation.end, by_group
                 )
                 self._record_connector_reuse(kv_cache, reservation.start, reservation.end)
+                self._record_alignment_forfeit(kv_cache, reservation.start, reservation.end)
                 req.py_served_prefix_end = reservation.end
+            else:
+                kv_cache = self.kv_cache_map[req.py_request_id]
+                local_end = kv_cache.num_committed_tokens
+                self._record_alignment_forfeit(kv_cache, local_end, local_end)
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
 
@@ -8302,7 +8311,45 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
         self._record_connector_reuse(kv_cache, local_end, position)
+        self._record_alignment_forfeit(kv_cache, local_end, position)
         return position > local_end
+
+    def _record_alignment_forfeit(self, kv_cache, local_end: int, served_end: int) -> None:
+        """Count the local reuse that block alignment gave up, once a request's offer settles.
+
+        Alignment rounds the local match down from the reusable prefix it would
+        otherwise take, `kv_cache._get_num_reusable_tokens_before_alignment()`, to
+        a multiple of `_connector_reuse_match_alignment()`. Of the tokens in between,
+        those the connector served in `[local_end, served_end)` count as served; the
+        rest are recomputed.
+
+        Args:
+            kv_cache: The request's cache.
+            local_end: Where the local match, and so the connector's offer, starts.
+            served_end: Where the connector-served prefix ends; `local_end` if it
+                served none.
+        """
+        alignment = self._connector_reuse_match_alignment()
+        if alignment <= 1:
+            return
+        unaligned_end = kv_cache._get_num_reusable_tokens_before_alignment()
+        aligned_end = unaligned_end // alignment * alignment
+        forfeited = unaligned_end - aligned_end
+        if forfeited <= 0:
+            return
+        served = max(0, min(served_end, unaligned_end) - max(local_end, aligned_end))
+        self._alignment_forfeited_served_tokens += served
+        self._alignment_forfeited_recomputed_tokens += forfeited - served
+
+    def _take_alignment_forfeit(self) -> tuple[int, int] | None:
+        """The served and recomputed forfeited tokens since the last call, or None without alignment."""
+        counts = (
+            self._alignment_forfeited_served_tokens,
+            self._alignment_forfeited_recomputed_tokens,
+        )
+        self._alignment_forfeited_served_tokens = 0
+        self._alignment_forfeited_recomputed_tokens = 0
+        return counts if self._connector_reuse_match_alignment() > 1 else None
 
     def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
         """Book the prompt tokens a connector fills in ``[start, end)`` as cached.
@@ -9571,6 +9618,7 @@ class KVCacheManagerV2(BaseResourceManager):
             connector_cached_tokens=(
                 connector_cached_tokens if self._connector_reports_cached_tokens() else None
             ),
+            alignment_forfeited_tokens=self._take_alignment_forfeit(),
         )
 
     def _connector_reports_cached_tokens(self) -> bool:

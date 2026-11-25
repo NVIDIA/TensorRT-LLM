@@ -56,8 +56,9 @@ def _connector(whole_blocks: bool | str, *, capacity_only: bool = False) -> Simp
     "backoff, partial_reuse, connector, is_draft, expected",
     [
         (1, False, _connector(True), False, TOKENS_PER_BLOCK),
-        # No backoff: matches of whole blocks already end on a boundary.
-        (0, False, _connector(True), False, 1),
+        # No backoff still aligns: trimming a match to the pages a sliding-window
+        # layer holds can end it mid-block.
+        (0, False, _connector(True), False, TOKENS_PER_BLOCK),
         # Whole-block declarations override the default partial reuse setting.
         (1, True, _connector(True), False, TOKENS_PER_BLOCK),
         # A connector that serves from any position needs nothing.
@@ -148,3 +149,69 @@ def test_retained_generation_retry_reserves_current_draft_width(growth_succeeds:
         assert manager._allocated_draft_lens == {}
         assert manager._inflight_draft_lens == {7: [0]}
         manager._fill_fresh_kv_pages.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "unaligned_end, local_end, served_end, expected",
+    [
+        # 300 reusable tokens align down to 256: the connector serves those 44 and more.
+        (300, 256, 512, (44, 0)),
+        # The connector serves nothing: all 44 are recomputed.
+        (300, 256, 256, (0, 44)),
+        # The connector serves 20 of them: the other 24 are recomputed.
+        (300, 256, 276, (20, 24)),
+        # A match already on a boundary gives nothing up.
+        (256, 256, 512, (0, 0)),
+    ],
+    ids=["served", "recomputed", "partly_served", "on_a_boundary"],
+)
+def test_alignment_forfeit_is_split_by_what_the_connector_served(
+    unaligned_end: int,
+    local_end: int,
+    served_end: int,
+    expected: tuple[int, int],
+) -> None:
+    manager = _manager(backoff=1, partial_reuse=False, connector=_connector(True))
+    manager._alignment_forfeited_served_tokens = 0
+    manager._alignment_forfeited_recomputed_tokens = 0
+    kv_cache = SimpleNamespace(_get_num_reusable_tokens_before_alignment=lambda: unaligned_end)
+
+    manager._record_alignment_forfeit(kv_cache, local_end, served_end)
+
+    assert manager._take_alignment_forfeit() == expected
+    # Each report covers the iterations since the last one.
+    assert manager._take_alignment_forfeit() == (0, 0)
+
+
+def test_alignment_forfeit_is_not_reported_without_alignment() -> None:
+    manager = _manager(backoff=1, partial_reuse=False, connector=_connector(False))
+    manager._alignment_forfeited_served_tokens = 0
+    manager._alignment_forfeited_recomputed_tokens = 0
+    kv_cache = SimpleNamespace(_get_num_reusable_tokens_before_alignment=lambda: 300)
+
+    manager._record_alignment_forfeit(kv_cache, 256, 512)
+
+    assert manager._take_alignment_forfeit() is None
+
+
+@pytest.mark.parametrize("forfeit", [(44, 20), None], ids=["aligned", "not_aligned"])
+def test_alignment_forfeit_reaches_the_iteration_stats(forfeit: tuple[int, int] | None) -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+        KVCacheV2IterationStatsReport,
+        append_kv_cache_iteration_stats,
+    )
+
+    stats: dict = {}
+    append_kv_cache_iteration_stats(
+        stats,
+        KVCacheV2IterationStatsReport(
+            by_window_size={}, by_pool_group={}, alignment_forfeited_tokens=forfeit
+        ),
+    )
+
+    if forfeit is None:
+        assert "iterAlignmentForfeitedConnectorTokens" not in stats
+        assert "iterAlignmentForfeitedRecomputedTokens" not in stats
+    else:
+        assert stats["iterAlignmentForfeitedConnectorTokens"] == 44
+        assert stats["iterAlignmentForfeitedRecomputedTokens"] == 20

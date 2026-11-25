@@ -520,6 +520,13 @@ public:
         return mNumReusableTokensBeforePruning;
     }
 
+    // Internal diagnostic: the reused prefix before a whole-block KV connector's
+    // alignment rounded it down (see BlockRadixTree::ReuseMatch).
+    int numReusableTokensBeforeAlignment() const noexcept
+    {
+        return mNumReusableTokensBeforeAlignment;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -926,6 +933,7 @@ private:
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;
     int mNumReusableTokensBeforePruning;
+    int mNumReusableTokensBeforeAlignment;
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

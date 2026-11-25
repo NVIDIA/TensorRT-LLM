@@ -158,6 +158,8 @@ class FakeConnectorManager:
     def __init__(self, num_matched=0, load_async=False, add_sequence=True):
         # Read by the manager to decide whether the prefix path runs at all.
         self.capacity_only = False
+        # The real manager always states this; the prefix path reads it to align matches.
+        self.requires_block_aligned_reuse = False
         self.prefix_reservations_enabled = False
         self.reservations = {}
         self.reservation_requests = {}
