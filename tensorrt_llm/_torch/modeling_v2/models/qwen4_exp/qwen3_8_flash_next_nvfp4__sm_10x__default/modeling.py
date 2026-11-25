@@ -604,6 +604,15 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_g
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_conv_lean import (
+    conv_lean as gdn_conv_lean,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_conv_lean import (
+    precompile as gdn_conv_lean_precompile,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_conv_lean import (
+    promote_x as gdn_promote_x,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (
     MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS,
 )
@@ -2268,14 +2277,14 @@ _HC_FIRST_X2_ROWS = _HC_ROWSN_ROWS  # capacity: fixed: dispatch thresholds
 DP_INPROJ_RELEASE_ENV = "TRTLLM_QWEN4_EXP_DP_INPROJ_RELEASE"
 #: Rows a rank at which the switch above can engage (`mid_rows_mm`'s rows past the GEMV's).
 _INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
-#: Off by default. `<r>` (2..4 requests a rank): two bitwise attention-DP decode forms also serve
-#: r..4 requests (4 r..16 rows; from 5 rows the hc first kernel's default plan has the K split
-#: the rows-on-N kernel keeps): the input projections behind a releasing site A
-#: (`DP_INPROJ_RELEASE_ENV`, its first plan; its build self-check still gates every row count)
-#: and the rows-on-N hc first kernel for a mixer with the injection (`DP_HC_TILES_ENV`, in place
-#: of the 64-row tile; the same K slices in the same order). Measured on dep8 at 3 requests a
-#: rank with r = 2, as part of a -0.33 ms step whose other row floors belong to forms not in
-#: this target. Read once, when the target is built.
+#: Off by default. `<r>` (2..4 requests a rank): the bitwise attention-DP decode forms below also
+#: serve r..4 requests (4 r..16 rows; from 5 rows the hc first kernel's default plan has the K
+#: split the rows-on-N kernel keeps): the input projections behind a releasing site A
+#: (`DP_INPROJ_RELEASE_ENV`, its first plan; its build self-check still gates every row count),
+#: the rows-on-N hc first kernel for a mixer with the injection (`DP_HC_TILES_ENV`, in place of
+#: the 64-row tile; the same K slices in the same order) and the lean verify conv
+#: (`DP_GDN_CONV_LEAN_ENV`, the same kernels at fewer rows). Measured on dep8 at 3 requests a
+#: rank with r = 2, as part of a -0.33 ms step. Read once, when the target is built.
 DP_LOWROWS_ENV = "TRTLLM_QWEN4_EXP_DP_LOWROWS"
 #: The most rows the lowered floors reach below their own ranges: 4 requests a rank.
 _DP_LOWROWS_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
@@ -2371,6 +2380,313 @@ def _gdn_replay_map_on(core, cm, device, ring: bool) -> bool:
         and (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, core.max_verify_rows)
         == (_GDN_REPLAY_MAP_PARTITION, _GDN_REPLAY_MAP_ROWS)
     )
+
+
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) with MTP and PDL,
+#: whose bound manager runs the CuTe replay over a bf16 pool (no FlashInfer ring) with the stock
+#: `GDNReplayState` promoting linear draft chains from a stacked conv pool, a generation-only
+#: verify step of `_GDN_LEAN_ROWS` rows runs every GDN layer's conv on the lean conv
+#: (`gdn_conv_lean`: the conv output and the raw q|k|v rows of every verify row into `xsave`, no
+#: window snapshots, no pool advance; a PDL dependent of the input projection), promotes the
+#: windows from those rows (`gdn_promote_x`, in place of the stock promotion, same bookkeeping
+#: arithmetic over the promotion's replay slots) and launches the gated norm as a PDL dependent
+#: of the replay (`rms_norm_gated_token_major(pdl=True)`; the registered op drops PDL once its
+#: grid covers the SMs, which every dep verify step's does). Values: the conv output, the
+#: promoted windows, the bookkeeping and the norm output are bitwise the stock launches'.
+#:
+#: Decided in `DecodeTarget.forward` from host ints that a decode graph's key fixes (rows,
+#: rows a request, requests), consumed by the wrapped `GDNReplayState` promotion, which the spec
+#: worker runs inside the same forward (`update_mamba_states`): a captured graph records the lean
+#: conv and `promote_x` together, a replay re-runs both. A step is lean for all its GDN layers or
+#: for none; mixed and context steps keep the stock pair. The bind compiles both kernels and runs
+#: them against the stock pair on private buffers with this rank's taps (rank-local; a
+#: difference or an error leaves the switch off at this rank with one warning). GB300 micro
+#: 0.05-0.10 ms a step; measured on every dep4 / dep8 front point. `0` keeps the stock pair.
+#: Read once, when the target is built.
+DP_GDN_CONV_LEAN_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_CONV_LEAN"
+#: Rows a rank at which a generation-only verify step runs lean: the input projection's
+#: `mid_rows_mm` rows (`DP_LOWROWS_ENV` lowers the floor).
+_GDN_LEAN_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
+#: The attribute marking a `GDNReplayState` whose promotion a core wrapped (binds repeat; a
+#: state is wrapped once).
+_GDN_LEAN_WRAPPED = "_qwen4_exp_gdn_lean_core"
+#: `(what, count, capturing)` shapes a lean form has reported in this process (one line each).
+_GDN_LEAN_LOGGED: set = set()
+
+
+class _GdnStep:
+    """What the lean GDN forms decided for the trunk step in flight, host side: `lean` (every
+    GDN layer runs `gdn_conv_lean`; the promotion must be `gdn_promote_x`) and the generation
+    requests it carried. Both trunk targets clear it before they decide; the wrapped promotion,
+    the last launch of the step's state update, clears `lean` again."""
+
+    __slots__ = ("lean", "gens")
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        self.lean = False
+        self.gens = 0
+
+
+def _gdn_lean_now(core) -> bool:
+    """Whether the trunk step in flight runs lean (`DP_GDN_CONV_LEAN_ENV`)."""
+    step = getattr(core, "_gdn_step", None)
+    return step is not None and step.lean
+
+
+def _gdn_step_clear(core) -> None:
+    """A trunk target's first word on the step: the previous step's lean decision is not this
+    step's."""
+    step = getattr(core, "_gdn_step", None)
+    if step is not None:
+        step.clear()
+
+
+def _gdn_lean_seen(core, what: str, count: int, unit: str) -> None:
+    """One log line the first time a lean form engages at a shape, eager and under capture
+    apart. Host side: it runs in the warmup and the capture of a graph, never on a replay."""
+    seen = (what, count, bool(torch.cuda.is_current_stream_capturing()))
+    if seen not in _GDN_LEAN_LOGGED:
+        _GDN_LEAN_LOGGED.add(seen)
+        logger.info(f"DP GDN {what} engaged: rank {core.dp_rank}, {count} {unit}, graph={seen[2]}")
+
+
+def _gdn_lean_build(core, device) -> bool:
+    """`DP_GDN_CONV_LEAN_ENV`, read once at build: the wish `_gdn_lean_bind` settles against
+    each bound manager. True at a dep4 / dep8 rank on SM103 with MTP, PDL and a width-4 conv
+    and the switch on (default); False elsewhere (set explicitly where it cannot apply: one
+    warning)."""
+    if not _switch(DP_GDN_CONV_LEAN_ENV, default=True):
+        return False
+    ok = (
+        _dp_decode_rank(core, device)
+        and core.mtp_enabled
+        and bool(_GDN_REPLAY_PDL)
+        and core.conv_kernel == 4
+    )
+    if not ok and os.environ.get(DP_GDN_CONV_LEAN_ENV, "").strip():
+        logger.warning(
+            f"{DP_GDN_CONV_LEAN_ENV} is set but ignored: it takes effect only at a dep4 / dep8 "
+            "rank on SM103 with MTP and PDL on, over a width-4 conv; every verify step keeps the "
+            "stock conv, promotion and gated norm"
+        )
+    return ok
+
+
+def _gdn_lean_state(core, cm) -> tuple:
+    """`(state, why)`: the bound manager's speculative state when the lean forms can promote
+    through it, else `(None, the reason)`."""
+    from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState
+
+    bound = core._bound
+    state = getattr(cm, "_speculative_state", None)
+    g0 = core.gdn_layers[0]
+    if bound.replay is None or bound.int_conv is None or bound.int_idx is None:
+        return None, "the manager bound no verify-step buffers"
+    if bound.replay.ring is not None:
+        return None, "the manager runs FlashInfer's ring replay"
+    if bound.pools.ssm[g0].dtype != torch.bfloat16:
+        return None, f"the recurrent pool is {bound.pools.ssm[g0].dtype}, not bf16 (no CuTe replay)"
+    if type(state) is not GDNReplayState:
+        return None, f"the speculative state is {type(state).__name__}, not GDNReplayState"
+    if not state._linear_steps or state._stacked_conv is None:
+        return None, "the speculative state does not promote linear draft chains in one launch"
+    if getattr(state, _GDN_LEAN_WRAPPED, None) not in (None, core):
+        return None, "the speculative state is already wrapped by another model"
+    stack, snaps, c = state._stacked_conv, state.intermediate_conv, core.conv_dim
+    layers = list(core.gdn_layers)
+    if snaps is None or snaps.dim() != 5 or tuple(snaps.shape[3:]) != (c, 3):
+        return None, "the snapshot buffer is not [layers, max_batch, T, conv_dim, 3]"
+    if tuple(stack.shape[0:1] + stack.shape[2:]) != (len(layers), c, 3):
+        return None, f"the stacked conv pool is {tuple(stack.shape)}"
+    if stack.dtype != torch.bfloat16 or stack.stride(2) != 3 or stack.stride(3) != 1:
+        return None, f"the conv pool is {stack.dtype} with strides {tuple(stack.stride())}"
+    for j, i in enumerate(layers):
+        view = bound.pools.conv[i]
+        if (
+            view.data_ptr() != stack[j].data_ptr()
+            or view.stride() != stack[j].stride()
+            or bound.int_conv[i].data_ptr() != snaps[j].data_ptr()
+        ):
+            return None, f"GDN layer {i} is not layer {j} of the manager's stacked buffers"
+        taps = core._decode._layers[i].conv_w
+        if tuple(taps.shape) != (c, 4) or not taps.is_contiguous() or taps.dtype != torch.bfloat16:
+            return None, f"GDN layer {i}'s conv taps are {tuple(taps.shape)} {taps.dtype}"
+    meta = state.get_replay_metadata()
+    if meta is None or meta.replay_step_width != snaps.shape[2]:
+        return None, "the replay step width is not the snapshot buffer's"
+    return state, ""
+
+
+def _gdn_lean_selfcheck(core, conv_w, c: int, t: int, history: int, stride: int, device) -> str:
+    """Run the lean pair and the stock pair (`causal_conv1d_triton_update` with snapshots, then
+    `promote_conv_and_advance_replay_triton`) on private buffers -- this rank's taps, random
+    rows, two layers, four requests on separate replay slots, every accepted count, a dummy
+    request -- and compare the conv output, the windows and the bookkeeping bitwise. '' when
+    they agree, else what differs. Rank-local: no collective."""
+    from tensorrt_llm._torch.modules.fla.replay_promotion import (
+        promote_conv_and_advance_replay_triton,
+    )
+
+    gen = torch.Generator(device=device).manual_seed(20261125)
+    n, layers, slots_n = 4, 2, 8
+    page = torch.randn(slots_n, layers, c, 3, generator=gen, device=device).to(torch.bfloat16)
+    x = torch.randn(n * t, stride, generator=gen, device=device).to(torch.bfloat16)[:, :c]
+    slots = torch.tensor([7, 0, 3, 5], dtype=torch.int32, device=device)
+    rows = torch.tensor([2, 0, 3, 1], dtype=torch.int32, device=device)
+    replay = torch.tensor([9, 4, 0, 6], dtype=torch.int32, device=device)
+    acc = torch.tensor([(g % t) + 1 for g in range(n)], dtype=torch.int32, device=device)
+    dummy = torch.tensor([False, False, False, True], device=device)
+    meta = torch.randint(0, history + 1, (12, 2), generator=gen, device=device).int()
+    meta[:, 1] %= 2
+    lean_page, lean_meta = page.clone(), meta.clone()
+    xsave = torch.zeros(layers, n, t, c, dtype=torch.bfloat16, device=device)
+    snaps = torch.zeros(layers, n, t, c, 3, dtype=torch.bfloat16, device=device)
+    lean_out, stock_out = [], []
+    for j in range(layers):
+        lean_out.append(
+            gdn_conv_lean(x, conv_w, lean_page[:, j], slots, rows, xsave[j], t, pad_slot_id=-1)
+        )
+        o = causal_conv1d_triton_update(
+            x=torch.transpose(torch.reshape(x, [n, t, c]), 1, 2), conv_state=page[:, j],
+            weight=conv_w, bias=None, activation="silu", conv_state_indices=slots,
+            pad_slot_id=-1, num_accepted_tokens=None, intermediate_conv_window=snaps[j],
+            intermediate_state_indices=rows,
+        )  # fmt: skip
+        stock_out.append(torch.reshape(torch.transpose(o, 1, 2), [n * t, c]))
+    gdn_promote_x(
+        lean_page.permute(1, 0, 2, 3), xsave, rows, slots, acc, dummy, lean_meta[:, 0],
+        lean_meta[:, 1], t, history, replay_slots=replay, pad_slot_id=-1,
+    )  # fmt: skip
+    promote_conv_and_advance_replay_triton(
+        page.permute(1, 0, 2, 3), snaps, rows, acc, slots, num_accepted_tokens=acc,
+        replay_pnat=meta[:, 0], replay_cache_buf_idx=meta[:, 1], dummy_request_mask=dummy,
+        replay_step_width=t, replay_history_size=history, replay_indices=replay,
+        position_source_is_token_count=True,
+    )  # fmt: skip
+    torch.cuda.synchronize(device)
+    bad = []
+    if not all(torch.equal(a, b) for a, b in zip(lean_out, stock_out)):
+        bad.append("the conv output")
+    if not torch.equal(lean_page, page):
+        bad.append("the promoted windows")
+    if not torch.equal(lean_meta, meta):
+        bad.append("the replay bookkeeping")
+    return " and ".join(bad)
+
+
+def _gdn_lean_bind(core, cm) -> None:
+    """Settle `DP_GDN_CONV_LEAN_ENV` against one bound cache manager (behind `_bound`): the
+    manager's state must be the stock `GDNReplayState` laid out as `_gdn_lean_state` checks; then
+    `xsave` (`[GDN layers, max_batch, T, conv_dim]` bf16) is allocated, both kernels and the PDL
+    gated norm are compiled, the self-check runs, and the state's promotion is wrapped once (it
+    runs the stock method unless the step in flight ran lean). Otherwise one warning and the
+    manager's verify steps keep the stock pair. Rank-local."""
+    if not getattr(core, "_gdn_lean_want", False):
+        return
+    core._gdn_lean_on = False
+    core._gdn_lean_state_ref = None
+    core._gdn_xsave, core._gdn_xsave_all = {}, None
+    core._gdn_step.clear()
+    state, why = _gdn_lean_state(core, cm)
+    layers = list(core.gdn_layers)
+    if state is not None:
+        snaps = state.intermediate_conv
+        max_batch, t, c = snaps.shape[1], snaps.shape[2], core.conv_dim
+        history = state.get_replay_metadata().replay_history_size
+        device = snaps.device
+        conv_w = core._decode._layers[layers[0]].conv_w
+        try:
+            gdn_conv_lean_precompile(c, t, history, sum(core.in_proj_split), device)
+            # The PDL gated norm a lean step launches, on a private two-token layer layout.
+            hv, n = core.num_v_heads, core.head_v_dim
+            proj = torch.zeros(2, sum(core.in_proj_split), dtype=torch.bfloat16, device=device)
+            z3 = torch.reshape(torch.split(proj, core.in_proj_split, 1)[1], [2, hv, n])
+            rms_norm_gated_token_major(
+                torch.zeros(2 * hv, n, dtype=torch.bfloat16, device=device), z3,
+                weight=core._decode._layers[layers[0]].gnorm, eps=core.eps, fp8_scale=None,
+                gate_activation="sigmoid", pdl=True,
+            )  # fmt: skip
+            why = _gdn_lean_selfcheck(core, conv_w, c, t, history, sum(core.in_proj_split), device)
+            if why:
+                why = f"the lean pair differs from the stock pair in {why}"
+        except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+            why = f"the lean kernels raised {type(e).__name__}: {e}"
+    if why:
+        logger.warning(
+            f"{DP_GDN_CONV_LEAN_ENV} set but not engaged for {type(cm).__name__} at rank "
+            f"{core.dp_rank}: {why}; its verify steps keep the stock conv, promotion and gated "
+            "norm"
+        )
+        return
+    xsave = torch.zeros([len(layers), max_batch, t, c], dtype=torch.bfloat16, device=device)
+    core._gdn_xsave_all = xsave
+    core._gdn_xsave = {i: xsave[j] for j, i in enumerate(layers)}
+    if getattr(state, _GDN_LEAN_WRAPPED, None) is None:
+        _gdn_lean_wrap(core, state)
+    core._gdn_lean_state_ref = state
+    core._gdn_lean_on = True
+    logger.info(
+        f"DP GDN conv lean bound ({DP_GDN_CONV_LEAN_ENV}): rank {core.dp_rank} of {core.dp_size}, "
+        f"{type(cm).__name__}, verify steps of {_dp_lowrows_floor(_GDN_LEAN_ROWS[0])}.."
+        f"{_GDN_LEAN_ROWS[1]} rows, xsave {tuple(xsave.shape)} = "
+        f"{xsave.numel() * 2 / (1 << 20):.1f} MiB (bind {core._binds})"
+    )
+
+
+def _gdn_lean_wrap(core, state) -> None:
+    """Wrap `state._promote_conv_states_and_advance_replay` once: the stock method unless the
+    step in flight ran lean on this core's bound state; then `gdn_promote_x` builds the same
+    windows from the raw rows and advances the same bookkeeping of the promotion's replay
+    slots. The promotion is the last launch of a state update, so the step's record ends here."""
+    stock = state._promote_conv_states_and_advance_replay
+
+    def promote(batch, metadata, replay_indices):
+        step = core._gdn_step
+        lean, step.lean = step.lean, False
+        if not lean or core._gdn_lean_state_ref is not state:
+            return stock(batch, metadata, replay_indices)
+        xsave = core._gdn_xsave_all
+        if batch.num_generations != step.gens or metadata.replay_step_width != xsave.shape[2]:
+            raise RuntimeError(
+                f"{DP_GDN_CONV_LEAN_ENV}: the lean step carried {step.gens} generation requests "
+                f"of {xsave.shape[2]} rows and the state update {batch.num_generations} of "
+                f"{metadata.replay_step_width}"
+            )
+        assert batch.is_dummy_request is not None, "the promotion needs the dummy mask"
+        gdn_promote_x(
+            state._stacked_conv,
+            xsave,
+            batch.source_state_indices,
+            batch.destination_state_indices,
+            batch.num_accepted_tokens,
+            batch.is_dummy_request,
+            metadata.prev_num_accepted_tokens,
+            metadata.cache_buf_idx,
+            metadata.replay_step_width,
+            metadata.replay_history_size,
+            replay_slots=replay_indices,
+            pad_slot_id=_PAD_SLOT_ID,
+        )
+
+    state._promote_conv_states_and_advance_replay = promote
+    setattr(state, _GDN_LEAN_WRAPPED, core)
+
+
+def _gdn_lean_step(core, num_gens: int, rows: int, p: int) -> None:
+    """`DP_GDN_CONV_LEAN_ENV`: decide, once for a generation-only verify step of `num_gens`
+    requests x `p` rows, whether all its GDN layers run lean. Host ints of the step, fixed by a
+    decode graph's key."""
+    xsave = core._gdn_xsave_all
+    lo, hi = _dp_lowrows_floor(_GDN_LEAN_ROWS[0]), _GDN_LEAN_ROWS[1]
+    if lo <= rows <= hi and p == xsave.shape[2] and num_gens <= xsave.shape[1]:
+        step = core._gdn_step
+        step.lean, step.gens = True, num_gens
+        _gdn_lean_seen(
+            core, "conv lean", rows, "rows (gdn_conv_lean, gdn_promote_x, PDL gated norm)"
+        )
 
 
 #: Off by default (class S: another K split than the bf16 entry). At an attention-DP rank on
@@ -2580,10 +2896,12 @@ def _warn_dp_row_floors_ignored(core) -> None:
             f"{DP_OUT_PROJ_BF16_ROWSLO_ENV} is set but ignored: it rides on "
             f"{DP_OUT_PROJ_BF16_ENV}, which is not engaged"
         )
-    if _dp_lowrows() is not None and not (core.hc_tiles or core._inproj_release):
+    if _dp_lowrows() is not None and not (
+        core.hc_tiles or core._inproj_release or getattr(core, "_gdn_lean_want", False)
+    ):
         logger.warning(
-            f"{DP_LOWROWS_ENV} is set but ignored: it lowers {DP_HC_TILES_ENV} and "
-            f"{DP_INPROJ_RELEASE_ENV}, neither of which is engaged"
+            f"{DP_LOWROWS_ENV} is set but ignored: it lowers {DP_HC_TILES_ENV}, "
+            f"{DP_INPROJ_RELEASE_ENV} and {DP_GDN_CONV_LEAN_ENV}, none of which is engaged"
         )
 
 
@@ -3957,6 +4275,7 @@ def _decode_forms(core) -> str:
             "releasing gather rows": rows(router.release_rows if router else None),
             "hc tiles": core.hc_tiles,
             "in-proj release rows": rows({r for t in (inproj or {}).values() for r in t}),
+            "gdn conv lean": getattr(core, "_gdn_lean_want", False),
             "out-proj gdn rows": rows(out["gdn_out"] if out else None),
             "out-proj attn rows": rows(out["attn_o"] if out else None),
             "out-proj inject rows": rows(getattr(getattr(core, "_siteb", None), "gemm", None)),
@@ -4407,6 +4726,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._inproj_release = None
         # `DP_GDN_REPLAY_MAP_ENV`, settled at each cache-manager bind.
         self.gdn_replay_map = False
+        # `DP_GDN_CONV_LEAN_ENV`: the wish (built after load), what each bind settled, and the
+        # step in flight's decision.
+        self._gdn_lean_want = self._gdn_lean_on = False
+        self._gdn_lean_state_ref = None
+        self._gdn_xsave, self._gdn_xsave_all = {}, None
+        self._gdn_step = _GdnStep()
         # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
         self._out_proj = None
         # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
@@ -4664,6 +4989,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.hc_tiles = _hc_tiles_build(self, device)
             self.hc_first_x2 = _hc_first_x2_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
+            self._gdn_lean_want = _gdn_lean_build(self, device)
             self._out_proj = _out_proj_build(self, device)
             self._draft_o = _draft_o_build(self, device)
             self._siteb = _siteb_build(self, device)
@@ -5147,6 +5473,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         if self.mtp_enabled:
             bound = bound._replace(**self._bind_step_buffers(cm, g, mm, rank_pools))
         self._bound = bound
+        # `DP_GDN_CONV_LEAN_ENV`: nothing unless the build wished it.
+        _gdn_lean_bind(self, cm)
 
     def _bind_step_buffers(self, cm, g: _pool.PoolGeometry, mm, pools: _pool.RankPools) -> dict:
         """The verify step's runtime-owned buffers of one manager: every verify row's conv
@@ -5835,6 +6163,22 @@ def _gdn_verify(
     cute = ssm.dtype == torch.bfloat16
     # Only the CuTe replay is launched as the conv's programmatic dependent.
     pdl = _GDN_REPLAY_PDL and cute and replay.ring is None
+    if _gdn_lean_now(core):
+        # `DP_GDN_CONV_LEAN_ENV`: the conv output (token-major, as the replay reads it) and the
+        # raw rows `gdn_promote_x` builds the accepted window from; no window snapshots, no pool
+        # advance. A PDL dependent of the input projection: it reads the slots, the window and
+        # the taps before its wait.
+        assert mq_out is None and cute and pdl, f"layer {i}: a lean step off the lean path"
+        mq_out = gdn_conv_lean(
+            mq,
+            L.conv_w,
+            pools.conv[i],
+            si_d,
+            int_idx,
+            core._gdn_xsave[i],
+            p,
+            pad_slot_id=_PAD_SLOT_ID,
+        )
     if mq_out is None:
         # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major.
         x3 = torch.transpose(torch.reshape(mq, [n, p, core.conv_dim]), 1, 2)
@@ -9820,6 +10164,8 @@ class PrefillTarget:
                 f"modeling_v2 qwen4_exp default target: rank {core.mapping.rank} runs short GDN "
                 "context chunks in place over the recurrent pool"
             )
+        # `DP_GDN_CONV_LEAN_ENV`: a step with context rows keeps the stock conv pair.
+        _gdn_step_clear(core)
         # Rows per generation sequence: 1 without speculation, else `runtime_draft_len + 1`.
         gen_p, is_verify = _verify_rows(core, md, spec_metadata, num_decodes, num_decode_tokens)
         attn_args["predicted_tokens_per_seq"] = gen_p
@@ -11599,6 +11945,8 @@ class DecodeTarget:
         verify_fused = (
             captured
             and is_verify
+            # `DP_GDN_CONV_LEAN_ENV`: a lean step's conv is `gdn_conv_lean` in every layer.
+            and not _gdn_lean_now(core)
             and (L.in_proj_g is not None or nv is not None)
             and _gemv_ready(x)
             and num_tokens <= min(_FP8_GEMV_ROWS["in"][1], _VERIFY_CONV_FUSED_MAX_ROWS)
@@ -11731,6 +12079,8 @@ class DecodeTarget:
             eps=core.eps,
             fp8_scale=None,
             gate_activation="sigmoid",
+            # `DP_GDN_CONV_LEAN_ENV`: a PDL dependent of the replay whatever the grid.
+            **({"pdl": True} if _gdn_lean_now(core) else {}),
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
         return core.tp_sum(
@@ -11892,6 +12242,11 @@ class DecodeTarget:
         step["predicted_tokens_per_seq"] = gen_p
         si_all = mm.state_indices[:batch]
         verify = _verify_state(core, mm, batch) if is_verify else None
+        # `DP_GDN_CONV_LEAN_ENV`: what the previous trunk step decided is not this step's; a
+        # generation-only verify step runs lean in all its GDN layers or in none.
+        _gdn_step_clear(core)
+        if is_verify and getattr(core, "_gdn_lean_on", False):
+            _gdn_lean_step(core, batch, num_tokens, gen_p)
         pools = core._bound.pools
         # The corrected positions the engine's decode prologue wrote for this step
         # (`SpecStepMetadataPrologue`), consumed here whichever branch reads them.
