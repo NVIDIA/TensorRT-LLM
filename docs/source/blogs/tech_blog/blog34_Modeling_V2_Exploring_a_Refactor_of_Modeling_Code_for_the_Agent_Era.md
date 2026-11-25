@@ -80,6 +80,13 @@ So in Modeling V2 we make a deliberate trade-off: **we accept some code redundan
 
 Modeling V2 draws a clear line through the stack.
 
+<div align="center">
+<figure>
+  <img src="../media/tech_blog34_architecture.svg" width="900">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: The Modeling V2 architecture. Modeling code sits above the line: each family owns its ModelCores, each ModelCore owns its weights and Targets, and only catalog ops are shared across families. Modeling V1 models, in contrast, share the attention, MoE and linear modules. Below the line, every model uses the same TensorRT LLM runtime through the <code>DecoderModel</code> / <code>DecoderModelForCausalLM</code> interface.</em></sub></p>
+
 **Above the line is modeling code, which is not shared between models.** Each model family lives in its own directory, `models/<family>/`. Inside it, each *ModelCore* lives in its own subdirectory, `models/<family>/<model_core>/`. A ModelCore is one complete model implementation for a specific checkpoint, GPU architecture and parallel layout, for example `r1_0528_nvfp4__sm_10x__default`. A ModelCore should not import, subclass or call Modeling V1 model code: the model classes in `_torch/models/`, the layers in `_torch/modules/`, or the shared attention and fused MoE modules. It also should not import code from its sibling ModelCores. Each ModelCore spells out its own forward pass, its own weight loading and its own model-specific kernels.
 
 **Below the line is the runtime, which stays shared.** Modeling V2 is not a separate inference engine. Every ModelCore plugs into TensorRT LLM through the existing `DecoderModel` / `DecoderModelForCausalLM` interfaces. It uses the same scheduler, KV cache manager, attention metadata, distributed execution, sampling, speculative decoding infrastructure and serving stack as every other model. Users keep using the LLM API and `trtllm-serve` unchanged.
@@ -242,27 +249,27 @@ Kimi K3.1 has the same backbone as K3. It adds a DeepSeek sparse-attention index
 
 An agent then moved the model to Modeling V2 in three days. In Modeling V2, an optimization is code inside a ModelCore directory, not a change spread across shared modules. Moving the model therefore meant carrying those optimizations into the new family, with no review of shared modules and no change to the Modeling V1 code that other models depend on. On top of this, the agent added the DSA indexer and DFlash2.
 
-Figure 1 shows the result on GB300. At about 185 tok/s/user, throughput per GPU rose from 8.6k to 14.1k tokens/s (+64%). At about 76 tok/s/user, it rose from 18.8k to 28.9k (+54%), with one third fewer GPUs. K3.1 has no Modeling V1 implementation: all of its work lives in Modeling V2.
+Figure 2 shows the result on GB300. At about 185 tok/s/user, throughput per GPU rose from 8.6k to 14.1k tokens/s (+64%). At about 76 tok/s/user, it rose from 18.8k to 28.9k (+54%), with one third fewer GPUs. K3.1 has no Modeling V1 implementation: all of its work lives in Modeling V2.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog34_k31_pareto.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: Kimi K3.1 Pro on GB300 with disaggregated serving. The Day 0 line runs K3.1 on the Modeling V1 Kimi K3 implementation with the K3 drafter. The Modeling V2 line runs the K3.1 ModelCores with the DFlash2 drafter. Each marker is one measured configuration, labeled by concurrency.</em></sub></p>
+<p align="center"><sub><em>Figure 2: Kimi K3.1 Pro on GB300 with disaggregated serving. The Day 0 line runs K3.1 on the Modeling V1 Kimi K3 implementation with the K3 drafter. The Modeling V2 line runs the K3.1 ModelCores with the DFlash2 drafter. Each marker is one measured configuration, labeled by concurrency.</em></sub></p>
 
 ### MiniMax M3.1: built on Modeling V2 from the start
 
 MiniMax M3.1 was optimized on Modeling V2 from its first day. Its ModelCores split by deployment: TP2, TP4 and TP8 low-latency generation, disaggregated context servers, and a high-throughput DEP server. Each ModelCore changes only its own directory, so each change needs only that ModelCore's tests and that ModelCore's owners. This lets the team land optimizations as fast as the agents produce them.
 
-Figure 2 shows how fast the Pareto frontier moved on VR200. In one week, from 10/23 to 10/30, peak interactivity rose from 415 to 1,227 tok/s/user. By 11/10, it reached 1,341 tok/s/user (3.2×), and peak throughput reached 271.8k tokens/s per GPU (2.1×). Part of the 11/10 gain comes from disaggregated serving, not only from the modeling code.
+Figure 3 shows how fast the Pareto frontier moved on VR200. In one week, from 10/23 to 10/30, peak interactivity rose from 415 to 1,227 tok/s/user. By 11/10, it reached 1,341 tok/s/user (3.2×), and peak throughput reached 271.8k tokens/s per GPU (2.1×). Part of the 11/10 gain comes from disaggregated serving, not only from the modeling code.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog34_m31_pareto.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 2: MiniMax M3.1 NVFP4 on VR200. The 10/23 line is an estimate of the day-0 performance. The 10/30 line adds the Rubin megakernels, with aggregated serving at the high-throughput points. The 11/10 line uses disaggregated serving with DEP, TP2, TP4 and TP8 generation servers.</em></sub></p>
+<p align="center"><sub><em>Figure 3: MiniMax M3.1 NVFP4 on VR200. The 10/23 line is an estimate of the day-0 performance. The 10/30 line adds the Rubin megakernels, with aggregated serving at the high-throughput points. The 11/10 line uses disaggregated serving with DEP, TP2, TP4 and TP8 generation servers.</em></sub></p>
 
 The step from 10/23 to 10/30 came mostly from megakernels: fusions across operator and layer boundaries that a shared module could not reasonably host. One decode stage, for example, runs in a single kernel:
 
@@ -288,14 +295,14 @@ The deepest change is speculative decoding. In the GLM-5.3-Flash ModelCores, MTP
 
 No separate speculative worker runs after the forward. The engine keeps only what lies outside it: input packing, the sampler and the KV rewind. The whole step therefore runs in one CUDA graph, and the draft and verify kernels are tuned together with the rest of the model. On the NVFP4 TP4 ModelCore, the entire decode step is launched by one native C++ step program.
 
-GLM-5.3-Flash also has a Modeling V1 implementation, so we can compare the two directly. Figure 3 shows both on four GB300 GPUs with TP4 and MTP with three draft tokens. The two runs use the same serving configuration and differ only in the `modeling_v2` option. Both fix the MTP acceptance length to the same value, so the comparison measures the cost of a step, not the quality of the drafts. At concurrency 1, interactivity doubles from 524 to 1,075 tok/s/user. At concurrency 16, it rises from 191 to 532 tok/s/user (2.8×). At concurrency 32, throughput per GPU rises from 24.0k to 45.5k tokens/s (1.9×).
+GLM-5.3-Flash also has a Modeling V1 implementation, so we can compare the two directly. Figure 4 shows both on four GB300 GPUs with TP4 and MTP with three draft tokens. The two runs use the same serving configuration and differ only in the `modeling_v2` option. Both fix the MTP acceptance length to the same value, so the comparison measures the cost of a step, not the quality of the drafts. At concurrency 1, interactivity doubles from 524 to 1,075 tok/s/user. At concurrency 16, it rises from 191 to 532 tok/s/user (2.8×). At concurrency 32, throughput per GPU rises from 24.0k to 45.5k tokens/s (1.9×).
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog34_glm53_pareto.svg" width="900">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: GLM-5.3-Flash NVFP4 on four GB300 GPUs with TP4 and MTP (three draft tokens). The Modeling V1 line runs the built-in implementation; the Modeling V2 line runs the NVFP4 TP4 ModelCore. Each line is the Pareto frontier of the EP1 and EP4 configurations, labeled by layout and concurrency.</em></sub></p>
+<p align="center"><sub><em>Figure 4: GLM-5.3-Flash NVFP4 on four GB300 GPUs with TP4 and MTP (three draft tokens). The Modeling V1 line runs the built-in implementation; the Modeling V2 line runs the NVFP4 TP4 ModelCore. Each line is the Pareto frontier of the EP1 and EP4 configurations, labeled by layout and concurrency.</em></sub></p>
 
 We have not yet profiled how the gain splits between its sources. Besides the fused step, the Modeling V2 ModelCore runs the MTP experts in FP8, where Modeling V1 falls back to an unquantized MoE path, and the two implementations use different KV cache layouts.
 
