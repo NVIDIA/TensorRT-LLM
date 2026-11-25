@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-source = Path(__file__).parents[1] / "integration/defs/accuracy/modeling_v2/multimodal.py"
+source = (
+    Path(__file__).parents[1] / "integration/defs/accuracy/modeling_v2/mistral_large4/multimodal.py"
+)
 spec = importlib.util.spec_from_file_location("multimodal_accuracy", source)
 multimodal = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(multimodal)

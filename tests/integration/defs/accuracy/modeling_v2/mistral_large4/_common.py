@@ -51,8 +51,8 @@ from ...accuracy_core import (
     acceptance_length_from_iteration_stats,
     assert_acceptance_length,
 )
-from .. import llguidance_panel, multimodal
 from .._env import scoped_env_overrides
+from . import llguidance_panel, multimodal
 
 # Certification is per GPU architecture, and a receipt from another one says nothing here:
 # each gate class runs only on its target's architecture.
