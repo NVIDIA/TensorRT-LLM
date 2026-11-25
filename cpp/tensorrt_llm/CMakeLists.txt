@@ -323,6 +323,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_batch_scheduler
     tllm_common_cublas
     tllm_common_cuda
+    tllm_common_cuda_architectures
     tllm_common_environment
     tllm_common_error
     tllm_common_fp8
