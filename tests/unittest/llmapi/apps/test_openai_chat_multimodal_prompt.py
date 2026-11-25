@@ -326,3 +326,17 @@ def test_the_engine_tokenizes_the_text_unless_the_native_renderers_ids_are_the_p
     assert prompt["prompt"] == "describe"
     assert "prompt_token_ids" not in prompt
     assert tokenizer.tokenize_requests == [False]
+
+
+def test_chat_rejects_media_device_even_without_media(tmp_path):
+    server = make_stub_openai_server(tmp_path, "test-vlm", _StubModelConfig(), None)
+    response = TestClient(server.app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-vlm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "media_io_kwargs": {"audio": {"device": "cpu"}},
+        },
+    )
+    assert response.status_code == 400
+    assert "media_io_kwargs.audio.device" in response.text

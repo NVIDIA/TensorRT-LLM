@@ -839,7 +839,7 @@ def _load_video_by_cv2(
     video: Union[str, bytes],
     num_frames: int = 10,
     fps: int = 30,
-    format: str = "pt",
+    format: str = "np",
     device: str = "cpu",
     extract_audio: bool = False,
     cv2_backend: Optional[int] = None,
@@ -847,7 +847,7 @@ def _load_video_by_cv2(
     max_decoded_frame_bytes: Optional[int] = None,
     decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> VideoData:
-    """Decode a video and return sampled frames as a list.
+    """Decode a video and return the sampled frames and source metadata.
 
     `video` is either a file path / URL (`str`) or raw mp4 bytes. When
     bytes are passed the caller must also pass `cv2_backend` (a
@@ -1574,7 +1574,7 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
     _modality = "image"
 
-    def __init__(self, format: str = "pt", device: str = "cpu") -> None:
+    def __init__(self, format: str = "pil", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
         self._format = format
@@ -1757,15 +1757,12 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         self,
         num_frames: int = 10,
         fps: int = 30,
-        format: str = "pt",
+        format: str = "np",
         device: str = "cpu",
         extract_audio: bool = False,
         max_decoded_frame_bytes: Optional[int] = None,
         decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
     ) -> None:
-        # `"pt"` is the safe default every video model handles; models tuned
-        # for the uint8-HWC path opt into `"np"` via
-        # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")
         if max_decoded_frame_bytes is not None and max_decoded_frame_bytes <= 0:
