@@ -782,8 +782,12 @@ def test_gdn_mtp_replay_leaves_the_fused_fp8_verify_alone(fused_verify, fp8_out,
         gdn.fused_verify = fused_verify
         gdn.norm = SimpleNamespace(fp8_scale=torch.tensor(0.5) if fp8_out else None)
         layers.append(gdn)
-    assert uses_gdn_mtp_replay(torch.nn.ModuleList(layers)) is expected
+    model = torch.nn.ModuleList(layers)
+    assert uses_gdn_mtp_replay(model) is expected
     assert uses_gdn_mtp_replay(torch.nn.ModuleList([torch.nn.Linear(2, 2)])) is False
+    # A cost estimate sizes the replay state that the model selects in the constructor.
+    for manager_cls in (Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager):
+        assert manager_cls.family_estimate_kwargs(model) == {"gdn_mtp_replay": expected}
 
 
 @pytest.mark.parametrize(

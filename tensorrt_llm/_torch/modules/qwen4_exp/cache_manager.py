@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     ReplayStateUpdateMetadata,
     create_gdn_state,
     estimate_gdn_replay_bytes_per_slot,
+    gdn_family_estimate_kwargs,
     gdn_family_init_kwargs,
     validate_gdn_layout,
 )
@@ -239,6 +240,11 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
                     getattr(model, "inforward_snapshot_min_main", 0) or 0
                 )
         return init_kwargs
+
+    @classmethod
+    @override
+    def family_estimate_kwargs(cls, model: torch.nn.Module) -> dict[str, object]:
+        return gdn_family_estimate_kwargs(model)
 
     @override
     def page_table_spec(self) -> PageTableSpec:

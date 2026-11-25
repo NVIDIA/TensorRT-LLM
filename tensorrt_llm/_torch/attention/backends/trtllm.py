@@ -57,6 +57,7 @@ from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from ...pyexecutor.resource_manager import cache_keeps_recurrent_state
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -4077,14 +4078,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from ...pyexecutor.kv_cache.mamba_cache_manager import \
-                BaseMambaCacheManager
-
             # Hybrid (mamba/masked-layer) KV managers take the graph-safe
             # append; the same predicate interface.py uses to detect hybrid
             # managers for mamba metadata. Dense MLA models keep the
             # host-side path unchanged.
-            if isinstance(metadata.kv_cache_manager, BaseMambaCacheManager):
+            if cache_keeps_recurrent_state(metadata.kv_cache_manager):
                 from .utils import \
                     append_mla_latent_cache_generation_cuda_graph_safe
 

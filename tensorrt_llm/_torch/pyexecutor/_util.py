@@ -88,9 +88,7 @@ from .kv_cache.fp4_mla_layout_hooks import Fp4MlaLayoutHooks
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
                                            _resolve_v2_max_attention_window_vec)
-from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
-                                           CppMambaHybridCacheManager,
-                                           MambaHybridCacheManager,
+from .kv_cache.mamba_cache_manager import (CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
@@ -99,7 +97,8 @@ from .model_engine import ModelEngine
 from .py_executor import PyExecutor, PyExecutorResources
 from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
                                KVCacheManager, PeftCacheManager,
-                               ResourceManager, ResourceManagerType)
+                               ResourceManager, ResourceManagerType,
+                               cache_keeps_recurrent_state)
 from .runtime_hooks import runtime_hooks_of
 from .sampler import TorchSampler
 from .sampler.penalties import PenaltyStore
@@ -1547,13 +1546,12 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
-        if (not is_draft and isinstance(manager_cls, type)
-                and issubclass(manager_cls, MambaHybridCacheManagerV2)
+        if (not is_draft and cache_keeps_recurrent_state(manager_cls)
                 and self._model_engine is not None):
-            from ..modules.fla.cache_manager import uses_gdn_mtp_replay
-            if uses_gdn_mtp_replay(self._model_engine.model):
-                # Cost the GDN replay region of the state the manager will select.
-                extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
+            # Cost the state the manager will select for the built model.
+            extra_kwargs = dict(
+                extra_kwargs,
+                **manager_cls.family_estimate_kwargs(self._model_engine.model))
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -2073,8 +2071,8 @@ class KvCacheCreator:
         if self._is_kv_cache_manager_v2:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 self._kv_cache_config)
-            if unified_layer_specs and not issubclass(
-                    self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            if (unified_layer_specs
+                    and not self._kv_cache_manager_describes_target_layers()):
                 # Target and draft layers can differ in page size and life
                 # cycle, so the group count comes from the combined layout. In a
                 # manager hosting draft layers the dummy workload is the
@@ -2910,6 +2908,12 @@ class KvCacheCreator:
                 and issubclass(manager_cls, KVCacheManagerV2)
                 and manager_cls.hosts_unified_draft_layers)
 
+    def _kv_cache_manager_describes_target_layers(self) -> bool:
+        """Whether the target's manager lays out its target layers itself."""
+        manager_cls = self._kv_cache_manager_cls
+        return (issubclass(manager_cls, KVCacheManagerV2)
+                and manager_cls.describes_own_target_layers())
+
     def _unified_drafter_reads_page_size(self, tokens_per_block: int) -> bool:
         """Whether the drafter's TRTLLM ops can read the target's pages."""
         draft_model = getattr(self._model_engine.model, "draft_model", None)
@@ -3029,8 +3033,10 @@ class KvCacheCreator:
         # kv_factor: the plain manager pages each layer through that layer's
         # own factor, so a K-only target there also holds a drafter's K and V.
         # A hybrid target cannot, so the mismatch keeps a separate pool.
-        if target_layout[3] != draft_layout[3] and issubclass(
-                self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        manager_cls = self._kv_cache_manager_cls
+        if (target_layout[3] != draft_layout[3]
+                and issubclass(manager_cls, KVCacheManagerV2)
+                and manager_cls.appended_draft_layers_use_target_kv_factor()):
             reason = ("the target stores a "
                       f"{'K-only' if target_layout[3] else 'K and V'} KV cache "
                       "while the drafter stores a "
@@ -3250,7 +3256,7 @@ class KvCacheCreator:
         if not self._should_unify_dflash_kv_cache():
             return ()
         draft_specs = self._build_unified_draft_layer_specs(kv_cache_config)
-        if issubclass(self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        if self._kv_cache_manager_describes_target_layers():
             return draft_specs
 
         target_model_config = self._model_engine.model.model_config
@@ -4743,7 +4749,7 @@ def _validate_recurrent_manager_cls(
         raise ValueError(
             "A hybrid Mamba / linear-attention model without a recurrent "
             f"layer is not supported (architectures={architectures!r}).")
-    if not issubclass(kv_cache_manager_cls, MambaHybridCacheManager):
+    if not cache_keeps_recurrent_state(kv_cache_manager_cls):
         raise ValueError(
             f"{kv_cache_manager_cls.__name__} holds no recurrent state, but "
             f"the model declares recurrent layers (architectures={architectures!r})."
@@ -5840,7 +5846,7 @@ def create_py_executor_resources(
 
     # For hybrid models, this has both impl and mamba_impl
     mamba_cache_manager = None
-    if isinstance(kv_cache_manager, BaseMambaCacheManager):
+    if cache_keeps_recurrent_state(kv_cache_manager):
         mamba_cache_manager = kv_cache_manager
 
     # Disaggregated serving's KV transfer buffers are allocated in C++ with

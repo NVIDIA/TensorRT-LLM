@@ -259,7 +259,20 @@ def use_py_mamba_cache_manager() -> bool:
 class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """Common recurrent views and snapshot planning, independent of algorithms."""
 
+    keeps_recurrent_state = True
     _supports_additional_snapshot_offsets = False
+
+    @classmethod
+    def family_estimate_kwargs(cls, model: torch.nn.Module) -> dict[str, object]:
+        """Return the keyword arguments a family adds to the cost estimates of its manager.
+
+        They are the constructor keyword arguments that select the state an estimate sizes and
+        that only the built model gives. The default adds none.
+
+        Args:
+            model: The built model.
+        """
+        return {}
 
     @property
     def cuda_state_indices(self) -> torch.Tensor:

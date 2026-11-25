@@ -26,10 +26,10 @@ from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
+    cache_keeps_recurrent_state,
     is_context_only_kv_cache,
 )
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
@@ -487,7 +487,7 @@ class DecoderWarmup:
             self._context_warmups_supported
             and not self.mapping.has_cp_helix()
             and self.guided_decoder is None
-            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+            and not cache_keeps_recurrent_state(kv_cache_manager)
         )
         # Helix ranks on a disaggregated generation server and decode-only
         # workers never run a context batch, so every phase below warms up
@@ -506,7 +506,7 @@ class DecoderWarmup:
             and not generation_only
             # Aggregated Helix warms prefill in the autotuner warmup instead.
             and not self.mapping.has_cp_helix()
-            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+            and not cache_keeps_recurrent_state(kv_cache_manager)
         )
 
         log_mem_snapshot("warmup/before_warmup")
@@ -584,10 +584,10 @@ class DecoderWarmup:
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
-            # since MambaHybridCacheManager skips _general_warmup and the
-            # default autotuner shape is single-seq / no-initstates. Safe
-            # no-op for non-Mamba models. It runs context requests, which a
-            # generation-only worker never serves.
+            # since a cache that keeps recurrent state skips _general_warmup
+            # and the default autotuner shape is single-seq / no-initstates.
+            # Safe no-op for non-Mamba models. It runs context requests, which
+            # a generation-only worker never serves.
             if not generation_only:
                 with (
                     self._warmup_timer.phase(
@@ -1267,7 +1267,7 @@ class DecoderWarmup:
             logger.debug("Skipped TRTLLM-Gen FMHA JIT warmup for Ctx kernels")
 
         # Kimi K3 / Kimi Linear are warmed by ``_run_mamba_hybrid_warmup``, not
-        # here: they always run on a ``MambaHybridCacheManager``, so
+        # here: their cache keeps recurrent state, so
         # ``can_run_general_warmup`` is False and the configs above never run.
 
         if self.guided_decoder is None and supports_generation and can_run_general_warmup:
@@ -1628,7 +1628,7 @@ class DecoderWarmup:
 
         Mamba hybrid models (e.g. Nemotron 3 Super 120B, Nemotron-Nano-12B-v2)
         skip ``_general_warmup`` because ``can_run_general_warmup`` is False
-        when the KV cache manager is a ``MambaHybridCacheManager``. The default
+        when the KV cache manager keeps recurrent state. The default
         ``_run_autotuner_warmup`` then issues a single ``least_requests=True``
         prefill = 1 sequence with ``num_cached_tokens_per_seq = 0``, which only
         compiles the ``num_seqs == 1`` / ``HAS_INITSTATES=False`` variants of
@@ -1669,7 +1669,7 @@ class DecoderWarmup:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
+        if kv_cache_manager is None or not cache_keeps_recurrent_state(kv_cache_manager):
             return
 
         token_num_upper_bound = min(

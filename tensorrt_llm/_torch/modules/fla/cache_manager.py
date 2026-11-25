@@ -1359,6 +1359,11 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
     ) -> dict[str, object]:
         return gdn_family_init_kwargs(model_config.pretrained_config, model)
 
+    @classmethod
+    @override
+    def family_estimate_kwargs(cls, model: torch.nn.Module) -> dict[str, object]:
+        return gdn_family_estimate_kwargs(model)
+
     @override
     def __init__(
         self,
@@ -1631,6 +1636,16 @@ def gdn_family_init_kwargs(
     return init_kwargs
 
 
+def gdn_family_estimate_kwargs(model: torch.nn.Module) -> dict[str, object]:
+    """Return the keyword arguments of ``gdn_family_init_kwargs`` that select the replay state
+    a cost estimate sizes.
+
+    Args:
+        model: The built model.
+    """
+    return {"gdn_mtp_replay": uses_gdn_mtp_replay(model)}
+
+
 def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):
     """Shared Qwen3.5/Qwen4 GDN geometry; attention and PLE stay model-owned."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -1663,6 +1678,7 @@ __all__ = [
     "estimate_gdn_replay_bytes_per_slot",
     "select_gdn_replay_state",
     "validate_gdn_layout",
+    "gdn_family_estimate_kwargs",
     "gdn_family_init_kwargs",
     "get_gdn_cache_params",
     "uses_gdn_fused_verify",

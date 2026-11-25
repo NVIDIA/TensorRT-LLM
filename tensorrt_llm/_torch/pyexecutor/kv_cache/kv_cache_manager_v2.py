@@ -2388,9 +2388,6 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
-    # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
-    # recompute tail to a full re-prefill.
-    _has_recurrent_state: bool = False
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0
@@ -2416,6 +2413,18 @@ class KVCacheManagerV2(BaseResourceManager):
         until they override this to hold the drafter's on their terms.
         """
         return cls is KVCacheManagerV2
+
+    @classmethod
+    def describes_own_target_layers(cls) -> bool:
+        """Whether the manager lays out its target layers itself, so that
+        ``layer_specs`` carries only a drafter's layers appended after them."""
+        return False
+
+    @classmethod
+    def appended_draft_layers_use_target_kv_factor(cls) -> bool:
+        """Whether a drafter's appended layers are paged with the target's
+        ``kv_factor`` instead of the one in their own layer spec."""
+        return False
 
     @property
     def spec_recompute_tail(self) -> int:
@@ -2739,7 +2748,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 "tail."
             )
             tail = 0
-        if tail > 0 and self._has_recurrent_state:
+        if tail > 0 and self.keeps_recurrent_state:
             # Conservative: a capped claim is equivalent to a shorter match,
             # but the hybrid snapshot/commit protocol is unvalidated with a
             # partial tail, so take the full re-prefill.

@@ -250,6 +250,24 @@ def test_plain_target_still_gets_target_and_draft_specs():
     )
 
 
+def test_layer_spec_split_follows_the_manager_declaration():
+    """A manager that lays out its own target layers gets only the drafter's, hybrid or not."""
+
+    class SelfDescribingManager(KVCacheManagerV2):
+        @classmethod
+        def accepts_appended_draft_layers(cls) -> bool:
+            return True
+
+        @classmethod
+        def describes_own_target_layers(cls) -> bool:
+            return True
+
+    creator = _creator(manager_cls=SelfDescribingManager)
+    specs = creator._build_unified_dflash_layer_specs(SimpleNamespace(max_attention_window=None))
+
+    assert [spec.owner for spec in specs] == [KVCacheLayerOwner.DRAFT] * _NUM_DRAFT_LAYERS
+
+
 def _declaring_creator(draft_kv_dtype):
     """A creator whose drafter config inherits the target's NVFP4 KV algo."""
     creator = _creator()

@@ -151,6 +151,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return False
 
     @classmethod
+    @override
+    def describes_own_target_layers(cls) -> bool:
+        return True
+
+    @classmethod
+    @override
+    def appended_draft_layers_use_target_kv_factor(cls) -> bool:
+        return True
+
+    @classmethod
     def attention_cache_geometry(
         cls,
         pretrained_config: object,
@@ -196,11 +206,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             every family.
         """
         return {}
-
-    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
-    # cache manager __init__ coerces a positive spec recompute tail to a full
-    # re-prefill (see _has_recurrent_state on the attention-only base classes).
-    _has_recurrent_state = True
 
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True

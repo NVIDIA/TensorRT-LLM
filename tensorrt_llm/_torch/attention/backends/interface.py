@@ -36,8 +36,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...memory_buffer_utils import Buffers, get_memory_buffers
 from ...metadata import KVCacheParams
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
-from ...pyexecutor.resource_manager import KVCacheManager
+from ...pyexecutor.resource_manager import (KVCacheManager,
+                                            cache_keeps_recurrent_state)
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
 from .cpp_schema import cpp_field
@@ -542,7 +542,7 @@ class AttentionMetadata:
             return
 
         if self.mamba_metadata is None:
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+            if cache_keeps_recurrent_state(self.kv_cache_manager):
                 metadata_cls = self.mamba_metadata_cls or getattr(
                     self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:

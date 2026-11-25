@@ -860,6 +860,19 @@ def test_attention_metadata_builds_the_resolved_mamba_metadata(
     assert metadata.mamba_metadata.prepared == [metadata]
 
 
+def test_attention_metadata_builds_no_mamba_metadata_without_recurrent_state():
+    """A cache manager that keeps no recurrent state gets no Mamba metadata, whatever class the model resolved."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+
+    metadata = object.__new__(AttentionMetadata)
+    metadata.mamba_metadata = None
+    metadata.mamba_metadata_cls = Mock()
+    metadata.kv_cache_manager = object.__new__(KVCacheManagerV2)
+    metadata._prepare_mamba_metadata()
+    assert metadata.mamba_metadata is False
+    metadata.mamba_metadata_cls.assert_not_called()
+
+
 @pytest.mark.cpu_only
 def test_kda_region_declares_storage_without_a_hybrid_manager():
     from tensorrt_llm._torch.pyexecutor.kv_cache.regions import lay_out_regions
