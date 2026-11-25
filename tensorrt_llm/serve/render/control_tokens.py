@@ -21,9 +21,11 @@ markers before rendering; the marked spans are then encoded as plain text and th
 the prompt, with the template's own control tokens, as usual.
 
 The marking and the encoding match ``apply_chat_template(..., sanitize_control_tokens=True)``
-of transformers 5.20 (huggingface/transformers#47386), which this module can delegate to once
-the transformers pin reaches 5.20. It needs only the standard library, ``jinja2`` and a
-Hugging Face fast tokenizer.
+of transformers 5.20 (huggingface/transformers#47386), except that dict keys are marked too: a
+tool's parameter names and a tool call's argument names are inputs as much as the values are,
+and the templates print them. This module can delegate to transformers once the pin reaches a
+release that marks keys as well. It needs only the standard library, ``jinja2`` and a Hugging
+Face fast tokenizer.
 """
 
 from __future__ import annotations
@@ -100,20 +102,21 @@ def _alternation(tokens: Sequence[str]) -> re.Pattern:
 
 
 def _strings(value: Any) -> Iterator[str]:
-    """Every string in ``value`` and in its nested lists, tuples and dict values."""
+    """Every string in ``value`` and in its nested lists, tuples and dicts (keys and values)."""
     stack = [value]
     while stack:
         item = stack.pop()
         if isinstance(item, str):
             yield item
         elif isinstance(item, dict):
+            stack.extend(item.keys())
             stack.extend(item.values())
         elif isinstance(item, (list, tuple)):
             stack.extend(item)
 
 
 def _spells(pattern: re.Pattern, values: Any) -> bool:
-    """Whether a string in ``values`` (dict values, not keys) matches ``pattern``."""
+    """Whether a string in ``values`` (a dict key or value too) matches ``pattern``."""
     search = pattern.search
     return any(search(text) for text in _strings(values))
 
@@ -125,13 +128,25 @@ def _without_markers(text: str) -> str:
 def _marked(value: Any, pattern: re.Pattern) -> Any:
     """A copy of ``value`` whose strings have every match of ``pattern`` wrapped in markers.
 
-    Dict keys stay as they are. Markers already in a string are dropped first, so they cannot
-    fake a marked token.
+    Dict keys are marked like values. Markers already in a string are dropped first, so they
+    cannot fake a marked token.
+
+    Raises:
+        ValueError: Two keys of a dict differ only in markers, so their marked copies would be
+            one key.
     """
     if isinstance(value, str):
         return pattern.sub(_WRAPPED, _without_markers(value))
     if isinstance(value, dict):
-        return {key: _marked(item, pattern) for key, item in value.items()}
+        marked: Dict[Any, Any] = {}
+        for key, item in value.items():
+            marked_key = _marked(key, pattern) if isinstance(key, str) else key
+            if marked_key in marked:
+                raise ValueError(
+                    f"Cannot mark the dict key {key!r}: it differs from another key only in markers."
+                )
+            marked[marked_key] = _marked(item, pattern)
+        return marked
     if isinstance(value, (list, tuple)):
         return [_marked(item, pattern) for item in value]
     return value
@@ -158,7 +173,7 @@ class ControlTokens:
     newline_text_ids: List[int]
 
     def found_in(self, *values: Any) -> bool:
-        """Whether a string in ``values`` (dict values, not keys) spells a control token."""
+        """Whether a string in ``values`` (a dict key or value too) spells a control token."""
         return _spells(self.pattern, values)
 
 

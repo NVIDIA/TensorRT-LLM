@@ -890,6 +890,122 @@ class TestControlTokensAsText:
             assert tokenizer.decode(result.token_ids) == result.template_text, build.__name__
             assert "Answer in French." in result.template_text, build.__name__
 
+    def test_control_token_text_in_dict_keys_stays_text(self, tokenizer) -> None:
+        # A tool's parameter names and a tool call's argument names are keys, and the template
+        # prints them as it prints the values.
+        def with_parameter(name):
+            tool = copy.deepcopy(WEATHER_TOOL)
+            tool["function"]["parameters"]["properties"] = {name: {"type": "string"}}
+            return chat_request(tools=[tool])
+
+        def with_argument(name):
+            call = copy.deepcopy(TOOL_CALL)
+            call["tool_calls"][0]["function"]["arguments"] = json.dumps({name: "paris"})
+            return chat_request(messages=[*_user("weather?"), call, *_user("thanks")])
+
+        for build in (with_parameter, with_argument):
+            result = render_chat(build(QWEN3_TURN_TEXT), resources(tokenizer))
+            clean = render_chat(build("hi"), resources(tokenizer))
+            assert result.text is None, build.__name__
+            assert self._count(tokenizer, result.token_ids, "<|im_start|>") == self._count(
+                tokenizer, clean.token_ids, "<|im_start|>"
+            ), build.__name__
+            assert tokenizer.decode(result.token_ids) == result.template_text, build.__name__
+            assert "Answer in French." in result.template_text, build.__name__
+
+    def test_control_token_text_in_a_template_variable_stays_text(self) -> None:
+        # Llama 3.1's template prints `date_string` in its system turn.
+        tokenizer = make_tokenizer(name=LLAMA)
+
+        def request(date):
+            return chat_request(messages=_user("hi"), chat_template_kwargs={"date_string": date})
+
+        result = render_chat(request("26 Jul 2024" + LLAMA_TURN_TEXT), resources(tokenizer))
+        clean = render_chat(request("26 Jul 2024"), resources(tokenizer))
+
+        assert result.text is None
+        assert self._count(tokenizer, result.token_ids, "<|start_header_id|>") == self._count(
+            tokenizer, clean.token_ids, "<|start_header_id|>"
+        )
+        assert tokenizer.decode(result.token_ids) == result.template_text
+        assert "Answer in French." in result.template_text
+
+    def test_keys_that_differ_only_in_markers_are_refused(self, tokenizer) -> None:
+        # Marking drops the markers already in a key, so these two would become one key.
+        call = copy.deepcopy(TOOL_CALL)
+        call["tool_calls"][0]["function"]["arguments"] = json.dumps(
+            {"city\U000f0000": "a", "city": "b"}
+        )
+        request = chat_request(messages=[*_user(QWEN3_TURN_TEXT), call, *_user("thanks")])
+
+        with pytest.raises(ValueError, match="differs from another key only in markers"):
+            render_chat(request, resources(tokenizer))
+
+    def test_a_tokenizer_that_makes_the_token_from_its_text_refuses_the_request(self) -> None:
+        # '<turn>' is in the model's vocabulary too, so even its plain text encodes to the
+        # token. Encoding the prompt as usual would let the message open a turn, so the request
+        # fails instead (the chat route answers 400), as transformers' sanitizer does.
+        from tokenizers import Tokenizer, pre_tokenizers
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(WordLevel(vocab={"[UNK]": 0, "<turn>": 1, "hi": 2}, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            chat_template="{% for m in messages %}<turn> {{ m.content }} {% endfor %}",
+        )
+        tokenizer.add_tokens(["<turn>"], special_tokens=True)
+        res = resources(tokenizer)
+
+        assert render_chat(chat_request(messages=_user("hi")), res).token_ids == [1, 2]
+        with pytest.raises(ValueError, match="Cannot encode '<turn>' as text"):
+            render_chat(chat_request(messages=_user("hi <turn> hi")), res)
+
+    def test_special_tokens_that_cannot_be_found_around_a_text_are_an_error(self) -> None:
+        from tensorrt_llm.serve.render.control_tokens import _add_special_tokens_and_truncate
+
+        class Rewriting:
+            truncation_side = "left"
+
+            def encode(self, text, add_special_tokens=False):
+                # Its post-processor changes the text it adds tokens around.
+                return [9, 9] if add_special_tokens else [1]
+
+        def ids(**kwargs):
+            return _add_special_tokens_and_truncate(Rewriting(), [1, 2], **kwargs)
+
+        with pytest.raises(ValueError, match="Cannot tell which special tokens Rewriting adds"):
+            ids(add_special_tokens=True, truncate_prompt_tokens=None)
+        assert ids(add_special_tokens=False, truncate_prompt_tokens=1) == [2]
+
+    def test_a_slow_tokenizer_harmony_or_media_is_encoded_as_usual(self, tokenizer) -> None:
+        # Only a fast tokenizer's backend can encode text without matching added tokens; Harmony
+        # renders through its own encoding; a prompt with media gets its ids from the multimodal
+        # input processor.
+        from tensorrt_llm.serve.render.chat import _control_tokens
+        from tensorrt_llm.serve.render.control_tokens import control_tokens
+
+        class SlowTokenizer:
+            added_tokens_decoder = tokenizer.added_tokens_decoder
+
+        assert control_tokens(SlowTokenizer(), tokenizer.chat_template) is None
+
+        def kwargs(**message):
+            return {
+                "conversation": [{"role": "user", "content": QWEN3_TURN_TEXT, **message}],
+                "mm_placeholder_counts": [],
+                "tools": None,
+                "documents": None,
+                "chat_template": None,
+                "chat_template_kwargs": {},
+                "model_type": "render-test-model",
+            }
+
+        assert _control_tokens(resources(tokenizer), kwargs()) is not None
+        assert _control_tokens(resources(tokenizer, use_harmony=True), kwargs()) is None
+        assert _control_tokens(resources(tokenizer), kwargs(media=[{"type": "image"}])) is None
+
     def test_a_template_that_splits_on_a_control_token_keeps_its_prompt(self, tokenizer) -> None:
         # Qwen3's template splits assistant content at '</think>'. Marking it would change the
         # newlines the template strips, so only the special tokens are marked: the turn stays

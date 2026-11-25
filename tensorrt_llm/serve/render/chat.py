@@ -249,9 +249,23 @@ def _control_tokens(res: RenderResources, kwargs: Dict[str, Any]) -> Optional[Co
     if template is None:
         return None
     tokens = control_tokens(tokenizer, template)
-    if tokens is None or not tokens.found_in(conversation, kwargs["tools"], kwargs["documents"]):
+    if tokens is None or not tokens.found_in(*_inputs_to_mark(kwargs)):
         return None
     return tokens
+
+
+def _inputs_to_mark(kwargs: Dict[str, Any]) -> Tuple[Any, Any, Any, Any]:
+    """The request's inputs to the template, which may spell control tokens.
+
+    The template kwargs are among them, as in transformers' ``sanitize_control_tokens``: a
+    template can print one (Llama 3.1's ``date_string``).
+    """
+    return (
+        kwargs["conversation"],
+        kwargs["tools"],
+        kwargs["documents"],
+        kwargs["chat_template_kwargs"],
+    )
 
 
 def _encode_control_tokens_as_text(
@@ -270,9 +284,15 @@ def _encode_control_tokens_as_text(
     plain ``rendered`` then stands.
     """
 
-    def render(conversation: Any, tools: Any, documents: Any) -> str:
+    def render(conversation: Any, tools: Any, documents: Any, chat_template_kwargs: Any) -> str:
         return apply_chat_template(
-            **{**kwargs, "conversation": conversation, "tools": tools, "documents": documents}
+            **{
+                **kwargs,
+                "conversation": conversation,
+                "tools": tools,
+                "documents": documents,
+                "chat_template_kwargs": chat_template_kwargs,
+            }
         )
 
     encoded = encode_as_text(
@@ -280,7 +300,7 @@ def _encode_control_tokens_as_text(
         getattr(res.tokenizer, "tokenizer", res.tokenizer),
         render,
         rendered,
-        (kwargs["conversation"], kwargs["tools"], kwargs["documents"]),
+        _inputs_to_mark(kwargs),
         # The forced prefix is written by the server, so it is encoded as usual.
         suffix=forced_prefix or "",
         add_special_tokens=add_special_tokens,
