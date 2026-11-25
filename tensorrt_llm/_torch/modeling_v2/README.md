@@ -570,7 +570,7 @@ CI selects tests by the scope of the change:
   Modeling V2 tests.
 
 Exact source-to-test associations retain additional named family and component
-checks outside these prefixes. See the [CBTS selection rules](../../../../jenkins/scripts/cbts/cbts/rules/README.md)
+checks outside these prefixes. See the [CBTS selection rules](../../../jenkins/scripts/cbts/cbts/rules/README.md)
 for these associations and shared-helper selection.
 
 A target is a directory under `models/<family>/` whose class the family's

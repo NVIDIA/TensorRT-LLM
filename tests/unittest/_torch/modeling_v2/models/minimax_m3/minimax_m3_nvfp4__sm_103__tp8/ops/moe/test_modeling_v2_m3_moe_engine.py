@@ -120,6 +120,8 @@ def test_malformed_buffers_are_rejected_by_the_call(bad) -> None:
     state = _state(2)
     layer = layer_for(state, "random")
     hidden, kw = hidden_states(2, seed=3), {}
+    # The first call compiles the state's kernel for that call's buffers: make a valid call first.
+    op(hidden, layer)
     if bad == "misaligned hidden":
         hidden = torch.randn(2 * H + 8, device="cuda").to(torch.bfloat16)[2 : 2 + 2 * H].view(2, H)
     elif bad == "fp32 out":

@@ -54,6 +54,9 @@ class DirectStage:
 
 
 class RubinMegaMoE(MegaMoECuteDsl):
+    # Launches and sizes its kernels itself, without the localized weight layout.
+    _supports_ugpu_localization = False
+
     def __init__(self, **kwargs):
         self._direct_stage_enabled = True
         self._wide_buckets = (128, 192)
