@@ -22,12 +22,10 @@
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 
 #if ENABLE_MULTI_DEVICE
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
 #include <mpi.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <torch/extension.h>
 #endif
 
 #include <algorithm>
@@ -350,6 +348,22 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
+    //! \brief Window buffers held on one device across all communicators.
+    //!
+    //! Sizes are as requested; ncclMemAlloc rounds each allocation up to its granularity.
+    struct DeviceUsage
+    {
+        size_t bufferCount{0}; //!< Buffers pooled on the device, checked out or not.
+        size_t totalBytes{0};  //!< Requested bytes of those buffers.
+        size_t inUseBytes{0};  //!< Requested bytes of the buffers currently checked out.
+    };
+
+    //! \brief Usage on `device`; all zero for a device with no buffers.
+    //!
+    //! Reads totals kept under their own lock, so it never waits for a window allocation or
+    //! registration in progress, which hold mMutex across collectives with other ranks.
+    DeviceUsage getDeviceUsage(int device) const;
+
     // Check if a communicator is valid (non-null)
     // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
     // All non-null comms are considered valid and will be registered when first used.
@@ -425,6 +439,11 @@ private:
         uint64_t releaseEpoch{0};
     };
 
+    // Keep mDeviceUsage in step with mBufferPool. Each assumes mMutex is already locked and takes mUsageMutex.
+    void addEntryUsageLocked(BufferEntry const& entry);
+    void removeEntryUsageLocked(BufferEntry const& entry);
+    void setInUseLocked(BufferEntry& entry, bool inUse);
+
     struct TensorLeaseScope;
 
     struct TensorLease
@@ -454,6 +473,9 @@ private:
     mutable std::mutex mMutex;
     std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
+    // Per-device totals of mBufferPool, guarded by mUsageMutex (taken after mMutex, never before it).
+    mutable std::mutex mUsageMutex;
+    std::unordered_map<int, DeviceUsage> mDeviceUsage;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always
@@ -519,61 +541,6 @@ private:
     std::shared_ptr<ncclComm_t> mComm;
     NCCLWindowBuffer mBuffer;
 };
-
-// Creates a PyTorch tensor backed by an NCCL window buffer.
-// The tensor will automatically release the buffer back to the pool when destroyed.
-// This is analogous to torch_ext::create_userbuffers_tensor() but for NCCLWindowAllocator.
-inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
-    std::shared_ptr<ncclComm_t> comm, at::IntArrayRef shape, torch::ScalarType dtype)
-{
-    // Calculate buffer size
-    int64_t buffer_size
-        = std::accumulate(shape.begin(), shape.end(), 1LL, std::multiplies<int64_t>()) * torch::elementSize(dtype);
-
-    // Calculate strides
-    std::vector<int64_t> strides_vec(shape.size());
-    if (!shape.empty())
-    {
-        strides_vec[shape.size() - 1] = 1;
-        for (int64_t i = static_cast<int64_t>(shape.size()) - 1; i >= 1; --i)
-        {
-            strides_vec[i - 1] = strides_vec[i] * shape[i];
-        }
-    }
-
-    // Request buffer from allocator
-    auto& allocator = NCCLWindowAllocator::getInstance();
-    NCCLWindowBuffer buffer;
-
-    if (!comm || !*comm)
-    {
-        TLLM_LOG_DEBUG("[createNCCLWindowTensor] null comm; returning invalid buffer");
-        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
-    }
-
-    // Expected resource failures, unknown capture state, and captures without a graph-pool owner
-    // return an invalid buffer so callers can use their existing unregistered fallback. Other
-    // programming errors must propagate instead of silently changing the collective implementation.
-    buffer = allocator.requestBuffer(*comm, buffer_size, at::cuda::getCurrentCUDAStream().stream());
-
-    // Defensive validation: ensure buffer is valid before proceeding
-    if (!buffer.isValid())
-    {
-        TLLM_LOG_DEBUG("[createNCCLWindowTensor] invalid buffer returned from requestBuffer; returning invalid buffer");
-        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
-    }
-
-    // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr, leaseId = buffer.leaseId](void*)
-    { NCCLWindowAllocator::getInstance().releaseBufferFromDestructor(*comm, ptr, leaseId); };
-
-    // Create tensor from the buffer
-    auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
-    auto const device = tensor.get_device();
-    allocator.registerTensorLease(*comm, tensor.storage().unsafeGetStorageImpl(), buffer.ptr, buffer.leaseId, device);
-
-    return std::make_pair(tensor, buffer);
-}
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 

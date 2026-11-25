@@ -75,7 +75,7 @@ def main() -> None:
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
-    # Match the reference app's 960x544 canvas and seed; inherit 28 steps and
+    # Match the reference app's 960x544 canvas and seed; inherit 50 steps and
     # 124 frames at 24 FPS (the app's aligned 5-second request).
     params.height = 544
     params.width = 960

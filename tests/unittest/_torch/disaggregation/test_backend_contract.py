@@ -550,6 +550,7 @@ def test_the_import_scan_sees_every_kind_of_import(tmp_path):
 def test_is_last_has_no_default():
     """Getting it wrong ends a transfer early and in silence, so it cannot be left out."""
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         Chunk(
             block_ids_per_layer_groups=[],
             kind_per_layer_group=[],
@@ -611,6 +612,7 @@ def test_cancelled_is_pending_until_told_otherwise():
 def test_failed_states_what_is_owed():
     """A failure has no default for ``reports_pending``: nobody can guess it for the caller."""
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         Failed(reason="x")
 
 

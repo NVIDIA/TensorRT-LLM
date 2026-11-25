@@ -20,7 +20,8 @@ from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
 from .configurable_moe import ConfigurableMoE
 from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
-from .cutedsl import (TrtllmCutedslFusedFc12Nvfp4Impl,
+from .cutedsl import (TrtllmCutedslFusedFc12Mxfp8Impl,
+                      TrtllmCutedslFusedFc12Nvfp4Impl,
                       TrtllmCutedslGroupedGemmBf16Impl,
                       TrtllmCutedslGroupedGemmNvfp4Impl,
                       TrtllmCutedslGroupedGemmNvfp4PlusImpl,
@@ -29,7 +30,9 @@ from .cutlass import cutlass_leaf, find_cutlass_leaf
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import (CuteDslB12xFusedMoE,
                                       CuteDslB12xNvfp4FusedMoE,
-                                      CuteDslB12xW4a16Nvfp4FusedMoE)
+                                      CuteDslB12xW4a16Nvfp4FusedMoE,
+                                      FlashinferCutedslNvfp4Impl,
+                                      FlashinferCutedslW4a16Nvfp4Impl)
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
@@ -72,7 +75,10 @@ __all__ = [
     "CuteDslB12xFusedMoE",
     "CuteDslB12xNvfp4FusedMoE",
     "CuteDslB12xW4a16Nvfp4FusedMoE",
+    "FlashinferCutedslNvfp4Impl",
+    "FlashinferCutedslW4a16Nvfp4Impl",
     "CuteDslFc12FusedMoE",
+    "TrtllmCutedslFusedFc12Mxfp8Impl",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
     "TrtllmCutedslGroupedGemmNvfp4Impl",

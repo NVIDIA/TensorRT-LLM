@@ -71,6 +71,11 @@ def _manager(offload: bool) -> Mock:
     impl = SimpleNamespace(
         init_config=SimpleNamespace(tokens_per_block=128, layers=layers),
         layer_grouping=((0, 1),),
+        buffer_grouping=(
+            tuple(
+                SimpleNamespace(layer_id=layer, role=role) for layer in range(2) for role in roles
+            ),
+        ),
         pool_group_descs=[
             SimpleNamespace(
                 pool_group_index=0,
@@ -105,6 +110,7 @@ def _manager(offload: bool) -> Mock:
         mixed_precision_high_layers={},
         get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.REPLICATED},
         get_disagg_role_layouts=lambda: {},
+        num_locality_domains=1,
     )
 
 

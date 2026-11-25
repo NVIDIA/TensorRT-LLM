@@ -8,7 +8,7 @@ from typing import Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.situ_and_mul import (
     situ_and_mul,
 )
 

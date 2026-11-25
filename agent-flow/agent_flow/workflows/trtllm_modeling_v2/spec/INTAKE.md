@@ -16,7 +16,7 @@ role reads about the model. Intake writes files and reads the tree; it starts no
   quantization blocks), the safetensors index, the tokenizer and chat template.
 - The reference implementation the user names, enough to write the architecture brief below, and
   whether it can load this checkpoint's weights as stored (its quantization in particular).
-- `tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and this workflow's README.
+- `tensorrt_llm/_torch/modeling_v2/README.md` and this workflow's README.
 - For native code, `cpp/tensorrt_llm/modeling_v2/README.md`: family libraries, build declarations,
   namespaces, registration, fake implementations, loading errors and rebuild/install identity.
 
@@ -40,8 +40,8 @@ trtllm-modeling-v2 intake derive --checkpoint <ckpt> --repo <trtllm checkout> \
     --out <dir>
 ```
 
-It writes `task.derived.yaml`, `derive.report.md` (every value the goal did not state and where
-it came from) and `intake.report.md` (the lint below, with prior art). With a `site.yaml` pass
+It writes `task.derived.yaml` and `derive.report.md` (every value the goal did not state and where
+it came from). With a `site.yaml` pass
 `--site` instead of `--repo`. Edit the derived spec; copy `task.example.yaml` only for what the
 goal words cannot say.
 
@@ -50,45 +50,50 @@ goal words cannot say.
 - `kv=` lists the KV dtypes in one word: the first is every gate's, each other one a variant
   (`gates: [accuracy]`) judged against the unit's own score.
 - Derive asks rather than guesses (and stops until the spec answers): `model_key` when
-  `config.json` names no model. A tuning goal that names no concurrency tunes at 1/32/128.
+  `config.json` names no model.
 
 ## 3. Map the request
 
 | the request says | the spec | why |
 |---|---|---|
 | members, e.g. "TP4, TEP4, ADP4" | `members: [tp4, tep4, dep4]` (ADP = attention DP + EP = `dep`) | |
+| a member wider than one node, e.g. "DEP16" on nodes of 4 GPUs | `members: [dep16]`, `environment.gpus_per_node: 4`, a gates session of `nodes: 4` started with its lead, and `environment.step_args` (README, "anything wider than one node"); a width that fills whole nodes | the member is **one engine across nodes**: each of its checks is a job of whole nodes that the session's lead runs once |
 | "X needs full validation" | X takes every unit and **one variant per feature axis** at X: the variant's `members: [X]`, `gates: [accuracy]` | a cross product of axes (KV dtype x chunking x reuse ...) multiplies the contract; add a combination only when the request names it |
-| "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
+| "Y only aggregate / text-only" | Y in `members.default` for core alone | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
-| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
-| disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
+| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `runtime: {kv_cache_reuse: true}` (the runtime switch decides: `kv_cache_config.enable_block_reuse` alone is overwritten by it), each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined unless the request names the combination |
+| disagg, the deployment known ("context 2 x DEP4, generation 3 x TEP4") | the three files the tree's own disaggregated examples use: `accuracy.disagg.config` (the proxy's, for `trtllm-serve disaggregated -c`: `context_servers.num_instances`, `generation_servers.num_instances`), `.context` and `.generation` (the LLM-API options a server of that side takes with `--config`: its own layout, limits, transceiver); the servers' environment in `accuracy.disagg.env` (`UCX_TLS` ...) | **the flow serves it**: one `trtllm-serve` per instance behind `trtllm-serve disaggregated`, the disagg unit's benchmark (the tree's own `trtllm-eval` command of it, with the unit's `benchmark_args`) scored through the proxy and held to that unit's anchor. A server gets its side's file as it is (the gate adds `modeling_v2: require`), nothing of the unit's options. The flow reads only the instances and a server's ranks (`tensor_parallel_size` x `pipeline_parallel_size`), one device a rank. It is one job on one node when its ranks fit; else a job across a gates session's nodes, as a wide member's is |
+| disagg, proven by a test of its own | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
-| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192); `perf.workload` | |
-| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point, a global total; a perf config's `cuda_graph_config` captures up to the live requests a rank holds (under attention DP the concurrency over the ranks, x1.5 as they finish unevenly) | it starts once the core's required checks hold, never holds the onboarding back (its jobs queue below the onboarding's, its verdict does not wait for it), and measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
+| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
-large checkpoint), and every change to the target runs the stale checks again, so the contract's
-size is paid once per fix, not once per run. Prove each requested feature **once**, at the member
-the request validates fully, and accept the rest in `coverage.accept`, where the delivery report
-states it:
+large checkpoint). A check that passed stands, so each is paid once, and again only after it
+failed or when a landing's worker names it. Prove each requested feature **once**, at the member
+the request validates fully. One check of any kind covers a feature; the delivery report lists
+the checks behind each (`coverage.yaml`):
 
 - A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
-  The accuracy check loads the same engine and fails unless each rank reports the variant's
-  setting (its KV dtype, its chunking); a variant that boots, boots at **every** member of its
-  unit.
+  That gate judges the variant's score against its unit's. No gate reads the dtype, the
+  chunking or the reuse the engine resolved, and such a variant owes no boot. A variant whose
+  gates include `boot` boots at the members of its unit where its benchmark does not run.
 - Members the request scopes to text-only or aggregate take core alone, not the variants.
 - A feature unit runs at one member (`members: {<feature>: [X]}`), and every variant stays on
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
   its boot), and each axis a variant; a variant on a feature unit (a KV dtype under MTP) is a
   combination, added only when the request names it. A variant of disagg owes nothing.
-- Leave the boot boundaries off (section 5) and the profile at `standard` unless the request asks.
+- Leave the profile at `standard` unless the request asks.
 
-The lint prints the checks per unit and variant; past ~30 deserves a second look.
+`--dry-run` journals the contract's checks per unit and variant; past ~30 deserves a second look.
 
-**The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
-will have, say in `notes` which task writes it (the lint's `disagg-test-pending` notes it until
-it exists), and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
+**Disagg: the deployment or a test.** State the deployment whenever the request says how it is
+served: no agent then writes serving or test code, and the check is the same for every model.
+It needs an anchor row for the disagg unit and its benchmark's data where the gates run (`accuracy.dataset_path`
+or the offline caches).
+
+A `test` is the other way: the run writes it; the flow deploys nothing of its own. Name the node
+id it will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
 devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
 than two engines at its member's width.
 
@@ -96,10 +101,9 @@ than two engines at its member's width.
 
 `cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
 (the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
-is 10-50x slower, each fix-and-recheck pays it, and it scores a path the target does not serve.
-The lint blocks a unit or variant whose accuracy runs eager unless the notes keep it on purpose
-(`intake-accept: accuracy-eager -- <why>`: a short subset, a capture still being built); a
-benchmark you start by hand runs captured too.
+is 10-50x slower and scores a path the target does not serve.
+Run a unit or variant's accuracy eager only on purpose (a short subset, a capture still being
+built), and say so in `notes`; a benchmark you start by hand runs captured too.
 
 ## 5. Accuracy and boot
 
@@ -113,17 +117,12 @@ benchmark you start by hand runs captured too.
   whose output is neither lm-eval's `accuracy:` line nor MMLU's weighted average needs
   `score_pattern` (a regular expression whose first group is the score, on the anchor's scale)
   and `samples`; without one, its gate quotes the lines that look like a score and fails.
-- **What fails a check.** Output that is wrong (nothing generated, a boot keyword missing) or a
-  benchmark under its floor. Everything stricter is recorded, not gated: the golden rule is the
-  benchmark score close to its reference. A model-level reference, when the run has one
-  (`accuracy.reference_logits.path`: first-token top-k log-probs per prompt, written by
-  `checks/harness/hf_reference.py` where `transformers` loads the checkpoint natively), is
-  compared at every boot: the first token the reference's (a flip within `tie_margin`, 0.15
-  nats, is a near-tie) and the distribution not diverged (Jensen-Shannon <= `max_js`, 0.20 nats;
-  centered cosine >= `min_cosine`, 0.98). A divergence past them is written into the verdict
-  with its prompts and numbers, and the verdict stands: loosen the bounds there if they are too
-  tight; the user judges the record. Kernel entries are judged by their output distribution
-  against their reference the same way (`trtllm-modeling-v2-entry`).
+- **What fails a check.** Nothing generated, or a benchmark under its floor: the golden rule
+  is the benchmark score close to its reference. Kernel entries are judged by their output
+  distribution against their reference (`trtllm-modeling-v2-entry`).
+- **Drafting floors.** A unit's `accuracy.acceptance` entry holds its own drafter; a later
+  unit that runs the same drafter (`features: [mtp, multimodal]`) is held to the entry of the
+  speculator it builds on unless it has its own, then to `default`.
 - **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
   the spec states (`org/model`; the checkpoint path's last two components are no model's name):
   the user's score, else the reference implementation's (HuggingFace `transformers`, where it
@@ -146,28 +145,23 @@ benchmark you start by hand runs captured too.
   against the unchunked engine. Its floor allows for the error of both scores. A variant that
   names a row of its own is judged against that row (its `discriminators` are layered over the
   unit's).
-- **Boot prompts.** One checked factual prompt and one checked arithmetic word problem (a
-  benchmark-style question with its numeric answer as the keyword): cheap semantic signal at every
-  boot.
-- **Boot boundaries** (`accuracy.envelope`). Off unless the request asks for them (prompts at
-  `max_seq_len`, loaded batches). When on, one boot per unit runs them (`members` picks it), and a
-  probe whose legs part on a near-tie (`tie_margin`) passes with a note. Give `probes` with one
-  right continuation, e.g.
-  `["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]`: open-ended prompts have near-tied
-  tokens that flip with batch shape (MoE routing, low-precision GEMM tactics) far more often.
+- **Boot prompts.** Two or three short prompts. Boot and serve require an answer, not a
+  word in it: an answer cut at `max_tokens` passes, and whether it is right is the
+  benchmark's to judge.
 
 ## 6. Environment
 
 - `environment.python` exists before launch: the editable install the gates measure, or an
   interpreter the image already has. Every gate's command runs under it.
-- `environment.substrate_checkpoint` is required when the stock modeling path does not register the
-  checkpoint's architecture (the lint checks): a small checkpoint the stock path supports, on this
-  cluster. Preflight's substrate gate boots it instead; skipping the gate also drops its MPI and
-  NVRTC checks.
-- A `session_spool` environment's spools exist once their sessions run. Until then lint with
-  `--sessions-planned`; start the sessions before launch.
+- A `session_spool` environment's spools exist once their sessions run: start the sessions
+  before launch.
 - Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
   only what a worker submits to it.
+- `environment.gpus_per_node` (or a session's) is what tells a member or a deployment wider
+  than one node from one that fits: without it everything is launched on one node. What spans
+  nodes needs a gates session of that many nodes (`nodes: N`) started with its lead,
+  `environment.step_args`, and a `TMPDIR` that is a directory of each node: README, "anything
+  wider than one node". Preflight refuses a spec whose gates sessions hold too few nodes.
 
 ## 7. Agents: yours
 
@@ -199,10 +193,11 @@ what the roles need while they work:
 - **Reference** — where it is, what it supports, how it loads this checkpoint's weights.
 - **Architecture** — layer pattern, attention kinds with head dims, sparse/indexer configuration,
   MoE (experts, top-k, clamps, router), norm and residual dtypes, towers.
-- **Prior art in this tree worth surveying** — the top leads of each kind in `intake.report.md`
-  (attention backends, custom ops, other targets' `ops/`, catalog entries), one line each named by
-  its `<dir>/<file>.py`: what it offers, or why it does not fit.
-- **Engine constraints** — from `intake.report.md` and the design they imply.
+- **Prior art in this tree worth surveying** — the leads you know (attention backends, custom
+  ops, other targets' `ops/`, catalog entries), one line each named by its `<dir>/<file>.py`: what
+  it offers, or why it does not fit. The run writes its own list, with the engine's limits for
+  this checkpoint, into `prior_art.md` when it starts.
+- **Engine constraints** — those you know, and the design they imply.
 - **Scope decisions** — what is gated where, what is checked outside the flow, and why.
 - **References outside the tree** — where you know them: another engine's implementation of
   this model (a checkout path, a package, a URL) and the kernels it uses.
@@ -214,17 +209,9 @@ Nothing about the intake itself: what intake may or may not do, launch blockers,
 provenance and questions for the user belong in your own summary beside the spec. Notes are read
 as standing orders, so "no build is allowed" written for the intake stops the run's own builds.
 
-## 9. Lint, then launch
+## 9. Dry run, then launch
 
-```bash
-trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md [--sessions-planned]
-```
-
-Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:
-`intake-accept: <rule>[, <rule>] -- <why>`. A `block` is what preflight or the first boot would stop
-on (a requested cell no check covers, a KV-cache dtype the engine does not load) and cannot be
-accepted, except a cross product of variants the request names and an accuracy check run eager on
-purpose. The report also prints the contract size; a contract past ~30 checks
-deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
-what was accepted. Once it runs, steer it only through `feedback` (the README's "While it runs"):
+`trtllm-modeling-v2 --task task.yaml --workspace W --dry-run` resolves the spec, probes the host
+and the agents, and journals the contract and the checks behind each feature, without an agent
+turn. Then launch. Once it runs, steer it only through `feedback` (the README's "While it runs"):
 cancelling the run's own jobs proves nothing and costs them again.

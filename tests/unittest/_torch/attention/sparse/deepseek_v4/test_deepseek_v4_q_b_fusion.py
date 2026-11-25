@@ -16,11 +16,14 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     _dsv4_q_b_gemm_cu_q_seqlens,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_q_b_gemm_cu_seqlens_per_phase() -> None:

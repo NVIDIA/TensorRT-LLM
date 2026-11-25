@@ -300,10 +300,47 @@ class TestBindingsNixlTransferStatus(TestCase):
 
     def test_last_status_unavailable_fallback(self):
         # cpp_status without get_last_status*/-> graceful sentinels, no raise.
-        cpp = Mock(spec=[])
+        cpp = Mock(spec=["release"])
         status = BindingsNixlTransferStatus(cpp)
         self.assertEqual(status.last_status(), -1)
         self.assertEqual(status.last_status_str(), "<unavailable>")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")
+class TestBindingsNixlTransferStatusRelease(TestCase):
+    """Dropping a status releases its request handle through the binding's release().
+
+    The binding releases the GIL in release(); the C++ destructor that runs
+    afterwards does not, so the handle must already be released by then.
+    """
+
+    def test_binding_exposes_release(self):
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+            TransferStatus as CppTransferStatus,
+        )
+
+        self.assertTrue(callable(getattr(CppTransferStatus, "release", None)))
+
+    def test_release_passthrough(self):
+        cpp = Mock()
+        cpp.release.return_value = True
+        status = BindingsNixlTransferStatus(cpp)
+        self.assertTrue(status.release())
+        cpp.release.assert_called_once_with()
+
+    def test_dropping_status_releases_handle(self):
+        cpp = Mock()
+        status = BindingsNixlTransferStatus(cpp)
+        cpp.release.assert_not_called()
+        del status
+        cpp.release.assert_called_once_with()
+
+    def test_dropping_status_without_cpp_status_is_quiet(self):
+        status = BindingsNixlTransferStatus.__new__(BindingsNixlTransferStatus)
+        with patch("sys.unraisablehook") as unraisable:
+            del status
+        unraisable.assert_not_called()
 
 
 @pytest.mark.skipif(not _HAS_CPP_NIXL_BINDING, reason="nixl C++ transfer-agent binding unavailable")

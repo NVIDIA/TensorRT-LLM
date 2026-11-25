@@ -18,6 +18,7 @@ import datetime
 import gc
 import importlib
 import importlib.util
+import json
 import logging
 import os
 import platform
@@ -52,17 +53,14 @@ from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
                                get_test_name_corrections_v2, handle_corrections,
-                               modify_by_test_list, preprocess_test_list_lines)
+                               modify_by_test_list,
+                               parse_and_validate_test_list,
+                               preprocess_test_list_lines)
 from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
                                    makedirs, print_info, print_warning,
                                    wsl_to_win_path)
 from .utils.periodic_junit import (PeriodicJUnitXML,
                                    register_pytest_timeout_evidence)
-
-try:
-    from llm import trt_environment
-except ImportError:
-    trt_environment = None
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -181,17 +179,9 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
     return wrapper
 
 
-# Fixture about whether the current pipeline is running in TRT environment.
-@pytest.fixture(scope="session")
-def is_trt_environment():
-    return trt_environment is not None
-
-
 # Helper function to get llm_root. Do not define it as a fixture so that this
 # function can be used during test collection phase.
-def get_llm_root(trt_config=None, gitlab_token=None):
-    if trt_environment:
-        return trt_environment.setup_tensorrt_llm_repo(trt_config, gitlab_token)
+def get_llm_root():
     llm_repo_root = os.environ.get("LLM_ROOT", None)
     if llm_repo_root is None:
         llm_repo_root = os.path.dirname(
@@ -302,6 +292,7 @@ def medusa_example_root(llm_root, llm_venv):
 @pytest.fixture(scope="function")
 def deepseek_v3_model_root(request):
     models_root = llm_models_root()
+    deepseek_v3_model_root = ""
     if request.param == "DeepSeek-V3":
         deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
     elif request.param == "DeepSeek-V3-Lite-bf16":
@@ -321,6 +312,7 @@ def deepseek_v3_model_root(request):
 @pytest.fixture(scope="function")
 def gpt_oss_model_root(request):
     models_root = os.path.join(llm_models_root(), "gpt_oss")
+    gpt_oss_model_root = ""
     if request.param == "gpt-oss-20b":
         gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
     assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"
@@ -777,6 +769,8 @@ skip_no_mxfp4_swizzle = pytest.mark.skipif(
 
 skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
                                    reason="This test is for SM120")
+skip_no_sm100f = pytest.mark.skipif(
+    not is_sm_100f(), reason="This test is for the SM100 family (SM100-SM109)")
 
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
@@ -860,6 +854,19 @@ def pytest_addoption(parser):
         action="store",
         default=None,
         help="Path to the file containing the list of tests to run",
+    )
+    parser.addoption(
+        "--cbts-test-list",
+        action="store",
+        default=None,
+        help=
+        "Intersect the original shard with this CBTS test list after splitting",
+    )
+    parser.addoption(
+        "--cbts-shard-result",
+        action="store",
+        default=None,
+        help="Write CBTS collection counts for the CI runner",
     )
     parser.addoption(
         "--workspace",
@@ -1066,18 +1073,11 @@ def pytest_collection_modifyitems(session, config, items):
     test_model_suites = config.getoption("--test-model-suites")
 
     if perf_test:
-        global ALL_PYTEST_ITEMS
-        ALL_PYTEST_ITEMS = None
-
-        import copy
-
         # Do not import at global level since that would create cyclic imports.
         from .perf.test_perf import generate_perf_tests
 
         # Perf tests are generated based on the test list to speed up the test collection time.
         items = generate_perf_tests(session, config, items)
-
-        ALL_PYTEST_ITEMS = copy.copy(items)
 
     if test_prefix:
         # Override the internal nodeid of each item to contain the correct test prefix.
@@ -1114,7 +1114,34 @@ def pytest_collection_modifyitems(session, config, items):
     for item in items:
         if test_prefix and item._nodeid.startswith(f"{test_prefix}/"):
             item._nodeid = item._nodeid[len(f"{test_prefix}/"):]
+    # Resolve against the full collection before splitting; unselected shards
+    # must not affect matching or trigger test-list correction suggestions.
+    cbts_list = config.getoption("--cbts-test-list")
+    cbts_names = None
+    if cbts_list:
+        parsed = parse_and_validate_test_list(cbts_list,
+                                              config,
+                                              items,
+                                              check_for_corrections=False)
+        cbts_names = {
+            name[len(test_prefix) + 1:]
+            if test_prefix and name.startswith(f"{test_prefix}/") else name
+            for name in parsed[1]
+        }
     yield
+    if cbts_names is not None:
+        deselected = [item for item in items if item.nodeid not in cbts_names]
+        items[:] = [item for item in items if item.nodeid in cbts_names]
+        config.hook.pytest_deselected(items=deselected)
+        config._cbts_empty_shard = bool(deselected) and not items
+        config._cbts_shard_result = {
+            "original_count": len(items) + len(deselected),
+            "selected_count": len(items),
+            "removed_count": len(deselected),
+            "intentional_empty": config._cbts_empty_shard,
+        }
+        print(f"CBTS: kept {len(items)} cases in the original shard; "
+              f"removed {len(deselected)}")
     for item in items:
         if test_prefix:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
@@ -1283,15 +1310,6 @@ def pytest_runtest_makereport(item, call):
         report.file = str(item.fspath)
         report.line = str(item.location[1])
         report.url = ""
-
-
-@pytest.fixture(scope="session")
-def all_pytest_items():
-    """
-    Provides all pytest items available in the current test definitions, before any
-    filtering has been applied.
-    """
-    return ALL_PYTEST_ITEMS
 
 
 @pytest.fixture(scope="session")
@@ -1609,4 +1627,13 @@ def pytest_runtest_setup(item):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if (exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+            and getattr(session.config, "_cbts_empty_shard", False)
+            and not session.testsfailed):
+        session.exitstatus = pytest.ExitCode.OK
+    result_path = session.config.getoption("--cbts-shard-result")
+    result = getattr(session.config, "_cbts_shard_result", None)
+    if (result_path and result and not session.testsfailed
+            and session.exitstatus == pytest.ExitCode.OK):
+        Path(result_path).write_text(json.dumps(result), encoding="utf-8")
     _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

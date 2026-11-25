@@ -15,6 +15,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
@@ -581,6 +582,10 @@ class MultimodalItemScheduler:
                 pin_memory=prefer_pinned(),
                 target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
             )
+
+        # The encoder can hold the GIL while it waits on the device, so the host functions of the
+        # previous graph replay must run first.
+        drain_captured_hostfuncs()
 
         # The vision tower runs outside ModelCaller, so its TP all-reduces can
         # return NCCL window tensors here. The cache stores clones, so every

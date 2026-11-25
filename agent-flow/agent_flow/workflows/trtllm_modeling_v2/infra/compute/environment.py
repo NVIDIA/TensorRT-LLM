@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..files import read_json
-from . import SPOOLCTL_PATH
+from . import SPOOLCTL_PATH, steps
 from .scheduler import SpoolPaths
 from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
 from .sessions import (
@@ -26,6 +26,7 @@ from .sessions import (
     SessionSpec,
     describe_sessions,
     env_assignments,
+    prepend_to_inherited,
     sessions_from_task,
 )
 
@@ -88,8 +89,12 @@ class RunEnvironment:
     spool: str | None = None
     # Every declared session an agent may submit to.
     sessions: tuple[SessionSpec, ...] = ()
-    # ``perf.dev_spools``: the sessions the tuners submit to; no other prompt names them.
-    dev_spools: tuple[str, ...] = ()
+    # ``environment.gpus_per_node``; ``None`` when undeclared.
+    gpus_per_node: int | None = None
+    # The nodes one engine spans (:meth:`at_width`).
+    nodes: int = 1
+    # ``environment.step_args``.
+    step_args: tuple[str, ...] = ()
 
     @property
     def ntasks(self) -> int:
@@ -100,6 +105,11 @@ class RunEnvironment:
     def needs_llmapi_launch(self) -> bool:
         """Whether the payload must be wrapped in ``trtllm-llmapi-launch``."""
         return self.ntasks > 1
+
+    def at_width(self, world_size: int) -> "RunEnvironment":
+        """This environment for one engine of ``world_size`` ranks, on the nodes it needs."""
+        size = max(1, int(world_size))
+        return replace(self, world_size=size, nodes=nodes_for_width(size, self.gpus_per_node))
 
     @property
     def launch_env(self) -> dict[str, str]:
@@ -143,12 +153,63 @@ class RunEnvironment:
             return f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {launch}'
         return launch
 
+    def step(
+        self,
+        argv: str,
+        *,
+        ranks: int,
+        nodes: int = 1,
+        hosts: str = steps.FIRST_HOST,
+        devices: Sequence[int] = (),
+        env: Mapping[str, str] | None = None,
+    ) -> str:
+        """``argv`` as ``ranks`` tasks of one world on ``nodes`` of the job's hosts (``steps.py``)."""
+        declared = {**replace(self, world_size=ranks).launch_env, **(env or {})}
+        if declared.get("TMPDIR"):
+            # Nodes compiling one Triton kernel in one shared directory race and kill the engine.
+            declared["TRITON_CACHE_DIR"] = os.path.join(declared["TMPDIR"], "triton-cache")
+        path = [os.path.dirname(self.python)] if os.path.isabs(self.python) else []
+        if declared.get("PATH"):
+            path.append(declared.pop("PATH"))
+        return steps.step_line(
+            self.step_args,
+            argv,
+            ranks=ranks,
+            nodes=nodes,
+            hosts=hosts,
+            assignments=env_assignments(declared),
+            devices=devices,
+            path=prepend_to_inherited("PATH", ":".join(path)) if path else "",
+        )
+
+    def world(
+        self,
+        argv: str,
+        *,
+        ranks: int,
+        devices: Sequence[int] = (),
+        env: Mapping[str, str] | None = None,
+        **_: Any,
+    ) -> str:
+        """:meth:`step` on one node: an engine's own launch; ``devices`` index ``$DEVICES``."""
+        if ranks == 1 and devices and os.path.isabs(self.python):
+            # `_mpirun_launch` does this above one rank.
+            argv = f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {argv}'
+        own = replace(
+            self,
+            world_size=ranks,
+            nodes=1,
+            env={**self.env, **(env or {})},
+            devices=tuple(f"${{DEVICES[{device}]}}" for device in devices),
+        )
+        return own.command(argv, single_process=not devices)
+
     def command(self, argv: str | Sequence[str], *, single_process: bool = False) -> str:
         """Return the command line ``argv`` prefixed for this environment.
 
         ``single_process`` is for work that is **not** engine work, such as a probe that imports
         the build and exits: one process whatever the world size, no launcher, the MPI
-        environment scrubbed.
+        environment scrubbed. Across ``nodes`` it is a step (:meth:`step`).
         """
         if not isinstance(argv, str):
             argv = " ".join(shlex.quote(str(part)) for part in argv)
@@ -156,6 +217,16 @@ class RunEnvironment:
             # Re-asked at one task: the launcher follows from the task count, and shrinking only
             # the payload would still start one copy of the probe per rank.
             return replace(self, world_size=1).command(argv, single_process=True)
+        if self.nodes > 1 and single_process:
+            return self.step(argv, ranks=1)
+        if self.nodes > 1:
+            return self.step(
+                f"{LLMAPI_LAUNCH} {argv}",
+                ranks=self.ntasks,
+                nodes=self.nodes,
+                hosts=steps.ALL_HOSTS,
+                devices=range(self.gpus_per_node or 0),
+            )
         if self.needs_llmapi_launch:
             argv = self._mpirun_launch(argv)
         elif single_process:
@@ -197,6 +268,7 @@ class RunEnvironment:
     def _describe_spool(self) -> str:
         """The prompt block for a long-lived compute session watching a spool."""
         spool = self.spool or "<spool>"
+        nodes = nodes_for_width(self.world_size, self.gpus_per_node)
         exports = "\n".join(f"export {part}" for part in env_assignments(self.launch_env))
         if not exports:
             exports = "# no extra environment"
@@ -264,7 +336,13 @@ class RunEnvironment:
                 f"{self.ntasks} processes that each believe they are rank 0 of a world "
                 "of 1 and hang forever with no error.\n"
                 "\n"
-                if self.needs_llmapi_launch
+                if self.needs_llmapi_launch and nodes == 1
+                else ""
+            )
+            + (
+                f"An engine of {self.world_size} ranks spans {nodes} nodes here: only "
+                "`trtllm-modeling-v2 gate ...` starts it. Debug by hand at a width that fits one.\n\n"
+                if nodes > 1
                 else ""
             )
             + "**Do not construct a launcher command, do not probe for one, and do not call a "
@@ -299,6 +377,23 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     )
 
 
+def gpus_per_node(data: Mapping[str, Any]) -> int | None:
+    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
+    env = data.get("environment") or {}
+    sizes = [env.get("gpus_per_node")] + [
+        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
+    ]
+    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
+    return max(sizes) if sizes else None
+
+
+def nodes_for_width(width: int | None, per_node: int | None) -> int:
+    """The nodes one engine of ``width`` ranks spans; one while it fits or either is unknown."""
+    if not width or not per_node or width <= per_node:
+        return 1
+    return -(-width // per_node)
+
+
 def scheduler_owns_devices(kind: str) -> bool:
     """Whether a scheduler, not this process, decides the devices and the host.
 
@@ -328,21 +423,8 @@ def resolve_environment(
         container_image=block.get("container_image"),
         spool=block.get("spool"),
         sessions=declared,
-        dev_spools=_dev_spools(task_data.get("perf")),
-    )
-
-
-def _dev_spools(perf: Any) -> tuple[str, ...]:
-    """``perf.dev_spools``, less any spool that also measures (``perf.spools``).
-
-    Only a declared list: the campaign's fallback to its measuring spools is not one, and a gate
-    beside a measurement would skew it.
-    """
-    if not isinstance(perf, Mapping):
-        return ()
-    measuring = {Path(str(s)) for s in perf.get("spools") or ()}
-    return tuple(
-        str(s) for s in perf.get("dev_spools") or () if s and Path(str(s)) not in measuring
+        gpus_per_node=gpus_per_node(task_data),
+        step_args=tuple(str(word) for word in block.get("step_args") or ()),
     )
 
 
@@ -409,6 +491,8 @@ __all__ = [
     "MULTI_TASK_SLURM_VARS",
     "RunEnvironment",
     "MPI_SETTINGS_KEPT",
+    "gpus_per_node",
+    "nodes_for_width",
     "SINGLE_TASK_MPI_SCRUB",
     "single_task_scrub",
     "resolve_environment",
