@@ -67,11 +67,11 @@ l0_gb300_multi_gpus:
   # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103: non-speculative GSM8K identity gate on
   # tp4, native DSpark quick coverage (GSM8K + AL, MMMU, multimodal panel with block reuse)
   # across tep4/dep4/tp4, and llguidance guided decoding on tp4.
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_gsm8k[tp4] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep4-quick] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp4-quick] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_llguidance TIMEOUT (60)
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_gsm8k[tp4]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep4-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp4-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_llguidance
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that

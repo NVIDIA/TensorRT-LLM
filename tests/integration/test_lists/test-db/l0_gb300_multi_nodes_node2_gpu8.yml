@@ -15,7 +15,7 @@ l0_gb300_multi_nodes_node2_gpu8:
       stage: post_merge
       backend: pytorch
   tests:
-  - accuracy/test_mistral_large4_disaggregated.py::test_mistral_large4_disagg TIMEOUT (130)
+  - accuracy/test_mistral_large4_disaggregated.py::test_mistral_large4_disagg
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm TIMEOUT (60)
   # Kimi K3 GSM8K accuracy plus an acceptance-length gate on the TEP8 DSpark
   # recipe. Measured 25m45s on 2x4 GB300.
@@ -38,6 +38,6 @@ l0_gb300_multi_nodes_node2_gpu8:
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
   # ModelingV2 Mistral Large 4 sm_103 on 2x4 GB300: native DSpark quick coverage across
   # tep8/dep8/tp8 (GSM8K + acceptance length, MMMU and multimodal panel with block reuse).
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep8-quick] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep8-quick] TIMEOUT (180)
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp8-quick] TIMEOUT (180)
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep8-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep8-quick]
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp8-quick] TIMEOUT (90)
