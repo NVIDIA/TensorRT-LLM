@@ -144,3 +144,32 @@ class TestStaticQuantGuard:
         # The guard is a no-op for dynamic recipes; quantization happens later
         # in _maybe_dynamic_quantize (GPU path, not exercised here).
         loader._check_static_quant_scales(_bf16_weights(), QuantAlgo.FP8, "blocks.0.attn1.to_q")
+
+
+def test_layer_lookup_resolves_patterns_like_the_model_config():
+    """The loader's per-layer lookup and ``DiffusionModelConfig.get_quant_config`` agree."""
+    layers = {
+        "transformer_blocks.*.ff.net.2": QuantConfig(quant_algo=QuantAlgo.FP8),
+        "transformer_blocks.3.ff.net.2": QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+    }
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        quant_config_dict=layers,
+    )
+    loader = DynamicLinearWeightLoader(model_config)
+    for name, expected in (
+        # A pattern-only entry.
+        ("transformer_blocks.7.ff.net.2", QuantAlgo.FP8),
+        # An exact entry wins over a pattern that also matches.
+        ("transformer_blocks.3.ff.net.2", QuantAlgo.NVFP4),
+        # No entry: the global algorithm.
+        ("transformer_blocks.7.attn.to_q", QuantAlgo.FP8_BLOCK_SCALES),
+    ):
+        assert loader._get_quant_algo_for_layer(name) == expected, name
+        assert model_config.get_quant_config(name).quant_algo == expected, name
+
+
+def test_layer_lookup_without_a_table_is_the_global_algorithm():
+    loader = _make_loader(QuantAlgo.NVFP4)
+    assert loader.quant_config_dict is None
+    assert loader._get_quant_algo_for_layer("transformer_blocks.0.attn.to_q") == QuantAlgo.NVFP4

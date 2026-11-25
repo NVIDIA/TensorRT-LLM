@@ -1926,6 +1926,7 @@ def _register_fake():
         scale_out: torch.Tensor,
         fp16_softmax: bool,
         out_dtype: torch.dtype,
+        skip_corr_threshold: float = 0.0,
     ):
         return q.new_empty(q.shape, dtype=out_dtype)
 

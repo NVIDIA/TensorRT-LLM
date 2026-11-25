@@ -393,6 +393,65 @@ def build_row_timesteps(
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
+class RowTimestepPlanner:
+    """``build_row_timesteps`` for every step of one layout without a 38k-row sort per step.
+
+    The rows fall into four classes fixed by the layout (default rows, condition video rows,
+    audio rows, condition audio rows); only the class values change per step. The class of
+    every row is recorded once, and each call sorts at most four values and gathers the
+    per-row index, which reproduces ``torch.unique(..., sorted=True, return_inverse=True)``
+    on the full row tensor exactly (same float32 values, same int64 indices).
+    """
+
+    def __init__(self, layout: MiniMaxH3PackedSequence) -> None:
+        classes = torch.zeros(layout.sequence_length, dtype=torch.long)
+        # Same assignment order as build_row_timesteps, so overlapping index sets resolve alike.
+        classes[layout.video_indices[: layout.num_condition_video_rows]] = 1
+        classes[layout.audio_indices[layout.num_condition_audio_rows :]] = 2
+        classes[layout.audio_indices[: layout.num_condition_audio_rows]] = 3
+        self._classes = classes
+        self._present = torch.bincount(classes, minlength=4) > 0
+
+    def __call__(
+        self,
+        video_timestep: float,
+        audio_timestep: float,
+        condition_video_timestep: float,
+        condition_audio_timestep: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        unique, positions = self.class_positions(
+            video_timestep, audio_timestep, condition_video_timestep, condition_audio_timestep
+        )
+        return unique, positions[self._classes]
+
+    @property
+    def classes(self) -> torch.Tensor:
+        """The class (0 to 3) of every row of the layout, int64."""
+        return self._classes
+
+    @property
+    def present(self) -> torch.Tensor:
+        """Which of the four classes have rows in the layout."""
+        return self._present
+
+    def class_positions(
+        self,
+        video_timestep: float,
+        audio_timestep: float,
+        condition_video_timestep: float,
+        condition_audio_timestep: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The distinct values of one step and the index of each class's value among them."""
+        values = torch.tensor(
+            [video_timestep, condition_video_timestep, audio_timestep, condition_audio_timestep],
+            dtype=torch.float32,
+        )
+        unique = torch.unique(values[self._present], sorted=True)
+        # Position of every class value in the sorted distinct values (absent classes map to 0, unused).
+        positions = (values[:, None] == unique[None, :]).to(torch.long).argmax(dim=1)
+        return unique, positions
+
+
 def keyframe_condition_noise(
     condition_latent_shapes: tuple[tuple[int, int, int], ...],
     patch_size: tuple[int, int, int],

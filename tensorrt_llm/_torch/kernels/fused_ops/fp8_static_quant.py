@@ -21,7 +21,7 @@ reciprocal of the scale and round to nearest even, saturating at +-448.
 import torch
 import triton
 import triton.language as tl
-import triton.language.extra.libdevice as tldevice
+from triton.language.extra import libdevice
 
 _BLOCK_SIZE = 16384
 _NUM_WARPS = 8
@@ -31,7 +31,7 @@ _NUM_WARPS = 8
 def _fp8_static_quant_kernel(x_ptr, scale_ptr, y_ptr, numel, BLOCK_SIZE: tl.constexpr):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
-    inv_scale = tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
+    inv_scale = libdevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(y_ptr + offsets, (x * inv_scale).to(y_ptr.dtype.element_ty), mask=mask)
 

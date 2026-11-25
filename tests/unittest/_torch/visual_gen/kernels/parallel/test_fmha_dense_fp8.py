@@ -27,8 +27,14 @@ def _supported(num_heads, out_dtype, fp16_softmax):
 
 
 def _require(num_heads, out_dtype, fp16_softmax):
-    if not _supported(num_heads, out_dtype, fp16_softmax):
-        pytest.skip(f"no dense FP8 kernel on SM{get_sm_version()} for this configuration")
+    if _supported(num_heads, out_dtype, fp16_softmax):
+        return
+    sm = get_sm_version()
+    config = f"heads={num_heads}, out_dtype={out_dtype}, fp16_softmax={fp16_softmax}"
+    if sm == 107:
+        # The SM107a cubins are a shipped resource of this build: their absence is a failure.
+        pytest.fail(f"SM{sm}: no dense FP8 kernel for {config}; the SM107a cubins are missing")
+    pytest.skip(f"no dense FP8 kernel on SM{sm} for {config}")
 
 
 def _cu_seqlens(batch, seq_len):
@@ -232,3 +238,128 @@ def test_fake_under_compile():
     eager = fn(q8, k8, v8)
     compiled = torch.compile(fn, fullgraph=True)(q8, k8, v8)
     torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
+
+
+def _folded_inputs(batch, seq_len, num_heads, seed):
+    """Q/K quantized with the softmax scale folded in (FP16 softmax), V with a per-tensor scale."""
+    q, k, v = _inputs(batch, seq_len, num_heads, seed=seed)
+    qk_mul = math.sqrt(HEAD_DIM**-0.5 * LOG2E)
+    vs = v.abs().amax() / E4M3_MAX
+    return _quant(q * qk_mul, 1.0), _quant(k * qk_mul, 1.0), _quant(v, vs), vs, qk_mul
+
+
+def test_opcheck_with_explicit_threshold():
+    """The schema's tenth argument reaches the fake: opcheck with skip_corr_threshold passed explicitly.
+
+    Only the fake-tensor check of opcheck runs: its schema check (``SchemaCheckMode``) compares the
+    inputs with ``torch.allclose`` to detect mutation, and FP8 tensors have no multiply kernel. The
+    schema's arity and the no-mutation / no-aliasing contract are checked directly instead.
+    """
+    _require(10, torch.bfloat16, fp16_softmax=True)
+    schema = torch.ops.trtllm.fmha_dense_fp8.default._schema
+    assert [a.name for a in schema.arguments][-1] == "skip_corr_threshold"
+    assert len(schema.arguments) == 10
+    assert all(a.alias_info is None for a in schema.arguments + schema.returns)
+    batch, seq_len = 1, 1560
+    q8, k8, v8, vs, _ = _folded_inputs(batch, seq_len, 10, seed=9)
+    args = (
+        q8,
+        k8,
+        v8,
+        _cu_seqlens(batch, seq_len),
+        seq_len,
+        None,
+        vs.reshape(1).float(),
+        True,
+        torch.bfloat16,
+        0.5,
+    )
+    torch.library.opcheck(torch.ops.trtllm.fmha_dense_fp8, args, test_utils=("test_faketensor",))
+    inputs = [a for a in args if isinstance(a, torch.Tensor)]
+    before = [t.view(torch.uint8).clone() for t in inputs]
+    out = torch.ops.trtllm.fmha_dense_fp8(*args)
+    torch.cuda.synchronize()
+    for t, b in zip(inputs, before):
+        assert torch.equal(t.view(torch.uint8), b), "input mutated"
+    out_storage = out.untyped_storage().data_ptr()
+    assert all(out_storage != t.untyped_storage().data_ptr() for t in inputs), (
+        "output aliases an input"
+    )
+
+
+@pytest.mark.parametrize("fp16_softmax", [False, True])
+@pytest.mark.parametrize("num_heads", [10, 14, 40])
+def test_strided_views_match_packed(fp16_softmax, num_heads):
+    """Q/K/V as the three planes of one [T, 3, H, D] buffer give the packed call's output bit for bit."""
+    _require(num_heads, torch.bfloat16, fp16_softmax)
+    batch, seq_len = 1, 1560
+    tokens = batch * seq_len
+    if fp16_softmax:
+        q8, k8, v8, vs, _ = _folded_inputs(batch, seq_len, num_heads, seed=10)
+        bmm1 = None
+    else:
+        q, k, v = _inputs(batch, seq_len, num_heads, seed=10)
+        qs, ks, vs = (t.abs().amax() / E4M3_MAX for t in (q, k, v))
+        q8, k8, v8 = _quant(q, qs), _quant(k, ks), _quant(v, vs)
+        softmax_scale = HEAD_DIM**-0.5
+        bmm1 = torch.stack([softmax_scale * qs * ks, softmax_scale * qs * ks * LOG2E]).float()
+    cu, scale_out = _cu_seqlens(batch, seq_len), vs.reshape(1).float()
+
+    buf = torch.empty((tokens, 3, num_heads, HEAD_DIM), dtype=E4M3, device="cuda")
+    views = [buf[:, i] for i in range(3)]
+    for view, packed in zip(views, (q8, k8, v8)):
+        view.copy_(packed)
+        assert not view.is_contiguous()
+        assert view.stride() == (3 * num_heads * HEAD_DIM, HEAD_DIM, 1)
+
+    packed_out = torch.ops.trtllm.fmha_dense_fp8(
+        q8, k8, v8, cu, seq_len, bmm1, scale_out, fp16_softmax, torch.bfloat16
+    )
+    strided_out = torch.ops.trtllm.fmha_dense_fp8(
+        *views, cu, seq_len, bmm1, scale_out, fp16_softmax, torch.bfloat16
+    )
+    assert strided_out.shape == (tokens, num_heads, HEAD_DIM) and strided_out.is_contiguous()
+    assert torch.equal(strided_out, packed_out)
+
+
+def test_rejects_bad_strides():
+    """A head stride other than head_dim, or a pointer off 16-byte alignment, is refused."""
+    _require(10, torch.bfloat16, fp16_softmax=True)
+    batch, seq_len, num_heads = 1, 256, 10
+    tokens = batch * seq_len
+    q8, k8, v8, vs, _ = _folded_inputs(batch, seq_len, num_heads, seed=11)
+    cu, scale_out = _cu_seqlens(batch, seq_len), vs.reshape(1).float()
+
+    def run(q, k, v):
+        return torch.ops.trtllm.fmha_dense_fp8(
+            q, k, v, cu, seq_len, None, scale_out, True, torch.bfloat16
+        )
+
+    wide = torch.empty((tokens, 3 * num_heads, HEAD_DIM), dtype=E4M3, device="cuda")
+    every_third_head = wide[:, ::3]  # head stride 3 * head_dim
+    with pytest.raises(RuntimeError, match="head stride"):
+        run(every_third_head, k8, v8)
+
+    storage = torch.empty(tokens * 3 * num_heads * HEAD_DIM + 16, dtype=E4M3, device="cuda")
+    shifted = storage[8:-8].view(tokens, 3, num_heads, HEAD_DIM)[:, 0]  # pointer offset 8 bytes
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        run(q8, shifted, v8)
+
+
+def test_skip_corr_threshold_bounds_and_output():
+    """The deferred output rescale keeps the result close to SDPA at t = 0 and t = 1; t > 8 is refused."""
+    _require(10, torch.bfloat16, fp16_softmax=True)
+    batch, seq_len, num_heads = 2, 1560, 10
+    q8, k8, v8, vs, qk_mul = _folded_inputs(batch, seq_len, num_heads, seed=12)
+    cu, scale_out = _cu_seqlens(batch, seq_len), vs.reshape(1).float()
+    ref = _reference(q8.float() / qk_mul, k8.float() / qk_mul, v8.float() * vs, batch, seq_len)
+
+    def run(threshold):
+        return torch.ops.trtllm.fmha_dense_fp8(
+            q8, k8, v8, cu, seq_len, None, scale_out, True, torch.bfloat16, threshold
+        )
+
+    for threshold in (0.0, 1.0):
+        assert _cosine(run(threshold), ref) > _min_cosine(torch.bfloat16)
+    with pytest.raises(RuntimeError, match=r"\[0, 8\]"):
+        run(9.0)

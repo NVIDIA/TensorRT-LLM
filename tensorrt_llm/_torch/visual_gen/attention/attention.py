@@ -73,7 +73,14 @@ class Attention(nn.Module):
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
         separate_qkv_is_self_attention: bool = False,
+        backend_kwargs: Optional[dict] = None,
     ):
+        """
+        Args:
+            backend_kwargs: Extra keyword arguments for the compute backend's constructor
+                (``create_attention``), for options a model sets per backend such as FA4's
+                ``use_2cta``. The caller is responsible for matching them to the backend.
+        """
         super().__init__()
 
         config = config or DiffusionModelConfig()
@@ -286,6 +293,7 @@ class Attention(nn.Module):
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
             sparse_params=sparse_params,
+            **(backend_kwargs or {}),
         )
 
         if enable_sequence_parallel and is_separate_qkv_cross_attention and vgm is not None:

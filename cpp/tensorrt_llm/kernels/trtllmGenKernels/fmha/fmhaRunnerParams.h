@@ -257,6 +257,10 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Zero derives the separate V token stride from the layout.
     int64_t mVTokenStrideInBytes = 0;
+    // Zero derives the separate Q / K token strides from the layout; a positive value reads Q / K
+    // through a strided view (e.g. the planes of a [S, 3, H, D] Ulysses receive buffer).
+    int64_t mQTokenStrideInBytes = 0;
+    int64_t mKTokenStrideInBytes = 0;
     // Packed KV buffer
     void const* kvPtr;
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.

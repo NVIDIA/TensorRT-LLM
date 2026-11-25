@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, resolve_layer_quant_config
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
@@ -143,10 +143,9 @@ class DynamicLinearWeightLoader:
 
     def _get_quant_algo_for_layer(self, name: str) -> Optional[QuantAlgo]:
         """Get quantization algorithm for a specific layer."""
-        if self.quant_config_dict is not None:
-            layer_config = self.quant_config_dict.get(name)
-            if layer_config is not None:
-                return layer_config.quant_algo
+        layer_config = resolve_layer_quant_config(self.quant_config_dict, name)
+        if layer_config is not None:
+            return layer_config.quant_algo
 
         if self.quant_config is not None:
             return self.quant_config.quant_algo

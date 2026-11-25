@@ -14,6 +14,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_107__u1/test_fp8_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
@@ -226,6 +227,12 @@ l0_cpu:
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/kernels/parallel_hw_agnostic
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/test_minimax_h3_scenario_resolver.py
+  - unittest/_torch/visual_gen/models/minimax_h3/minimax_h3_nvfp4__sm_107__u1_u4/test_minimax_h3_scenario_nvfp4_backends.py
+  - unittest/_torch/visual_gen/models/minimax_h3/test_fp8_u4_block_ops.py
+  - unittest/_torch/visual_gen/models/minimax_h3/test_fp8_u4_gen_fmha.py
+  - unittest/_torch/visual_gen/models/minimax_h3/test_fp8_u4_transport.py
+  - unittest/_torch/visual_gen/models/minimax_h3/test_fp8_u4_vae_opt.py
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
@@ -249,6 +256,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_ltx23_registry.py
   - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
   - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
+  - unittest/_torch/visual_gen/test_minimax_h3_attention_precision.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_vsa.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py

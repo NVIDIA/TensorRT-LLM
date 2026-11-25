@@ -27,6 +27,7 @@
 #include <torch/extension.h>
 
 #include <climits>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -72,6 +73,19 @@ tk::TllmGenFmhaRunner& runnerFor(tk::Data_type dtypeOut, int device)
 }
 
 // Shape-only parameters; callers fill the pointers and the stream before running.
+// Q / K / V may be strided views [T, H, D] with unit element and head strides (e.g. the planes of a
+// [T, 3, H, D] Ulysses receive buffer): the token stride goes to the runner, which
+// builds the TMA descriptors from it. A packed tensor keeps the stride 0 (today's path).
+int64_t tokenStrideBytes(torch::Tensor const& t, char const* name)
+{
+    TORCH_CHECK(t.stride(2) == 1 && t.stride(1) == t.size(2), "fmha_dense_fp8: ", name,
+        " must have unit element stride and head stride == head_dim; got strides ", t.strides());
+    int64_t const strideBytes = t.stride(0) * t.element_size();
+    TORCH_CHECK(strideBytes % 16 == 0 && reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 16 == 0,
+        "fmha_dense_fp8: ", name, " token stride and pointer must be 16-byte aligned");
+    return t.stride(0) == t.size(1) * t.size(2) ? 0 : strideBytes;
+}
+
 tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t numTokens, int64_t numHeads,
     int64_t headDim, bool fp16Softmax, int device)
 {
@@ -111,16 +125,23 @@ tk::TllmGenFmhaRunnerParams makeParams(int64_t batch, int64_t maxSeqLen, int64_t
 // scale_out: fp32 [1] on device, v_descale for BF16 output or v_descale / out_scale for FP8 output.
 // With fp16_softmax the softmax scale must be folded into the Q/K quantization scales; the op runs
 // the kernels with a unit scaleSoftmaxLog2 of its own.
+// skip_corr_threshold: deferred output rescale: the kernel skips the O rescale while
+//   the running row max has grown by at most 2^t (E4M3 BMM2 then uses a P scale of 1.75 instead of
+//   448); 0 = rescale every step (unconditional rescale), at most 8 for E4M3 BMM2.
 torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, torch::Tensor const& v,
     torch::Tensor const& cu_seqlens, int64_t max_seqlen, c10::optional<torch::Tensor> const& scale_bmm1,
-    torch::Tensor const& scale_out, bool fp16_softmax, c10::ScalarType out_dtype)
+    torch::Tensor const& scale_out, bool fp16_softmax, c10::ScalarType out_dtype, double skip_corr_threshold)
 {
+    TORCH_CHECK(skip_corr_threshold >= 0.0 && skip_corr_threshold <= 8.0,
+        "fmha_dense_fp8: skip_corr_threshold must be in [0, 8] for E4M3 BMM2");
     TORCH_CHECK(q.scalar_type() == c10::ScalarType::Float8_e4m3fn && k.scalar_type() == q.scalar_type()
             && v.scalar_type() == q.scalar_type(),
         "fmha_dense_fp8: q, k and v must be float8_e4m3fn");
     TORCH_CHECK(q.dim() == 3 && k.sizes() == q.sizes() && v.sizes() == q.sizes(),
         "fmha_dense_fp8: q, k and v must share one [T, H, D] shape");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "fmha_dense_fp8: q, k, v not contiguous");
+    int64_t const qStrideBytes = tokenStrideBytes(q, "q");
+    int64_t const kStrideBytes = tokenStrideBytes(k, "k");
+    int64_t const vStrideBytes = tokenStrideBytes(v, "v");
     TORCH_CHECK(cu_seqlens.scalar_type() == c10::ScalarType::Int && cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2,
         "fmha_dense_fp8: cu_seqlens must be int32 [B + 1]");
     TORCH_CHECK(max_seqlen > 0 && max_seqlen <= q.size(0),
@@ -152,6 +173,9 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
     p.qPtr = q.data_ptr();
     p.kPtr = k.data_ptr();
     p.vPtr = v.data_ptr();
+    p.mQTokenStrideInBytes = qStrideBytes;
+    p.mKTokenStrideInBytes = kStrideBytes;
+    p.mVTokenStrideInBytes = vStrideBytes;
     p.oPtr = out.data_ptr();
     p.cumSeqLensQPtr = cu_seqlens.data_ptr<int>();
     p.cumSeqLensKvPtr = cu_seqlens.data_ptr<int>();
@@ -161,6 +185,8 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
         = fp16_softmax ? softmaxScale.data_ptr<float>() : scale_bmm1->data_ptr<float>() + tk::kIdxScaleSoftmaxLog2Ptr;
     p.outputScalePtr = scale_out.data_ptr<float>();
     p.stream = at::cuda::getCurrentCUDAStream(device);
+    // Board 692 A.5 (a): defer the output rescale while the running row max grows by at most 2^threshold.
+    p.mSkipCorrThreshold = static_cast<float>(skip_corr_threshold);
 
     auto const [supported, info] = runner.isSupportedWithInfo(p);
     TORCH_CHECK(supported, "fmha_dense_fp8: no trtllm-gen kernel for this configuration: ", info);
@@ -198,7 +224,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fmha_dense_fp8(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens, int max_seqlen, Tensor? scale_bmm1, "
-        "Tensor scale_out, bool fp16_softmax, ScalarType out_dtype) -> Tensor");
+        "Tensor scale_out, bool fp16_softmax, ScalarType out_dtype, float skip_corr_threshold=0.) -> Tensor");
     m.def("fmha_dense_fp8_is_supported(int head_dim, int num_heads, ScalarType out_dtype, bool fp16_softmax) -> bool");
 }
 

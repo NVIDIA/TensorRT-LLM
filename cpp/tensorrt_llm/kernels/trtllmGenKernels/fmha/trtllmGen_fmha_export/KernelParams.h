@@ -148,7 +148,9 @@ static CUtensorMap buildNdTmaDescriptor(tg::Dtype dtypeElt,
 
 // Create the TMA shape/stride for Q.
 template <class FmhaOptions, class KernelTraits_>
-static auto makeTmaShapeStrideQ(FmhaOptions const& options, KernelTraits_ const& kernelTraits) {
+static auto makeTmaShapeStrideQ(FmhaOptions const& options,
+                                KernelTraits_ const& kernelTraits,
+                                int32_t qTokenStrideElements = 0) {
 
   //
   // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
@@ -197,8 +199,12 @@ static auto makeTmaShapeStrideQ(FmhaOptions const& options, KernelTraits_ const&
   int32_t strideGroupedHeads{headDimQk};
   // The stride between heads.
   int32_t strideHeads{numGroupedHeads * strideGroupedHeads};
-  // The stride between tokens.
+  // The stride between tokens. A positive qTokenStrideElements (separate Q only) overrides the
+  // packed stride, e.g. for Q read in place from a [S, 3, H, D] buffer.
   int32_t strideTokens{hiddenDimQkv};
+  if (qTokenStrideElements > 0 && isSeparateQkv(options.mQkvLayout) && !options.mGroupsHeadsQ) {
+    strideTokens = qTokenStrideElements;
+  }
 
   // Assemble the stride (1, strideTokens, strideHeads).
   // Swap the first two dimension as mentioned before.
@@ -318,7 +324,7 @@ static auto makeShapeKv(FmhaOptions const& options, KernelParams const& params) 
 
 // Compute the strides for K and V.
 template <class FmhaOptions>
-static auto makeStrideKv(FmhaOptions const& options, bool isK, int32_t vTokenStrideElements = 0) {
+static auto makeStrideKv(FmhaOptions const& options, bool isK, int32_t tokenStrideElements = 0) {
 
   // The headDim for Q and K.
   int headDimQk{options.mHeadDimQk};
@@ -359,10 +365,12 @@ static auto makeStrideKv(FmhaOptions const& options, bool isK, int32_t vTokenStr
       strideKeysVals = hiddenDimQkv;
     } else if (isContiguousKv(options.mQkvLayout)) {
       strideKeysVals = paddedHeadDimKv;
-    } else if (isSeparateQkv(options.mQkvLayout) && !isK) {
-      if (vTokenStrideElements > 0) {
-        strideKeysVals = vTokenStrideElements;
-      } else if (options.mHeadDimQk != options.mHeadDimV && options.mDtypeKv != tg::Dtype::E4m3) {
+    } else if (isSeparateQkv(options.mQkvLayout)) {
+      // tokenStrideElements: the token stride of the tensor described (K or V), 0 = packed.
+      if (tokenStrideElements > 0) {
+        strideKeysVals = tokenStrideElements;
+      } else if (!isK && options.mHeadDimQk != options.mHeadDimV &&
+                 options.mDtypeKv != tg::Dtype::E4m3) {
         strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQk - 64 + options.mHeadDimV);
       }
     }
@@ -426,12 +434,12 @@ static auto makeTmaShapeStrideKv(FmhaOptions const& options,
                                  bool isK,
                                  bool storeTransformedKvInTmem,
                                  int reshapeFactor,
-                                 int32_t vTokenStrideElements = 0) {
+                                 int32_t tokenStrideElements = 0) {
   // The shape elements.
   auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
   // The stride elements.
   auto [strideKeys, strideHeads, strideBatch] =
-    makeStrideKv(options, isK, vTokenStrideElements);
+    makeStrideKv(options, isK, tokenStrideElements);
 
   // The TMA layout is 4D:
   // Shape:  (headDim, numKeys, numHeadsKv, batchSize)
@@ -471,9 +479,9 @@ static auto makeTmaShapeStrideKv(FmhaOptions const& options,
 template <class FmhaOptions>
 static bool canUseTmaKvReshape(FmhaOptions const& options,
                               bool isK,
-                              int32_t vTokenStrideElements = 0) {
+                              int32_t tokenStrideElements = 0) {
   int32_t const strideKeys =
-    std::get<0>(makeStrideKv(options, isK, vTokenStrideElements));
+    std::get<0>(makeStrideKv(options, isK, tokenStrideElements));
   // For K the headDim may include extra RoPE coefficients.
   int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
@@ -665,7 +673,9 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int32_t startTokenIdxSfO,
                                     bool useBlockSparseAttention,
                                     bool usesSharedPagedKvIdx,
-                                    int32_t vTokenStrideElements = 0) {
+                                    int32_t vTokenStrideElements = 0,
+                                    int32_t kTokenStrideElements = 0,
+                                    int32_t qTokenStrideElements = 0) {
 
   // Create the return struct.
   KernelParams params{};
@@ -685,7 +695,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   auto kernelTraits = getKernelTraitsFromOptions(options);
 
   // Shape/stride for gmem tensor Q.
-  auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] = makeTmaShapeStrideQ(options, kernelTraits);
+  auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] = makeTmaShapeStrideQ(options, kernelTraits, qTokenStrideElements);
   // Build tma descriptor for Q.
   params.tmaQ_ =
     buildNdTmaDescriptor(options.mDtypeQ, shapeQ, strideQ, tileShapeQ, const_cast<void*>(qBasePtr));
@@ -698,7 +708,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // when the input strides do not make consecutive token rows contiguous for a widened TMA box.
   int32_t reshapeFactorKv{kernelTraits.mReshapeFactorKv};
   if (reshapeFactorKv > 1 &&
-      (!canUseTmaKvReshape(options, /*isK*/ true) ||
+      (!canUseTmaKvReshape(options, /*isK*/ true, kTokenStrideElements) ||
        !canUseTmaKvReshape(options, /*isK*/ false, vTokenStrideElements))) {
     reshapeFactorKv = 1;
   }
@@ -709,7 +719,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                                 params,
                                                 /*isK*/ true,
                                                 storeTransformedKvInTmem,
-                                                reshapeFactorKv);
+                                                reshapeFactorKv,
+                                                kTokenStrideElements);
 
   // The tileShapes for K/V.
   std::vector<uint32_t> tileShapeK(shapeK.size(), 1);
@@ -1029,6 +1040,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     int32_t,
                                     bool,
                                     bool,
+                                    int32_t = 0,
+                                    int32_t = 0,
                                     int32_t = 0) {
   return KernelParams{};
 }

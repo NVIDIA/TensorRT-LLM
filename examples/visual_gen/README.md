@@ -9,6 +9,7 @@ for feature details.
 |---|---|
 | [`quickstart_example.py`](quickstart_example.py) | Minimal VisualGen API example |
 | [`models/`](models/) | Per-model example scripts |
+| [`minimax_h3_sm107_stack.md`](minimax_h3_sm107_stack.md) | MiniMax-H3 NVFP4 scenario on SM107: environment, selection and settings |
 | [`configs/`](configs/) | Shared `VisualGenArgs` YAMLs (used by `--visual_gen_args` and `trtllm-serve`) |
 | [`serve/`](serve/) | `trtllm-serve` usage, benchmarking, and clients |
 
@@ -28,6 +29,7 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 # FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml.
 # 2-GPU DiT tensor parallelism config: configs/minimax-h3-bf16-tp2.yaml.
 # 2-GPU Ulysses config: configs/minimax-h3-bf16-2gpu.yaml.
+# A pre-quantized ModelOpt NVFP4 or FP8 checkpoint needs no quant_config: pass it as --model with the BF16 config.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
 # FastH3 8-Step V2 VSA on Blackwell:
 python models/fasth3.py --visual_gen_args configs/fasth3-bf16-trtllm-vsa-1gpu.yaml

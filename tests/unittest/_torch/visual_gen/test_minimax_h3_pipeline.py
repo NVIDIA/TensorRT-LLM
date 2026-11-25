@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -258,8 +259,11 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self,
         prompt: str,
         keyframes: list[Image.Image],
+        while_encoding: Optional[Callable[[], None]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del prompt, keyframes
+        if while_encoding is not None:
+            while_encoding()
         return torch.ones(1, 2, 4), torch.full((2,), MINIMAX_H3_TEXT_TAG)
 
     def _encode_keyframes(
@@ -2026,10 +2030,9 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN"])
-def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
+def test_pipeline_rejects_unvalidated_ulysses_attention() -> None:
     config = _ulysses_pipeline_config()
-    config.attention.backend = backend
+    config.attention.backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="VANILLA"):
         MiniMaxH3Pipeline(config)
 

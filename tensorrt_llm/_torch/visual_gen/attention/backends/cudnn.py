@@ -29,23 +29,186 @@ Quant dtype    ``quant_attention_config``                 cuDNN node
 Layout: NHD ``[B, S, H, D]``.  cuDNN takes explicit per-tensor strides, so the
 NHD buffers are described to the graph as ``[B, H, S, D]`` with BSHD strides and
 never transposed into a real HND copy.
+
+Padding: the SDPA nodes have no key-padding input. A trailing-padding
+``key_padding_mask`` (valid tokens form a prefix, as Ulysses and the CUDA-graph
+buckets lay it out) is honoured by running each batch item on its valid prefix and
+zero-filling the padded output rows; callers declare with ``discard_padded_queries``
+that they never read those rows.
 """
 
 import math
 import threading
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 import cudnn
 import torch
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
 from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
+
+# The padded-prefix attention output is written in place (one buffer, padding rows zeroed) rather
+# than pad + cat per layer; same plan and values.
+_PREFIX_INPLACE = True
+
+# Dense FP8 attention through trtllm-gen's FMHA (``trtllm::fmha_dense_fp8``, #20005) instead of
+# the cuDNN graph, selected per backend instance with ``fp8_dense_fmha``:
+#   "cudnn"            the cuDNN FP8 SDPA graph (default)
+#   "trtllm-gen"       the bf16-softmax cubin, scale_bmm1 = [1 / log2 e, dq * dk * sm_scale * log2 e]
+#                      folded on the device from the producer's descales
+#   "trtllm-gen-fp16sm" the Fp16Softmax cubin, which runs with a unit scaleSoftmaxLog2: the producer
+#                      must have folded sm_scale * log2 e into the Q / K codes (checked once)
+# ``fp8_skip_corr_threshold`` t > 0 defers the output rescale while the running row max has grown by at
+# most 2^t (E4M3 BMM2 then uses a P scale of 1.75 instead of 448; the op's argument), and
+# ``fp8_strided_views`` hands the op strided ``[S, H / U, D]`` views of a ``[S, 3, H / U, D]`` Ulysses
+# receive buffer in place of contiguous copies (the op reads them through their token stride).
+# Board 692 spots A.3, A.5 (a) and U.3.
+_A3_VARIANTS: Dict[str, Optional[bool]] = {
+    "cudnn": None,
+    "trtllm-gen": False,
+    "trtllm-gen-fp16sm": True,
+}
+_A3_LOG2E = math.log2(math.e)
+_a3_state: Dict[str, Any] = {}
+
+
+def _a3_load(device: torch.device) -> Dict[str, Any]:
+    """Check the in-tree op once per process; cache the constant tensors per device."""
+    if "checked" not in _a3_state:
+        if not hasattr(torch.ops.trtllm, "fmha_dense_fp8_is_supported"):
+            raise RuntimeError(
+                "fp8_dense_fmha: trtllm::fmha_dense_fp8 is not registered in this build of TensorRT-LLM"
+            )
+        _a3_state["checked"] = True
+    key = str(device)
+    if key not in _a3_state:
+        _a3_state[key] = {
+            # scale_bmm1 = [1 / log2 e, dq * dk * sm_scale * log2 e] = base + weight * (dq * dk)
+            "base": torch.tensor([1.0 / _A3_LOG2E, 0.0], dtype=torch.float32, device=device),
+            "weight": {},
+            "cu": {},
+            "supported": {},
+            "fold_checked": False,
+        }
+    return _a3_state[key]
+
+
+def _a3_tokens_view(x: torch.Tensor, t: int, h: int, d: int, strided: bool) -> torch.Tensor:
+    """``[T, H, D]`` view of ``x`` for the op: the strided view in place when ``strided`` and the
+    layout allows it (unit element stride, head stride ``d``, 16-byte aligned token stride and
+    pointer), else a contiguous copy."""
+    if (
+        strided
+        and not x.is_contiguous()
+        and x.dim() == 4
+        and x.shape[0] == 1
+        and x.stride(-1) == 1
+        and x.stride(-2) == d
+        and (x.stride(1) * x.element_size()) % 16 == 0
+        and x.data_ptr() % 16 == 0
+    ):
+        return x[0]
+    return _a3_contiguous_fp8(x).view(t, h, d)
+
+
+def _a3_contiguous_fp8(x: torch.Tensor) -> torch.Tensor:
+    """Contiguous copy of a float8 view whose last dimension is dense.
+
+    The Ulysses receive buffer hands Q / K / V as strided ``[S, H / U, D]`` views of one
+    ``[S, 3, H / U, D]`` tensor; ``Tensor.contiguous()`` on float8 takes PyTorch's generic
+    elementwise copy. Viewing the
+    same bytes as int32 (D % 4 == 0) takes the vectorized copy at the memory floor; the bytes are
+    unchanged, so the result is bit-identical to ``x.contiguous()``.
+    """
+    if x.is_contiguous():
+        return x
+    if x.dtype == torch.float8_e4m3fn and x.stride(-1) == 1 and x.shape[-1] % 4 == 0:
+        return x.view(torch.int32).contiguous().view(torch.float8_e4m3fn)
+    return x.contiguous()
+
+
+@torch.compiler.disable
+def _a3_fmha_dense_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    fp8_descales: torch.Tensor,
+    sm_scale: float,
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    *,
+    variant: str,
+    skip_corr_threshold: float = 0.0,
+    strided: bool = False,
+) -> torch.Tensor:
+    """Dense non-causal self-attention on pre-quantized e4m3 Q / K / V ``[B, S, H, D]`` (NHD)
+    through ``trtllm::fmha_dense_fp8`` (``variant``: a key of ``_A3_VARIANTS`` other than cudnn)."""
+    fp16_softmax = _A3_VARIANTS[variant]
+    b, s, h, d = q.shape
+    if k.shape != q.shape or v.shape != q.shape:
+        raise ValueError(
+            "fp8_dense_fmha: trtllm-gen dense FP8 FMHA needs q, k and v of one [B, S, H, D] shape."
+        )
+    st = _a3_load(q.device)
+    if (h, d, s) not in st["supported"]:
+        ok = bool(torch.ops.trtllm.fmha_dense_fp8_is_supported(d, h, out_dtype, fp16_softmax))
+        info = ("supported" if ok else "unsupported") + f" (fp16_softmax={fp16_softmax})"
+        logger.info(
+            f"[cudnn backend] fp8_dense_fmha={variant} H={h} D={d} S={s} out={out_dtype}: {info}"
+        )
+        st["supported"][(h, d, s)] = info.startswith("supported")
+        if not st["supported"][(h, d, s)]:
+            raise RuntimeError(f"fp8_dense_fmha={variant}: {info}")
+    cu_seqlens = st["cu"].get((b, s))
+    if cu_seqlens is None:
+        cu_seqlens = st["cu"][(b, s)] = torch.arange(b + 1, dtype=torch.int32, device=q.device) * s
+    t = b * s
+    q8, k8, v8 = (_a3_tokens_view(x, t, h, d, strided) for x in (q, k, v))
+    descales = fp8_descales.to(torch.float32).reshape(3)
+    if fp16_softmax:
+        if not st["fold_checked"]:
+            # One host sync per process: the FP16-softmax kernel runs with a unit base-2 scale,
+            # so the producer's Q / K descales must carry sm_scale * log2 e exactly.
+            prod = float((descales[0] * descales[1]).item()) * sm_scale * _A3_LOG2E
+            if abs(prod - 1.0) > 1e-4:
+                raise RuntimeError(
+                    f"fp8_dense_fmha={variant}: dq * dk * sm_scale * log2e = {prod:.6f} != 1; "
+                    "the producer must fold the softmax scale into the Q / K FP8 scales."
+                )
+            logger.info(
+                f"[cudnn backend] fold check passed: dq * dk * sm_scale * log2e = {prod:.7f}"
+            )
+            st["fold_checked"] = True
+        scale_bmm1 = None
+    else:
+        weight = st["weight"].get(sm_scale)
+        if weight is None:
+            weight = st["weight"][sm_scale] = torch.tensor(
+                [0.0, sm_scale * _A3_LOG2E], dtype=torch.float32, device=q.device
+            )
+        scale_bmm1 = torch.addcmul(st["base"], weight, (descales[0:1] * descales[1:2]).expand(2))
+    o = torch.ops.trtllm.fmha_dense_fp8(
+        q8,
+        k8,
+        v8,
+        cu_seqlens,
+        s,
+        scale_bmm1,
+        descales[2:3].contiguous(),
+        fp16_softmax,
+        out_dtype,
+        skip_corr_threshold,
+    )
+    o = o.view(b, s, h, d)
+    if out is not None:
+        out.copy_(o)
+        return out
+    return o
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -222,6 +385,12 @@ class _CuDNNProblemShape:
 # ============================================================================
 
 
+def _device_sm_version(device: torch.device) -> int:
+    """SM version (e.g. 107) of ``device``, not of CUDA device 0."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor
+
+
 class CuDNNAttention(AttentionBackend):
     """cuDNN SDPA backend for visual generation.
 
@@ -237,6 +406,10 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
     _scales_cache: ClassVar[Dict[Tuple[int, str | None], Any]] = {}
+    # Valid-prefix lengths of the last key_padding_mask seen: (mask, mask._version, lengths).
+    # Every layer of a request receives the same mask object, so the device-to-host
+    # synchronization that reads the lengths happens once per request, not once per layer.
+    _padding_prefix_cache: ClassVar[Optional[Tuple[torch.Tensor, Optional[int], List[int]]]] = None
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -247,8 +420,21 @@ class CuDNNAttention(AttentionBackend):
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
+        fp8_dense_fmha: str = "cudnn",
+        fp8_skip_corr_threshold: float = 0.0,
+        fp8_strided_views: bool = False,
         **kwargs,
     ):
+        """
+        Args:
+            fp8_dense_fmha: Kernel for pre-quantized FP8 dense self-attention: ``"cudnn"`` (the
+                cuDNN graph), ``"trtllm-gen"`` or ``"trtllm-gen-fp16sm"`` (trtllm-gen's FMHA, the
+                latter with the softmax scale folded into the Q / K scales by the producer).
+            fp8_skip_corr_threshold: trtllm-gen only; defer the output rescale while the running
+                row max grows by at most 2^t (0 = never, the exact path).
+            fp8_strided_views: trtllm-gen only; read Q / K / V from strided views of a Ulysses
+                receive buffer in place instead of copying them.
+        """
         self.layer_idx = layer_idx
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -256,6 +442,17 @@ class CuDNNAttention(AttentionBackend):
         self.dtype = dtype or torch.bfloat16
         self.quant_attention_config = quant_attention_config
         self.quant_dtype = self.check_quant_dtype(quant_attention_config)
+        if fp8_dense_fmha not in _A3_VARIANTS:
+            raise ValueError(
+                f"fp8_dense_fmha={fp8_dense_fmha!r}: expected one of {sorted(_A3_VARIANTS)}"
+            )
+        if fp8_dense_fmha != "cudnn" and self.quant_dtype != "fp8":
+            raise ValueError("fp8_dense_fmha needs the per-tensor 'fp8' quant_attention_config")
+        if not 0.0 <= fp8_skip_corr_threshold <= 8.0:
+            raise ValueError("fp8_skip_corr_threshold must be in [0, 8]")
+        self.fp8_dense_fmha = fp8_dense_fmha
+        self.fp8_skip_corr_threshold = float(fp8_skip_corr_threshold)
+        self.fp8_strided_views = bool(fp8_strided_views)
         self.check_library_feature(self.quant_dtype)
         self.scale = 1.0 / math.sqrt(head_dim)
 
@@ -314,8 +511,13 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        if get_sm_version() not in (100, 103, 107) and quant_dtype is not None:
-            raise RuntimeError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
+        if quant_dtype is None:
+            return
+        if _device_sm_version(device) not in (100, 103, 107):
+            raise RuntimeError(
+                "cuDNN quantized attention requires an NVIDIA Blackwell- or Rubin-class GPU "
+                "(SM 100, 103 or 107)."
+            )
 
     @classmethod
     def check_library_feature(cls, quant_dtype: str | None = None) -> None:
@@ -331,6 +533,7 @@ class CuDNNAttention(AttentionBackend):
         with cls._cache_lock:
             cls._graph_cache.clear()
             cls._scales_cache.clear()
+            cls._padding_prefix_cache = None
 
     @staticmethod
     def _build_graph(
@@ -620,7 +823,7 @@ class CuDNNAttention(AttentionBackend):
                 f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
                 f"{type(kv_cache).__name__}"
             )
-        if self._resolve_mask(attention_mask, key_padding_mask):
+        if key_padding_mask is not None or attention_mask == PredefinedAttentionMask.CAUSAL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
             raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
@@ -780,13 +983,54 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        fp8_descales: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run one dense attention problem.
+
+        ``out``: optional ``[B, S_q, H, D_v]`` NHD view to write the output into (the
+        padded-prefix path hands the valid rows of its padded buffer); its inner strides must
+        be those of a packed NHD tensor. With B = 1 the batch stride is never dereferenced,
+        so a row-range view of a longer buffer qualifies.
+        """
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
-        out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        out_dtype = self._out_dtype()
+        # Pre-quantized inputs: the producer already cast Q / K / V to FP8 E4M3 with per-tensor
+        # scales (MiniMax-H3's fused QK-norm + RoPE + cast) and hands the three descales over.
+        pre_quantized = q.dtype == torch.float8_e4m3fn
+        if pre_quantized:
+            if self.quant_dtype != "fp8" or fp8_descales is None or fp8_descales.numel() != 3:
+                raise ValueError(
+                    "FP8 q / k / v need the per-tensor 'fp8' recipe and fp8_descales of 3 values."
+                )
+            if k.dtype != q.dtype or v.dtype != q.dtype:
+                raise ValueError("FP8 q, k and v must all be float8_e4m3fn.")
+            if self.fp8_dense_fmha != "cudnn":
+                if is_causal or with_lse or s_q != s_kv or h_q != h_kv or d_qk != d_v:
+                    raise ValueError(
+                        "fp8_dense_fmha: trtllm-gen dense FP8 FMHA serves non-causal "
+                        "self-attention without LSE."
+                    )
+                return (
+                    _a3_fmha_dense_fp8(
+                        q,
+                        k,
+                        v,
+                        fp8_descales,
+                        self.scale,
+                        out_dtype,
+                        out,
+                        variant=self.fp8_dense_fmha,
+                        skip_corr_threshold=self.fp8_skip_corr_threshold,
+                        strided=self.fp8_strided_views,
+                    ),
+                    None,
+                )
+        else:
+            q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
         # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
@@ -799,7 +1043,15 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and is_fused_qkv(q, k, v):
+            if pre_quantized:
+                # Strided NHD views are fine (the strides are part of the graph key below);
+                # only a non-unit head-dim stride forces a copy.
+                q_q, k_q, v_q = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+                descales = fp8_descales.to(torch.float32)
+                descale_q = descales[0:1].reshape(1, 1, 1, 1)
+                descale_k = descales[1:2].reshape(1, 1, 1, 1)
+                descale_v = descales[2:3].reshape(1, 1, 1, 1)
+            elif d_qk == d_v and is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
                 qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
@@ -861,7 +1113,19 @@ class CuDNNAttention(AttentionBackend):
             device=device,
         )
 
-        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        if out is None:
+            output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        else:
+            if (
+                out.shape != (b, s_q, h_q, d_v)
+                or out.dtype != out_dtype
+                or out.stride()[1:] != (h_q * d_v, d_v, 1)
+                or (b > 1 and out.stride(0) != s_q * h_q * d_v)
+            ):
+                raise ValueError(
+                    "cuDNN attention: `out` must be a packed NHD view of the problem shape."
+                )
+            output = out
         tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
         tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
 
@@ -877,9 +1141,100 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
-        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
+        # Stats is packed [B, H, S, 1]; LSE consumers (Ring/Attention2D) expect [B, H, S].
+        lse = None if stats is None else stats.squeeze(-1)
         return output, lse
+
+    @classmethod
+    def _padding_prefix_lengths(cls, key_padding_mask: torch.Tensor) -> List[int]:
+        """Per-item valid-prefix lengths of a trailing-padding mask, read from the host once.
+
+        The cache is keyed by mask identity and mutation counter; a mask created under
+        ``torch.inference_mode`` has no counter and is re-read on every call.
+        """
+        version = None if torch.is_inference(key_padding_mask) else key_padding_mask._version
+        with cls._cache_lock:
+            cached = cls._padding_prefix_cache
+            if (
+                version is not None
+                and cached is not None
+                and cached[0] is key_padding_mask
+                and cached[1] == version
+            ):
+                return cached[2]
+        mask = key_padding_mask.cpu()
+        lengths = mask.sum(dim=1).tolist()
+        expected = torch.arange(mask.shape[1]).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+        if not torch.equal(mask, expected):
+            raise ValueError("cuDNN padded self-attention requires trailing padding.")
+        with cls._cache_lock:
+            cls._padding_prefix_cache = (key_padding_mask, version, lengths)
+        return lengths
+
+    @torch.compiler.disable
+    def _forward_padded_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        fp8_descales: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attend each batch item over its valid prefix; padded output rows are zero.
+
+        The output keeps the padded ``[B, S, H, D_v]`` shape because Ulysses needs it
+        for the return all-to-all. The quantized recipes run unchanged on the prefix:
+        the per-tensor FP8 amax and the MXFP8 block scales then exclude the padding.
+        """
+        if key_padding_mask.dtype != torch.bool or key_padding_mask.shape != q.shape[:2]:
+            raise ValueError("cuDNN padding mask must be boolean with shape [batch, sequence].")
+        lengths = self._padding_prefix_lengths(key_padding_mask)
+        seq_len = q.shape[1]
+        if _PREFIX_INPLACE:
+            # In-place prefix write: one padded output buffer; cuDNN writes each item's valid
+            # prefix straight into it and only the padding rows are zero-filled, instead of a
+            # full-size zero-fill (F.pad) plus a full copy (torch.cat) per layer. Same cuDNN
+            # plan (the problem shape and strides are unchanged), so the values are identical.
+            output = q.new_empty(
+                (len(lengths), seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype()
+            )
+            for batch_idx, length in enumerate(lengths):
+                if length < seq_len:
+                    output[batch_idx, length:].zero_()
+                if length:
+                    item = slice(batch_idx, batch_idx + 1)
+                    self._run(
+                        q[item, :length],
+                        k[item, :length],
+                        v[item, :length],
+                        is_causal=False,
+                        with_lse=False,
+                        fp8_descales=fp8_descales,
+                        out=output[item, :length],
+                    )
+            return output
+        outputs = []
+        for batch_idx, length in enumerate(lengths):
+            if length == 0:
+                output = q.new_zeros(
+                    (1, seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype()
+                )
+            else:
+                item = slice(batch_idx, batch_idx + 1)
+                output, _ = self._run(
+                    q[item, :length],
+                    k[item, :length],
+                    v[item, :length],
+                    is_causal=False,
+                    with_lse=False,
+                    fp8_descales=fp8_descales,
+                )
+                output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, seq_len - length))
+            outputs.append(output)
+        return torch.cat(outputs, dim=0)
+
+    def _out_dtype(self) -> torch.dtype:
+        return self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
 
     def forward(
         self,
@@ -890,6 +1245,7 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        discard_padded_queries: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -899,7 +1255,10 @@ class CuDNNAttention(AttentionBackend):
             k: Key tensor ``[B, S_kv, H_kv, D]``.
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
-            key_padding_mask: Not supported by this backend.
+            key_padding_mask: Boolean ``[B, S]`` valid-prefix mask for dense
+                self-attention (True = valid). Padding must be trailing.
+            discard_padded_queries: Caller guarantees masked query rows are unused.
+                Required with ``key_padding_mask``; padded output rows are zero-filled.
             kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: they are written at
                 ``staging_offset`` and attention runs over everything cached before them
@@ -913,8 +1272,25 @@ class CuDNNAttention(AttentionBackend):
         """
         if kv is not None:
             return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
+        if key_padding_mask is not None:
+            if (
+                not discard_padded_queries
+                or attention_mask != PredefinedAttentionMask.FULL
+                or k.shape[1] != q.shape[1]
+            ):
+                raise ValueError(
+                    "cuDNN padding requires dense self-attention with discarded padded queries."
+                )
+            return self._forward_padded_self_attention(
+                q, k, v, key_padding_mask, fp8_descales=kwargs.get("fp8_descales")
+            )
         output, _ = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
+            q,
+            k,
+            v,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            with_lse=False,
+            fp8_descales=kwargs.get("fp8_descales"),
         )
         return output
 
@@ -931,25 +1307,25 @@ class CuDNNAttention(AttentionBackend):
 
         Returns:
             output: ``[B, S_q, H, D_v]``
-            lse: ``[B, S_q, H]`` float32
+            lse: ``[B, H, S_q]`` float32
         """
         if kwargs.get("kv") is not None:
             raise NotImplementedError("forward_with_lse does not support a K/V cache.")
+        if key_padding_mask is not None:
+            raise NotImplementedError(
+                "cuDNN forward_with_lse does not support key_padding_mask; the padded rows "
+                "have no log-sum-exp for the Ring / Attention2D merge."
+            )
         output, lse = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
+            q,
+            k,
+            v,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            with_lse=True,
+            fp8_descales=kwargs.get("fp8_descales"),
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."
         return output, lse
-
-    @staticmethod
-    def _resolve_mask(
-        attention_mask: PredefinedAttentionMask, key_padding_mask: Optional[torch.Tensor]
-    ) -> bool:
-        if key_padding_mask is not None:
-            raise NotImplementedError(
-                "cuDNN backend does not support key_padding_mask; use the VANILLA backend."
-            )
-        return attention_mask == PredefinedAttentionMask.CAUSAL
 
     @classmethod
     def support_lse(cls) -> bool:

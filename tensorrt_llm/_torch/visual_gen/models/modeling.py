@@ -36,9 +36,17 @@ class BaseDiffusionModel(nn.Module):
     # Set to True by models that apply ``TokenReorder`` around their block stack, so
     # ``sparse_attention_config.token_order`` takes effect.
     _supports_token_order = False
+    # Set to True by models that give each Linear the precision a per-layer quantization table
+    # (``model_config.quant_config_dict``, a MIXED_PRECISION checkpoint) assigns it.
+    _supports_per_layer_quant = False
 
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
+        if model_config.quant_config_dict and not self._supports_per_layer_quant:
+            raise ValueError(
+                "a per-layer quantization table (MIXED_PRECISION checkpoint) is not implemented "
+                f"for {type(self).__name__}; it would build every Linear with one algorithm."
+            )
         if model_config.parallel.token_sharded_tp and not self._supports_token_sharded_tp:
             raise ValueError(
                 "parallel_config.tp_layout='token_sharded' is not implemented for "

@@ -21,6 +21,7 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -43,9 +44,17 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .attention_precision import (
+    SUPPORTED_ULYSSES_SIZES,
+    SUPPORTED_ULYSSES_SIZES_TEXT,
+    attention_module_names,
+    resolve_attention_precision,
+    validate_attention_precision,
+)
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 from .vsa import get_h3_vsa_context, h3_vsa_attention
 
@@ -110,6 +119,17 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
     return dense_config
 
 
+def _unquantized_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
+    """Return a shallow config copy whose attention runs on unquantized operands: no
+    ``quant_attention_config`` and no sparse attention; the backend stays the pipeline's."""
+
+    unquantized = model_config.model_copy(deep=False)
+    unquantized.attention = model_config.attention.model_copy(
+        update={"quant_attention_config": None, "sparse_attention_config": None}
+    )
+    return unquantized
+
+
 class MiniMaxH3RotaryPosEmbed(nn.Module):
     """Three-axis RoPE over packed ``(time, height, width)`` coordinates."""
 
@@ -133,6 +153,23 @@ class MiniMaxH3RotaryPosEmbed(nn.Module):
         return freqs.cos(), freqs.sin()
 
 
+# Compute capabilities on which FA4's 2-CTA forward kernel is the faster BF16 attention for
+# H3's shapes (56 heads x 128, 19k to 104k packed tokens): SM 103 and SM 107.
+# On SM 100 the process default stays, where the same kernel regresses long sequences.
+FA4_2CTA_CAPABILITIES = frozenset({(10, 3), (10, 7)})
+
+
+def fa4_use_2cta_default(attn_backend: str) -> Optional[bool]:
+    """Return the H3 default for FA4's 2-CTA kernel on the current device.
+
+    ``True`` requests the kernel on the parts in ``FA4_2CTA_CAPABILITIES``; ``None`` keeps FA4's
+    process default everywhere else, for other backends and without a CUDA device.
+    """
+    if attn_backend.upper() != "FA4" or not torch.cuda.is_available():
+        return None
+    return True if torch.cuda.get_device_capability() in FA4_2CTA_CAPABILITIES else None
+
+
 class MiniMaxH3Attention(Attention):
     """Full non-causal attention with per-head RMSNorm and partial 3D RoPE."""
 
@@ -146,12 +183,17 @@ class MiniMaxH3Attention(Attention):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         module_name: str,
+        fa4_use_2cta: Optional[bool] = None,
+        backend_kwargs: Optional[dict] = None,
     ) -> None:
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
         # each one is pushed to the peers while the next is computed (forward_async).
         use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
+        backend_kwargs = dict(backend_kwargs or {})
+        if fa4_use_2cta is not None and model_config.attention.backend.upper() == "FA4":
+            backend_kwargs["use_2cta"] = fa4_use_2cta
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -171,6 +213,7 @@ class MiniMaxH3Attention(Attention):
             module_name=module_name,
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
+            backend_kwargs=backend_kwargs or None,
         )
         self.use_async_ulysses = use_async_ulysses
         sparse = model_config.attention.sparse_attention_config
@@ -472,6 +515,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         fuse_bf16_gate_up_swiglu: bool = False,
+        unquantized_attention: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -482,7 +526,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=_dense_attention_model_config(model_config),
+            model_config=(
+                _unquantized_attention_model_config(model_config)
+                if unquantized_attention
+                else _dense_attention_model_config(model_config)
+            ),
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
@@ -533,6 +581,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         final_norm_eps: float,
         model_config: DiffusionModelConfig,
         fuse_bf16_gate_up_swiglu: bool = False,
+        unquantized_attention: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
@@ -541,6 +590,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
             "FA4",
             "TRTLLM",
             "FLASHINFER",
+            "CUDNN",
         )
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
@@ -558,6 +608,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     model_config=model_config,
                     layer_idx=layer_idx,
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+                    unquantized_attention=(
+                        f"token_refiner.refiner_blocks.{layer_idx}.attn" in unquantized_attention
+                    ),
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -577,7 +630,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded token-refiner sequences require key_padding_mask support; "
-                    "use VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "use VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
                 )
             if self._attn_backend != "TRTLLM":
                 # Attention caches use the mask version to detect changes.
@@ -610,6 +663,9 @@ def _pad_rotary_emb(
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
+    # The attention module class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
+    attention_cls = MiniMaxH3Attention
+
     def __init__(
         self,
         *,
@@ -623,19 +679,28 @@ class MiniMaxH3TransformerBlock(nn.Module):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         fuse_bf16_gate_up_swiglu: bool = False,
+        fa4_use_2cta: Optional[bool] = None,
+        backend_kwargs: Optional[dict] = None,
+        unquantized_attention: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
         )
-        self.attn = MiniMaxH3Attention(
+        self.attn = self.attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=model_config,
+            model_config=(
+                _unquantized_attention_model_config(model_config)
+                if unquantized_attention
+                else model_config
+            ),
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
+            fa4_use_2cta=fa4_use_2cta,
+            backend_kwargs=backend_kwargs,
         )
         self.norm2 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
@@ -713,7 +778,6 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
     ) -> torch.Tensor:
-        hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
@@ -732,6 +796,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
             4,
             3,
         )
+        return self._forward_mlp_residual(hidden_states, norm_hidden_states, mod, adaln_indices)
+
+    def _forward_mlp_residual(
+        self, hidden_states, norm_hidden_states, mod, adaln_indices
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
         ff_output = self.ff(
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
@@ -747,6 +817,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             architecture, dtype, distributed mapping, and loading settings.
     """
 
+    # The transformer-block class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
+    block_cls = MiniMaxH3TransformerBlock
+    replicate_token_refiner = False
+    _supports_per_layer_quant = True
+
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
@@ -756,33 +831,39 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "FA4",
             "TRTLLM",
             "FLASHINFER",
+            "CUDNN",
         )
         quant_algo = model_config.quant_config.quant_algo
-        # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
-        if quant_algo is not None and not (
+        dynamic_weights = model_config.dynamic_weight_quant
+        # Supported recipes: load-time (dynamic) FP8 / FP8_BLOCK_SCALES / NVFP4
+        # quantization of a BF16 checkpoint, or a pre-quantized ModelOpt NVFP4 or
+        # per-tensor FP8 checkpoint whose quantized weights, scales and calibrated
+        # activation scales are loaded as exported.
+        dynamic_supported = (
             quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
-            and model_config.dynamic_weight_quant
-        ):
-            raise NotImplementedError(
-                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / FP8_BLOCK_SCALES / NVFP4 weights only."
-            )
-        # The released checkpoint keeps proj_in / audio_proj_in / proj_out /
-        # audio_proj_out in FP32 and feeds them FP32 activations.  NVFP4
-        # quantizes them like every other Linear (see ``post_load_weights``),
-        # but ``fp4_quantize`` only accepts fp16/bf16/e4m3, so those FP32
-        # activations would be rejected at the kernel boundary.  Hand those
-        # projections the model dtype instead; FP8 has no such restriction and
-        # keeps its validated FP32 activations.
-        self._projection_act_dtype = (
-            model_config.torch_dtype if quant_algo == QuantAlgo.NVFP4 else torch.float32
+            and dynamic_weights
         )
+        static_supported = quant_algo in (QuantAlgo.NVFP4, QuantAlgo.FP8) and not dynamic_weights
+        if quant_algo is not None and not (dynamic_supported or static_supported):
+            raise NotImplementedError(
+                "MiniMax-H3 supports BF16, dynamically quantized FP8 / FP8_BLOCK_SCALES / "
+                "NVFP4 weights, or a pre-quantized NVFP4 / FP8 checkpoint only."
+            )
         # The dynamic loader does not initialize NVFP4's static activation scale.
-        if quant_algo == QuantAlgo.NVFP4 and not model_config.force_dynamic_quantization:
+        if (
+            quant_algo == QuantAlgo.NVFP4
+            and dynamic_weights
+            and not model_config.force_dynamic_quantization
+        ):
             raise NotImplementedError(
                 f"MiniMax-H3 {quant_algo.name} requires force_dynamic_quantization=True; "
                 "the dynamic loader does not calibrate Linear.input_scale, so the "
                 "static activation-scale path would read an uninitialized scale."
             )
+        self._model_dtype = model_config.torch_dtype
+        # The transformer blocks' attention runs at the packed clip length; the token refiner
+        # keeps FA4's process default.
+        self.fa4_use_2cta = fa4_use_2cta_default(self._attn_backend)
 
         # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
         # because the fused GEMM is slightly slower than cuBLAS at small M. H3's
@@ -889,6 +970,35 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         )
         self.rope = MiniMaxH3RotaryPosEmbed(rope_freq_dim, rope_theta)
 
+        # Attention modules the checkpoint (or the run-time option) keeps on BF16 operands.
+        self.attention_precision = resolve_attention_precision(cfg, model_config.extra_attrs) or {}
+        vgm = model_config.visual_gen_mapping
+        validate_attention_precision(
+            self.attention_precision,
+            num_layers=num_layers,
+            num_refiner_layers=num_refiner_layers,
+            model_dtype=model_config.torch_dtype,
+            ulysses_size=int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1,
+            async_ulysses=bool(model_config.parallel.async_ulysses),
+        )
+        unquantized_attention = frozenset(self.attention_precision)
+        if unquantized_attention:
+            logger.info(
+                "MiniMax-H3 attention_precision: BF16 operands in "
+                f"{len(unquantized_attention)} of {num_layers + num_refiner_layers} attention "
+                "modules: "
+                + ", ".join(
+                    name
+                    for name in attention_module_names(num_layers, num_refiner_layers)
+                    if name in unquantized_attention
+                )
+            )
+
+        refiner_config = model_config
+        if self.replicate_token_refiner:
+            # Every rank already has the conditioning input and the Refiner weights.
+            # Keep the unsharded sequence length so its GEMMs use the single-rank geometry.
+            refiner_config = model_config.model_copy(update={"visual_gen_mapping": None})
         self.token_refiner = MiniMaxH3TokenRefiner(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -898,12 +1008,14 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             norm_eps=norm_eps,
             qk_norm_eps=qk_norm_eps,
             final_norm_eps=final_norm_eps,
-            model_config=model_config,
+            model_config=refiner_config,
             fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+            unquantized_attention=unquantized_attention,
         )
+        backend_kwargs = self._attention_backend_kwargs()
         self.transformer_blocks = nn.ModuleList(
             [
-                MiniMaxH3TransformerBlock(
+                self.block_cls(
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -914,6 +1026,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     model_config=model_config,
                     layer_idx=layer_idx,
                     fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
+                    fa4_use_2cta=self.fa4_use_2cta,
+                    backend_kwargs=backend_kwargs,
+                    unquantized_attention=(
+                        f"transformer_blocks.{layer_idx}.attn" in unquantized_attention
+                    ),
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -929,38 +1046,142 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             hidden_size, audio_in_channels, bias=True, **fp32_linear_kwargs
         )
 
-        self.apply_quant_config_exclude_modules()
+        self.apply_layer_quant_configs()
 
-    def apply_quant_config_exclude_modules(self) -> None:
-        """Drop quantization from Linears the quant config excludes.
+    def _attention_backend_kwargs(self) -> Optional[dict]:
+        """Extra constructor arguments for the transformer blocks' attention backend.
 
-        Every Linear is constructed with the model-wide ``quant_config``, so
-        without this an excluded module still builds quantized buffers while
-        ``DynamicLinearWeightLoader`` hands it a high-precision weight -- an FP8
-        buffer left at its default scale of 1.0, or an NVFP4 shape mismatch.
+        None here; a scenario returns the options its attention recipe needs (for example the
+        cuDNN backend's ``fp8_dense_fmha``).
+        """
+        return None
 
-        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights``
-        caches ``quant_method`` and allocates the quantized parameters, and it
-        early-returns once ``_weights_created`` is set. With the default
-        ``skip_create_weights_in_init=False`` that has already happened by the time
-        this runs, so an excluded module would keep its quantized buffers and
-        method. Rebuild those modules so the layout matches the no-quant config.
+    # TRT-LLM Linears that fuse several checkpoint Linears, and the checkpoint names the
+    # fused module stands for (relative to the parent module). ``load_weights`` reads the
+    # same tensors through ``params_map`` and ``_remap_feed_forward_weights``.
+    _FUSED_CHECKPOINT_LINEARS = {
+        "qkv_proj": ("to_q", "to_k", "to_v"),
+        "gate_up_proj": ("net.0.proj",),
+        "down_proj": ("net.2",),
+    }
+
+    @classmethod
+    def _checkpoint_linear_names(cls, name: str) -> tuple[str, ...]:
+        """Checkpoint module names behind TRT-LLM Linear ``name`` (one, or several when fused)."""
+        parent, _, leaf = name.rpartition(".")
+        members = cls._FUSED_CHECKPOINT_LINEARS.get(leaf)
+        if members is None:
+            return (name,)
+        return tuple(f"{parent}.{member}" if parent else member for member in members)
+
+    def _layer_quant_config(self, name: str) -> QuantConfig:
+        """The checkpoint's QuantConfig for Linear ``name`` under a MIXED_PRECISION export.
+
+        A fused Linear (QKV, gate/up) must find one precision behind all of its checkpoint
+        names: it holds one weight buffer and one set of scales. A Linear that no group
+        covers is an error, never a silent fallback to the global algorithm.
+        """
+        configs = {
+            ckpt: self.model_config.get_layer_quant_config(ckpt)
+            for ckpt in self._checkpoint_linear_names(name)
+        }
+        missing = [ckpt for ckpt, config in configs.items() if config is None]
+        if missing:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint assigns no precision to Linear '{name}' "
+                f"(checkpoint names {missing}) and does not list it under 'ignore'"
+            )
+        precisions = {(config.quant_algo, config.group_size) for config in configs.values()}
+        if len(precisions) != 1:
+            raise ValueError(
+                f"MIXED_PRECISION checkpoint gives the fused Linear '{name}' several precisions: "
+                + ", ".join(f"{ckpt}={config.quant_algo.name}" for ckpt, config in configs.items())
+            )
+        return next(iter(configs.values()))
+
+    def apply_layer_quant_configs(self) -> Counter:
+        """Give every Linear the quant config the checkpoint assigns it, before weights load.
+
+        Every Linear is constructed with the model-wide ``quant_config``. Two kinds of module
+        need another one: the modules ``exclude_modules`` lists keep high precision, and under
+        a MIXED_PRECISION export each quantized Linear takes its group's recipe (NVFP4 or
+        per-tensor FP8). Without this an excluded module would build quantized buffers while
+        ``DynamicLinearWeightLoader`` hands it a high-precision weight (an FP8 buffer left at its
+        default scale of 1.0, or an NVFP4 shape mismatch), and an FP8 Linear would receive an
+        NVFP4 layout.
+
+        ModelOpt writes both lists in the checkpoint's names (``attn.to_q``, ``ff.net.0.proj``),
+        so a fused TRT-LLM Linear is excluded when all of its checkpoint members are; a partial
+        exclusion of one fused Linear is an error.
+
+        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights`` caches
+        ``quant_method`` and allocates the quantized parameters, and it early-returns once
+        ``_weights_created`` is set. With the default ``skip_create_weights_in_init=False`` that
+        has already happened by the time this runs, so the module is rebuilt with the new config.
+
+        Returns the census of Linears per precision (``NVFP4`` / ``FP8`` / ``BF16``), logged once
+        for mixed-precision checkpoints.
         """
         quant_config = self.model_config.quant_config
-        if quant_config is None or quant_config.exclude_modules is None:
-            return
+        census: Counter = Counter()
+        layered = self.model_config.quant_config_dict is not None
+        if quant_config is None or (quant_config.exclude_modules is None and not layered):
+            return census
+        if layered:
+            vgm = self.model_config.visual_gen_mapping
+            ulysses_size = int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1
+            if ulysses_size not in SUPPORTED_ULYSSES_SIZES:
+                raise NotImplementedError(
+                    "MiniMax-H3 MIXED_PRECISION is supported at Ulysses "
+                    f"{SUPPORTED_ULYSSES_SIZES_TEXT}, found Ulysses {ulysses_size}"
+                )
+            if ulysses_size > 1 and self.model_config.parallel.async_ulysses:
+                raise NotImplementedError(
+                    "MiniMax-H3 MIXED_PRECISION is not supported with async_ulysses"
+                )
 
         no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for name, module in self.named_modules():
-            if isinstance(module, Linear):
-                if quant_config.is_module_excluded_from_quantization(name):
-                    if getattr(module, "quant_config", None) is not None:
-                        module.quant_config = no_quant_config
-                        if getattr(module, "_weights_created", False):
-                            module._weights_created = False
-                            module._parameters.clear()
-                            module._buffers.clear()
-                            module.create_weights()
+            if not isinstance(module, Linear) or getattr(module, "quant_config", None) is None:
+                continue
+            members = self._checkpoint_linear_names(name)
+            excluded = [quant_config.is_module_excluded_from_quantization(m) for m in members]
+            if quant_config.is_module_excluded_from_quantization(name) or all(excluded):
+                target = no_quant_config
+            elif any(excluded):
+                raise ValueError(
+                    f"quant_config.exclude_modules covers only part of the fused Linear '{name}': "
+                    + ", ".join(
+                        f"{m} {'excluded' if e else 'quantized'}" for m, e in zip(members, excluded)
+                    )
+                )
+            elif layered:
+                target = self._layer_quant_config(name)
+                if target.quant_algo not in (QuantAlgo.NVFP4, QuantAlgo.FP8):
+                    raise NotImplementedError(
+                        f"MiniMax-H3 MIXED_PRECISION supports NVFP4 and per-tensor FP8 Linears; "
+                        f"'{name}' asks for {target.quant_algo.name}"
+                    )
+            else:
+                census[quant_config.quant_algo.name if quant_config.quant_algo else "BF16"] += 1
+                continue
+            census[target.quant_algo.name if target.quant_algo else "BF16"] += 1
+            current = module.quant_config
+            if (current.quant_algo, current.group_size) == (target.quant_algo, target.group_size):
+                continue
+            module.quant_config = target
+            if getattr(module, "_weights_created", False):
+                module._weights_created = False
+                module._parameters.clear()
+                module._buffers.clear()
+                module.create_weights()
+        if layered:
+            logger.info(
+                "MiniMax-H3 MIXED_PRECISION checkpoint: "
+                + ", ".join(f"{count} {algo}" for algo, count in sorted(census.items()))
+                + f" Linears ({sum(census.values())} total)"
+            )
+        return census
 
     @property
     def device(self) -> torch.device:
@@ -1052,8 +1273,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         if static_context.text_embeds.shape[1] != text_indices.numel():
             raise ValueError("text_indices must contain one entry for every cached text embedding.")
 
-        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self._projection_act_dtype))
+        video_embeds = self.proj_in(self._projection_input(self.proj_in, hidden_states))
+        audio_embeds = self.audio_proj_in(
+            self._projection_input(self.audio_proj_in, audio_hidden_states)
+        )
         text_embeds = static_context.text_embeds
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
@@ -1093,11 +1316,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    "VANILLA, FA4, TRTLLM or FLASHINFER."
+                    "VANILLA, FA4, TRTLLM, FLASHINFER or CUDNN."
                 )
-            # FA4 seqused_k and TRTLLM prefix trimming require trailing padding.
-            # Ulysses appends padding in this layout.
-            if self._attn_backend in ("FA4", "TRTLLM") and bool(
+            # FA4 seqused_k, TRTLLM prefix trimming and the cuDNN prefix run require trailing
+            # padding. Ulysses appends padding in this layout.
+            if self._attn_backend in ("FA4", "TRTLLM", "CUDNN") and bool(
                 ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
@@ -1143,12 +1366,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             dim=1,
             unpad_to=sequence_length,
         )
-        video_output = self.proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
-        ).index_select(1, video_indices)
-        audio_output = self.audio_proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
-        ).index_select(1, audio_indices)
+        video_input, audio_input = self._head_inputs(packed_hidden_states)
+        video_output = self.proj_out(video_input).index_select(1, video_indices)
+        audio_output = self.audio_proj_out(audio_input).index_select(1, audio_indices)
 
         if not return_dict:
             return video_output, audio_output
@@ -1157,15 +1377,31 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             audio_sample=audio_output,
         )
 
-    @staticmethod
-    def _remap_feed_forward_weights(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    # ``ff.net.0.proj`` tensors whose leading dimension is the fused output
+    # width and therefore split into the ``up`` and ``gate`` halves. Every
+    # other tensor of that module (per-tensor scalars such as ``input_scale``,
+    # ``weight_scale_2`` and FP8's ``weight_scale``, input-side
+    # ``pre_quant_scale``) describes the whole module and is given to both.
+    _FEED_FORWARD_ROW_SPLIT_SUFFIXES = frozenset({"weight", "bias", "weight_scale"})
+
+    @classmethod
+    def _remap_feed_forward_weights(
+        cls, weights: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         remapped = {}
         for key, value in weights.items():
             if ".ff.net.0.proj." in key:
                 prefix, suffix = key.split("net.0.proj.", maxsplit=1)
-                # Diffusers' SwiGLU stores ``[up, gate]`` while TRT-LLM's
-                # fused GatedMLP consumes ``[gate, up]``.
-                up, gate = value.chunk(2, dim=0)
+                if (
+                    suffix in cls._FEED_FORWARD_ROW_SPLIT_SUFFIXES
+                    and value.dim() > 0
+                    and value.shape[0] > 1
+                ):
+                    # Diffusers' SwiGLU stores ``[up, gate]`` while TRT-LLM's
+                    # fused GatedMLP consumes ``[gate, up]``.
+                    up, gate = value.chunk(2, dim=0)
+                else:
+                    up = gate = value
                 remapped[f"{prefix}gate.{suffix}"] = gate
                 remapped[f"{prefix}up.{suffix}"] = up
             else:
@@ -1230,6 +1466,27 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 f"MiniMax-H3 checkpoint is missing {len(missing)} required tensors: "
                 f"{preview}{suffix}"
             )
+
+    def _head_inputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The inputs of the video and the audio output projection."""
+        return (
+            self._projection_input(self.proj_out, hidden_states),
+            self._projection_input(self.audio_proj_out, hidden_states),
+        )
+
+    def _projection_input(self, projection: Linear, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Cast a media-projection input to the dtype that projection runs in.
+
+        The released checkpoint keeps proj_in / audio_proj_in / proj_out /
+        audio_proj_out in FP32 and feeds them FP32 activations
+        (``post_load_weights``). A quantized projection cannot take FP32:
+        ``fp4_quantize`` accepts fp16/bf16/e4m3 only, so it gets the model
+        dtype instead. Whether a projection is quantized depends on the recipe
+        and on the checkpoint's exclusion list, so decide per module.
+        """
+        if projection.has_any_quant and self._model_dtype is not None:
+            return hidden_states.to(self._model_dtype)
+        return hidden_states.to(torch.float32)
 
     def post_load_weights(self) -> None:
         for module in self.modules():
