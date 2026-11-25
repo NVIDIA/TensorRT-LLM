@@ -43,6 +43,9 @@ class _FakeTokenizer:
 def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
     """Video placeholder expands to one token per encoder embedding."""
     processor = object.__new__(Qwen3VLInputProcessorBase)
+    processor._processor = SimpleNamespace(
+        mm_special_token_ids=torch.tensor([_VISION_START_TOKEN_ID])
+    )
     processor._config = SimpleNamespace(
         image_token_id=_IMAGE_TOKEN_ID,
         video_token_id=_VIDEO_TOKEN_ID,
@@ -200,6 +203,7 @@ def test_external_embeddings_reuse_common_item_metadata(model):
 
     cls = Qwen3VLInputProcessorBase if model == "qwen3" else Qwen2_5VLInputProcessorBase
     processor = object.__new__(cls)
+    processor._processor = SimpleNamespace()
     processor._config = SimpleNamespace(
         image_token_id=_IMAGE_TOKEN_ID,
         video_token_id=_VIDEO_TOKEN_ID,
@@ -451,7 +455,8 @@ def test_legacy_image_handoff_still_works(video_handoff):
         _VISION_END_TOKEN_ID,
         12,
     ]
-    assert mm.multimodal_input.multimodal_lengths == [3]
+    includes_start = processor.get_mm_special_token_ids() is not None
+    assert mm.multimodal_input.multimodal_lengths == [2 + int(includes_start)]
     handoff.mrope_position_deltas_handle = None
     with pytest.raises(ValueError, match="position IDs require position deltas"):
         llm._preprocess({"prompt": "video prompt"}, SamplingParams(max_tokens=1), handoff)

@@ -380,7 +380,7 @@ def _validate_prepared_embedding_layout(processor, ids, params, disagg):
     """Check any spans declared by a Python descriptor-only handoff."""
     sizes = _validate_embedding_handles(processor,
                                         disagg.multimodal_embedding_handles)
-    if params is None:
+    if params is None or params.multimodal_data is None:
         raise ValueError("Prepared handoff requires multimodal parameters")
     metadata = params.item_metadata
     if metadata is not None and metadata.output_embedding_lengths != tuple(
@@ -401,20 +401,37 @@ def _validate_prepared_embedding_layout(processor, ids, params, disagg):
             identity = MultimodalInputLayout(ids, identity.multimodal_lengths,
                                              identity.multimodal_positions,
                                              sizes)
-    if layout is None and identity is None:
-        _, embed, _ = _compute_mm_masks(torch.tensor(ids),
-                                        processor.get_vocab_size(),
-                                        processor.get_mm_token_ids(),
-                                        processor.get_mm_special_token_ids())
-        if metadata is None or int(embed.sum()) != sum(sizes):
-            raise ValueError(
-                "Prepared embedding lengths do not match the prompt")
+    embed = None
+    special_offsets = []
     for record in (layout, identity):
         if record is not None:
             if len(record.multimodal_lengths) != len(sizes):
                 raise ValueError(
                     "Encoder handoff requires one embedding handle per item")
-            _validate_embedding_runs(processor, ids, record, sizes)
+            embed, special_offsets = _validate_embedding_runs(
+                processor, ids, record, sizes)
+    if embed is None:
+        mm, embed, special = _compute_mm_masks(
+            torch.tensor(ids), processor.get_vocab_size(),
+            processor.get_mm_token_ids(), processor.get_mm_special_token_ids())
+        if metadata is None or int(embed.sum()) != sum(sizes):
+            raise ValueError(
+                "Prepared embedding lengths do not match the prompt")
+        special_offsets = torch.where(
+            special[mm])[0].tolist() if special is not None else []
+
+    data = params.multimodal_data
+    cumsum = embed.cumsum(0, dtype=torch.int64)
+    actual = data.get("multimodal_embed_mask_cumsum")
+    if actual is not None and (not isinstance(actual, torch.Tensor)
+                               or not torch.equal(actual, cumsum)):
+        raise ValueError("Prepared embedding mask conflicts with the prompt")
+    if data.get("special_token_offsets") is not None and data[
+            "special_token_offsets"] != special_offsets:
+        raise ValueError("Prepared framing offsets conflict with the prompt")
+    data["multimodal_embed_mask_cumsum"] = cumsum
+    if special_offsets:
+        data["special_token_offsets"] = special_offsets
 
 
 def _encoder_item_digests(inputs, item_refs=None):
@@ -562,6 +579,8 @@ class PreprocessedInputs:
 class BaseLLM:
     """The base class for all LLM classes.
     """
+
+    _paused = False
 
     def __init__(self,
                  model: Union[str, Path],
@@ -1063,6 +1082,10 @@ class BaseLLM:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
         """
         with _release_encoder_handles_on_error(disaggregated_params):
+            if self._paused:
+                raise RuntimeError(
+                    "AsyncLLM is paused. Call resume_generation() before submitting new requests."
+                )
             if self._encode_only:
                 raise RuntimeError(
                     "generate_async() is not available when encode_only=True. "

@@ -229,13 +229,29 @@ class PostprocWorker:
                     await pipe.put_async(None)
                 break
             assert isinstance(batch, list)
-            if len(self._push_pipes) == 1:
-                await self._push_pipes[0].put_async(batch)
-                continue
-            for frontend_id, sub_batch in enumerate(
-                    bucket_responses_by_frontend(batch, len(self._push_pipes))):
-                if sub_batch:
-                    await self._push_pipes[frontend_id].put_async(sub_batch)
+            batches = ([batch] if len(self._push_pipes) == 1
+                       else bucket_responses_by_frontend(
+                           batch, len(self._push_pipes)))
+            for frontend, outgoing in enumerate(batches):
+                if not outgoing:
+                    continue
+                first_unsent = frontend
+                try:
+                    send = self._push_pipes[frontend]._prepare_async_put(
+                        outgoing)
+                    # Cancellation during a send can race with local queue acceptance.
+                    first_unsent = frontend + 1
+                    await send
+                except (Exception, asyncio.CancelledError) as error:
+                    from .._torch.pyexecutor.llm_request import \
+                        release_undelivered_response
+                    if isinstance(error, zmq.ZMQError):
+                        # A rejected PUSH leaves the entire message with the sender.
+                        first_unsent = frontend
+                    for pending in batches[first_unsent:]:
+                        for response in pending:
+                            release_undelivered_response(response)
+                    raise
 
     async def _mainloop(self):
         ''' The loop for handle_response and keep producing outputs. '''

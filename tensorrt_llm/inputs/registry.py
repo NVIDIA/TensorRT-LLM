@@ -371,6 +371,10 @@ class BaseMultimodalInputProcessor(ABC):
             placeholder_ids = set(mm_token_ids.tolist())
             video_id = getattr(self.config, "video_token_id", None)
             frame_id = getattr(self.config, "vision_start_token_id", None)
+            if frame_id is not None:
+                special_ids = self.get_mm_special_token_ids()
+                if special_ids is None or frame_id not in special_ids:
+                    frame_id = None
             expanded = []
             positions, counts = [], []
             types, special_offsets = [], []

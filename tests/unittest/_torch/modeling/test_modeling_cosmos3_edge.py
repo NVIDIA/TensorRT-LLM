@@ -152,6 +152,7 @@ def test_edge_disagg_handoff_without_deepstack():
     vision_start = 20
     vision_end = 21
     processor = object.__new__(Cosmos3EdgeInputProcessor)
+    processor._processor = SimpleNamespace()
     processor._config = SimpleNamespace(
         image_token_id=image_token_id,
         video_token_id=18,
@@ -418,6 +419,7 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         vision_start = self.hf_config.vision_start_token_id
         vision_end = self.hf_config.vision_end_token_id
         processor = object.__new__(Cosmos3EdgeInputProcessor)
+        processor._processor = SimpleNamespace()
         processor._config = self.hf_config
         processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
         prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(

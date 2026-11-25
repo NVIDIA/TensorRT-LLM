@@ -814,6 +814,12 @@ def test_legacy_prepared_embedding_runs_are_checked_at_submission(llm):
         multimodal_embedding_handles=handles,
     )
     assert submit(llm, inputs, disagg) is mm
+    cumsum = mm.multimodal_data["multimodal_embed_mask_cumsum"]
+    assert cumsum.tolist() == [0, 1, 2, 2]
+    cumsum[1] = 0
+    with pytest.raises(ValueError, match="embedding mask"):
+        submit(llm, inputs, disagg)
+    cumsum[1] = 1
     mm.multimodal_input.multimodal_positions[:] = [1, 1]
     mm.multimodal_input.multimodal_run_positions[:] = [1, 1]
     with pytest.raises(ValueError, match="ordered and non-overlapping"):

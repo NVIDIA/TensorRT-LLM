@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import torch
+import zmq
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult, PyResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -27,11 +28,12 @@ from tensorrt_llm.executor.base_worker import (
     _drop_refused_response,
 )
 from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.executor.postproc_worker import PostprocWorker
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
 from tensorrt_llm.executor.result import GenerationResult, ResponseWrapper
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import ErrorResponse, RequestError
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError, namespace_client_id
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -169,6 +171,59 @@ def test_postprocessor_releases_encoder_exports_on_error():
     assert not any(path.exists() for path in files)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["serialization", "refused", "cancelled"])
+async def test_postprocessor_releases_only_unsent_frontend_batches(failure):
+    class FormatterResult:
+        def __reduce__(self):
+            raise RuntimeError("formatter state cannot be serialized")
+
+    outputs = []
+    paths = []
+    for frontend in range(3):
+        response, files = _exporting_response()
+        params = DisaggregatedParams(
+            multimodal_embedding_handles=response.result.mm_embedding_handles
+        )
+        # A formatter can return an object the IPC queue cannot serialize.
+        output = PostprocWorker.Output(
+            namespace_client_id(frontend, CLIENT_ID),
+            FormatterResult() if frontend == 1 and failure == "serialization" else None,
+            is_final=True,
+            disaggregated_params=params,
+        )
+        outputs.append(output)
+        paths.append(files)
+
+    async def batches():
+        yield outputs
+
+    with closing(ZeroMqQueue(is_server=True, is_async=True)) as pipe:
+        failure_type = {
+            "serialization": RuntimeError,
+            "refused": zmq.ZMQError,
+            "cancelled": asyncio.CancelledError,
+        }[failure]
+        delivered = AsyncMock(side_effect=[None, failure_type()])
+        pipe._send_data_async = delivered
+        worker = SimpleNamespace(_mainloop=batches, _push_pipes=[pipe] * len(outputs))
+        try:
+            with pytest.raises(failure_type):
+                await PostprocWorker._batched_put(worker)
+            assert delivered.await_count == (1 if failure == "serialization" else 2)
+            gc.collect()
+            assert all(path.exists() for path in paths[0])
+            assert all(path.exists() == (failure == "cancelled") for path in paths[1])
+            assert not any(path.exists() for path in paths[2])
+        finally:
+            # Consume exports that still belong to this test, including the delivered batch.
+            for output, files in zip(outputs, paths):
+                if any(path.exists() for path in files):
+                    SharedTensorContainer.release_many(
+                        output.disaggregated_params.multimodal_embedding_handles
+                    )
+
+
 def test_proxy_releases_postprocessed_encoder_exports_for_a_missing_client():
     response, files = _exporting_response()
     params = DisaggregatedParams(multimodal_embedding_handles=response.result.mm_embedding_handles)
@@ -211,6 +266,19 @@ def test_failed_frontend_completion_releases_its_exports():
     gc.collect()
     assert not any(path.exists() for path in files)
     assert params.multimodal_embedding_handles is None
+
+
+def test_paused_generation_releases_encoder_exports():
+    from tensorrt_llm._torch.async_llm import AsyncLLM
+
+    response, files = _exporting_response()
+    handoff = DisaggregatedParams(multimodal_embedding_handles=response.result.mm_embedding_handles)
+    llm = object.__new__(AsyncLLM)
+    llm._paused = True
+    with pytest.raises(RuntimeError, match="AsyncLLM is paused"):
+        llm.generate_async([1], disaggregated_params=handoff)
+    gc.collect()
+    assert not any(path.exists() for path in files)
 
 
 @pytest.mark.parametrize(

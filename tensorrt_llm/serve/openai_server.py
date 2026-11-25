@@ -64,7 +64,8 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import LLM, PreprocessedInputs, RequestOutput
-from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.reasoning_parser import (_PROMPT_TAIL_CHARS,
+                                                  ReasoningParserFactory)
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
@@ -2685,6 +2686,20 @@ class OpenAIServer(_VideoRoutesMixin):
             if postproc_args.reasoning_parser and (
                     ReasoningParserFactory.resolves_thinking_from_prompt(
                         postproc_args.reasoning_parser)):
+                if pending_handles and request.add_generation_prompt:
+                    # The encoder rendered the template. Decode its text tail,
+                    # skipping media slots and preserving the reasoning markers.
+                    assert params is not None and params.multimodal_input is not None
+                    record = params.multimodal_input
+                    positions = record.multimodal_run_positions or record.multimodal_positions
+                    lengths = record.multimodal_run_lengths or record.multimodal_lengths
+                    ids = request.prompt_token_ids
+                    assert ids is not None
+                    # A UTF-8 character may take up to four byte tokens.
+                    start = max(positions[-1] + lengths[-1],
+                                len(ids) - 4 * _PROMPT_TAIL_CHARS)
+                    rendered_prompt = self.tokenizer.decode(
+                        ids[start:], skip_special_tokens=False)
                 if rendered_prompt and request.add_generation_prompt:
                     thinking = ReasoningParserFactory.resolve_prefilled_thinking(
                         postproc_args.reasoning_parser, rendered_prompt)

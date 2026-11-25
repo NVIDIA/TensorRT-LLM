@@ -37,7 +37,6 @@ class AsyncLLM(LLM):
 
         super().__init__(*args, **kwargs)
         self._async_initialized = False
-        self._paused = False
 
     async def setup_async(self):
         """Setup the LLM asynchronously."""
@@ -137,13 +136,6 @@ class AsyncLLM(LLM):
         return await self._executor.collective_rpc_async(
             method, args, kwargs, unique_reply_rank=unique_reply_rank, target_ranks=target_ranks
         )
-
-    def generate_async(self, *args, **kwargs):
-        if self._paused:
-            raise RuntimeError(
-                "AsyncLLM is paused. Call resume_generation() before submitting new requests."
-            )
-        return super().generate_async(*args, **kwargs)
 
     async def pause_generation(self) -> None:
         """Abort all in-flight requests and block new ones until resume_generation() is called.

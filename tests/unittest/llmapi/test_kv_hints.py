@@ -451,6 +451,7 @@ def test_llm_async_forwards_hints_to_executor() -> None:
 
     llm = MagicMock()
     llm._encode_only = False
+    llm._paused = False
     llm._executor.is_shutdown.return_value = False
     llm._prepare_sampling_params.return_value = SamplingParams(max_tokens=4)
     llm._preprocess.return_value = ([1, 2], None, None, None)

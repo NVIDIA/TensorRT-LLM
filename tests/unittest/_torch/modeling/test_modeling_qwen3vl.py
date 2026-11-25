@@ -1191,6 +1191,18 @@ def test_encoder_handoff_preserves_adjacent_images_and_fragmented_video(model):
 
 
 @pytest.mark.cpu_only
+def test_legacy_qwen_embedding_spans_follow_processor_mask():
+    processor, width = _make_qwen_vl_embedding_processor("qwen2.5", [11, 12, 13])
+    processor._processor = SimpleNamespace()
+    _, params = processor.build_disagg_prefill_multimodal_inputs(
+        {"prompt": "image"}, [{"tensor_size": [2, width]}], mm_hashes=[[7] * 8]
+    )
+    assert params.multimodal_input.multimodal_run_positions == [1]
+    assert params.multimodal_input.multimodal_run_lengths == [2]
+    assert "special_token_offsets" not in params.multimodal_data
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("positions", [[1, 1], [3, 1]], ids=["overlap", "swapped"])
 def test_legacy_encoder_layout_rejects_misassigned_image_spans(positions):
     from tensorrt_llm.inputs.multimodal import MultimodalInputLayout

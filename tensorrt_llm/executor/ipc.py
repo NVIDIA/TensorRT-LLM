@@ -262,17 +262,17 @@ class ZeroMqQueue:
                 else:
                     logger.error(f"Failed to send object: {obj}")
 
-    async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
+    def _prepare_async_put(self, obj: Any, routing_id: Optional[bytes] = None):
+        """Prepare a queue message without starting the asynchronous send."""
         self.setup_lazily()
         self._check_thread_safety()
+        if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+            obj = self._prepare_data(obj)
+        return self._send_data_async(obj, routing_id=routing_id)
+
+    async def put_async(self, obj: Any, routing_id: Optional[bytes] = None):
         try:
-            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
-                # Need manual serialization for encryption or ROUTER multipart
-                data = self._prepare_data(obj)
-                await self._send_data_async(data, routing_id=routing_id)
-            else:
-                # Standard socket without encryption
-                await self.socket.send_pyobj(obj)
+            await self._prepare_async_put(obj, routing_id=routing_id)
         except TypeError as e:
             logger.error(f"Cannot pickle {obj}")
             raise e
@@ -280,8 +280,6 @@ class ZeroMqQueue:
             logger.error(f"Error sending object: {e}")
             logger.error(traceback.format_exc())
             raise e
-
-        nvtx_mark("ipc.send", color="blue", category="IPC")
 
     async def put_async_noblock(self, obj: Any):
         self.setup_lazily()
@@ -469,7 +467,7 @@ class ZeroMqQueue:
             self.socket.send(data, flags=flags)
 
     async def _send_data_async(self,
-                               data: bytes,
+                               data: Any,
                                routing_id: Optional[bytes] = None):
         """Async version of _send_data."""
         if self.socket_type == zmq.ROUTER:
@@ -477,8 +475,11 @@ class ZeroMqQueue:
             if identity is None:
                 raise ValueError("ROUTER socket requires identity")
             await self.socket.send_multipart([identity, data])
-        else:
+        elif self.use_hmac_encryption:
             await self.socket.send(data)
+        else:
+            await self.socket.send_pyobj(data)
+        nvtx_mark("ipc.send", color="blue", category="IPC")
 
     def _recv_data(self, return_identity: bool = False) -> Any:
         """Receive data using appropriate API based on socket type."""

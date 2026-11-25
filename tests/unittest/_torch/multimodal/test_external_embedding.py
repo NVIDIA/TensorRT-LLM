@@ -46,7 +46,8 @@ def _make_tokenizer(input_ids):
 def _make_qwen3_vl_processor(config, tokenizer):
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor"
                ) as mock_auto_processor:
-        mock_auto_processor.from_pretrained.return_value = Mock()
+        mock_auto_processor.from_pretrained.return_value = Mock(
+            mm_special_token_ids=None)
         return Qwen3VLInputProcessorBase(
             model_path="dummy_path",
             config=config,

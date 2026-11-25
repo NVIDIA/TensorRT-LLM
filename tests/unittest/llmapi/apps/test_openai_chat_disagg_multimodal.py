@@ -28,7 +28,7 @@ import gc
 import io
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -168,6 +168,7 @@ def route_client(tmp_path):
     server._internal_disagg_auth_key = "test-secret"
     server.await_disconnected = AsyncMock()
     server._create_chat_response = AsyncMock(return_value=_stub_response())
+    captured["server"] = server
 
     app = FastAPI()
     app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
@@ -221,6 +222,10 @@ def test_generation_only_never_loads_relayed_media(route_client):
 )
 def test_signed_encoder_handoff_skips_media(route_client, monkeypatch, phase, use_base64):
     client, captured = route_client
+    server = captured["server"]
+    server.generator.args.reasoning_parser = "nemotron-v3"
+    # The encoder rendered a template whose closing marker turns thinking off.
+    server.tokenizer.decode = Mock(return_value="<think></think>")
     if phase == "context_only":
         monkeypatch.setattr(OpenAIServer, "_has_cache_transceiver_config", lambda self: True)
     handle = SharedTensorContainer.from_tensor(torch.arange(8.0).reshape(2, 4)).dump_to_dict()
@@ -262,6 +267,9 @@ def test_signed_encoder_handoff_skips_media(route_client, monkeypatch, phase, us
     delivered = client.post("/v1/chat/completions", json=body, headers=headers)
     assert delivered.status_code == 200, delivered.text
     assert captured["inputs"] == {"prompt_token_ids": ids}
+    server.tokenizer.decode.assert_called_once_with(ids[3:], skip_special_tokens=False)
+    postproc = server._create_chat_response.await_args.args[1]
+    assert postproc.postproc_args.chat_template_kwargs["enable_thinking"] is False
     (embedding,) = captured["embeddings"]
     assert torch.equal(embedding, torch.arange(8.0).reshape(2, 4))
     gc.collect()

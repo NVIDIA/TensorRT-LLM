@@ -12,6 +12,7 @@ must drop those late responses via ``self._results.get(client_id)`` rather than
 
 from types import SimpleNamespace
 
+from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
 
@@ -46,12 +47,18 @@ def _make_proxy():
     return proxy
 
 
+def _final_response(client_id):
+    result = tllm.Result()
+    result.is_final = True
+    return tllm.Response(request_id=client_id, client_id=client_id, result=result)
+
+
 def test_late_response_after_terminate_is_dropped_without_keyerror():
     """A response for an already-popped client_id must be dropped, not crash."""
     proxy = _make_proxy()
     proxy._results = {}  # terminate already finalized + popped this client_id
 
-    late = SimpleNamespace(client_id=999, has_error=False, result=SimpleNamespace(is_final=True))
+    late = _final_response(999)
     proxy.result_queue = _FakeResultQueue([late])
 
     # Must not raise KeyError; the dispatch loop stays alive (returns True).
@@ -68,7 +75,7 @@ def test_final_response_is_delivered_and_popped():
     queue = _RecordingQueue()
     proxy._results = {7: SimpleNamespace(queue=queue)}
 
-    resp = SimpleNamespace(client_id=7, has_error=False, result=SimpleNamespace(is_final=True))
+    resp = _final_response(7)
     proxy.result_queue = _FakeResultQueue([resp])
 
     assert proxy.dispatch_result_task() is True
