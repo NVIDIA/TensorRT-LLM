@@ -7,6 +7,7 @@ This test uses torch.multiprocessing to spawn multiple processes simulating
 ctx and gen instances with different TP/PP configurations.
 """
 
+import gc
 import os
 import signal
 import sys
@@ -233,6 +234,14 @@ class TorchDistributedWrapper:
         return ret[0]
 
 
+# How the two instances order a transfer (see the _run_*_transfer functions):
+#   ctx_first       ctx sends, then gen receives asynchronously
+#   ctx_first_sync  ctx sends, then gen receives with request_and_receive_sync
+#   gen_first1      ctx prepares (prepare_context_requests), then gen receives and ctx sends
+#   gen_first2      gen posts its receives first, then ctx prepares and sends
+WORKFLOWS = ("ctx_first", "ctx_first_sync", "gen_first1", "gen_first2")
+
+
 def worker_fn(
     rank: int,
     world_size: int,
@@ -245,17 +254,13 @@ def worker_fn(
     ctx_enable_dp: bool = False,
     gen_enable_dp: bool = False,
     is_mla: bool = False,
-    ctx_gen_workflow: str = "ctx_first",
-):
-    """Worker function for each process.
+    workflows: tuple[str, ...] = WORKFLOWS,
+) -> None:
+    """Join the Gloo world, then run each workflow in ``workflows`` in turn.
 
-    When gen_first=False (default, context-first): the context instance sends
-    KV cache data first, then the generation instance receives it.
-
-    When gen_first=True (generation-first): the generation instance sends a
-    REQUEST_DATA message first. The context side uses prepare_context_requests()
-    to create a TxSession eagerly and waits for peer request info, then sends
-    KV cache + auxiliary (first-gen / draft) tokens.
+    Each workflow builds its own cache manager and transceiver, so its NIXL
+    agents and connections start cold; the process, its CUDA context and the
+    Gloo world are shared.
     """
 
     # Signal handler for graceful termination
@@ -279,6 +284,58 @@ def worker_fn(
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
     tensorrt_llm.logger.set_level("info")
 
+    mismatched_workflows = []
+    for workflow in workflows:
+        try:
+            verified = _run_workflow(
+                rank=rank,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                is_mla=is_mla,
+                ctx_gen_workflow=workflow,
+            )
+        except Exception as e:
+            earlier = (
+                f" (KV mismatch earlier in {mismatched_workflows})" if mismatched_workflows else ""
+            )
+            raise RuntimeError(f"[Rank {rank}] workflow {workflow} failed{earlier}") from e
+        if not verified:
+            mismatched_workflows.append(workflow)
+        # transceiver.shutdown() released this workflow's agents; collect objects still held in
+        # reference cycles and wait for every rank before any rank creates the next workflow's.
+        gc.collect()
+        dist.barrier()
+
+    dist.destroy_process_group()
+    # Rank 0 broadcasts each workflow's verdict, so every rank fails together here.
+    assert not mismatched_workflows, f"KV mismatch in workflows {mismatched_workflows}"
+
+
+def _run_workflow(
+    rank: int,
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    ctx_enable_dp: bool,
+    gen_enable_dp: bool,
+    is_mla: bool,
+    ctx_gen_workflow: str,
+) -> bool:
+    """Transfer a batch of requests under one workflow; return whether the received KV matched.
+
+    Context-first workflows: the context instance sends KV cache data first,
+    then the generation instance receives it.
+
+    Generation-first workflows: the generation instance sends a REQUEST_DATA
+    message first. The context side uses prepare_context_requests() to create a
+    TxSession eagerly and waits for peer request info, then sends KV cache +
+    auxiliary (first-gen / draft) tokens.
+    """
     ctx_instance_num = ctx_tp * ctx_pp
     gen_instance_num = gen_tp * gen_pp
 
@@ -729,10 +786,12 @@ def worker_fn(
         _run_ctx_first_sync_transfer(
             rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
         )
-    else:
+    elif ctx_gen_workflow == "ctx_first":
         _run_ctx_first_transfer(
             rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
         )
+    else:
+        raise ValueError(f"unknown workflow {ctx_gen_workflow!r}")
 
     # ===== Phase 3: Wait for remaining transfers to complete =====
     # Synchronize before checking completion
@@ -818,10 +877,10 @@ def worker_fn(
         else:
             print(f"\n[Rank {rank}] Some requests FAILED verification!", flush=True)
 
-    # Broadcast pass/fail to all ranks for assertion
+    # Broadcast pass/fail so every rank returns the same verdict
     pass_tensor = torch.tensor([1 if all_passed else 0], dtype=torch.int)
     dist.broadcast(pass_tensor, src=0)
-    assert pass_tensor.item() == 1, "Some requests failed verification!"
+    verified = pass_tensor.item() == 1
 
     dist.barrier()
 
@@ -836,7 +895,7 @@ def worker_fn(
     # Cleanup
     transceiver.shutdown()
     kv_cache_manager.shutdown()
-    dist.destroy_process_group()
+    return verified
 
 
 def _run_ctx_first_transfer(rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp):
@@ -1062,10 +1121,19 @@ def run_v2_transceiver_mp(
     ctx_enable_dp: bool = False,
     gen_enable_dp: bool = False,
     is_mla: bool = False,
-    ctx_gen_workflow: str = "ctx_first",
+    workflows: tuple[str, ...] = WORKFLOWS,
     max_port_retries: int = 5,
-):
-    """Multi-process test for KvCacheTransceiverV2 using mp.spawn."""
+) -> None:
+    """Multi-process test for KvCacheTransceiverV2 using mp.spawn.
+
+    ``workflows`` is a non-empty tuple of names from WORKFLOWS, run in order by one set of
+    processes. A tuple keeps every rank on the same workflow at each step; a set could iterate
+    in a different order in each spawned process.
+    """
+    if not isinstance(workflows, tuple) or not workflows or not set(workflows) <= set(WORKFLOWS):
+        raise ValueError(
+            f"workflows must be a non-empty tuple of names from {WORKFLOWS}, got {workflows!r}"
+        )
     world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
 
     master_addr = "127.0.0.1"
@@ -1076,7 +1144,7 @@ def run_v2_transceiver_mp(
         else ""
     )
     mla_str = ", MLA" if is_mla else ""
-    mode_str = ", " + ctx_gen_workflow
+    mode_str = ", " + "/".join(workflows)
 
     for attempt in range(max_port_retries):
         master_port = find_free_port()
@@ -1102,7 +1170,7 @@ def run_v2_transceiver_mp(
                     ctx_enable_dp,
                     gen_enable_dp,
                     is_mla,
-                    ctx_gen_workflow,
+                    workflows,
                 ),
                 nprocs=world_size,
                 join=True,
@@ -1120,7 +1188,7 @@ def run_v2_transceiver_mp(
     print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
 
 
-# Context-first test configurations
+# Topologies for test_v2_transceiver_mp; one spawn per topology runs every workflow in WORKFLOWS.
 # Reference: cpp/tests/unit_tests/multi_gpu/cacheTransceiverTest.cpp
 MP_TEST_CONFIGS = [
     # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, test_id)
@@ -1144,20 +1212,21 @@ MP_TEST_CONFIGS = [
 ]
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],
     ids=[c[7] for c in MP_TEST_CONFIGS],
 )
-@pytest.mark.parametrize(
-    "workflow",
-    ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
-)
 def test_v2_transceiver_mp(
-    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow, monkeypatch
+    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, monkeypatch
 ):
-    """Test KvCacheTransceiverV2 with context-first multi-process configurations."""
+    """Test KvCacheTransceiverV2 across processes.
+
+    One spawn per topology runs every workflow in WORKFLOWS. A KV mismatch is reported at
+    the end with every mismatched workflow; an exception names its workflow and stops the
+    topology's remaining workflows.
+    """
     # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
     for name in list(os.environ):
@@ -1176,5 +1245,4 @@ def test_v2_transceiver_mp(
         ctx_enable_dp=ctx_enable_dp,
         gen_enable_dp=gen_enable_dp,
         is_mla=is_mla,
-        ctx_gen_workflow=workflow,
     )
