@@ -478,6 +478,7 @@ jobs:
           repository: ${{ fromJson(needs.Authorization.outputs.args).repo }}
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
           lfs: 'true'
+          persist-credentials: false
 
       - name: Run blossom action
         uses: NVIDIA/blossom-action@main
