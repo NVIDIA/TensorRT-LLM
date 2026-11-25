@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-397 captured fields.
+401 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -181,8 +181,12 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.kv_events_config.hwm` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.max_queue_size` | `int` | `value` |  |
 | `kv_cache_config.kv_events_config.publisher` | `literal\|none` | `categorical` | `null`, `zmq` |
+| `kv_cache_config.kv_pool_rebalance_config.allow_cross_node_disagg` | `bool` | `value` |  |
 | `kv_cache_config.kv_pool_rebalance_config.check_interval` | `int` | `value` |  |
 | `kv_cache_config.kv_pool_rebalance_config.cooldown_secs` | `float` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.copy_based_rebalancing` | `bool` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.drop_unreferenced_on_rebalance` | `bool` | `value` |  |
+| `kv_cache_config.kv_pool_rebalance_config.in_place_relocation` | `bool` | `value` |  |
 | `kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches` | `int` | `value` |  |
 | `kv_cache_config.kv_pool_rebalance_config.moving_average_decay` | `float` | `value` |  |
 | `kv_cache_config.kv_pool_rebalance_config.ratio_tolerance` | `float` | `value` |  |
