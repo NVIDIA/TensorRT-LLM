@@ -34,7 +34,7 @@ TensorRT LLM has all the essential capabilities to serve as the rollout engine i
 
 ## MLPerf Training v6.1 results
 
-In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B, a large-scale LLM post-training workload, a stage central to recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train for about 10 steps to reach a target accuracy, excluding validation time.
+In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B GRPO, a large-scale LLM post-training workload, a stage central to recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train for about 10 steps to reach a target accuracy, excluding validation time.
 
 In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of 56 accelerators, **RL post-training on NVIDIA Vera Rubin with NeMo RL and TensorRT LLM achieves the fastest time to train at 28.47 minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs.
 
@@ -68,7 +68,7 @@ In RL, a rollout is one attempt by the model to solve a task in an environment, 
 </div>
 <p align="center"><em>Figure 3: One training step in the 56-GPU recipe. Training pulls trajectories from the replay buffer while rollout keeps generating in the background, and a weight refit connects the two at every step.</em></p>
 
-The other performance numbers in this post, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements. They are not MLPerf results and have not been verified by MLCommons.
+The rest of the performance numbers in this blog, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements.
 
 ### RL Rollout vs. Online Serving
 
@@ -78,8 +78,8 @@ In our submissions, the global batch is 512 trajectories per training step, and 
 | --- | --- | --- |
 | **Goal** | Tokens per second under a latency SLA (TTFT and TPOT) | Time to train. Each training step needs 512 finished trajectories, so the slowest rollouts hold training back |
 | **Concurrency** | Varies with load; bigger batches raise throughput | Set by the training recipe, not by traffic: only a few steps' worth of rollouts can be in flight |
-| **Requests** | Independent requests | Closed-loop multi-turn: about 30 calls each, context grows from roughly 8k to 30k tokens, only about 1.4k new tokens per turn (~96% prefix cache hit) |
-| **Weights** | Fixed | In-flight weight update (refit) after every training step, taking only about 4% of the step time |
+| **Request pattern** | Single-turn and multi-turn requests, driven by user traffic | Agentic multi-turn: about 30 dependent calls per trajectory, context grows from roughly 8k to 30k tokens, only about 1.4k new tokens per turn (~96% prefix cache hit) |
+| **Weights** | Fixed | In-flight weight update (refit) after every training step |
 | **Outputs** | Generated tokens | Must also return the logprob of every sampled token, which can add overhead to the inference engine. |
 | **Environment** | Dedicated machines | Cluster shared with the trainer and sandboxes; host CPUs contended by Gym and the sandboxes |
 
@@ -170,7 +170,7 @@ Together, these host-path changes cut the median host time of a mixed iteration 
 
 ### Shard-to-Shard Weight Refit in NeMo RL (for All Scales)
 
-After every training step, the rollout engine loads the new weights and generation pauses while it does. Refit takes only about 4% of a training step, so it matters less than the other optimizations here, but every rollout GPU pays for it on every step. Our first version sent the whole model, about 790 GB, to every rollout GPU, which then quantized all 512 experts. The main change is on the NeMo RL side, shard-to-shard refit (`nccl_reshard`): the Megatron trainer sends each routed expert over NCCL straight to the GPU that stores it, so a rollout GPU receives and quantizes only its own experts. Together with whole-stack expert loading in TensorRT LLM and a few related tuning changes, this cut the refit time by about 88%, from about 21 to 2.5 seconds in our small-scale setup.
+After every training step, the rollout engine loads the new weights and generation pauses while it does. Refit takes about 4% of a training step for our recipes, but every rollout GPU pays for it on every step. Our first version sent the whole model, about 790 GB, to every rollout GPU, which then quantized all 512 experts. The main change is on the NeMo RL side, shard-to-shard refit (`nccl_reshard`): the Megatron trainer sends each routed expert over NCCL straight to the GPU that stores it, so a rollout GPU receives and quantizes only its own experts. Together with whole-stack expert loading in TensorRT LLM and a few related tuning changes, this cut the refit time by about 88%, from about 21 to 2.5 seconds in our small-scale setup.
 
 ## How to Reproduce
 
