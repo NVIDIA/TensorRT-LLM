@@ -3,6 +3,7 @@
 
 import asyncio
 import inspect
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -880,25 +881,30 @@ class TestMakeMediaIo:
         assert io._num_frames == 8
         assert io._fps == 1
 
-    def test_request_keys_shallow_merge_over_server(self):
-        server = MultimodalServerConfig(
-            media_io_kwargs={"image": {"format": "pil", "device": "cuda"}}
+    @pytest.mark.parametrize(
+        ("flags", "key"),
+        [
+            ([], "format"),
+            (["--grpc", "--grpc-protocol", "openengine"], "format"),
+            (["--enable_visual_gen"], "format"),
+            (["--enable_visual_gen"], "device"),
+        ],
+    )
+    def test_server_flag_rejects_representation(self, tmp_path, flags, key):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.serve import serve
+
+        result = CliRunner().invoke(
+            serve, [str(tmp_path), *flags, "--media_io_kwargs", json.dumps({"video": {key: None}})]
         )
-        request = {"image": {"format": "pt"}}
-        io = _make_media_io("image", server, request)
-        assert io._format == "pt"
-        assert io._device == "cuda"
+        assert result.exit_code == 2
+        assert f"media_io_kwargs.video.{key}" in result.output
 
     def test_other_modalities_fall_back_to_server(self):
-        server = MultimodalServerConfig(
-            media_io_kwargs={
-                "video": {"num_frames": 8},
-                "image": {"format": "pil"},
-            }
-        )
-        request = {"video": {"num_frames": 32}}
-        io = _make_media_io("image", server, request)
-        assert io._format == "pil"
+        server = MultimodalServerConfig(media_io_kwargs={"video": {"fps": 4}})
+        io = _make_media_io("video", server, {"audio": {}})
+        assert io._fps == 4
 
     def test_video_num_frames_override_drops_server_fps(self):
         """Overriding only `num_frames` drops the server's `fps` so the loader's built-in is used."""
@@ -926,10 +932,10 @@ class TestMediaIoKwargsLoaderForwarding:
     def test_io_constructed_with_resolved_kwargs(self, mm_tracker_factory):
         """Merged kwargs are baked into the MediaIO instance, not forwarded as call-time args."""
         tracker = mm_tracker_factory(
-            server_kwargs={"image": {"format": "pil", "device": "cuda"}},
-            request_kwargs={"image": {"format": "pt"}},
+            server_kwargs={"video": {"num_frames": 8, "extract_audio": True}},
+            request_kwargs={"video": {"num_frames": 4}},
         )
-        part = {"type": "image_url", "image_url": {"url": "i"}}
+        part = {"type": "video_url", "video_url": {"url": "v"}}
 
         captured = []
         original = _chat_utils._make_media_io
@@ -940,11 +946,11 @@ class TestMediaIoKwargsLoaderForwarding:
             return io
 
         with patch.object(_chat_utils, "_make_media_io", side_effect=spy):
-            parse_chat_message_content_part(part, tracker)
+            parse_chat_message_content_part(part, tracker)["data"].close()
 
         assert len(captured) == 1
-        assert captured[0]._format == "pt"
-        assert captured[0]._device == "cuda"
+        assert captured[0]._num_frames == 4
+        assert captured[0]._extract_audio is True
 
     @pytest.mark.asyncio
     async def test_input_audio_synthesizes_data_url(self, mm_tracker_factory):
@@ -1106,7 +1112,7 @@ class TestRequestLocalMediaPaths:
         path = allowed / "img.png"
         url = f"file://{path}" if form == "file_uri" else str(path)
         image = await self._load(url)
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1158,7 +1164,7 @@ class TestRequestLocalMediaPaths:
             Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")
             encoded = base64.b64encode(buf.getvalue()).decode("ascii")
         image = await self._load(f"data:image/png;base64,{encoded}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_remote_url_not_checked_as_local(self, monkeypatch):
@@ -1201,7 +1207,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         (allowed / "alias.png").symlink_to(allowed / "img.png")
         image = await self._load(f"file://{allowed}/alias.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_symlink_appearing_after_resolution_refused(self, monkeypatch, media_dirs):
@@ -1315,7 +1321,7 @@ class TestRequestLocalMediaPaths:
 
         monkeypatch.setattr(media_io, "open_allowed_local_media", open_then_replace)
         image = await self._load(f"file://{path}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_loaded_without_descriptor_directory(self, monkeypatch, media_dirs):
@@ -1324,7 +1330,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         monkeypatch.setattr("tensorrt_llm.inputs.media_io._DESCRIPTOR_DIR", None)
         image = await self._load(f"file://{allowed}/img.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_misconfigured_directory_refused_generically(

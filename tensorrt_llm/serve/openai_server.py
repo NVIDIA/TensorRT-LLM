@@ -54,7 +54,8 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
-from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            _validate_media_io_kwargs)
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -704,6 +705,7 @@ class OpenAIServer(_VideoRoutesMixin):
         ip = getattr(self.generator, "input_processor", None)
         if isinstance(ip, BaseMultimodalInputProcessor):
             model_pref = ip.get_preferred_media_io_kwargs() or {}
+            _validate_media_io_kwargs(model_pref)
             if model_pref:
                 cfg = self.multimodal_server_config or MultimodalServerConfig()
                 merged = {m: dict(kw) for m, kw in model_pref.items()}

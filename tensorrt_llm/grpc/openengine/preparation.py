@@ -14,7 +14,11 @@ import numpy as np
 from google.protobuf import struct_pb2
 
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalInput,
+    MultimodalParams,
+    _validate_media_io_kwargs,
+)
 from tensorrt_llm.llmapi.llm import PreprocessedInputs
 
 _DECODE_PREPARATION_KEY = "trtllm_decode_preparation"
@@ -36,10 +40,12 @@ def _config_digest(llm: Any) -> str:
     config = processor.config.to_dict()
     config.pop("_name_or_path", None)
     image_processor = getattr(processor.processor, "image_processor", None)
+    media_io_kwargs = processor.get_preferred_media_io_kwargs()
+    _validate_media_io_kwargs(media_io_kwargs)
     identity = {
         "model": config,
         "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
-        "media_io": processor.get_preferred_media_io_kwargs(),
+        "media_io": media_io_kwargs,
         "image_processor": image_processor.to_dict() if image_processor is not None else None,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()
