@@ -15,6 +15,7 @@
 """Registration contract of fast_custom_op and of the trtllm ops registered through it."""
 
 import itertools
+import operator
 import os
 import subprocess
 import sys
@@ -229,6 +230,10 @@ def test_recover_pass_splits_fused_add_rmsnorm(overload: bool) -> None:
     graph.call_function(fused.default if overload else fused, (x, residual, weight, 1e-6))
     graph.output((x, residual))
     gm = recover_pass(torch.fx.GraphModule(torch.nn.Module(), graph))
-    targets = [n.target for n in gm.graph.nodes if n.op == "call_function"]
-    assert fused not in targets and fused.default not in targets
-    assert torch.ops.trtllm.flashinfer_rmsnorm.default in targets
+    calls = [n for n in gm.graph.nodes if n.op == "call_function"]
+    assert [n.target for n in calls] == [operator.add, torch.ops.trtllm.flashinfer_rmsnorm.default]
+    add_node, norm_node = calls
+    assert add_node.args == (x, residual)
+    assert norm_node.args == (add_node, weight, 1e-6)
+    (output,) = (n for n in gm.graph.nodes if n.op == "output")
+    assert output.args == ((norm_node, add_node),)
