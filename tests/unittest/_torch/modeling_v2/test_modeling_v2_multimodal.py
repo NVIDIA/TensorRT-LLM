@@ -14,6 +14,7 @@ from tensorrt_llm._torch.modeling_v2.multimodal import (
     MultimodalEncoderSpec,
     MultimodalModelForCausalLM,
 )
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import _validate_multimodal_input
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -115,7 +116,7 @@ def test_construction_and_checkpoint_ownership(disable, monkeypatch):
     if disable:
         monkeypatch.setattr(_TinyTower, "__init__", lambda *args: pytest.fail("constructed tower"))
 
-    class Checkpoint(dict):
+    class Checkpoint(ConsumableWeightsDict):
         def __getitem__(self, key):
             if disable and key.startswith("model.visual."):
                 pytest.fail("read disabled tower weight")
@@ -129,7 +130,10 @@ def test_construction_and_checkpoint_ownership(disable, monkeypatch):
         assert model.mm_encoder is None
     else:
         assert model.mm_encoder.loaded == {"model.visual.patch": 5}
-    assert model.llm.loaded == {"model.layers.0.weight": 3}
+    assert model.llm.loaded is weights
+    assert weights.keys() == ["model.layers.0.weight"]
+    assert weights["model.layers.0.weight"] == 3
+    assert weights.mark_consumed("model.layers.0") == 1
 
 
 def test_attached_embeddings_require_encoder_prefill_disaggregation(monkeypatch):
@@ -175,7 +179,7 @@ def test_registration_requires_an_encoder_packing_hook():
 def test_custom_forward_uses_shared_multimodal_preparation():
     class Custom(_TinyModel):
         def forward(self, input_ids, multimodal_params, num_context_requests=1):
-            prepared = self.prepare_multimodal_embeds(
+            prepared = super().prepare_multimodal_embeds(
                 input_ids=input_ids,
                 positions=None,
                 multimodal_params=multimodal_params,
@@ -183,13 +187,17 @@ def test_custom_forward_uses_shared_multimodal_preparation():
             )
             return prepared[1][0] if prepared is not None else None
 
-    class WithoutPreparation(Custom):
+    class Bypass:
         def forward(self, input_ids, multimodal_params):
             return None
+
+    class WithoutPreparation(Bypass, Custom):
+        pass
 
     model = _model(Custom)
     params = [_params(8, 9)]
     assert model(PROMPT, params).tolist() == [[8], [9]]
+    assert model(PROMPT, params, num_context_requests=0) is None
     with pytest.raises(RuntimeError, match="prepare_multimodal"):
         _model(WithoutPreparation)(PROMPT, params)
 

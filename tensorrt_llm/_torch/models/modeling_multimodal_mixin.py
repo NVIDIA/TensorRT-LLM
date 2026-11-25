@@ -17,6 +17,7 @@
 import contextlib
 import copy
 import itertools
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -59,6 +60,11 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
     has_multimodal_input,
+)
+
+# A custom V2 forward sets this for the duration of a media step.
+_pending_multimodal_preparation: ContextVar[Optional["MultimodalModelMixin"]] = ContextVar(
+    "_pending_multimodal_preparation", default=None
 )
 
 
@@ -1190,6 +1196,8 @@ class MultimodalModelMixin:
             multimodal_params=context_params,
             **forward_kwargs,
         )
+        if _pending_multimodal_preparation.get() is self:
+            _pending_multimodal_preparation.set(None)
         return input_ids, active_embeddings, extra_embeds
 
     def prepare_multimodal_inputs(

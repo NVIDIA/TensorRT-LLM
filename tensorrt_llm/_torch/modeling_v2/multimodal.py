@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import inspect
-from contextvars import ContextVar
 from functools import wraps
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -14,11 +13,13 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.model_hooks import call_load_weights
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
     MultimodalEncoderSpec,
     MultimodalModelMixin,
+    _pending_multimodal_preparation,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
@@ -30,26 +31,18 @@ __all__ = ["MultimodalEncoderSpec", "MultimodalModelForCausalLM"]
 
 # The loader and router read these flags from the composite class before construction.
 _LANGUAGE_MODEL_CLASS_ATTRIBUTES = {
+    "EPLB_MODES": frozenset(),
     "moe_impls_honored": frozenset(),
     "draft_moe_impls_honored": frozenset(),
     "supports_nvfp4_kv_cache": False,
 }
 
 
-# Only custom forwards need a behavioral check. Calls that inherit the mixin
-# take the ordinary preparation path without any guard on the inference step.
-_pending_preparation = ContextVar("_pending_preparation", default=None)
-
-
-def _prepare_custom_forward(self, **kwargs):
-    prepared = MultimodalModelMixin.prepare_multimodal_embeds(self, **kwargs)
-    if prepared is not None and _pending_preparation.get() is self:
-        _pending_preparation.set(None)
-    return prepared
-
-
 def _check_custom_forward(forward):
     signature = inspect.signature(forward)
+    defaults = signature.bind_partial()
+    defaults.apply_defaults()
+    default_num_contexts = defaults.arguments.get("num_context_requests")
 
     @wraps(forward)
     def checked(self, *args, **kwargs):
@@ -58,24 +51,27 @@ def _check_custom_forward(forward):
         metadata = kwargs.get(
             "attn_metadata", bound.get("attn_metadata", args[0] if args else None)
         )
-        if (
-            not params
-            or _pending_preparation.get() is self
-            or not self.select_multimodal_params(
-                params, getattr(metadata, "num_contexts", len(params))
+        if not params or _pending_multimodal_preparation.get() is self:
+            return forward(self, *args, **kwargs)
+        num_contexts = getattr(metadata, "num_contexts", None)
+        if num_contexts is None:
+            num_contexts = kwargs.get(
+                "num_context_requests", bound.get("num_context_requests", default_num_contexts)
             )
+        if not self.select_multimodal_params(
+            params, len(params) if num_contexts is None else num_contexts
         ):
             return forward(self, *args, **kwargs)
-        token = _pending_preparation.set(self)
+        token = _pending_multimodal_preparation.set(self)
         try:
             result = forward(self, *args, **kwargs)
-            if _pending_preparation.get() is self:
+            if _pending_multimodal_preparation.get() is self:
                 raise RuntimeError(
                     "A custom multimodal forward must call prepare_multimodal_inputs or prepare_multimodal_embeds"
                 )
             return result
         finally:
-            _pending_preparation.reset(token)
+            _pending_multimodal_preparation.reset(token)
 
     return checked
 
@@ -157,16 +153,14 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
             raise TypeError("V2 encoders must use the grouped encode_multimodal_inputs template")
         if (
             cls.prepare_multimodal_inputs is not MultimodalModelMixin.prepare_multimodal_inputs
-            or cls.prepare_multimodal_embeds
-            not in (MultimodalModelMixin.prepare_multimodal_embeds, _prepare_custom_forward)
+            or cls.prepare_multimodal_embeds is not MultimodalModelMixin.prepare_multimodal_embeds
         ):
             raise TypeError("V2 models must use shared multimodal input preparation")
-        if cls.forward is not MultimodalModelMixin.forward and (
-            "forward" in cls.__dict__
-            or cls.prepare_multimodal_embeds is not _prepare_custom_forward
+        if cls.forward is not MultimodalModelMixin.forward and not any(
+            issubclass(base, MultimodalModelForCausalLM) and base.forward is cls.forward
+            for base in cls.__bases__
         ):
             cls.forward = _check_custom_forward(cls.forward)
-            cls.prepare_multimodal_embeds = _prepare_custom_forward
 
         for flag in (
             "supports_encoder_cache",
@@ -297,22 +291,26 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
         return {**kwargs, **prepared}
 
     def load_weights(self, weights, weight_mapper=None) -> None:
-        """Route checkpoint keys by tower prefix. Disabled towers leave their weights unread."""
+        """Route checkpoint keys by tower prefix, skipping values for disabled towers in this mapping."""
         encoder_weights = {name: {} for name in self.mm_encoders}
-        text_weights = {}
+        encoder_keys = set()
         for key in weights.keys():
             for name, spec in type(self).mm_encoders.items():
                 if key.startswith(spec.weight_prefix):
+                    encoder_keys.add(key)
                     if name in encoder_weights:
                         encoder_weights[name][key] = weights[key]
                     break
-            else:
-                text_weights[key] = weights[key]
         for name, tower in self.mm_encoders.items():
-            tower.load_weights(encoder_weights[name])
+            tower.load_weights(encoder_weights.pop(name))
+        if isinstance(weights, ConsumableWeightsDict):
+            # Shard-aware decoders need the loader's checkpoint metadata and handles.
+            weights.mark_consumed_keys(encoder_keys)
+        else:
+            weights = {key: weights[key] for key in weights.keys() if key not in encoder_keys}
         if (
             weight_mapper is not None
             and "weight_mapper" in inspect.getfullargspec(self.llm.load_weights).args
         ):
             weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
-        call_load_weights(self.llm.load_weights, text_weights, weight_mapper)
+        call_load_weights(self.llm.load_weights, weights, weight_mapper)

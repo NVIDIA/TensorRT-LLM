@@ -87,11 +87,13 @@ def test_profiling_inputs_fill_the_item_budget_with_legal_frames():
 )
 @pytest.mark.parametrize("vision", [fp8_vision, nvfp4_vision], ids=["fp8", "nvfp4"])
 @torch.inference_mode()
-def test_qwen4_exp_grouped_tower_matches_independent_items(vision):
+def test_qwen4_exp_grouped_tower_matches_independent_items(vision, monkeypatch):
     from .test_vision_warm_up import _tower
 
     tower = _tower(vision)
-    grid = [(2, 4, 8), (1, 8, 8), (1, 12, 8)]
+    # The final video frame shares a call with the next image.
+    monkeypatch.setattr(vision, "VISION_CALL_MAX_PATCHES", 96)
+    grid = [(4, 4, 8), (1, 8, 8), (1, 12, 8)]
     rng = torch.Generator(device="cuda").manual_seed(17)
     pixels = [
         torch.randn(t * h * w, tower.pixel_width, dtype=tower.dtype, device="cuda", generator=rng)

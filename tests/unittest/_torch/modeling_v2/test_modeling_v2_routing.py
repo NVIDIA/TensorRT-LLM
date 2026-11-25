@@ -1454,11 +1454,16 @@ def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 def test_qwen4_exp_encoder_attention_backend_falls_back():
-    """The target's own vision tower would ignore it; the built-in model applies it."""
+    """The target declares fixed vision attention and the built-in model applies the override."""
     config = _model_config(_qwen4_exp_config())
     selected = MultimodalConfig(encoder_attention_backend={"vision": "TRTLLM"})
-    _declined(config, dict(multimodal_config=selected), match="encoder_attention_backend")
-    _claimed(config, dict(multimodal_config=MultimodalConfig(encoder_attention_backend={})))
+    _declined(
+        config.copy_with(multimodal_config=selected),
+        dict(multimodal_config=selected),
+        match="vision encoder's attention backend cannot be changed",
+    )
+    default = MultimodalConfig(encoder_attention_backend={})
+    _claimed(config.copy_with(multimodal_config=default), dict(multimodal_config=default))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")

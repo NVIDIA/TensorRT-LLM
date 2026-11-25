@@ -377,7 +377,7 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
             dict(
                 multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"})
             ),
-            "encoder_attention_backend",
+            "vision encoder's attention backend cannot be changed",
         ),
     ],
     ids=[
@@ -406,8 +406,10 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
 )
 def test_what_the_target_does_not_run_declines(on_sm103, config_kwargs, llm_args_kwargs, match):
     """``auto`` falls back to the built-in model and ``require`` says why, once per reason."""
+    args = _llm_args("auto", **llm_args_kwargs)
     config = _routed_config(**config_kwargs)
-    assert modeling_v2_resolve(config, _llm_args("auto", **llm_args_kwargs)) is None
+    config.multimodal_config = args.multimodal_config
+    assert modeling_v2_resolve(config, args) is None
     with pytest.raises(ValueError, match=match):
         modeling_v2_resolve(config, _llm_args("require", **llm_args_kwargs))
 

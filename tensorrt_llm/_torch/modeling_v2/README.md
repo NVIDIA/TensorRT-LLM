@@ -224,8 +224,9 @@ Each spec constructs a local tower with the corresponding checkpoint subconfig
 (for example, `vision_config`) and the decoder activation dtype. When the checkpoint
 has no subconfig for that encoder name, the tower receives the composite config.
 `weight_prefix` accepts one prefix or a tuple of disjoint prefixes for a tower
-and its projector. With `disable_mm_encoder`, the base skips construction and
-leaves every matching checkpoint tensor unread.
+and its projector. With `disable_mm_encoder`, the base skips tower construction
+and matching values in the weight mapping it receives. The checkpoint reader
+can still load an entire shard before calling the model.
 
 | Feature | Tower or processor contract |
 | --- | --- |
@@ -235,7 +236,7 @@ leaves every matching checkpoint tensor unread.
 | Cross-request cache | Every tower declares `supports_encoder_cache` when its output is reusable by stable media and processor hashes. The mixin builds partial misses from the processor's partitions. A worker needs a local tower and a positive `encoder_cache_max_bytes` for persistent reuse. |
 | Side-stream prefetch | A tower that runs safely on the current stream declares `multimodal_data_device_paths`. The base combines paths across towers. Configure `encoder_side_stream_max_ahead` with item scheduling disabled. |
 | GPU vision normalization | Image and video towers opt in with `supports_vision_gpu_normalize`. The architecture's processor must support raw pixels with `VisionNormalization`. The packer calls `normalize_vision_pixels` after staging. |
-| Encoder attention | The tower's `supported_encoder_attention_backends` set is keyed by its spec name on the model. An empty set declares fixed attention. Configurable towers also receive the selected `model_config` keyword, with a private config for the encoder. |
+| Encoder attention | The model exposes each tower's `supported_encoder_attention_backends` by spec name. An empty set declares fixed attention. Configurable towers receive a private `model_config` with explicit selections applied. Use `get_encoder_attention_backend(name, default)` when the tower's default differs from the decoder's. |
 
 The default fusion uses the decoder's text embedding layer. A decoder that
 needs the original IDs sets `llm_requires_input_ids = True` and receives
@@ -248,7 +249,10 @@ A custom forward processing media must call `prepare_multimodal_inputs` or
 `prepare_multimodal_embeds`. Subclass registration checks the grouped encoder
 and shared preparation methods. A custom forward is checked on an actual media step.
 
-Modeling V2 checks admission before batching. A V2 worker without a local
+Modeling V2 checks admission before batching. The base accepts in-vocabulary
+prompt IDs. A target using out-of-vocabulary media sentinels needs admission
+that validates them against its processor's exact IDs and placement.
+A V2 worker without a local
 encoder rejects raw media. Precomputed embeddings require a multimodal V2
 model in encoder/prefill disaggregated mode. M-RoPE positions alone pass
 this check. Modeling V1 models keep their existing admission behavior.

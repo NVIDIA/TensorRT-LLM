@@ -315,9 +315,3 @@ def _check_vision_deployment(model_config, llm_args) -> None:
         raise NoTarget(
             "multimodal_config.encoder_cuda_graph: the vision tower has no encoder CUDA graph"
         )
-    if mm_config.encoder_attention_backend:
-        raise NoTarget(
-            "multimodal_config.encoder_attention_backend="
-            f"{mm_config.encoder_attention_backend}; the target's vision tower runs its own "
-            "attention and does not apply it"
-        )
