@@ -4870,6 +4870,16 @@
           "title": "Enable Branch Snapshot",
           "type": "boolean"
         },
+        "enable_multi_snapshot_prefill": {
+          "default": false,
+          "description": "Allow supported recurrent models with KV cache V2 and periodic snapshots to prefill across multiple snapshot boundaries in one iteration. When disabled, periodic snapshots retain their existing chunking behavior.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Enable Multi Snapshot Prefill",
+          "type": "boolean"
+        },
         "periodic_snapshot_interval": {
           "default": 0,
           "description": "The number of tokens between periodic snapshots in the Mamba prefix cache. Periodic snapshots are disabled by default; set this to a positive value to enable them.",

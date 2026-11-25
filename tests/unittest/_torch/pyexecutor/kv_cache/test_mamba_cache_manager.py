@@ -897,6 +897,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         "tensorrt_llm._torch.pyexecutor._util.logger.info",
         info_log,
     )
+    model_engine.model._supports_periodic_snapshots = True
 
     common_kwargs = dict(
         model_engine=model_engine,
@@ -926,9 +927,25 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     )
     _create_kv_cache_manager(
         kv_cache_manager_cls=RecordingV2Manager,
-        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+        ),
         **common_kwargs,
     )
+    assert captured_v2["enable_periodic_snapshots"] is False
+
+    _create_kv_cache_manager(
+        kv_cache_manager_cls=RecordingV2Manager,
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=64, enable_multi_snapshot_prefill=True
+            ),
+        ),
+        **common_kwargs,
+    )
+    assert captured_v2["enable_periodic_snapshots"] is True
 
     assert captured_cpp["use_replay_state_update"] is None
     assert captured_cpp["gdn_fused_verify"] is True

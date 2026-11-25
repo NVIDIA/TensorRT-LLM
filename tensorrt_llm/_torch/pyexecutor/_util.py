@@ -4945,7 +4945,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_periodic_snapshots"] = (
             model_engine is not None
             and getattr(model_engine.model, "_supports_periodic_snapshots",
-                        False) is True)
+                        False) is True and
+            kv_cache_config.mamba_state_config.enable_multi_snapshot_prefill)
 
     if config_utils.is_glm5_next(config) or is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on

@@ -6058,6 +6058,16 @@ class MambaStateConfig(StrictBaseModel):
         "prefix cache. Periodic snapshots are disabled by default; set this "
         "to a positive value to enable them.")
 
+    enable_multi_snapshot_prefill: bool = Field(
+        default=False,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Allow supported recurrent models with KV cache V2 and periodic "
+        "snapshots to prefill across multiple snapshot boundaries in one "
+        "iteration. When disabled, periodic snapshots retain their existing "
+        "chunking behavior.")
+
     additional_snapshot_offsets_from_start: List[_StrictPositiveInt] = Field(
         default_factory=list,
         status="prototype",

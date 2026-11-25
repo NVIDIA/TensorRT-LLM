@@ -223,7 +223,9 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
             tokens_per_block=64,
             free_gpu_memory_fraction=0.25,
             mamba_ssm_cache_dtype="float32",
-            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=64, enable_multi_snapshot_prefill=True
+            ),
         ),
     ) as llm:
         model = llm._executor.engine.model_engine.model

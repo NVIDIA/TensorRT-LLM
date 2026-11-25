@@ -2347,6 +2347,7 @@ def test_MambaStateConfig_defaults_use_independent_lists():
     second = MambaStateConfig()
 
     assert first.periodic_snapshot_interval == 0
+    assert first.enable_multi_snapshot_prefill is False
     first.additional_snapshot_offsets_from_start.append(128)
     first.additional_snapshot_offsets_from_end.append(0)
 
