@@ -566,34 +566,23 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
             return
         offload = getattr(kv_cache_manager, "_enable_kv_cache_offload", False)
-
-        def cache_views(layer_idx: int) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            nvfp4 = kv_cache_manager.is_nvfp4_layer(layer_idx)
-            if offload and kv_cache_manager.offloads_layer(layer_idx):
-                # Offloaded layers write their new tokens into arena cells.
-                arena = kv_cache_manager.get_sparse_arena_buffers
-                return (
-                    arena(layer_idx, "HND"),
-                    arena(layer_idx, "HND", scales=True) if nvfp4 else None,
-                )
-            return (
+        # An offloaded layer stages no views. Their one reader, the compiled fused
+        # producer, runs only without offload; the eager producer takes the layer's
+        # arena from the cache manager.
+        self.msa_layer_cache_tensors = {
+            layer_idx: (
                 kv_cache_manager.get_buffers(layer_idx, kv_layout="HND"),
+                self.msa_idx_k_cache(layer_idx),
                 (
                     kv_cache_manager.get_block_scale_buffers(layer_idx, kv_layout="HND")
-                    if nvfp4
+                    if kv_cache_manager.is_nvfp4_layer(layer_idx)
                     else None
                 ),
             )
-
-        self.msa_layer_cache_tensors = {}
-        for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ()):
-            if layer_idx in kv_cache_manager.layer_offsets:
-                main, scales = cache_views(layer_idx)
-                self.msa_layer_cache_tensors[layer_idx] = (
-                    main,
-                    self.msa_idx_k_cache(layer_idx),
-                    scales,
-                )
+            for layer_idx in getattr(kv_cache_manager, "sparse_layer_ids", ())
+            if layer_idx in kv_cache_manager.layer_offsets
+            if not (offload and kv_cache_manager.offloads_layer(layer_idx))
+        }
         capture_graph = self.is_cuda_graph
         buffers = self.cuda_graph_buffers
         max_num_sequences = int(self.max_num_sequences)

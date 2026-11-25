@@ -417,7 +417,7 @@ class SparseBatchShape:
             tables; each entry is a page table's worth of indices. Required for the same
             reason as ``layer_counts``.
         partial_unit_groups: Life cycles that restore a partially filled unit on
-            reservation, requiring one extra fetch work entry per row.
+            reservation, requiring one write-preparation restore entry per row.
     """
 
     num_life_cycles: int
@@ -488,7 +488,7 @@ class SparseBatchShape:
             total += 3 * rows * width + 1
             total += num_layers * (3 * flush_capacity + 1)
             total += rows * num_layers
-        return _INDEX_BYTES * (total + 6 * rows * self.partial_unit_groups)
+        return _INDEX_BYTES * (total + 3 * rows * self.partial_unit_groups)
 
 
 def sparse_batch_shape(

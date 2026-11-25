@@ -102,8 +102,8 @@ void checkMinimaxM3Int32LaunchGeometry(int64_t numTokens, int64_t slotsPerToken)
         "MiniMax-M3 producer launch geometry exceeds int32");
 }
 
-void checkMinimaxM3Nvfp4HndKVPools(
-    torch::Tensor const& dataCache, torch::Tensor const& scaleCache, int64_t numHeads, int64_t headDim)
+void checkMinimaxM3Nvfp4HndKVPools(torch::Tensor const& dataCache, torch::Tensor const& scaleCache, int64_t numHeads,
+    int64_t headDim, bool allowArena = false)
 {
     TORCH_CHECK(dataCache.is_cuda() && dataCache.scalar_type() == at::ScalarType::Byte,
         "NVFP4 data cache must be a CUDA uint8 tensor");
@@ -127,12 +127,18 @@ void checkMinimaxM3Nvfp4HndKVPools(
         "NVFP4 data cache must have contiguous packed head blocks");
     TORCH_CHECK(scaleCache.stride(2) == scaleCache.size(3) * scaleCache.stride(3),
         "NVFP4 scale cache must have contiguous scale head blocks");
+    // An arena slot names a K cell; its V cell is at a fixed positive cell offset,
+    // and the data and scale arenas share every slot.
+    auto const isCellArena = [&](torch::Tensor const& cache)
+    { return allowArena && cache.stride(0) == numHeads * cache.stride(2) && cache.stride(1) % cache.stride(0) == 0; };
     TORCH_CHECK(dataCache.stride(1) >= dataCache.size(2) * dataCache.stride(2)
-            && dataCache.stride(0) >= dataCache.size(1) * dataCache.stride(1),
+            && (dataCache.stride(0) >= dataCache.size(1) * dataCache.stride(1) || isCellArena(dataCache)),
         "NVFP4 data cache planes or pages overlap");
     TORCH_CHECK(scaleCache.stride(1) >= scaleCache.size(2) * scaleCache.stride(2)
-            && scaleCache.stride(0) >= scaleCache.size(1) * scaleCache.stride(1),
+            && (scaleCache.stride(0) >= scaleCache.size(1) * scaleCache.stride(1) || isCellArena(scaleCache)),
         "NVFP4 scale cache planes or pages overlap");
+    TORCH_CHECK(isCellArena(dataCache) == isCellArena(scaleCache),
+        "NVFP4 data and scale caches must both be paged pools or both be cell arenas");
     TORCH_CHECK(dataCache.stride(0) % 2 == 0 && dataCache.stride(1) % 2 == 0,
         "NVFP4 data cache page and plane strides must preserve uint16 store alignment");
 }
@@ -388,7 +394,8 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     torch::Tensor const& outCacheLoc, torch::Tensor const& kvQuantScale, int64_t numHeadsQ, int64_t numHeadsKV,
     int64_t numHeadsIndex, int64_t headDim, int64_t rotaryDim, double eps, torch::Tensor const& qWeight,
     torch::Tensor const& kWeight, torch::Tensor const& indexQWeight, torch::Tensor const& indexKWeight,
-    torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds)
+    torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds,
+    std::optional<torch::Tensor> const& indexOutCacheLoc, bool kvCacheIsArena)
 {
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRotaryDim = 64;
@@ -417,7 +424,11 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     CHECK_INPUT(indexKWeight, torch::kBFloat16);
     CHECK_INPUT(rotaryCosSin, torch::kFloat32);
     CHECK_INPUT(kvQuantScale, torch::kFloat32);
-    checkMinimaxM3Nvfp4HndKVPools(kvDataCache, kvScaleCache, numHeadsKV, headDim);
+    // As for the FP8 producer, cell arenas address main K/V by arena cell while
+    // index keys stay paged, so they need their own index slot map.
+    TORCH_CHECK(!kvCacheIsArena || indexOutCacheLoc.has_value(),
+        "kv_cache_is_arena requires index_out_cache_loc for the paged index-K cache");
+    checkMinimaxM3Nvfp4HndKVPools(kvDataCache, kvScaleCache, numHeadsKV, headDim, kvCacheIsArena);
     TORCH_CHECK(kvDataCache.size(3) == kPageSize, "MiniMax-M3 NVFP4 horizontal producer requires page_size=128");
     TORCH_CHECK(kvQuantScale.numel() >= 3, "NVFP4 K/V quantization scale must contain [Q, K, V]");
     TORCH_CHECK(indexKCache.is_cuda() && indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn,
@@ -425,8 +436,8 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) == kPageSize
             && indexKCache.size(3) == kHeadDim,
         "Index-K cache must be HND [num_pages, 1, 128, 128]");
-    TORCH_CHECK(indexKCache.size(0) == kvDataCache.size(0),
-        "Index-K and main NVFP4 caches must contain the same number of pages");
+    TORCH_CHECK(indexOutCacheLoc.has_value() || indexKCache.size(0) == kvDataCache.size(0),
+        "Caches sharing a slot mapping must contain the same number of pages");
     TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == kHeadDim,
         "Index-K cache must have contiguous token rows");
     TORCH_CHECK(
@@ -441,6 +452,12 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     TORCH_CHECK(
         packed.size(1) == totalHeads * headDim, "Packed tensor width must equal (Q + 2*KV + index-Q + 1) * head_dim");
     TORCH_CHECK(outCacheLoc.numel() >= numTokens, "out_cache_loc is shorter than num_tokens");
+    auto const& indexSlots = indexOutCacheLoc.has_value() ? *indexOutCacheLoc : outCacheLoc;
+    CHECK_INPUT(indexSlots, torch::kInt32);
+    TORCH_CHECK(indexSlots.dim() == 1 && indexSlots.numel() >= numTokens,
+        "index_out_cache_loc must be one-dimensional and cover num_tokens");
+    TORCH_CHECK(indexSlots.get_device() == packed.get_device(),
+        "index_out_cache_loc must be on the packed input's CUDA device");
     TORCH_CHECK(positionIds.numel() == numTokens, "position_ids length must equal num_tokens");
     TORCH_CHECK(qWeight.numel() == headDim && kWeight.numel() == headDim && indexQWeight.numel() == headDim
             && indexKWeight.numel() == headDim,
@@ -469,14 +486,14 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     auto stream = at::cuda::getCurrentCUDAStream(packed.get_device());
     tensorrt_llm::kernels::launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(packed.data_ptr(), qOut.data_ptr(),
         indexQOut.data_ptr(), kvDataCache.data_ptr(), kvScaleCache.data_ptr(), indexKCache.data_ptr(),
-        outCacheLoc.data_ptr<int>(), kvQuantScale.data_ptr<float>(), kvDataCache.stride(0), kvDataCache.stride(1),
-        kvDataCache.stride(2), kvDataCache.stride(3), kvScaleCache.stride(0), kvScaleCache.stride(1),
-        kvScaleCache.stride(2), indexKCache.stride(0), indexKCache.stride(2), kvDataCache.size(0),
-        static_cast<int>(kvDataCache.size(3)), static_cast<int>(numTokens), static_cast<int>(numHeadsQ),
-        static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex), static_cast<int>(headDim),
-        static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),
-        indexQWeight.data_ptr(), indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(), positionIds.data_ptr<int>(),
-        stream);
+        outCacheLoc.data_ptr<int>(), indexSlots.data_ptr<int>(), kvQuantScale.data_ptr<float>(), kvDataCache.stride(0),
+        kvDataCache.stride(1), kvDataCache.stride(2), kvDataCache.stride(3), kvScaleCache.stride(0),
+        kvScaleCache.stride(1), kvScaleCache.stride(2), indexKCache.stride(0), indexKCache.stride(2),
+        kvDataCache.size(0), indexKCache.size(0), static_cast<int>(kvDataCache.size(3)), static_cast<int>(numTokens),
+        static_cast<int>(numHeadsQ), static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex),
+        static_cast<int>(headDim), static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(),
+        kWeight.data_ptr(), indexQWeight.data_ptr(), indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(),
+        positionIds.data_ptr<int>(), stream);
     return {qOut, indexQOut};
 }
 
@@ -508,8 +525,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(Tensor packed, Tensor(a!) kv_data_cache, Tensor(b!) "
         "kv_scale_cache, Tensor(c!) index_k_cache, Tensor out_cache_loc, Tensor kv_quant_scale, int num_heads_q, "
         "int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps, Tensor q_weight, Tensor "
-        "k_weight, Tensor index_q_weight, Tensor index_k_weight, Tensor rotary_cos_sin, Tensor position_ids) -> "
-        "(Tensor, Tensor)");
+        "k_weight, Tensor index_q_weight, Tensor index_k_weight, Tensor rotary_cos_sin, Tensor position_ids, Tensor? "
+        "index_out_cache_loc=None, bool kv_cache_is_arena=False) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

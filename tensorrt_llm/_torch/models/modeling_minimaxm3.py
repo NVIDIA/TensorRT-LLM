@@ -363,9 +363,14 @@ def _tensor_view_key(
 
 
 def _nvfp4_cache_supports_fused_write(
-    data: torch.Tensor, scales: torch.Tensor, num_heads: int
+    data: torch.Tensor, scales: torch.Tensor, num_heads: int, *, arena: bool = False
 ) -> bool:
-    """Reject invalid HND pools; select fusion only for its packed layout."""
+    """Reject invalid HND pools; select fusion only for its packed layout.
+
+    With ``arena``, the caches may instead be an offloaded layer's sparse cache
+    arenas: one K cell per page index, with each V cell a whole number of cells
+    after its K cell.
+    """
     if (
         data.dim() != 5
         or scales.dim() != 5
@@ -378,12 +383,18 @@ def _nvfp4_cache_supports_fused_write(
     ):
         raise ValueError("MiniMax-M3 NVFP4 data and scale caches must have matching HND geometry")
     for cache in (data, scales):
+        cell_arena = (
+            arena
+            and cache.stride(0) > 0
+            and cache.stride(0) == num_heads * cache.stride(2)
+            and cache.stride(1) % cache.stride(0) == 0
+        )
         if (
             cache.stride(4) != 1
             or cache.stride(3) != cache.shape[4]
             or cache.stride(2) < 128 * cache.stride(3)
             or cache.stride(1) < num_heads * cache.stride(2)
-            or cache.stride(0) < 2 * cache.stride(1)
+            or (cache.stride(0) < 2 * cache.stride(1) and not cell_arena)
         ):
             raise ValueError(
                 "MiniMax-M3 NVFP4 cache rows must be packed and heads/planes/pages must not overlap"
@@ -1082,9 +1093,9 @@ def minimax_m3_attn_custom_op_inplace(
     The captured horizontal producer can populate both caches before this
     boundary. A packed projection runs that producer here instead, while
     separate projections leave their cache writes here. A resident layer
-    requires the producer; an offloaded layer it declines, such as one with an
-    NVFP4 cache, runs the unfused norm, RoPE and cache writes. Slice padded
-    inputs to live tokens before request-dependent cache and MSA work.
+    requires the producer; an offloaded layer it declines runs the unfused
+    norm, RoPE and cache writes. Slice padded inputs to live tokens before
+    request-dependent cache and MSA work.
     """
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
@@ -1106,8 +1117,8 @@ def minimax_m3_attn_custom_op_inplace(
                     f"piecewise attention boundary for layer {layer_idx}, but its "
                     "runtime geometry or cache layout was unsupported."
                 )
-            # Only an offloaded layer may decline: an NVFP4 cache has no fused producer
-            # that writes the sparse cache arena.
+            # Only an offloaded layer may decline; the unfused cache writes below
+            # also write its sparse cache arena.
             logger.warning_once(
                 f"MiniMax-M3 layer {layer_idx}: the fused QKV producer declined this "
                 "offloaded layer's KV cache, so its packed projection runs the unfused "
@@ -1603,7 +1614,8 @@ class MiniMaxM3Attention(Attention):
         positions and cache slots cover pure prefill, mixed aggregate batches,
         and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
         caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
-        Q, index-Q, and index-K remain FP8.
+        Q, index-Q, and index-K remain FP8.  An offloaded layer's K/V, and its
+        NVFP4 scales, go to its sparse cache arenas; Q is the same either way.
         """
         offload_state = getattr(attn_metadata, "sparse_offload_state", None)
         if (
@@ -1613,7 +1625,6 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
             or packed.dtype != torch.bfloat16
             or position_ids is None
-            or (offload_state is not None and self.main_kv_is_nvfp4)
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
@@ -1627,9 +1638,12 @@ class MiniMaxM3Attention(Attention):
                 return None
             if offload:
                 # An offloaded layer writes its new tokens into sparse cache arena cells.
-                # NVFP4 offload returned above, so there is no scale arena to write.
                 buffers = kv_cache_manager.get_sparse_arena_buffers(self.layer_idx, "HND")
-                scale_buffers = None
+                scale_buffers = (
+                    kv_cache_manager.get_sparse_arena_buffers(self.layer_idx, "HND", scales=True)
+                    if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
+                    else None
+                )
             else:
                 buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
                 scale_buffers = (
@@ -1669,6 +1683,8 @@ class MiniMaxM3Attention(Attention):
                 kv_quant_scale,
                 *static_args,
                 positions,
+                index_out_cache_loc=index_out_cache_loc,
+                kv_cache_is_arena=offload,
             )
         else:
             q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
@@ -1793,7 +1809,7 @@ class MiniMaxM3Attention(Attention):
         layer_uses_nvfp4 = scale_buffers is not None
         if layer_uses_nvfp4:
             supports_fused_layout = buffers is not None and _nvfp4_cache_supports_fused_write(
-                buffers, scale_buffers, self.num_key_value_heads
+                buffers, scale_buffers, self.num_key_value_heads, arena=offload
             )
             supported_main_cache = (
                 supports_fused_layout

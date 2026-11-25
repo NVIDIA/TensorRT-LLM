@@ -713,8 +713,10 @@ No host involvement, so the call enqueues and returns. Every shape is static acr
 The selection is not the only thing that needs a cell. The block being written needs one
 too, and needs it before the selection takes any victim. Both are resolved by the same
 probe, over one virtual list: the in-flight ordinals `[history_units, capacity_units)`
-first, then the selection. A missing in-flight unit normally only reserves a cell.
-With `include_partial_units`, a nonempty host prefix is restored on its first reservation.
+first, then the selection. A missing in-flight unit only reserves a cell. With
+`include_partial_units`, the growing unit's nonempty host prefix is restored on its first
+reservation, which only write preparation makes: a selection resolve leaves that unit to it
+(see *Writing the in-flight unit*).
 
 ### Writing the in-flight unit
 
@@ -738,9 +740,11 @@ input tokens are available.
 MiniMax-M3 offload always sets `include_partial_units=True`; it is not configurable. Its
 blocks receive a token appended each step, which this mode serves. History units use
 `floor(history / unit_tokens)` and capacity units use
-`ceil(capacity / unit_tokens)`, reserving the growing block on every step. A miss for that
-block restores its host prefix before exposing the write index; a hit leaves live writes
-intact. The fetch work list includes one extra entry per row for that prefix. Write
+`ceil(capacity / unit_tokens)`, reserving the growing block on every step. In write
+preparation, a miss for that block restores its host prefix before exposing the write index;
+a hit leaves live writes intact. A selection resolve never reserves or copies that block, so
+its fetch list holds complete history only: even a resolve that runs before write
+preparation queues no copy that could land on a token the model writes before the fetch. Write
 preparation has a separate fixed list with one entry per row, overwritten on each call;
 empty entries use `kNoSparseSlot`. It needs no counter or per-call memset and cannot
 clobber a pending selection's fetch list. Each advancing row flushes through
@@ -878,8 +882,8 @@ and does so worst where histories are short — early decode, short prompts — 
 exactly the regime someone reads the rate to understand.
 
 So the resolve counts the selection entries that named real history, in the pass that
-already classifies them. The miss half counts selected-history misses, excluding partial-prefix restores even
-when a selection resolve also restores one. The two are produced together and agree by construction on
+already classifies them. The miss half counts selected-history misses; partial-prefix restores happen only in
+write preparation and are never counted. The two are produced together and agree by construction on
 what they count; hits are their difference and are never stored.
 
 **Each row adds its own contribution, rather than anything reading a total afterwards.**

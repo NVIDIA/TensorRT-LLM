@@ -2246,35 +2246,38 @@ class TestSparseUnitCopy(unittest.TestCase):
 
     def test_the_work_splits_across_the_grid(self):
         """Giving the copy more CTAs only divides the work list, never changes the result."""
-        unit, units_per_page, misses = 16, 8, 5
-        page_stride = unit * units_per_page
-        host = self._pattern(page_stride)
-        # More warps than work on the last pass: the surplus must find nothing to do.
-        for grid_ctas in (1, 2, 4, 8):
-            with self.subTest(grid_ctas=grid_ctas):
-                result = _introspection.sparse_unit_copy(
-                    host_pool=host,
-                    host_page_stride=page_stride,
-                    page_table=[0],
-                    device_arena=[0] * page_stride,
-                    base_cell=0,
-                    num_blocks=1,
-                    cells_per_buffer=1,
-                    buffer_bytes=page_stride,
-                    num_chunks=1,
-                    chunk_bytes=unit,
-                    chunk_stride=0,
-                    unit_stride=unit,
-                    expansion=units_per_page,
-                    miss_ordinal=list(range(misses)),
-                    miss_slot=list(range(misses)),
-                    miss_count=[misses],
-                    selection_width=misses,
-                    buffer_layer=list(range(1)),
-                    grid_ctas=grid_ctas,
-                )
-                self.assertEqual(result[: unit * misses], host[: unit * misses])
-                self.assertEqual(result[unit * misses :], [0] * (page_stride - unit * misses))
+        units_per_page, misses = 8, 5
+        # A 16-byte unit takes a warp and a 16 KiB one a whole CTA, so on the CTA path these
+        # grids run from CTAs taking several units each to more CTAs than units. The surplus
+        # warps or CTAs must find nothing to do.
+        for unit in (16, 16384):
+            page_stride = unit * units_per_page
+            host = self._pattern(page_stride)
+            for grid_ctas in (1, 2, 4, 8):
+                with self.subTest(unit=unit, grid_ctas=grid_ctas):
+                    result = _introspection.sparse_unit_copy(
+                        host_pool=host,
+                        host_page_stride=page_stride,
+                        page_table=[0],
+                        device_arena=[0] * page_stride,
+                        base_cell=0,
+                        num_blocks=1,
+                        cells_per_buffer=1,
+                        buffer_bytes=page_stride,
+                        num_chunks=1,
+                        chunk_bytes=unit,
+                        chunk_stride=0,
+                        unit_stride=unit,
+                        expansion=units_per_page,
+                        miss_ordinal=list(range(misses)),
+                        miss_slot=list(range(misses)),
+                        miss_count=[misses],
+                        selection_width=misses,
+                        buffer_layer=list(range(1)),
+                        grid_ctas=grid_ctas,
+                    )
+                    self.assertEqual(result[: unit * misses], host[: unit * misses])
+                    self.assertEqual(result[unit * misses :], [0] * (page_stride - unit * misses))
 
 
 class TestSparseFetch(unittest.TestCase):
@@ -4684,7 +4687,12 @@ class TestSparseWriteIndices(unittest.TestCase):
             manager.shutdown()
 
     def test_partial_restore_preserves_pending_fetch_and_committed_prefix(self) -> None:
-        """Write preparation may interleave with a fetch; partial commits see current bytes."""
+        """Write preparation and the write itself may interleave with a fetch.
+
+        The selection resolves first; write preparation then reserves the growing block, and
+        the model appends to it before the fetch runs. The cell keeps both the transferred
+        prefix and the appended token, and the partial commit publishes them.
+        """
         ctypes, cudart, torch = self._deps()
         manager = self._manager(partial=True)
         cache = reused = None
@@ -4719,8 +4727,9 @@ class TestSparseWriteIndices(unittest.TestCase):
                 torch.cuda.synchronize()
                 batch.resolve_sparse_selection(buffers, selected, handle)
                 batch.prepare_sparse_write_indices(buffers, out, handle)
-                batch.fetch_resolved_pages(buffers, selected, fetched, handle)
                 torch.cuda.synchronize()
+                index = int(out[0, 0])
+                self.assertEqual(int(out[1, 0]), BAD_PAGE_INDEX)
 
                 def read_cell(index):
                     data = (ctypes.c_ubyte * self.BUF)()
@@ -4733,20 +4742,26 @@ class TestSparseWriteIndices(unittest.TestCase):
                     self.assertEqual(int(error), 0)
                     return bytes(data)
 
-                self.assertEqual(batch.peek_hit_miss_counter(), (0, 1))
-                self.assertEqual(read_cell(int(fetched[0, 0, 0])), patterns[0])
-                index = int(out[0, 0])
-                self.assertEqual(read_cell(index), patterns[1])
-                self.assertEqual(int(out[1, 0]), BAD_PAGE_INDEX)
-                written = self._pattern(self.BUF, 53)
-                source = (ctypes.c_ubyte * self.BUF).from_buffer_copy(written)
+                # The model appends token `history` as soon as its write index exists, before
+                # the selection's fetch has run.
+                token_bytes = self.BUF // self.TPB
+                offset = (history % self.TPB) * token_bytes
+                token = self._pattern(token_bytes, 53)
+                source = (ctypes.c_ubyte * token_bytes).from_buffer_copy(token)
                 (error,) = cudart.cudaMemcpy(
-                    arena + index * self.BUF,
+                    arena + index * self.BUF + offset,
                     ctypes.addressof(source),
-                    self.BUF,
+                    token_bytes,
                     cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
                 )
                 self.assertEqual(int(error), 0)
+                batch.fetch_resolved_pages(buffers, selected, fetched, handle)
+                torch.cuda.synchronize()
+
+                self.assertEqual(batch.peek_hit_miss_counter(), (0, 1))
+                self.assertEqual(read_cell(int(fetched[0, 0, 0])), patterns[0])
+                written = patterns[1][:offset] + token + patterns[1][offset + token_bytes :]
+                self.assertEqual(read_cell(index), written)
                 for _ in range(2):
                     batch.prepare_sparse_write_indices(buffers, out, handle)
                 torch.cuda.synchronize()

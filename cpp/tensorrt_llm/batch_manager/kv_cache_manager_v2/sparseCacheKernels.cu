@@ -409,8 +409,6 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
-    // Misses of the write unit's restored prefix, which the hit/miss statistics leave out.
-    __shared__ int32_t numRestoreMisses;
     __shared__ int32_t copyBase;
     // The staleness at which the misses run out, and how many of the entries holding
     // exactly that staleness are wanted. A threshold past the histogram evicts nothing.
@@ -435,7 +433,6 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
-        numRestoreMisses = 0;
         thresholdStaleness = kAgeBuckets;
         neededAtThreshold = 0;
         takenAtThreshold = 0;
@@ -521,15 +518,18 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         {
             (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
         }
+        else if (i < inFlight && ord < copyableUnits)
+        {
+            // A growing unit with a host prefix is its write preparation's to reserve, which
+            // restores the prefix before the model writes. Queued here, the copy could land
+            // after a token written in between.
+            inFlightSlot[i] = kNoSparseSlot;
+        }
         else
         {
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
             missIdx[j] = i;
-            if (i < inFlight && ord < copyableUnits)
-            {
-                atomicAdd(&numRestoreMisses, 1);
-            }
         }
     }
     if (resolvedMine > 0)
@@ -539,14 +539,14 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __syncthreads();
 
     // Claim this row's run in the compacted list now that the miss set is final, so the
-    // eviction loop below can write straight into it. Copyable misses include a partial
-    // host prefix when configured. Hit/miss statistics count only selected entries,
-    // excluding the write unit's restore, and are added once per row.
+    // eviction loop below can write straight into it. Only complete history is copied, so
+    // every claimed entry is a selected miss. Hit/miss statistics count only selected
+    // entries, and are added once per row.
     {
         int32_t mine = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
-            mine += missOrd[j] < copyableUnits ? 1 : 0;
+            mine += missOrd[j] < historyUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -554,17 +554,15 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         if (tid == 0)
         {
             copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
-            // The list is sized for every row missing its whole selection and, with partial
-            // units, the growing unit's prefix, so a claim can only run past it if the caller
-            // sized it from a different width.
+            // The list is sized for every row missing its whole selection, so a claim can only
+            // run past it if the caller sized it from a different width.
             KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
-                int32_t const selectedMisses = claimed - numRestoreMisses;
-                if (selectedMisses > 0)
+                if (claimed > 0)
                 {
-                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
+                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
                 }
             }
         }
@@ -620,10 +618,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t const position = missIdx[j];
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
         (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
-        // Fetch complete history and, when configured, the host prefix of a newly
-        // reserved partial unit. Resident units are hits, so a fetch never overwrites
-        // the token the model has just appended to its reserved cell.
-        if (ordinal < copyableUnits)
+        // Fetch complete history only. An in-flight miss is just reserved: the one with a
+        // host prefix was left to write preparation above, so no copy queued here can land
+        // on a token the model writes before the fetch runs.
+        if (ordinal < historyUnits)
         {
             auto const c = copyBase + atomicAdd(&numCopy, 1);
             args.work.row[c] = row;
@@ -750,8 +748,9 @@ __device__ void copySparseUnits(
     SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
 {
     // Large host reads need enough independent loads to cover link latency. Small
-    // units and dirty-token writes keep a warp per item for batch parallelism.
-    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= 16 * 1024)
+    // units and dirty-token writes keep a warp per item for batch parallelism. The
+    // grid gives each large item a CTA of its own; see sparseCopyGridCtas.
+    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= kSparseCtaCopyMinChunkBytes)
     {
         copySparseUnitsImpl<Vec, kThreads>(args, desc, list, globalWarp);
     }
@@ -1050,12 +1049,13 @@ int32_t sparseCopyMultiprocessors(CUdevice device)
     return std::max(smCount, 1);
 }
 
-int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount) noexcept
+int32_t sparseCopyGridCtas(int32_t workCapacity, int32_t smCount, bool ctaPerItem) noexcept
 {
     constexpr int32_t kCtasPerSm = 4;
 
     int32_t const full = std::max(smCount, 1) * kCtasPerSm;
-    int32_t const needed = (workCapacity + kWarpsPerCopyCta - 1) / kWarpsPerCopyCta;
+    int32_t const itemsPerCta = ctaPerItem ? 1 : kWarpsPerCopyCta;
+    int32_t const needed = (workCapacity + itemsPerCta - 1) / itemsPerCta;
     return std::max(1, std::min(full, needed));
 }
 

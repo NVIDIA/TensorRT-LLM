@@ -451,9 +451,8 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer. With `enable_kv_cache_offload: true`, layers with an
-NVFP4 main cache skip the fused producer and run the unfused norm, RoPE and
-cache writes. The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
+caches with an FP8 indexer, with or without `enable_kv_cache_offload: true`.
+The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
 family also accept a standalone DSpark drafter; see the deployment guide.
 
 On a disaggregated generation worker, `enable_kv_cache_offload: true` keeps

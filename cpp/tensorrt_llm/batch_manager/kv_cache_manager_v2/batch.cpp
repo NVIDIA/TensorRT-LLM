@@ -206,6 +206,12 @@ void Batch::_allocateCopyDesc()
 
         for (auto const& run : runs)
         {
+            // A fetch copies such a pool's units a CTA each, so its grid needs a CTA for
+            // every item the list can hold.
+            if (run.layout.chunkBytes >= kSparseCtaCopyMinChunkBytes)
+            {
+                scratch.fetchCopiesByCta = true;
+            }
             // A run is consecutive buffers of one pool, which can span layers: a pool holds
             // every layer's buffer of one size. An index table spec covers one layer's
             // run of a pool (sparseIndexTableSpecs), so each buffer names its own table,
@@ -328,13 +334,12 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
     auto const layers = static_cast<size_t>(scratch.numLayers);
     // One list for the fetch, holding the worst case of every row missing its whole
-    // selection plus, with partial units, the growing unit's restored prefix; one per layer
-    // for the write-back, each holding the units the step's token
+    // selection (a growing unit's prefix is restored through restoreWork instead); one per
+    // layer for the write-back, each holding the units the step's token
     // budget can carry across a watermark. The fetch's is the life cycle's, not the
     // selection's: every layer of the selection just resolved reads it, and the next
     // resolve of any selection here overwrites it.
-    scratch.fetchWork.capacity
-        = static_cast<int32_t>(rows) * (width + static_cast<int>(mManager->sparseCacheIncludesPartialUnits(lcId)));
+    scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
     scratch.fetchWork.numLists = 1;
     scratch.restoreWork.capacity = mManager->sparseCacheIncludesPartialUnits(lcId) ? mMaxBatchSize : 0;
     scratch.restoreWork.numLists = 1;
@@ -1792,7 +1797,7 @@ void Batch::prepareSparseWriteIndices(
         copy.direction = SparseCopyDirection::kFetch;
         copy.unitsPerPage = unitsPerPage;
         copy.work = resolve.work;
-        copy.gridCtas = sparseCopyGridCtas(numRows, mManager->_smCount());
+        copy.gridCtas = sparseCopyGridCtas(numRows, mManager->_smCount(), scratch.fetchCopiesByCta);
         launchSparseUnitCopy(copy, stream);
     }
 
@@ -1884,7 +1889,8 @@ void Batch::writeBackSparseUnits(LifeCycleId lifeCycle, CUstream stream)
     // The work list is every layer of this row, which is what a write-back crosses at once,
     // unlike a fetch, which resolves one layer across the whole batch.
     copy.work = scratch.flushWork;
-    copy.gridCtas = sparseCopyGridCtas(scratch.flushWork.capacity, mManager->_smCount());
+    // A write-back copies a warp per item whatever its chunk size.
+    copy.gridCtas = sparseCopyGridCtas(scratch.flushWork.capacity, mManager->_smCount(), /*ctaPerItem=*/false);
     launchSparseUnitCopy(copy, stream);
 }
 
@@ -2032,7 +2038,7 @@ void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t con
     copy.direction = SparseCopyDirection::kFetch;
     copy.unitsPerPage = unitsPerPage;
     copy.work = layerWork;
-    copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
+    copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount(), scratch.fetchCopiesByCta);
     launchSparseUnitCopy(copy, stream);
 
     // The index table the attention kernel reads is derived from the resolve's slots alone:

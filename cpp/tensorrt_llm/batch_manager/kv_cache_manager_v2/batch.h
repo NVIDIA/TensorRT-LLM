@@ -140,6 +140,11 @@ struct SparseStepScratch
     //! descriptors and differ only in which of them they launch over.
     SparseCopyDesc const* copyDesc = nullptr;
     int32_t numBuffers = 0;
+
+    //! Whether a fetch copies this life cycle's work items a CTA each, which a pool whose
+    //! chunks reach kSparseCtaCopyMinChunkBytes calls for. Set with the descriptors; sizes
+    //! the grids of the fetch and of the partial-prefix restore.
+    bool fetchCopiesByCta = false;
 };
 
 //! Per-row watermarks, in tokens. Everything a step needs about how far a request has got

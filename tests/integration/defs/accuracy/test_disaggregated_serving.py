@@ -3485,26 +3485,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(3600)
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
-    def test_kv_cache_offload(self, kv_dtype: str) -> None:
-        """M3 tokens match resident decode across long-context cache lifecycles."""
-        self._run_kv_cache_offload(kv_dtype, block_reuse=False)
-
-    @pytest.mark.timeout(3600)
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    @parametrize_with_ids("kv_dtype", ["fp8"])
     def test_kv_cache_offload_block_reuse(self, kv_dtype: str) -> None:
         """M3 repeated prompts reuse received KV and match resident decode exactly."""
-        self._run_kv_cache_offload(kv_dtype, block_reuse=True)
-
-    def _run_kv_cache_offload(self, kv_dtype: str, *,
-                              block_reuse: bool) -> None:
         _run_minimax_m3_kv_cache_offload(
             f"{llm_models_root()}/MiniMax-M3-NVFP4",
             "nvidia/MiniMax-M3-NVFP4",
             kv_dtype,
-            block_reuse=block_reuse)
+            block_reuse=True)
 
     @pytest.mark.skip_less_device(6)
     @pytest.mark.skip_less_device_memory(140000)

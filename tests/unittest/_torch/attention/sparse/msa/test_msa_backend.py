@@ -585,6 +585,45 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
 
 
 @pytest.mark.cpu_only
+def test_msa_buffers_stage_no_views_for_offloaded_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offloaded layers' arenas belong to the cache manager, so no view of them is staged.
+
+    The compiled producer, the only reader of the staged views, never runs with offload.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(
+        sparse_layer_ids=[3, 4],
+        layer_offsets={3: 0, 4: 1},
+        _enable_kv_cache_offload=True,
+        offloads_layer=lambda layer_idx: True,
+        is_nvfp4_layer=lambda layer_idx: True,
+    )
+    manager = metadata.kv_cache_manager
+    getters = (
+        "get_buffers",
+        "get_block_scale_buffers",
+        "get_sparse_arena_buffers",
+        "get_index_k_buffer",
+    )
+    for name in getters:
+        setattr(manager, name, Mock())
+    monkeypatch.setattr(
+        metadata,
+        "get_empty",
+        lambda buffers, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]),
+    )
+    # No native pool in this CPU test; only zero-copy cache-view staging is under test.
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+
+    metadata._create_msa_buffers()
+
+    assert metadata.msa_layer_cache_tensors == {}
+    for name in getters:
+        getattr(manager, name).assert_not_called()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("kv_dtype", "expect_lengths"),
     [

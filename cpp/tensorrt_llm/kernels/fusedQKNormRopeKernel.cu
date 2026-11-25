@@ -745,15 +745,16 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
 // rounded to BF16 (matching the existing materialized producer), quantized in
 // four-lane SF16 groups, and written directly to the packed-data and scale
 // pools.  K scales are token-major; V scales use the runtime's 4x4 token-quad
-// swizzle.
+// swizzle.  The data and scale caches share outCacheLoc's slots; index-K uses
+// indexOutCacheLoc, so either main cache may be a sparse cache arena.
 __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
     __nv_fp8_e4m3* indexQOutput, uint8_t* kvDataCache, uint8_t* kvScaleCache, __nv_fp8_e4m3* indexKCache,
-    int const* outCacheLoc, float const* kvQuantScale, int64_t dataPageStride, int64_t dataPlaneStride,
-    int64_t dataHeadStride, int64_t dataTokenStride, int64_t scalePageStride, int64_t scalePlaneStride,
-    int64_t scaleHeadStride, int64_t indexPageStride, int64_t indexTokenStride, int64_t numPages, int numTokens,
-    int numHeadsQ, int numHeadsKV, int numHeadsIndex, float eps, __nv_bfloat16 const* qWeight,
-    __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight, __nv_bfloat16 const* indexKWeight,
-    float const* rotaryCosSin, int const* positionIds)
+    int const* outCacheLoc, int const* indexOutCacheLoc, float const* kvQuantScale, int64_t dataPageStride,
+    int64_t dataPlaneStride, int64_t dataHeadStride, int64_t dataTokenStride, int64_t scalePageStride,
+    int64_t scalePlaneStride, int64_t scaleHeadStride, int64_t indexPageStride, int64_t indexTokenStride,
+    int64_t numPages, int64_t numIndexPages, int numTokens, int numHeadsQ, int numHeadsKV, int numHeadsIndex, float eps,
+    __nv_bfloat16 const* qWeight, __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight,
+    __nv_bfloat16 const* indexKWeight, float const* rotaryCosSin, int const* positionIds)
 {
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
@@ -856,14 +857,15 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
         return;
     }
 
-    int slot = laneId == 0 ? outCacheLoc[tokenIdx] : 0;
+    int const* slots = isIndexK ? indexOutCacheLoc : outCacheLoc;
+    int slot = laneId == 0 ? slots[tokenIdx] : 0;
     slot = __shfl_sync(0xffffffff, slot, 0);
     if (slot < 0)
     {
         return;
     }
     int const page = slot / kMinimaxM3PageSize;
-    if (page >= numPages)
+    if (page >= (isIndexK ? numIndexPages : numPages))
     {
         return;
     }
@@ -1103,12 +1105,12 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
 
 void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_data_cache, void* kv_scale_cache, void* index_k_cache, int const* out_cache_loc,
-    float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride, int64_t data_head_stride,
-    int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride, int64_t scale_head_stride,
-    int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int page_size, int num_tokens,
-    int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
-    void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
-    float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
+    int const* index_out_cache_loc, float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride,
+    int64_t data_head_stride, int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride,
+    int64_t scale_head_stride, int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages,
+    int64_t num_index_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 NVFP4 horizontal producer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(
@@ -1139,11 +1141,12 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
         static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
         static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<uint8_t*>(kv_data_cache),
         static_cast<uint8_t*>(kv_scale_cache), static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc,
-        kv_quant_scale, data_page_stride, data_plane_stride, data_head_stride, data_token_stride, scale_page_stride,
-        scale_plane_stride, scale_head_stride, index_page_stride, index_token_stride, num_pages, num_tokens,
-        num_heads_q, num_heads_kv, num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight),
-        static_cast<__nv_bfloat16 const*>(k_weight), static_cast<__nv_bfloat16 const*>(index_q_weight),
-        static_cast<__nv_bfloat16 const*>(index_k_weight), rotary_cos_sin, position_ids));
+        index_out_cache_loc, kv_quant_scale, data_page_stride, data_plane_stride, data_head_stride, data_token_stride,
+        scale_page_stride, scale_plane_stride, scale_head_stride, index_page_stride, index_token_stride, num_pages,
+        num_index_pages, num_tokens, num_heads_q, num_heads_kv, num_heads_index, eps,
+        static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
+        static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
+        rotary_cos_sin, position_ids));
 }
 } // namespace kernels
 

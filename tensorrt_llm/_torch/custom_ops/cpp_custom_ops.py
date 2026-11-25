@@ -626,13 +626,30 @@ def _register_fake():
 
     @torch.library.register_fake(
         "trtllm::minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert")
-    def _(packed, kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc,
-          kv_quant_scale, num_heads_q, num_heads_kv, num_heads_index, head_dim,
-          rotary_dim, eps, q_weight, k_weight, index_q_weight, index_k_weight,
-          rotary_cos_sin, position_ids):
+    def _(packed,
+          kv_data_cache,
+          kv_scale_cache,
+          index_k_cache,
+          out_cache_loc,
+          kv_quant_scale,
+          num_heads_q,
+          num_heads_kv,
+          num_heads_index,
+          head_dim,
+          rotary_dim,
+          eps,
+          q_weight,
+          k_weight,
+          index_q_weight,
+          index_k_weight,
+          rotary_cos_sin,
+          position_ids,
+          index_out_cache_loc=None,
+          kv_cache_is_arena=False):
         del kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc
         del kv_quant_scale, num_heads_kv, rotary_dim, eps, q_weight, k_weight
         del index_q_weight, index_k_weight, rotary_cos_sin, position_ids
+        del index_out_cache_loc, kv_cache_is_arena
         num_tokens = packed.shape[0]
         return (packed.new_empty((num_tokens, num_heads_q, head_dim),
                                  dtype=torch.float8_e4m3fn),
