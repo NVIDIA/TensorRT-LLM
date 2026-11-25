@@ -37,10 +37,6 @@ namespace tensorrt_llm::common
 // swizzled. Expressing both as a layout lets one quantizer serve both: it just evaluates
 // partition(i, g).
 //
-//   ScaleAlign is the alignment, in scales, that the consumer needs a sequence's scale base to
-//   have. The SM90 K path loads its four scales as one float4, so it needs 4; everything else
-//   needs 1.
-//
 //   ScaleGeometry declares the scale-buffer addressing convention used by the consumer.
 
 // -------------------------------------------------------------------------------------------
@@ -51,7 +47,6 @@ struct ContiguousPartition
     using Layout = cute::Layout<cute::Shape<cute::Shape<cute::Int<BlockSize>>, cute::Shape<cute::_1>>,
         cute::Stride<cute::Stride<cute::_1>, cute::Stride<cute::Int<BlockSize>>>>;
     using ScaleGeometry = ContiguousScaleGeometry<BlockSize>;
-    static constexpr int ScaleAlign = ScaleGeometry::kScaleAlign;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -67,7 +62,6 @@ struct HopperQPartition
     using Layout = cute::Layout<cute::Shape<cute::Shape<cute::_2>, cute::Shape<cute::_8, cute::_4>>,
         cute::Stride<cute::Stride<cute::_8>, cute::Stride<cute::_1, cute::_16>>>;
     using ScaleGeometry = HopperQScaleGeometry;
-    static constexpr int ScaleAlign = ScaleGeometry::kScaleAlign;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -84,7 +78,6 @@ struct HopperKPartition
         cute::Stride<cute::Stride<cute::_1, cute::_8>, cute::Stride<cute::_64, cute::_2>>>;
     // The consumer loads a thread's four chunk scales with one 128-bit access.
     using ScaleGeometry = HopperKScaleGeometry;
-    static constexpr int ScaleAlign = ScaleGeometry::kScaleAlign;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -100,16 +93,13 @@ struct PartitionTraits
     static constexpr int ScalesPerTile = cute::size<1>(Layout{});
     // Tokens in one tile.
     static constexpr int TileTokens = cute::size(Layout{});
-    static constexpr int ScaleAlign = Partition::ScaleAlign;
 
     static_assert(TileTokens == TokensPerScale * ScalesPerTile, "partition must be a bijection");
     static_assert(cute::cosize(Layout{}) == TileTokens, "partition must tile densely");
-    static_assert(ScaleAlign > 0 && (ScaleAlign & (ScaleAlign - 1)) == 0, "ScaleAlign must be 2^k");
 
     using ScaleGeometry = typename Partition::ScaleGeometry;
     static_assert(TokensPerScale == ScaleGeometry::kTokensPerScale);
     static_assert(ScalesPerTile == ScaleGeometry::kScalesPerTile);
-    static constexpr int SlotsPerSeq = ScaleGeometry::kSlotsPerSeq;
 
     CUTE_HOST_DEVICE static constexpr int scaleBase(int cuSeqLen, int seqIdx)
     {
