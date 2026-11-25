@@ -60,7 +60,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format"
+pytest "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>

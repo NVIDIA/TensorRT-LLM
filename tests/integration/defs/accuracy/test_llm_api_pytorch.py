@@ -2145,8 +2145,8 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
     """Build a MoeLoadBalancerConfig for DeepSeek V4 from the HF config.
 
     All V4 layers run MoE (no first_k_dense_replace prefix), so static
-    assignments cover every layer in 0..num_hidden_layers-1. Extra slots
-    per rank match the TestNemotronV3Super pattern (16 redundant per rank).
+    assignments cover every layer in 0..num_hidden_layers-1. Each rank gets
+    16 redundant expert slots.
     """
     with open(f"{model_path}/config.json") as f:
         cfg = json.load(f)
@@ -2617,12 +2617,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         eager_token_ids = run(PrefillCudaGraphBackend.DISABLED)
         breakable_token_ids = run(PrefillCudaGraphBackend.BREAKABLE)
         assert breakable_token_ids == eager_token_ids
-
-
-_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
-    "Solve the problem carefully. End your response with a final line exactly "
-    "in the form #### <answer>, using the simplest numeric form without units "
-    "or trailing zeros.")
 
 
 @pytest.mark.timeout(14400)

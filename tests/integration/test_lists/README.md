@@ -38,12 +38,12 @@ Copy the test path and command-line options, omitting `ISOLATION`,
 node ID and prevents matching if left in:
 
 ```yaml
-- accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] TIMEOUT (90) ISOLATION
+- accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] TIMEOUT (90) ISOLATION
 - unittest/executor/test_base_worker.py ISOLATION
 ```
 
 ```text
-accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] SKIP (Known issue in this test)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency] SKIP (Known issue in this test)
 unittest/executor/test_base_worker.py SKIP (Known issue in this file)
 ```
 
