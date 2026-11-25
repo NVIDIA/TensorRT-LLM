@@ -589,6 +589,7 @@ class TestRetainedGenerationAllocation:
         assert manager._allocated_draft_lens == {5: 3}
         assert manager._inflight_draft_lens == {5: [3]}
         assert manager._retained_generation_allocations == {}
+        manager._fill_fresh_kv_pages.assert_called_once_with(5)
 
     @pytest.mark.parametrize("draft_slots", [1, 3])
     def test_an_equal_or_narrower_retry_keeps_the_allocation(self, draft_slots):
@@ -608,6 +609,7 @@ class TestRetainedGenerationAllocation:
         assert manager._retained_generation_allocations == {5: 1}
         assert manager._allocated_draft_lens == {}
         assert manager._inflight_draft_lens == {}
+        manager._fill_fresh_kv_pages.assert_not_called()
 
 
 class TestSkippedGenerationStepUndo:

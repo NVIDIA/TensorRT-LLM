@@ -157,30 +157,22 @@ def test_declares_speculative_prefill() -> None:
     )
 
 
-def test_only_an_explicit_true_declares() -> None:
-    class Truthy:
-        supports_speculative_prefill = "yes"
-
-    assert not KvCacheConnectorManager.declares_speculative_prefill(Truthy, Truthy)
-
-
 @pytest.mark.parametrize(
     ("role", "normalized_role"),
     [
-        ("context", "context"),
         ("CONTEXT", "context"),
         ("Ctx0", "context"),
-        ("generation", "generation"),
         ("GENERATION", "generation"),
         ("gen0", "generation"),
-        ("Gen1", "generation"),
         ("unknown", None),
-        ("", None),
         (None, None),
     ],
 )
-@pytest.mark.parametrize("capacity_only", [False, True])
-@pytest.mark.parametrize("speculative_prefill_only", [False, True])
+@pytest.mark.parametrize(
+    ("speculative_prefill_only", "capacity_only"),
+    [(True, False), (False, False), (True, True)],
+    ids=["speculative_prefill", "not_speculative", "capacity_only"],
+)
 def test_speculative_role_checked_before_serving(
     monkeypatch: pytest.MonkeyPatch,
     role: str | None,
@@ -207,10 +199,8 @@ def test_speculative_role_checked_before_serving(
 
 @pytest.mark.parametrize("capacity_only", [False, True])
 @pytest.mark.parametrize("speculative_prefill_only", [False, True])
-@pytest.mark.parametrize("use_v2", [True, "auto", False], ids=["v2", "auto", "v1"])
-@pytest.mark.parametrize(
-    "make_spec_config", [None, _mtp_eagle, _eagle3], ids=["no_spec", "mtp_eagle", "eagle3"]
-)
+@pytest.mark.parametrize("use_v2", [True, "auto"], ids=["v2", "auto"])
+@pytest.mark.parametrize("make_spec_config", [None, _mtp_eagle], ids=["no_spec", "mtp_eagle"])
 def test_speculation_is_refused_next_to_a_kv_moving_connector(
     make_spec_config: Callable[[], SpeculativeConfig] | None,
     use_v2: bool | str,

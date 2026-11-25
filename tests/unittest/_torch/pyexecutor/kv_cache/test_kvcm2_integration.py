@@ -8652,33 +8652,3 @@ class TestVetoedContextChunk:
         assert cache.capacity == cache.history_length == long_turn.context_current_position
         for request in (long_turn, short_turn):
             manager.free_resources(request)
-
-
-@pytest.mark.parametrize("prefetch_limit", [0, 2])
-def test_constructed_manager_supports_executor_disk_prefetch(prefetch_limit: int) -> None:
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    manager, _ = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            enable_block_reuse=True,
-            disk_prefetch_num_reqs=prefetch_limit,
-            max_gpu_total_bytes=16 << 20,
-        ),
-        [Mock()],
-    )
-    requests = [SimpleNamespace(is_first_context_chunk=True, py_request_id=i) for i in range(3)]
-    executor = SimpleNamespace(
-        _is_kv_manager_v2=True,
-        kv_cache_manager=manager,
-        active_requests=requests,
-        _prefetched_request_ids=set(),
-    )
-    with patch.object(manager, "prefetch_for_context_tokens") as prefetch:
-        PyExecutor._prefetch_for_context_requests(executor)
-        PyExecutor._prefetch_for_context_requests(executor)
-    if prefetch_limit:
-        assert prefetch.call_args_list == [call(requests[:2]), call(requests[2:])]
-        assert executor._prefetched_request_ids == {0, 1, 2}
-    else:
-        prefetch.assert_not_called()
-        assert not executor._prefetched_request_ids

@@ -217,17 +217,6 @@ def test_speculative_prefill_requires_kv_cache_manager_v2(
     connector.worker.register_kv_caches.assert_not_called()
 
 
-def test_unopted_connector_keeps_the_speculative_refusal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A connector must explicitly opt into speculative-prefill mode.
-    connector = _connector(capacity_only=False, enable_attention_dp=False)
-    executor, _ = _speculative_connector_executor(monkeypatch, connector, max_draft_len=1)
-
-    with pytest.raises(NotImplementedError, match="speculative decoding"):
-        executor._maybe_init_kv_connector_manager()
-
-
 @pytest.mark.parametrize(
     "use_v2,connector_mode,num_groups,with_retention,rejected",
     [

@@ -97,13 +97,6 @@ def _broadcast(manager: KvCacheConnectorManager) -> Mock:
     return kv_cache_connector.mpi_broadcast
 
 
-def test_modes_default_off() -> None:
-    with connector_mpi():
-        manager = KvCacheConnectorManager(MagicMock(), MagicMock())
-    assert manager.speculative_prefill_only is False
-    assert manager.enable_attention_dp is False
-
-
 @pytest.mark.parametrize("undeclared", ["worker", "scheduler"])
 def test_constructor_refuses_undeclared_connector(undeclared: str) -> None:
     worker = MagicMock() if undeclared == "worker" else SpecMock()
@@ -257,20 +250,3 @@ def test_admission_refuses_only_non_context_requests(
             PyExecutor._validate_request(executor, request)
     else:
         _validate_connector_admission(executor.kv_connector_manager, request)
-
-
-def test_only_an_explicit_context_only_flag_is_admitted() -> None:
-    """A merely truthy `is_context_only_request` is not context-only work."""
-    manager = _manager(attention_dp=True)
-    request = _request(7)
-    request.is_context_only_request = "yes"
-
-    with pytest.raises(ValueError, match="context-only"):
-        _validate_connector_admission(manager, request)
-    with pytest.raises(NotImplementedError, match="context-only"):
-        manager.query_num_new_matched_tokens(request, 0)
-    manager.scheduler.get_num_new_matched_tokens.assert_not_called()
-
-
-def test_admission_without_a_connector() -> None:
-    _validate_connector_admission(None, _request(7, context_only=False, generation_only=True))

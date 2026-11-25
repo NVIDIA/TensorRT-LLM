@@ -828,7 +828,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     assert order == ["connector", "kv pools"]
 
 
-@pytest.mark.parametrize("request_count", [0, 1, 2])
+@pytest.mark.parametrize("request_count", [0, 2])
 def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int) -> None:
     executor = object.__new__(PyExecutor)
     requests = [

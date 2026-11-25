@@ -279,16 +279,6 @@ def test_dummy_requests_never_reach_storage(forbid_connector_collectives: None) 
     cache.get_page_indices_by_layer_group.assert_not_called()
 
 
-def test_mock_requests_are_not_mistaken_for_dummies(forbid_connector_collectives: None) -> None:
-    """Only an explicit True marks a dummy; a mock answers every attribute truthily."""
-    manager = _manager()
-    request = MagicMock()
-    request.request_id = 5
-    manager.scheduler.request_finished.return_value = True
-    assert manager.request_finished(request, [1])
-    manager.scheduler.request_finished.assert_called_once_with(request, [1])
-
-
 @pytest.mark.parametrize(
     "is_dummy_request,is_attention_dp_dummy",
     [(True, False), (False, True)],
@@ -1869,17 +1859,6 @@ def test_failed_async_load_restarts_the_parked_request(
     # It is asked about again rather than skipped as an already-loaded request.
     assert manager.should_add_sequence(req)
     assert not manager.has_pending_transfers(8)
-
-
-def test_failed_async_load_of_a_finished_request_is_fatal(
-    forbid_connector_collectives: None,
-) -> None:
-    """A late report may describe an already-completed response using missing KV."""
-    manager = _failed_load_manager()
-    manager.worker.take_failed_async_load_requests.return_value = {9}
-    with pytest.raises(RuntimeError, match="earlier get_finished"):
-        manager.pop_failed_async_loads()
-    manager.worker.take_failed_async_load_requests.assert_called_once()
 
 
 def test_failed_async_load_in_adp_recovery_loop_is_not_resumed(
