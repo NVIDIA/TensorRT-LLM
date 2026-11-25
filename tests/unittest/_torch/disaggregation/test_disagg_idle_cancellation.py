@@ -2554,7 +2554,7 @@ def test_scheduler_holds_failed_receive_until_retirement_then_cleans_once(execut
         get_history_length=lambda req: req.prompt_len
     )
     executor._handle_errors("held transfer failed", requests=[request], charge_budget=False)
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.enable_batch_waiting = False
     executor._get_ctx_mla_kv_len_cap = lambda: None
