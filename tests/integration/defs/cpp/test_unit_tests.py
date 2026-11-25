@@ -116,7 +116,7 @@ def test_haloq_planner_unit_tests(build_haloq_planner_tests, build_dir):
 
     _cpp.run_command(
         [
-            f"{build_dir}/tests/unit_tests/kernels/moeRebalanceHaloQTest",
+            f"{build_dir}/tests/unit_tests/kernels/moe/moeRebalanceHaloQTest",
             f"--gtest_output=xml:{build_dir}/{xml_name}",
         ],
         cwd=build_dir,

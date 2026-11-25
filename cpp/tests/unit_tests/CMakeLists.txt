@@ -23,6 +23,7 @@ endif()
 
 add_subdirectory(common)
 add_subdirectory(kernels)
+add_subdirectory(kernels/moe)
 add_subdirectory(multi_gpu)
 add_subdirectory(runtime)
 add_subdirectory(thop)
