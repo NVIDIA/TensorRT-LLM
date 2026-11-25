@@ -79,7 +79,10 @@ def test_draft_head_without_a_worker_gathers():
 
 
 class _Core:
-    """The core's step surface: `begin_step`, the forward and its output split."""
+    """The core's step surface: `begin_step`, the forward and its output split, and no Lamport
+    launch-index registry (`_lamport_steps`, which the shell's forward brackets the step with)."""
+
+    _lamport_steps = None
 
     def __init__(self, final):
         self.final = final
