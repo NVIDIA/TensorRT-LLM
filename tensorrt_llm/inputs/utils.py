@@ -341,6 +341,11 @@ def _read_tensor_archive(content: bytes,
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             members = archive.infolist()
+            # zipfile renames a member by a Unicode path field or at a NUL;
+            # torch.load uses the stored name.
+            if any(m.filename != m.orig_filename for m in members):
+                raise ValueError(
+                    "Tensor payload record names must be stored as is.")
             names = [m.filename for m in members]
             prefix = names[0].split("/", 1)[0] + "/" if names else ""
             records = [n[len(prefix):] for n in names if n.startswith(prefix)]

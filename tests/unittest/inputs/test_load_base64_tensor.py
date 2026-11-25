@@ -87,6 +87,21 @@ def _pickle(
     return head + body + b"."
 
 
+def _alias(payload: str, record: str) -> str:
+    """Store one record under another name, with a Unicode path field naming it back."""
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as dst:
+        for info in src.infolist():
+            name = info.filename
+            copy = zipfile.ZipInfo(name + "~" if name.endswith(record) else name)
+            if copy.filename != name:
+                stored = binascii.crc32(copy.filename.encode())
+                copy.extra = struct.pack("<HHBI", 0x7075, 5 + len(name), 1, stored) + name.encode()
+            dst.writestr(copy, src.read(info))
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
 def _with_pickle(pickled: bytes) -> str:
     """A torch.save archive of ``zeros(8)`` with its data.pkl record swapped."""
     return _rewrite(_encode(torch.zeros(8)), {"data.pkl": pickled})
@@ -421,6 +436,8 @@ _ARCHIVE_REJECTED = {
     "missing-pickle": (_rewrite(_ZEROS, {"data.pkl": None}), "only the records"),
     "unknown-record": (_rewrite(_ZEROS, add=["archive/notes"]), "only the records"),
     "duplicate-record": (_rewrite(_ZEROS, add=["archive/version"]), "only the records"),
+    # zipfile would read archive/version~ as archive/version; torch.load would not.
+    "unicode-path-alias": (_alias(_ZEROS, "/version"), "stored as is"),
     "directory-over-limit": (_rewrite(_ZEROS, add=[f"x/{i}" for i in range(400)]), "is over"),
     "zip64-directory-over-limit": (
         _patch(_ZEROS, _zip64_edit(40, lambda _: 8192, True)),
