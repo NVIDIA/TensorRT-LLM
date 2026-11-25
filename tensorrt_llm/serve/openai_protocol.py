@@ -317,8 +317,7 @@ class ResponseFormat(OpenAIBaseModel):
 class TensorBytesHandle(OpenAIBaseModel):
     """A tensor copied by value (``SharedTensorContainer.from_tensor_bytes``).
 
-    The only tensor form the protocol carries: CUDA IPC and shared-memory
-    handles do not work on another host.
+    Rotary state uses this form so it can cross hosts.
     """
     method_key: int
     tensor_size: List[NonNegativeInt]
@@ -337,12 +336,11 @@ class TensorBytesHandle(OpenAIBaseModel):
         return self
 
 
-# Context worker -> generation worker only. to_disaggregated_params() sets them
-# only for context-only results (a generation response would echo the request's
-# copies), and to_llm_disaggregated_params() passes them only to generation-only
-# requests.
+# Both handoffs carry the same prompt identity and portable rotary state.
 _MULTIMODAL_HANDOFF_FIELDS = ("multimodal_input", "mrope_position_ids_handle",
                               "mrope_position_deltas_handle")
+_ENCODER_HANDOFF_FIELDS = (*_MULTIMODAL_HANDOFF_FIELDS,
+                           "multimodal_embedding_handles")
 
 
 class DisaggregatedParams(OpenAIBaseModel):
@@ -375,10 +373,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     mrope_position_deltas_handle: Optional[TensorBytesHandle] = Field(
         default=None,
         description="mRoPE position deltas of the context request.")
-    # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve also needs the
-    # encoder -> context handoff: encoder embedding handles, with their hashes
-    # and prompt layout. Add them here and in to_disaggregated_params() /
-    # to_llm_disaggregated_params().
+    multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=
+        "Encoder exports in prompt item order for the prefill worker.")
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
@@ -409,7 +407,7 @@ class DisaggregatedParams(OpenAIBaseModel):
         # predates these fields still accepts a reply without them.
         data = handler(self)
         if isinstance(data, dict):
-            for key in _MULTIMODAL_HANDOFF_FIELDS:
+            for key in _ENCODER_HANDOFF_FIELDS:
                 if data.get(key, ...) is None:
                     data.pop(key)
         return data
@@ -1133,9 +1131,8 @@ class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
-    # TODO: progressivly add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
-    # TODO: and use a JSON-safe handle to refer to the server-side output
-    mm_embedding_handle: Optional[Dict[str, Any]] = None
+    mm_embedding_handle: Optional[Union[Dict[str, Any], List[Dict[str,
+                                                                  Any]]]] = None
 
     # Ids of the generated tokens. RL rollouts need exactly what the engine
     # sampled -- re-tokenizing the decoded text is lossy -- and these models are
@@ -2350,21 +2347,26 @@ def _deserialize_first_gen_logits(
     return result
 
 
-def to_disaggregated_params(
-        tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
+def to_disaggregated_params(tllm_disagg_params: LlmDisaggregatedParams,
+                            *,
+                            encoder: bool = False) -> DisaggregatedParams:
     if tllm_disagg_params is None:
         return None
     ctx_usage = tllm_disagg_params.ctx_usage
     if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
         ctx_usage = UsageInfo.model_validate(ctx_usage)
     handoff = {}
-    if tllm_disagg_params.request_type == "context_only":
+    if encoder or tllm_disagg_params.request_type == "context_only":
         handoff = {
             name: getattr(tllm_disagg_params, name)
             for name in _MULTIMODAL_HANDOFF_FIELDS
         }
+    if encoder:
+        handoff[
+            "multimodal_embedding_handles"] = tllm_disagg_params.multimodal_embedding_handles
     return DisaggregatedParams(
-        request_type=tllm_disagg_params.request_type,
+        request_type="context_only"
+        if encoder else tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
         first_gen_log_probs=_serialize_first_gen_log_probs(
             tllm_disagg_params.first_gen_log_probs),
@@ -2393,7 +2395,18 @@ def to_llm_disaggregated_params(
     ctx_usage = disaggregated_params.ctx_usage
     handoff = {}
     # LlmDisaggregatedParams lowercases request_type; match it the same way.
-    if disaggregated_params.request_type.lower() == "generation_only":
+    request_type = disaggregated_params.request_type.lower()
+    if disaggregated_params.multimodal_embedding_handles is not None:
+        if request_type not in ("context_only", "context_and_generation"):
+            raise ValueError(
+                "Encoder embedding handles require a prefill request")
+        if not disaggregated_params.multimodal_embedding_handles or disaggregated_params.multimodal_input is None:
+            raise ValueError(
+                "An encoder handoff requires embedding handles and multimodal_input"
+            )
+        handoff = disaggregated_params.model_dump(
+            include=set(_ENCODER_HANDOFF_FIELDS))
+    elif request_type == "generation_only":
         handoff = disaggregated_params.model_dump(
             include=set(_MULTIMODAL_HANDOFF_FIELDS))
     return LlmDisaggregatedParams(

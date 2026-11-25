@@ -325,12 +325,21 @@ class OpenAIDisaggregatedService(OpenAIService):
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
-        gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
+        encoder = (
+            request.disaggregated_params is not None
+            and request.disaggregated_params.multimodal_embedding_handles is not None
+        )
+        # A prepared prompt must reach the prefill worker that owns its exports.
+        gen_server, need_ctx = (
+            (None, True)
+            if encoder
+            else await self._check_conditional_disagg(request, disagg_request_id)
+        )
         # Context retries may replace disagg_request_id for the KV-transfer
         # handshake. Keep the ID used to reserve the generation server separate
         # so its coordinator-side load is released under the original key.
         gen_reservation_id = disagg_request_id if gen_server else None
-        benchmark_gen_only = await self._check_gen_only_disagg(request)
+        benchmark_gen_only = not encoder and await self._check_gen_only_disagg(request)
         need_ctx = need_ctx and not benchmark_gen_only
         ctx_response = None
         gen_req = request
@@ -453,13 +462,15 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
+        params = request.disaggregated_params
+        if params is None or params.multimodal_embedding_handles is None:
+            params = DisaggregatedParams(request_type="context_only")
+        params.request_type = "context_only"
+        params.disagg_request_id = disagg_request_id
+        params.schedule_style = self._schedule_style
+        params.return_prompt_token_ids_b64 = self._tokids_ctxbytes
         update = {
-            "disaggregated_params": DisaggregatedParams(
-                request_type="context_only",
-                disagg_request_id=disagg_request_id,
-                schedule_style=self._schedule_style,
-                return_prompt_token_ids_b64=self._tokids_ctxbytes,
-            ),
+            "disaggregated_params": params,
             "stream": False,
             "stream_options": None,
         }
@@ -496,8 +507,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                 # materialization on the orchestrator loop), else the int array.
                 if ctx_response.prompt_token_ids_b64 is not None:
                     request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                    if request.prompt_token_ids is not None:
+                        request.prompt_token_ids = None
                 else:
                     request.prompt_token_ids = ctx_response.prompt_token_ids
+                    if request.prompt_token_ids_b64 is not None:
+                        request.prompt_token_ids_b64 = None
                 # Opt-in: drop conversation history so the gen worker doesn't
                 # re-parse the full conversation JSON (dominates its GIL at high
                 # concurrency). It uses prompt_token_ids and only reads the last

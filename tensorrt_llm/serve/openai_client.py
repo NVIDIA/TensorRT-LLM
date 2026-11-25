@@ -46,7 +46,6 @@ from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     build_subagent_affinity_headers,
-    request_requires_internal_disagg_auth,
 )
 from tensorrt_llm.serve.multi_frontend import frontend_of_conversation
 from tensorrt_llm.serve.openai_protocol import (
@@ -343,7 +342,10 @@ class OpenAIHttpClient(OpenAIClient):
         headers = build_subagent_affinity_headers(
             self._internal_disagg_auth_key, request, self._role
         )
-        if self._role == ServerRole.GENERATION and request_requires_internal_disagg_auth(request):
+        if self._role == ServerRole.GENERATION or (
+            request.disaggregated_params is not None
+            and request.disaggregated_params.multimodal_embedding_handles is not None
+        ):
             headers.update(
                 build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
             )
@@ -565,11 +567,17 @@ class OpenAIHttpClient(OpenAIClient):
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
+            encoder_exports = (
+                disagg_params.multimodal_embedding_handles if disagg_params is not None else None
+            )
             response_started = False
             streaming_status_rejected = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
+                if encoder_exports is not None:
+                    # The worker may open these exports as soon as the POST starts.
+                    disagg_params.multimodal_embedding_handles = None
                 async with self._session.post(
                     url,
                     data=body,
@@ -606,6 +614,9 @@ class OpenAIHttpClient(OpenAIClient):
                                 response_metrics,
                             )
                     if http_response.status >= 400:
+                        if encoder_exports is not None and http_response.status == 401:
+                            # Authentication failed before the worker accepted ownership.
+                            disagg_params.multimodal_embedding_handles = encoder_exports
                         if is_stream:
                             # Preserve no-replay semantics even if reading the
                             # rejected response's diagnostics fails.
@@ -657,6 +668,8 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if encoder_exports is not None and isinstance(e, aiohttp.ClientConnectorError):
+                    disagg_params.multimodal_embedding_handles = encoder_exports
                 if fallback_url is not None and isinstance(e, aiohttp.ClientConnectorError):
                     logger.warning(
                         f"Context frontend affinity port of {url} refused the connection: "
@@ -668,6 +681,12 @@ class OpenAIHttpClient(OpenAIClient):
                     url, fallback_url = fallback_url, None
                     affinity_refusals = 1
                     continue
+                # Opening a shared tensor consumes its export. Only a refused
+                # connection establishes that no worker could have opened it.
+                if encoder_exports is not None and (
+                    response_started or not isinstance(e, aiohttp.ClientConnectorError)
+                ):
+                    raise
                 if streaming_status_rejected:
                     raise
                 # A 4xx from the worker is the request's own fault (malformed

@@ -258,7 +258,7 @@ def test_absent_multimodal_handoff_is_left_out_of_json():
     from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
     from tensorrt_llm.serve.openai_protocol import OpenAIBaseModel, to_disaggregated_params
 
-    handoff = set(_handoff_fields())
+    handoff = set(_handoff_fields()) | {"multimodal_embedding_handles"}
     older = create_model(
         "OlderDisaggregatedParams",
         __base__=OpenAIBaseModel,
@@ -276,7 +276,8 @@ def test_absent_multimodal_handoff_is_left_out_of_json():
     with pytest.raises(ValidationError):
         older.model_validate({**params.model_dump(), "multimodal_input": None})
     params = to_disaggregated_params(_multimodal_handoff("context_only"))
-    assert handoff <= set(params.model_dump(mode="json"))
+    assert set(_handoff_fields()) <= set(params.model_dump(mode="json"))
+    assert params.multimodal_embedding_handles is None
 
 
 def test_generation_response_does_not_echo_multimodal_handoff():

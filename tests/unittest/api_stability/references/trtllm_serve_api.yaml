@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Stability reference for the `trtllm-serve` HTTP request/response schemas.
 #
 # This YAML is the *single source of truth* for the stability status of every
@@ -921,7 +924,7 @@ models:
         required: false
       mm_embedding_handle:
         kind: extension
-        type: Optional[Dict[str, Any]]
+        type: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]
         default: null
         status: beta
         required: false

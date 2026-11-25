@@ -207,16 +207,30 @@ written as `.cpu().tolist()`.
 
 ## Encoder/Prefill Handoff
 
-For encoder/prefill disaggregation (E/P), model processor hooks return
-`(prompt_token_ids, MultimodalParams)`. Use `MultimodalParams.from_embeddings`
-to attach embeddings or shared-tensor handles. See
-[inputs/registry.py](source:tensorrt_llm/inputs/registry.py) for the hook contract.
+Pass the encoder result’s expanded `prompt_token_ids` and
+`disaggregated_params` to the prefill worker. The parameters carry one
+embedding handle per item in prompt order, the encoder’s `multimodal_input`,
+and, for mRoPE models, position IDs and deltas by value. Prefill checks the
+item runs against the expanded prompt and the model’s embedding-token mask.
+This preserves text between video frames and the boundary between adjacent
+images. Models using this layout need no prefill prompt builder.
 
-`DisaggregatedParams` remains the transport envelope used by external
-orchestrators such as Dynamo. The prefill processor still rebuilds model-specific
-prompt layout; its local Params result does not replace the wire protocol.
-Custom E/P hooks must follow the tuple return contract. Review Python hook
-compatibility separately from transport fields when changing this interface.
+On the chat endpoint, the encoder returns the ordered
+`choices[0].disaggregated_params.multimodal_embedding_handles` and top-level
+`prompt_token_ids`. A singleton is also available as `mm_embedding_handle`.
+An orchestrator selects the encoder and forwards the envelope and IDs in a
+signed chat request using the existing `internal_request_auth_key`. The static
+router supports context-first scheduling. A combined worker accepts the handoff
+directly with `request_type="context_and_generation"`.
 
-These contracts do not change the supported model/modality matrix or impose a
-common batching policy on every model.
+Embedding handles are single-consumer exports. The encoder, prefill worker,
+and any router responsible for releasing an undelivered export must share
+access to the backing storage, including a compatible GPU device mapping for
+CUDA IPC. Upgrade these participants before enabling the handoff. Once a
+request may have reached prefill, obtain fresh exports before retrying. The
+context-to-generation handoff carries the prompt identity and portable mRoPE
+state after prefill consumes the embeddings.
+
+Nemotron-H pruned video also uses the retained token count per tubelet to
+finalize the prompt. Its Python E/P caller supplies the original media and
+prompt to the specialized prefill builder.

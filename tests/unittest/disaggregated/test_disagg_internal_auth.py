@@ -81,6 +81,7 @@ def test_protected_fields_come_from_protocol_metadata():
         "ctx_info_endpoint",
         "encoded_opaque_state",
         "multimodal_input",
+        "multimodal_embedding_handles",
         "mrope_position_ids_handle",
         "mrope_position_deltas_handle",
     }
@@ -206,6 +207,37 @@ def test_multimodal_handoff_is_signed():
     wire_request.disaggregated_params.multimodal_input.multimodal_hashes[0][0] = 2
     with pytest.raises(ValueError, match="Invalid internal"):
         validate_internal_disagg_request("secret", wire_request, headers)
+
+
+@pytest.mark.parametrize("b64", [False, True])
+def test_encoder_handoff_binds_prompt_and_handles(b64):
+    request = ChatCompletionRequest(
+        model="vl",
+        messages=[{"role": "user", "content": "Describe"}],
+        prompt_token_ids=None if b64 else [1, 2],
+        prompt_token_ids_b64="AQAAAAIAAAA=" if b64 else None,
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            multimodal_embedding_handles=[{"tensor_size": [2, 8]}],
+        ),
+    )
+    headers = build_internal_disagg_auth_headers("secret", request)
+    wire = ChatCompletionRequest.model_validate_json(request.model_dump_json())
+    validate_internal_disagg_request("secret", wire, headers)
+    with pytest.raises(ValueError, match="internal_request_auth_key"):
+        validate_internal_disagg_request(None, wire, headers)
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", wire, {})
+    wire.disaggregated_params.multimodal_embedding_handles[0]["tensor_size"][1] = 16
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", wire, headers)
+    wire.disaggregated_params.multimodal_embedding_handles[0]["tensor_size"][1] = 8
+    if b64:
+        wire.prompt_token_ids_b64 = "AwAAAAIAAAA="
+    else:
+        wire.prompt_token_ids[0] = 3
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", wire, headers)
 
 
 def test_requests_without_multimodal_handoff_keep_their_signature():

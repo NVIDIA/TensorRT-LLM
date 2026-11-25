@@ -392,6 +392,62 @@ def test_gen_request_keeps_multimodal_handoff_on_the_wire(chat):
     assert received.model_dump(include=set(handoff)) == handoff
 
 
+@pytest.mark.parametrize("item_count", [1, 2])
+def test_encoder_reply_survives_chat_and_context_wire(item_count):
+    from dataclasses import asdict
+
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+    from tensorrt_llm.serve.openai_client import _encode_request_body
+    from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
+
+    handles = [
+        {"method_key": 2, "tensor_size": [1, 8], "storage_handle": str(i)}
+        for i in range(item_count)
+    ]
+    ids = list(range(item_count + 2))
+    record = asdict(
+        MultimodalInput.from_components(
+            [[i] * 8 for i in range(item_count)],
+            list(range(1, item_count + 1)),
+            [1] * item_count,
+            [str(i) for i in range(item_count)],
+        )
+    )
+    params = LlmDisaggregatedParams(
+        multimodal_input=record,
+        multimodal_embedding_handles=handles,
+        mrope_position_ids_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.arange(3 * len(ids)).reshape(3, 1, -1)
+        ).dump_to_dict(),
+        mrope_position_deltas_handle=SharedTensorContainer.from_tensor_bytes(
+            torch.tensor([-1], dtype=torch.int32)
+        ).dump_to_dict(),
+    )
+    reply = _make_chat_response("length", prompt_token_ids=ids)
+    reply.choices[0].mm_embedding_handle = handles[0] if item_count == 1 else handles
+    reply.choices[0].disaggregated_params = to_disaggregated_params(params, encoder=True)
+    reply = ChatCompletionResponse.model_validate_json(reply.model_dump_json())
+    assert reply.choices[0].mm_embedding_handle == (handles[0] if item_count == 1 else handles)
+    request = ChatCompletionRequest(
+        model=reply.model,
+        messages=[{"role": "user", "content": "describe"}],
+        prompt_token_ids=reply.prompt_token_ids,
+        disaggregated_params=reply.choices[0].disaggregated_params,
+    )
+    service = _make_service("context_first")
+    forwarded = service._get_ctx_request(request, 42)
+    worker = ChatCompletionRequest.model_validate(
+        msgspec.msgpack.decode(_encode_request_body(forwarded))
+    )
+    restored = to_llm_disaggregated_params(worker.disaggregated_params)
+    assert worker.prompt_token_ids == ids
+    assert restored.multimodal_input == record
+    assert restored.multimodal_embedding_handles == handles
+    assert restored.mrope_position_ids_handle == params.mrope_position_ids_handle
+    assert restored.mrope_position_deltas_handle == params.mrope_position_deltas_handle
+
+
 def test_get_ctx_request_preserves_conversation_params_on_wire():
     service = _make_service("context_first")
     request = CompletionRequest(

@@ -974,6 +974,40 @@ class TestDisaggIdRegenOnRetry:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("refused", [False, True])
+    async def test_encoder_exports_retry_only_before_connection(self, refused):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session, internal_disagg_auth_key="secret")
+        request = ChatCompletionRequest(
+            model="vl",
+            messages=[{"role": "user", "content": "describe"}],
+            prompt_token_ids=[1, 2],
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only",
+                multimodal_embedding_handles=[{"tensor_size": [1, 8]}],
+            ),
+        )
+        error = (
+            aiohttp.ClientConnectorError(Mock(), OSError(errno.ECONNREFUSED, "refused"))
+            if refused
+            else aiohttp.ServerDisconnectedError()
+        )
+        session.post.side_effect = error
+        with pytest.raises(type(error)):
+            await client.send_request(request)
+        assert session.post.call_count == (3 if refused else 1)
+        attempt = session.post.call_args.kwargs
+        received = ChatCompletionRequest.model_validate(msgspec.msgpack.decode(attempt["data"]))
+        validate_internal_disagg_request("secret", received, attempt["headers"])
+        assert received.disaggregated_params.multimodal_embedding_handles == [
+            {"tensor_size": [1, 8]}
+        ]
+        # The router can release its exports only if every connection was refused.
+        assert request.disaggregated_params.multimodal_embedding_handles == (
+            received.disaggregated_params.multimodal_embedding_handles if refused else None
+        )
+
+    @pytest.mark.asyncio
     async def test_retry_regenerates_disagg_id(self):
         session = AsyncMock(spec=aiohttp.ClientSession)
         ids = iter(range(1000, 2000))

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 
 from tensorrt_llm.bindings.executor import RequestPerfMetrics
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer, _time_input_processing
 from tensorrt_llm.serve.anthropic_protocol import AnthropicCreateBatchRequest
@@ -147,7 +148,7 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
         metrics_dict={},
         prompt_token_ids=[7, 8],
         aresult=AsyncMock(side_effect=complete),
-        disaggregated_params=SimpleNamespace(
+        disaggregated_params=DisaggregatedParams(
             multimodal_embedding_handles=[{"tensor_size": [4, 8]}],
             mrope_position_ids_handle=None,
             mrope_position_deltas_handle=None,

@@ -56,6 +56,8 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.coordinator_server import SHUTDOWN_POLL_S
+from tensorrt_llm.serve.disagg_auth import (EncoderHandoffAuthenticationError,
+                                            validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
@@ -64,9 +66,10 @@ from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ConversationParams, ErrorResponse, ResponsesRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    _ENCODER_HANDOFF_FIELDS, ChatCompletionRequest, ChatCompletionResponse,
+    CompletionRequest, ConversationParams, DisaggregatedParams, ErrorResponse,
+    ResponsesRequest, UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -458,6 +461,7 @@ class OpenAIDisaggServer:
         # caller that keeps it alive until the first chunk (/v1/messages pings).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
+            encoder_params = None
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:
@@ -465,8 +469,26 @@ class OpenAIDisaggServer:
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
                 try:
+                    params = req.disaggregated_params
+                    if params is not None and params.multimodal_embedding_handles is not None:
+                        validate_internal_disagg_request(
+                            self._config.internal_request_auth_key, req, raw_req.headers)
+                        # Forward only the encoder state. KV-transfer endpoints and
+                        # scheduling instructions come from the router itself.
+                        encoder_params = DisaggregatedParams(
+                            request_type=params.request_type,
+                            **{k: getattr(params, k) for k in _ENCODER_HANDOFF_FIELDS})
+                        req.disaggregated_params = encoder_params
+                        if params.request_type.lower() not in ("context_only", "context_and_generation"):
+                            raise ValueError("Encoder embedding handles require a prefill request")
+                        if self._config.schedule_style == "generation_first":
+                            raise ValueError("Encoder embedding handles require context-first routing")
+                        if (req.prompt_token_ids is None) == (req.prompt_token_ids_b64 is None):
+                            raise ValueError("Encoder handoff requires one expanded prompt token ID representation")
                     ensure_request_chat_template_allowed(
                         req, self._allow_request_chat_template)
+                except EncoderHandoffAuthenticationError as e:
+                    raise HTTPException(status_code=401, detail=str(e)) from e
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(
@@ -502,9 +524,22 @@ class OpenAIDisaggServer:
                 # quietly instead of raising into the ASGI server.
                 return Response(status_code=_CLIENT_CLOSED_REQUEST_STATUS)
             except Exception as e:
+                if (encoder_params is not None and isinstance(e, aiohttp.ClientResponseError)
+                        and e.status == 401):
+                    # The router accepted the caller's exports and will release them.
+                    # A 401 to that caller would leave it owning the same exports.
+                    e = HTTPException(status_code=502,
+                                      detail="Prefill worker rejected router authentication")
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
+            finally:
+                # A refused connection or a failure during routing left these
+                # authenticated exports here. Sending the worker POST clears them.
+                if encoder_params is not None and encoder_params.multimodal_embedding_handles:
+                    from tensorrt_llm._torch.shared_tensor import \
+                        SharedTensorContainer
+                    SharedTensorContainer.release_many(encoder_params.multimodal_embedding_handles)
         return wrapper
 
     @staticmethod

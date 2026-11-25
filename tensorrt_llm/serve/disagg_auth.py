@@ -25,7 +25,11 @@ from tensorrt_llm.serve.conversation_id import (
     get_request_conversation_id,
     get_request_subagent_affinity_id,
 )
-from tensorrt_llm.serve.openai_protocol import _MULTIMODAL_HANDOFF_FIELDS, UCompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    _ENCODER_HANDOFF_FIELDS,
+    ChatCompletionRequest,
+    UCompletionRequest,
+)
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
 SUBAGENT_AFFINITY_AUTH_HEADER = "x-trtllm-subagent-affinity-auth"
@@ -39,11 +43,19 @@ _MISSING_AUTH_KEY_WARNING = (
 )
 
 
+class EncoderHandoffAuthenticationError(ValueError):
+    """The receiver did not accept an export from this sender."""
+
+
 def get_internal_disagg_auth_fields() -> tuple[str, ...]:
-    return _INTERNAL_DISAGG_AUTH_FIELDS + _MULTIMODAL_HANDOFF_FIELDS
+    return _INTERNAL_DISAGG_AUTH_FIELDS + _ENCODER_HANDOFF_FIELDS
 
 
-def _warn_missing_auth_key() -> None:
+def _handle_missing_auth_key(request: UCompletionRequest) -> None:
+    if request.disaggregated_params.multimodal_embedding_handles is not None:
+        raise EncoderHandoffAuthenticationError(
+            "Encoder embedding handles require internal_request_auth_key"
+        )
     warnings.warn(_MISSING_AUTH_KEY_WARNING, FutureWarning, stacklevel=2)
 
 
@@ -74,9 +86,19 @@ def _auth_payload(request: UCompletionRequest) -> bytes:
     # keep the signature that older routers and workers compute.
     payload.update(
         disaggregated_params.model_dump(
-            mode="json", include=set(_MULTIMODAL_HANDOFF_FIELDS), exclude_none=True
+            mode="json", include=set(_ENCODER_HANDOFF_FIELDS), exclude_none=True
         )
     )
+    if disaggregated_params.multimodal_embedding_handles is not None:
+        if not isinstance(request, ChatCompletionRequest):
+            raise ValueError("Encoder embedding handles require a chat completion")
+        payload.update(
+            model=request.model,
+            cache_salt=request.cache_salt,
+            request_type=disaggregated_params.request_type,
+            prompt_token_ids=request.prompt_token_ids,
+            prompt_token_ids_b64=request.prompt_token_ids_b64,
+        )
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -94,7 +116,7 @@ def build_internal_disagg_auth_headers(
     if not request_requires_internal_disagg_auth(request):
         return {}
     if not internal_disagg_auth_key:
-        _warn_missing_auth_key()
+        _handle_missing_auth_key(request)
         return {}
     return {INTERNAL_DISAGG_AUTH_HEADER: _sign_request(internal_disagg_auth_key, request)}
 
@@ -107,7 +129,7 @@ def validate_internal_disagg_request(
     if not request_requires_internal_disagg_auth(request):
         return
     if not internal_disagg_auth_key:
-        _warn_missing_auth_key()
+        _handle_missing_auth_key(request)
         return
 
     expected = _sign_request(internal_disagg_auth_key, request)
@@ -115,7 +137,10 @@ def validate_internal_disagg_request(
     if provided is None or not hmac.compare_digest(
         provided.encode("utf-8"), expected.encode("utf-8")
     ):
-        raise ValueError("Invalid internal disaggregated request authentication")
+        message = "Invalid internal disaggregated request authentication"
+        if request.disaggregated_params.multimodal_embedding_handles is not None:
+            raise EncoderHandoffAuthenticationError(message)
+        raise ValueError(message)
 
 
 def _sign_subagent_affinity(

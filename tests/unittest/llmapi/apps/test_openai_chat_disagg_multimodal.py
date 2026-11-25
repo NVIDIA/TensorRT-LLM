@@ -24,7 +24,9 @@ The engine is stubbed, so what these tests read is the prompt dict as it leaves
 """
 
 import base64
+import gc
 import io
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -34,12 +36,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
     UsageInfo,
 )
+from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from .openai_server_stub import make_stub_openai_server
 
@@ -150,9 +156,16 @@ def route_client(tmp_path):
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
+        params = kwargs.get("disaggregated_params")
+        if params is not None and params.multimodal_embedding_handles:
+            captured["embeddings"] = [
+                SharedTensorContainer.from_dict(handle).get_local_view().clone()
+                for handle in params.multimodal_embedding_handles
+            ]
         return SimpleNamespace(request_id=1, prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
 
     server = make_stub_openai_server(tmp_path, MODEL, _StubModelConfig(), generate_async)
+    server._internal_disagg_auth_key = "test-secret"
     server.await_disconnected = AsyncMock()
     server._create_chat_response = AsyncMock(return_value=_stub_response())
 
@@ -201,6 +214,107 @@ def test_generation_only_never_loads_relayed_media(route_client):
 
     assert response.status_code == 200, response.text
     assert "multi_modal_data" not in captured["inputs"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "use_base64"), [("context_only", True), ("context_and_generation", False)]
+)
+def test_signed_encoder_handoff_skips_media(route_client, monkeypatch, phase, use_base64):
+    client, captured = route_client
+    if phase == "context_only":
+        monkeypatch.setattr(OpenAIServer, "_has_cache_transceiver_config", lambda self: True)
+    handle = SharedTensorContainer.from_tensor(torch.arange(8.0).reshape(2, 4)).dump_to_dict()
+    storage = Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+    ids = [7, 1025, 1025, 17, 19]
+    body = _chat_body(
+        "image_url",
+        {
+            "request_type": phase,
+            "multimodal_embedding_handles": [handle],
+            "multimodal_input": {
+                "multimodal_hashes": [[1] * 8],
+                "multimodal_positions": [1],
+                "multimodal_lengths": [2],
+                "multimodal_item_run_cu_offsets": [0, 1],
+                "multimodal_run_positions": [1],
+                "multimodal_run_lengths": [2],
+            },
+            "mrope_position_ids_handle": SharedTensorContainer.from_tensor_bytes(
+                torch.arange(len(ids)).expand(3, 1, -1)
+            ).dump_to_dict(),
+            "mrope_position_deltas_handle": SharedTensorContainer.from_tensor_bytes(
+                torch.tensor([0], dtype=torch.int32)
+            ).dump_to_dict(),
+        },
+    )
+    body["messages"][0]["content"][1] = _unreadable_image_part()
+    body["prompt_token_ids"] = ids
+    if use_base64:
+        body.pop("prompt_token_ids")
+        packed_ids = torch.tensor(ids, dtype=torch.int32).numpy().tobytes()
+        body["prompt_token_ids_b64"] = base64.b64encode(packed_ids).decode()
+    request = ChatCompletionRequest.model_validate(body)
+    headers = build_internal_disagg_auth_headers("test-secret", request)
+    rejected = client.post("/v1/chat/completions", json=body)
+    assert rejected.status_code == 401 and "authentication" in rejected.text
+    assert storage.exists()
+    assert "inputs" not in captured
+    delivered = client.post("/v1/chat/completions", json=body, headers=headers)
+    assert delivered.status_code == 200, delivered.text
+    assert captured["inputs"] == {"prompt_token_ids": ids}
+    (embedding,) = captured["embeddings"]
+    assert torch.equal(embedding, torch.arange(8.0).reshape(2, 4))
+    gc.collect()
+    assert not storage.exists()
+
+
+def test_prepared_context_with_missing_handles_is_rejected(route_client, monkeypatch):
+    client, captured = route_client
+    monkeypatch.setattr(OpenAIServer, "_has_cache_transceiver_config", lambda self: True)
+    body = _chat_body(
+        "image_url",
+        {
+            "request_type": "context_only",
+            "multimodal_input": {
+                "multimodal_hashes": [[1] * 8],
+                "multimodal_positions": [1],
+                "multimodal_lengths": [2],
+            },
+        },
+    )
+    headers = build_internal_disagg_auth_headers(
+        "test-secret", ChatCompletionRequest.model_validate(body)
+    )
+    response = client.post("/v1/chat/completions", json=body, headers=headers)
+    assert response.status_code == 400 and "requires embedding handles" in response.text
+    assert "inputs" not in captured
+
+
+def test_pruned_video_export_is_retired_only_after_authentication(route_client, monkeypatch):
+    client, _ = route_client
+    released = []
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", released.append)
+    handle = {"tensor_size": [2, 4], "metadata": {"retained_token_counts": [1, 1]}}
+    body = _chat_body(
+        "image_url",
+        {
+            "request_type": "context_and_generation",
+            "multimodal_embedding_handles": [handle],
+            "multimodal_input": {
+                "multimodal_hashes": [[1] * 8],
+                "multimodal_positions": [1],
+                "multimodal_lengths": [2],
+            },
+        },
+    )
+    headers = build_internal_disagg_auth_headers(
+        "test-secret", ChatCompletionRequest.model_validate(body)
+    )
+    assert client.post("/v1/chat/completions", json=body).status_code == 401
+    assert not released
+    rejected = client.post("/v1/chat/completions", json=body, headers=headers)
+    assert rejected.status_code == 400 and "Pruned video" in rejected.text
+    assert released == [handle]
 
 
 @pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))

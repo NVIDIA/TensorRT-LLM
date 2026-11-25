@@ -18,7 +18,7 @@ import traceback
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import copy_context
 from datetime import datetime
 from http import HTTPStatus
@@ -43,6 +43,7 @@ from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.disaggregated_params import _has_retained_token_counts
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -100,8 +101,8 @@ from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
-    request_requires_internal_disagg_auth, validate_internal_disagg_request,
-    validate_subagent_affinity)
+    EncoderHandoffAuthenticationError, request_requires_internal_disagg_auth,
+    validate_internal_disagg_request, validate_subagent_affinity)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
@@ -125,8 +126,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    ensure_request_chat_template_allowed, to_disaggregated_params,
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -210,6 +211,23 @@ def _is_visual_gen_instance(obj) -> bool:
 # yapf: enable
 
 _msgpack_decoder = msgspec.msgpack.Decoder()
+
+
+class _EncoderResponse(JSONResponse):
+    """Own the encoder exports until the HTTP response body has been sent."""
+
+    def __init__(self, content: dict, request: Request, exports: ExitStack):
+        super().__init__(content)
+        self._request = request
+        self._exports = exports.pop_all()
+
+    async def __call__(self, scope, receive, send):
+        with self._exports:
+            if self._request is not None and await self._request.is_disconnected(
+            ):
+                return
+            await super().__call__(scope, receive, send)
+            self._exports.pop_all()
 
 
 class _MsgspecRequest(KvHintsRequest):
@@ -1131,13 +1149,37 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
-        if (request_requires_internal_disagg_auth(request)
-                and not self._has_cache_transceiver_config()):
-            raise ValueError("Protected disaggregated request fields require "
-                             "cache_transceiver_config to be configured")
+        params = request.disaggregated_params
         headers = None if raw_request is None else raw_request.headers
-        validate_internal_disagg_request(
-            getattr(self, "_internal_disagg_auth_key", None), request, headers)
+        key = getattr(self, "_internal_disagg_auth_key", None)
+        if params is not None and params.multimodal_embedding_handles is not None:
+            # Only the authenticated sender can transfer ownership of an export.
+            validate_internal_disagg_request(key, request, headers)
+            if self._has_cache_transceiver_config():
+                return
+            if (params.request_type.lower() == "context_and_generation"
+                    and params.encoded_opaque_state is None
+                    and params.ctx_info_endpoint is None):
+                # A combined worker keeps its KV locally.
+                return
+            SharedTensorContainer.release_many(
+                params.multimodal_embedding_handles)
+        elif (not request_requires_internal_disagg_auth(request)
+              or self._has_cache_transceiver_config()):
+            validate_internal_disagg_request(key, request, headers)
+            return
+        raise ValueError("Protected disaggregated request fields require "
+                         "cache_transceiver_config to be configured")
+
+    def _reject_encoder_handoff(self, request: ChatCompletionRequest,
+                                raw_request: Request) -> None:
+        params = request.disaggregated_params
+        if params is not None and params.multimodal_embedding_handles is not None:
+            self._validate_internal_disagg_request(request, raw_request)
+            SharedTensorContainer.release_many(
+                params.multimodal_embedding_handles)
+            raise ValueError(
+                "Encoder embedding handles require a multimodal prefill worker")
 
     def _get_scheduling_params(
             self, request: Union[ChatCompletionRequest, CompletionRequest],
@@ -1157,6 +1199,14 @@ class OpenAIServer(_VideoRoutesMixin):
             return cache_transceiver_config.get("backend") is not None
         return (cache_transceiver_config is not None and getattr(
             cache_transceiver_config, "backend", None) is not None)
+
+    @staticmethod
+    def _decode_chat_prompt_token_ids(request: ChatCompletionRequest) -> None:
+        if request.prompt_token_ids is None and request.prompt_token_ids_b64:
+            import numpy as np
+            request.prompt_token_ids = np.frombuffer(base64.b64decode(
+                request.prompt_token_ids_b64),
+                                                     dtype=np.int32).tolist()
 
     @staticmethod
     def _attach_multimodal_data(
@@ -2312,7 +2362,28 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         input_started = _start_input_processing()
+        pending_handles = None
         try:
+            self._validate_internal_disagg_request(request, raw_request)
+            params = request.disaggregated_params
+            has_ids = request.prompt_token_ids is not None
+            has_b64_ids = bool(request.prompt_token_ids_b64)
+            if params is not None:
+                pending_handles = params.multimodal_embedding_handles
+                if (pending_handles is None
+                        and params.multimodal_input is not None
+                        and params.request_type.lower() != "generation_only"
+                        and (has_ids or has_b64_ids)):
+                    raise ValueError(
+                        "Encoder-prepared prompt requires embedding handles")
+            disaggregated_params = to_llm_disaggregated_params(params)
+            if _has_retained_token_counts(pending_handles):
+                raise ValueError(
+                    "Pruned video requires its raw prompt and media at prefill")
+            if pending_handles and has_ids == has_b64_ids:
+                raise ValueError(
+                    "Encoder embedding handles require exactly one "
+                    "representation of expanded prompt_token_ids")
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
             render_resources = RenderResources.from_server(self)
@@ -2520,27 +2591,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 # calls in the model output.
                 postproc_args.tools = (postproc_args.tools
                                        or []) + dynamic_tool_params
-            self._validate_internal_disagg_request(request, raw_request)
-            disaggregated_params = to_llm_disaggregated_params(
-                request.disaggregated_params)
-
-            # A generation-only worker already has prompt_token_ids with the
-            # placeholders expanded and the KV behind them over the
-            # transceiver, so the media still on the relayed messages is not
-            # its to resolve.
-            #
-            # Decided before the fetch rather than after it: resolving
-            # downloads and decodes every item a second time, and fails
-            # outright on a reference only the context worker could read --
-            # a node-local path, or a single-use or expired URL.
-            #
-            # prompt_token_ids_b64 counts too; it is decoded into
-            # prompt_token_ids further below.
-            resolve_media = not (disaggregated_params is not None
-                                 and disaggregated_params.request_type
-                                 == "generation_only" and
-                                 (request.prompt_token_ids is not None
-                                  or request.prompt_token_ids_b64))
+            # Expanded IDs already describe the media the producer resolved.
+            resolve_media = not (
+                disaggregated_params is not None and
+                (disaggregated_params.request_type == "generation_only"
+                 or disaggregated_params.multimodal_embedding_handles) and
+                (has_ids or has_b64_ids))
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
@@ -2562,12 +2618,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
-            # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
-            if request.prompt_token_ids is None and request.prompt_token_ids_b64:
-                import numpy as np
-                request.prompt_token_ids = np.frombuffer(
-                    base64.b64decode(request.prompt_token_ids_b64),
-                    dtype=np.int32).tolist()
+            self._decode_chat_prompt_token_ids(request)
 
             rendered_prompt = None
             if request.prompt_token_ids is not None:
@@ -2695,7 +2746,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
-            if preprocess_fn is not None:
+            if preprocess_fn is not None and not pending_handles:
                 preprocess = functools.partial(preprocess_fn, prompt,
                                                sampling_params,
                                                disaggregated_params)
@@ -2708,6 +2759,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         or get_request_conversation_id(request), preprocess)
                 generate_inputs = await self._run_input_processor(preprocess)
 
+            # generate_async takes ownership of the prepared prompt's exports.
+            pending_handles = None
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -2760,6 +2813,11 @@ class OpenAIServer(_VideoRoutesMixin):
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
+        except EncoderHandoffAuthenticationError as e:
+            return self.create_error_response(
+                str(e),
+                err_type="AuthenticationError",
+                status_code=HTTPStatus.UNAUTHORIZED)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -2771,6 +2829,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
         finally:
+            if pending_handles:
+                SharedTensorContainer.release_many(pending_handles)
             _record_input_processing("total", input_started)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
@@ -3090,64 +3150,70 @@ class OpenAIServer(_VideoRoutesMixin):
                                 raw_request: Request) -> Response:
 
         async def create_mm_embedding_response(promise: RequestOutput):
-            await promise.aresult()
-            # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            params = promise.disaggregated_params
-            mm_embedding_handles = (params.multimodal_embedding_handles
-                                    if params else None)
-            # The response returns only the embedding handles; release the
-            # exports no caller can open.
-            if params is not None:
-                for handle in (params.mrope_position_ids_handle,
-                               params.mrope_position_deltas_handle):
-                    if handle is not None:
-                        SharedTensorContainer.release_dict(handle)
-            if not mm_embedding_handles:
-                return self.create_error_response(
-                    message="Multimodal embedding handle missing in response",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            if any("tensor_size" not in h for h in mm_embedding_handles):
-                return self.create_error_response(
-                    message="Multimodal embedding handle missing tensor_size",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-            mm_embedding_handle = (mm_embedding_handles[0]
-                                   if len(mm_embedding_handles) == 1 else
-                                   mm_embedding_handles)
-            num_tokens = sum(
-                int(h["tensor_size"][0]) for h in mm_embedding_handles)
-            return ChatCompletionResponse(
-                id=str(promise.request_id),
-                model=self.model,
-                choices=[
-                    ChatCompletionResponseChoice(
-                        index=0,
-                        message=ChatMessage(role="assistant", content="dummy"),
-                        mm_embedding_handle=mm_embedding_handle,
-                        finish_reason="length",
-                    )
-                ],
-                usage=UsageInfo(
-                    prompt_tokens=num_tokens,
-                    completion_tokens=1,
-                    total_tokens=num_tokens + 1,
-                ),
-            )
+            with ExitStack() as exports:
+                completion = asyncio.create_task(promise.aresult())
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    # An already-published completion can win the race with abort.
+                    promise.abort()
+                    await completion
+                    raise
+                finally:
+                    params = promise.disaggregated_params
+                    handles = params.multimodal_embedding_handles if params else None
+                    if handles:
+                        exports.callback(SharedTensorContainer.release_many,
+                                         handles)
+                    if params is not None:
+                        # Byte-form mRoPE needs no release. Retire any legacy IPC exports.
+                        SharedTensorContainer.release_many(
+                            (params.mrope_position_ids_handle,
+                             params.mrope_position_deltas_handle))
+                if not handles or any(not h.get("tensor_size")
+                                      for h in handles):
+                    return self.create_error_response(
+                        message=
+                        "Multimodal embedding handle or tensor_size missing in response",
+                        err_type="InternalServerError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                num_tokens = sum(h["tensor_size"][0] for h in handles)
+                # Pruned video needs raw frames at prefill to build its EVS token stream.
+                prepared = params.multimodal_input is not None and not _has_retained_token_counts(
+                    handles)
+                response = ChatCompletionResponse(
+                    id=str(promise.request_id),
+                    model=self.model,
+                    prompt_token_ids=promise.prompt_token_ids
+                    if prepared else None,
+                    choices=[
+                        ChatCompletionResponseChoice(
+                            index=0,
+                            message=ChatMessage(role="assistant",
+                                                content="dummy"),
+                            mm_embedding_handle=(
+                                handles[0] if len(handles) == 1 else
+                                handles if not prepared else None),
+                            disaggregated_params=(to_disaggregated_params(
+                                params, encoder=True) if prepared else None),
+                            finish_reason="length",
+                        )
+                    ],
+                    usage=UsageInfo(prompt_tokens=num_tokens,
+                                    completion_tokens=1,
+                                    total_tokens=num_tokens + 1),
+                )
+                await self._extract_metrics(promise, raw_request)
+                return _EncoderResponse(response.model_dump(), raw_request,
+                                        exports)
 
         input_started = _start_input_processing()
         try:
-            ensure_request_chat_template_allowed(
-                request, self.allow_request_chat_template)
-            conversation: List[ConversationMessage] = []
-            # Same pipeline as the chat route: the server template and the
-            # model extension's tool serialization apply here too.
+            self._reject_encoder_handoff(request, raw_request)
+            self._decode_chat_prompt_token_ids(request)
             render_resources = RenderResources.from_server(self)
-            tool_dicts = None if request.tools is None else [
-                render_resources.extension.serialize_tool(tool)
-                for tool in request.tools
-            ]
-
+            tool_dicts = prepare_chat_request(request,
+                                              render_resources).tool_dicts
             try:
                 conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
@@ -3183,6 +3249,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         chat_template_kwargs=request.chat_template_kwargs,
                         injected_chat_template_kwargs=request.
                         injected_chat_template_kwargs,
+                        truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
@@ -3196,16 +3263,29 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._attach_multimodal_data(prompt, request, mm_data,
                                              mm_item_order)
 
-            promise = self.generator.generate_async(inputs=prompt, )
+            if request.mm_processor_kwargs:
+                prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+
+            promise = self.generator.generate_async(
+                inputs=prompt,
+                sampling_params=SamplingParams(
+                    add_special_tokens=request.add_special_tokens,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens))
             _record_input_processing("total", input_started)
             input_started = None
 
-            asyncio.create_task(self.await_disconnected(raw_request, promise))
+            disconnect = asyncio.create_task(
+                self.await_disconnected(raw_request, promise))
+            try:
+                return await create_mm_embedding_response(promise)
+            finally:
+                disconnect.cancel()
 
-            response = await create_mm_embedding_response(promise)
-            await self._extract_metrics(promise, raw_request)
-            return JSONResponse(content=response.model_dump())
-
+        except EncoderHandoffAuthenticationError as e:
+            return self.create_error_response(
+                str(e),
+                err_type="AuthenticationError",
+                status_code=HTTPStatus.UNAUTHORIZED)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -3486,6 +3566,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         input_started = _start_input_processing()
         try:
+            self._reject_encoder_handoff(request, raw_request)
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
             # Named tool_choice (forced function call) is not yet supported on
@@ -3604,6 +3685,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
+        except EncoderHandoffAuthenticationError as e:
+            return self.create_error_response(
+                str(e),
+                err_type="AuthenticationError",
+                status_code=HTTPStatus.UNAUTHORIZED)
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:

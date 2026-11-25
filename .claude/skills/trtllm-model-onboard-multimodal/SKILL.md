@@ -114,8 +114,8 @@ the implementation steps below.
 
 When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MULTIMODAL_DISAGGREGATED=1`:
 
-- **Encoder worker:** runs as a standalone `MultimodalEncoder` (`mm_encoder_only=True`). It executes only the multimodal encoder and ships `mm_embeddings` (+ mRoPE position ids/deltas) to prefill+decode workers as shared-tensor handles.
-- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true. For supplied embeddings, override `_attach_multimodal_embeddings_impl`, not the `attach_multimodal_embeddings` wrapper. Handle-based E/P input uses `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None)` and returns `(prompt_token_ids, MultimodalParams)`; build the Params with `MultimodalParams.from_embeddings`. `DisaggregatedParams` remains the transport envelope, separate from this local return value. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
+- **Encoder worker:** the standalone `MultimodalEncoder` exports an embedding per item together with the expanded prompt, its multimodal record, and portable mRoPE positions when applicable.
+- **Prefill+decode worker:** pass the expanded IDs and encoder disaggregation parameters to the LLM. Common admission attaches the exports to the existing token runs. The model consumes the same packed features it would receive after local encoding.
 
 This item-scheduled cache path currently applies only when the encoder and LLM
 run in the same process. `mm_encoder_only` / EPD keeps its existing
@@ -425,7 +425,7 @@ Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model tex
 
 **Optional tokenized+MM fast path (skip unless needed):** set `supports_token_id_mm_expansion = True` (`ClassVar`) and implement `get_text_with_mm_placeholders(mm_counts)` + `expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens, ...)`. The base-class `call_with_token_ids` then builds dummy placeholder text, runs `call_with_text_prompt` on it, expands the real token IDs, and merges any returned `mm_data_updates` (e.g. video `evs_ids`) into `multimodal_data`. Leave the flag `False` and the base class just detokenizes token-ID inputs and re-runs `call_with_text_prompt`. Only LlavaNext + Nemotron H multimodal opt in today.
 
-**EPD overrides (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — for supplied embeddings. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl. If the model supports handle-based E/P handoff, implement `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None) -> tuple[list[int], MultimodalParams]`; preserve prompt order, hashes, output rows, and model-specific auxiliary data in the returned Params. See Qwen3-VL's implementation and the developer guide's [handoff contract](../../../docs/source/developer-guide/multimodal.md#encoderprefill-handoff).
+**EPD inputs (if `@support_multimodal_disaggregated`):** declare the model’s embedding-token mask and preserve item order in the encoder output. The common path consumes the expanded IDs, item runs and embedding descriptors. For the separate external `multi_modal_embeddings` API, override `_attach_multimodal_embeddings_impl`. See the [handoff contract](../../../docs/source/developer-guide/multimodal.md#encoderprefill-handoff).
 
 **Decorator stack** — bottom-up application; `register_vision_encoder` requires `register_auto_model` to have run first:
 
@@ -545,7 +545,7 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 - [ ] Batched/packed/shared fields have explicit `input_partitions`, or the model overrides selection for its layout. Payload indices are modality-local; metadata indices are prompt-global. Execution reads `item_metadata.item_refs`, not frontend `mm_item_order`.
 - [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
 - [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
-- [ ] `_attach_multimodal_embeddings_impl` implemented (not the `attach_multimodal_embeddings` wrapper) if `@support_multimodal_disaggregated`.
+- [ ] Encoder exports match the prompt-ordered item runs for E/P. Implement `_attach_multimodal_embeddings_impl` if the model also accepts external `multi_modal_embeddings`.
 - [ ] Handle-based E/P hooks accept keyword-only `mm_hashes` and return `(prompt_token_ids, MultimodalParams)`. Cache references stay on request Params; execution views do not own them.
 
 **Performance contracts**

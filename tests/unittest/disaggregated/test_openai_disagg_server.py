@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
+import gc
 import json
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import pytest
+import torch
 from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import Headers
@@ -159,6 +163,71 @@ def test_create_client_does_not_register_with_server_metrics_collector(bounded_r
     assert client is mock_client.return_value
     mock_client.assert_called_once()
     assert mock_client.call_args.kwargs["bounded_replay_on_generation"] is bounded_replay
+
+
+@pytest.mark.parametrize("failure", ["placement", "worker_auth"])
+def test_router_releases_only_unaccepted_encoder_exports(tmp_path, monkeypatch, failure):
+    from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
+
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
+    from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
+    handle = SharedTensorContainer.from_tensor(torch.ones(1, 8)).dump_to_dict()
+    storage = Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+    request = ChatCompletionRequest(
+        model="vl",
+        messages=[{"role": "user", "content": "describe"}],
+        prompt_token_ids=[7, 1025],
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            multimodal_embedding_handles=[handle],
+            multimodal_input={
+                "multimodal_hashes": [[1] * 8],
+                "multimodal_positions": [1],
+                "multimodal_lengths": [1],
+                "multimodal_item_run_cu_offsets": [0, 1],
+                "multimodal_run_positions": [1],
+                "multimodal_run_lengths": [1],
+            },
+            ctx_info_endpoint="tcp://unused",
+        ),
+    )
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_disagg_server(DisaggConfig())
+        server._config.internal_request_auth_key = "secret"
+        monkeypatch.setattr(server._service, "is_ready", AsyncMock(return_value=True))
+        session = MagicMock(spec=aiohttp.ClientSession)
+        rejected = AsyncMock(status=401, headers={}, reason="Unauthorized")
+        rejected.text = AsyncMock(return_value="Unauthorized")
+        session.post.return_value.__aenter__ = AsyncMock(return_value=rejected)
+        monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", Mock())
+        client = OpenAIHttpClient(
+            router=AsyncMock(),
+            role=ServerRole.CONTEXT,
+            session=session,
+            internal_disagg_auth_key="secret",
+        )
+
+        async def dispatch(validated_request, hooks):
+            assert validated_request.disaggregated_params.ctx_info_endpoint is None
+            if failure == "placement":
+                raise HTTPException(status_code=503, detail="no context worker")
+            return await client.send_request(validated_request, server="context:1234")
+
+        monkeypatch.setattr(server._service, "_send_disagg_request", dispatch)
+        ingress = env.client(server.app, lifespan=False)
+        body = request.model_dump(mode="json")
+        assert ingress.post("/v1/chat/completions", json=body).status_code == 401
+        session.post.assert_not_called()
+        assert storage.exists()
+
+        headers = build_internal_disagg_auth_headers("secret", request)
+        response = ingress.post("/v1/chat/completions", json=body, headers=headers)
+        assert response.status_code == (503 if failure == "placement" else 502), response.text
+        assert session.post.call_count == (failure == "worker_auth")
+        gc.collect()
+        assert not storage.exists()
 
 
 def test_extract_conversation_id_from_headers():
