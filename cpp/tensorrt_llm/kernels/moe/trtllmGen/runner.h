@@ -227,11 +227,10 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
         int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
         int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
-        cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
+        cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1,
+        int32_t maxNumCtasInBatchDim = 0);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeAct;
-    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
     int32_t mTileTokensDim;
     ActType mActType;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
@@ -268,12 +267,9 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
         int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
         void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1,
-        int32_t validIntermediateSize = -1);
+        int32_t validIntermediateSize = -1, int32_t maxNumCtasInBatchDim = 0);
 
 private:
-    batchedGemm::trtllm::gen::Dtype mDtypeAct;
-    batchedGemm::trtllm::gen::Dtype mDtypeWeights;
-    batchedGemm::trtllm::gen::Dtype mDtypeOut;
     int32_t mTileTokensDim;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
 };
@@ -360,6 +356,9 @@ struct MoERunnerArgs
     // Stop after FC1 (+ activation): the caller runs FC2 on workspace.gemm1_output / gemm1_output_scale with the
     // routing tables. Requires do_finalize == false.
     bool skip_gemm2{false};
+
+    // The most CTAs the caller's routing puts in the batch dimension, or 0 for the worst case of the problem.
+    int32_t max_num_ctas_in_batch_dim{0};
 };
 
 struct MoEWorkspace

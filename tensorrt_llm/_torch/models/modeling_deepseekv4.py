@@ -1544,11 +1544,14 @@ class DeepseekV4Gate(nn.Module):
         apply_routing: bool = False,
         moe_backend: str = "CUTLASS",
         has_vl_bias: bool = False,
+        small_m_logit_partials: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype), requires_grad=False
         )
+        # The model opted into partials from ``router_logit_partials.SMALL_M_MIN_ROWS`` rows.
+        self.small_m_logit_partials = small_m_logit_partials
         self.moe_backend = moe_backend
         bias_dtype = torch.float32
 
@@ -1615,7 +1618,9 @@ class DeepseekV4Gate(nn.Module):
             # An empty attention-DP peer still joins expert communication, but
             # the router's cuBLAS fallback does not accept an empty GEMM.
             return hidden_states.new_empty((0, self.weight.shape[0]), dtype=torch.float32)
-        if partials and router_partials.applies(hidden_states, self.weight):
+        if partials and router_partials.applies(
+            hidden_states, self.weight, small_m=self.small_m_logit_partials
+        ):
             return router_partials.router_logit_partials(hidden_states, self.weight)
         return router_gemm_autotuned(hidden_states, self.weight)
 
@@ -1808,6 +1813,9 @@ class DeepseekV4MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             has_vl_bias=bool(getattr(config, "use_vision_bias", False)),
+            small_m_logit_partials=bool(
+                model_config.extra_attrs.get("moe_router_partials_small_m", False)
+            ),
         )
         experts_quant_config = self._get_experts_quant_config(model_config, layer_idx)
         if override_quant_config is not None and experts_quant_config is model_config.quant_config:
@@ -3538,6 +3546,8 @@ _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
     prioritize_decode_graphs=True,
     loop_on_execution_stream=True,
     prompts_to_owners=True,
+    skip_adp_count_gather=True,
+    skip_verify_row_gather=True,
 )
 
 

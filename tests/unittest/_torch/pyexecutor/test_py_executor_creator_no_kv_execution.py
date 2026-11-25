@@ -34,12 +34,7 @@ def _args():
 )
 def test_non_generation_models_reject_unsupported_loops(mapping, error):
     with pytest.raises(ValueError, match=error):
-        _check_no_kv_execution(_args(), Mapping(**mapping), is_generation=False)
-
-
-@pytest.mark.parametrize("mapping", [_PP2, _ADP], ids=["pp", "adp"])
-def test_generation_models_are_not_checked(mapping):
-    _check_no_kv_execution(_args(), Mapping(**mapping), is_generation=True)
+        _check_no_kv_execution(_args(), Mapping(**mapping))
 
 
 def _encoder_args(**overrides):
@@ -54,6 +49,7 @@ def _encoder_args(**overrides):
         enable_resource_governor=False,
         sleep_config=None,
         orchestrator_type=None,
+        enable_client_io_during_gpu_wait=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -88,6 +84,7 @@ def test_scheduled_encoder_rejects_unsupported_parallelism(mapping, error):
         (dict(enable_resource_governor=True), "enable_resource_governor"),
         (dict(sleep_config=object()), "sleep_config"),
         (dict(orchestrator_type="ray"), "orchestrator_type='ray'"),
+        (dict(enable_client_io_during_gpu_wait=True), "enable_client_io_during_gpu_wait"),
     ],
 )
 def test_scheduled_encoder_rejects_settings_by_name(overrides, setting):
@@ -105,23 +102,24 @@ def test_scheduled_encoder_serves_tensor_parallel_rpc_workers():
 
 
 @pytest.mark.parametrize(
-    ("config", "model_kwargs", "is_generation"),
+    ("config", "args_kwargs", "is_generation"),
     [
-        (BertConfig(architectures=["BertForSequenceClassification"]), None, False),
-        (LlamaConfig(architectures=["LlamaForCausalLM"]), None, True),
+        (BertConfig(architectures=["BertForSequenceClassification"]), {}, False),
+        (LlamaConfig(architectures=["LlamaForCausalLM"]), {}, True),
         (
             LlamaConfig(architectures=["LlamaForCausalLM"]),
-            {"architectures": ["LlamaForTextEmbedding"]},
+            {"model_kwargs": {"architectures": ["LlamaForTextEmbedding"]}},
             False,
         ),
+        (LlamaConfig(architectures=["LlamaForCausalLM"]), {"mm_encoder_only": True}, False),
     ],
-    ids=["pooling", "generation", "overridden-to-pooling"],
+    ids=["pooling", "generation", "overridden-to-pooling", "mm-encoder-only"],
 )
 def test_dispatch_reads_the_architecture_model_loading_will_use(
-    tmp_path, config, model_kwargs, is_generation
+    tmp_path, config, args_kwargs, is_generation
 ):
     config.save_pretrained(tmp_path)
-    args = TorchLlmArgs(model=str(tmp_path), model_kwargs=model_kwargs)
+    args = TorchLlmArgs(model=str(tmp_path), **args_kwargs)
 
     _, loaded = ModelLoader.load_config_with_defaults(str(tmp_path), args, HfCheckpointLoader())
 

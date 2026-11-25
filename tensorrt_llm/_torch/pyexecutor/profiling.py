@@ -46,12 +46,13 @@ import time
 import uuid
 import weakref
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Mapping, Optional
 
 import torch
 
+from tensorrt_llm._utils import current_cuda_stream, wait_event
 from tensorrt_llm.logger import logger
-from tensorrt_llm.metrics.logging import LoggerExposure
+from tensorrt_llm.metrics.logging import LoggerExposure, format_kv_pool_fields
 from tensorrt_llm.metrics.perf import PerfMetricsRecord
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
@@ -65,6 +66,25 @@ from .runtime_hooks import runtime_hooks_of
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+KV_POOL_LOG_ENV_VAR_NAME = "TLLM_KV_POOL_LOG"
+
+
+def load_kv_pool_log_enabled(env_var: str = KV_POOL_LOG_ENV_VAR_NAME) -> bool:
+    """Parse the per-pool KV cache log switch, ignoring case and surrounding spaces.
+
+    ``1``, ``true``, ``on`` and ``yes`` enable it; unset, empty, ``0``, ``false``, ``off`` and
+    ``no`` do not. Any other value leaves it disabled with a warning.
+    """
+    raw = os.environ.get(env_var, "").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw not in ("", "0", "false", "off", "no"):
+        logger.warning(
+            f"Ignoring unrecognized {env_var}={raw!r}; per-pool KV cache logging stays "
+            "disabled. Use 1/true/on/yes to enable it."
+        )
+    return False
+
 
 # The iteration log refreshes kv_cache_util (a full KV cache stats build) once
 # per this many iterations and reuses the last value in between.
@@ -848,6 +868,12 @@ class PyExecutorProfileManager:
         self.metrics = executor._perf_metrics
         self.metrics_logger = LoggerExposure(logger.info)
         self._metrics_log_rank_enabled = False
+        self._kv_pool_log_enabled = load_kv_pool_log_enabled()
+        # (rank snapshot, per-pool utilization read together with that snapshot's KV stats)
+        self._kv_pool_sample = None
+        self._kv_pool_gib_logged = False
+        if self._kv_pool_log_enabled:
+            self.metrics.rank_listener = self._sample_kv_pools
 
     @property
     def _executor(self) -> "PyExecutor":  # noqa: F821
@@ -863,7 +889,45 @@ class PyExecutorProfileManager:
     def expose_metrics(self, record: PerfMetricsRecord) -> None:
         """Select executor-loop logging after collection and rank filtering."""
         if self._executor.print_log and self._metrics_log_rank_enabled:
-            self.metrics_logger.emit(record)
+            kv_pool_text = self._kv_pool_log_text(record) if self._kv_pool_log_enabled else ""
+            self.metrics_logger.emit(record, kv_pool_text=kv_pool_text)
+
+    def _sample_kv_pools(self, snapshot: Mapping) -> None:
+        """Read per-pool KV cache utilization right after ``snapshot`` read the KV cache stats.
+
+        The collector makes a rank snapshot whenever ``kv_cache_util`` is read: every
+        ``ITER_LOG_KV_UTIL_REFRESH_ITERS`` loops in logger-only mode, or each measured
+        iteration with iteration stats. Reading the pools at that point, rather than when the
+        line is printed, keeps both fields at the same moment even if pages are released in
+        between. Warmup (a temporary KV cache manager), the V1 manager and ranks that do not
+        print read nothing.
+        """
+        self._kv_pool_sample = None
+        executor = self._executor
+        manager = executor.kv_cache_manager
+        if (
+            "kvCacheStats" not in snapshot
+            or manager is None
+            or not executor._is_kv_manager_v2
+            or executor.is_warmup
+            or not executor.print_log
+            or not self._metrics_log_rank_enabled
+        ):
+            return
+        self._kv_pool_sample = (snapshot, manager.get_kv_cache_pool_utilization())
+
+    def _kv_pool_log_text(self, record: PerfMetricsRecord) -> str:
+        """Return the per-pool fields sampled with this line's KV snapshot, once per snapshot."""
+        sample = self._kv_pool_sample
+        if sample is None or sample[0] is not record.per_rank:
+            return ""
+        self._kv_pool_sample = None
+        gpu_pool_gib = None
+        if not self._kv_pool_gib_logged:
+            self._kv_pool_gib_logged = True
+            manager = self._executor.kv_cache_manager
+            gpu_pool_gib = [size / 2**30 for size in manager.get_gpu_pool_bytes()]
+        return format_kv_pool_fields(sample[1], gpu_pool_gib)
 
     @contextmanager
     def profile_step(self):
@@ -907,6 +971,16 @@ class PyExecutorProfileManager:
             log_all_ranks = False
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
         self._metrics_log_rank_enabled = log_all_ranks or executor.dist.rank in log_ranks
+        if (
+            self._kv_pool_log_enabled
+            and not executor.is_warmup
+            and not (executor._is_kv_manager_v2 and executor.print_log)
+        ):
+            logger.warning(
+                f"{KV_POOL_LOG_ENV_VAR_NAME} has no "
+                "effect: per-pool KV cache logging requires KV Cache Manager V2 and "
+                "print_iter_log=True."
+            )
 
         def profile_step_fn():
             nonlocal it, start_time
@@ -938,14 +1012,14 @@ class PyExecutorProfileManager:
                 if one_timing_event:
                     pass
                 elif it % 2 == 0:
-                    end_event_1.record()
+                    end_event_1.record(current_cuda_stream())
                     if start_event_2 is not None:
-                        end_event_2.synchronize()
+                        wait_event(end_event_2)
                         prev_device_step_time = start_event_2.elapsed_time(end_event_2)
                 else:
-                    end_event_2.record()
+                    end_event_2.record(current_cuda_stream())
                     if start_event_1 is not None:
-                        end_event_1.synchronize()
+                        wait_event(end_event_1)
                         prev_device_step_time = start_event_1.elapsed_time(end_event_1)
 
                 host_step_time = (end_time - start_time) * 1000  # ms
@@ -1002,11 +1076,11 @@ class PyExecutorProfileManager:
                 if it % 2 == 0:
                     if start_event_1 is None:
                         start_event_1 = torch.cuda.Event(enable_timing=True)
-                    start_event_1.record()
+                    start_event_1.record(current_cuda_stream())
                 else:
                     if start_event_2 is None:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
-                    start_event_2.record()
+                    start_event_2.record(current_cuda_stream())
 
         with controller.iterations():
             yield profile_step_fn

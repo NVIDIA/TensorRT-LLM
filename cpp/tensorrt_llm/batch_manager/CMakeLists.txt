@@ -126,6 +126,15 @@ set_target_properties(
   tllm_context_transfer_consensus PROPERTIES CXX_EXTENSIONS OFF
                                              POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_batch_rnn_cache_routing STATIC rnnCacheRouting.cpp)
+add_library(tllm::batch_rnn_cache_routing ALIAS tllm_batch_rnn_cache_routing)
+target_link_libraries(tllm_batch_rnn_cache_routing
+                      PUBLIC tllm::executor_cache_routing)
+target_compile_features(tllm_batch_rnn_cache_routing PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_batch_rnn_cache_routing PROPERTIES CXX_EXTENSIONS OFF
+                                          POSITION_INDEPENDENT_CODE ON)
+
 add_library(tllm_batch_request_info STATIC requestInfo.cpp)
 add_library(tllm::batch_request_info ALIAS tllm_batch_request_info)
 target_link_libraries(
@@ -163,7 +172,8 @@ add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC tllm::kv_cache tllm::batch_scheduler tllm::context_transfer_consensus
-         tllm::peft_cache tllm::batch_request_info)
+         tllm::peft_cache tllm::batch_request_info
+         tllm::batch_rnn_cache_routing)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}

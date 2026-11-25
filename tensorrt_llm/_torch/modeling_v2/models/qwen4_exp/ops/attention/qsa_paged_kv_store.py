@@ -11,7 +11,8 @@ import torch
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's main K/V geometry and the engine's QSA metadata. `heads_q`
 #: places k and v as head slices of the packed `[T, 24 + 2 + 2, 256]` QKV
@@ -132,7 +133,7 @@ class QsaPagedKvStore(OpWrapper):
     index plane is never touched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # The decode and prefill targets read k/v off the fused projection row; the MTP

@@ -6,7 +6,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)). Validated for Nano / Super only.
-- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned sampling preset — guidance scale, control guidance and flow shift — for any of those the request leaves unset; requests with several hints fall back to the generic video defaults. The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
+- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned defaults — guidance scale and control guidance — for whichever of those it leaves unset; a request with several hints does not combine them and runs at the generic video guidance scale with control guidance 1.0. Flow shift is the request's value, else 10.0 (see [Sampling schedule](#sampling-schedule)). The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 - **Action** — policy / forward dynamics / inverse dynamics generation (`--action_mode` selects the generic workflow; a checkpoint carrying a `policy` manifest selects policy automatically). `inverse_dynamics` reads its observation clip from `--video_path` (MP4/AVI, decoded on worker NVDEC like V2V). State-conditioned policy requests supply the current model-space state through `action`; the model pipeline does not perform robot-protocol conversion. Action and audio generation are mutually exclusive. A predicted trajectory has no representation in a video container, so action runs are saved as `safetensors` or `pt`, keeping the rollout and the action tensor in one payload. Over `trtllm-serve`, checkpoint-selected Policy also makes `format=auto` resolve to `safetensors`, so `format` may be omitted; generic Action requests that explicitly set `action_mode` may likewise leave `format=auto`.
 
@@ -282,14 +282,22 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 Without a selection, each mode samples its own grid. On Nano and Super, T2V, I2V
 and T2I use the checkpoint's Karras grid, and V2V and transfer use the Diffusers
 shifted-linear flow grid. Edge uses its checkpoint-declared linear flow grid in
-every mode. `extra_params.sigma_grid` selects a grid explicitly for base
+every mode.
+
+A request that sends no `flow_shift` runs at 10.0 for V2V and transfer, and at 3.0
+for T2I and for Edge video. These values stand in for the `flow_shift` of 1.0 in
+the published scheduler configs, which those configs' own grid never reads. A
+checkpoint whose scheduler config carries any other `flow_shift` runs at its own
+value, and T2V and I2V on Nano and Super always take the checkpoint's.
+
+`extra_params.sigma_grid` selects a grid explicitly for base
 (non-distilled) checkpoints:
 
 | `sigma_grid` | Grid | `flow_shift` |
 |---|---|---|
 | `"karras"` | The checkpoint's Karras levels | Not used; an explicit value is rejected |
-| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; mode default when omitted |
-| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; mode default when omitted |
+| `"native"` | The Cosmos framework's shifted-linear flow grid | Used; resolved shift when omitted |
+| `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; resolved shift when omitted |
 
 Selecting a linear grid does not change the shift: pass `flow_shift` with it.
 A `flow_shift` so extreme that the grid's sigmas are not finite, strictly
