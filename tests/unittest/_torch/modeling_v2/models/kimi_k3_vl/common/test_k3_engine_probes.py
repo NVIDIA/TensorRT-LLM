@@ -304,34 +304,32 @@ def test_dspark_unified_draft_cache_probes_on_the_k3_hybrid_manager():
 
 
 def test_kda_inforward_snapshot_plan_on_the_private_metadata():
-    """In-forward KDA snapshots (context, block reuse): ``KimiK3HybridCacheManager`` plans them
-    whenever main's KDA kernels are present, whatever the model, and
-    ``finish_inforward_snapshots`` then commits the prefix from the live slot and copies the
-    staging rows back. ``Mamba2Metadata.prepare`` hands the plan to
-    ``_prepare_inforward_split``, which the family's step metadata (``common/kda_metadata``, the
-    ``mamba_metadata_cls`` of every target) turns into a ``kda_snapshot`` plan on the live slots
-    with the plan's staging rows; the KDA layers read those rows through
+    """In-forward snapshots (context, block reuse): main's hybrid managers that plan them
+    (``InforwardSnapshotHost``) commit the prefix from the live slot in
+    ``finish_inforward_snapshots`` and copy the staging rows back, and
+    ``GDNMambaMetadata.prepare`` hands the plan to ``_prepare_inforward_split``. The family's
+    step metadata (``common/kda_metadata``, the ``mamba_metadata_cls`` of every target)
+    implements that hook: it turns the plan into a ``kda_snapshot`` plan on the live slots with
+    the plan's staging rows, which the KDA layers read through
     ``inforward_snapshot_stage_views``."""
     import torch
 
-    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+    from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
         InforwardSnapshotEntry,
-        MambaHybridCacheManagerV2,
+        InforwardSnapshotHost,
     )
 
-    assert issubclass(KimiK3HybridCacheManager, MambaHybridCacheManagerV2)
     for name in ("inforward_snapshot_stage_views", "state_index", "finish_inforward_snapshots"):
-        assert callable(getattr(MambaHybridCacheManagerV2, name, None)), name
-    assert "_prepare_inforward_split(" in inspect.getsource(Mamba2Metadata.prepare)
+        assert callable(getattr(InforwardSnapshotHost, name, None)), name
+    assert "_prepare_inforward_split(" in inspect.getsource(GDNMambaMetadata.prepare)
     metadata_cls = _k3_module("common.kda_metadata").K3MambaMetadata
     for target in TARGETS:
         text_cls = _k3_module(_GLUE[target]).KimiK3DefaultForCausalLM
         assert text_cls.mamba_metadata_cls is metadata_cls, target
         assert _target_class(target).mamba_metadata_cls is metadata_cls, target
     assert list(inspect.signature(metadata_cls._prepare_inforward_split).parameters) == list(
-        inspect.signature(Mamba2Metadata._prepare_inforward_split).parameters
+        inspect.signature(GDNMambaMetadata._prepare_inforward_split).parameters
     )
 
     metadata = metadata_cls.__new__(metadata_cls)
