@@ -1788,7 +1788,7 @@ private:
     std::once_flag mStageKvLoaded;
 
     FmhaInterface mFmhaInterface{std::filesystem::path(getExecPath()).parent_path().string(), /*exportsCubin=*/false,
-        /*numRotations=*/1, /*verbose=*/false, /*enableDiskCache=*/false};
+        /*numRotations=*/1, /*verbose=*/false, /*enableDiskCache=*/true};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
