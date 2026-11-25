@@ -3550,6 +3550,8 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_group.num_slots for pool_group in candidate.pool_group_descs
         ]
         self.impl = candidate
+        # The largest size of the GPU pool; resize_gpu_quota never grows it past this.
+        self._max_gpu_quota = self.gpu_quota
         # Cached at construction so the per-locality-domain metadata invariants
         # stay stable for the manager's lifetime.
         self._fork_join_attn = resolve_fork_join_attn(
@@ -9358,7 +9360,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """Resize the GPU KV cache pool to ``quota`` bytes, rounded down to its allocation unit.
 
         Every KV cache must be suspended, the CUDA graph padding dummies included, and no queued
-        work may use the pool.
+        work may use the pool. The views of the pool (attention's, a drafter's) are bound while the
+        pool is at its size at construction and cover that many slots, so the pool never grows past
+        that size.
 
         Returns:
             The quota the pool took.
@@ -9366,11 +9370,17 @@ class KVCacheManagerV2(BaseResourceManager):
         Raises:
             OutOfPagesError: The pages in use do not fit in ``quota`` bytes.
             RuntimeError: A KV cache is not suspended.
+            ValueError: ``quota`` exceeds the pool's size at construction.
         """
         unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
         quota = max(0, quota) // unit * unit
         if quota == self.gpu_quota:
             return quota
+        if quota > self._max_gpu_quota:
+            raise ValueError(
+                f"The GPU KV cache pool cannot grow to {quota} bytes, past its size at "
+                f"construction of {self._max_gpu_quota} bytes"
+            )
         num_slots = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
         if not self.impl.resize(GPU_LEVEL, quota):
             raise OutOfPagesError(f"The GPU KV cache pool cannot be resized to {quota} bytes")

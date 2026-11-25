@@ -79,6 +79,20 @@ def test_resize_releases_memory_keeps_kv(manager):
     assert manager.get_buffers(0)[pages[-1]].eq(1.5).all()
 
 
+def test_resize_refuses_growth_past_construction(manager):
+    """Refuse to grow the pool past its size at construction, the size its views cover."""
+    quota = manager.gpu_quota
+    num_slots = [pool_group.num_slots for pool_group in manager.impl.pool_group_descs]
+    with pytest.raises(ValueError, match="cannot grow to .* past its size at construction"):
+        manager.resize_gpu_quota(quota + 64 * MIB)
+    assert manager.gpu_quota == quota
+    assert [pool_group.num_slots for pool_group in manager.impl.pool_group_descs] == num_slots
+
+    # Growing back to that size after a shrink is allowed.
+    assert manager.resize_gpu_quota(quota - 64 * MIB) == quota - 64 * MIB
+    assert manager.resize_gpu_quota(quota) == quota
+
+
 def test_kv_pools_suspended_resumes_after_error(manager):
     """Keep every request active with its KV when a restore shrinks the pool and then fails."""
     (request,) = manager.add_dummy_requests([0], [512])
