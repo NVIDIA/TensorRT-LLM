@@ -256,7 +256,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 
 #### `modeling_v2`
 
-* **Description:** Set it to `require`. With the default, `off`, loading fails with `Unknown architecture for AutoModelForCausalLM: MistralLarge4ForCausalLM`. With `require`, a deployment that no target claims fails at load time with a message listing what was checked (compute capability, parallel mapping, speculative decoding and quantization) and which deployments the targets serve. `auto` serves the supported deployments as well, but for a deployment that no target claims it falls back to the default path and fails with the `Unknown architecture` error, which does not say why; use `require`.
+* **Description:** Set it to `require`. The default, `auto`, serves the supported deployments as well, but for a deployment that no target claims it falls back to the default path and fails with `Unknown architecture for AutoModelForCausalLM: MistralLarge4ForCausalLM`, which does not say why. With `require`, an unclaimed deployment fails at load time with a message listing what was checked (compute capability, parallel mapping, speculative decoding and quantization) and which deployments the targets serve.
 
 #### `tensor_parallel_size`, `moe_expert_parallel_size`, `moe_tensor_parallel_size`, `enable_attention_dp`
 
