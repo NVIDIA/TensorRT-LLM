@@ -596,6 +596,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_p
     gdn_prefill_conv_post,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     FLASHINFER_REPLAY_RING_SIZE,
@@ -606,7 +607,10 @@ from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import QsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.speculative.vocab_parallel import vocab_parallel_argmax_enabled
+from tensorrt_llm._torch.speculative.vocab_parallel import (
+    VocabShardedLogits,
+    vocab_parallel_argmax_enabled,
+)
 from tensorrt_llm._torch.utils import (
     ActivationType,
     is_gdn_replay_enabled,
@@ -10448,6 +10452,342 @@ class DecodeTarget:
 # ------------------------------------------------------------ the MTP module ---
 
 
+def _mtp_head_final(core, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The MTP module's head input: its stack-final hyper-connection mixer over the grouped norm of
+    `hidden_states` (the module's un-collapsed residual), `[rows, hidden]`."""
+    M = core._mtp
+    _, normed = qwen4_exp_hc_inject_norm(
+        hidden_states, None, None, M.fhc_norm, core.eps, core.hc_count
+    )
+    final, _ = _hc_mixer(core, normed, M.fhc_first, M.fhc_up, False)
+    return final
+
+
+#: Opt-in: under attention DP (a dep4 / dep8 rank on SM103) the vocabulary projection of the
+#: heads it names runs over a group of attention-DP ranks that each hold a slice of `lm_head`
+#: (upstream's `GroupShardedVerify`): the members' rows are gathered, each member projects all of
+#: them on its 1/G of the vocabulary with the bf16 weight (a view, no copy) and the tokens are
+#: picked across the slices, exchanging a few words a row instead of streaming the whole head at
+#: every rank. Comma list of `draft` (the greedy draft tokens, through the spec worker's
+#: `draft_head` hook) and `verify` (the target tokens of greedy and temperature-only steps), or
+#: `1` for both. Only steps in which the group holds one row count it serves take it, and only
+#: row counts at which this rank's slice logits are the full head's bits (checked at build on
+#: every rank and agreed over the group): a greedy row's token is the full head's argmax. A
+#: temperature-only row is an exact draw from `softmax(logits / T)` at its own Philox seed and
+#: offset, but not the stock sampler's draw (class S: the text of a sampled request changes as it
+#: would with another seed). Measured (GB300, our own kernels over the same slices): the verify
+#: head -0.11..-0.13 ms a step at dep4 12 requests a rank, the draft head part of a -0.47 ms
+#: step bundle. Read once, after load.
+DP_HEAD_SHARD_ENV = "TRTLLM_QWEN4_EXP_DP_HEAD_SHARD"
+#: Which ranks form a group: `node` (the default, upstream's rule: `min(gpus_per_node, DP size)`
+#: consecutive ranks, IPC peer memory) or `domain` (every attention-DP rank, MNNVL peer memory
+#: across the nodes of one NVLink domain: dep8 on 4-GPU trays projects 1/8 of the vocabulary a
+#: rank instead of 1/4, as measured).
+DP_HEAD_SHARD_GROUP_ENV = "TRTLLM_QWEN4_EXP_DP_HEAD_SHARD_GROUP"
+#: Requests a rank each head was measured to serve (the verify head with 4 rows a request).
+_DP_HEAD_SHARD_REQUESTS = {"verify": (1, 32), "draft": (1, 64)}  # capacity: fixed: dispatch
+
+
+def _dp_head_shard_heads() -> frozenset:
+    """`DP_HEAD_SHARD_ENV`: the heads it names (empty: off)."""
+    raw = os.environ.get(DP_HEAD_SHARD_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return frozenset()
+    if value in _SWITCH_ON:
+        return frozenset({"draft", "verify"})
+    heads = frozenset(h.strip() for h in value.split(","))
+    if not heads <= {"draft", "verify"}:
+        raise ValueError(f"{DP_HEAD_SHARD_ENV}={raw!r}: expected 0, 1 or a list of draft, verify")
+    return heads
+
+
+def _dp_head_shard_group() -> str:
+    """`DP_HEAD_SHARD_GROUP_ENV`: `node` (unset or empty) or `domain`."""
+    raw = os.environ.get(DP_HEAD_SHARD_GROUP_ENV, "")
+    value = raw.strip().lower() or "node"
+    if value not in ("node", "domain"):
+        raise ValueError(f"{DP_HEAD_SHARD_GROUP_ENV}={raw!r}: expected node or domain")
+    return value
+
+
+class _ShardVerifyLogits(VocabShardedLogits):
+    """What the spec worker gets as `logits` in a step `DP_HEAD_SHARD_ENV`'s verify head served:
+    the step's target tokens, already drawn (`_sample_tokens_for_batch` takes them through
+    `select_tokens`). It holds no logits; the worker reads `dim()` and `device` besides, and the
+    shell swaps the object for a placeholder in the outputs it returns."""
+
+    def __init__(self, tokens: torch.Tensor, vocab: int) -> None:
+        self.tokens, self.vocab = tokens, vocab
+
+    @property
+    def device(self) -> torch.device:
+        return self.tokens.device
+
+    @property
+    def num_rows(self) -> int:
+        return self.tokens.shape[0]
+
+    @property
+    def shape(self) -> tuple:
+        return (self.num_rows, self.vocab)
+
+    def dim(self) -> int:
+        return 2
+
+    def gather(self) -> torch.Tensor:
+        raise RuntimeError(
+            f"{DP_HEAD_SHARD_ENV}: this step's target logits are vocabulary slices on the ranks "
+            "of a group; a consumer of the whole distribution cannot be served"
+        )
+
+    def select_tokens(self, spec_metadata) -> torch.Tensor:
+        return self.tokens
+
+
+class _DpHeadShard:
+    """`DP_HEAD_SHARD_ENV`'s state on one attention-DP rank: the group (`GroupShardedVerify`), the
+    row counts each head serves (the same sets on every member), and the step's per-rank request
+    counts, which the draft hook decides from.
+
+    Every member of a group makes the same calls in the same order with the same rows, so each
+    decision reads only what the members hold alike: the step's per-rank request and token
+    counts, the CUDA-graph flag, the group-synchronized sampling variant
+    (`samples_from_vocab_shards` makes the engine exchange it) and deploy-time constants. A rank
+    whose own rows differ from the group's in a served step raises: its peers would wait."""
+
+    def __init__(self, group, core, verify_rows: frozenset, draft_rows: frozenset) -> None:
+        self.group, self.core = group, core
+        self.verify_rows, self.draft_rows = verify_rows, draft_rows
+        self.placeholder = torch.full(
+            (max(verify_rows, default=1), 1),
+            float("nan"),
+            dtype=torch.float32,
+            device=group.weight.device,
+        )
+        self.counts: list | None = None
+        self.graph = False
+
+    def _members(self, counts) -> list:
+        g = self.group
+        return list(counts[g.first_dp_rank : g.first_dp_rank + g.group_size])
+
+    def begin_step(self, spec_metadata) -> None:
+        """Stash the step's per-rank request counts and its CUDA-graph flag (host values)."""
+        counts = getattr(spec_metadata, "subseq_all_rank_num_tokens", None)
+        self.counts = None if counts is None else [int(n) for n in counts]
+        self.graph = bool(getattr(spec_metadata, "is_cuda_graph", False))
+
+    def _engages(self, rows: int, counts, served: frozenset, what: str) -> bool:
+        if not self.graph or counts is None:
+            return False
+        members = self._members(counts)
+        if any(c != members[0] for c in members) or members[0] not in served:
+            return False
+        if rows != members[0]:
+            raise RuntimeError(
+                f"{DP_HEAD_SHARD_ENV}: rank {self.core.dp_rank} holds {rows} {what} rows in a step "
+                f"whose group holds {members}"
+            )
+        return True
+
+    def draft_engages(self, rows: int) -> bool:
+        return self._engages(rows, self.counts, self.draft_rows, "draft")
+
+    def tokens(self, final: torch.Tensor, params=(None, None, None)) -> torch.Tensor:
+        """This rank's tokens of `final` `[R, hidden]` bf16 over the group's slices (two group
+        launches and the slice GEMM); `params` the rows' temperatures, seeds and offsets."""
+        return self.group.sample(self.group.logits(final, *params))
+
+    def verify_tokens(self, worker, spec_metadata, attn_metadata, head_rows):
+        """The target tokens of a step the verify head serves, int64 `[rows]`, or None."""
+        if not self.verify_rows or not self.graph:
+            return None
+        if spec_metadata.is_ragged_verify or getattr(worker, "guided_decoder", None) is not None:
+            return None
+        greedy = spec_metadata.is_all_greedy_sample
+        if not (greedy or spec_metadata.is_all_temperature_only):
+            return None
+        tokens = getattr(attn_metadata, "all_rank_num_tokens", None)
+        if not self._engages(head_rows.shape[0], tokens, self.verify_rows, "verify"):
+            return None
+        params = (None, None, None)
+        if not greedy:
+            rows = head_rows.shape[0]
+            params = (
+                spec_metadata.temperatures[:rows],
+                spec_metadata.seeds[:rows],
+                spec_metadata.offsets[:rows],
+            )
+        return self.tokens(head_rows.contiguous(), params)
+
+
+class _DpShardDraftHead:
+    """`DP_HEAD_SHARD_ENV`'s `draft`: the spec worker's `draft_head` hook. The worker asks
+    `supports(rows)` once a draft pass and, on True, calls `sample` in place of
+    `MTPLayer.shared_head` + the greedy draft sampler."""
+
+    def __init__(self, core, shard: _DpHeadShard) -> None:
+        self.core, self.shard = core, shard
+
+    def supports(self, rows: int) -> bool:
+        return self.shard.draft_engages(rows)
+
+    def sample(self, hidden_states: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Greedy draft tokens, int32 `[rows]` (into `out` when given)."""
+        tokens = self.shard.tokens(_mtp_head_final(self.core, hidden_states))
+        if out is None:
+            return tokens.to(torch.int32)
+        out.copy_(tokens)
+        return out
+
+
+def _dp_head_shard_check(group, lm_head, counts) -> list:
+    """The row counts in `counts` at which this rank's slice logits (the group's GEMM over
+    `group_size * rows` test rows) differ in any bit from the full head called `rows` rows at a
+    time, as each rank calls it. On this rank alone; also the slice GEMM's warm-up."""
+    bad = []
+    g, lo, n = group.group_size, group.vocab_offset, group.local_vocab
+    dev = group.weight.device
+    for rows in sorted(counts):
+        gen = torch.Generator(device=dev).manual_seed(20261125 + 1009 * rows + group.rank)
+        x = torch.randn((g * rows, group.hidden), generator=gen, device=dev)
+        x = (x * torch.exp(torch.randn_like(x[:, :1]))).to(torch.bfloat16)
+        mine = torch.mm(x, group.weight.t(), out=group.slice_logits[: g * rows])
+        for p in range(g):
+            full = lm_head(x[p * rows : (p + 1) * rows])[:, lo : lo + n]
+            if not torch.equal(
+                mine[p * rows : (p + 1) * rows].view(torch.int16), full.view(torch.int16)
+            ):
+                bad.append(rows)
+                break
+    return bad
+
+
+def _dp_head_shard_build(shell, device):
+    """`DP_HEAD_SHARD_ENV`, read once after load (the shell's `post_load_weights`): the rank's
+    `_DpHeadShard` (and the worker's `draft_head` hook), or None. Collective over the attention-DP
+    group where set at a layout it serves: the group's peer buffers, then one all-gather over the
+    attention-DP group of whether each rank's group was built and the row counts whose slice
+    logits differ on a rank (a count no rank failed is served; a group missing anywhere leaves the
+    heads unchanged on every rank). Everything deciding before the collectives is the layout, the
+    deploy configuration or the env, the same on every rank."""
+    heads = _dp_head_shard_heads()
+    if not heads:
+        return None
+    core = shell.model
+    worker = shell.spec_worker
+    spec = shell.spec_config
+    lm_head = getattr(shell, "lm_head", None)
+    weight = getattr(lm_head, "weight", None)
+    why = None
+    if not _dp_decode_rank(core, device):
+        why = "it serves a dep4 / dep8 rank on SM103"
+    elif worker is None or not core.mtp_enabled:
+        why = "there is no MTP spec worker"
+    elif getattr(spec, "use_rejection_sampling", False) or getattr(spec, "enable_penalty", False):
+        why = "rejection sampling and the occurrence penalties read the whole target distribution"
+    elif getattr(spec, "use_relaxed_acceptance_for_thinking", False):
+        why = "relaxed acceptance reads the target distribution"
+    elif (
+        getattr(spec, "acceptance_rate_window_size", None)
+        and getattr(spec, "acceptance_rate_threshold", None) is not None
+    ):
+        # As upstream's group verify head (`DSv4DSparkWorker.prepare_vocab_sharded_sampling`):
+        # the acceptance-rate gate can stop one rank's drafting alone, and its peers would wait
+        # in the group's draft-head exchange.
+        why = "the acceptance-rate gate can stop one rank's drafting alone"
+    elif getattr(core.mapping, "enable_lm_head_tp_in_adp", False):
+        why = "enable_lm_head_tp_in_adp shards the heads its own way"
+    elif "draft" in heads and not (
+        getattr(worker, "is_mtp_eagle", False) and getattr(worker, "draft_head", 1) is None
+    ):
+        why = "the spec worker has no free `draft_head` hook in an MTP-Eagle draft loop"
+    elif not (
+        type(lm_head) is LMHead
+        and isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and tuple(weight.shape) == (core.vocab, core.hidden)
+        and getattr(lm_head, "bias", None) is None
+        # The group's slice GEMM writes bf16 logits; a head with another output dtype (fp32
+        # `lm_head_output_dtype`) would differ in every count's bits (as upstream's group head).
+        and getattr(lm_head, "output_dtype", None) in (None, torch.bfloat16)
+    ):
+        why = "lm_head is not the replicated dense bf16 head with bf16 logits"
+    if why is not None:
+        logger.warning(f"{DP_HEAD_SHARD_ENV} is set but ignored: {why}; the heads are unchanged")
+        return None
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.distributed.peer_buffers import PeerTransport
+    from tensorrt_llm._torch.speculative.group_sharded_sampling import GroupShardedVerify
+
+    domain = _dp_head_shard_group() == "domain"
+    size = core.dp_size if domain else min(core.mapping.gpus_per_node, core.dp_size)
+    per = core.max_verify_rows
+    sizes = sorted(
+        {int(b) for b in (getattr(core.model_config, "cuda_graph_batch_sizes", None) or ())}
+    )
+    want = {}
+    for head in heads:
+        lo, hi = _DP_HEAD_SHARD_REQUESTS[head]
+        scale = per if head == "verify" else 1
+        want[head] = frozenset(scale * b for b in sizes if lo <= b <= hi)
+    max_rows = max((max(r) for r in want.values() if r), default=0)
+    if not max_rows:
+        # The deploy configuration's, the same on every rank: nothing collective has run.
+        logger.warning(
+            f"{DP_HEAD_SHARD_ENV} is set but ignored: no CUDA-graph batch size in the measured "
+            f"range; the heads are unchanged"
+        )
+        return None
+    counts = frozenset().union(*want.values())
+    group, error, bad = None, "", []
+    try:
+        # Collective over this rank's group only. Its answer is the same on the group's members,
+        # but under `node` another group may answer otherwise (its peer buffers failed), so the
+        # whole attention-DP group agrees below before any rank returns.
+        group = GroupShardedVerify.create(
+            core.mapping, weight, size, max_rows, None if domain else PeerTransport.IPC
+        )
+        if group is None:
+            error = (
+                f"no group of {size} ranks ({DP_HEAD_SHARD_GROUP_ENV}="
+                f"{'domain' if domain else 'node'}) over this mapping"
+            )
+        else:
+            bad = _dp_head_shard_check(group, lm_head, counts)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+    except Exception as e:  # noqa: BLE001 -- every rank agrees below
+        error = f"{type(e).__name__}: {e}"
+    reports = Distributed.get(core.mapping).tp_allgather((error, bad))
+    errors = [e for e, _ in reports if e]
+    refused = frozenset().union(*(frozenset(b) for _, b in reports))
+    if errors:
+        logger.warning(
+            f"{DP_HEAD_SHARD_ENV} is set but ignored on every rank: {errors[0]}; the heads are "
+            "unchanged"
+        )
+        return None
+    shard = _DpHeadShard(
+        group,
+        core,
+        want.get("verify", frozenset()) - refused,
+        want.get("draft", frozenset()) - refused,
+    )
+    if shard.draft_rows:
+        worker.draft_head = _DpShardDraftHead(core, shard)
+    logger.info(
+        f"attention-DP heads over vocabulary slices ({DP_HEAD_SHARD_ENV}): rank {core.dp_rank} "
+        f"of {core.dp_size}, group of {size} ({group.buffers.transport.value}), slice "
+        f"[{group.vocab_offset}, {group.vocab_offset + group.local_vocab}), verify rows "
+        f"{sorted(shard.verify_rows)}, draft rows {sorted(shard.draft_rows)}, not bitwise on some "
+        f"rank (full head kept): {sorted(refused)}"
+    )
+    return shard if (shard.verify_rows or shard.draft_rows) else None
+
+
 class MTPLayer:
     """The checkpoint's MTP module, replayed once per draft step by the spec worker: one more
     decoder layer (two hyper-connections, gated GQA over its own QSA indexer, a 512-expert
@@ -10498,11 +10838,7 @@ class MTPLayer:
         attention TP; this rank's bf16 vocabulary shard where `_sharded_head` allows). The norm
         and the mixer are the trunk's stack-final site's."""
         core = self.core
-        M = core._mtp
-        _, normed = qwen4_exp_hc_inject_norm(
-            hidden_states, None, None, M.fhc_norm, core.eps, core.hc_count
-        )
-        final, _ = _hc_mixer(core, normed, M.fhc_first, M.fhc_up, False)
+        final = _mtp_head_final(core, hidden_states)
         draft_head = getattr(core, "draft_head", None)
         if draft_head is None:
             if self._sharded_head(lm_head, final.shape[0]):
@@ -11353,6 +11689,17 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
         self._mm_token_ids_cache: torch.Tensor | None = None
         # Replicated on every rank; built once the weights are real (`post_load_weights`).
         self.vision_tower: _vision.VisionTower | None = None
+        # `DP_HEAD_SHARD_ENV` (opt-in): the attention-DP heads over vocabulary slices, built
+        # after load.
+        self._dp_head_shard: _DpHeadShard | None = None
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """With `DP_HEAD_SHARD_ENV`'s verify head the engine exchanges the attention-DP ranks'
+        sampling variants (greedy, temperature-only) and captures the temperature-only one, so
+        the members of a group decide alike."""
+        shard = self._dp_head_shard
+        return shard is not None and bool(shard.verify_rows)
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
@@ -11462,7 +11809,16 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             )
         )
         head_rows = _head_rows(self.model, spec_metadata.gather_ids, final)
-        if isinstance(self.logits_processor, _WideningLogitsProcessor):
+        shard = self._dp_head_shard
+        shard_tokens = None
+        if shard is not None:
+            shard.begin_step(spec_metadata)
+            shard_tokens = shard.verify_tokens(
+                self.spec_worker, spec_metadata, attn_metadata, head_rows
+            )
+        if shard_tokens is not None:
+            logits = _ShardVerifyLogits(shard_tokens, self.model.vocab)
+        elif isinstance(self.logits_processor, _WideningLogitsProcessor):
             verify_argmax_only, self.logits_processor.draft_argmax_only = _spec_argmax_only(
                 self.spec_worker, spec_metadata
             )
@@ -11499,7 +11855,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             n = attn_metadata.num_tokens
             input_ids, hc = input_ids[:n], hc[:n]
             position_ids = position_ids[..., :n]
-        return self.spec_worker(
+        outputs = self.spec_worker(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hc,
@@ -11509,6 +11865,12 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             draft_model=self.draft_model,
             resource_manager=kwargs.get("resource_manager"),
         )
+        if shard_tokens is not None and isinstance(outputs, dict):
+            # The engine keeps the step's `logits` output (and slices it on an idle rank); nothing
+            # reads its values, since the one-model sampler admits no request asking for logits.
+            if isinstance(outputs.get("logits"), _ShardVerifyLogits):
+                outputs["logits"] = shard.placeholder[: shard_tokens.shape[0]]
+        return outputs
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)
@@ -11520,6 +11882,9 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
         self.vision_tower.warm_up()
         if self.one_rank:
             self._build_heads(self.lm_head.weight.data)
+        elif self.spec_worker is not None and self._dp_head_shard is None:
+            # Collective where set (every rank of the attention-DP group builds it).
+            self._dp_head_shard = _dp_head_shard_build(self, self.lm_head.weight.device)
 
     def _build_heads(self, weight: torch.Tensor) -> None:
         """The tp1 heads' copies of `weight`: the draft head's FP8 copies (per row, and packed

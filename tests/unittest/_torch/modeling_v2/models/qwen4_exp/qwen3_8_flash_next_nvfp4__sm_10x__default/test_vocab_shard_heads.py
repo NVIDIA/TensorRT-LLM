@@ -122,6 +122,7 @@ def test_verify_logits_go_through_the_worker_with_the_exchange(monkeypatch, exch
     shell.model = _Core(torch.arange(12.0).reshape(3, 4))
     shell.spec_worker = _Worker(exchange, calls)
     shell.one_rank = False
+    shell._dp_head_shard = None
     shell.lm_head = "head"
     shell.logits_processor = SimpleNamespace(
         forward=lambda rows, head, md, ctx: calls.append(("gather", rows.shape[0])) or "gathered"
