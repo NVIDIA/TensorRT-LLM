@@ -530,19 +530,11 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
 
 
 def test_a_failed_construction_releases_host_resident_weights(monkeypatch) -> None:
-    """A construction that fails after building the model engine releases the model's
-    host-resident tables before the error, whose traceback keeps the model, reaches the caller."""
     released = []
+    module = SimpleNamespace(release_host_resident_weights=lambda: released.append(True))
 
-    class _Table:
-        def release_host_resident_weights(self):
-            released.append(self)
-
-    table = _Table()
-
-    def _fail_after_building(**kwargs):
-        engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: [table]))
-        kwargs.get("model_engines", []).append(engine)
+    def _fail_after_building(*, model_engines, **kwargs):
+        model_engines.append(SimpleNamespace(model=SimpleNamespace(modules=lambda: [module])))
         raise RuntimeError("warmup failed")
 
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _fail_after_building)
@@ -551,7 +543,7 @@ def test_a_failed_construction_releases_host_resident_weights(monkeypatch) -> No
     )
     with pytest.raises(RuntimeError, match="warmup failed"):
         py_executor_creator.create_py_executor(llm_args)
-    assert released == [table]
+    assert released == [True]
 
 
 def _dense_fp4_mla_model_config() -> SimpleNamespace:

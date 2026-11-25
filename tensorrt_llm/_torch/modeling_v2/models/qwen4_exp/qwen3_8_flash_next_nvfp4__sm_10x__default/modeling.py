@@ -1645,10 +1645,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
 
     def release_host_resident_weights(self) -> None:
-        """Release the host-resident n-gram table (`ple_host_table`), in `node` its chunks and
-        the broker threads that serve them to the host's other processes. The executor creator
-        calls it when a construction fails after the model loaded: the error's traceback keeps
-        this core, so the table would not be collected while the caller holds the error."""
+        """Close the host-resident n-gram table and, in `node`, its broker threads."""
         _weights._close_ngram_table(self)
 
     # ---------------------------------------------------------------- bind ---
