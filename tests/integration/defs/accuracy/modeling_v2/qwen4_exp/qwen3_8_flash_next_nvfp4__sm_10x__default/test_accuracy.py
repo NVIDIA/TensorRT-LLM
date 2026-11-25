@@ -439,8 +439,9 @@ _DEP8 = dict(
 # (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in, another K split; SM103 only), and once more
 # with the two opt-in attention-DP row ranges: the grouped sparse GQA from 2 requests a rank
 # (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another summation order than split-K) and the
-# cluster top-k up to 256 rows (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`).
-# FP8 at dep4 once more with the e4m3 QSA index anchors
+# cluster top-k up to 256 rows (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`), and once with
+# those row ranges on the trunk's bitmap-union verify kernel (`TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1`,
+# class S, SM103 only). FP8 at dep4 once more with the e4m3 QSA index anchors
 # (`TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1`, opt-in and lossy against the bf16 keys: every anchor and
 # the index query rounded to e4m3), which only the pass keys reach (gsm8k stays dense).
 # Then the whole attention-DP stack the AgentX
@@ -510,6 +511,15 @@ _QUANTIZED_KV = [
                 get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
             ),
         ],
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(dp_rows=True, dp_bitmap=True),
+        id="dep4_fp8_kv_dp_bitmap",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the bitmap-union verify kernel serves SM103"
+        ),
     ),
     pytest.param(
         _DEP4,
@@ -975,6 +985,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("dp_rows"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
+        if variant.get("dp_bitmap"):
+            env["TRTLLM_QWEN4_EXP_DP_GQA_BITMAP"] = "1"
         if variant.get("index_key_fp8"):
             env["TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"] = "1"
         if variant.get("tep_opt_in"):
