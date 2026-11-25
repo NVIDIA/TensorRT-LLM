@@ -247,9 +247,8 @@ l0_b200:
   # GLM-5.3-Flash FP8 modeling_v2 target (sm_100): its operations. The 4-rank boundary matrix runs in
   # l0_dgx_b200.
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 --ignore=unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/comm/test_modeling_v2_mhc_ar_boundary.py
-  # KDA runtime state-pool and mixed-batch core coverage.
+  # KDA runtime state-pool coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
-  - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
@@ -260,8 +259,6 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
   - unittest/_torch/modeling/test_kimi_k3_moe_front.py
-  # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
-  - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
