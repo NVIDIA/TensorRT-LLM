@@ -308,13 +308,7 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The baseline schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
-
-The encoder extension is pinned to canonical [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), which is not yet included in that BSR release. Its exact source revision is recorded in the vendor lock and schema manifest.
-
-Before releasing the encoder extension, pin the merged upstream schema revision
-and regenerate the vendored bindings. Draft revisions use the canonical
-`openengine.v1` namespace and must not be treated as a stable wire contract.
+The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.2.0`](https://github.com/ai-dynamo/openengine/tree/v0.2.0), Git commit `475dcf2e332c4f9975dcdf7f65838cbabd5acc31`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `b7001e32713d4b8abc70d49dd1be6113`.
 
 TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
@@ -348,11 +342,10 @@ For disaggregated subagent context requests, configure `internal_request_auth_ke
 
 ## Image encoder handoff (experimental)
 
-Image E+PD and E+P+D use the unary `Encoder.Encode` contract proposed in
-[OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
-immutable source revision in the vendor lock. Both client and server need the
-matching bindings; this proposal is not in a published BSR release or runtime.
-TP/PP/CP must each be 1.
+Image E+PD and E+P+D use the unary `Encoder.Encode` contract released in
+[OpenEngine v0.2.0](https://github.com/ai-dynamo/openengine/tree/v0.2.0). Both client
+and server need compatible bindings and a TensorRT-LLM build containing the
+native encoder integration. TP/PP/CP must each be 1.
 
 The model processor must support native multimodal disaggregation. Load the same
 immutable checkpoint revision and processor configuration on every engine.
