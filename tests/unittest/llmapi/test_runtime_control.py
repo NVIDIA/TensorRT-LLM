@@ -168,7 +168,7 @@ def test_memory_status_signs_empty_body():
         response = client.get("/memory_status", headers=headers)
 
     assert response.status_code == 200
-    assert response.json() == {"state": "running", "parked_tags": []}
+    assert response.json() == {"state": "running", "parked_tags": [], "failure_reason": None}
 
 
 def test_invalid_worker_status_is_an_internal_error():
@@ -468,7 +468,9 @@ def test_legacy_and_generic_controls_are_mutually_exclusive():
 @pytest.mark.parametrize("generator_cls", [LLM, AsyncLLM])
 def test_runtime_control_rejects_multiple_frontends(generator_cls):
     generator = object.__new__(generator_cls)
-    generator.args = SimpleNamespace(sleep_config=SleepConfig(), num_serve_frontends=2)
+    generator.args = SimpleNamespace(
+        sleep_config=SleepConfig(), num_serve_frontends=2, env_overrides=None
+    )
 
     with pytest.raises(ValueError, match="require num_serve_frontends=1"):
         OpenAIServer(

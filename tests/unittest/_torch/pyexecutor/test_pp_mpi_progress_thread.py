@@ -186,6 +186,7 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor.dist = SimpleNamespace(rank=0, world_size=1, pp_size=pp_size)
     executor.worker_lock = threading.Lock()
     executor.worker_started = False
+    executor.checkpoint = None
     executor.num_micro_batches = 2
     executor._disable_mpi = False
     executor._mpi_progress_thread = None

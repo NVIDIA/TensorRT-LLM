@@ -17,6 +17,7 @@
 import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,7 @@ from test_common.serve.fakes import (
     UserProbeMiddleware,
 )
 from test_common.serve.middleware import middleware_snapshot
-from test_common.serve.routes import _records_conflict, compare, effective_routes
+from test_common.serve.routes import _records_conflict, compare, effective_routes, snapshot_routes
 
 import tensorrt_llm._utils
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -207,6 +208,46 @@ def test_isolated_serve_env_restores_global_state(tmp_path):
 def test_isolated_serve_env_rejects_use_without_with(tmp_path):
     with pytest.raises(AttributeError):
         isolated_serve_env(tmp_path).build_openai_server(AggConfig())
+
+
+def test_isolated_serve_env_joins_worker_pools(tmp_path: Path) -> None:
+    """Environment exit retires test-owned threads before the leak guard runs."""
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig())
+        workers = [
+            pool.submit(threading.current_thread).result(timeout=1)
+            for pool in (
+                server._input_proc_executor,
+                server._media_load_executor,
+                server._metrics_stats_executor,
+            )
+        ]
+        assert all(worker.is_alive() for worker in workers)
+    assert all(not worker.is_alive() for worker in workers)
+
+
+def test_checkpoint_factory_has_read_only_native_boundary(tmp_path: Path) -> None:
+    """Build real lifecycle routes without pretending to implement native mutations."""
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(checkpoint=True))
+        status = server.checkpoint_lifecycle.get_lifecycle_status()
+        assert status.profile.ranks == [0]
+        assert status.readiness.admission_open
+        routes = [
+            record
+            for record in snapshot_routes(server.app)
+            if record.split()[1] == "/ready" or record.split()[1].startswith("/checkpoint/")
+        ]
+        assert routes == [
+            "GET /ready _MsgspecRoute",
+            "GET /checkpoint/status _MsgspecRoute",
+            "POST /checkpoint/prepare_capture _MsgspecRoute",
+            "POST /checkpoint/validate_runtime _MsgspecRoute",
+            "POST /checkpoint/activate _MsgspecRoute",
+            "POST /checkpoint/abort_operation _MsgspecRoute",
+        ]
+        with pytest.raises(NotImplementedError, match="only supports.*checkpoint profile"):
+            server.generator._collective_rpc("checkpoint_step", non_block=True)
 
 
 # ---------------------------------------------------------------------------

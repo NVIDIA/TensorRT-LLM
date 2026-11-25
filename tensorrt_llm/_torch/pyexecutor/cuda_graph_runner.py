@@ -738,6 +738,15 @@ class CUDAGraphRunner:
         """
         self._pre_replay_hooks.append(hook)
 
+    def unregister_pre_replay_hook(
+        self, hook: Callable[[KeyType, int, Dict[str, Any], Dict[str, Any]],
+                             None]
+    ) -> None:
+        """Remove this observer without mutating an in-progress hook iteration."""
+        self._pre_replay_hooks = [
+            other for other in self._pre_replay_hooks if other != hook
+        ]
+
     def _resolve_sample_type(
         self,
         batch: ScheduledRequests,

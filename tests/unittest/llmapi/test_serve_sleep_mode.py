@@ -137,6 +137,7 @@ def test_runtime_control_rejects_embedding_server() -> None:
         encode_only=True,
         sleep_config=SleepConfig(),
         num_serve_frontends=1,
+        env_overrides=None,
     )
 
     with mock.patch.object(OpenAIServer, "_register_runtime_control_routes") as register_routes:

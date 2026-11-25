@@ -155,6 +155,7 @@ class SnapshotConfig:
 
 CONFIGS: Tuple[SnapshotConfig, ...] = (
     SnapshotConfig("llm", "openai_server", AggConfig()),
+    SnapshotConfig("llm_checkpoint", "openai_server", AggConfig(checkpoint=True)),
     SnapshotConfig("llm_context", "openai_server", AggConfig(role=ServerRole.CONTEXT)),
     SnapshotConfig("llm_generation", "openai_server", AggConfig(role=ServerRole.GENERATION)),
     SnapshotConfig("llm_gpt_oss", "openai_server", AggConfig(model_type="gpt_oss")),

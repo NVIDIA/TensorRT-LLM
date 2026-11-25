@@ -205,6 +205,16 @@ class ProfileController:
         """Whether a profile window is open; read without the lock, so it may lag one iteration."""
         return self._profile_enabled
 
+    def has_active_or_scheduled_window(self) -> bool:
+        """Return whether a current or pending profile window prevents resident capture."""
+        with self._profile_state_lock:
+            iteration = self._current_iteration()
+            return (
+                self._profile_enabled
+                or self._runtime_profile_pending_start_iter is not None
+                or any(index >= iteration for index in self.profile_start_iters)
+            )
+
     def reset_iterations(self) -> None:
         """Schedule only the environment's windows, dropping runtime-scheduled iterations."""
         start_iters, stop_iters = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
