@@ -1225,6 +1225,20 @@ def test_detect_qwen3_non_chatml_forced_thinking(tmp_path):
         "deepseek-r1")
 
 
+def test_detect_qwen3_non_chatml_prompt_after_chatml_history(tmp_path):
+    """Only the generation prompt has to be in the Qwen ChatML format."""
+    model_dir = str(tmp_path / "Qwen3-chatml-history-deepseek-prompt")
+    jinja = _DEEPSEEK_TOKEN_TEMPLATE.replace(
+        "{{'<｜User｜>' + message['content'] + '<｜Assistant｜>'}}",
+        "{{'<|im_start|>user\\n' + message['content'] + '<|im_end|>\\n'}}")
+    _write_qwen3_checkpoint(model_dir,
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None)
+
+
 @pytest.mark.parametrize(("name", "model_type"), [
     ("DeepSeek-V3.1", "deepseek_v3"),
     ("SomeUnknownModel", "some_unknown_type"),
