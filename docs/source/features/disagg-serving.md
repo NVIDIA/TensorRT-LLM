@@ -421,6 +421,8 @@ owned by the target's KV cache manager. A reused context prefix rebuilds the
 draft's retained suffix. Generation reads these pages directly. With no load
 balancer configured, the context worker also omits the draft head and MoE
 weights. This profile uses `bounded_replay_on_generation: false`, the default.
+Confidence scheduling, including any `confidence_cost_table_path`, is used
+only by the generation worker. Use a cost table for that worker's topology.
 
 ### DeepSeek-V4.1 context decoder weights
 

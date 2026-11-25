@@ -140,7 +140,10 @@ def install_ctx_decoder_batch(executor) -> Optional[CtxDecoderBatcher]:
     model = getattr(engine.model, "model", None)
     window = getattr(model, "decoder_replay_window", 0)
     draft = getattr(engine.model, "draft_model", None)
-    final_window_draft = getattr(draft, "supports_final_window_context_replay", False) is True
+    supports_final_window = getattr(draft, "supports_final_window_context_replay", None)
+    final_window_draft = callable(supports_final_window) and supports_final_window(
+        scheduler.kv_cache_manager
+    )
     if not (
         executor.dist.tp_size > 1
         and executor.dist.pp_size == 1

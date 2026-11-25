@@ -31,6 +31,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from ...models.modeling_utils import QuantConfig
 from ..model_config import ModelConfig, MoESelection
@@ -489,18 +490,25 @@ class _DSv41DSparkContextDraftModel(DSv41DSparkDraftModel):
 
     def _cache_attn_weights(self, src: dict) -> None:
         device = self.mtp_layers[0].main_norm.weight.device
+        wkv_weights = {}
         for stage_id, stage in enumerate(self.mtp_layers):
             prefix = f"mtp.{stage_id}.attn."
+            weight = _materialize(src[prefix + "wkv.weight"]).to(device)
+            scale = _materialize(src[prefix + "wkv.scale"]).to(device)
+            wkv_weights[prefix + "wkv.weight"] = weight
+            wkv_weights[prefix + "wkv.scale"] = scale
             stage._dspark_attn = {
                 "wkv": self._block_dequant(
-                    src[prefix + "wkv.weight"].to(device),
-                    src[prefix + "wkv.scale"].to(device),
+                    weight,
+                    scale,
                     block=self.checkpoint_fp8_block_size,
                 ),
-                "kv_norm_w": src[prefix + "kv_norm.weight"].to(device).to(torch.bfloat16),
+                "kv_norm_w": _materialize(src[prefix + "kv_norm.weight"]).to(
+                    device=device, dtype=torch.bfloat16
+                ),
             }
         self._pack_backfill_wkv_weights()
-        self._cache_fp8_prep_weights(src)
+        self._cache_fp8_prep_weights(wkv_weights)
 
     def _reject_generation(self, *args, **kwargs):
         raise RuntimeError("A context-only DSpark drafter cannot generate draft tokens")
@@ -518,19 +526,25 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
 
     draft_model_cls = DSv41DSparkDraftModel
 
-    @property
-    def supports_final_window_context_replay(self) -> bool:
-        """The final context capture fully seeds the PRIVATE draft window."""
-        return getattr(self.dspark_model, "context_kv_only", False) is True
+    def supports_final_window_context_replay(self, manager) -> bool:
+        """Draft KV can be rebuilt from the final capture for request-private layers."""
+        layers = manager.draft_layer_ids
+        return bool(layers) and all(
+            manager.get_layer_cache_spec(layer).reuse_policy == ReusePolicy.PRIVATE
+            for layer in layers
+        )
 
     def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
         """Whether the V4.1 draft attention reads context from pages of this size."""
         return tokens_per_block in (128, 256)
 
     def __init__(self, draft_config, *args, context_kv_only=False, **kwargs):
-        if context_kv_only and getattr(draft_config, "moe_load_balancer", None) is None:
-            self.draft_model_cls = _DSv41DSparkContextDraftModel
-        super().__init__(draft_config, *args, **kwargs)
+        draft_model_cls = (
+            _DSv41DSparkContextDraftModel
+            if context_kv_only and getattr(draft_config, "moe_load_balancer", None) is None
+            else self.draft_model_cls
+        )
+        super().__init__(draft_config, *args, draft_model_cls=draft_model_cls, **kwargs)
 
     def load_weights(self, weights: dict[str, torch.Tensor], weight_mapper=None, **kwargs) -> None:
         context_kv_only = getattr(self.dspark_model, "context_kv_only", False)

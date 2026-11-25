@@ -802,6 +802,8 @@ def dspark_attention_forward_batched(
         raise ValueError(
             f"kv_cache window extent {kv_cache.shape[1]} does not match window_size {window_size}"
         )
+    if g == 0:
+        return x
     rd = rope_head_dim
     # The model shares these live gathers across stages; direct callers build them here.
     if rope_metadata is None:
@@ -867,18 +869,17 @@ def dspark_attention_forward_batched(
         )
 
     # The fused kernel requires explicit physical-window validity.
-    fused = (
-        block_tables is not None
-        and on_gpu
-        and IS_CUTLASS_DSL_AVAILABLE
-        and _get_dspark_arch_str() is not None
+    paged_attention = (
+        {} if block_tables is None else dict(block_tables=block_tables, window_size=window_size)
     )
-    fused = fused or (
-        block_tables is None
-        and valid_len is not None
+    paged_write = (
+        {} if block_tables is None else dict(block_tables=block_tables, capacities=capacities)
+    )
+    fused = (
+        valid_len is not None
         and IS_CUTLASS_DSL_AVAILABLE
         and is_fused_dsv4_dspark_attention_supported(
-            q, write_target, valid_len, attn_sink, inverse_rope_freqs
+            q, write_target, valid_len, attn_sink, inverse_rope_freqs, **paged_attention
         )
         and is_fused_dspark_attention_preparation_supported(
             main_kv_input,
@@ -889,6 +890,7 @@ def dspark_attention_forward_batched(
             write_target,
             slots,
             start_pos,
+            **paged_write,
         )
     )
     if fused:
@@ -991,8 +993,8 @@ def dspark_attention_forward_batched(
                 start_pos[:, None],
                 torch.ones_like(start_pos[:, None], dtype=torch.bool),
                 write_target,
-                block_tables,
-                capacities,
+                block_tables.contiguous(),
+                capacities.contiguous(),
             )
             positions = (
                 start_pos[:, None] - window_size + torch.arange(window_size, device=x.device)
@@ -1083,7 +1085,7 @@ class DSparkDeferredMoe(NamedTuple):
 
 def dspark_attention_forward_tp(
     x: torch.Tensor,
-    main_x: torch.Tensor,
+    main_x: Optional[torch.Tensor],
     start_pos: torch.Tensor,
     kv_window: torch.Tensor,
     slots: torch.Tensor,
@@ -1103,7 +1105,7 @@ def dspark_attention_forward_tp(
     ] = None,
     block_tables: Optional[torch.Tensor] = None,
     capacities: Optional[torch.Tensor] = None,
-    main_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    main_kv_written: bool = False,
 ) -> torch.Tensor:
     """Captured-context draft attention on this rank's head shard; returns the TP partial sum.
 
@@ -1118,7 +1120,7 @@ def dspark_attention_forward_tp(
     as in the replicated path (``wkv`` is the stage's BF16 copy). The caller reduces the returned
     ``[G, block, hidden]`` partial across the TP group. ``ring_attention_metadata`` maps the
     rolling windows to the paged kernel's inputs (:func:`_dspark_ring_attention_metadata`).
-    ``main_kv`` marks main-KV frames already written by the caller; their writes must
+    ``main_kv_written`` marks main-KV frames already written by the caller; their writes must
     precede this call on the attention stream.
     """
     from ..modules.low_m_gemm import fp8_grouped_lowm, mxfp8_linear_scale, mxfp8_lowm_linear
@@ -1128,7 +1130,8 @@ def dspark_attention_forward_tp(
     main = torch.cuda.current_stream()
     # The K/V path (main-KV frame and draft-block K/V) runs on a side stream next to the query path.
     side = private_stream(x.device.index, "dspark_attn_kv")
-    if main_kv is None:
+    if not main_kv_written:
+        assert main_x is not None
         side.wait_stream(main)
         with torch.cuda.stream(side):
             projected_main_kv = F.linear(main_x, wkv)
@@ -2707,7 +2710,7 @@ class DSv4DSparkDraftModel(nn.Module):
             and _get_dspark_arch_str() is not None
             and self._attn_params["head_dim"] == 512
             and rd == 64
-            and pools[0].shape[-2] == 128
+            and pools[0].shape[-2] in (128, 256)
             and self._backfill_kv_norm_weight is not None
         ):
             if kv is None:
@@ -2904,7 +2907,7 @@ class DSv4DSparkDraftModel(nn.Module):
         self,
         stage: "DSv4DSparkBlock",
         h: torch.Tensor,
-        main_x: torch.Tensor,
+        main_x: Optional[torch.Tensor],
         start_pos,
         freqs_cis: torch.Tensor,
         moe_input_ids: torch.Tensor,
@@ -2923,7 +2926,7 @@ class DSv4DSparkDraftModel(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None,
         windows_ready: Optional[torch.cuda.Event] = None,
-        main_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        main_kv_written: bool = False,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -3042,7 +3045,7 @@ class DSv4DSparkDraftModel(nn.Module):
                 ring_attention_metadata=ring_attention_metadata,
                 block_tables=page_tables,
                 capacities=page_capacities,
-                main_kv=main_kv,
+                main_kv_written=main_kv_written,
             )
             if split:
                 attn_allreduce = stage._mhc_fused_allreduce()
@@ -3051,6 +3054,7 @@ class DSv4DSparkDraftModel(nn.Module):
                     T, block, hidden
                 )
         elif page_tables is not None or slots is not None:
+            assert main_x is not None
             # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
             # written/read through ``slots``).
             attn = dspark_attention_forward_batched(
@@ -3070,6 +3074,7 @@ class DSv4DSparkDraftModel(nn.Module):
                 **self._attn_params,
             )
         else:
+            assert main_x is not None
             attn = dspark_attention_forward(
                 layer_input,
                 main_x,
@@ -3212,9 +3217,12 @@ class DSv4DSparkDraftModel(nn.Module):
                 windows ``[T, num_stages, window_size, head_dim]`` owned by the
                 worker; updated in place each call. ``None`` allocates fresh zero
                 windows (single-shot golden / test path).
+            valid_len: written history per request. With managed pages, omission
+                assumes the available window up to ``start_pos`` is populated.
         Returns:
             ``(draft_tokens [T, block], confidence [T, block] or None)``.
         """
+        assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if kv_pages is not None:
             positions = torch.full(
                 (bonus_token_ids.shape[0],),
@@ -3222,6 +3230,8 @@ class DSv4DSparkDraftModel(nn.Module):
                 dtype=torch.long,
                 device=bonus_token_ids.device,
             )
+            if valid_len is None:
+                valid_len = positions.clamp(max=int(self._attn_params["window_size"]))
             return self.forward_batched(
                 main_hidden,
                 bonus_token_ids,
@@ -3235,7 +3245,6 @@ class DSv4DSparkDraftModel(nn.Module):
                 return_logits=return_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
-        assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
                 "DSpark attention weights are not bound; load the draft checkpoint with "
@@ -3291,7 +3300,8 @@ class DSv4DSparkDraftModel(nn.Module):
         all_rank_num_tokens: Optional[List[int]] = None,
         main_x: Optional[torch.Tensor] = None,
         windows_ready: Optional[torch.cuda.Event] = None,
-        main_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        main_kv_written: bool = False,
+        main_x_rows: Optional[torch.Tensor] = None,
     ) -> tuple:
         """CUDA-graph-safe batched block-draft forward (all gen requests at once).
 
@@ -3317,7 +3327,8 @@ class DSv4DSparkDraftModel(nn.Module):
                 (``main_hidden`` is then unused).
             windows_ready: Event after a side stream writes the managed history;
                 only the first stage waits on it.
-            main_kv: Marks prewritten main-KV frames for the TP attention path.
+            main_kv_written: Marks prewritten main-KV frames for the TP attention path.
+            main_x_rows: Optional bonus-row indices into the projected context in main_x.
         Returns:
             ``(draft_tokens [G, block], confidence [G, block] or None)``.
         """
@@ -3344,23 +3355,29 @@ class DSv4DSparkDraftModel(nn.Module):
                 hc_mult=self.hc_mult,
                 pre_mix=self.uses_lagged_pre,
             )
+        use_tp_attention = (
+            self._tp_attention_ready
+            and valid_len is not None
+            and 0 < bonus_token_ids.shape[0] * self.block_size <= _TP_ATTN_ROW_LIMIT
+        )
+        skip_bonus = block_inputs is not None and main_kv_written and use_tp_attention
+        if skip_bonus:
+            main_x = None
+        elif main_x_rows is not None:
+            assert main_x is not None
+            main_x = main_x.index_select(0, main_x_rows)
         if block_inputs is None:
             x, main_x, draft_ids = self.forward_embed(main_hidden, bonus_token_ids, main_x)
             rope_metadata = _prepare_dspark_attention_rope(start_pos, self.block_size, freqs_cis)
             pre_mix = self._initial_pre_mix(x)
         else:
             x, draft_ids, rope_metadata, pre_mix = block_inputs
-            if main_x is None:
+            if main_x is None and not skip_bonus:
                 main_x = self.project_captured(main_hidden)
-        main_x = main_x.unsqueeze(1)  # [G, 1, hidden] for the MQA K/V projection
+        if main_x is not None:
+            main_x = main_x.unsqueeze(1)  # [G, 1, hidden] for the MQA K/V projection
         moe_input_ids = draft_ids.reshape(-1)
-        tp_step = None
-        if (
-            self._tp_attention_ready
-            and valid_len is not None
-            and 0 < x.shape[0] * self.block_size <= _TP_ATTN_ROW_LIMIT
-        ):
-            tp_step = self._tp_attention_step(rope_metadata)
+        tp_step = self._tp_attention_step(rope_metadata) if use_tp_attention else None
         defer = self._fuses_moe_boundary(x.shape[0] * self.block_size) and not return_confidence
 
         ring_attention_metadata = (
@@ -3396,7 +3413,7 @@ class DSv4DSparkDraftModel(nn.Module):
                 defer_out=defer,
                 ring_attention_metadata=ring_attention_metadata,
                 windows_ready=windows_ready if s == 0 else None,
-                main_kv=main_kv,
+                main_kv_written=main_kv_written,
             )
             if defer:
                 h, pre_mix, deferred = h
@@ -3755,9 +3772,11 @@ class DSv4DSparkForCausalLM(nn.Module):
         num_stages=None,
         block_size=None,
         draft_moe_selection: Optional[MoESelection] = None,
+        *,
+        draft_model_cls: type[DSv4DSparkDraftModel] | None = None,
     ):
         super().__init__()
-        self.dspark_model = self.draft_model_cls(
+        self.dspark_model = (draft_model_cls or self.draft_model_cls)(
             draft_config,
             aux_stream_dict,
             num_stages=num_stages,

@@ -140,6 +140,13 @@ class RankInfo:
         get_draft_view = getattr(kvm, "get_draft_kv_cache_view", None)
         shares_draft_layers = get_draft_view is not None and get_draft_view() is kvm
         draft_layer_ids = kvm.draft_layer_ids if shares_draft_layers else ()
+        ignored_roles = frozenset(getattr(kvm, "get_disagg_ignored_roles", lambda: ())())
+        if ignored_roles:
+            draft_layer_ids = tuple(
+                layer
+                for layer in draft_layer_ids
+                if not ignored_roles.issuperset(kvm.get_layer_buffer_roles(layer))
+            )
         draft_kv_dtype = None
         if draft_layer_ids:
             dtype = kvm.get_layer_dtype(draft_layer_ids[0])
@@ -173,7 +180,7 @@ class RankInfo:
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
             num_draft_layers=len(draft_layer_ids),
             draft_kv_dtype=draft_kv_dtype,
-            draft_layers_reshard_across_tp=shares_draft_layers
+            draft_layers_reshard_across_tp=bool(draft_layer_ids)
             and getattr(kvm, "hosts_unified_draft_layers", False),
         )
 

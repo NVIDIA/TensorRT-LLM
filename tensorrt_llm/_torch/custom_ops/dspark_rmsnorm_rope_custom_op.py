@@ -171,6 +171,37 @@ def _is_dspark_draft_block_supported(
     )
 
 
+def _is_dspark_page_write_layout_supported(
+    x: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    start_pos: torch.Tensor,
+    capacities: torch.Tensor,
+) -> bool:
+    batch = x.shape[0]
+    return (
+        x.shape[1] == 1
+        and kv_cache.ndim == 3
+        and kv_cache.shape[1] in (16, 32, 64, 128, 256)
+        and kv_cache.shape[2] == _DSV4_DSPARK_HEAD_DIM
+        and kv_cache.dtype == x.dtype
+        and kv_cache.stride(1) == _DSV4_DSPARK_HEAD_DIM
+        and kv_cache.stride(2) == 1
+        and block_tables.ndim == 2
+        and block_tables.shape[0] == batch
+        and block_tables.dtype == torch.int32
+        and block_tables.stride(1) == 1
+        and all(
+            t.is_cuda and t.device == x.device
+            for t in (kv_cache, block_tables, start_pos, capacities)
+        )
+        and all(
+            t.shape == (batch,) and t.dtype == torch.int64 and t.is_contiguous()
+            for t in (start_pos, capacities)
+        )
+    )
+
+
 def is_fused_dspark_attention_preparation_supported(
     main_x: torch.Tensor,
     block_x: torch.Tensor,
@@ -180,8 +211,26 @@ def is_fused_dspark_attention_preparation_supported(
     kv_cache: torch.Tensor,
     slots: torch.Tensor,
     start_pos: torch.Tensor,
+    *,
+    block_tables: torch.Tensor | None = None,
+    capacities: torch.Tensor | None = None,
 ) -> bool:
     """Return whether RMSNorm/RoPE can directly prepare the attention inputs."""
+    if block_tables is not None:
+        return (
+            capacities is not None
+            and main_x.ndim == 3
+            and main_x.shape[-1] == _DSV4_DSPARK_HEAD_DIM
+            and main_x.shape[0] == block_x.shape[0]
+            and all(t.device == main_x.device for t in (weight, main_freqs, block_x, block_freqs))
+            and is_fused_dspark_rmsnorm_rope_supported(
+                main_x, weight, main_freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
+            )
+            and _is_dspark_page_write_layout_supported(
+                main_x, kv_cache, block_tables, start_pos, capacities
+            )
+            and _is_dspark_draft_block_supported(block_x, weight, block_freqs)
+        )
     return (
         main_x.shape[0] == block_x.shape[0]
         and _is_dspark_cache_write_supported(main_x, weight, main_freqs, kv_cache, slots, start_pos)
@@ -418,8 +467,8 @@ def _compile_dspark_paged_backfill(num_stages: int, page_size: int, eps: float, 
     )
     mask = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (tokens,), stride_order=(0,))
     positions = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (tokens,), stride_order=(0,))
-    tables = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (cute.sym_int(), cute.sym_int()), stride_order=(1, 0)
+    tables = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (cute.sym_int(), cute.sym_int()), stride=(cute.sym_int64(), 1)
     )
     capacities = cute.runtime.make_fake_compact_tensor(
         cutlass.Int64, (cute.sym_int(),), stride_order=(0,)
@@ -997,10 +1046,52 @@ def cute_dsl_dspark_paged_backfill(
     eps: float,
 ) -> None:
     """Write valid [request, interim, stage] RMSNorm/RoPE rows through absolute page mappings."""
-    with torch.cuda.device(kv.device):
-        compiled = _compile_dspark_paged_backfill(
-            weight.shape[0], pools[0].shape[1], eps, kv.device.index
+    if not pools:
+        raise ValueError("DSpark paged backfill requires a pool for each draft stage")
+    stages = len(pools)
+    dim = _DSV4_DSPARK_HEAD_DIM
+    page_size = pools[0].shape[1] if pools[0].ndim == 3 else 0
+    if (
+        positions.ndim != 2
+        or positions.dtype != torch.int64
+        or mask.shape != positions.shape
+        or mask.dtype != torch.bool
+        or kv.shape not in ((*positions.shape, stages * dim), (*positions.shape, stages, dim))
+        or weight.shape != (stages, dim)
+        or kv.dtype != torch.bfloat16
+        or weight.dtype != kv.dtype
+        or freqs.ndim != 3
+        or freqs.shape[1:] != (_DSV4_DSPARK_ROPE_DIM // 2, 2)
+        or freqs.dtype != torch.float32
+        or not all(
+            tensor.is_cuda and tensor.device == kv.device and tensor.is_contiguous()
+            for tensor in (kv, weight, freqs, mask, positions)
         )
+        or page_size <= 0
+        or not all(
+            pool.is_cuda
+            and pool.device == kv.device
+            and pool.dtype == kv.dtype
+            and pool.ndim == 3
+            and pool.shape[1:] == (page_size, dim)
+            and pool.stride()[1:] == (dim, 1)
+            for pool in pools
+        )
+        or block_tables.ndim != 2
+        or block_tables.shape[0] != positions.shape[0]
+        or block_tables.dtype != torch.int32
+        or block_tables.stride(1) != 1
+        or block_tables.device != kv.device
+        or capacities.shape != (positions.shape[0],)
+        or capacities.dtype != torch.int64
+        or not capacities.is_contiguous()
+        or capacities.device != kv.device
+    ):
+        raise ValueError("Invalid DSpark paged backfill input layout")
+    if not positions.numel():
+        return
+    with torch.cuda.device(kv.device):
+        compiled = _compile_dspark_paged_backfill(stages, page_size, eps, kv.device.index)
         compiled(
             kv.view(-1, _DSV4_DSPARK_HEAD_DIM),
             weight,
@@ -1102,27 +1193,7 @@ def cute_dsl_dspark_rmsnorm_rope_page_write(
     """Normalize/rotate [batch, 1, 512] KV into pages; zero capacities mask dummy rows."""
     _validate_dspark_preparation(x, weight, freqs)
     batch = x.shape[0]
-    if (
-        x.shape[1] != 1
-        or kv_cache.ndim != 3
-        or kv_cache.shape[1] not in (16, 32, 64, 128, 256)
-        or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM
-        or kv_cache.dtype != x.dtype
-        or kv_cache.stride(1) != _DSV4_DSPARK_HEAD_DIM
-        or kv_cache.stride(2) != 1
-        or block_tables.ndim != 2
-        or block_tables.shape[0] != batch
-        or block_tables.dtype != torch.int32
-        or block_tables.stride(1) != 1
-        or not all(
-            t.is_cuda and t.device == x.device
-            for t in (kv_cache, block_tables, start_pos, capacities)
-        )
-        or not all(
-            t.shape == (batch,) and t.dtype == torch.int64 and t.is_contiguous()
-            for t in (start_pos, capacities)
-        )
-    ):
+    if not _is_dspark_page_write_layout_supported(x, kv_cache, block_tables, start_pos, capacities):
         raise ValueError(
             "DSpark page write requires BF16 pages with contiguous tokens, INT32 "
             "page-table rows and contiguous INT64 positions/capacities on x's device"

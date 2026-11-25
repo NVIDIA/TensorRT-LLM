@@ -86,7 +86,7 @@ from tensorrt_llm.mapping import Mapping
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
-from ..common import make_scheduled_inputs
+from ..common import get_speculative_model, make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
@@ -213,10 +213,7 @@ class DecoderRunner(ScheduledModelRunner):
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self._model = model
-        speculative_model = model
-        for attribute in ("language_model", "llm"):
-            if not hasattr(speculative_model, "spec_worker"):
-                speculative_model = getattr(speculative_model, attribute, speculative_model)
+        speculative_model = get_speculative_model(model)
         worker = getattr(speculative_model, "spec_worker", None)
         prepare_context = getattr(worker, "prepare_draft_context", None)
         if prepare_context is not None:
@@ -701,6 +698,12 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
     ) -> Any:
         scheduled_requests = forward_inputs.batch
+        if (
+            getattr(self._inputs, "_dspark_context_worker", False)
+            and not is_dummy
+            and any(not request.is_dummy for request in scheduled_requests.generation_requests)
+        ):
+            raise RuntimeError("A V4.1 DSpark context worker cannot serve generation requests")
         new_tensors_device = forward_inputs.new_tensors_device
         cache_indirection_buffer = forward_inputs.cache_indirection_buffer
         gather_context_logits = forward_inputs.gather_context_logits
@@ -1442,4 +1445,4 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _get_spec_worker(self):
         """Return the one-model speculative worker when it is initialized."""
-        return getattr(self._model, "spec_worker", None)
+        return getattr(get_speculative_model(self._model), "spec_worker", None)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -882,8 +883,42 @@ class CSA2CacheManager(KVCacheManagerV2):
         return 1
 
     @classmethod
-    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
-        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
+    def _get_per_request_layer_tokens(
+        cls,
+        model_config,
+        mapping,
+        num_layers=None,
+        *,
+        tokens_per_block,
+        kv_cache_config=None,
+        max_seq_len=None,
+        spec_config=None,
+        is_draft=False,
+        layer_specs=None,
+        shared_draft_block_width=None,
+    ):
+        if not max_seq_len or max_seq_len < 0:
+            return None
+        sizes, windows, _ = cls._cache_sizing_components(
+            model_config,
+            mapping,
+            tokens_per_block=tokens_per_block,
+            spec_config=spec_config,
+            kv_cache_config=kv_cache_config,
+            num_layers=num_layers,
+            layer_specs=layer_specs,
+        )
+        _, headroom = _get_generation_kv_capacity(spec_config, is_draft=is_draft)
+        full_tokens = math.ceil((max_seq_len + headroom) / tokens_per_block) * tokens_per_block
+        entries = []
+        for size, window in zip(sizes, windows):
+            if window is None or not 0 < window < max_seq_len:
+                entries.append((size, full_tokens, 0))
+                continue
+            blocks = math.ceil((window + headroom - 2) / tokens_per_block) + 1
+            retained = min(full_tokens, blocks * tokens_per_block)
+            entries.append((size, retained, retained))
+        return entries, full_tokens
 
     def _build_cache_config(self, config):
         layers = []
@@ -1967,26 +2002,41 @@ class CSA2CacheManager(KVCacheManagerV2):
         committed = int(cache.num_committed_tokens or 0)
         protected_blocks = (committed + self.tokens_per_block - 1) // self.tokens_per_block
         state = self._fresh_pages_filled.setdefault(request_id, {})
-        filled = 0
-        for (physical_layer, data_role), (layer, _ratio, role) in self._physical_roles.items():
-            converter = self._get_page_index_converter(physical_layer, data_role)
-            pages = np.asarray(self.get_cache_indices(request_id, layer, role), dtype=np.int64)
-            key = (physical_layer, data_role)
+
+        def fresh_indices(key, indices, expansion):
+            pages = np.asarray(indices, dtype=np.int64)
             previous = state.get(key)
             state[key] = pages.copy()
-            protected = protected_blocks * converter.expansion
             fresh = pages != BAD_PAGE_INDEX
-            fresh[:protected] = False
+            fresh[: protected_blocks * expansion] = False
             if previous is not None:
                 common = min(previous.size, pages.size)
                 fresh[:common] &= previous[:common] == BAD_PAGE_INDEX
-            if not fresh.any():
-                continue
-            buffer = self.get_buffers(layer, role)
-            indices = np.unique(pages[fresh]).tolist()
+            return np.unique(pages[fresh]).tolist() if fresh.any() else []
+
+        def fill(buffer, indices):
             if not _fill_kv_pages(buffer, indices, self._fresh_page_fill):
                 raise ValueError(f"CSA2 fresh-page fill does not support {buffer.dtype}")
-            filled += len(indices)
+            return len(indices)
+
+        filled = 0
+        for (physical_layer, data_role), (layer, _ratio, role) in self._physical_roles.items():
+            converter = self._get_page_index_converter(physical_layer, data_role)
+            indices = fresh_indices(
+                (physical_layer, data_role),
+                self.get_cache_indices(request_id, layer, role),
+                converter.expansion,
+            )
+            if indices:
+                filled += fill(self.get_buffers(layer, role), indices)
+        for layer in self.draft_layer_ids:
+            indices = fresh_indices(
+                (self.layer_offsets[layer], Role.KEY),
+                self.get_batch_cache_indices([request_id], layer)[0],
+                1,
+            )
+            if indices:
+                filled += fill(self.get_buffers(layer), indices)
         if filled:
             torch.cuda.synchronize()
             if not self._fresh_fill_announced:
@@ -2005,6 +2055,10 @@ class CSA2CacheManager(KVCacheManagerV2):
         for model_layer, _ratio, role in self._physical_roles.values():
             guard_key = model_layer if role == CSA2CacheRole.SWA else -1
             yield guard_key, self.get_buffers(model_layer, role)
+        for layer in self.draft_layer_ids:
+            scale = self.get_layer_page_index_scale(layer)
+            stride = self._get_cache_view_page_stride(scale, self.get_layer_kv_factor(layer))
+            yield -1, self.get_buffers(layer)[:: scale // stride]
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         has_invalid_values = super().check_invalid_values_in_kv_cache(fill_with_zero)
@@ -2016,18 +2070,19 @@ class CSA2CacheManager(KVCacheManagerV2):
         return has_invalid_values
 
     @classmethod
-    def get_cache_size_per_token(
+    def _cache_sizing_components(
         cls,
         model_config,
         mapping,
         *,
         tokens_per_block,
-        max_batch_size=0,
         max_num_tokens=0,
         spec_config=None,
         kv_cache_config=None,
-        **kwargs,
+        num_layers=None,
+        layer_specs=None,
     ):
+        """Return physical bytes per token, retention windows, and reuse policies."""
         layout = CSA2Layout.from_hf_config(model_config.pretrained_config)
         if mapping.pp_size != 1 or mapping.cp_size != 1:
             raise ValueError("CSA2 cache sizing requires PP=CP=1")
@@ -2036,7 +2091,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         reserve = getattr(spec_config, "max_draft_len", 0)
         if kv_cache_config is not None and kv_cache_config.enable_block_reuse:
             reserve += draft_prompt_lookahead(spec_config) or 0
-        num_layers = kwargs.get("num_layers") or model_config.get_num_attention_layers()
+        num_layers = num_layers or model_config.get_num_attention_layers()
         limit = getattr(model_config, "extra_attrs", {}).get("csa2_context_swa_layer_limit")
         _validate_context_swa_layer_limit(limit, num_layers)
         capture_window = _get_replay_capture_window(
@@ -2074,7 +2129,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 getattr(model_config, "extra_attrs", {}).get("bounded_replay_on_generation", False)
             ),
         )
-        draft_specs = kwargs.get("layer_specs") or ()
+        draft_specs = layer_specs or ()
         sizes.extend(spec.bytes_per_token() for spec in draft_specs)
         windows.extend(
             _draft_retention_window(
@@ -2085,6 +2140,55 @@ class CSA2CacheManager(KVCacheManagerV2):
         scratch_groups.extend(
             (ReusePolicy.PRIVATE if replay_window else ReusePolicy.REQUIRED).value
             for _ in draft_specs
+        )
+        return sizes, windows, scratch_groups
+
+    @classmethod
+    def draft_layers_share_pool_group(
+        cls, model_config, mapping, *, tokens_per_block, spec_config, kv_cache_config, layer_specs
+    ) -> bool:
+        """Whether appended layers join existing target lifecycles in the profiling cache."""
+        _, windows, policies = cls._cache_sizing_components(
+            model_config,
+            mapping,
+            tokens_per_block=tokens_per_block,
+            spec_config=spec_config,
+            kv_cache_config=kv_cache_config,
+            layer_specs=layer_specs,
+        )
+        first_draft = len(windows) - len(layer_specs)
+        target_lifecycles = set(zip(windows[:first_draft], policies[:first_draft]))
+        # CSA2 target layers have no sink tokens. All buffers in one
+        # lifecycle share its pool group even when their slot sizes differ.
+        return all(
+            not spec.num_sink_tokens and (window, policy) in target_lifecycles
+            for spec, window, policy in zip(
+                layer_specs, windows[first_draft:], policies[first_draft:]
+            )
+        )
+
+    @classmethod
+    def get_cache_size_per_token(
+        cls,
+        model_config,
+        mapping,
+        *,
+        tokens_per_block,
+        max_batch_size=0,
+        max_num_tokens=0,
+        spec_config=None,
+        kv_cache_config=None,
+        **kwargs,
+    ):
+        sizes, windows, scratch_groups = cls._cache_sizing_components(
+            model_config,
+            mapping,
+            tokens_per_block=tokens_per_block,
+            max_num_tokens=max_num_tokens,
+            spec_config=spec_config,
+            kv_cache_config=kv_cache_config,
+            num_layers=kwargs.get("num_layers"),
+            layer_specs=kwargs.get("layer_specs"),
         )
         _, headroom = _get_generation_kv_capacity(
             spec_config, is_draft=kwargs.get("is_draft", False)

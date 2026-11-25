@@ -3,10 +3,13 @@
 """Embedded DSpark over the CSA2 manager's explicit draft layers."""
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._utils import is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
+from ..configs.deepseek_v41 import disagg_context_draft_kv_only_enabled
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..modules.multi_stream_utils import private_stream
 from ..pyexecutor import device_copy
 from .dspark import DSparkSpecMetadata, DSv4DSparkWorker
@@ -22,6 +25,8 @@ class DSparkCopySite(device_copy.CopySiteEnum):
 class DSv41DSparkWorker(DSv4DSparkWorker):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if disagg_context_draft_kv_only_enabled(self.spec_config):
+            self.return_confidence = False
         self._context_kv_only = False
         self._draft_kv_manager = None
         self._draft_kv_buffers = ()
@@ -36,9 +41,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._draft_page_indices = {}
         self._draft_prepared_batch = None
         self._managed_residency = {}
+        self._chunking_ids: set[int] = set()
         self._draft_metadata_host_buffers = []
-        self._uploaded_slots = None
-        self._uploaded_capacities = None
         self._table_slots = None
         self._draft_updates_device = None
         self._draft_indices_device = None
@@ -80,6 +84,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 for spec in specs
             ):
                 raise ValueError("V4.1 DSpark draft storage does not match the checkpoint")
+            self._prewarm_draft_pages(draft_model, manager)
             self._draft_kv_manager = manager
             self._draft_layer_ids = layers
             self._draft_reuse_policy = specs[0].reuse_policy
@@ -88,8 +93,11 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             )
             shape = (self._batch_to_slot.shape[0], manager.max_blocks_per_seq)
             slots = self._ctx_len.numel()
-            self._draft_table_storage = torch.zeros(
-                (slots + shape[0], shape[1]), dtype=torch.int32, device=self._ctx_len.device
+            self._draft_table_storage = torch.full(
+                (slots + shape[0], shape[1]),
+                BAD_PAGE_INDEX,
+                dtype=torch.int32,
+                device=self._ctx_len.device,
             )
             self._draft_slot_block_tables = self._draft_table_storage[:slots]
             self._draft_fallback_block_tables = self._draft_table_storage[slots:]
@@ -101,15 +109,54 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._draft_capacities = torch.zeros(
                 shape[0], dtype=torch.long, device=self._ctx_len.device
             )
+            self._slot_upload = device_copy.DeviceCopyBuffer(
+                self._batch_to_slot, site=DSparkCopySite.REQUEST_SLOTS, pin_memory=prefer_pinned()
+            )
+            self._capacity_upload = device_copy.DeviceCopyBuffer(
+                self._draft_capacities,
+                site=DSparkCopySite.PAGE_CAPACITIES,
+                pin_memory=prefer_pinned(),
+            )
+            self._host_slots = torch.empty(shape[0], dtype=torch.long, device="cpu")
+            self._host_capacities = torch.empty_like(self._host_slots)
             self._draft_page_versions.clear()
             self._draft_page_indices.clear()
             self._draft_prepared_batch = None
             self._managed_residency.clear()
-            self._uploaded_slots = None
-            self._uploaded_capacities = None
+            self._chunking_ids.clear()
             self._table_slots = None
         spec_metadata._dspark_worker = self
-        self._prepare_page_tables(spec_metadata.request_ids, attn_metadata.num_contexts)
+        self._prepare_page_tables(
+            spec_metadata.request_ids,
+            attn_metadata.num_contexts,
+            paused_in_place_ids=getattr(spec_metadata, "paused_in_place_ids", frozenset()),
+            context_chunking_ids=spec_metadata.context_chunking_ids,
+        )
+
+    def _prewarm_draft_pages(self, draft_model, manager) -> None:
+        params = draft_model._attn_params
+        if (
+            not IS_CUTLASS_DSL_AVAILABLE
+            or int(params["head_dim"]) != 512
+            or int(params["rope_head_dim"]) != 64
+        ):
+            return
+        from ..custom_ops.dspark_attention_custom_op import warmup_paged_dspark
+
+        heads = set()
+        if not self._context_kv_only and self._win == 128:
+            inner = draft_model.dspark_model
+            heads.add(int(params["n_heads"]))
+            if inner._tp_attention_ready:
+                heads.update(stage.self_attn.num_heads_tp for stage in inner.mtp_layers)
+        warmup_paged_dspark(
+            self._ctx_len.device,
+            manager.tokens_per_block,
+            draft_model.num_stages,
+            float(params["eps"]),
+            self.max_draft_len,
+            heads,
+        )
 
     def _page_indices(self, cache, is_context: bool) -> tuple[int, tuple[int, ...]]:
         manager = self._draft_kv_manager
@@ -141,7 +188,14 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             raise ValueError("DSpark stages require identical page-table geometry")
         return first, tables[0]
 
-    def _prepare_page_tables(self, request_ids: list[int], num_contexts: int) -> None:
+    def _prepare_page_tables(
+        self,
+        request_ids: list[int],
+        num_contexts: int,
+        *,
+        paused_in_place_ids: frozenset[int] = frozenset(),
+        context_chunking_ids: frozenset[int] = frozenset(),
+    ) -> None:
         manager = self._draft_kv_manager
         private = self._draft_reuse_policy == ReusePolicy.PRIVATE
         native = private and not num_contexts
@@ -154,15 +208,21 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._draft_block_tables = table
             self._table_slots = None
         batch_state = manager.draft_page_table_state() if managed else None
+        batch_snapshot = (
+            (batch_state, tuple(request_ids), paused_in_place_ids)
+            if batch_state is not None
+            else None
+        )
         previous_batch = self._draft_prepared_batch
         if (
-            batch_state is not None
+            batch_snapshot is not None
             and previous_batch is not None
-            and previous_batch[0] is batch_state
-            and previous_batch[1] == tuple(request_ids)
+            and (previous_batch[0] is batch_state and previous_batch[1:] == batch_snapshot[1:])
+            and self._slot_upload.host_values is not None
+            and self._capacity_upload.host_values is not None
+            and not device_copy.CHECK_MODE
         ):
             return
-        batch_snapshot = None if batch_state is None else (batch_state, tuple(request_ids))
         self._draft_prepared_batch = None
         versioned_window = private and not num_contexts and manager.tokens_per_block == self._win
         real_rows = [
@@ -174,9 +234,21 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             and manager.kv_cache_map[rid].is_active
         ]
         real_ids = {request_ids[row] for row in real_rows}
-        for rid in self._req_to_slot.keys() - real_ids:
+        # An absent context can still be between chunks on a resident cache.
+        # Finished contexts release their slot even while their pages are pinned for transfer.
+        retained = {
+            rid
+            for rid in self._chunking_ids - real_ids
+            if (cache := manager.kv_cache_map.get(rid)) is not None
+            and cache.is_active
+            and self._managed_residency.get(rid) is cache
+        }
+        released = self._req_to_slot.keys() - real_ids - paused_in_place_ids - retained
+        for rid in released:
             self._free_slots.append(self._req_to_slot.pop(rid))
             self._managed_residency.pop(rid, None)
+        self._chunking_ids.difference_update(released | real_ids)
+        self._chunking_ids.update(context_chunking_ids & real_ids)
         slots = [self._scratch_slot] * len(request_ids)
         updates = []
         capacities = [0] * self._draft_capacities.shape[0]
@@ -209,10 +281,36 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                     first = max(0, cache.history_length - self._win) // manager.tokens_per_block
                     version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
                 if previous != version:
-                    table = self._page_indices(cache, row < num_contexts)
-                    if self._draft_page_indices.get(slot) != table:
-                        updates.append((slot, row, *table))
-                        self._draft_page_indices[slot] = table
+                    page_indices = self._page_indices(cache, row < num_contexts)
+                    old_indices = self._draft_page_indices.get(slot)
+                    if old_indices != page_indices:
+                        first, indices = page_indices
+                        if old_indices is not None:
+                            # Clear retired columns before exposing the updated row.
+                            old_first, old_pages = old_indices
+                            old_end = old_first + len(old_pages)
+                            left_end = min(first, old_end)
+                            right_start = max(old_first, first + len(indices))
+                            if left_end > old_first:
+                                updates.append(
+                                    (
+                                        slot,
+                                        row,
+                                        old_first,
+                                        (BAD_PAGE_INDEX,) * (left_end - old_first),
+                                    )
+                                )
+                            if old_end > right_start:
+                                updates.append(
+                                    (
+                                        slot,
+                                        row,
+                                        right_start,
+                                        (BAD_PAGE_INDEX,) * (old_end - right_start),
+                                    )
+                                )
+                        updates.append((slot, row, first, indices))
+                        self._draft_page_indices[slot] = page_indices
                     self._draft_page_versions[slot] = version
                 first, indices = self._draft_page_indices[slot]
                 capacities[row] = (first + len(indices)) * manager.tokens_per_block
@@ -235,32 +333,27 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._ctx_len[self._scratch_slot].zero_()
             self._valid_len[self._scratch_slot].zero_()
         slot_values = tuple(slots)
-        capacity_values = tuple(capacities)
-        slots_changed = self._uploaded_slots != slot_values
-        capacities_changed = self._uploaded_capacities != capacity_values
+        host_slots = self._host_slots.numpy()
+        host_slots.fill(self._scratch_slot)
+        host_slots[: len(slots)] = slots
+        self._host_capacities.numpy()[:] = capacities
+        self._slot_upload.update(self._host_slots)
+        self._capacity_upload.update(self._host_capacities)
         if managed:
             self._table_slots = None
         gather_table = not managed and self._table_slots != slot_values
-        if not updates and not slots_changed and not capacities_changed and not gather_table:
-            self._draft_prepared_batch = batch_snapshot
-            return
         direct = private and not native and self._table_slots == slot_values
         count = sum(len(indices) for _, _, _, indices in updates) * (2 if direct else 1)
-        host = next(
-            (item for item in self._draft_metadata_host_buffers if item["event"].query()), None
-        )
-        if host is None:
-            host = {"event": torch.cuda.Event()}
-            self._draft_metadata_host_buffers.append(host)
-        for name, size, dtype in (
-            ("indices", count, torch.long),
-            ("values", count, torch.int32),
-            ("slots", self._batch_to_slot.numel(), torch.long),
-            ("capacities", len(capacities), torch.long),
-        ):
-            if name not in host or host[name].numel() < size:
-                host[name] = torch.empty(size, dtype=dtype, pin_memory=prefer_pinned())
         if count:
+            host = next(
+                (item for item in self._draft_metadata_host_buffers if item["event"].query()), None
+            )
+            if host is None:
+                host = {"event": torch.cuda.Event()}
+                self._draft_metadata_host_buffers.append(host)
+            for name, dtype in (("indices", torch.long), ("values", torch.int32)):
+                if name not in host or host[name].numel() < count:
+                    host[name] = torch.empty(count, dtype=dtype, pin_memory=prefer_pinned())
             width = self._draft_slot_block_tables.shape[1]
             destinations = host["indices"].numpy()
             values = host["values"].numpy()
@@ -289,24 +382,12 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             device_copy.copy(DSparkCopySite.PAGE_INDICES, indices_device, host["indices"][:count])
             device_copy.copy(DSparkCopySite.PAGE_VALUES, values_device, host["values"][:count])
             self._draft_table_storage.view(-1).index_copy_(0, indices_device, values_device)
-        if slots_changed:
-            host_slots = host["slots"].numpy()
-            host_slots.fill(self._scratch_slot)
-            host_slots[: len(slots)] = slots
-            device_copy.copy(DSparkCopySite.REQUEST_SLOTS, self._batch_to_slot, host["slots"])
-            self._uploaded_slots = slot_values
-        if capacities_changed:
-            host["capacities"].numpy()[:] = capacities
-            device_copy.copy(
-                DSparkCopySite.PAGE_CAPACITIES, self._draft_capacities, host["capacities"]
-            )
-            self._uploaded_capacities = capacity_values
+            host["event"].record()
         if not managed and not direct and (updates or gather_table):
             torch.index_select(
                 self._draft_slot_block_tables, 0, self._batch_to_slot, out=self._draft_block_tables
             )
             self._table_slots = slot_values
-        host["event"].record()
         self._draft_prepared_batch = batch_snapshot
 
     def _seed_context_windows(
@@ -328,83 +409,95 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
         private = self._draft_reuse_policy == ReusePolicy.PRIVATE
-        contexts = []
-        context_offset = 0
+        private_rows = []
+        end = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
             capture_len = chunk_len if capture_lens is None else capture_lens[i]
             if not 0 <= capture_len <= chunk_len:
                 raise ValueError("DSpark capture length must be a suffix of its context chunk")
-            contexts.append((context_offset, chunk_len, capture_len))
-            context_offset += chunk_len
-        batched = set()
-        if private and captured is not None:
-            eligible = [
-                capture_len >= self._win
-                and self._req_to_slot.get(spec_metadata.request_ids[i], self._scratch_slot)
-                != self._scratch_slot
-                for i, (_, _, capture_len) in enumerate(contexts)
-            ]
-            first = 0
-            while first < len(contexts):
-                last = first + 1
-                if eligible[first]:
-                    while last < min(first + 8, len(contexts)) and eligible[last]:
-                        last += 1
-                if last - first > 1:
-                    ends = [offset + length for offset, length, _ in contexts[first:last]]
-                    hidden = torch.stack([captured[end - self._win : end] for end in ends])
-                    frames = (
-                        torch.stack(
-                            [flat_position_ids[end - self._win : end] for end in ends]
-                        ).long()
-                        + 1
-                    )
-                    draft_model.write_context_pages(
-                        hidden,
-                        frames,
-                        torch.ones_like(frames, dtype=torch.bool),
-                        self._draft_kv_buffers,
-                        self._draft_block_tables[first:last],
-                        self._draft_capacities[first:last],
-                    )
-                    slots = self._batch_to_slot[first:last]
-                    self._ctx_len.index_copy_(0, slots, frames[:, -1])
-                    self._valid_len.index_fill_(0, slots, self._win)
-                    batched.update(range(first, last))
-                first = last
-        for i, (context_offset, chunk_len, capture_len) in enumerate(contexts):
-            chunk_positions = flat_position_ids[context_offset : context_offset + chunk_len]
+            end += chunk_len
             if chunk_len == 0:
                 continue
-            req_id = spec_metadata.request_ids[i]
-            slot = self._req_to_slot.get(req_id, self._scratch_slot)
-            if captured is None and slot != self._scratch_slot:
+            slot = self._req_to_slot.get(spec_metadata.request_ids[i], self._scratch_slot)
+            if slot == self._scratch_slot:
+                continue
+            if captured is None:
                 raise RuntimeError(
                     "Embedded DSpark requires captured context to initialize KV history"
                 )
-            if captured is not None and capture_len:
-                keep = min(self._win, capture_len)
-                count = (
-                    capture_len
-                    if self._draft_kv_manager.enable_block_reuse and (not private)
-                    else keep
+            keep = min(self._win, capture_len)
+            if private and keep:
+                private_rows.append((i, end, keep))
+                continue
+            if keep:
+                count = capture_len if self._draft_kv_manager.enable_block_reuse else keep
+                frames = (flat_position_ids[end - count : end].long() + 1).unsqueeze(0)
+                draft_model.write_context_pages(
+                    captured[end - count : end].unsqueeze(0),
+                    frames,
+                    torch.ones_like(frames, dtype=torch.bool),
+                    self._draft_kv_buffers,
+                    self._draft_block_tables[i : i + 1],
+                    self._draft_capacities[i : i + 1],
                 )
-                if i not in batched:
-                    positions = (chunk_positions[-count:].long() + 1).unsqueeze(0)
-                    draft_model.write_context_pages(
-                        captured[
-                            context_offset + chunk_len - count : context_offset + chunk_len
-                        ].unsqueeze(0),
-                        positions,
-                        torch.ones_like(positions, dtype=torch.bool),
-                        self._draft_kv_buffers,
-                        self._draft_block_tables[i : i + 1],
-                        self._draft_capacities[i : i + 1],
-                    )
-                    self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
-            if i not in batched:
-                self._ctx_len[slot] = chunk_positions[-1] + 1
+                self._valid_len[slot] = (self._valid_len[slot] + keep).clamp(max=self._win)
+            self._ctx_len[slot] = flat_position_ids[end - 1] + 1
+
+        # Group similar suffix lengths to limit padding. Each projection is
+        # bounded by the work in eight full windows.
+        private_rows.sort(key=lambda row: row[2], reverse=True)
+        first = 0
+        while first < len(private_rows):
+            width = private_rows[first][2]
+            last = first + 1
+            while (
+                last < min(first + 8 * self._win // width, len(private_rows))
+                and 2 * private_rows[last][2] >= width
+            ):
+                last += 1
+            rows = private_rows[first:last]
+            batch_rows = len(rows)
+            row_start, first_end, _ = rows[0]
+            capture_start = first_end - width
+            if all(
+                row == row_start + j and keep == width and end == first_end + j * width
+                for j, (row, end, keep) in enumerate(rows)
+            ):
+                capture = slice(capture_start, rows[-1][1])
+                row_slice = slice(row_start, row_start + batch_rows)
+                hidden = captured[capture].reshape(batch_rows, width, -1)
+                frames = flat_position_ids[capture].long().reshape(batch_rows, width) + 1
+                ends = frames[:, -1]
+                mask = torch.ones_like(frames, dtype=torch.bool)
+                tables = self._draft_block_tables[row_slice]
+                capacities = self._draft_capacities[row_slice]
+                slots = self._batch_to_slot[row_slice]
+                num_valid = width
+            else:
+                hidden_rows, frame_rows, last_frames = [], [], []
+                for _, end, keep in rows:
+                    suffix = captured[end - keep : end]
+                    positions = flat_position_ids[end - keep : end].long() + 1
+                    last_frames.append(positions[-1])
+                    if keep != width:
+                        suffix = F.pad(suffix, (0, 0, 0, width - keep))
+                        positions = F.pad(positions, (0, width - keep))
+                    hidden_rows.append(suffix)
+                    frame_rows.append(positions)
+                hidden, frames, ends = map(torch.stack, (hidden_rows, frame_rows, last_frames))
+                mask = frames != 0
+                tables = torch.stack([self._draft_block_tables[row] for row, _, _ in rows])
+                capacities = torch.stack([self._draft_capacities[row] for row, _, _ in rows])
+                slots = torch.stack([self._batch_to_slot[row] for row, _, _ in rows])
+                num_valid = mask.sum(dim=1)
+            draft_model.write_context_pages(
+                hidden, frames, mask, self._draft_kv_buffers, tables, capacities
+            )
+            self._ctx_len.index_copy_(0, slots, ends)
+            valid_len = (self._valid_len.index_select(0, slots) + num_valid).clamp(max=self._win)
+            self._valid_len.index_copy_(0, slots, valid_len)
+            first = last
 
     def _follow_target_step(
         self,
@@ -536,7 +629,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 **projection,
             )
 
-        windows_ready = main_kv = None
+        windows_ready = main_x_rows = None
+        main_kv_written = False
         if fork is not None:
             main_x, kv = fork
             if kv.shape[1] > K:
@@ -544,35 +638,31 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
 
                 main = torch.cuda.current_stream()
                 side = private_stream(kv.device.index, "dspark_prep_fork")
+                # Both streams read this table. Publish it on main before the fork.
+                draft_model.dspark_model._dspark_freqs_table(start_pos.device)
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
-                    positions, valid, slots32, start32, bonus_x = main_kv_backfill_inputs(
+                    positions, valid = main_kv_backfill_inputs(
                         start_pos,
                         num_accepted_tokens[num_contexts:batch_size],
-                        slots,
-                        main_rows,
-                        main_x.flatten(0, 1),
                         kv.shape[1],
                     )
                     draft_model.write_context_pages(
                         None, positions, valid, self._draft_kv_buffers, tables, capacities, kv=kv
                     )
-                    main_kv = (slots32, start32)
                     windows_ready = torch.cuda.Event()
                     windows_ready.record(side)
                 for tensor in (
                     num_accepted_tokens,
                     start_pos,
-                    slots,
                     kv,
-                    main_x,
-                    main_rows,
                     tables,
                     capacities,
                 ):
                     tensor.record_stream(side)
-                for tensor in (bonus_x, *main_kv):
-                    tensor.record_stream(main)
+                main_kv_written = True
+                bonus_x = main_x.flatten(0, 1)
+                main_x_rows = main_rows
             else:
                 write_backfill(kv=kv)
                 bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
@@ -597,7 +687,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             all_rank_num_tokens=all_rank_num_tokens,
             main_x=bonus_x,
             windows_ready=windows_ready,
-            main_kv=main_kv,
+            main_kv_written=main_kv_written,
+            main_x_rows=main_x_rows,
         )
         confidence = draft_output[1]
         if confidence is not None:

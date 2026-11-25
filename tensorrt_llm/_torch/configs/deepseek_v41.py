@@ -50,6 +50,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
+from tensorrt_llm._utils import normalize_disagg_role
+
 logger = logging.get_logger(__name__)
 
 __all__ = [
@@ -588,7 +590,7 @@ def disagg_context_decoder_skipping_enabled(bounded_replay_on_generation: bool) 
     return (
         bounded_replay_on_generation
         and decoder_bounded_replay_enabled()
-        and os.environ.get("TRTLLM_DISAGG_ROLE") == "context"
+        and normalize_disagg_role(os.environ.get("TRTLLM_DISAGG_ROLE")) == "context"
     )
 
 
@@ -596,7 +598,7 @@ def disagg_context_draft_kv_only_enabled(spec_config) -> bool:
     """Whether an explicitly designated context worker only seeds embedded DSpark KV."""
     mode = getattr(spec_config, "spec_dec_mode", None)
     return (
-        os.environ.get("TRTLLM_DISAGG_ROLE") == "context"
+        normalize_disagg_role(os.environ.get("TRTLLM_DISAGG_ROLE")) == "context"
         and mode is not None
         and mode.is_dspark()
         and getattr(spec_config, "draft_is_embedded_in_target", False)

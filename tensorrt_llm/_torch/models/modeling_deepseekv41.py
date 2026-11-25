@@ -26,7 +26,12 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, mpi_disabled
+from tensorrt_llm._utils import (
+    get_sm_version,
+    is_blackwell_datacenter,
+    mpi_disabled,
+    normalize_disagg_role,
+)
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -2130,7 +2135,7 @@ class DeepseekV41Model(DeepseekV4Model):
             # otherwise their MoE collectives diverge. Pruned context workers
             # force source routing even for warmup and dummy batches; generation
             # workers always execute every layer, including remote-tail batches.
-            role = os.environ.get("TRTLLM_DISAGG_ROLE")
+            role = normalize_disagg_role(os.environ.get("TRTLLM_DISAGG_ROLE"))
             if role != "generation" and not disagg_context_decoder_skipping_enabled(
                 model_config.extra_attrs.get("bounded_replay_on_generation", False)
             ):

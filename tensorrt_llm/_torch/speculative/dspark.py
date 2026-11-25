@@ -227,6 +227,7 @@ class DSparkSpecMetadata(SpecMetadata):
     # Valid suffix rows per context in the original target batch. None keeps
     # the ordinary full-capture contract; zero means this chunk has no capture.
     context_capture_lens: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    context_chunking_ids: frozenset[int] = field(default_factory=frozenset, init=False, repr=False)
 
     # Hidden state capture fields
     layers_to_capture: Optional[List[int]] = None
@@ -888,7 +889,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # windows or reset the live slot maps.
             self._win_inited = True
 
-        if self._attention_warmup_attempted:
+        if self._kv_windows is None or self._attention_warmup_attempted:
             return
 
         # Prewarm the same self-JIT ops used by production before CUDA graph

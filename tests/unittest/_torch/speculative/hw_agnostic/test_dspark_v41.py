@@ -400,9 +400,15 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
     assert len(model.mtp_layers) == 3
     assert all(not hasattr(stage, "mlp") for stage in model.mtp_layers)
     assert model.run_moe_lockstep_noop([1], torch.device("cpu")) is None
-    supports_replay = DSv41DSparkForCausalLM.supports_final_window_context_replay.fget
-    assert supports_replay(SimpleNamespace(dspark_model=model))
-    assert not supports_replay(SimpleNamespace(dspark_model=SimpleNamespace()))
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
+
+    supports_replay = DSv41DSparkForCausalLM.supports_final_window_context_replay
+    policy = SimpleNamespace(reuse_policy=ReusePolicy.PRIVATE)
+    manager = SimpleNamespace(draft_layer_ids=(20,), get_layer_cache_spec=lambda _: policy)
+    assert supports_replay(SimpleNamespace(dspark_model=model), manager)
+    assert supports_replay(SimpleNamespace(dspark_model=SimpleNamespace()), manager)
+    policy.reuse_policy = ReusePolicy.REQUIRED
+    assert not supports_replay(SimpleNamespace(dspark_model=model), manager)
 
     class ContextLoader:
         def __init__(self, model):
@@ -498,6 +504,7 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(mode):
     nn.Module.__init__(model)
     model.hc_mult = 2
     model.block_size = 2
+    model._attn_params = {"window_size": 4}
     model.model_config = SimpleNamespace(
         mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)
     )
@@ -513,6 +520,8 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(mode):
 
     def fake_stage(self, stage, hidden, *args, pre_mix, **kwargs):
         index = len(seen)
+        if mode == "paged-scalar":
+            torch.testing.assert_close(args[-1], torch.tensor([1]))
         seen.append(pre_mix.clone())
         return hidden + 1, mixes[index]
 
@@ -548,10 +557,13 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(mode):
             torch.zeros(1, 9),
             torch.ones(1, dtype=torch.long),
             torch.ones(1, dtype=torch.long),
+            valid_len=torch.tensor([1]),
             return_logits=True,
             **kwargs,
         )
         torch.testing.assert_close(logits, expected)
+        with pytest.raises(AssertionError, match="start_pos > 0"):
+            model.forward(torch.zeros(1, 9), torch.ones(1, dtype=torch.long), 0, **kwargs)
 
 
 @pytest.mark.parametrize("batched", [False, True])

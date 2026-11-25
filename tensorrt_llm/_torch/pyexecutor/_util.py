@@ -2094,7 +2094,15 @@ class KvCacheCreator:
                     # A hybrid manager's appended draft layers.
                     num_pool_groups += _get_num_storage_pool_groups(
                         unified_layer_specs, self._tokens_per_block)
-            if self._get_embedded_draft_layer_specs():
+            embedded_draft_specs = self._get_embedded_draft_layer_specs()
+            if (embedded_draft_specs and not self._kv_cache_manager_cls.
+                    draft_layers_share_pool_group(
+                        self._model_engine.model.model_config,
+                        self._mapping,
+                        tokens_per_block=self._tokens_per_block,
+                        spec_config=spec_cfg,
+                        kv_cache_config=self._kv_cache_config,
+                        layer_specs=embedded_draft_specs)):
                 num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 

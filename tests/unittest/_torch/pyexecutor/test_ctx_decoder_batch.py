@@ -27,13 +27,16 @@ def test_context_decoder_batching_requires_a_complete_final_window_draft(
     engine = object.__new__(ModelEngine)
     engine.model = SimpleNamespace(
         model=SimpleNamespace(decoder_replay_window=140, decoder_replay_split=20),
-        draft_model=SimpleNamespace(supports_final_window_context_replay=final_window_draft),
+        draft_model=SimpleNamespace(
+            supports_final_window_context_replay=lambda _: final_window_draft
+        ),
     )
     engine.spec_config = object() if has_spec else None
     scheduler = Mock(
         spec=KVCacheV2Scheduler,
         chunking_enabled=True,
         chunking_policy=ContextChunkingPolicy.FIRST_COME_FIRST_SERVED,
+        kv_cache_manager=object(),
     )
     executor = SimpleNamespace(
         scheduler=scheduler,

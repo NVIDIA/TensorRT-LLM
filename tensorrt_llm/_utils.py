@@ -791,6 +791,16 @@ def print_all_stacks():
                      "".join(traceback.format_stack(frame)))
 
 
+def normalize_disagg_role(role: Optional[str]) -> Optional[str]:
+    """Return the canonical context or generation role used by a worker."""
+    role = (role or "").lower()
+    if role == "context" or role.startswith("ctx"):
+        return "context"
+    if role.startswith("gen"):
+        return "generation"
+    return None
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":

@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.configs.deepseek_v41 import disagg_context_draft_kv_only_enabled
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
@@ -93,6 +94,7 @@ from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_position_id_offset,
+    get_speculative_model,
     get_top_level_model,
     pad_input_tokens,
     prepare_multimodal_indices,
@@ -487,8 +489,14 @@ class DecoderInputPreparer:
         )
 
         spec_config = self._config.spec_config if self._config is not None else None
+        model_type = getattr(getattr(model, "config", None), "model_type", None)
+        self._dspark_context_worker = model_type in (
+            "deepseek_v41",
+            "deepseek_v41_text",
+        ) and disagg_context_draft_kv_only_enabled(spec_config)
         self._dspark_confidence_enabled = bool(
-            spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
+            not self._dspark_context_worker
+            and getattr(spec_config, "enable_confidence_scheduling", False)
         )
         self._dspark_trims_submitted_tokens = self._dspark_confidence_enabled
         self._dspark_device_windows = bool(
@@ -3374,6 +3382,12 @@ class DecoderInputPreparer:
             spec_metadata.paused_in_place_ids = getattr(
                 scheduled_requests, "paused_in_place_ids", frozenset()
             )
+            if isinstance(spec_metadata, DSparkSpecMetadata):
+                spec_metadata.context_chunking_ids = frozenset(
+                    req.py_request_id
+                    for req in scheduled_requests.context_requests_chunking
+                    if not req.is_dummy
+                )
             spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
@@ -4068,7 +4082,7 @@ class DecoderInputPreparer:
 
     def _get_spec_worker(self):
         """Return the one-model speculative worker when it is initialized."""
-        return getattr(self.model, "spec_worker", None)
+        return getattr(get_speculative_model(self.model), "spec_worker", None)
 
     def _dspark_tp_rank0_rows(self):
         """Return a hook that swaps this rank's confidence rows for TP rank 0's.
