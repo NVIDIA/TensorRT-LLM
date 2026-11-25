@@ -157,10 +157,10 @@ any state ── rank 0 not in the new mask, or a survivor replies FAILED ──
   Progress counts its iteration, install steps and the rounds its peers wait for it in (all-to-all round flags,
   host-collective epochs), so a long step whose rounds advance is not hung. A joining rank
   that waits on no peer gets `ADMISSION_TIMEOUT_S` (20 s). During the first startup the same rule runs with
-  `RENDEZVOUS_TIMEOUT_S` (600 s) in place of the hang timeout: progress is the number of startup collectives
-  completed, a rank that started waits on every rank that has not, host-collective rounds count as in serving, and a
-  hung rank aborts the startup. A replacement's startup is timed apart from the rule: no progress (startup
-  collectives, autotuner warmup steps) for 600 s and its node supervisor kills it (see [Rejoin](#rejoin)).
+  `RENDEZVOUS_TIMEOUT_S` (1800 s) in place of the hang timeout: progress counts completed startup collectives,
+  checkpoint loading and autotuner warmup steps, a rank that started waits on every rank that has not,
+  host-collective rounds count as in serving, and a hung rank aborts the startup. A replacement's startup is timed
+  apart from the rule: no progress for 1800 s and its node supervisor kills it (see [Rejoin](#rejoin)).
 - Paused: outside a change, a rank in the paused mask of its node supervisor's latest report is not hung, even once
   its own reports stop, if that node report arrived within half the hang timeout. The executor pauses its hang
   detector (`HangDetector.pause`) around calls that may block longer than a hang timeout:
@@ -238,11 +238,11 @@ poll of free device memory, at most once a second, finds it free.
    the host weights its rank wrote.
 3. It reports `joining_ready`. The authority proposes adding it; admission uses the same INSTALL path as a failover.
 4. A replacement that fails before it served 600 s, counted from its first `COMMITTED` listing, is restarted after a
-   backoff (1 s, doubling). A replacement with no startup progress for 600 s, or not connected 600 s after it
+   backoff (1 s, doubling). A replacement with no startup progress for 1800 s, or not connected 1800 s after it
    started, is killed and counts as such a failure. After 3 failures in a row (`_MAX_FAILED_REPLACEMENTS`) the rank
    is given up (`given_up_mask`). A rank is given up at once when its node supervisor left, when a replacement exits
-   with `REPLACEMENT_CANNOT_START` (78), when a killed process is not reaped within 600 s, or when its GPU is still
-   busy after 600 s (see step 5).
+   with `REPLACEMENT_CANNOT_START` (78), when a killed process is not reaped within 1800 s, or when its GPU is still
+   busy after 1800 s (see step 5).
 5. A lost node returns when the operator starts its node supervisor again in the same job and container, with the
    same shared secret, rendezvous address and settings (not node 0), through the launcher. On Slurm, for lost node
    `<i>`, the one-task step passes the supervisor's srun check (`SLURM_STEP_NUM_TASKS == 1`), and the launcher passes
@@ -266,7 +266,7 @@ poll of free device memory, at most once a second, finds it free.
    started, or when the record's rank count is not `--nodes` times the step's GPUs. Its report clears the node's
    given-up ranks, and their replacements rejoin in one membership change. A replacement of a rank that a previous
    supervisor started waits until no process runs on its GPU (NVML), polling every `_BACKOFF_S`, up to
-   `RENDEZVOUS_TIMEOUT_S` (600 s), and the rank is given up after that. A GPU that NVML cannot check counts as a
+   `RENDEZVOUS_TIMEOUT_S` (1800 s), and the rank is given up after that. A GPU that NVML cannot check counts as a
    replacement that could not start (`_count_failed_replacement`), so no replacement starts unchecked.
 
 ### Startup record and replay
