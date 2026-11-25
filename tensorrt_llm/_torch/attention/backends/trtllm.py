@@ -25,8 +25,6 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
 import numpy as np
 import torch
 
-from tensorrt_llm.bindings import DataType
-
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
@@ -38,7 +36,8 @@ if TYPE_CHECKING:
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
-                                 maybe_pin_memory, prefer_pinned)
+                                 maybe_pin_memory, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
                                      RotaryScalingType)
@@ -55,6 +54,7 @@ from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fallback import FallbackFmha
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
@@ -111,7 +111,7 @@ def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
 
 
 class _ContextPlan:
-    """Host state of a context-only trtllm-gen call, shared by the layers of one forward.
+    """Host state of a dense context-only FMHA call, shared by the layers of one forward.
 
     TrtllmAttentionMetadata drops it whenever the lengths or the batch can change (prepare(), KV-length and
     spec-dec updates, draft swaps); the bound tensors are also compared by identity. ``sig`` is the
@@ -121,8 +121,7 @@ class _ContextPlan:
     __slots__ = ("kv_lens", "prompt_lens", "kv_lens_cuda", "prompt_lens_cuda",
                  "num_contexts", "num_ctx_tokens", "block_offsets", "workspace",
                  "kv_cache_manager", "pool_pointers", "sig", "fmha_cls",
-                 "counter_rows", "total_num_blocks", "max_q_len", "max_kv_len",
-                 "is_fallback")
+                 "counter_rows", "total_num_blocks", "max_q_len", "max_kv_len")
 
 
 @functools.cache
@@ -2133,7 +2132,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             gqa_decode (GqaDecodeSetup): Enables the GQA decode FMHA library
                 (fmha/gqa_decode.py) for this layer.
             cache_context_plan (bool): Plan a context-only forward once for the
-                layers that share its metadata and run the trtllm-gen context
+                layers sharing metadata, using FlashInfer trtllm-gen or the dense,
+                non-quantized BF16/FP16 FallbackFmha context
                 kernel from that plan (dense, non-sparse layers only).
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
@@ -2233,6 +2233,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
+        self._context_plan_unquantized = not self.quant_mode.has_any_quant()
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
@@ -3083,9 +3084,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                           metadata: TrtllmAttentionMetadata) -> tuple:
         """Key of a context plan besides the forward state that the metadata invalidates.
 
-        With the layer's KV-pool bound (checked in _run_context_plan) it holds
-        every input of the FMHA selection and of the context workspace size
-        that _is_plain_context_call leaves variable.
+        Together with the bound metadata identities and per-call admission,
+        it holds the variable inputs of FMHA selection and context workspace
+        sizing. Libraries that need a block extent also recheck the layer's
+        KV-pool bound in _run_context_plan.
         """
         return (self._context_plan_layer_key, q.dtype, fwd.output.dtype,
                 fwd.attention_input_type, fwd.attention_window_size,
@@ -3145,9 +3147,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if (q.dtype not in (torch.bfloat16, torch.float16) or fwd.output is None
                 or fwd.output.dtype != q.dtype or self.is_mla_enable
                 or self.sparse_params is not None
-                or self.quant_mode.has_any_quant()):
+                or not self._context_plan_unquantized):
             return False
-        expected_kv_dtype = DataType.BF16 if q.dtype == torch.bfloat16 else DataType.HALF
+        expected_kv_dtype = torch_dtype_to_binding(q.dtype)
         if getattr(metadata.kv_cache_manager, "dtype",
                    None) != expected_kv_dtype:
             return False
@@ -3160,15 +3162,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 or getattr(metadata.kv_cache_manager,
                            "mixed_precision_high_layers", None)):
             return False
-        if (fwd.out_scale is not None or fwd.output_gate is not None
-                or fwd.sage_attn_num_elts_per_blk_q != 0
+        if (fwd.out_scale is not None or fwd.sage_attn_num_elts_per_blk_q != 0
                 or fwd.sage_attn_num_elts_per_blk_k != 0
                 or fwd.sage_attn_num_elts_per_blk_v != 0
                 or fwd.sage_attn_qk_int8 or fwd.sage_attn_smooth_k
                 or fwd.sage_attn_smooth_v or fwd.sage_quantized is not None
                 or fwd.vc_attention or fwd.vc_operands is not None
-                or fwd.qk_fp8_per_tensor or fwd.v_fp8_per_tensor
-                or fwd.sparse_backend_args is not None
                 or fwd.timestep is not None
                 or fwd.sparse_attn_phase is not None):
             return False
@@ -3208,20 +3207,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         plan.pool_pointers = metadata.host_kv_cache_pool_pointers
         plan.sig = sig
         plan.fmha_cls = None
-        plan.is_fallback = False
         if (metadata.kv_cache_manager is None or plan.block_offsets is None
-                or plan.workspace is None or metadata.beam_width != 1
-                or metadata.max_context_q_len_override is not None
-                or metadata.spec_decoding_bl_tree_mask is not None
-                or metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
-                or metadata.helix_position_offsets is not None
-                or metadata.enable_flash_mla):
+                or plan.workspace is None):
             return plan
-        from .fmha.fallback import FallbackFmha
         from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
         fmha = self._fmha_manager.select(self, q, None, None, metadata, fwd)
-        plan.is_fallback = type(fmha) is FallbackFmha
-        if plan.is_fallback:
+        if type(fmha) is FallbackFmha:
             if not self._fallback_context_plan_eligible(q, metadata, fwd):
                 return plan
         elif not isinstance(fmha, FlashInferTrtllmGenFmha):
@@ -3291,10 +3282,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self._context_plan_matches(plan, sig, metadata):
             plan = self._build_context_plan(q, metadata, fwd, sig)
             metadata.context_plan = plan
-        if plan.fmha_cls is None:
-            return False
-        if plan.is_fallback and not self._fallback_context_plan_eligible(
+        elif plan.fmha_cls is FallbackFmha and not self._fallback_context_plan_eligible(
                 q, metadata, fwd):
+            return False
+        if plan.fmha_cls is None:
             return False
         fmha = self._context_plan_fmha_for(plan)
         if fmha is None:

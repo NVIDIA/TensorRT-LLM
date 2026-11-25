@@ -498,6 +498,18 @@ attention, or SageAttention; self-attention requires KV-cache updates. It reject
 raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
 with the native `AttentionOp` input requirements.
 
+Dense layers can opt into `cache_context_plan` to share a context-only plan
+through `TrtllmAttentionMetadata.context_plan`. The first compatible layer uses
+its manager to select FlashInfer trtllm-gen or the exact `FallbackFmha` class;
+fallback plans cover non-quantized BF16/FP16 with matching KV and output dtypes.
+Later compatible layers skip selection but bind fresh layer, QKV and output
+references. Every hit rechecks per-call admission, the signature and metadata
+buffer/manager identities; fallback hits also recheck recipes and mixed-precision
+state, and libraries needing a block extent recheck the layer's KV-pool bound.
+An offered output gate remains available for the module to apply when the FMHA
+library leaves `output_gate_applied` false. Metadata preparation, runtime-view
+rebinding, KV-length/speculative updates and draft swaps invalidate the plan.
+
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic

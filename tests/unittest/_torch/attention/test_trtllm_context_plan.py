@@ -23,7 +23,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
 )
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 A = backend.TrtllmAttention
 M = backend.TrtllmAttentionMetadata
@@ -70,6 +72,7 @@ def fixture(
         is_mla_enable=False,
         sparse_params=None,
         quant_mode=QuantMode(0),
+        _context_plan_unquantized=True,
         num_heads=1,
         num_kv_heads=1,
         head_dim=4,
@@ -91,8 +94,7 @@ def fixture(
         "_run_context_plan",
         "_fallback_context_plan_eligible",
     ]:
-        if hasattr(A, name):
-            setattr(a, name, types.MethodType(getattr(A, name), a))
+        setattr(a, name, types.MethodType(getattr(A, name), a))
     a._ensure_rope_table_size = Mock()
     if cls is FlashInferTrtllmGenFmha:
         fmha = object.__new__(cls)
@@ -165,6 +167,34 @@ def same(test: unittest.TestCase, x: FmhaParams, y: FmhaParams) -> None:
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("plan_built", [False, True], ids=["build", "hit"])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("sage_attn_smooth_v", True),
+        ("sage_attn_smooth_k", True),
+        ("sage_attn_qk_int8", True),
+        ("sage_attn_num_elts_per_blk_q", 1),
+        ("sage_quantized", object()),
+        ("vc_attention", True),
+        ("vc_operands", object()),
+        ("out_scale", torch.ones(1)),
+        ("qk_fp8_per_tensor", True),
+        ("v_fp8_per_tensor", True),
+        ("sparse_attn_phase", 1),
+        ("timestep", 1.0),
+    ],
+)
+def test_fallback_plan_recipe_admission(field: str, value: object, plan_built: bool) -> None:
+    a, lib, q, m, f = fixture()
+    if plan_built:
+        assert a._run_context_plan(q, None, None, m, f)
+    lib.run_context.reset_mock()
+    setattr(f, field, value)
+    assert not a._run_context_plan(q, None, None, m, f)
+    lib.run_context.assert_not_called()
+
+
 class TestContextPlan(unittest.TestCase):
     def test_mixed_precision_uses_regular_path_before_and_after_plan(self) -> None:
         for field in [
@@ -214,11 +244,17 @@ class TestContextPlan(unittest.TestCase):
         a.create_output = Mock(return_value=(allocated,))
         actual = a._run_context_plan
 
-        def require_output(q, k, v, metadata, fwd) -> bool:
+        def require_output(
+            q_in: torch.Tensor,
+            k: torch.Tensor | None,
+            v: torch.Tensor | None,
+            metadata: CpuMetadata,
+            fwd: AttentionForwardArgs,
+        ) -> bool:
             self.assertIsNotNone(
                 fwd.output, "ordinary caller output must be allocated before plan admission"
             )
-            return actual(q, k, v, metadata, fwd)
+            return actual(q_in, k, v, metadata, fwd)
 
         a._run_context_plan = require_output
         # This fixture exercises allocation order without constructing GPU metadata.
@@ -227,22 +263,81 @@ class TestContextPlan(unittest.TestCase):
         a.create_output.assert_called_once()
         lib.run_context.assert_called_once()
 
-    def test_fi_existing_and_missing_output(self) -> None:
-        for missing in [False, True]:
-            with self.subTest(missing=missing):
-                a, lib, q, m, f = fixture(cls=FlashInferTrtllmGenFmha)
-                allocated = f.output
-                if missing:
-                    f.output = None
-                a.create_output = Mock(return_value=(allocated,))
-                self.assertIs(A.forward(a, q, None, None, m, f), allocated)
-                self.assertEqual(a.create_output.call_count, 1 if missing else 0)
-                lib.run_context.assert_called_once()
+    def test_offered_gate_with_existing_and_missing_output(self) -> None:
+        for cls in [FallbackFmha, FlashInferTrtllmGenFmha]:
+            for missing in [False, True]:
+                with self.subTest(library=cls.__name__, missing=missing):
+                    a, lib, q, m, f = fixture(cls=cls)
+                    f.output_gate = torch.ones(2, 4, dtype=torch.bfloat16)
+                    self.assertTrue(a._run_context_plan(q, None, None, m, f))
+                    self.assertIs(m.context_plan.fmha_cls, cls)
+                    lib.run_context.reset_mock()
+                    allocated = f.output
+                    if missing:
+                        f.output = None
+                    a.create_output = Mock(return_value=(allocated,))
+                    self.assertIs(A.forward(a, q, None, None, m, f), allocated)
+                    self.assertEqual(a.create_output.call_count, 1 if missing else 0)
+                    lib.run_context.assert_called_once()
+                    self.assertFalse(f.output_gate_applied)
+
+    def test_fp16_plan_build_and_hit(self) -> None:
+        a, lib, q, m, f = fixture()
+        q = q.half()
+        f.output = f.output.half()
+        m.kv_cache_manager.dtype = DataType.HALF
+        for _ in range(2):
+            self.assertTrue(a._run_context_plan(q, None, None, m, f))
+        self.assertEqual(a._fmha_manager.select.call_count, 1)
+        self.assertEqual(lib.run_context.call_count, 2)
+
+    def test_kv_dtype_mismatch_refuses_plan(self) -> None:
+        for dtype, kv_dtype in [
+            (torch.bfloat16, DataType.FP8),
+            (torch.float16, DataType.BF16),
+        ]:
+            with self.subTest(dtype=dtype, kv_dtype=kv_dtype):
+                a, lib, q, m, f = fixture()
+                q = q.to(dtype)
+                f.output = f.output.to(dtype)
+                m.kv_cache_manager.dtype = kv_dtype
+                self.assertFalse(a._run_context_plan(q, None, None, m, f))
+                lib.run_context.assert_not_called()
+
+    def test_quant_eligibility_is_cached_before_plan_build_and_hits(self) -> None:
+        a, _, q, m, f = fixture()
+        with patch.object(
+            QuantMode, "has_any_quant", side_effect=AssertionError("quant mode recomputed")
+        ):
+            self.assertTrue(a._run_context_plan(q, None, None, m, f))
+            self.assertTrue(a._run_context_plan(q, None, None, m, f))
+
+    def test_quant_config_update_refreshes_plan_eligibility(self) -> None:
+        a, _, q, m, f = fixture()
+        a.rope_dim = 0
+        a.position_embedding_type = 0
+        a.attention_chunk_size = None
+        a.q_scaling = 1.0
+        a.kv_cache_dtype = "auto"
+        for config, eligible in [
+            (QuantConfig(), True),
+            (QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8), False),
+            (QuantConfig(), True),
+        ]:
+            with self.subTest(eligible=eligible):
+                with patch.object(backend, "FmhaManager", return_value=a._fmha_manager):
+                    A.update_quant_config(a, config)
+                self.assertEqual(a._context_plan_unquantized, eligible)
+                self.assertEqual(a._run_context_plan(q, None, None, m, f), eligible)
 
     def test_forward_keeps_error_contract_and_allocation_order(self) -> None:
-        for kind in ["window-pair", "window-generation", "dsv4"]:
+        for kind, message in [
+            ("window-pair", "must be provided together"),
+            ("window-generation", "supported only for context attention"),
+            ("dsv4", "requires caller-provided output"),
+        ]:
             with self.subTest(kind=kind):
-                a, lib, q, m, f = fixture()
+                a, _, q, m, f = fixture()
                 f.output = None
                 a.create_output = Mock()
                 a._run_context_plan = Mock(return_value=False)
@@ -253,10 +348,10 @@ class TestContextPlan(unittest.TestCase):
                         f.attention_input_type = AttentionInputType.generation_only
                 else:
                     f.enable_dsv4_epilogue_fusion = True
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, message):
                     A.forward(a, q, None, None, m, f)
                 a.create_output.assert_not_called()
-                lib.run_context.assert_not_called()
+                a._run_context_plan.assert_not_called()
 
     def test_disabled_plan_keeps_regular_allocator(self) -> None:
         a, _, q, m, f = fixture()
@@ -277,7 +372,8 @@ class TestContextPlan(unittest.TestCase):
         a, fmha, q, m, f = fixture()
         self.assertTrue(a._run_context_plan(q, None, None, m, f))
         got = fmha.run_context.call_args.args[0]
-        expected = fmha.context_params(q, None, None, m, f, m.effective_workspace, 0, 2, 3)
+        fmha.forward(q, None, None, m, f)
+        expected = fmha.run_context.call_args.args[0]
         same(self, got, expected)
         self.assertEqual(got.total_num_blocks, 0)
         b, second, q2, _, f2 = fixture(1)
@@ -305,35 +401,18 @@ class TestContextPlan(unittest.TestCase):
 
     def test_fallback_subclass_keeps_regular_forward(self) -> None:
         class Specialized(FallbackFmha):
-            def forward(self, *args, **kwargs):
+            def forward(self, *args: object, **kwargs: object) -> None:
                 raise AssertionError("special forward cannot be bypassed")
 
         a, _, q, m, f = fixture(cls=Specialized)
         self.assertFalse(a._run_context_plan(q, None, None, m, f))
 
-    def test_recipe_and_quant_scope(self) -> None:
-        for field, value in [
-            ("sage_attn_smooth_v", True),
-            ("sage_attn_smooth_k", True),
-            ("sage_attn_qk_int8", True),
-            ("sage_attn_num_elts_per_blk_q", 1),
-            ("sage_quantized", object()),
-            ("vc_attention", True),
-            ("vc_operands", object()),
-            ("out_scale", torch.ones(1)),
-            ("qk_fp8_per_tensor", True),
-            ("v_fp8_per_tensor", True),
-            ("sparse_attn_phase", 1),
-            ("timestep", 1.0),
-        ]:
-            with self.subTest(field=field):
-                a, _, q, m, f = fixture()
-                setattr(f, field, value)
-                self.assertFalse(a._run_context_plan(q, None, None, m, f))
+    def test_quant_and_sparse_scope(self) -> None:
         for mode in [QuantMode.INT8_KV_CACHE, QuantMode.FP8_KV_CACHE, QuantMode.INT8_WEIGHTS]:
             with self.subTest(mode=mode):
                 a, _, q, m, f = fixture()
                 a.quant_mode = mode
+                a._context_plan_unquantized = not mode.has_any_quant()
                 self.assertFalse(a._run_context_plan(q, None, None, m, f))
         a, _, q, m, f = fixture()
         f.sparse_runtime_params.sparse_kv_indices = torch.ones(1, dtype=torch.int32)
@@ -362,14 +441,6 @@ class TestContextPlan(unittest.TestCase):
         self.assertFalse(a._run_context_plan(q, None, None, m, f))
         a, _, q, m, f = fixture()
         self.assertFalse(a._run_context_plan(q.float(), None, None, m, f))
-
-    def test_plan_hit_cannot_bypass_new_recipe(self) -> None:
-        a, lib, q, m, f = fixture()
-        self.assertTrue(a._run_context_plan(q, None, None, m, f))
-        lib.run_context.reset_mock()
-        f.vc_attention = True
-        self.assertFalse(a._run_context_plan(q, None, None, m, f))
-        lib.run_context.assert_not_called()
 
     def test_workspace_tensor_and_window_rebind(self) -> None:
         for change in ["workspace", "kv_tensor", "manager", "pool", "window", "signature"]:
