@@ -1268,6 +1268,130 @@ def _gdn_replay_map_on(core, cm, device, ring: bool) -> bool:
     )
 
 
+#: Off by default (class S: another K split than the bf16 entry). At an attention-DP rank on
+#: SM103, the output projections of a decode step -- the GDN out projection and the attention
+#: o projection, `[rows, 6144] x [6144, 2560]` -- run `mid_rows_mm`'s bf16 tcgen05 GEMM over the
+#: checkpoint's weight (no copy) with PDL, at the MMA N and plan `_OUT_PROJ_TABLE` names for the
+#: row count, instead of the step's bf16 entry (`low_m_bf16_mm`: FlashInfer's split-K kernel up
+#: to 32 rows, cuBLASLt without PDL above). The GEMM streams its weight before its wait, so it
+#: overlaps the gated norm (which releases its dependents early) or the attention's last
+#: launch. Same bf16 operands and fp32 accumulation; the K split differs, so the output moves
+#: at bf16 rounding level (0 of 18 greedy texts equal on GB300 dep4, 837174). Values: `1` -- the
+#: GDN out projection at every row count of the table, the attention o projection at
+#: `_OUT_PROJ_ATTN_ROWS` (where its producer does not release early and the micro measured a
+#: gain); `gdn` -- the GDN site only; `all` -- both sites at every row count of the table. Only
+#: the row counts of the CUDA-graph batch sizes engage (their kernels are compiled at build).
+#: GB300: 3-ctx dep4 cap 12 step -0.14 ms (837700 vs 837701); the GDN site saves 36..111 us a
+#: step of 36 launches at 20..128 rows. Read once, when the target is built.
+DP_OUT_PROJ_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"
+#: `(first rows, last rows, MMA N, plan)`: the GEMM of a row count, measured on GB300 (the
+#: model's GDN chain of 36 layers captured with each candidate; ks 3..12 x 9 (kpb, stages, l2)
+#: at 28 / 48 / 96 / 120 / 224 rows and the best plans at 15 more counts). The MMA N rounded to
+#: 16 rows wins over the op's 32 / 64 / 128 / 256 at every count. Past 144 rows cuBLASLt is
+#: faster; those rows keep the bf16 entry.
+_OUT_PROJ_TABLE = (
+    (17, 28, 32, MidPlan(12, 2, 8, 2)),
+    (29, 32, 32, MidPlan(6, 4, 10, 1)),
+    (33, 36, 48, MidPlan(6, 4, 10, 1)),
+    (37, 40, 48, MidPlan(6, 4, 8, 2)),
+    (41, 48, 48, MidPlan(6, 4, 10, 1)),
+    (49, 64, 64, MidPlan(6, 4, 8, 2)),
+    (65, 80, 80, MidPlan(6, 4, 4, 2)),
+    (81, 96, 96, MidPlan(6, 4, 8, 2)),
+    (97, 112, 112, MidPlan(6, 4, 8, 2)),
+    (113, 128, 128, MidPlan(6, 4, 6, 2)),
+    (129, 144, 144, MidPlan(6, 4, 6, 2)),
+)
+#: The weight geometry `(N, K)` the table was measured for: the trunk's output projections.
+_OUT_PROJ_GEOM = (2560, 6144)
+#: Rows at which the attention o projection takes the GEMM under the value `1` (GB300 micro,
+#: 12 launches a step: 0.004..0.017 ms saved at 32..96 rows, -0.003..-0.005 at 20..28 against
+#: FlashInfer's split-K, -0.003..-0.008 from 120 rows).
+_OUT_PROJ_ATTN_ROWS = (29, 96)  # capacity: fixed: dispatch thresholds
+
+
+def _out_proj_mode() -> str:
+    """`DP_OUT_PROJ_BF16_ENV`: "" (unset, empty, an off spelling), "1", "gdn" or "all"."""
+    raw = os.environ.get(DP_OUT_PROJ_BF16_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return ""
+    if value in _SWITCH_ON:
+        return "1"
+    if value in ("gdn", "all"):
+        return value
+    raise ValueError(f"{DP_OUT_PROJ_BF16_ENV}={raw!r}: expected 0, 1, gdn or all")
+
+
+def _out_proj_shape(rows: int) -> tuple | None:
+    """`(MMA N, plan)` of `_OUT_PROJ_TABLE` at `rows`, None outside it."""
+    for lo, hi, mpad, plan in _OUT_PROJ_TABLE:
+        if lo <= rows <= hi:
+            return mpad, plan
+    return None
+
+
+def _out_proj_build(core, device) -> dict | None:
+    """`DP_OUT_PROJ_BF16_ENV`, read once at build: `{"gdn_out" | "attn_o": {rows: (MMA N,
+    plan)}}` at an attention-DP rank on SM103 whose output projections are contiguous bf16
+    `_OUT_PROJ_GEOM` weights with no other decode copy, every entry's GEMM compiled here; None
+    where it is off. Set where it cannot apply: one warning, None."""
+    mode = _out_proj_mode()
+    if not mode:
+        return None
+    names = [f"l{i}_out_w" for i in core.gdn_layers] + [f"l{i}_o_w" for i in core.attn_layers]
+    bad = [
+        n
+        for n in names
+        if n not in core.w
+        or n in core._mid
+        or core.w[n].dtype != torch.bfloat16
+        or tuple(core.w[n].shape) != _OUT_PROJ_GEOM
+        or not core.w[n].is_contiguous()
+        or core.w[n].data_ptr() % 16
+    ]
+    if not _dp_decode_rank(core, device) or bad:
+        logger.warning(
+            f"{DP_OUT_PROJ_BF16_ENV} is set but ignored: it serves a dep4 / dep8 rank on SM103 "
+            f"whose output projections are bf16 {_OUT_PROJ_GEOM[0]} x {_OUT_PROJ_GEOM[1]} "
+            f"weights without another decode copy ({len(bad)} are not)"
+        )
+        return None
+    gdn = {}
+    for rows in _graph_rows(core, _OUT_PROJ_TABLE[0][0], _OUT_PROJ_TABLE[-1][1]):
+        shape = _out_proj_shape(rows)
+        if shape is not None:
+            gdn[rows] = shape
+    lo, hi = _OUT_PROJ_ATTN_ROWS
+    attn = (
+        {}
+        if mode == "gdn"
+        else dict(gdn)
+        if mode == "all"
+        else {r: e for r, e in gdn.items() if lo <= r <= hi}
+    )
+    w = core.w[names[0]]
+    for mpad, plan in sorted(set(gdn.values()), key=str):
+        # The first call compiles the kernel (`mid_mm_raw` caches it per shape and plan).
+        mid_mm_raw(torch.zeros(1, w.shape[1], dtype=w.dtype, device=device), w, plan, mpad=mpad)
+    logger.info(
+        f"output projections on the bf16 mid-rows GEMM ({DP_OUT_PROJ_BF16_ENV}={mode}): rank "
+        f"{core.dp_rank} of {core.dp_size}, GDN rows {sorted(gdn)}, attention rows {sorted(attn)}"
+    )
+    return {"gdn_out": gdn, "attn_o": attn}
+
+
+def _out_proj(core, x, weight_t, site: str, dense):
+    """An output projection of a decode step: `DP_OUT_PROJ_BF16_ENV`'s GEMM at a row count its
+    table serves for `site` (`weight_t` the `.t()` view of the checkpoint's `[N, K]` weight,
+    `x` contiguous and 16-byte aligned), else `dense()` (the step's `_dense_mm`)."""
+    table = core._out_proj
+    ent = None if table is None else table[site].get(x.shape[0])
+    if ent is None or not x.is_contiguous() or x.data_ptr() % 16:
+        return dense()
+    return mid_mm_raw(x, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
+
+
 #: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
 #: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
 #: dep2 was never run with them; it keeps the stock forms.
@@ -1838,6 +1962,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._inproj_release = None
         # `DP_GDN_REPLAY_MAP_ENV`, settled at each cache-manager bind.
         self.gdn_replay_map = False
+        # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
+        self._out_proj = None
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -2021,6 +2147,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         if device.type == "cuda":
             self.hc_tiles = _hc_tiles_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
+            self._out_proj = _out_proj_build(self, device)
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
             _route_front_build(self, self._decode._layers, device)
@@ -7021,7 +7148,15 @@ class DecodeTarget:
             )
         if not gated:
             fused_sigmoid_mul_inplace(out, gate)
-        return core.tp_sum(_dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m))
+        return core.tp_sum(
+            _out_proj(
+                core,
+                out,
+                L.o,
+                "attn_o",
+                lambda: _dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m),
+            )
+        )
 
     def _hc_site(
         self,
@@ -7653,7 +7788,15 @@ class DecodeTarget:
             core.num_k_heads,
             core.head_k_dim,
         )
-        return core.tp_sum(_dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m))
+        return core.tp_sum(
+            _out_proj(
+                core,
+                o,
+                L.out,
+                "gdn_out",
+                lambda: _dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m),
+            )
+        )
 
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
         """A verify step's gated RMS norm (sigmoid gate, plain non-gemma weight) and the
@@ -7668,7 +7811,15 @@ class DecodeTarget:
             gate_activation="sigmoid",
         )
         o = torch.reshape(o, [num_tokens, core.value_dim])
-        return core.tp_sum(_dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m))
+        return core.tp_sum(
+            _out_proj(
+                core,
+                o,
+                L.out,
+                "gdn_out",
+                lambda: _dense_mm(o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m),
+            )
+        )
 
     def _ple_block(self, hc, input_ids, ple_state, next_norm, stage) -> tuple:
         """The n-gram side path on its decoder layer, added into the stream and normalized

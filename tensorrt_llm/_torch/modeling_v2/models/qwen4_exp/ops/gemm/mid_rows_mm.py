@@ -105,8 +105,13 @@ def _ldg_v4(addr, *, loc=None, ip=None):
 
 @dsl_user_op
 def _ldg_f32(addr, *, loc=None, ip=None):
+    """One fp32 from global by a coherent load. Not `ld.global.nc`: the activation scales are
+    the previous launch's output, read after a `griddepcontrol.wait` that is not the kernel's
+    first statement, and ptxas may hoist a non-coherent load above such a wait (it treats the
+    data as read-only for the kernel's lifetime). `test_modeling_v2_mid_rows_mm_sass.py` holds
+    every variant to no non-coherent global load."""
     return cutlass.Float32(
-        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.nc.f32 $0, [$1];", "=f,l", loc, ip, True)
+        _asm(T.f32(), [cutlass.Int64(addr)], "ld.global.f32 $0, [$1];", "=f,l", loc, ip, True)
     )
 
 
