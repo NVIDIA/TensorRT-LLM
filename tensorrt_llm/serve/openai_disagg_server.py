@@ -67,7 +67,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
     ConversationParams, ErrorResponse, ResponsesRequest, UCompletionRequest,
     UCompletionResponse, ensure_request_chat_template_allowed,
-    summarize_validation_errors, validation_error_body)
+    summarize_validation_errors, validation_error_envelope)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -332,39 +332,37 @@ class OpenAIDisaggServer:
 
         self._val_err_n = 0
         self.app.add_exception_handler(RequestValidationError,
-                                       self._request_validation_error)
+                                       self._handle_request_validation_error)
 
         self.register_routes()
 
-    async def _request_validation_error(
+    async def _handle_request_validation_error(
             self, request: Request, exc: RequestValidationError) -> Response:
-        """Answer a request whose body failed validation with a 400.
+        """Handle a request that failed FastAPI/Pydantic validation with a 400.
 
-        /v1/messages answers in the Anthropic envelope, which Anthropic clients
-        parse, and every other route in OpenAI's ``{"error": {...}}``. The
-        message comes from ``exc.errors()``, never ``str(exc)``, which quotes
-        every rejected value and names the endpoint's source file and line.
-
-        Failures are also logged so a client/server schema mismatch shows up
-        server-side, throttled (first, then every 1000th) so a client whose
-        every request fails the same way cannot flood the event loop.
+        /v1/messages returns in the Anthropic envelope before the throttled
+        warning log below; every other route answers in OpenAI's
+        ``{"error": {...}}`` and logs a throttled warning (first, then every
+        1000th) to bound log volume when a client repeats an invalid request.
+        The message comes from ``exc.errors()``, never ``str(exc)``, which
+        quotes every rejected value and names the endpoint's source file and
+        line.
         """
         self._perf_metrics_collector.validation_exceptions.inc()
+        message, param = summarize_validation_errors(exc.errors())
         if request.url.path.startswith("/v1/messages"):
-            message, _ = summarize_validation_errors(exc.errors())
             return anthropic_error_response(message, "invalid_request_error",
                                             400)
         self._val_err_n += 1
         if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-            message, _ = summarize_validation_errors(exc.errors())
-            message = message.translate(_LOG_CONTROL_CHARACTERS)
+            sanitized = message.translate(_LOG_CONTROL_CHARACTERS)
             method = request.method.translate(_LOG_CONTROL_CHARACTERS)
             path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
             logger.warning(
                 f"[validation] {method} {path} 400 "
-                f"(n={self._val_err_n}): {message}")
+                f"(n={self._val_err_n}): {sanitized}")
         return JSONResponse(status_code=400,
-                            content=validation_error_body(exc.errors()))
+                            content=validation_error_envelope(message, param))
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():

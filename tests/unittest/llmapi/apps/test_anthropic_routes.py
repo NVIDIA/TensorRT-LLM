@@ -1085,7 +1085,7 @@ def _anthropic_validation_handler(app: FastAPI, *, validation_env: ServeTestEnv)
     from fastapi.exceptions import RequestValidationError
 
     server = validation_env.build_openai_server(AggConfig(model_name=MODEL))
-    app.add_exception_handler(RequestValidationError, server._request_validation_error)
+    app.add_exception_handler(RequestValidationError, server._handle_request_validation_error)
 
 
 def _count_tokens_client(*, validation_env: ServeTestEnv) -> TestClient:

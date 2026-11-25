@@ -136,10 +136,110 @@ def test_a_rejected_tool_is_named_by_its_place_not_its_name(client):
     response = client.post("/v1/chat/completions", json=_chat_body(tools=[tool]))
     error = _error(response)
     assert error["param"] == "tools.0.function"
-    assert error["message"].startswith("Invalid value for 'tools.0.function': ")
-    assert "enum values" in error["message"]
+    assert error["message"] == (
+        f"Invalid value for 'tools.0.function': tool function declares "
+        f"{TOOL_PARAM_MAX_ENUM_VALUES + 1} enum values across its parameters "
+        f"schema; the maximum is {TOOL_PARAM_MAX_ENUM_VALUES}."
+    )
+    assert "Value error," not in error["message"]
+    assert ".." not in error["message"]
     assert name[:64] not in response.text
     assert len(response.content) < 1024
+
+
+def test_value_error_strips_pydantic_prefix_and_avoids_double_period(client):
+    error = _error(client.post("/v1/chat/completions", json=_chat_body(tool_choice="required")))
+    assert error["param"] is None
+    assert not error["message"].startswith("Value error,")
+    assert not error["message"].endswith("..")
+    assert error["message"].endswith(".")
+
+
+def test_request_part_prefixes_are_stripped_from_locations():
+    errors = [
+        {
+            "type": "greater_than",
+            "loc": ("query", "limit"),
+            "msg": "Input should be greater than 0",
+        },
+        {
+            "type": "string_type",
+            "loc": ("path", "batch_id"),
+            "msg": "Input should be a valid string",
+        },
+        {"type": "missing", "loc": ("header", "x-api-key"), "msg": "Field required"},
+        {"type": "missing", "loc": ("cookie", "session"), "msg": "Field required"},
+    ]
+    message, param = summarize_validation_errors(errors)
+    assert param == "limit"
+    assert "'limit'" in message
+    assert "'batch_id'" in message
+    assert "'x-api-key'" in message
+    assert "'session'" in message
+    assert "'query.limit'" not in message
+
+
+def test_scalar_member_tags_do_not_drop_list_dict_or_none_keys():
+    errors = [
+        {"type": "string_type", "loc": ("body", "dict", "list", "none", "value"), "msg": "bad"},
+    ]
+    assert summarize_validation_errors(errors) == (
+        "Invalid value for 'dict.list.none.value': bad.",
+        "dict.list.none.value",
+    )
+
+
+def test_surviving_union_members_rank_closest_match_first(client):
+    error = _error(
+        client.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": [{"role": "system", "content": 5}]},
+        )
+    )
+    assert error["param"] == "messages.0.content"
+    assert error["message"].startswith("Invalid value for 'messages.0.content': ")
+
+    responses_error = _error(
+        client.post(
+            "/v1/responses",
+            json={
+                "model": MODEL,
+                "input": "hi",
+                "tools": [{"type": "web_search", "search_context_size": "huge"}],
+            },
+        )
+    )
+    assert responses_error["param"] == "tools.0.search_context_size"
+    assert responses_error["message"].startswith(
+        "Invalid value for 'tools.0.search_context_size': "
+    )
+
+
+def test_union_ranking_excludes_nested_member_tags_and_skips_all_rejected_unions():
+    # Nested scalar union tags ("int", "float") must not inflate depth above a
+    # deeper request path ("content.count").
+    nested_errors = [
+        {"type": "int_type", "loc": ("body", "Flat", "alt", "int"), "msg": "bad int"},
+        {"type": "float_type", "loc": ("body", "Flat", "alt", "float"), "msg": "bad float"},
+        {"type": "int_type", "loc": ("body", "Nested", "content", "count"), "msg": "bad count"},
+        {"type": "bool_type", "loc": ("body", "Nested", "content", "enabled"), "msg": "bad bool"},
+        {"type": "string_type", "loc": ("body", "Nested", "content", "name"), "msg": "bad str"},
+    ]
+    _, param = summarize_validation_errors(nested_errors)
+    assert param == "content.count"
+
+    # When every union member is rejected on its discriminator, preserve the
+    # original order instead of promoting a deeper rejected member's unrelated
+    # missing field.
+    all_rejected = [
+        {"type": "literal_error", "loc": ("body", "First", "role"), "msg": "Input should be 'a'"},
+        {"type": "missing", "loc": ("body", "Second", "name"), "msg": "Field required"},
+        {"type": "literal_error", "loc": ("body", "Second", "role"), "msg": "Input should be 'b'"},
+        {"type": "int_type", "loc": ("body", "Second", "content", "count"), "msg": "bad count"},
+    ]
+    message, param = summarize_validation_errors(all_rejected)
+    assert param == "role"
+    assert message.startswith("Invalid value for 'role': ")
 
 
 def test_an_unknown_parameter_named_like_a_type_is_still_named(client):

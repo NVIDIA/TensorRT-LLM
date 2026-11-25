@@ -942,7 +942,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.router.route_class = _MsgspecRoute
 
         self.app.add_exception_handler(RequestValidationError,
-                                       self._request_validation_error)
+                                       self._handle_request_validation_error)
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -1226,16 +1226,16 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
 
-    async def _request_validation_error(
+    async def _handle_request_validation_error(
             self, request: Request, exc: RequestValidationError) -> Response:
-        """Answer a request whose body failed validation with a 400.
+        """Handle a request that failed FastAPI/Pydantic validation.
 
-        /v1/messages answers in the Anthropic envelope, visual generation in
-        its own, and every other route in OpenAI's ``{"error": {...}}``,
-        whose top-level ``error`` key existing clients look for. The message
-        comes from ``exc.errors()``, never ``str(exc)``: that quotes every
-        rejected value (an inline image is megabytes of base64) and names the
-        endpoint's source file and line.
+        /v1/messages answers 400 in the Anthropic envelope, visual generation
+        answers 422 in its own envelope, and every other route answers 400 in
+        OpenAI's ``{"error": {...}}``, whose top-level ``error`` key existing
+        clients look for. The message comes from ``exc.errors()``, never
+        ``str(exc)``: that quotes every rejected value (an inline image is
+        megabytes of base64) and names the endpoint's source file and line.
         """
         if request.url.path.startswith("/v1/messages"):
             if self.metrics_collector:
