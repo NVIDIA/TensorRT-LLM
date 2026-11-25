@@ -119,24 +119,22 @@ YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
 
 - Select a file in [examples/configs/curated](../../../../examples/configs/curated)
   by filename, for example `-cfg:deepseek-v4-pro-latency.yaml`.
-- Select shared benchmark settings from [model_presets.yml](../../../../examples/configs/model_presets.yml)
-  with `-cfg:model_presets.yml@lightning_mtp`. Both Lightning variants use this
-  preset and select their respective backend with `-moe:CUTEDSL` or `-moe:CUTLASS`.
-  A complete recipe can be followed by its workload-specific differences, for example
-  `-cfg:musespark-open.yaml+model_presets.yml@musespark_text`.
+- Use a named preset for workloads whose historical settings would make the ID too long.
+  For example, `-cfg:lightning_mtp` supplies the shared KV, MTP and streaming settings
+  for both Nemotron Lightning variants. Each case selects its own `moe:` backend.
+  These presets are declared together in [pytorch_model_config.py](pytorch_model_config.py).
 - Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
   Append comma-separated overrides to a selection, or combine selections from left
-  to right with `+`, as in `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
+  to right with `+`, as in `-cfg:glm53_flash_fp8+mtp3`.
   Use YAML scalar values and dotted field names, for example
   `cfg:speculative_config.decoding_type=NGram,max_draft_len=3`. The runner passes these fields to
-  the same configuration validation as a YAML file. Put paths and lists in YAML.
+  the same configuration validation as a YAML file. Put paths and lists in the selected recipe or preset.
   Later selections override earlier ones and merge nested mappings.
 
-Define shared settings under `presets` in [model_presets.yml](../../../../examples/configs/model_presets.yml).
-Use `source` and `fields` to reuse individual fields from a repository YAML. An optional
-`section` selects a nested mapping or a named entry in a sequence. Put workload-specific
-values in `settings`, and hardware-specific values in `on_sm`. Draft paths prefixed
-with `${LLM_MODELS_ROOT}/` resolve against the test model cache at launch.
+Each Core and Spark case selects at most one model YAML. Complete recipes come from
+`examples/configs/curated/`. Cases using named Python presets get all their shared
+settings from that module. Draft paths prefixed with `${LLM_MODELS_ROOT}/` resolve
+against the test model cache at launch.
 
 The test parameter also names the engine directory. Keep both the full parameter and
 the exported benchmark name within 255 bytes. Reuse a shared profile when inlining
