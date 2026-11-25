@@ -21,6 +21,15 @@ nibbles, which becomes +0, the same zero. Scale bytes are positive E4M3, never 0
 Outputs, rank-major over the group's `W * R` rows: the codes `[W R, H / 2]` uint8 and scales
 `[W R, H / 16]` uint8 in the route front's layouts, and the logits `[W R, E]` bf16.
 
+`ownk` (owner top-k): the row's owner routes it instead, and the row carries its routing rather
+than its logits. One warp a row loads the owner's logits, sanitized as above, and runs the route
+front's own `route_one_token` (the statements every routing warp runs over the gathered logits);
+lanes 0..2 then publish 3 vectors of 16-bit slots: the 10 experts, their 10 BF16 weights' bits, 4
+zeros (`moe_route_front__decode.IDS_ROW_SLOTS`; experts < 512 and weights >= +0.0, never the
+marker). A row is 93 vectors instead of 154, and the routing-only front reads the slots
+(`route_front_only(..., ids_in=True)`) instead of routing all `W R` rows on every rank. The third
+output is then the routing `[W R, 24]` int16.
+
 Transport: the host-index gather of `dep_lamport_round_trip`'s workspace, statement for statement
 on an int32 view of the same buffers (a vector is 4 int32 lanes; the marker is any 16-bit half
 equal to 0x8000): the slot is `(state[1] + launch_index) mod 3`, each reader re-arms the vector it
@@ -39,11 +48,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Int64
+from cutlass import Int32, Int64, const_expr
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch.kernels.blackwell import moe_decode_front as _mdf
+from tensorrt_llm._torch.kernels.blackwell import moe_route_front as _mrf
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import dep_lamport_round_trip as _rt
 
@@ -116,6 +126,27 @@ def _shfl(x, src, *, loc=None, ip=None):
 
 
 @cute.jit
+def _routing_words(sel, w, lane):
+    """The 4 words of routing vector `lane` (meaningful in lanes 0..2; every lane of the warp calls
+    it): 16-bit slot `s` holds the expert of pick `s` (s < 10), the weight bits of pick `s - 10`
+    (s < 20), else 0; word `j` = slot `2 j` | slot `2 j + 1` << 16 of the vector's 8."""
+    ids16 = sel & Int32(65535)
+    w16 = w & Int32(65535)
+    words = []
+    for j in cutlass.range_constexpr(4):
+        half = []
+        for h in cutlass.range_constexpr(2):
+            slot = lane * Int32(8) + Int32(2 * j + h)
+            a = _shfl(ids16, slot)
+            b = _shfl(w16, slot - Int32(10))
+            half.append(
+                _mdf._sel_lt(slot, Int32(10), a, _mdf._sel_lt(slot, Int32(20), b, Int32(0)))
+            )
+        words.append(half[0] | (half[1] << Int32(16)))
+    return words[0], words[1], words[2], words[3]
+
+
+@cute.jit
 def _poll_from(local, offset, first):
     """The vector at `offset` (int32 lanes) of this rank's slot once no 16-bit lane holds the
     marker, from the already-issued load `first`."""
@@ -178,9 +209,11 @@ def _pack_kernel(
     PEER_ORDER: cutlass.Constexpr[tuple[int, ...]],
     HIDDEN: cutlass.Constexpr[int],
     EXPERTS: cutlass.Constexpr[int],
+    OWNK: cutlass.Constexpr[bool],
 ):
     """One CTA a row: warps [0, s0 / 32) code units (thread u < H / 32), then scale receivers,
-    then logit units (E / 8 lanes); the other lanes only re-arm."""
+    then logit units (E / 8 lanes), or with `OWNK` one routing warp (its lanes 0..2 the routing
+    units); the other lanes only re-arm."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     grid_x, _, _ = cute.arch.grid_dim()
@@ -190,8 +223,8 @@ def _pack_kernel(
     cute.arch.griddepcontrol_launch_dependents()
     cv: cutlass.Constexpr = HIDDEN // 32
     sv: cutlass.Constexpr = HIDDEN // 256
-    lv: cutlass.Constexpr = EXPERTS // 8
-    vpr: cutlass.Constexpr = HIDDEN // 32 + HIDDEN // 256 + EXPERTS // 8
+    lv: cutlass.Constexpr = 3 if OWNK else EXPERTS // 8
+    vpr: cutlass.Constexpr = HIDDEN // 32 + HIDDEN // 256 + lv
     s0: cutlass.Constexpr = -(-cv // 32) * 32
     l0: cutlass.Constexpr = s0 + -(-sv // 32) * 32
     buffer_arrays = [cutlass.make_array_view(buffer) for buffer in buffers]
@@ -255,14 +288,23 @@ def _pack_kernel(
         c2 = _clean(lo1)
         c3 = _clean(hi1)
         s16 = sf0 | (sf1 << Int32(8))
-    elif (u >= Int32(l0)) & (u < Int32(l0 + lv)):
-        m0, m1, m2, m3 = _mdf._ld_v4(
-            lg_ptr + (Int64(row) * Int64(EXPERTS) + Int64(u - Int32(l0)) * Int64(8)) * Int64(2)
-        )
-        c0 = _clean(m0)
-        c1 = _clean(m1)
-        c2 = _clean(m2)
-        c3 = _clean(m3)
+    elif (u >= Int32(l0)) & (u < Int32(l0 + (32 if OWNK else lv))):
+        if const_expr(OWNK):
+            # The whole warp routes the owner's row over its sanitized logits (16 a lane).
+            src = lg_ptr + (Int64(row) * Int64(EXPERTS) + Int64(lane_id) * Int64(16)) * Int64(2)
+            m0, m1, m2, m3 = _mdf._ld_v4(src)
+            m4, m5, m6, m7 = _mdf._ld_v4(src + Int64(16))
+            packed = tuple(_clean(m) for m in (m0, m1, m2, m3, m4, m5, m6, m7))
+            sel, w = _mrf.route_one_token(packed, lane_id, 10)
+            c0, c1, c2, c3 = _routing_words(sel, w, lane_id)
+        else:
+            m0, m1, m2, m3 = _mdf._ld_v4(
+                lg_ptr + (Int64(row) * Int64(EXPERTS) + Int64(u - Int32(l0)) * Int64(8)) * Int64(2)
+            )
+            c0 = _clean(m0)
+            c1 = _clean(m1)
+            c2 = _clean(m2)
+            c3 = _clean(m3)
     # The scale vector of an 8-lane group (every lane takes part; non-code lanes hold 0).
     g = lane_id - lane_id % Int32(8)
     q0 = _shfl(s16, g) | (_shfl(s16, g + Int32(1)) << Int32(16))
@@ -367,8 +409,10 @@ def _pack_kernel(
             buffer_arrays[PEER_ORDER[k]].store(
                 lgv[0:4, cutlass.align(_ALIGN)], mine + off_l, 4, alignment=_ALIGN, is_volatile=True
             )
+        # 16-bit lanes a row of the third output: the logits, or with OWNK the routing slots
+        out_lanes: cutlass.Constexpr = _mrf.IDS_ROW_SLOTS if OWNK else EXPERTS
         _mdf._st_v4(
-            lgo_ptr + (own_row * Int64(EXPERTS) + Int64(kk) * Int64(8)) * Int64(2), c0, c1, c2, c3
+            lgo_ptr + (own_row * Int64(out_lanes) + Int64(kk) * Int64(8)) * Int64(2), c0, c1, c2, c3
         )
         _receive(
             local,
@@ -377,7 +421,7 @@ def _pack_kernel(
             ws,
             off_l,
             lgo_ptr,
-            EXPERTS * 2,
+            out_lanes * 2,
             Int64(kk) * Int64(16),
             rows,
             row,
@@ -392,9 +436,11 @@ def _pack_kernel(
         cute.arch.store(slot_count_ptr, Int32(0), sem="relaxed", scope="gpu")
 
 
-def threads(hidden: int, experts: int) -> int:
-    """Threads a CTA: whole warps of code units, scale receivers and logit units."""
-    return (-(-(hidden // 32) // 32) + -(-(hidden // 256) // 32) + -(-(experts // 8) // 32)) * 32
+def threads(hidden: int, experts: int, ownk: bool = False) -> int:
+    """Threads a CTA: whole warps of code units, scale receivers and logit units (`ownk`: one
+    routing warp)."""
+    tail = 1 if ownk else -(-(experts // 8) // 32)
+    return (-(-(hidden // 32) // 32) + -(-(hidden // 256) // 32) + tail) * 32
 
 
 @cute.jit
@@ -416,6 +462,7 @@ def _pack_launch(
     PEER_ORDER: cutlass.Constexpr[tuple[int, ...]],
     HIDDEN: cutlass.Constexpr[int],
     EXPERTS: cutlass.Constexpr[int],
+    OWNK: cutlass.Constexpr[bool],
 ) -> None:
     _pack_kernel(
         x_ptr,
@@ -434,7 +481,8 @@ def _pack_launch(
         PEER_ORDER,
         HIDDEN,
         EXPERTS,
-    ).launch(grid=(rows, 1, 1), block=(threads(HIDDEN, EXPERTS), 1, 1), stream=stream)
+        OWNK,
+    ).launch(grid=(rows, 1, 1), block=(threads(HIDDEN, EXPERTS, OWNK), 1, 1), stream=stream)
 
 
 _COMPILED: dict = {}
@@ -449,22 +497,24 @@ def transported_codes(codes: torch.Tensor) -> torch.Tensor:
     return clean.view(torch.uint8).view(codes.shape)
 
 
-def vectors_a_row(hidden: int, experts: int) -> int:
+def vectors_a_row(hidden: int, experts: int, ownk: bool = False) -> int:
     """16-byte vectors a row travels as."""
-    return hidden // 32 + hidden // 256 + experts // 8
+    return hidden // 32 + hidden // 256 + (3 if ownk else experts // 8)
 
 
 class PackGather:
     """The packed gather over a host-index `dep_lamport_round_trip.DepRoundTrip` (`trip`), compiled
-    for this rank at `hidden` / `experts`. Rank-local to build; outside graph capture."""
+    for this rank at `hidden` / `experts` (`ownk`: rows carry their owner's routing). Rank-local to
+    build; outside graph capture."""
 
-    def __init__(self, trip, hidden: int, experts: int) -> None:
+    def __init__(self, trip, hidden: int, experts: int, ownk: bool = False) -> None:
         assert trip.steps is not None, "the packed gather serves the host-index workspace"
         assert hidden % 256 == 0 and experts % 8 == 0, (hidden, experts)
-        self.trip, self.hidden, self.experts = trip, hidden, experts
-        self.vpr = vectors_a_row(hidden, experts)
+        assert not ownk or experts == 512, "the owner's top-k is the route front's (512 experts)"
+        self.trip, self.hidden, self.experts, self.ownk = trip, hidden, experts, bool(ownk)
+        self.vpr = vectors_a_row(hidden, experts, ownk)
         dev = trip.buffer.device.index
-        key = (trip.rank, trip.world, dev, hidden, experts)
+        key = (trip.rank, trip.world, dev, hidden, experts, self.ownk)
         fn = _COMPILED.get(key)
         if fn is None:
             cutlass.cuda.initialize_cuda_context(dev)
@@ -502,6 +552,7 @@ class PackGather:
                 order,
                 hidden,
                 experts,
+                self.ownk,
                 options="--enable-tvm-ffi",
             )
             _COMPILED[key] = fn
@@ -526,7 +577,10 @@ class PackGather:
         rows, w, dev = x.shape[0], trip.world, x.device
         xq = torch.empty((w * rows, self.hidden // 2), dtype=torch.uint8, device=dev)
         xsf = torch.empty((w * rows, self.hidden // 16), dtype=torch.uint8, device=dev)
-        lg = torch.empty((w * rows, self.experts), dtype=torch.bfloat16, device=dev)
+        if self.ownk:
+            lg = torch.empty((w * rows, _mrf.IDS_ROW_SLOTS), dtype=torch.int16, device=dev)
+        else:
+            lg = torch.empty((w * rows, self.experts), dtype=torch.bfloat16, device=dev)
         stream = _raw_stream(dev.index)
         index = trip.steps.next(trip, stream)
         self.fn(
@@ -553,17 +607,23 @@ class DepLamportPackGather(OpWrapper):
     `[R, H]` bf16 rows and their `[R, E]` bf16 router logits (contiguous) gathered rank-major over
     `pack`'s workspace (`PackGather`) as the NVFP4 codes `[W R, H / 2]` uint8 and linear block
     scales `[W R, H / 16]` uint8 at `global_scale` (fp32 `[1]`) of the rows with -0.0 lanes as +0.0,
-    and the logits `[W R, E]` with -0.0 as +0.0. Every rank calls it at the same point with the
-    same `R` (`pack.takes`)."""
+    and the logits `[W R, E]` with -0.0 as +0.0, or with `pack.ownk` the rows' routing (top-10 and
+    Renormalize weights of those logits, `[W R, 24]` int16 in `route_front_only(ids_in=True)`'s
+    form). Every rank calls it at the same point with the same `R` (`pack.takes`)."""
 
     ARCHS = frozenset({Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=why, spec=dict(world=world, hidden=2560, experts=512, rows=rows))
-        for world, rows, why in (
-            (4, 12, "dep4 3 requests a rank (a 4-GPU tray runs it)"),
-            (8, 12, "dep8 3 requests a rank"),
-            (8, 48, "dep8 12 requests a rank"),
-            (8, 112, "dep8 28 requests a rank"),
+        Cell(why=why, spec=dict(world=world, hidden=2560, experts=512, rows=rows, ownk=ownk))
+        for world, rows, ownk, why in (
+            (4, 12, False, "dep4 3 requests a rank (a 4-GPU tray runs it)"),
+            (8, 12, False, "dep8 3 requests a rank"),
+            (8, 48, False, "dep8 12 requests a rank"),
+            (8, 112, False, "dep8 28 requests a rank"),
+            (4, 12, True, "owner top-k, dep4 3 requests a rank (a tray runs it)"),
+            (8, 48, True, "owner top-k, dep8 12 requests a rank (a token a routing warp)"),
+            (8, 72, True, "owner top-k, dep8 18 requests a rank"),
+            (8, 96, True, "owner top-k, dep8 24 requests a rank"),
+            (8, 112, True, "owner top-k, dep8 28 requests a rank"),
         )
     )
 
@@ -571,25 +631,30 @@ class DepLamportPackGather(OpWrapper):
     Source: one CuTe DSL kernel (`_pack_kernel`) over the host-index workspace of
     `dep_lamport_round_trip` (an int32 view of its buffers), compiled per rank at build. Its
     prototype ran the same statements at 8 ranks over two nodes of one rack, bitwise against the
-    bf16 gather + route front quantization (0 differing bytes). Not certified here (no GPU run
+    bf16 gather + route front quantization (0 differing bytes). The owner top-k form's prototype
+    ran 8 ranks over two nodes the same way, its routing bitwise the route front's over the
+    gathered logits (0 differing bytes, eagerly and replayed). Not certified here (no GPU run
     yet); the device-counter workspace is not served.
     """
 
     def __call__(self, x, logits, global_scale, pack: PackGather):
         return pack(x, logits, global_scale)
 
-    def reference(self, xs_in_rank_order, logits_in_rank_order, global_scale):
+    def reference(self, xs_in_rank_order, logits_in_rank_order, global_scale, ownk=False):
         """Collective (the documented exception to mirroring `__call__`): every rank's rows and
         logits in rank order; `fp4_quantize` (linear scales) of the sanitized gathered rows, its
         codes as the transport delivers them (`transported_codes`), and the sanitized gathered
-        logits."""
-        from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (  # noqa: E501
-            fp4_quantize,
+        logits, or with `ownk` their `renorm_moe_routing_op` routing as `routed_rows`."""
+        from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
+            moe_route_front__decode as _front,
         )
 
         rows = torch.cat([_rt._sanitized(x) for x in xs_in_rank_order])
-        xq, xsf = fp4_quantize(rows, global_scale, 16, False, False)
+        xq, xsf = _front.fp4_quantize(rows, global_scale, 16, False, False)
         lg = torch.cat([_rt._sanitized(g) for g in logits_in_rank_order])
+        if ownk:
+            ids, wts = _front.renorm_moe_routing_op(lg, _front.TOP_K, torch.bfloat16)
+            lg = _front.routed_rows(ids, wts)
         return transported_codes(xq), xsf.reshape(rows.shape[0], -1), lg
 
     def is_valid(self, x, logits, global_scale, pack: PackGather) -> None:

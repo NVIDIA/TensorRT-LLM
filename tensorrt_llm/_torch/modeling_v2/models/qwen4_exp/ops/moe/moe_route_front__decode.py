@@ -18,6 +18,10 @@ completes); past them clusters of 16 and the default release.
 `fast2=True` (past 512 rows, where a warp routes two tokens) routes each of a warp's two tokens
 on the kernel's one-token fast path instead of both on the full per-lane sort: the same bits.
 
+`route_front_only(..., ids_in=True)` (past `LEAN_MAX_ROWS`) takes rows their owners already
+routed (`IDS_ROW_SLOTS` int16 a row: the experts, then their weight bits, which the attention-DP
+packed gather forms with the kernel's own `route_one_token`) and builds the same tables.
+
 Bitwise: the experts and weights are `renorm_moe_routing_op`'s, the codes and scales
 `fp4_quantize`'s; the tables match the runner's own routing up to the row order inside an
 expert's tile, which no output depends on.
@@ -84,13 +88,17 @@ def _threads(rows: int, hidden: int, num_local: int) -> int:
 #: Rows from which a warp routes two tokens (clusters of 16 CTAs of 32 warps): `fast2` changes
 #: the launch only past them.
 FAST2_MIN_ROWS = 513
+#: int16 slots of a routed row (`ids_in`): the 10 experts, their 10 weights' bits, 4 zeros.
+IDS_ROW_SLOTS = 24
 
 
-def _key(rows, hidden, row_stride, num_local, tile, fast2, route_only=False) -> tuple:
+def _key(rows, hidden, row_stride, num_local, tile, fast2, route_only=False, ids_in=False) -> tuple:
     fast2 = bool(fast2) and rows >= FAST2_MIN_ROWS
     pdl = bool(get_env_enable_pdl())
-    return (rows, hidden, row_stride, num_local, tile, pdl, fast2) + (
-        ("route",) if route_only else ()
+    return (
+        (rows, hidden, row_stride, num_local, tile, pdl, fast2)
+        + (("route",) if route_only else ())
+        + (("ids",) if ids_in else ())
     )
 
 
@@ -102,13 +110,14 @@ def compile_front(
     tile: int,
     fast2: bool = False,
     route_only: bool = False,
+    ids_in: bool = False,
 ):
     """Compile (once) the launch of `rows` gathered rows of `hidden` (row stride `row_stride`)
     for a window of `num_local` experts at tile `tile` (`fast2`: two tokens a warp on the
-    one-token fast path; `route_only`: the routing cluster alone, `route_front_only`); False
-    where the kernel does not take the shape. Outside CUDA-graph capture only; `__call__` then
-    finds it."""
-    key = _key(rows, hidden, row_stride, num_local, tile, fast2, route_only)
+    one-token fast path; `route_only`: the routing cluster alone, `route_front_only`; `ids_in`:
+    with it, over routed rows past `LEAN_MAX_ROWS`); False where the kernel does not take the
+    shape. Outside CUDA-graph capture only; `__call__` then finds it."""
+    key = _key(rows, hidden, row_stride, num_local, tile, fast2, route_only, ids_in)
     if key in _COMPILED:
         return _COMPILED[key] is not None
     assert not torch.cuda.is_current_stream_capturing(), "compile outside graph capture"
@@ -137,10 +146,16 @@ def compile_front(
         threads=_threads(rows, hidden, num_local) if lean else ROUTE_THREADS,
         lean=lean,
     )
-    if not 1 <= rows <= MAX_ROWS or not MoeRouteFrontKernel.supports(**config):
+    if (
+        not 1 <= rows <= MAX_ROWS
+        or (ids_in and not route_only)
+        or not MoeRouteFrontKernel.supports(ids_in=ids_in, **config)
+    ):
         _COMPILED[key] = None
         return False
-    kernel = MoeRouteFrontKernel(use_pdl=key[5], fast2=key[6], route_only=route_only, **config)
+    kernel = MoeRouteFrontKernel(
+        use_pdl=key[5], fast2=key[6], route_only=route_only, ids_in=ids_in, **config
+    )
     z = cutlass.Int64(0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     _COMPILED[key] = cute.compile(kernel, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream)
@@ -266,17 +281,24 @@ def route_front_only(
     num_local: int,
     hidden: int,
     fast2: bool = False,
+    ids_in: bool = False,
 ):
     """`moe_route_front`'s routing alone, for rows whose NVFP4 form the caller has already (the
     attention-DP packed gather): `ids, wts` and the tables written into `tables`, bitwise the full
     launch's over the same logits (the same routing cluster; its quantization clusters are not
-    launched). `compile_front(rows, hidden, hidden, num_local, tile, fast2, route_only=True)`
+    launched). With `ids_in`, `logits` is the rows' routing instead, `[rows, IDS_ROW_SLOTS]` int16
+    (contiguous) formed from their logits by the kernel's `route_one_token`: the same `ids, wts`
+    and tables. `compile_front(rows, hidden, hidden, num_local, tile, fast2, True, ids_in)`
     first. Not an entry of its own: `moe_route_front`'s test holds it to that launch."""
     import cuda.bindings.driver as cuda
     import cutlass
 
     rows = logits.shape[0]
-    fn = _COMPILED.get(_key(rows, hidden, hidden, num_local, tile, fast2, True))
+    if ids_in:
+        # the kernel reads 16-bit slots at a fixed row pitch: a logits tensor here reads garbage
+        assert logits.dtype is torch.int16 and logits.is_contiguous(), logits.dtype
+        assert tuple(logits.shape) == (rows, IDS_ROW_SLOTS), tuple(logits.shape)
+    fn = _COMPILED.get(_key(rows, hidden, hidden, num_local, tile, fast2, True, ids_in))
     assert fn is not None, f"no routing-only front compiled for {rows} rows: `compile_front`"
     dev = logits.device
     ids = torch.empty([rows, TOP_K], dtype=torch.int32, device=dev)
@@ -296,6 +318,15 @@ def route_front_only(
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     return ids, wts
+
+
+def routed_rows(ids: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
+    """The `ids_in` form of rows routed to experts `ids` `[R, 10]` int32 with weights `wts`
+    `[R, 10]` bf16: `[R, IDS_ROW_SLOTS]` int16."""
+    out = torch.zeros([ids.shape[0], IDS_ROW_SLOTS], dtype=torch.int16, device=ids.device)
+    out[:, :TOP_K] = ids.to(torch.int16)
+    out[:, TOP_K : 2 * TOP_K] = wts.contiguous().view(torch.int16)
+    return out
 
 
 def check_tables(views, ids: torch.Tensor, local_offset: int, num_local: int, tile: int) -> str:

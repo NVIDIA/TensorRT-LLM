@@ -7,8 +7,10 @@ activation of a decode MoE block's gathered rows in one launch.
   bitwise `fp4_quantize`'s, the experts and weights bitwise `renorm_moe_routing_op`'s, and the
   tables hold their meaning (`check_tables`) for the cell's window and tile. Logits with
   repeated values exercise the top-k's ties.
+* **GPU**: `route_front_only` alone, and with `ids_in` over rows routed by `routed_rows`, writes
+  the full launch's experts, weights and tables.
 * **CPU** (`check_tables` itself): a table built the way the runner reads it passes, and each
-  way of breaking it is named.
+  way of breaking it is named; the `ids_in` row layout.
 
 The window output through the runner entered pre-routed is held bitwise to the runner's own
 routing by the target's build check (`modeling._route_front_check`) on every layer.
@@ -122,6 +124,48 @@ def test_route_only_is_the_full_launchs_routing(cell):
     torch.cuda.synchronize()
     assert torch.equal(ids2, ids) and torch.equal(wts2.view(torch.int16), wts.view(torch.int16))
     assert torch.equal(tables, full_tables)
+
+
+@_GPU
+@pytest.mark.parametrize(
+    "cell",
+    [c for c in op.moe_route_front.CELLS if c.spec["rows"] > op.LEAN_MAX_ROWS],
+    ids=lambda c: c.why[:40],
+)
+def test_ids_in_is_the_routing_fronts_routing(cell):
+    """`route_front_only(ids_in=True)` over the rows' routing (`routed_rows` of the routing-only
+    front's experts and weights) writes the same experts, weights and tables, bit for bit; the
+    lean rows decline it."""
+    spec, device = cell.spec, torch.device("cuda")
+    seed = zlib.crc32(cell.why.encode()) % 2**31 + 29
+    logits, _, _, tables = _operands(spec, seed, device)
+    fast2 = spec.get("fast2", False)
+    rows, hidden = spec["rows"], spec["hidden"]
+    args = (spec["tile"], spec["local_offset"], spec["num_local"])
+    assert op.compile_front(rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True)
+    assert op.compile_front(
+        rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True, ids_in=True
+    )
+    ref_tables = tables.clone()
+    ids, wts = op.route_front_only(logits, ref_tables, *args, hidden, fast2)
+    routed = op.routed_rows(ids, wts)
+    ids2, wts2 = op.route_front_only(routed, tables, *args, hidden, fast2, ids_in=True)
+    torch.cuda.synchronize()
+    assert torch.equal(ids2, ids) and torch.equal(wts2.view(torch.int16), wts.view(torch.int16))
+    assert torch.equal(tables, ref_tables)
+    assert not op.compile_front(256, hidden, hidden, 64, 32, False, True, ids_in=True)
+
+
+@pytest.mark.cpu_only
+def test_routed_rows_layout():
+    """`ids_in`'s row: the experts in slots 0..9, the weights' bf16 bits in 10..19, 4 zeros."""
+    ids = _ids(3)
+    wts = torch.rand(3, op.TOP_K).to(torch.bfloat16)
+    rows = op.routed_rows(ids, wts)
+    assert rows.dtype is torch.int16 and tuple(rows.shape) == (3, op.IDS_ROW_SLOTS)
+    assert torch.equal(rows[:, : op.TOP_K].to(torch.int32), ids)
+    assert torch.equal(rows[:, op.TOP_K : 2 * op.TOP_K], wts.view(torch.int16))
+    assert not bool(rows[:, 2 * op.TOP_K :].any())
 
 
 def _tables(ids: torch.Tensor, local_offset: int, num_local: int, tile: int) -> list:

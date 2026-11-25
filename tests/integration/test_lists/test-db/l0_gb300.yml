@@ -173,7 +173,9 @@ l0_gb300:
   # eager and replayed; the finalize form's PDL wait first in its SASS. The 8-rank cells skip here.
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_rs_inject.py
   # qwen4_exp family, pre-merge: the packed NVFP4 + logits gather against fp4_quantize of the
-  # gathered rows, 4 ranks on the host-index workspace, eager and replayed (8 ranks skip here).
+  # gathered rows, 4 ranks on the host-index workspace, eager and replayed (8 ranks skip here);
+  # its owner top-k form (rows carry their owner's routing) against renorm_moe_routing_op, on 4
+  # ranks and in a one-GPU kernel of the owner's routing statements.
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_pack_gather.py
   # qwen4_exp family, pre-merge: the tep4 fused MoE finalize all-reduce against its reference,
   # 4 ranks, one rank held back before each graph replay.
