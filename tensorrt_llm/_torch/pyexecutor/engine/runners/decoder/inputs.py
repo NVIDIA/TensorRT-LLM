@@ -978,6 +978,9 @@ class DecoderInputPreparer:
             and not self.mapping.has_cp_helix()
             and not self._dspark_trims_submitted_tokens
         ):
+            stage_rng = False
+            if self.runtime_hooks.pack_spec_rng_uploads:
+                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -992,7 +995,7 @@ class DecoderInputPreparer:
                     else None
                 ),
                 steady_decode_prepare=self._config.steady_decode_prepare,
-                stage_rng=self.runtime_hooks.pack_spec_rng_uploads,
+                stage_rng=stage_rng,
             )
 
     @property
