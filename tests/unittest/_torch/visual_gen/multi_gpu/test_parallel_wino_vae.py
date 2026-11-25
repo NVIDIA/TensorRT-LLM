@@ -1,0 +1,282 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Multi-GPU tests for the spatially sharded WinoVae (``ParallelWinoVae``).
+
+The sharded model must reproduce the single-GPU WinoVae: the fused norm / frame-buffer /
+Winograd paths exchange halo lines instead of recomputing the borders.
+
+Run with:
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py -v
+"""
+
+import os
+
+os.environ["TLLM_DISABLE_MPI"] = "1"
+
+from typing import Callable
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_wino_vae import shard_extents
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
+    WinoVae,
+    WinoVaeCausalConv3d,
+    WinoVaeOptions,
+)
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import Shard
+from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
+
+from ._worker_pool import run_distributed
+
+# wino_vae_test_utils is in tests/unittest/_torch/visual_gen (spawned workers inherit pytest's
+# sys.path entry for it).
+__extra_import_path__ = [".."]
+
+from wino_vae_test_utils import small_config  # noqa: E402
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mpi_env():
+    yield
+    os.environ.pop("TLLM_DISABLE_MPI", None)
+
+
+SMALL_CONFIG = small_config()
+
+# "direct" halo exchange is demanded, not left to "auto": a rendezvous failure must fail the
+# test rather than silently run the NCCL path. ``spatial``: spatial Winograd forced onto every
+# eligible residual-block conv (the tiny config's layers are below the production selection
+# thresholds), else the production selection (none at this size: conv2d per input).
+OPTION_SETS = {
+    "direct": ({"halo_exchange": "direct"}, True),
+    "nccl": ({"halo_exchange": "nccl"}, True),
+    "direct_no_spatial": ({"halo_exchange": "direct"}, False),
+}
+
+
+def _run(world_size: int, test_fn: Callable, *args):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    direct = any(
+        isinstance(a, str) and a in OPTION_SETS and OPTION_SETS[a][0]["halo_exchange"] == "direct"
+        for a in args
+    )
+    if direct and not all(
+        torch.cuda.can_device_access_peer(i, j)
+        for i in range(world_size)
+        for j in range(world_size)
+        if i != j
+    ):
+        pytest.skip("direct halo exchange needs peer access between all the GPUs")
+    # Fresh ranks per test: the direct halo exchange holds symmetric-memory handles for the
+    # life of the process, and _model patches the conv selection in the worker.
+    run_distributed(
+        world_size, test_fn, *args, dist_backend="nccl", reuse=False, preload=("tensorrt_llm",)
+    )
+
+
+def _model(device: str, option_set: str) -> tuple[WinoVae, WanVAE]:
+    """The bf16 WinoVae under test and the native model in fp32 on the same weights (the
+    reference both the sharded and the single-GPU run are judged against)."""
+    options, spatial = OPTION_SETS[option_set]
+    if spatial:
+        # This worker process only: every eligible conv takes spatial Winograd.
+        WinoVaeCausalConv3d._spatial_selected = lambda *args: True
+    torch.manual_seed(0)
+    model = WinoVae(SMALL_CONFIG, WinoVaeOptions.from_dict(options)).to(device=device)
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    native = WanVAE(SMALL_CONFIG).to(device=device)
+    native.load_state_dict(model.state_dict(), strict=True)
+    model = model.to(dtype=torch.bfloat16).eval()
+    return model, native.to(dtype=torch.float32).eval()
+
+
+def _parallel(model: WinoVae, world_size: int, split_dim: str):
+    ranks = list(range(world_size))
+    pg = dist.new_group(ranks, use_local_synchronization=False)
+    adj = [
+        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
+        for i in range(world_size - 1)
+    ]
+    return ParallelVAEFactory.from_vae(model, split_dim, pg, adj).eval()
+
+
+def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
+    return ((got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)).item()
+
+
+def _check(
+    got: torch.Tensor,
+    single: torch.Tensor,
+    ref32: torch.Tensor,
+    split_dim: str,
+    what: str,
+    in_size: int,
+    align: int = 1,
+) -> None:
+    """The sharded result must sit as close to the fp32 reference as the single-GPU one
+    (different conv algorithms and Winograd tile phases change the bf16 rounding, so the two
+    bf16 runs are not bitwise equal) and show no error spike at the rank boundary."""
+    assert got.shape == single.shape, (got.shape, single.shape)
+    rel_single = _rel_l2(single, ref32)
+    rel_shard = _rel_l2(got, ref32)
+    assert rel_shard <= 1.25 * rel_single + 1e-3, (
+        f"{what}: sharded rel_l2={rel_shard:.3e} vs single {rel_single:.3e}"
+    )
+    axis = 3 if split_dim == "height" else 4
+    err = (got.float() - single.float()).abs()
+    dims = tuple(d for d in range(err.dim()) if d != axis)
+    line = err.mean(dim=dims)
+    n = line.shape[0]
+    world = dist.get_world_size()
+    # Rank boundaries in output lines: the input-side shard extents (``in_size`` along the
+    # split axis, in units of ``align``) scaled to the output resolution.
+    units = shard_extents(in_size, world, align)
+    bounds = [sum(units[:r]) * n // in_size for r in range(1, world)]
+    seam = max(line[b - 1 : b + 1].max().item() for b in bounds)
+    assert seam <= 2.5 * line.median().item() + 1e-4, (
+        f"{what}: error at the rank boundary {seam:.3e} vs median line {line.median().item():.3e}"
+    )
+
+
+def _logic_decode(
+    rank: int,
+    world_size: int,
+    split_dim: str,
+    option_set: str,
+    frames: int,
+    latent_hw: tuple[int, int] = (8, 12),
+):
+    device = f"cuda:{rank}"
+    model, native = _model(device, option_set)
+    gen = torch.Generator().manual_seed(1)
+    # Latent 8 x 12 (pixels 128 x 192) divides by two and four along either axis; 9 x 13
+    # divides along neither, exercising unequal shards.
+    latent = torch.randn(1, SMALL_CONFIG["z_dim"], frames, *latent_hw, generator=gen).to(
+        device, torch.bfloat16
+    )
+    with torch.inference_mode():
+        ref32 = native.decode(latent.float(), return_dict=False)[0]
+        single = model.decode(latent, return_dict=False)[0].clone()
+        parallel = _parallel(model, world_size, split_dim)
+        got = parallel.decode(latent, return_dict=False)[0]
+    _check(
+        got,
+        single,
+        ref32,
+        split_dim,
+        f"rank {rank}: decode {split_dim} {option_set}",
+        latent_hw[0 if split_dim == "height" else 1],
+    )
+
+
+def _logic_encode(
+    rank: int,
+    world_size: int,
+    split_dim: str,
+    option_set: str,
+    frames: int,
+    pixel_hw: tuple[int, int] = (128, 192),
+):
+    device = f"cuda:{rank}"
+    model, native = _model(device, option_set)
+    gen = torch.Generator().manual_seed(2)
+    pixels = (torch.rand(1, 3, frames, *pixel_hw, generator=gen) * 2 - 1).to(device, torch.bfloat16)
+    with torch.inference_mode():
+        ref32 = native.encode(pixels.float(), return_dict=False)[0].mode()
+        single = model.encode(pixels, return_dict=False)[0].mode().clone()
+        parallel = _parallel(model, world_size, split_dim)
+        got = parallel.encode(pixels, return_dict=False)[0].mode()
+    _check(
+        got,
+        single,
+        ref32,
+        split_dim,
+        f"rank {rank}: encode {split_dim} {option_set}",
+        pixel_hw[0 if split_dim == "height" else 1],
+        SMALL_CONFIG["scale_factor_spatial"],
+    )
+
+
+class TestParallelWinoVaeDecode:
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", list(OPTION_SETS))
+    @pytest.mark.parametrize("frames", [1, 5])
+    def test_decode_2gpu(self, split_dim: str, option_set: str, frames: int) -> None:
+        _run(2, _logic_decode, split_dim, option_set, frames)
+
+    # Four ranks: every rank but the edges has two neighbours, so both halo lines travel in
+    # one exchange (the 8 x 12 latent divides by four along either axis).
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", ["direct", "direct_no_spatial"])
+    def test_decode_4gpu(self, split_dim: str, option_set: str) -> None:
+        _run(4, _logic_decode, split_dim, option_set, 5)
+
+    # Unequal shards: a 9 x 13 latent over four ranks is 3/2/2/2 rows or 4/3/3/3 columns.
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", ["direct", "nccl", "direct_no_spatial"])
+    def test_decode_4gpu_uneven(self, split_dim: str, option_set: str) -> None:
+        _run(4, _logic_decode, split_dim, option_set, 5, (9, 13))
+
+
+class TestParallelWinoVaeEncode:
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", ["direct", "direct_no_spatial"])
+    def test_encode_2gpu(self, split_dim: str, option_set: str) -> None:
+        _run(2, _logic_encode, split_dim, option_set, 9)
+
+    def test_encode_4gpu(self) -> None:
+        _run(4, _logic_encode, "width", "direct", 9)
+
+    # Unequal shards in 16-pixel units: 144 x 208 pixels is 9 x 13 units over four ranks.
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    def test_encode_4gpu_uneven(self, split_dim: str) -> None:
+        _run(4, _logic_encode, split_dim, "direct", 9, (144, 208))
+
+
+def _logic_gather_rows(rank: int, world_size: int, extents: list[int]):
+    """Equal and unequal row gathers, repeated: every rank's rows in rank order, and the
+    communication buffers are allocated once and reused."""
+    torch.cuda.set_device(rank)
+    group = dist.group.WORLD
+    adj = [dist.new_group([i, i + 1]) for i in range(world_size - 1)]
+    shard = Shard(rank, world_size, "h", group, adj, halo="nccl")
+    shard.set_extents(extents)
+    channels, scale = 16, 3
+    counts = [e * scale for e in extents]
+    for step in range(3):
+        parts = [
+            torch.full((n, channels), 100 * step + r, dtype=torch.bfloat16, device="cuda")
+            for r, n in enumerate(counts)
+        ]
+        got = shard.gather_rows(parts[rank])
+        assert torch.equal(got, torch.cat(parts)), f"rank {rank} step {step}"
+        if step == 0:
+            buffers = {k: b.data_ptr() for k, b in shard._buffers.items()}
+        else:
+            assert {k: b.data_ptr() for k, b in shard._buffers.items()} == buffers
+
+
+@pytest.mark.parametrize("extents", [[2, 2, 2, 2], [3, 2, 2, 2]])
+def test_gather_rows_4gpu(extents: list[int]) -> None:
+    _run(4, _logic_gather_rows, extents)
+
+
+def test_shard_extents() -> None:
+    assert shard_extents(80, 8) == [10] * 8
+    assert shard_extents(52, 8) == [7, 7, 7, 7, 6, 6, 6, 6]
+    assert shard_extents(13, 4) == [4, 3, 3, 3]
+    assert shard_extents(208, 4, align=16) == [64, 48, 48, 48]
+    with pytest.raises(ValueError):
+        shard_extents(200, 4, align=16)  # not a multiple of the unit
+    with pytest.raises(ValueError):
+        shard_extents(48, 4, align=16)  # fewer units than ranks
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

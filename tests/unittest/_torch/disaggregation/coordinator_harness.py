@@ -40,6 +40,7 @@ class TransferRequest(SimpleNamespace):
             is_attention_dp_dummy=False,
             is_finished=False,
             py_decoding_iter=1,
+            py_draft_tokens=[],
             py_gen_first_emitted=True,
             is_disagg_context_complete_state=False,
             is_disagg_context_transmission_state=False,
@@ -48,6 +49,10 @@ class TransferRequest(SimpleNamespace):
             py_multimodal_params=None,
             py_disaggregated_params=None,
             cached_tokens=0,
+            py_per_pos_drafted=[],
+            py_per_pos_accepted=[],
+            py_total_draft_tokens=0,
+            py_total_accepted_draft_tokens=0,
             response=None,
         )
         defaults.update(overrides)

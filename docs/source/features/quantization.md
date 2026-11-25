@@ -96,9 +96,21 @@ generation attention expands the selected tokens to FP8 rows. `fp8rope` requests
 records, which are expanded to FP8 rows where they cannot be read in place, and
 fails with a cache that does not support them.
 Servers that exchange KV caches, such as the context and generation servers of a
-disaggregated deployment, must use the same layout. `auto` follows the GPU, the
-installed CuTe DSL and `TLLM_FMHA_LIBS` of each server, so select `residual` or
-`fp8rope` explicitly when these differ between the servers.
+disaggregated deployment, must use the same layout. `auto` follows each server's
+cache configuration (including sparse KV cache offload, mixed-precision KV
+caches and the cache-manager version), GPU, installed CuTe DSL, Helix parallelism,
+and `TLLM_FMHA_LIBS`. If those automatic choices differ, explicitly select a
+layout supported by every exchanging server. For disaggregated NVFP4 DSA serving
+with generation-side sparse KV cache offload, setting
+`TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT=residual` on all context and generation servers
+resolves the `auto` layout mismatch, even on otherwise identical nodes.
+Exchanging servers must also use matching
+`TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION` settings (for example, leave the default
+`1` on every server), because this setting changes the residual cache's data and
+scale byte counts.
+Offloaded caches do not support `fp8rope`, so a resident worker that selects
+`fp8rope` under `auto` would otherwise use a different representation. If `auto`
+already selects `residual` on every worker, no explicit override is needed.
 
 #### MLA Latent Scale for Quantized KV Caches
 
@@ -222,10 +234,21 @@ The language component decides which quantization methods are supported by a giv
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
 | Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
 | Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
-| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
+| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   | Y[^rubin-nvfp4-kv] |     Y     |     Y     |     Y      |     Y      |
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |
+
+[^rubin-nvfp4-kv]: On SM107, NVFP4 KV cache is retained for dense FP4 MLA with
+    the TRTLLM attention backend, DSA with a non-mixed KV-cache dtype, MiniMax-M3
+    MSA sparse layers, and modeling-v2 targets that explicitly support NVFP4 KV
+    cache (such as GLM-5.2). MiniMax-M3 MSA dense and draft layers use FP8.
+    Other attention configurations, including standard-attention
+    LLaMA-v2, LLaMA 3 and Qwen-3, fall back to FP8 KV cache with a warning at load.
+    A `mixed_*` dtype is rejected by this SM107 guard only when its effective
+    mapped quantization remains NVFP4 and none of the supported paths applies,
+    as with `mixed_nvfp4_*` on DSA. For ordinary dense models,
+    `mixed_nvfp4_fp8` maps to FP8 for this check and does not trigger that rejection.
 
 ```{note}
 FP8 block wise scaling GEMM kernels for sm100/103/107 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).

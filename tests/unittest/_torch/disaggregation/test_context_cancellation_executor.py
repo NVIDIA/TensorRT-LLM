@@ -142,6 +142,7 @@ def executor() -> PyExecutor:
 
 
 def _prepare_fetch(engine: PyExecutor) -> None:
+    engine.enable_iter_perf_stats = False
     engine.control_requests = []
     engine.request_accumulated = []
     engine.is_shutdown = False
@@ -208,6 +209,35 @@ def test_context_cancellation_result_precedes_physical_retirement(
         executor._do_terminate_request.assert_not_called()
     else:
         executor._do_terminate_request.assert_called_once_with(request)
+
+
+def test_context_cancellation_preserves_completed_prefill_counters(executor: PyExecutor) -> None:
+    request = _request()
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_chunk_size = 4
+    request.move_to_next_context_chunk()
+    assert request.context_remaining_length == 4
+    request.py_ctx_computed_tokens = 4
+    request.py_ctx_first_begin = 0
+    request.py_ctx_num_chunks = 1
+    executor.active_requests.append(request)
+    _consume_abort(executor, request.py_client_id, request.py_request_id)
+
+    # Match the scheduler: lifecycle cancellation runs before idle cancellation.
+    remaining = executor._progress_context_cancellations([])
+    assert executor._cancel_waiting_disagg_requests(remaining) == []
+
+    executor.disagg.request_logical_context_cancellation.assert_called_once_with(request)
+    executor._enqueue_responses.assert_called_once()
+    ((request_id, response),) = executor._enqueue_responses.call_args.args[0]
+    assert request_id == request.py_request_id
+    assert response.result.is_final
+    assert response.result.get_result().finish_reasons == [FinishReason.CANCELLED]
+    assert response.result.ctx_computed_tokens == 4
+    assert response.result.ctx_first_begin == 0
+    assert response.result.ctx_num_chunks == 1
+    assert not executor.active_requests and not executor.canceled_req_ids
+    executor._do_terminate_request.assert_called_once_with(request)
 
 
 def test_context_retirement_coexists_with_replicated_gen_vote(
@@ -469,6 +499,7 @@ def test_fetch_preserves_admission_result_when_completing_queued_context_cancel(
     executor.dist = SimpleNamespace(rank=0, tp_size=1, cp_config=None, cp_rank=0, cp_size=1)
     executor._fetch_and_enqueue_requests = Mock()
     executor._should_exclude_last_generation_logits = Mock(return_value=False)
+    executor._num_embeddings = 1234
     # Keep the real queued cancellation and capacity admission. Conversion
     # is unrelated to the admission API's (requests, placement) return value.
     monkeypatch.setattr(

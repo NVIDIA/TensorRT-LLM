@@ -218,8 +218,12 @@ async def test_llm_manager_cancels_in_flight_requests_on_failure():
 
     start = asyncio.get_running_loop().time()
     manager.run()
+    # asyncio.wait does not cancel the worker on timeout, so the failure must
+    # wake the idle worker by itself.
+    done, _ = await asyncio.wait({manager._backend_task}, timeout=10)
+    assert done, "A failed request did not wake the idle worker."
     with pytest.raises(ValueError, match="simulated request failure"):
-        await asyncio.wait_for(manager._backend_task, timeout=10)
+        manager._backend_task.result()
     elapsed = asyncio.get_running_loop().time() - start
 
     # Without cancellation the worker would block on the 30s requests.
@@ -413,6 +417,66 @@ async def test_llm_manager_duration_not_exceeded():
     assert manager._inbox.empty()
 
     await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_idle_worker_waits_instead_of_polling() -> None:
+    """An idle worker waits for a request or a stop instead of polling the inbox."""
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    async def mock_aresult() -> MagicMock:
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+    manager = LlmManager(llm=mock_llm, outbox=outbox, streaming=False, concurrency=1)
+
+    polls = 0
+    get_nowait = manager._inbox.get_nowait
+
+    def counting_get_nowait() -> tuple[InferenceRequest, SamplingParams, PostprocParams]:
+        nonlocal polls
+        polls += 1
+        return get_nowait()
+
+    manager._inbox.get_nowait = counting_get_nowait
+
+    manager.run()
+    # A polling worker would take the empty inbox on each of these event loop turns.
+    for _ in range(100):
+        await asyncio.sleep(0)
+    assert polls <= 2
+
+    # An enqueued request wakes the worker.
+    req = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=10)
+    await manager.enqueue(req, SamplingParams(), PostprocParams())
+    await asyncio.wait_for(outbox.get(), timeout=10)
+
+    # So does a stop. asyncio.wait does not cancel on timeout, so a stop() that
+    # no longer wakes the worker fails here.
+    stop_task = asyncio.create_task(manager.stop())
+    try:
+        done, _ = await asyncio.wait({stop_task}, timeout=10)
+        assert stop_task in done, "stop() did not wake the idle worker"
+        stop_task.result()
+        assert manager._backend_task.done()
+    finally:
+        pending = [t for t in (stop_task, manager._backend_task) if not t.done()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ def _bitwise(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 #: The shapes each target calls this entry with beyond its own cells, by target directory.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="fp8 tep2 MTP-2 verify logits, 128 requests x 3 rows",
             spec=dict(shape=(384, VOCAB)),

@@ -231,6 +231,41 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Spark Flash-Next bench: no TRTLLM-Gen MoE, and MTP does not run on these backends.
+        {
+            'patterns': [
+                'qwen3.8_flash_next_fp4-bench-pytorch-streaming-',
+                'qwen3.8_flash_next_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                'speculative_config': None,
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_27b'],
+            'config': {
+                'trust_remote_code': True,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],
@@ -915,6 +950,23 @@ def get_model_yaml_config(model_label: str,
                 'attn_backend': 'FLASHINFER',
             }
         },
+        {
+            'patterns': ['nemotron_3_nano_30b', 'nemotron_3_nano_4b'],
+            'config': {
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        {
+            'patterns': ['nemotron_3_nano_30b'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
         # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
         {
             'patterns': ['nemotron_3_nano_omni_nvfp4'],
@@ -1007,6 +1059,25 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        {
+            'patterns': [
+                'nemotron_3_super_120b_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                # CUDA graphs with the overlap scheduler hang across two DGX Spark nodes.
+                'disable_overlap_scheduler': True,
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
         # Nemotron-3-Super-120B-NVFP4_MTP (streaming/low-latency variant for spark perf)
         {
             'patterns': [
@@ -1062,7 +1133,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (served from HF).
+        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (synced HF submodule).
         {
             'patterns': ['nemotron_3_ultra_550b_nvfp4-serve-pytorch-'],
             'config': {
@@ -1094,6 +1165,208 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'print_iter_log': False,
             }
+        },
+    ]
+
+    # Single-node recipes from #22078, #21019, #21621, #22261 and #22498.
+    # Keep these after the shared patterns so existing single-GPU recipes
+    # cannot override the four-GPU cache and prefill settings.
+    pattern_configs += [
+        {
+            'patterns': ['kimi_k3_nvfp4_dep8-serve-pytorch'],
+            'config': {
+                'trust_remote_code': True,
+                'enable_attention_dp': True,
+                'max_seq_len': 8192,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                    'max_num_tokens': 131072,
+                    'use_low_precision_moe_combine': True,
+                },
+                'kv_cache_config': {
+                    'dtype': 'nvfp4',
+                    'enable_block_reuse': False,
+                    # The recurrent states alone need ~15 GiB at batch 32;
+                    # reserve room for them on B300 GPUs.
+                    'free_gpu_memory_fraction': 0.8,
+                    'tokens_per_block': 64,
+                },
+            },
+        },
+        {
+            'patterns': ['glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch'],
+            'config': {
+                'modeling_v2': 'require',
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'max_seq_len': 16384,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+                'kv_cache_config': {
+                    # test_perf.py creates a BF16-KV view of the FP8-KV export;
+                    # model loading rejects an explicit bfloat16 override.
+                    'dtype': 'auto',
+                    'tokens_per_block': 128,
+                    'enable_block_reuse': True,
+                    'free_gpu_memory_fraction': 0.8,
+                    'mamba_state_config': {
+                        'additional_snapshot_offsets_from_end': [0],
+                    },
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            },
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch'],
+            'config': {
+                'modeling_v2': 'require',
+                'max_seq_len': 9216,
+                'prefill_cuda_graph_backend': 'breakable',
+                'prefill_capture_num_tokens': [512, 1024, 2048, 4096, 8192],
+                'cuda_graph_config': {
+                    'max_batch_size': 128,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': True,
+                    'free_gpu_memory_fraction': 0.6,
+                    'mamba_state_config': {
+                        'periodic_snapshot_interval': 256,
+                    },
+                },
+            },
+        },
+        {
+            'patterns': ['minimax_m3.1_flash_nvfp4'],
+            'config': {
+                'modeling_v2': 'require',
+                'trust_remote_code': True,
+                'enable_attention_dp': False,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'nvfp4',
+                    'free_gpu_memory_fraction': 0.6,
+                    'enable_block_reuse': False,
+                },
+                'sparse_attention_config': {
+                    'algorithm': 'minimax_m3',
+                    'implementation': 'msa',
+                    'indexer_kv_dtype': 'fp8',
+                    'fuse_qkv_index_projection': True,
+                    'sparse_disable_index_value': True,
+                },
+            },
+        },
+        {
+            'patterns': ['minimax_m3.1_flash_nvfp4_dspark'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    7,
+                    'speculative_model':
+                    f'{llm_models_root()}/MiniMax-M3.1-Flash/dspark',
+                },
+            },
+        },
+        {
+            'patterns': ['muse_spark_open_nvfp4_agentx-serve-pytorch'],
+            'config': {
+                'trust_remote_code':
+                True,
+                'max_seq_len':
+                1048576,
+                'enable_chunked_prefill':
+                True,
+                'enable_attention_dp':
+                False,
+                'allreduce_strategy':
+                'NCCL',
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                },
+                'scheduler_config': {
+                    'capacity_scheduler_policy': 'MAX_UTILIZATION',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 24,
+                    'batch_sizes': list(range(1, 25)),
+                },
+                'prefill_cuda_graph_backend':
+                'breakable',
+                'prefill_capture_num_tokens': [
+                    1,
+                    2,
+                    4,
+                    8,
+                    16,
+                    32,
+                    64,
+                    128,
+                    256,
+                    512,
+                    768,
+                    1024,
+                    1280,
+                    1536,
+                    1792,
+                    2048,
+                    2304,
+                    2560,
+                    2816,
+                    3072,
+                    3584,
+                    4096,
+                    4608,
+                    5120,
+                    5632,
+                    6144,
+                    6656,
+                    7168,
+                    7680,
+                    8192,
+                ],
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': True,
+                    'block_reuse_config': {
+                        'swa_endpoint_rewind_tokens': 1024
+                    },
+                    'pool_ratio': [0.25, 0.75],
+                    'free_gpu_memory_fraction': 0.8,
+                    'host_cache_size': 171798691840,
+                },
+                'disable_mm_encoder':
+                True,
+                'num_postprocess_workers':
+                8,
+                'stream_interval':
+                20,
+                'enable_tokenization_cache':
+                True,
+                'enable_iter_perf_stats':
+                True,
+                'iter_perf_stats_interval':
+                40,
+            },
         },
     ]
 

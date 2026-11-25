@@ -117,6 +117,7 @@ add_th_common_family(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
+  lmHeadArgmaxOp.cpp
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
@@ -139,6 +140,7 @@ add_th_common_family(
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
   ncclCommunicatorOp.cpp
+  nativeMemoryOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
   localityDomainAllocator.cpp
@@ -192,6 +194,7 @@ add_library(
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
   $<TARGET_OBJECTS:th_common_decoding>)
+tllm_localize_cutlass_runtime_helpers(th_common)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
