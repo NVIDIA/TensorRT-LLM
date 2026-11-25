@@ -55,6 +55,7 @@ TOOLS = [
     _tool(name)
     for name in (
         "bash",
+        "echo",
         "get_current_weather",
         "get_weather",
     )
@@ -82,6 +83,24 @@ COMBINED_CASES = [
         "",
         "",
         [("bash", '{"command": "echo [THINK]"}')],
+    ),
+    # A [TOOL_CALLS] inside a quoted JSON string value stays part of the arguments.
+    (
+        '[TOOL_CALLS]echo[ARGS]{"text":"print [TOOL_CALLS] please"}',
+        "",
+        "",
+        [("echo", '{"text":"print [TOOL_CALLS] please"}')],
+    ),
+    # Escaped quotes keep [TOOL_CALLS] inside the string; a real call right after still splits.
+    (
+        '[TOOL_CALLS]echo[ARGS]{"text":"say \\"[TOOL_CALLS]\\""}'
+        '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}</s>',
+        "",
+        "",
+        [
+            ("echo", '{"text":"say \\"[TOOL_CALLS]\\""}'),
+            ("get_weather", '{"city": "Paris"}'),
+        ],
     ),
 ]
 
@@ -169,6 +188,16 @@ def test_markers_never_reach_the_client():
             assert marker not in content, (text, marker)
             assert marker not in reasoning, (text, marker)
             assert all(marker not in name for name, _ in calls), (text, marker)
+
+
+def test_tool_calls_marker_inside_json_string_split_across_chunks():
+    pieces = ['[TOOL_CALLS]echo[ARGS]{"text":"print [TOOL_', 'CALLS] please"}</s>']
+    reasoning, content, calls = _parse_stream(pieces, reasoning_parser=False)
+    assert (reasoning, content, calls) == (
+        "",
+        "",
+        [("echo", '{"text":"print [TOOL_CALLS] please"}')],
+    )
 
 
 def test_tool_choice_none_strips_the_calls():

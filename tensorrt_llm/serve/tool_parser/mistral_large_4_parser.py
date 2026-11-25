@@ -242,6 +242,10 @@ class MistralLarge4ToolParser(BaseToolParser):
             return False
         index, marker = min(found)
         self._arguments.feed(buffer[:index])
+        if marker == TOOL_CALLS and self._arguments._in_string:
+            self._arguments.feed(marker)
+            self._buffer = buffer[index + len(marker) :]
+            return True
         self._close_call(calls)
         self._buffer = buffer[index + len(marker) :]
         self._state = _NAME if marker == TOOL_CALLS else _END
