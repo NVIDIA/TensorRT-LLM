@@ -347,6 +347,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm
     fp8_per_tensor_mm,
     fp8_per_tensor_weight,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import (
+    WIDE_MAX_ROWS as _LOW_M_WIDE_MAX_ROWS,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MAX_ROWS as _MID_ROWS_MAX,
@@ -1341,6 +1344,36 @@ def _tep_draft_layer(core) -> bool:
 #: counts are agreed over the group at build (`_tep_decode_front_build`, collective). Read once,
 #: when the target is built; set where it cannot apply it warns and does nothing.
 TEP_MOE_FRONT_ENV = "TRTLLM_QWEN4_EXP_TEP_MOE_FRONT"
+
+
+#: Off by default (opt-in: other GEMM kernels at rows that ran on cuBLAS, a same-precision
+#: reorder). At a tep4 rank with its fast forms (`TEP_FAST_DECODE_ENV`), a generation-only step's
+#: bf16 projections take FlashInfer's split-K low-M kernel with PDL (`low_m_bf16_mm`'s `wide`
+#: rows) where they ran on cuBLAS:
+#: - the attention input, the GDN input and the attention o / GDN out projections at 9-16 rows
+#:   (`wide` 1: the tactics measured at 16 rows; o / GDN out stay on cuBLAS past 16, where it is
+#:   faster);
+#: - the PLE key and value projections at 9-16 rows, and the trunk shared expert's gate|up and
+#:   down at up to 16 rows (`wide` 2: split-K's default tactic where it takes the shape).
+#: Every branch accumulates in fp32 and rounds once; the sums run in another order. Read once,
+#: when the target is built; set at another layout it warns and does nothing.
+TEP_PROJ_ENV = "TRTLLM_QWEN4_EXP_TEP_PROJ_SPLITK"
+#: Rows from which the PLE projections take the split-K kernel under `TEP_PROJ_ENV` (measured at
+#: 12 and 16; fewer rows keep cuBLAS).
+_TEP_PLE_WIDE_MIN_ROWS = 9  # capacity: fixed: a dispatch threshold
+
+
+def _tep_proj(core) -> bool:
+    """`TEP_PROJ_ENV` at this core: whether a tep4 rank with its fast forms takes the wide rows.
+    Set where it cannot apply, one warning."""
+    if not _switch(TEP_PROJ_ENV):
+        return False
+    if core.tep_fast:
+        return True
+    logger.warning(
+        f"{TEP_PROJ_ENV} is set but ignored: it serves a tep4 rank with {TEP_FAST_DECODE_ENV} on"
+    )
+    return False
 
 
 #: Off by default (a Lamport transport: race-risk, opt-in). At a tep4 rank whose trunk MoE takes
@@ -2353,7 +2386,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # A decode step's bf16 projection entry, and its GDN in_proj's: at tp1 the one-rank
         # dispatch (`_one_rank_projection`), at the other layouts the shapes' own.
         one_rank = self.one_rank
-        self.decode_mm = _one_rank_projection if one_rank else _decode_projection
+        # A tep4 rank's projections past `low_m_bf16_mm`'s table (`TEP_PROJ_ENV`).
+        self.tep_proj = _tep_proj(self)
+        self.decode_mm = (
+            _one_rank_projection
+            if one_rank
+            else (_tep_wide_projection if self.tep_proj else _decode_projection)
+        )
         # At one rank a trtllm-gen decode MoE leaves its finalize to the next site
         # (`DecodeTarget._moe`).
         self.moe_fold = one_rank and self.trunk_moe_backend == "TRTLLM"
@@ -2363,10 +2402,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The decode sites' rows pairs alone: at one rank, and at a tep4 rank under
         # `TEP_FAST_DECODE_ENV` (replicated sites over the all-reduced rows).
         self.hc_decode_pairs = one_rank or self.tep_fast
+        in_wide = 1 if self.tep_proj else 0
         self.decode_in_mm = (
             _one_rank_projection
             if one_rank
-            else (lambda mat_a, mat_b: low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL))
+            else (lambda mat_a, mat_b: low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL, in_wide))
         )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
@@ -3920,7 +3960,7 @@ def _combine_inject_fits(x, routed, shared, inject) -> bool:
     )
 
 
-def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor, wide: int = 0) -> torch.Tensor:
     """A generation-only step's dense bf16 projection at every layout but tp1 (the attention
     input and output projections and the GDN output projection of `DecodeTarget`, which the
     engine captures in CUDA graphs; tp1 takes `_one_rank_projection`).
@@ -3929,11 +3969,24 @@ def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor
     `bf16_gemv_pdl`: its weight streams into registers before it waits on the producer.
     Everything else runs `low_m_bf16_mm`, whose table picks FlashInfer's low-M kernels at the
     rows and shapes it names (a tp4/tep4 rank's, and the whole layer's that a dep4 / dep2 rank
-    holds) and cuBLAS elsewhere. Both launch with PDL per `_DECODE_PROJ_PDL` and read the
-    activation only after `griddepcontrol.wait`."""
+    holds; with `wide` its rows past the table, `TEP_PROJ_ENV`) and cuBLAS elsewhere. Both
+    launch with PDL per `_DECODE_PROJ_PDL` and read the activation only after
+    `griddepcontrol.wait`."""
     if mat_a.shape[0] <= _GEMV_MAX_ROWS and mat_b.shape[0] == _GEMV_TP4_K:
         return bf16_gemv_pdl(mat_a, mat_b, _DECODE_PROJ_PDL)
-    return low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL)
+    return low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL, wide)
+
+
+def _tep_wide_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    """`_decode_projection` with `low_m_bf16_mm`'s tep4 rows past its table (`TEP_PROJ_ENV`)."""
+    return _decode_projection(mat_a, mat_b, 1)
+
+
+def _tep_wide_mm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    """A tep4 decode projection that runs on cuBLAS by default (the PLE key and value, the trunk
+    shared expert), under `TEP_PROJ_ENV`: `low_m_bf16_mm` with split-K's default tactic where it
+    takes the shape, up to `low_m_bf16_mm.WIDE_MAX_ROWS` rows."""
+    return low_m_bf16_mm(mat_a, mat_b, _DECODE_PROJ_PDL, 2)
 
 
 def _one_rank_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
@@ -5064,8 +5117,16 @@ def _shared_expert(core, x, L: _LayerWeights, decode_gemm=None) -> tuple:
             mid=L.sh_dn_m,
         )
         return shared, decode_gemm(x, L.sh_gate)
-    gug = cublas_mm(x, L.sh_gug)
-    shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), L.sh_dn)
+    # A tep4 decode step under `TEP_PROJ_ENV`: both GEMMs on the split-K low-M kernel.
+    mm = (
+        _tep_wide_mm
+        if decode_gemm is not None
+        and getattr(core, "tep_proj", False)
+        and x.shape[0] <= _LOW_M_WIDE_MAX_ROWS
+        else cublas_mm
+    )
+    gug = mm(x, L.sh_gug)
+    shared = mm(silu_and_mul_rows(gug, core.shared_inter), L.sh_dn)
     return shared, gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
 
 
@@ -8618,10 +8679,17 @@ class DecodeTarget:
         if _ple_needs_sum(core):
             ngram = core.tp_sum(ngram)
         conv_input = torch.empty_like(hc) if stage else None
+        # A tep4 rank under `TEP_PROJ_ENV`: 9-16 rows on the split-K low-M kernel.
+        ple_mm = (
+            _tep_wide_mm
+            if getattr(core, "tep_proj", False)
+            and _TEP_PLE_WIDE_MIN_ROWS <= ngram.shape[0] <= _LOW_M_WIDE_MAX_ROWS
+            else cublas_mm
+        )
         out = ple_gate_conv_inject_norm(
             hc,
-            cublas_mm(ngram, S.ple_key),
-            cublas_mm(ngram, S.ple_val),
+            ple_mm(ngram, S.ple_key),
+            ple_mm(ngram, S.ple_val),
             S.ple_nk_w,
             S.ple_nq_w,
             S.ple_nc_w,

@@ -54,11 +54,12 @@ def _build(m, n, k, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     certifying(op)
     s = cell.spec
-    assert plan(s["m"], s["n"], s["k"]).kind == s["kind"], plan(s["m"], s["n"], s["k"])
+    picked = plan(s["m"], s["n"], s["k"], s["wide"])
+    assert picked.kind == s["kind"], picked
     mat_a, mat_b = _build(s["m"], s["n"], s["k"], seed=zlib.crc32(cell.why.encode()) % 2**31)
-    out = op(mat_a, mat_b, s["pdl"])
+    out = op(mat_a, mat_b, s["pdl"], s["wide"])
     assert out.shape == (s["m"], s["n"]) and out.dtype == torch.bfloat16 and out.is_contiguous()
-    _compare(out, op.reference(mat_a, mat_b, s["pdl"]))
+    _compare(out, op.reference(mat_a, mat_b, s["pdl"], s["wide"]))
 
 
 #: `(M, N, K, branch)` of the table's shapes and M buckets the cells do not drive:
@@ -106,6 +107,26 @@ def test_plan_pins_the_branch_of_the_other_table_shapes() -> None:
     picked = [(m, n, k, want, plan(m, n, k).kind) for m, n, k, want in _PLAN_PINS]
     wrong = [p for p in picked if p[3] != p[4]]
     assert not wrong, f"(M, N, K, pinned, picked): {wrong}"
+
+
+#: `(M, N, K, wide, branch)`: the rows `wide` adds and those it leaves alone.
+_WIDE_PINS = (
+    (12, 4120, 2560, 1, "splitk"),
+    (16, 4352, 2560, 1, "splitk"),
+    (9, 2560, 1536, 1, "splitk"),
+    (17, 4352, 2560, 1, "cublas"),  # past WIDE_MAX_ROWS
+    (12, 2560, 2560, 1, "cublas"),  # not in _WIDE: wide 1 adds no default tactic
+    (4, 4352, 2560, 1, "splitk"),  # the table's own row first
+    (2, 4352, 2560, 1, "direct"),
+    (12, 10240, 2560, 0, "cublas"),
+    (17, 2560, 640, 2, "cublas"),
+)
+
+
+def test_plan_pins_the_wide_rows() -> None:
+    picked = [(m, n, k, w, want, plan(m, n, k, w).kind) for m, n, k, w, want in _WIDE_PINS]
+    wrong = [p for p in picked if p[4] != p[5]]
+    assert not wrong, f"(M, N, K, wide, pinned, picked): {wrong}"
 
 
 def test_graph_replay_after_warmup() -> None:
