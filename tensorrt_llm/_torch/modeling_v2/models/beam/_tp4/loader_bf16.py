@@ -24,12 +24,13 @@ import hashlib
 import json
 import math
 import os
-import struct
 import threading
 from collections import OrderedDict
 from typing import Generator, Mapping, Optional, Sequence
 
 import torch
+
+from tensorrt_llm._utils import prefer_pinned
 
 from .layout_bf16 import BF16, F32, FP8, TensorSpec
 
@@ -37,7 +38,6 @@ INDEX_FILE = "model.safetensors.index.json"
 TILE_BYTES = 16 << 20
 _ITEMSIZE = {"U8": 1, FP8: 1, BF16: 2, F32: 4}
 _TORCH_DTYPE = {FP8: torch.float8_e4m3fn, BF16: torch.bfloat16, F32: torch.float32}
-_MAX_HEADER = 256 << 20
 
 
 class CheckpointFormatError(ValueError):
@@ -63,26 +63,6 @@ class Entry:
         return cols * _ITEMSIZE[self.dtype]
 
 
-def _read_header(path: str) -> tuple:
-    with open(path, "rb") as f:
-        raw = f.read(8)
-        if len(raw) != 8:
-            raise CheckpointFormatError(f"{path}: truncated safetensors header length")
-        (length,) = struct.unpack("<Q", raw)
-        if not 0 < length <= _MAX_HEADER:
-            raise CheckpointFormatError(f"{path}: implausible header length {length}")
-        header = f.read(length)
-        if len(header) != length:
-            raise CheckpointFormatError(f"{path}: truncated safetensors header")
-    try:
-        table = json.loads(header)
-    except json.JSONDecodeError as exc:
-        raise CheckpointFormatError(f"{path}: malformed header JSON: {exc}") from None
-    if not isinstance(table, dict):
-        raise CheckpointFormatError(f"{path}: header is not a JSON object")
-    return table, 8 + length
-
-
 class SafetensorsCatalog:
     """Index and headers of a caller-supplied checkpoint directory; metadata only."""
 
@@ -97,42 +77,43 @@ class SafetensorsCatalog:
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
         if not isinstance(weight_map, dict) or not weight_map:
             raise CheckpointFormatError(f"{INDEX_FILE} has no weight_map")
-        self.entries: "OrderedDict[str, Entry]" = OrderedDict()
-        for filename in sorted(set(weight_map.values())):
-            if not isinstance(filename, str) or os.path.basename(filename) != filename:
+        # Checkpoint adapters are imported when loading, after model registration.
+        from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_catalog import (
+            build_safetensors_checkpoint_catalog,
+        )
+
+        for filename in weight_map.values():
+            if (
+                not isinstance(filename, str)
+                or not filename
+                or os.path.basename(filename) != filename
+                or filename in (".", "..")
+            ):
                 raise CheckpointFormatError(f"{INDEX_FILE} names an unsafe shard path {filename!r}")
-            path = os.path.join(self.checkpoint_dir, filename)
-            table, data_start = _read_header(path)
-            size = os.path.getsize(path)
-            spans = []
-            for name, info in table.items():
-                if name == "__metadata__":
-                    continue
-                try:
-                    dtype, shape = info["dtype"], info["shape"]
-                    begin, end = info["data_offsets"]
-                except (KeyError, TypeError, ValueError):
-                    raise CheckpointFormatError(
-                        f"{filename}: malformed header entry {name!r}"
-                    ) from None
-                if weight_map.get(name) != filename:
-                    raise CheckpointFormatError(
-                        f"{name} is stored in {filename} but the index maps it to {weight_map.get(name)!r}"
-                    )
-                if type(begin) is not int or type(end) is not int:
-                    raise CheckpointFormatError(f"{filename}: {name} offsets must be integers")
-                if not 0 <= begin <= end or data_start + end > size:
-                    raise CheckpointFormatError(
-                        f"{filename}: {name} spans [{begin}, {end}) outside the file"
-                    )
-                spans.append((begin, end, name))
-                self.entries[name] = Entry(
-                    name, path, dtype, shape, data_start + begin, data_start + end
+        paths = [
+            os.path.join(self.checkpoint_dir, name) for name in sorted(set(weight_map.values()))
+        ]
+        try:
+            catalog = build_safetensors_checkpoint_catalog(paths)
+        except ValueError as exc:
+            raise CheckpointFormatError(str(exc)) from exc
+        self.entries: "OrderedDict[str, Entry]" = OrderedDict()
+        for tensor in catalog.tensors:
+            (extent,) = tensor.extents
+            filename = extent.object_id
+            if weight_map.get(tensor.name) != filename:
+                raise CheckpointFormatError(
+                    f"{tensor.name} is stored in {filename} but the index maps it to "
+                    f"{weight_map.get(tensor.name)!r}"
                 )
-            spans.sort()
-            for (b0, e0, n0), (b1, _, n1) in zip(spans, spans[1:]):
-                if b1 < e0:
-                    raise CheckpointFormatError(f"{filename}: {n0} and {n1} overlap")
+            self.entries[tensor.name] = Entry(
+                tensor.name,
+                os.path.join(self.checkpoint_dir, filename),
+                tensor.dtype,
+                tensor.shape,
+                extent.offset_bytes,
+                extent.end_offset_bytes,
+            )
         missing = sorted(set(weight_map) - set(self.entries))
         if missing:
             raise CheckpointFormatError(
@@ -179,16 +160,19 @@ class SafetensorsCatalog:
 
 
 class TileReader:
-    """Bounded byte-range reads: at most two pinned staging buffers of ``tile_bytes``.
+    """Bounded byte-range reads: at most two staging buffers of ``tile_bytes``.
 
     ``tiles(entry, rows)`` yields ``(row_start, row_stop, host_view)`` for consecutive row
     ranges; the next tile is read on a background thread while the caller consumes the
     current one, and a buffer is refilled only after the caller's device copy of it
     completed. Counts the bytes read and the peak staging footprint.
+    Pinning follows ``prefer_pinned()`` unless explicitly overridden.
     """
 
-    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool = True) -> None:
+    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool | None = None) -> None:
         self.tile_bytes = tile_bytes
+        if pin is None:
+            pin = prefer_pinned()
         self.buffers = [
             torch.empty(tile_bytes, dtype=torch.uint8, pin_memory=pin) for _ in range(2)
         ]

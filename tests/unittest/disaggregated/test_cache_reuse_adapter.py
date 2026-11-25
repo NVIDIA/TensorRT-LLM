@@ -14,7 +14,7 @@
 # limitations under the License.
 """Tests for CacheReuseAdapter, the positional _create_chunk, and Sender ordinal pairing."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -27,6 +27,13 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttentionLayerConfig,
+    BufferConfig,
+    ReusePolicy,
+    SsmLayerConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -197,9 +204,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     cache = SimpleNamespace(
         num_committed_tokens=256,
         reuse_status=[
-            SimpleNamespace(endpoint=256, complete=True),
-            SimpleNamespace(endpoint=256, complete=encoder_hit),
-            SimpleNamespace(endpoint=256, complete=False),
+            SimpleNamespace(endpoint=256, complete=True, policy=ReusePolicy.REQUIRED),
+            SimpleNamespace(endpoint=256, complete=encoder_hit, policy=ReusePolicy.OPTIONAL),
+            SimpleNamespace(endpoint=256, complete=False, policy=ReusePolicy.OPTIONAL),
         ],
         get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
         is_active=False,
@@ -232,6 +239,105 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     manager.enable_block_reuse = True
     manager.kv_cache_map.clear()
     assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+
+
+def _sink_only_manager(cache, num_sink_tokens: int, *, hybrid: bool):
+    """Manager stand-in whose per-group life cycles come from KVCacheManagerV2 itself.
+
+    Groups: the low-precision history, the high-precision group (sinks and a
+    66-token window), a PRIVATE group and, for a hybrid model, a Mamba layer,
+    whose config has no sink count.
+    """
+    kv = [BufferConfig(role=role, size=128) for role in ("key", "value")]
+    layers = [
+        AttentionLayerConfig(layer_id=0, buffers=kv),
+        AttentionLayerConfig(
+            layer_id=1,
+            buffers=kv,
+            sliding_window_size=66,
+            num_sink_tokens=num_sink_tokens,
+            reuse_policy=ReusePolicy.SINK_REQUIRED_ONLY,
+        ),
+        AttentionLayerConfig(layer_id=2, buffers=kv, reuse_policy=ReusePolicy.PRIVATE),
+    ]
+    if hybrid:
+        states = [BufferConfig(role=role, size=128) for role in ("ssm_state", "conv_state")]
+        layers.append(SsmLayerConfig(layer_id=3, buffers=states))
+    manager = SimpleNamespace(
+        enable_block_reuse=True,
+        tokens_per_block=128,
+        kv_cache_map={0: cache},
+        kv_cache_manager_py_config=SimpleNamespace(layers=layers),
+        _layer_ids_by_group=[[layer_id] for layer_id in range(len(layers))],
+        _layer_group_life_cycles=None,
+    )
+    manager._life_cycle_by_layer_group = MethodType(
+        KVCacheManagerV2._life_cycle_by_layer_group, manager
+    )
+    return manager
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_v2_receive_skips_the_claimed_sinks_of_a_missing_window(hybrid):
+    transceiver, req = _build_transceiver_for_kv_slice(
+        0, 513, tokens_per_block=128, is_generation_only=True
+    )
+    # Mixed-precision KV: the low-precision history, then the high-precision group with one
+    # sink token and a 66-token window whose pages were missing at resume.
+    groups = [
+        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
+        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=66),
+    ]
+    pages = [[10, 11, 12, 13, 14], [20, -1, -1, 23, 24]]
+    cache = SimpleNamespace(
+        num_committed_tokens=512,
+        reuse_status=[
+            SimpleNamespace(endpoint=512, complete=True, policy=ReusePolicy.REQUIRED),
+            SimpleNamespace(endpoint=512, complete=False, policy=ReusePolicy.SINK_REQUIRED_ONLY),
+        ],
+        get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
+        is_active=False,
+    )
+    adapter = _CacheReuseAdapterV2(_sink_only_manager(cache, 1, hybrid=hybrid))
+    transceiver._reuse_adapter = adapter
+    transceiver._page_table.layer_groups = groups
+    # The claimed sink page is shared with other requests; only the fresh window is received.
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [512, 128]
+    received = transceiver._create_chunk(req).block_ids_per_layer_groups
+    for actual, expected in zip(received, [[-1, -1, -1, -1, 14], [-1, -1, -1, 23, 24]]):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "committed, num_sink_tokens, window_present, held",
+    [
+        (512, 1, True, 512),  # the window is present: the whole prefix is held
+        (512, 129, False, 256),  # sinks spanning two blocks are held as whole blocks
+        (128, 129, False, 128),  # a prefix that ends inside the sinks holds only itself
+    ],
+)
+def test_v2_sink_only_group_holds_its_sinks(committed, num_sink_tokens, window_present, held):
+    cache = SimpleNamespace(
+        num_committed_tokens=committed,
+        reuse_status=[
+            SimpleNamespace(endpoint=committed, complete=True, policy=ReusePolicy.REQUIRED),
+            SimpleNamespace(
+                endpoint=committed, complete=window_present, policy=ReusePolicy.SINK_REQUIRED_ONLY
+            ),
+            SimpleNamespace(endpoint=committed, complete=False, policy=ReusePolicy.PRIVATE),
+            SimpleNamespace(endpoint=committed, complete=True, policy=ReusePolicy.REQUIRED),
+        ],
+    )
+    adapter = _CacheReuseAdapterV2(_sink_only_manager(cache, num_sink_tokens, hybrid=True))
+    groups = [AttentionLayerGroup(pool_group_idx=idx, kv_head_num_per_rank=1) for idx in range(4)]
+    req = SimpleNamespace(py_request_id=0)
+    # A PRIVATE group never supplies a prefix; the Mamba state is complete at the endpoint.
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [
+        committed,
+        held,
+        0,
+        committed,
+    ]
 
 
 class TestCreateKvSliceBlockSpan:

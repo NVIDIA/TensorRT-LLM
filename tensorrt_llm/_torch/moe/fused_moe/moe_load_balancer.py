@@ -35,7 +35,16 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     Args:
         t: The tensor to convert
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    if t.dim() > 2:
+        # MoeWeight is a 2D (height, width, pitch) cudaMemcpy2D descriptor, so a
+        # higher-rank weight -- e.g. a TRTLLM-Gen BlockMajorK expert weight,
+        # [K / blockK, Mn, blockK] -- is described by its leading dims collapsed,
+        # which covers the same bytes. Contiguity makes that flatten a view; a
+        # copy would leave weight_ptr dangling once this function returns.
+        assert t.is_contiguous(), (
+            f"a {t.dim()}D weight must be contiguous to be described by a "
+            f"single pitch, shape={tuple(t.shape)}, strides={t.stride()}")
+        t = t.flatten(0, -2)
     shape = [1, 1]
     pitch = 1
     elt_size = torch.tensor([], dtype=t.dtype).element_size()
@@ -131,8 +140,6 @@ class HostMoeTensorSharer:
             expert_id: The ID of the expert
             name: The name of the weight
         """
-        assert len(tensor_shape
-                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
         assert expert_id < self.expert_start or expert_id >= self.expert_end
         if name not in self.name_info:
@@ -154,8 +161,6 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
@@ -285,7 +290,10 @@ class HostMoeTensorSharer:
 
     def pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ load balancer has shut down, so no weight update
+        still reads them, and before the barrier that lets the owner unlink them.
         """
         for shm in self.imported_shms:
             shm.close()
@@ -757,7 +765,9 @@ class SingleLayerMoeLoadBalancer:
 
     def py_pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ shutdown and before the barrier.
         """
         if self.updates_enabled:
             self.host_tensor_sharer.pre_shutdown_cleanup()
@@ -1076,9 +1086,11 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         local_safe = bool(local_safe and not self.in_iter)
         if not all(self.shared_mpi_comm.allgather(local_safe)):
             return False
+        # Stop the C++ weight-update threads first. They read the host weights
+        # that the cleanup below closes.
+        self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
@@ -1125,6 +1137,45 @@ moe_model_arch_list = [
     'Qwen3_5MoeForConditionalGeneration',
 ]
 
+#: The EPLB modes ``moe_load_balancer_mode`` reports.
+MOE_LOAD_BALANCER_MODES = frozenset({"static", "online", "per_layer_dynamic"})
+
+
+def moe_load_balancer_mode(model_config,
+                           mapping: Optional[Mapping]) -> Optional[str]:
+    """Return the EPLB mode the engine runs this model with, or None.
+
+    ``maybe_create_moe_load_balancer`` creates a balancer exactly when this
+    returns a mode, so code that decides before the model is built, such as
+    the modeling_v2 resolver, agrees with the loader on whether EPLB runs.
+
+    Args:
+        model_config: The model's ``ModelConfig``. Its ``moe_load_balancer``
+            and the first of ``pretrained_config.architectures`` are read.
+        mapping: The mapping the model is built with.
+
+    Returns:
+        ``"static"`` for standard EPLB that keeps its initial placement
+        (``layer_updates_per_iter == 0``), ``"online"`` for standard EPLB
+        that updates layers, ``"per_layer_dynamic"`` for per-layer dynamic
+        EPLB, and None when no balancer is created: no ``moe_load_balancer``
+        config, an architecture outside ``moe_model_arch_list``, a single EP
+        rank, or smart routing (``moe_cluster_size > 1``).
+    """
+    config = model_config.moe_load_balancer
+    if config is None or mapping is None:
+        return None
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or [None]
+    if architectures[0] not in moe_model_arch_list:
+        return None
+    if mapping.moe_ep_size <= 1 or mapping.moe_cluster_size > 1:
+        return None
+    mode = getattr(config, "mode", "standard")
+    if mode == "standard":
+        return "online" if config.layer_updates_per_iter > 0 else "static"
+    return mode
+
 
 def maybe_create_moe_load_balancer(
     model_config, mapping: Optional[Mapping]
@@ -1169,8 +1220,7 @@ def maybe_create_moe_load_balancer(
                 "warmup placement requires pure expert parallelism: "
                 f"world size {mapping.world_size} != moe_ep_size {ep_size}")
 
-    if (in_supported_model_arch and using_ep and not using_smart_router
-            and config is not None):
+    if moe_load_balancer_mode(model_config, mapping) is not None:
         config.setup(ep_rank=ep_rank, ep_size=ep_size)
         if mode == "per_layer_dynamic":
             from .per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer

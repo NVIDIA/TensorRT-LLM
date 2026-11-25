@@ -170,6 +170,8 @@ def check_config(config: Any) -> Schedule:
         and mlp.index("sparse") < len(mlp) - mlp[::-1].index("dense")
     ):
         raise ValueError("dense feed-forward layers must precede the sparse ones")
+    if _get(config, "rope_scaling") is not None:
+        raise ValueError("rope_scaling is unsupported; sliding layers use unscaled RoPE")
     rope = _get(config, "rope_parameters")
     sliding = (rope or {}).get("sliding_attention") if isinstance(rope, Mapping) else None
     if (

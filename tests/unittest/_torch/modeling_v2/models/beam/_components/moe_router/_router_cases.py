@@ -273,18 +273,16 @@ def _ties() -> dict:
     )
 
 
-#: The order `torch.topk(..., sorted=True)` returns for each tie row -- the source router's
-#: order, measured on sm_103. A tie at a selection boundary keeps the lower index; tied
-#: values inside the selection are not in index order.
-TIE_ROUTES = {
-    "expert_boundary_tie_same_group_39_57": ([0, 1, 2, 3], [0, 1, 32, 33, 64, 65, 96, 39]),
-    "expert_boundary_tie_distant_3_126": ([0, 1, 2, 3], [0, 1, 32, 33, 64, 65, 96, 3]),
-    "expert_order_tie_33_62": ([0, 1, 2, 3], [0, 1, 33, 62, 64, 65, 96, 97]),
-    "group_boundary_tie_3_6": ([0, 1, 2, 3], [0, 1, 32, 33, 64, 65, 96, 97]),
-    "group_order_tie_1_4": ([0, 4, 1, 2], [0, 1, 128, 32, 33, 129, 64, 65]),
-    "all_equal": ([1, 0, 2, 3], [7, 6, 4, 5, 1, 0, 2, 3]),
-    "expert_boundary_tie_10way": ([0, 1, 2, 3], [0, 1, 32, 33, 64, 65, 96, 5]),
-}
+def assert_topk_membership(scores: torch.Tensor, indices: torch.Tensor, k: int) -> None:
+    """Selected IDs include every score above the boundary and only valid ties at it."""
+    assert scores.ndim == indices.ndim == 1
+    assert indices.numel() == k and indices.unique().numel() == k
+    assert bool(((indices >= 0) & (indices < scores.numel())).all())
+    boundary = scores.sort(descending=True).values[k - 1]
+    assert bool((scores[indices] >= boundary).all())
+    required = torch.nonzero(scores > boundary).flatten()
+    assert bool(torch.isin(required, indices).all())
+
 
 EPSILON_IDS = [0, 1, 32, 33, 64, 65, 96, 97]
 

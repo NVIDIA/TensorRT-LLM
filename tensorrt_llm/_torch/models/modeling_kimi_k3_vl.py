@@ -37,7 +37,7 @@ reuses everything numerically identical from the K2.5 implementation:
 """
 
 import copy
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,6 +76,9 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
+
+if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 # ---------------------------------------------------------------------------
 # Native MoonViT3d Vision Encoder Components (K3 deltas)
@@ -467,6 +470,19 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
 
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the text backbone's declaration, read from ``text_config``."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return KimiLinearForCausalLM.get_recurrent_state_spec(
+            text_config, quant_config=quant_config
+        )
 
     def __init__(
         self,

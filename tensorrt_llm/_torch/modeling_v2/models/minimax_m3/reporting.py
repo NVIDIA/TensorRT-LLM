@@ -7,6 +7,8 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Callable, Optional, Protocol
 
+import torch
+
 
 class _Logger(Protocol):
     info: Callable[[str], None]
@@ -38,6 +40,9 @@ def require_mode(state: ReportingTarget, /) -> bool:
 def _log_once(
     state: ReportingTarget, /, level: Callable[[str], None], path: str, reason: str, message: str
 ) -> None:
+    """Log eager diagnostics once; compiled regions do not lock or log."""
+    if torch.compiler.is_compiling():
+        return
     key = (path, reason)
     with state._lock:
         if key in state._logged:
@@ -47,7 +52,9 @@ def _log_once(
 
 
 def missed(state: ReportingTarget, /, path: str, rows: Optional[int], reason: str) -> None:
-    """``path`` covers this step but cannot run: raise under require, else log once; the caller falls back."""
+    """Raise under require, including during tracing; otherwise report only on eager steps."""
+    if not state._require[0] and torch.compiler.is_compiling():
+        return
     at = "" if rows is None else f" at {rows} rows"
     if state._require[0]:
         raise state.FastPathUnavailable(
@@ -67,14 +74,23 @@ def capture_missed(state: ReportingTarget, /, path: str, rows: Optional[int], wh
 
 
 def taken(state: ReportingTarget, /, path: str, rows: Optional[int], what: str = "") -> None:
-    """``path`` ran on this rank at ``rows``: one rank-tagged info line per (path, rows, what), the engagement line
-    every GEN rank prints for each fast path it takes (``what``: an optional detail, e.g. the projection)."""
+    """Report eager engagement once per (path, rows, what) on each rank.
+
+    Compiled regions do not report. ``what`` is an optional detail such as the projection. Hot paths call this on
+    every step, so a line already logged returns before the rank query, the lock and the message formatting.
+    """
+    if torch.compiler.is_compiling():
+        return
+    reason = f"taken: {rows}: {what}" if what else f"taken: {rows}"
+    # Lock-free read: keys are only added under the lock, and a stale miss falls through to _log_once's locked check.
+    if (path, reason) in state._logged:
+        return
     at = "" if rows is None else f" at {rows} rows"
     detail = f" ({what})" if what else ""
     state._log_once(
         state.logger.info,
         path,
-        f"taken: {rows}" + (f": {what}" if what else ""),
+        reason,
         f"[M3 dispatch] rank {state.mpi_rank()}: {path} taken{at}{detail}",
     )
 

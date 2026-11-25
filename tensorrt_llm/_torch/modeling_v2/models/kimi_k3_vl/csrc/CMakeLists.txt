@@ -23,8 +23,12 @@ add_modeling_v2_shared(
   SOURCES *.cu *.cpp
   DEPS internal_cutlass)
 
-set_source_files_properties(k3AttnResDecode.cu PROPERTIES COMPILE_OPTIONS
-                                                          "--use_fast_math")
+# The attention-residual kernels are copies of
+# cpp/tensorrt_llm/kernels/kimiK3AttnRes, which compiles with --use_fast_math;
+# the same flag keeps their results bit-identical.
+set_source_files_properties(
+  k3AttnResDecode.cu k3AttnResFwd.cu k3AttnResPersistent.cu
+  PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 add_modeling_v2_target(kimi_k3_vl kimi_k3_mxfp4__sm_100__tp16_moetp4ep4
                        ARCHS 100f)

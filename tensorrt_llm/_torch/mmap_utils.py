@@ -12,27 +12,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-memory `mmap`/`madvise` helpers for file-backed page cache.
+"""Host-memory `mmap`/`madvise`/`fadvise` helpers for file-backed page cache.
 
-These utilities either advise the OS to drop the physical pages backing
-read-only file-backed mmap regions (e.g. safetensors shards) so the resident
-file cache cannot grow unbounded during weight load on host-memory-constrained
-nodes, or conversely fault a file's pages into the page cache ahead of use
-(`populate_file_pages`). Callers must establish that a tensor is file-backed
-before using `advise_tensor_pageout`.
+These utilities advise the OS to drop the physical pages backing read-only
+file-backed mmap regions (e.g. safetensors shards) so the resident file cache
+cannot grow unbounded during weight load on host-memory-constrained nodes,
+fault a file's pages into the page cache ahead of use (`populate_file_pages`),
+or drop a file's page cache once its data is no longer needed
+(`release_file_page_cache`) and wait for the page migration that the freed
+memory triggers (`wait_for_page_migration_to_settle`). Callers must establish
+that a tensor is file-backed before using `advise_tensor_pageout`.
 """
 
 import ctypes
 import errno as errno_codes
 import mmap
 import os
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
 
 __all__ = [
     "madvise_range",
     "populate_file_pages",
     "pageout_file_backed_regions",
     "advise_tensor_pageout",
+    "release_file_page_cache",
+    "page_cache_bytes",
+    "wait_for_page_migration_to_settle",
 ]
 
 _MADV_DONTNEED = 4
@@ -269,3 +275,93 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
 
     # madvise only the complete pages fully inside the tensor's bounds.
     madvise_range(start_aligned, end_aligned - start_aligned, mode)
+
+
+_MEMINFO_PATH = "/proc/meminfo"
+_VMSTAT_PATH = "/proc/vmstat"
+
+
+def release_file_page_cache(paths: Iterable[str]) -> int:
+    """Advise the kernel to drop the page cache of ``paths`` (``POSIX_FADV_DONTNEED``).
+
+    Returns the total size in bytes of the files advised, not the bytes
+    dropped: the kernel keeps pages that are dirty or mapped by a process.
+    Files that cannot be opened or advised are skipped.
+    """
+    advised_bytes = 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            advised_bytes += os.fstat(fd).st_size
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return advised_bytes
+
+
+def page_cache_bytes() -> int | None:
+    """Bytes of file data in the host's page cache (``Cached`` in ``/proc/meminfo``).
+
+    Returns None if it cannot be read.
+    """
+    try:
+        with open(_MEMINFO_PATH) as meminfo:
+            for line in meminfo:
+                if line.startswith("Cached:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _migrated_pages() -> int | None:
+    try:
+        with open(_VMSTAT_PATH) as vmstat:
+            for line in vmstat:
+                if line.startswith("pgmigrate_success "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def wait_for_page_migration_to_settle(
+    max_wait_s: float = 120.0,
+    quiet_s: float = 5.0,
+    poll_s: float = 0.5,
+    max_bytes_per_s: float = 128 * 2**20,
+) -> float:
+    """Wait until the kernel has stopped migrating pages, or ``max_wait_s`` passes.
+
+    Freeing a large page cache at once leaves free memory fragmented, and the
+    kernel compacts it by migrating in-use pages. A thread that touches a page
+    under migration blocks until the copy finishes. Polls ``pgmigrate_success``
+    in ``/proc/vmstat`` until the migration rate, in bytes per second over the
+    measured interval between reads, stays at or below ``max_bytes_per_s`` for
+    ``quiet_s`` seconds.
+
+    Returns the seconds waited: 0 if ``pgmigrate_success`` cannot be read at
+    the start, and the time waited so far if a later read fails.
+    """
+    start = time.monotonic()
+    previous = _migrated_pages()
+    if previous is None:
+        return 0.0
+    previous_time = quiet_since = start
+    while True:
+        time.sleep(poll_s)
+        now = time.monotonic()
+        current = _migrated_pages()
+        if current is None:
+            return now - start
+        interval = now - previous_time
+        if interval > 0 and ((current - previous) * mmap.PAGESIZE / interval > max_bytes_per_s):
+            quiet_since = now
+        previous, previous_time = current, now
+        if now - quiet_since >= quiet_s or now - start >= max_wait_s:
+            return now - start

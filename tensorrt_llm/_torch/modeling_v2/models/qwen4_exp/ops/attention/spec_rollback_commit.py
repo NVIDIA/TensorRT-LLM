@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`SpeculativeRollback`'s staging and commit of a verify step in one launch each.
 
-Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_103__default`,
+Tier 5 (Triton, called by the qwen4_exp target, `qwen3_8_flash_next_nvfp4__sm_10x__default`,
 at every layout). Each `__call__` is one launch of a Triton kernel of this file,
 JIT-compiled on first use for the device it runs on. A verify step runs `p` rows per generation
 request through the trunk; the PLE pools and the QSA planes are written for every row. The staging
@@ -28,7 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import ROW
 
 #: Conv channels a program covers.
@@ -63,17 +64,21 @@ def _stage_kernel(
     STATE: tl.constexpr,
     STATE_BLOCK: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    STAGE_CONV: tl.constexpr = True,
 ):
     i = tl.program_id(0)
     cb = tl.program_id(1)
     slot = tl.load(slots + i).to(tl.int64)
-    c = cb * BLOCK_C + tl.arange(0, BLOCK_C)
-    s = tl.arange(0, STATE_BLOCK)
-    m = (c < channels)[:, None] & (s < STATE)[None, :]
-    vals = tl.load(conv_pool + slot * conv_s0 + c[:, None] * conv_s1 + s[None, :] * conv_s2, mask=m)
-    tl.store(
-        conv_prev + (i.to(tl.int64) * channels + c[:, None]) * STATE + s[None, :], vals, mask=m
-    )
+    if STAGE_CONV:
+        c = cb * BLOCK_C + tl.arange(0, BLOCK_C)
+        s = tl.arange(0, STATE_BLOCK)
+        m = (c < channels)[:, None] & (s < STATE)[None, :]
+        vals = tl.load(
+            conv_pool + slot * conv_s0 + c[:, None] * conv_s1 + s[None, :] * conv_s2, mask=m
+        )
+        tl.store(
+            conv_prev + (i.to(tl.int64) * channels + c[:, None]) * STATE + s[None, :], vals, mask=m
+        )
     if cb == 0:
         w = tl.arange(0, W_BLOCK)
         hist = tl.load(ngram_pool + slot * ngram_stride + w, mask=w < CTX)
@@ -118,6 +123,7 @@ def _commit_kernel(
     STATE_BLOCK: tl.constexpr,
     BLOCK_C: tl.constexpr,
     ROW: tl.constexpr,
+    PREV_IN_POOL: tl.constexpr = False,
 ):
     i = tl.program_id(0)
     cb = tl.program_id(1)
@@ -131,13 +137,22 @@ def _commit_kernel(
     j = a + s
     m = (c < channels)[:, None] & (s < STATE)[None, :]
     from_prev = (j < STATE)[None, :]
-    prev = tl.load(
-        conv_prev + (i64 * channels + c[:, None]) * STATE + j[None, :], mask=m & from_prev
-    )
+    if PREV_IN_POOL:
+        # The pool row still holds the pre-step state: every read lands before any store.
+        prev = tl.load(
+            conv_pool + slot * conv_s0 + c[:, None] * conv_s1 + j[None, :] * conv_s2,
+            mask=m & from_prev,
+        )
+    else:
+        prev = tl.load(
+            conv_prev + (i64 * channels + c[:, None]) * STATE + j[None, :], mask=m & from_prev
+        )
     xin = tl.load(
         conv_x + i64 * x_s0 + (j - STATE).to(tl.int64)[None, :] * x_s1 + c[:, None] * x_s2,
         mask=m & ~from_prev,
     )
+    if PREV_IN_POOL:
+        tl.debug_barrier()
     tl.store(
         conv_pool + slot * conv_s0 + c[:, None] * conv_s1 + s[None, :] * conv_s2,
         tl.where(from_prev, prev, xin),
@@ -197,7 +212,7 @@ class SpecRollbackStage(OpWrapper):
     Fusion boundary: the two reads of the staging; the slots and ids are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request", spec=dict(n=1, p=4)),
         Cell(why="MTP3, 128 requests", spec=dict(n=128, p=4)),
@@ -219,16 +234,21 @@ class SpecRollbackStage(OpWrapper):
     int32 as the call site hands them, slots 0 and 1873 among those read.
     """
 
-    def __call__(self, ngram_pool, conv_pool, slots, ids, p: int):
+    def __call__(self, ngram_pool, conv_pool, slots, ids, p: int, conv: bool = True):
+        """`conv=False` stages the n-gram stream only and returns `(stream, None)`, for a caller
+        whose PLE launch left the conv pool rows unpublished (the commit then reads them in
+        place)."""
         n = slots.shape[0]
         ctx = ngram_pool.shape[1]
         channels, state = conv_pool.shape[1], conv_pool.shape[2]
         stream = torch.empty([n, ctx + p], dtype=ngram_pool.dtype, device=ngram_pool.device)
-        conv_prev = torch.empty(
-            [n, channels, state], dtype=conv_pool.dtype, device=conv_pool.device
+        conv_prev = (
+            torch.empty([n, channels, state], dtype=conv_pool.dtype, device=conv_pool.device)
+            if conv
+            else None
         )
         if n:
-            _stage_kernel[(n, triton.cdiv(channels, _BLOCK_C))](
+            _stage_kernel[(n, triton.cdiv(channels, _BLOCK_C) if conv else 1)](
                 ngram_pool,
                 ngram_pool.stride(0),
                 conv_pool,
@@ -238,7 +258,7 @@ class SpecRollbackStage(OpWrapper):
                 slots,
                 ids,
                 stream,
-                conv_prev,
+                conv_prev if conv else stream,
                 channels,
                 P=p,
                 CTX=ctx,
@@ -246,17 +266,18 @@ class SpecRollbackStage(OpWrapper):
                 STATE=state,
                 STATE_BLOCK=_pow2(state),
                 BLOCK_C=_BLOCK_C,
+                STAGE_CONV=bool(conv),
                 num_warps=4,
             )
         return stream, conv_prev
 
-    def reference(self, ngram_pool, conv_pool, slots, ids, p: int):
+    def reference(self, ngram_pool, conv_pool, slots, ids, p: int, conv: bool = True):
         n = slots.shape[0]
         slots = slots.to(torch.long)
         rows = torch.reshape(ids[: n * p], [n, p]).to(ngram_pool.dtype)
-        return torch.cat([ngram_pool[slots], rows], 1), conv_pool[slots]
+        return torch.cat([ngram_pool[slots], rows], 1), (conv_pool[slots] if conv else None)
 
-    def is_valid(self, ngram_pool, conv_pool, slots, ids, p: int) -> None:
+    def is_valid(self, ngram_pool, conv_pool, slots, ids, p: int, conv: bool = True) -> None:
         assert ngram_pool.dim() == 2 and ngram_pool.stride(1) == 1
         assert ngram_pool.dtype == torch.int64
         assert conv_pool.dim() == 3
@@ -278,7 +299,7 @@ class SpecRollbackCommit(OpWrapper):
     `SpecRollbackStage`, `qsa_rollback_gather` and the position gather produced.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request, 12 planes", spec=dict(n=1, p=4, planes=12)),
         Cell(why="MTP3, 128 requests, 12 planes", spec=dict(n=128, p=4, planes=12)),
@@ -335,6 +356,10 @@ class SpecRollbackCommit(OpWrapper):
         if not n:
             return
         blocks = max(triton.cdiv(channels, _BLOCK_C), index_old.shape[0])
+        # `conv_prev` None: the conv pool rows still hold the pre-step state (read in place).
+        prev_in_pool = conv_prev is None
+        if prev_in_pool:
+            conv_prev = conv_pool
         _commit_kernel[(n, blocks)](
             accepted,
             slots,
@@ -371,6 +396,7 @@ class SpecRollbackCommit(OpWrapper):
             STATE_BLOCK=_pow2(state),
             BLOCK_C=_BLOCK_C,
             ROW=ROW,
+            PREV_IN_POOL=prev_in_pool,
             num_warps=4,
         )
 
@@ -404,6 +430,8 @@ class SpecRollbackCommit(OpWrapper):
         """
         n, p, _ = conv_x.shape
         context, state_len = ngram_pool.shape[1], conv_pool.shape[2]
+        if conv_prev is None:
+            conv_prev = conv_pool[slots.to(torch.long)]
         a = accepted.to(torch.long)
         req = torch.arange(n, device=a.device)
         # Window k of the unfold is the id history after k rows.
@@ -454,11 +482,13 @@ class SpecRollbackCommit(OpWrapper):
             f"stream must be the contiguous [n, context + p] = [{n}, {ngram_pool.shape[1] + p}] "
             f"spec_rollback_stage wrote; got {tuple(stream.shape)}"
         )
-        assert conv_pool.shape[1] == channels and conv_prev.is_contiguous(), (
+        assert conv_pool.shape[1] == channels and (
+            conv_prev is None or conv_prev.is_contiguous()
+        ), (
             "conv_prev must be contiguous (read as packed [n, C, state_len] rows), and conv_pool "
             "as wide as conv_x"
         )
-        assert conv_prev.shape == (n, channels, conv_pool.shape[2]), (
+        assert conv_prev is None or conv_prev.shape == (n, channels, conv_pool.shape[2]), (
             f"conv_prev is {tuple(conv_prev.shape)}, expected {(n, channels, conv_pool.shape[2])}"
         )
         assert position.dim() == 3 and position.shape[2] == 3, (

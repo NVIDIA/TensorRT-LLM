@@ -33,6 +33,22 @@ To verify what's loaded, launch Claude Code under TensorRT-LLM project directory
 and type `/skills` or `/agents` in the Claude Code prompt to see available
 skills and sub-agents.
 
+## Skills published to the NVIDIA skills catalog
+
+Skills that are published to the [NVIDIA skills catalog](https://github.com/NVIDIA/skills)
+live under the repository-root `skills/` directory, because NVSkills CI only
+validates and signs skills there. `.claude/skills/<name>` is a symlink to
+`skills/<name>`, so Claude Code still discovers them; edit them under
+`skills/<name>/`.
+
+Each change to a published skill must be signed again before it reaches the
+catalog. A maintainer comments `/nvskills-ci` on the pull request, and NVSkills
+CI pushes an `Attach NVSkills validation signatures` commit that updates
+`BENCHMARK.md`, `skill-card.md` and `skill.oms.sig`. Do not edit those three
+files by hand, and do not push to the branch after the signature commit
+unless you request a new run. The catalog keeps the last signed version of a
+skill until a newer version is signed.
+
 ## How to use skills and agents
 
 There are two ways to trigger skills and agents:

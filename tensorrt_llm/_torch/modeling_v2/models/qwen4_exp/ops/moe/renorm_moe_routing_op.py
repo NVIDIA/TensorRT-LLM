@@ -3,7 +3,7 @@
 """Renormalized MoE routing: top-k over the raw router logits, then a softmax
 over just those k, in one trtllm call.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at
 every layout."""
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 
-def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16) -> dict:
-    """The checkpoint's router: 512 experts, top-10, bf16 logits."""
+def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16, capture: bool = False) -> dict:
+    """The checkpoint's router: 512 experts, top-10, bf16 logits; `capture`: replayed from a
+    captured CUDA graph over two steps' logits."""
     return dict(
         tokens=tokens,
         num_experts=512,
@@ -25,6 +27,7 @@ def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16) -> dict:
         logits_dtype=torch.bfloat16,
         output_dtype=output_dtype,
         dist="randn",
+        capture=capture,
     )
 
 
@@ -48,7 +51,7 @@ class RenormMoeRoutingOp(OpWrapper):
     expert parallelism -- every column of the row is ranked.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # The trunk pre-routes the trtllm-gen FP4 runner with bf16 weights at every
     # member: tp4/tep4 route every row the rank holds; dep4 routes the
@@ -86,6 +89,20 @@ class RenormMoeRoutingOp(OpWrapper):
             why="coarse logits (3 values): ties decide most of the ranking",
             spec=dict(_ckpt(64), output_dtype=torch.float32, dist="coarse"),
         ),
+        # The FP8 target's routed experts in its captured decode graph (1..128 rows).
+        Cell(
+            why="FP8 target captured attention-DP decode: 8 rows (dep2 2 x 4, dep4 4 x 2)",
+            spec=_ckpt(8, capture=True),
+        ),
+        Cell(
+            why="FP8 target captured decode: 72 rows (batch 72)",
+            spec=_ckpt(72, capture=True),
+        ),
+        Cell(
+            why="FP8 target captured decode: 128 rows, the largest (batch 128; dep2 2 x 64, "
+            "dep4 4 x 32 gathered)",
+            spec=_ckpt(128, capture=True),
+        ),
     )
 
     note = """
@@ -111,7 +128,8 @@ class RenormMoeRoutingOp(OpWrapper):
     every multi-row cell. The bf16 weights of a row sum to 1 within 2.44e-3
     (the rounding of ten weights).
     CUDA-graph replay at 128 rows is bit-exact against the reference on
-    refilled logits (the test holds it).
+    refilled logits (the test holds it), and so is a second step's replay at
+    the `capture` cells.
 
     Preconditions, enforced loudly by the op: `router_logits` 2-D CUDA bf16 /
     fp16 / fp32; `output_dtype` fp32, bf16 or None (fp16 raises even for fp16
@@ -149,8 +167,9 @@ class RenormMoeRoutingOp(OpWrapper):
     NaN and an all `-inf` row poison the row to NaN; a `-inf` among finite
     logits is a soft mask). Row counts between the cells -- dep4's smallest
     gathered decode (4 rows), the MTP3 verify (128 x 4) -- run the same kernel
-    instance on a different grid size and are not cells. Router logits from
-    the checkpoint's own router GEMM were not driven; the cells use randn and
+    instance on a different grid size and are not cells. Not driven under
+    capture: the other captured row counts. Router logits from the
+    checkpoint's own router GEMM were not driven; the cells use randn and
     coarse logits.
     """
 

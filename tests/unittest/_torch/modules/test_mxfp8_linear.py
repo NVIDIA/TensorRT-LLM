@@ -1183,3 +1183,151 @@ def test_mxfp8_loaded_tactic_primes_before_graph_capture(
     graph.replay()
     torch.testing.assert_close(captured, runner(inputs, tactic=tactic), atol=0, rtol=0)
     reloaded._profile_single_kernel.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 prefill GEMM requires SM107",
+)
+@pytest.mark.parametrize(
+    "rows,reject_tile", [(1023, False), (1024, False), (1985, False), (1024, True)]
+)
+@torch.inference_mode()
+def test_sm107_mxfp8_prefill_linear_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    reject_tile: bool,
+) -> None:
+    """The opted-in Linear runs the prefill kernel or native fallback on quantized operands."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+    monkeypatch.delenv("TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER", raising=False)
+    torch.manual_seed(6312)
+    weight, scale = quant_bf16_to_mxfp8(torch.randn(512, 512, dtype=torch.bfloat16) * 0.02, 32)
+    linear = Linear(
+        512,
+        512,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    linear.load_weights([{"weight": weight, "weight_scale_inv": scale}])
+    assert linear.quant_method.use_cutlass
+    linear.use_sm107_mxfp8_prefill_gemm = True
+    inputs = torch.randn(rows, 512, dtype=torch.bfloat16, device="cuda")
+    original = cute_dsl_custom_ops.cute_dsl_mxfp8_prefill_gemm_rubin
+    cute_results = []
+
+    def observe(*args: torch.Tensor) -> torch.Tensor | None:
+        output = original(*args)
+        cute_results.append(output)
+        return output
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "cute_dsl_mxfp8_prefill_gemm_rubin", observe)
+    # Enumeration is never needed, even on the first shape or a rejected tile.
+    monkeypatch.setattr(
+        cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear,
+        "get_valid_tactics",
+        Mock(side_effect=AssertionError("Full tactic enumeration")),
+    )
+    if reject_tile:
+        monkeypatch.setattr(
+            cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear.kernel_class,
+            "can_implement",
+            staticmethod(lambda *args: False),
+        )
+    actual = linear(inputs)
+    assert len(cute_results) == int(rows >= 1024)
+    if cute_results:
+        assert (cute_results[0] is None) == reject_tile
+    if reject_tile:
+        linear.use_sm107_mxfp8_prefill_gemm = False
+        torch.testing.assert_close(actual, linear(inputs), atol=0, rtol=0)
+    quantized, packed = mxfp8_quantize_activation(inputs)
+    plain = unswizzle_sf(packed, ((rows + 127) // 128) * 128, 512, 32)[:rows, :16]
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = (
+            dequant_mxfp8_weight(quantized, plain).float()
+            @ dequant_mxfp8_weight(weight.cuda(), scale.cuda()).float().T
+        )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 native O-B GEMM requires SM107",
+)
+@pytest.mark.parametrize("rows", [1024, 1985, 2048])
+@torch.inference_mode()
+def test_sm107_mxfp8_o_b_loaded_tactic_graph(monkeypatch, tmp_path, rows):
+    """A loaded native winner primes before capture and consumes changed values and scales."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
+    from tensorrt_llm._torch.custom_ops.mxfp8_gemm import Sm107MXFP8GemmRunner
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    def dequantize(values, scales):
+        m, k = values.shape
+        plain = unswizzle_sf(scales, ((m + 127) // 128) * 128, k, 32)[:m, : k // 32]
+        return dequant_mxfp8_weight(values, plain)
+
+    inputs = _mxfp8_swapab_inputs(rows, 5120, 8192)
+    native = Sm107MXFP8GemmRunner(torch.bfloat16)
+    tactics = native.get_valid_tactics(inputs, None)
+    assert len(tactics) == 1
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16, ("cutedsl_sm107",))
+    tuner = AutoTuner()
+    key = tuner.profiling_cache.get_cache_key(
+        custom_ops_module._MXFP8_GEMM_AUTOTUNED_OP,
+        runner,
+        tuple(x.shape for x in inputs),
+        runner.tuning_config,
+    )
+    tuner.profiling_cache[key] = (0, ("cutedsl_sm107", tactics[0]), 0.1)
+    path = tmp_path / "sm107-o-b.json"
+    tuner.profiling_cache.save_cache(path, rank=0)
+    reloaded = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", reloaded)
+    reloaded.profiling_cache.load_cache(path, rank=0)
+    monkeypatch.setattr(
+        reloaded, "_profile_single_kernel", Mock(side_effect=AssertionError("Retuning"))
+    )
+    monkeypatch.setattr(cute_dsl_custom_ops.CuteDSLMXFP8RubinLinear, "kernel_cache", {})
+    monkeypatch.setattr(Sm107MXFP8GemmRunner, "_ALPHA", {})
+    selected = []
+    original_forward = Sm107MXFP8GemmRunner.forward
+
+    def observe_forward(self, operands: list[torch.Tensor], tactic=-1) -> torch.Tensor:
+        selected.append(tactic)
+        return original_forward(self, operands, tactic=tactic)
+
+    monkeypatch.setattr(Sm107MXFP8GemmRunner, "forward", observe_forward)
+    with flashinfer_mxfp8_autotune():
+        custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    assert any(key[1] == "MXFP8GemmUnifiedRunner" for key in reloaded._primed_cached_tactics)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = custom_ops_module.mxfp8_gemm_autotuned(
+            *inputs, torch.bfloat16, ("cutedsl_sm107",)
+        )
+    changed = _mxfp8_swapab_inputs(rows, 5120, 8192)
+    assert not torch.equal(inputs[0].view(torch.uint8), changed[0].view(torch.uint8))
+    for destination, source in zip(inputs, changed):
+        destination.copy_(source)
+    graph.replay()
+    eager = custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, ("cutedsl_sm107",))
+    assert torch.equal(captured.view(torch.uint8), eager.view(torch.uint8))
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = dequantize(*inputs[:2]) @ dequantize(*inputs[2:]).T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    torch.testing.assert_close(captured.float(), expected, atol=2e-2, rtol=2e-2)
+    assert selected and all(tactic == tactics[0] for tactic in selected)
+    reloaded._profile_single_kernel.assert_not_called()

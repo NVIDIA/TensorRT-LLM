@@ -445,8 +445,9 @@ def test_metadata_helper_keeps_native_constructor_kwargs(explicit_false):
     model, kwargs = _metadata_inputs(NativeMetadata)
     if explicit_false:
         kwargs["enable_ragged_verification"] = False
-    metadata_module.build_attention_metadata(model, **kwargs)
+    metadata_module.build_attention_metadata(model, max_total_draft_tokens=5, **kwargs)
 
+    assert "max_total_draft_tokens" not in seen[0]
     assert "enable_ragged_verification" not in seen[0]
     assert seen[0]["max_num_heads_per_kv"] == 4
 
@@ -479,19 +480,23 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
             self.enable_ragged_verification = kwargs.pop("enable_ragged_verification", False)
             self.kv_cache_manager = kwargs["kv_cache_manager"]
             self.ragged_verify_lens = None
-            seen.append(self.enable_ragged_verification)
+            seen.append((self.enable_ragged_verification, kwargs["max_total_draft_tokens"]))
 
     model, kwargs = _metadata_inputs(MetadataProbe)
     decoder = object.__new__(DecoderMetadata)
     decoder.attn_metadata = None
     decoder.model = SimpleNamespace(model_config=model)
     decoder._config = SimpleNamespace(
-        **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=enabled)
+        **kwargs,
+        max_total_draft_tokens=5,
+        spec_config=SimpleNamespace(enable_confidence_scheduling=enabled),
     )
     decoder.mapping = kwargs["mapping"]
     decoder._attention_runtime_features = kwargs["attention_runtime_features"]
     decoder._buffers = SimpleNamespace(cache_indirection=None)
-    monkeypatch.setattr(decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model: None)
+    monkeypatch.setattr(
+        decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model, _manager=None: None
+    )
     kv = object()
 
     result = decoder.setup_attention(kv)
@@ -499,9 +504,9 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
         result.ragged_verify_lens = [1, 2]
     result._validate_ragged_verification()
 
-    assert seen == [enabled]
+    assert seen == [(enabled, 5)]
     assert decoder.setup_attention(kv) is result
-    assert seen == [enabled]
+    assert seen == [(enabled, 5)]
 
 
 @pytest.mark.parametrize("graph_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])

@@ -229,6 +229,7 @@ def test_populate_before_stage_matches_the_upload(uniform):
             top_p=1.0,
             min_p=0.0,
             is_greedy=False,
+            is_temperature_only=True,
             seed=request_random_seed(request),
         )
     b = len(requests)

@@ -60,6 +60,7 @@ def _penalty_mapping_meta(
         verify_lens=None,
         qo_indptr=None,
         total_verify_tokens=None,
+        rejection_sample_method="standard",
     )
     if verify_lens is not None:
         lens = torch.tensor(verify_lens, dtype=torch.int32)
@@ -157,7 +158,7 @@ def test_occurrence_penalty_applies_to_ragged_packed_rows(monkeypatch):
     logits = torch.zeros((7, 3))
     draft_tokens = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]])
 
-    penalized = _make_worker()._apply_occurrence_penalties(
+    penalized = _make_worker()._edit_target_logits(
         logits, draft_tokens, num_contexts=1, batch_size=3, spec_metadata=metadata
     )
 

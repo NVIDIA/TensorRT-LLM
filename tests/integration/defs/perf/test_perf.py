@@ -90,10 +90,12 @@ DEEPSEEK_V41_MODELS = {
     "deepseek_v41_flash_nvfp4_dspark",
 }
 GLM53_FLASH_NVFP4_MODELS = {
+    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
     "glm_5.3_flash_nvfp4",
     "glm_5.3_flash_nvfp4_mtp",
 }
 QWEN38_MTP_MODELS = {
+    "qwen3.8_flash_next_fp8_mtp_tep4",
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
     "qwen3.8_flash_next_fp4_mtp",
@@ -103,6 +105,10 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    "kimi_k3_nvfp4_dep8",
+    "minimax_m3.1_flash_nvfp4",
+    "minimax_m3.1_flash_nvfp4_dspark",
+    "muse_spark_open_nvfp4_agentx",
     *GLM53_FLASH_NVFP4_MODELS,
     *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
@@ -111,12 +117,17 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_super_120b_fp8",
     "nemotron_3_ultra_550b_nvfp4",
     "glm_5.3_fp8",
     "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
+    "qwen3.8_27b",
+    "qwen3.8_27b_fp4",
+    "qwen3.8_flash_next_fp4",
+    "qwen3.8_flash_next_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_3.5_lightning_30b_nvfp4_mtp",
@@ -160,6 +171,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "minimax_m3.1_flash_nvfp4_dspark",
     "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
@@ -883,7 +895,7 @@ class PerfTestConfig:
         if self.is_bert_like():
             assert len(self.output_lens
                        ) == 0, f"BERT-like models must not have output_lens!"
-        else:
+        elif self.model_name != "muse_spark_open_nvfp4_agentx":
             assert len(
                 self.output_lens
             ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
@@ -1070,7 +1082,52 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._gpu_clock_lock = gpu_clock_lock
 
     def get_trtllm_bench_model(self):
-        return get_model_dir(self._config.model_name)
+        model_dir = get_model_dir(self._config.model_name)
+        if self._config.model_name == "glm_5.3_flash_nvfp4_mtp_bf16_kv":
+            return self._prepare_bf16_kv_checkpoint(model_dir)
+        return model_dir
+
+    def _prepare_bf16_kv_checkpoint(self, model_dir: str) -> str:
+        """Keep checkpoint weight quantization while disabling KV quantization.
+
+        The shared GLM export declares FP8 KV. The loader's ``auto`` preserves
+        that metadata and it rejects an explicit ``bfloat16`` override. Use a
+        workspace-local view with amended JSON metadata and symlinked weights.
+        """
+
+        def clear_kv_quantization(config: dict) -> None:
+            for key, value in config.items():
+                if key in {"kv_cache_quant_algo", "kv_cache_scheme"}:
+                    config[key] = None
+                elif isinstance(value, dict):
+                    clear_kv_quantization(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            clear_kv_quantization(item)
+
+        checkpoint = os.path.join(self._get_engine_dir(), "bf16-kv-model")
+        os.makedirs(checkpoint, exist_ok=True)
+        for name in os.listdir(model_dir):
+            source = os.path.join(model_dir, name)
+            destination = os.path.join(checkpoint, name)
+            if name in {
+                    "config.json", "hf_quant_config.json", "quant_cfg.json"
+            }:
+                with open(source) as f:
+                    config = json.load(f)
+                if name == "config.json":
+                    dtype = config.get("dtype", config.get("torch_dtype"))
+                    if dtype not in {"bfloat16", "bf16"}:
+                        raise ValueError(
+                            "The GLM BF16-KV recipe requires a BF16 checkpoint; "
+                            f"found dtype={dtype!r}")
+                clear_kv_quantization(config)
+                with open(destination, "w") as f:
+                    json.dump(config, f)
+            elif not os.path.lexists(destination):
+                os.symlink(os.path.abspath(source), destination)
+        return checkpoint
 
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
@@ -1466,6 +1523,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                         output_len,
                                         real_dataset_path: str = ""):
         model_dir = self.get_trtllm_bench_model()
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            return [
+                "env",
+                "AGENTX_DURATION=3600",
+                # Cover warmup, benchmark grace, and dataset preparation.
+                "AGENTX_TIMEOUT_GRACE=2400",
+                "AGENTX_MAX_CTX=1048576",
+                "AGENTX_WARMUP_PER_LANE=10",
+                "AGENTX_EXTRA_ARGS=--benchmark-grace-period 30 "
+                "--warmup-grace-period 1800 --num-dataset-entries 393",
+                "python",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "agentx_client.py"),
+                "--model",
+                model_dir,
+                "--concurrency",
+                str(self._config.concurrency),
+                "--dataset",
+                "semianalysis_cc_traces_weka_062126",
+                "--artifact-dir",
+                os.path.join(self._output_dir, "agentx"),
+            ]
         client_cmd = [
             "python",
             "-m",
@@ -1564,6 +1643,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         reuse would then serve their prefixes to the measured requests. If the
         source has no articles to spare, the client gets no pass.
         """
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            # AgentX owns the scenario warmup and measured duration.
+            return None
         if not warmup_pass_enabled():
             return None
         num_requests = one_wave_requests(self._config.concurrency,
@@ -1616,7 +1698,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
-                    output_len = self._config.output_lens[len_idx]
+                    output_len = (self._config.output_lens[len_idx]
+                                  if self._config.output_lens else None)
                     real_dataset_path = ""
                     if self._config.model_name in SPEC_DEC_REAL_DATASET_MODELS:
                         dataset_source = SPEC_DEC_REAL_DATASET_MODELS[
@@ -1658,7 +1741,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
                                None)
                 server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
-            if self._config.model_name in QWEN38_MTP_MODELS:
+            if self._config.model_name in {
+                    "kimi_k3_nvfp4_dep8",
+                    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
+                    "minimax_m3.1_flash_nvfp4",
+                    "minimax_m3.1_flash_nvfp4_dspark",
+                    "muse_spark_open_nvfp4_agentx",
+            }:
+                server_timeout = 5400
+            elif self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
@@ -2018,8 +2109,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         for bs in self._config.batch_sizes:
             for len_idx, input_len in enumerate(self._config.input_lens):
                 cmd_idx += 1
-                output_len = None if self._config.is_bert_like(
-                ) else self._config.output_lens[len_idx]
+                output_len = (self._config.output_lens[len_idx]
+                              if self._config.output_lens else None)
 
                 # Get list of metrics depending on config.
                 if self._config.runtime == "serve":
