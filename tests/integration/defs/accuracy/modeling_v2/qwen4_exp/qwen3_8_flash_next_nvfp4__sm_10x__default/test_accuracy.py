@@ -451,8 +451,20 @@ _DEP8 = dict(
 # the host-indexed Lamport round trip; SM103 only). Then the whole attention-DP stack the AgentX
 # front points run, every opt-in form together on top of the default ones (host-indexed Lamport
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
-# widest; SM103 only), at dep4 and at dep8 (two nodes of one rack).
-_DP_FRONT_STACK = dict(lamport="lamport_step", router_front=True, out_proj_bf16="all", dp_rows=True)
+# widest on the bitmap-union verify kernel, the e4m3 index anchors, and the dep follow-ups'
+# forms above; SM103 only), at dep4 and at dep8 (two nodes of one rack; there with the
+# heads' group over the NVLink domain and the low-row floors at 2 requests a rank, as the dep8
+# front ran them).
+_DP_FRONT_STACK = dict(
+    lamport="lamport_step",
+    router_front=True,
+    out_proj_bf16="all",
+    dp_rows=True,
+    dp_bitmap=True,
+    dp_opt_in=True,
+    index_key_fp8=True,
+)
+_DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True)
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -516,7 +528,7 @@ _QUANTIZED_KV = [
     pytest.param(
         _DEP8,
         "fp8",
-        _DP_FRONT_STACK,
+        _DP8_FRONT_STACK,
         id="dep8_fp8_kv_front_stack",
         marks=[
             skip_not_in_a_world_across_nodes,
@@ -1006,6 +1018,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 ("DRAFT_O_MID", "1"),
             ):
                 env[f"TRTLLM_QWEN4_EXP_DP_{name}"] = value
+        if variant.get("dp8_domain"):
+            env["TRTLLM_QWEN4_EXP_DP_HEAD_SHARD_GROUP"] = "domain"
+            env["TRTLLM_QWEN4_EXP_DP_LOWROWS"] = "2"
         if variant.get("dp_rows"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
