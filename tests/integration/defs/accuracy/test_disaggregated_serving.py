@@ -39,7 +39,8 @@ import requests
 import yaml
 from datasets import load_dataset
 from defs.common import single_host_ucx_env, wait_for_reported_addr
-from test_common.disagg_timeout import configure_weight_loading
+from test_common.disagg_timeout import (checked_worker_command,
+                                        configure_weight_loading)
 from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
                                      sm100f_moe_tactic_or_cutlass)
 
@@ -506,6 +507,8 @@ def launch_disaggregated_llm(
         log_files = []
         try:
             for i, (env, args) in enumerate(server_configs):
+                if server_name in ("ctx", "gen"):
+                    args = checked_worker_command(args, env)
                 if enable_redirect_log:
                     log_path = os.path.join(temp_dir.name,
                                             f"output_{server_name}_{i}.log")

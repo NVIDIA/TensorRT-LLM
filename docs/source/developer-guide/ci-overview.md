@@ -237,8 +237,8 @@ Selected disaggregated cases in L0 pre-merge and post-merge use
 
 The opt-in markers on individual tests define the loading budgets. Set
 `TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT` to a positive number of seconds to override
-them. Selected standalone tests specify their execution budgets explicitly so
-Jenkins can provide a larger group timeout.
+the loading budget for every marked test. Selected standalone tests specify
+their execution budgets explicitly so Jenkins can provide a larger group timeout.
 
 After all ranks have loaded, the harness applies the test's service readiness
 limit within the execution budget. This lets the harness report a readiness
@@ -249,11 +249,13 @@ coordinator launches.
 This version supports one cluster launch per test attempt and single-host
 PyTorch workers with the main/one-model checkpoint. It does not separate the
 loading of an additional external draft model or later worker reloads. Each
-attempt has its own shared state directory; ranks publish atomic completion
-events rather than parsed progress bars. Concurrent rank durations are not
-added. Some initialization precedes or overlaps loading and is consequently
-within the first budget. A fresh runtime wheel built from the same checkout is
-required; changing test sources alone does not install the completion signal.
+attempt has its own shared state directory. The runtime's startup timer publishes
+an atomic `model_weight_loading` completion event for each rank that finishes
+loading successfully. The phase boundary uses the last event on the shared
+host clock. Some initialization precedes or overlaps loading and is included in
+the first budget. Supervised workers check the selected TensorRT-LLM wheel for
+startup event support before importing the runtime. Build the wheel from the
+same checkout as the tests.
 
 Use `--timeout-method=thread` with a whole-test pytest timeout to enable the
 supervisor. It emits `[disagg-timeout] phase=weight_loading` and

@@ -107,6 +107,7 @@
 /tests/integration/test_lists/qa @NVIDIA/trt-llm-qa
 /tests/integration/test_lists/qa/llm_perf_* @NVIDIA/trt-llm-qa-perf
 /tests/integration/test_lists/qa/functional/ @NVIDIA/trt-llm-qa-function
+/tests/test_common/disagg_timeout.py @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-disagg-devs
 
 # ===== RUNTIME =====
 /cpp/include/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs

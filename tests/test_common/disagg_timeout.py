@@ -15,14 +15,15 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from pathlib import Path
 
 import pytest
 from pytest_timeout import Settings
 
 _ATTEMPT_ENV = "TRTLLM_TEST_DISAGG_TIMEOUT_DIR"
-_WORKER_ENV = "TRTLLM_TEST_WEIGHT_LOADING_DIR"
+_WORKER_ENV = "TRTLLM_STARTUP_EVENT_DIR"
+_WEIGHT_LOADING_PHASE = "model_weight_loading"
 _LOADING_OVERRIDE = "TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT"
 _MARKER = "disagg_weight_loading"
 PLUGIN_NAME = "disagg-weight-loading-timeout"
@@ -30,6 +31,44 @@ _LOADING_BUDGET = pytest.StashKey[float]()
 _WATCHDOG = pytest.StashKey["_Watchdog"]()
 _SETTINGS = pytest.StashKey[Settings]()
 _ReportTimeout = Callable[[pytest.Item, float], None]
+
+# Check the package in the same interpreter that will call the console entry
+# point. Finding the submodule directly avoids importing the CUDA runtime.
+_CHECKED_SERVE = """\
+from importlib.machinery import PathFinder
+from importlib.util import find_spec
+import sys
+
+# Match the installed console script's import behavior outside its bin dir.
+if sys.path and sys.path[0] == "":
+    sys.path.pop(0)
+
+package = find_spec("tensorrt_llm")
+if (package is None or not package.submodule_search_locations or
+        PathFinder.find_spec("tensorrt_llm._startup_events",
+                             package.submodule_search_locations) is None):
+    sys.exit("Disaggregated weight-loading supervision requires startup phase events. "
+             "Install a TensorRT-LLM wheel built from this checkout.")
+
+from tensorrt_llm.commands.serve import main
+sys.argv[0] = "trtllm-serve"
+sys.exit(main())
+"""
+
+
+def checked_worker_command(args: list[str], env: Mapping[str, str]) -> list[str]:
+    """Wrap an opted-in worker's serve entry point with a runtime capability check.
+
+    Args:
+        args: The trtllm-serve command and its arguments.
+        env: The same environment passed to the worker subprocess.
+
+    Returns:
+        The command to run in the worker subprocess.
+    """
+    if os.environ.get(_ATTEMPT_ENV) and env.get(_WORKER_ENV):
+        return ["python3", "-c", _CHECKED_SERVE, *args[1:]]
+    return args
 
 
 def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> ReadinessBudget | None:
@@ -62,7 +101,10 @@ def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> Readi
         directory = root / f"worker-{index}"
         directory.mkdir()
         env[_WORKER_ENV] = str(directory)
-        expected.extend(f"worker-{index}/rank-{rank}.done" for rank in range(world_size))
+        expected.extend(
+            f"{directory.name}/{_WEIGHT_LOADING_PHASE}.rank-{rank}.done"
+            for rank in range(world_size)
+        )
     if not expected:
         raise ValueError("At least one worker rank is required")
     temporary = root / "expected.tmp"
@@ -119,7 +161,16 @@ class ReadinessBudget:
         self.safety_timeout = math.ceil(safety_timeout)
 
     def remaining(self, wait_start: float, timeout: float, now: float) -> float | None:
-        """Check the deadline and return seconds remaining, or None while loading."""
+        """Check the deadline and return seconds remaining, or None while loading.
+
+        Args:
+            wait_start: Host monotonic timestamp when readiness polling started.
+            timeout: Readiness budget in seconds.
+            now: Current host monotonic timestamp.
+
+        Raises:
+            TimeoutError: The cluster did not become ready before its deadline.
+        """
         completed_at = self._completions.completed_at()
         if completed_at is None:
             return None
@@ -245,7 +296,12 @@ class _Watchdog:
 
 
 def can_supervise(item: pytest.Item, settings: Settings) -> bool:
-    """Whether the marked item uses pytest-timeout's whole-item thread mode."""
+    """Whether the marked item uses pytest-timeout's whole-item thread mode.
+
+    Args:
+        item: The pytest test item.
+        settings: Its resolved pytest-timeout settings.
+    """
     uses_thread = settings.method == "thread" or (
         settings.method == "signal" and threading.current_thread() is not threading.main_thread()
     )
@@ -258,7 +314,7 @@ def can_supervise(item: pytest.Item, settings: Settings) -> bool:
 
 
 def is_supervised(item: pytest.Item) -> bool:
-    """Whether the disagg watchdog owns this item's timeout."""
+    """Whether the disagg watchdog owns the pytest test item's timeout."""
     return item.get_closest_marker(_MARKER) is not None and _SETTINGS in item.stash
 
 
@@ -337,7 +393,12 @@ def _positive_seconds(item: pytest.Item, setting: str, value: object) -> float:
 
 
 def register(config: pytest.Config, report_timeout: _ReportTimeout | None = None) -> None:
-    """Register once from the integration conftest."""
+    """Register once from the integration conftest.
+
+    Args:
+        config: Pytest session configuration.
+        report_timeout: Optional callback for evidence and traceback reporting.
+    """
     config.addinivalue_line(
         "markers", "disagg_weight_loading(seconds): separate loading and post-loading budgets"
     )

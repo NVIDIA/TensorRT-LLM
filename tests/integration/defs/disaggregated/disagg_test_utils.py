@@ -33,6 +33,7 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import single_host_ucx_env
 from defs.conftest import is_sm_100f
+from test_common.disagg_timeout import checked_worker_command
 
 from tensorrt_llm.logger import logger
 
@@ -202,7 +203,9 @@ def _run_worker(
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
         return ProcessWrapper(
-            subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
+            subprocess.Popen(
+                checked_worker_command(cmd, env), env=env, stdout=stdout, stderr=stderr
+            ),
             log_file=log_file,
             log_path=log_path,
             port=port,

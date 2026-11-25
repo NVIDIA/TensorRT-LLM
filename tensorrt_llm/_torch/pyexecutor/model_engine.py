@@ -4,11 +4,12 @@
 import functools
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
@@ -37,7 +38,6 @@ from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..tensor_lru_cache import TensorLRUCache
-from ._weight_loading import notify_weight_loading_complete
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import plan_cuda_graphs
@@ -138,6 +138,7 @@ class ModelEngine:
         checkpoint_loader: BaseCheckpointLoader | None = None,
         model_weights_memory_tag: str | None = None,
         model_weights_restore_mode=None,
+        startup_timer: _StartupTimer | None = None,
     ):
         # cleanup() also runs on an engine whose construction failed part-way.
         self._cleanup_done = False
@@ -158,6 +159,7 @@ class ModelEngine:
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
+            startup_timer=startup_timer,
         )
         if not self.model.model_config.is_generation:
             raise ValueError(
@@ -276,6 +278,7 @@ class ModelEngine:
         checkpoint_loader: BaseCheckpointLoader | None,
         model_weights_memory_tag: str | None,
         model_weights_restore_mode,
+        startup_timer: _StartupTimer | None = None,
     ) -> None:
         """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: BaseMoeLoadBalancer | None = None
@@ -291,10 +294,15 @@ class ModelEngine:
                 model_weights_restore_mode=model_weights_restore_mode,
             )
             # Open checkpoint and load the LLM module object.
-            self.model, moe_load_balancer = self.model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
+            load_phase = (
+                startup_timer.phase("model_weight_loading", completion_rank=self.mapping.rank)
+                if startup_timer is not None
+                else nullcontext()
             )
-            notify_weight_loading_complete(self.mapping.rank)
+            with load_phase:
+                self.model, moe_load_balancer = self.model_loader.load(
+                    checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
+                )
             if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:

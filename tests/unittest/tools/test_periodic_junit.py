@@ -105,7 +105,7 @@ def _close(reporter: PeriodicJUnitXML) -> None:
     """Stop the watchdog and close the sidecar file."""
     # Timer.cancel() only stops a callback that has not started yet, so capture the
     # timer before _cancel_hang_timer() drops the reference and join it -- otherwise
-    # an in-flight _dump_hang() would write into the file closed below.
+    # an in-flight dump_hang() would write into the file closed below.
     timer = reporter._hang_timer
     reporter._cancel_hang_timer()
     if timer is not None:

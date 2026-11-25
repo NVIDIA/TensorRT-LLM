@@ -106,7 +106,12 @@ class _PytestTimeoutEvidencePlugin:
             _emit_timeout_event(_TIMEOUT_ATTEMPT_MARKER, item, attempt)
 
     def emit_timeout(self, item: "Item", timeout: float) -> None:
-        """Preserve exact attempt evidence for a custom timeout supervisor."""
+        """Preserve exact attempt evidence for a custom timeout supervisor.
+
+        Args:
+            item: The pytest test item whose timeout expired.
+            timeout: The expired timeout budget in seconds.
+        """
         _emit_timeout_event(_TIMEOUT_EVIDENCE_MARKER, item,
                             self._attempts.get(item.nodeid, 1), timeout)
 
@@ -166,14 +171,19 @@ class _PytestTimeoutEvidencePlugin:
 
 
 def report_test_timeout(item: "Item", timeout: float) -> None:
-    """Record timeout evidence and dump stacks for the active test."""
+    """Record timeout evidence and dump stacks for the active test.
+
+    Args:
+        item: The pytest test item whose timeout expired.
+        timeout: The expired timeout budget in seconds.
+    """
     manager = item.config.pluginmanager
     evidence = manager.getplugin(_TIMEOUT_EVIDENCE_PLUGIN_NAME)
     if evidence is not None:
         evidence.emit_timeout(item, timeout)
     reporter = manager.getplugin("periodic_junit")
     if reporter is not None:
-        reporter._dump_hang(item.nodeid)
+        reporter.dump_hang(item.nodeid)
 
 
 def register_pytest_timeout_evidence(config) -> None:
@@ -612,8 +622,12 @@ class PeriodicJUnitXML:
         except (TypeError, ValueError):
             return None
 
-    def _dump_hang(self, nodeid: str) -> None:
-        """Write every thread's stack to the sidecar file (called from the timer)."""
+    def dump_hang(self, nodeid: str) -> None:
+        """Write every thread's stack to the sidecar file.
+
+        Args:
+            nodeid: The pytest node ID of the hung test.
+        """
         if self._hang_file is None:
             return
         try:
@@ -658,7 +672,7 @@ class PeriodicJUnitXML:
         # subsecond timeout had already killed the test.
         dump_after = timeout * self.hang_dump_fraction
         timer = threading.Timer(dump_after,
-                                self._dump_hang,
+                                self.dump_hang,
                                 args=(item.nodeid, ))
         timer.daemon = True
         with self._hang_lock:

@@ -1118,6 +1118,7 @@ def _create_py_executor(
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
+            startup_timer=_startup_timer,
         )
         model_engine_slot[0] = model_engine
 
