@@ -70,6 +70,7 @@ def _replace_at_worker_on_background_error(response):
         frontend_result_queues=None,
         result_queue=SimpleNamespace(put=sent.extend),
         _pop_result=lambda client_id: None,
+        _rank_failure_requests=None,
     )
     worker._has_background_error = MethodType(BaseWorker._has_background_error, worker)
     worker._create_error_response = MethodType(BaseWorker._create_error_response, worker)
