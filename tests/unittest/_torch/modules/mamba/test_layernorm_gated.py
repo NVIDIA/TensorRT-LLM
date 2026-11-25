@@ -470,6 +470,14 @@ class TestRMSNormBasic:
         """Tiles are tall enough for whole 16-byte loads of x and z, and at least 4 rows."""
         assert layernorm_gated._multirow_rows(N, dtype.itemsize) == expected_rows
 
+    def test_taller_tiles_start_at_the_row_threshold(self) -> None:
+        """Inputs with fewer than _MULTIROW_TALL_MIN_ROWS rows keep 4-row tiles."""
+        threshold = layernorm_gated._MULTIROW_TALL_MIN_ROWS
+        x = torch.empty(threshold, 128, device="cuda", dtype=torch.bfloat16)
+        for num_rows, rows in ((threshold - 1, layernorm_gated._MULTIROW_ROWS), (threshold, 8)):
+            tile = layernorm_gated._multirow_tile(x[:num_rows], num_rows, 128, True)
+            assert tile["ROWS"] == rows
+
     @pytest.mark.parametrize(
         "N,dtype",
         [
@@ -489,7 +497,8 @@ class TestRMSNormBasic:
         from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 
         device = "cuda"
-        heads, num_tokens = 4, 1031
+        heads = 4
+        num_tokens = triton.cdiv(layernorm_gated._MULTIROW_TALL_MIN_ROWS, heads) + 7
         num_rows = heads * num_tokens
         assert layernorm_gated._multirow_rows(N, dtype.itemsize) > layernorm_gated._MULTIROW_ROWS
         torch.manual_seed(17)

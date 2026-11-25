@@ -137,13 +137,16 @@ def _layer_norm_fwd_1pass_kernel(
 # Rows per tile of the multi-row gated-RMSNorm kernel. At the GDN decode
 # shape (thousands of 128-element rows) one row per CTA leaves the kernel
 # launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
-# reduction order (bitwise-identical output) at ~2x the throughput. Shorter
-# rows take taller tiles, so every thread loads whole 16-byte vectors of x and
-# z, and add each row in the 4-row tile's order (_row_sum_sq), so every tile
-# height gives the same output bits.
+# reduction order (bitwise-identical output) at ~2x the throughput. From
+# _MULTIROW_TALL_MIN_ROWS rows, shorter rows take taller tiles, so every thread
+# loads whole 16-byte vectors of x and z, and add each row in the 4-row tile's
+# order (_row_sum_sq), so every tile height gives the same output bits. Fewer
+# rows keep 4-row tiles, whose larger grids run faster on inputs too small to
+# fill the GPU.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+_MULTIROW_TALL_MIN_ROWS = 12288
 
 
 def _multirow_rows(N: int, element_size: int) -> int:
@@ -366,16 +369,18 @@ _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 _multirow_variants_with_siblings = set()
 
 
-def _multirow_tile(x, stride_x, contig):
-    """ROWS and _row_sum_sq's layout constants for x's rows.
+def _multirow_tile(x, M, stride_x, contig):
+    """ROWS and _row_sum_sq's layout constants for M rows of x.
 
     A taller tile adds in the 4-row tile's order only when each thread holds
     whole 16-byte vectors of x, which Triton emits only for 16-byte aligned
-    rows; other rows keep 4-row tiles.
+    rows; other rows, and fewer than _MULTIROW_TALL_MIN_ROWS rows, keep 4-row
+    tiles.
     """
     N = x.shape[1]
     rows = _multirow_rows(N, x.element_size())
-    if x.data_ptr() % 16 != 0 or not (contig or stride_x % 16 == 0):
+    if (M < _MULTIROW_TALL_MIN_ROWS or x.data_ptr() % 16 != 0
+            or not (contig or stride_x % 16 == 0)):
         rows = _MULTIROW_ROWS
     split = 1
     if rows > _MULTIROW_ROWS:
@@ -432,10 +437,11 @@ def _launch_multirow_kernel(x,
     one of them, while every request in flight waits. So the first launch of a
     variant also compiles its siblings, the same call with the other values
     of these flags. GROUPS changes only from _MULTIROW_GROUPS_MIN_ROWS rows,
-    which a warmup of the largest batch reaches; the siblings of a grouped
-    launch include the same call with one tile per program, which smaller
-    batches run. (Under torch.compile the launch is traced, not run, so there
-    is no variant to pair.)
+    and ROWS from _MULTIROW_TALL_MIN_ROWS rows, which a warmup of the largest
+    batch reaches; the siblings of a grouped or taller-tile launch include the
+    same call with single 4-row tiles, which smaller batches run. (Under
+    torch.compile the launch is traced, not run, so there is no variant to
+    pair.)
 
     The row strides are compile keys too (== 1, % 16, and CONTIG), and a
     one-token batch can change them: PyTorch gives a dimension of size 1 the
@@ -446,7 +452,7 @@ def _launch_multirow_kernel(x,
     M, N = x.shape
     stride_x, stride_y = x.stride(0), y.stride(0)
     contig = stride_x == N and stride_y == N
-    tile = _multirow_tile(x, stride_x, contig)
+    tile = _multirow_tile(x, M, stride_x, contig)
     rows = tile["ROWS"]
     groups = (_MULTIROW_GROUPS if grouped and M >= _MULTIROW_GROUPS_MIN_ROWS
               and rows == _MULTIROW_ROWS else 1)
@@ -484,9 +490,11 @@ def _launch_multirow_kernel(x,
                                    kwargs,
                                    device_index,
                                    launched=(launch_with_pdl, even))
-        if groups != 1:
-            # Fewer rows run one tile per program.
-            one_tile = dict(kwargs, GROUPS=1)
+        if groups != 1 or rows != _MULTIROW_ROWS:
+            # Fewer rows run single 4-row tiles.
+            one_tile = dict(kwargs,
+                            GROUPS=1,
+                            **_multirow_tile(x, 1, stride_x, contig))
             _compile_multirow_siblings(args, one_tile, device_index)
         # One token: `heads` rows, dense x and y rows when that is one row,
         # and a dense gate. All four of its variants are compiled, so that
@@ -500,7 +508,8 @@ def _launch_multirow_kernel(x,
                 dict(kwargs,
                      GROUPS=1,
                      CONTIG=contig,
-                     **_multirow_tile(x, one_token[0], contig)), device_index)
+                     **_multirow_tile(x, heads, one_token[0],
+                                      contig)), device_index)
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
