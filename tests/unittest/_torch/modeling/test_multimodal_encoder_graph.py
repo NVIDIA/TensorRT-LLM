@@ -1127,3 +1127,37 @@ def test_dummy_padding_isolates_real_tokens(cuda_device, make_cuda_runner):
     )
     captured_meta = runner._captured[captured_key].metadata
     assert captured_meta.seq_lens_cuda.tolist() == padded_seq_lengths
+
+
+@pytest.mark.cpu_only
+def test_batched_encoder_graph_masks_unused_items_and_time():
+    from tensorrt_llm._torch.models.multimodal_encoder_graph import BatchedEncoderGraphIOAdapter
+
+    inputs = {
+        "features": torch.ones(2, 350, 2),
+        "attention_mask": torch.ones(2, 350, dtype=torch.bool),
+    }
+    adapter = BatchedEncoderGraphIOAdapter(inputs)
+    buckets = adapter.capture_buckets(2, 700)
+    assert [b.total_tokens for b in buckets if b.num_contexts == 2] == [512, 640, 700]
+    runner = MultimodalEncoderGraphRunner(
+        encoder_fn=lambda tensors, _: tensors,
+        io_adapter=adapter,
+        metadata_provider=adapter,
+        config=MultimodalEncoderCudaGraphConfig(buckets=[(6, 1), (12, 2)]),
+    )
+    bucket = runner._select_bucket(2, 12, [6, 6])
+    assert bucket == EncoderGraphKey(12, 2)
+    assert runner._select_bucket(1, 7, [7]) is None
+    assert adapter.can_replay(bucket, [5])
+    assert not adapter.can_replay(bucket, [7])
+    key = adapter.graph_key(bucket, enable_padding=True)
+    assert key == (2, 6)
+    static = adapter.allocate_inputs(key, torch.device("cpu"))
+    for batch, time in [(2, 6), (1, 5), (2, 6)]:
+        live = {name: tensor[:batch, :time] for name, tensor in inputs.items()}
+        adapter.copy_inputs(static, live, [time] * batch)
+        assert static["attention_mask"].sum() == batch * time
+        torch.testing.assert_close(
+            adapter.collect_outputs(static, [time] * batch)["features"], live["features"]
+        )

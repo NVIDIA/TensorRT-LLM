@@ -334,6 +334,89 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
         }
 
 
+class BatchedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
+    """Capture dense [items, time, ...] tensors with a boolean [items, time] mask.
+
+    The startup sample spans the tower's longest supported time window. Padding stays
+    within each item's window, so temporal convolutions cannot cross item boundaries.
+    For a fixed time window, configure buckets as (items * window, items) for the
+    desired item capacities. This captures just that time length. A replay returns the
+    live dense extent. The tower uses its clip lengths to trim each item's output.
+    """
+
+    graph_critical_attrs = ()
+
+    def __init__(self, inputs: Mapping[str, torch.Tensor]) -> None:
+        self._max_time = next(iter(inputs.values())).shape[1]
+        self._specs = {name: (tensor.shape[2:], tensor.dtype) for name, tensor in inputs.items()}
+        self._specs.setdefault("attention_mask", (torch.Size([]), torch.bool))
+
+    def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
+        return sorted(
+            EncoderGraphKey(count * time, count)
+            for count in range(1, min(max_batch_size, max_num_tokens) + 1)
+            for time in _token_budgets(min(self._max_time, max_num_tokens // count))
+        )
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        return (
+            0 < len(seq_lengths) <= bucket.num_contexts
+            and max(seq_lengths) <= bucket.total_tokens // bucket.num_contexts
+        )
+
+    def graph_key(self, bucket: EncoderGraphKey, *, enable_padding: bool) -> EncoderGraphKey:
+        return EncoderGraphKey(bucket.num_contexts, bucket.total_tokens // bucket.num_contexts)
+
+    def capture_seq_lengths(self, bucket: EncoderGraphKey, key: EncoderGraphKey) -> list[int]:
+        items, time = key
+        return [time] * items
+
+    def padded_seq_lengths(
+        self, seq_lengths: Sequence[int], *, bucket: EncoderGraphKey, enable_padding: bool
+    ) -> list[int]:
+        return [*seq_lengths, *([0] * (bucket.num_contexts - len(seq_lengths)))]
+
+    def allocate_inputs(
+        self, key: EncoderGraphKey, device: torch.device
+    ) -> dict[str, torch.Tensor]:
+        items, time = key
+        return {
+            name: torch.zeros((items, time, *shape), dtype=dtype, device=device)
+            for name, (shape, dtype) in self._specs.items()
+        }
+
+    def copy_inputs(
+        self,
+        static_inputs: Mapping[str, torch.Tensor],
+        inputs: Mapping[str, torch.Tensor],
+        seq_lengths: Sequence[int],
+    ) -> None:
+        for name, dst in static_inputs.items():
+            if name == "attention_mask" and name not in inputs:
+                dst.zero_()
+                for mask, length in zip(dst, seq_lengths):
+                    mask[:length].fill_(True)
+                continue
+            src = inputs[name]
+            if dst.dtype != src.dtype:
+                raise ValueError(f"Encoder graph input {name} expects {dst.dtype}, got {src.dtype}")
+            dst.zero_()
+            dst[: src.shape[0], : src.shape[1]].copy_(src)
+
+    def collect_outputs(
+        self, outputs: Mapping[str, torch.Tensor], seq_lengths: Sequence[int]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor[: len(seq_lengths), : max(seq_lengths)] for name, tensor in outputs.items()
+        }
+
+    def build(self, key: EncoderGraphKey) -> None:
+        """Dense attention consumes the mask directly."""
+
+    def refresh_in_place(self, metadata: None, padded_seq_lengths: Sequence[int]) -> None:
+        """The mask is refreshed along with the other graph inputs."""
+
+
 @dataclass(frozen=True)
 class _CapturedGraph(Generic[_MetadataT]):
     """Bookkeeping for a single captured graph variant."""
@@ -576,7 +659,10 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
         seq_lengths: Sequence[int],
     ) -> Optional[EncoderGraphKey]:
         # Custom predicates may rely on exact context counts before checking their layout.
-        allows_partial_count = type(self._io_adapter).can_replay is PackedEncoderGraphIOAdapter.can_replay
+        allows_partial_count = type(self._io_adapter).can_replay in (
+            PackedEncoderGraphIOAdapter.can_replay,
+            BatchedEncoderGraphIOAdapter.can_replay,
+        )
         for bucket in self._buckets:
             if not allows_partial_count and real_contexts != bucket.num_contexts:
                 continue

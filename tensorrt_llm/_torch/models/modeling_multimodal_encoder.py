@@ -220,13 +220,17 @@ class MultimodalEncoderMixin:
             raise ValueError(
                 "VANILLA attention does not support multimodal encoder CUDA graphs."
             )
-        specs = {
-            name: EncoderGraphTensorSpec(tuple(tensor.shape[1:]),
-                                         tensor.dtype)
-            for name, tensor in inputs.items()
-        }
-        adapter = PackedEncoderGraphIOAdapter(specs,
-                                              attn_metadata=attn_metadata)
+        if self.encoder_cuda_graph_layout == "batched":
+            from .multimodal_encoder_graph import BatchedEncoderGraphIOAdapter
+            adapter = BatchedEncoderGraphIOAdapter(inputs)
+        else:
+            specs = {
+                name: EncoderGraphTensorSpec(tuple(tensor.shape[1:]),
+                                             tensor.dtype)
+                for name, tensor in inputs.items()
+            }
+            adapter = PackedEncoderGraphIOAdapter(specs,
+                                                  attn_metadata=attn_metadata)
         return MultimodalEncoderGraphRunner(encoder_fn=self._encoder_graph_fn,
                                             metadata_provider=adapter,
                                             io_adapter=adapter,
@@ -321,6 +325,8 @@ class MultimodalEncoderMixin:
         attention_metadata_capacity: Optional[dict[str, int]] = None,
     ) -> None:
         """Map encoder item/token budgets to attention metadata capacity."""
+        if self.encoder_cuda_graph_layout == "batched":
+            return
         capacities = (
             attention_metadata_capacity
             if attention_metadata_capacity is not None else

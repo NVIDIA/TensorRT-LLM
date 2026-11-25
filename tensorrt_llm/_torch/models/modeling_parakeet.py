@@ -15,7 +15,7 @@
 
 import math
 from functools import cache
-from typing import Dict, NamedTuple, Optional
+from typing import Dict, Mapping, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -37,6 +37,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 
 EPSILON = 1e-5
 LOG_ZERO_GUARD_VALUE = 2**-24
@@ -638,8 +639,11 @@ class ParakeetConformerBlock(nn.Module):
         return self.norm_out(hidden_states)
 
 
-class ParakeetEncoder(nn.Module):
+class ParakeetEncoder(MultimodalEncoderMixin, nn.Module):
     """Conformer encoder for Parakeet audio."""
+
+    encoder_cuda_graph_modality = "audio"
+    encoder_cuda_graph_layout = "batched"
 
     def __init__(self, config: ParakeetEncoderConfig, dtype: Optional[torch.dtype] = None):
         super().__init__()
@@ -667,35 +671,35 @@ class ParakeetEncoder(nn.Module):
             cfg.subsampling_conv_stride,
         )
 
-    def _build_attention_mask(self, attention_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Convert 2-D input mask to 4-D additive attention mask after subsampling."""
-        output_lengths = self._get_subsampling_output_length(attention_mask.sum(-1))
-        output_mask = torch.arange(seq_len, device=attention_mask.device) < output_lengths[:, None]
-        mask_2d = output_mask.unsqueeze(1).expand(-1, seq_len, -1)
-        mask_2d = mask_2d & mask_2d.transpose(1, 2)
-        return mask_2d.unsqueeze(1)
-
     def forward(
         self,
         input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.subsampling(input_features, attention_mask)
-        hidden_states = hidden_states * self.input_scale
-        position_embeddings = self.encode_positions(hidden_states)
-
-        attn_mask_4d = None
+        hidden_states = self.subsampling(input_features, attention_mask) * self.input_scale
+        inputs = {"hidden_states": hidden_states}
         if attention_mask is not None:
-            attn_mask_4d = self._build_attention_mask(attention_mask, hidden_states.shape[1])
+            output_lengths = self._get_subsampling_output_length(attention_mask.sum(-1))
+            inputs["attention_mask"] = (
+                torch.arange(hidden_states.shape[1], device=hidden_states.device)
+                < output_lengths[:, None]
+            )
+        return self._run_blocks(inputs, None)["hidden_states"]
 
+    def _encoder_graph_fn(
+        self, inputs: Mapping[str, torch.Tensor], attn_metadata: object
+    ) -> dict[str, torch.Tensor]:
+        hidden_states = inputs["hidden_states"]
+        position_embeddings = self.encode_positions(hidden_states)
+        valid = inputs.get("attention_mask")
+        attn_mask = None if valid is None else (valid[:, :, None] & valid[:, None, :]).unsqueeze(1)
         for block in self.layers:
             hidden_states = block(
                 hidden_states,
-                attention_mask=attn_mask_4d,
+                attention_mask=attn_mask,
                 position_embeddings=position_embeddings,
             )
-
-        return hidden_states
+        return {"hidden_states": hidden_states}
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load weights from a flat dict with keys relative to the encoder root.
