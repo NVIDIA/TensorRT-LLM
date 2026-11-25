@@ -14,7 +14,7 @@ import traceback
 import weakref
 from collections import OrderedDict, deque
 from concurrent.futures import Future, InvalidStateError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import (
@@ -1089,7 +1089,8 @@ class DiffusionExecutor:
             self._fail_rank(f"session {session.session_id}", e)
             raise
         finally:
-            self._end_session(session, pipeline_state)
+            idle = ending is _SessionExit.IDLE_TIMEOUT
+            self._end_session(session, pipeline_state, self._idle_timeout_error() if idle else None)
         return ending
 
     def _open_session(self, req: DiffusionRequest) -> Optional[Tuple[SessionState, SlotPool, Any]]:
@@ -1213,9 +1214,7 @@ class DiffusionExecutor:
                     )
                     if not session.ended:
                         self.response_queue.put(
-                            session.terminal_result(
-                                error=f"session idle timeout ({idle_timeout:.0f}s) expired"
-                            )
+                            session.terminal_result(error=self._idle_timeout_error())
                         )
                     return _SessionExit.IDLE_TIMEOUT
             if any(self._from_session(message, session) for message in commands):
@@ -1227,13 +1226,19 @@ class DiffusionExecutor:
                 self._advance_session(session, pool, pipeline_state)
                 active_at = time.monotonic()
 
-    def _end_session(self, session: SessionState, pipeline_state: Any) -> None:
+    def _idle_timeout_error(self) -> str:
+        return f"session idle timeout ({self._session_idle_timeout():.0f}s) expired"
+
+    def _end_session(
+        self, session: SessionState, pipeline_state: Any, reason: Optional[str] = None
+    ) -> None:
         """Tear the session down: the CLOSE broadcast, the pipeline's close and
-        ``SessionClosed`` to the client."""
+        ``SessionClosed`` to the client, with ``reason`` when the worker closed a
+        session its client may not have finished reading."""
         session.discard_inputs()
         self._send_tag(_RankTag.CLOSE)
         self._close_pipeline(pipeline_state, f"session {session.session_id}")
-        self.response_queue.put(SessionClosed(session.session_id))
+        self.response_queue.put(SessionClosed(session.session_id, reason=reason))
         logger.info(f"Worker {self.device_id}: session {session.session_id} closed")
 
     def _advance_session(self, session: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
@@ -1588,6 +1593,19 @@ class PendingSubmit(NamedTuple):
     admission: Future
 
 
+def _lost_results_error(error: Optional[str], reason: str, dropped: int) -> str:
+    """The terminal error of a session the worker closed for ``reason`` while the
+    client still had ``dropped`` results to read; ``error`` is what the terminal
+    said before."""
+    earlier = [] if error in (None, reason) else [error]
+    lost = (
+        "1 unread result was discarded"
+        if dropped == 1
+        else f"{dropped} unread results were discarded"
+    )
+    return "; ".join(earlier + [reason, lost])
+
+
 class SessionChannel:
     """Coordinator side of one session: the hand-off point between the main
     thread (the public ``VisualGenSession`` calls) and the client's background
@@ -1937,16 +1955,26 @@ class SessionChannel:
         self._notify(reader)
         return self._closed, True
 
-    def worker_closed(self) -> None:
+    def worker_closed(self, reason: Optional[str] = None) -> None:
         """The worker confirmed (or initiated) the close. Media still unread is
         dropped with its mappings; a terminal is kept unless the client had
-        closed; the close operation completes."""
+        closed; the close operation completes. When the worker closed on its
+        own for ``reason`` and media was dropped, the kept terminal becomes an
+        error that says so and how many results were lost."""
         with self._lock:
             if self._closed is None:
                 self._closed = Future()
+                dropped = sum(1 for m in self._results if m.type is ResultType.MEDIA)
                 kept = [
                     m for m in self._results if m.type in (ResultType.ENDED, ResultType.TERMINAL)
                 ]
+                if dropped and reason is not None:
+                    kept = [
+                        replace(m, error=_lost_results_error(m.error, reason, dropped))
+                        if m.type is ResultType.TERMINAL
+                        else m
+                        for m in kept
+                    ]
                 self._results.clear()
                 self._results.extend(kept)
             self._lockstep_due = 0
@@ -2720,7 +2748,7 @@ class DiffusionRemoteClient:
             channel.deliver(reply)
         elif isinstance(reply, SessionClosed):
             self._forget_session(reply.session_id)
-            channel.worker_closed()
+            channel.worker_closed(reply.reason)
             self._retire_unsent(reply.session_id)
 
     def _session_opened(self, channel: SessionChannel, reply: SessionOpened) -> None:

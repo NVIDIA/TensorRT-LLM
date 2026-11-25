@@ -410,7 +410,9 @@ class SessionConfig(StrictBaseModel):
         description=(
             "Seconds a session may wait for the client (no submit, no result request, "
             "no slot return) while only the client can make progress, before the "
-            "executor closes it with a terminal error and frees the model instance. "
+            "executor closes it and frees the model instance. Results the client had "
+            "not read are discarded, and the session then ends with an error that "
+            "says how many. "
             "An open session occupies its model instance, so a client that pauses "
             "longer than this between calls loses the session. None disables the timeout."
         ),

@@ -1744,7 +1744,9 @@ def test_idle_timeout_expires_held_and_unread_media_and_keeps_its_terminal_once(
         _wait_until(lambda: pipe.closed == 1, what="pipeline close")
 
 
-def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
+def test_idle_timeout_after_the_terminal_reports_the_results_it_discarded(harness):
+    """A finished session whose client had not read its last result when the
+    idle timeout closed it: the stream ends with an error, not as complete."""
     pipe = CountingPipeline(initial=False, length=1)
     with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
         s = h.open()
@@ -1752,10 +1754,39 @@ def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
         channel = h.client._sessions[s.request_id]
         _wait_until(lambda: _closed(channel), timeout=10, what="the idle close")
         results = s.results()
-        terminal = next(results)  # media dropped, the normal terminal kept
-        assert terminal.done and terminal.error is None
+        terminal = next(results)  # the media is gone with the worker's buffers
+        assert terminal.done
+        assert "idle timeout" in terminal.error
+        assert "1 unread result was discarded" in terminal.error
         with pytest.raises(StopIteration):
             next(results)
+
+
+def test_idle_timeout_with_nothing_unread_keeps_the_normal_terminal(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        s.submit("controls", 1)
+        channel = h.client._sessions[s.request_id]
+        results = s.results()
+        assert next(results).advance_index == 0  # held; only the terminal is unread
+        _wait_until(lambda: _closed(channel), timeout=10, what="the idle close")
+        terminal = next(results)
+        assert terminal.done and terminal.error is None
+
+
+def test_idle_timeout_before_the_terminal_counts_the_results_it_discarded(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        s.submit("controls", 1)
+        s.submit("controls", 2)
+        channel = h.client._sessions[s.request_id]
+        _wait_until(lambda: _closed(channel), timeout=10, what="the idle close")
+        terminal = next(s.results())
+        assert terminal.done
+        assert terminal.error.count("idle timeout") == 1  # the reason is not repeated
+        assert terminal.error.endswith("2 unread results were discarded")
 
 
 def test_refused_traffic_does_not_restart_the_idle_clock(harness):
@@ -1831,7 +1862,7 @@ def test_terminals_keep_empty_outputs_after_the_close(harness):
         channel = h.client._sessions[s.request_id]
         _wait_until(lambda: _closed(channel), what="the idle close")
         terminal = next(s.results())
-        assert terminal.done and terminal.error is None
+        assert terminal.done and "discarded" in terminal.error
         assert terminal.outputs == {} and terminal.video is None
         assert terminal.copy().outputs == {}
         with pytest.raises(StopIteration):
@@ -1858,7 +1889,7 @@ def test_worker_initiated_close_still_keeps_its_terminal(harness):
         channel = h.client._sessions[s.request_id]
         _wait_until(lambda: _closed(channel), what="the idle close")
         terminal = next(s.results())
-        assert terminal.done and terminal.error is None
+        assert terminal.done and "idle timeout" in terminal.error
 
 
 def test_explicit_close_after_a_timeout_close_discards_the_retained_terminal(harness):

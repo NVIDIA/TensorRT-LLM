@@ -223,4 +223,7 @@ class SessionResultMessage(SessionReply):
 @dataclass
 class SessionClosed(SessionReply):
     """The worker released the session: on the client's close, on the idle
-    timeout, or after a terminal result."""
+    timeout, or after a terminal result. ``reason`` is set when the worker closed
+    a session whose client may still have had results to read (the idle timeout)."""
+
+    reason: Optional[str] = None
