@@ -75,6 +75,9 @@ for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by de
 decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
 its e4m3 KV head, and the MoE route front over its own rows. With `TEP_FINAR_ENV` (opt-in) such a
 MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`).
+With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only draft step runs the draft layer on the
+one-rank decode form at the rank's shard (`DecodeTarget._mtp_layer`), a draft-extend step's
+continuing rows included.
 
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
@@ -1254,17 +1257,23 @@ def _dp_topk_cluster_rows(core) -> int:
     return value
 
 
-def _tep_fast_decode(core) -> bool:
-    """`TEP_FAST_DECODE_ENV` at this core's layout: whether it is a tep4 rank with the switch on
-    (default). Set to 1 at another layout: one warning, False."""
-    on = _switch(TEP_FAST_DECODE_ENV, default=True)
-    tep4 = (
+def _tep4_layout(core) -> bool:
+    """Whether this core is a tep4 rank: attention TP over `_TEP_RANKS` ranks without attention
+    DP, the routed experts as `_TEP_RANKS` whole-expert windows."""
+    return (
         not core.one_rank
         and core.dp_size == 1
         and core.attn_tp_size == _TEP_RANKS
         and core.mapping.world_size == _TEP_RANKS
         and core.local_experts * _TEP_RANKS == core.num_experts
     )
+
+
+def _tep_fast_decode(core) -> bool:
+    """`TEP_FAST_DECODE_ENV` at this core's layout: whether it is a tep4 rank with the switch on
+    (default). Set to 1 at another layout: one warning, False."""
+    on = _switch(TEP_FAST_DECODE_ENV, default=True)
+    tep4 = _tep4_layout(core)
     if on and not tep4 and os.environ.get(TEP_FAST_DECODE_ENV, "").strip():
         logger.warning(
             f"{TEP_FAST_DECODE_ENV} is set but ignored: it serves a tep4 rank (attention TP "
@@ -1273,6 +1282,46 @@ def _tep_fast_decode(core) -> bool:
             f"{core.dp_size}, {core.local_experts} of {core.num_experts} experts"
         )
     return on and tep4
+
+
+#: Off by default (opt-in: a same-precision reorder of the draft side). At a tep4 rank with MTP,
+#: a generation-only draft step runs the draft layer as `DecodeTarget._mtp_layer`, the one-rank
+#: decode form, over this rank's shard instead of the generic pass (`_mtp_front`, `_mtp_qkv`,
+#: `_mtp_index_branch`, `_mtp_tail`):
+#: - the front end's two projections, the fused `[q | k | v | gate | index | pad]` attention input
+#:   (one GEMM over a second copy of the rank's draft q / k / v and index rows instead of four
+#:   GEMMs and three copies), the output projection and the shared expert's gate|up on the
+#:   decode entry (`core.decode_mm`) on a captured step; the embedding branch of the front end on
+#:   the side stream beside the hidden branch;
+#: - both hyper-connection sites as the trunk's decode sites (`_hc_site`: the rows pairs with
+#:   `TEP_FAST_DECODE_ENV`), one norm + rope launch for the q / k and index planes;
+#: - the sparse core on the multi-rank decode ops the generic pass runs (`_draft_sparse`), and a
+#:   draft-extend step's continuing rows (`_draft_continue`): every row writes its K/V and index
+#:   key, each request's continuing row alone runs the scores, the GQA, the output projection,
+#:   the second site and the MoE;
+#: - the draft MoE's shared expert on the side stream beside the routed window, and its
+#:   combination and injection in one launch (`mtp_moe_combine_inject`).
+#: The two partials the generic pass sums (the output projection's, the routed window's) are
+#: summed the same way. Draft tokens can move at a near-tie (other GEMM kernels, the rows-pair
+#: rounding at the sites); the target side reads none of this layer's output. Read once, when the
+#: target is built; set at another layout or without MTP it warns and does nothing.
+TEP_DRAFT_LAYER_ENV = "TRTLLM_QWEN4_EXP_TEP_DRAFT_LAYER"
+
+
+def _tep_draft_layer(core) -> bool:
+    """`TEP_DRAFT_LAYER_ENV` at this core's layout: whether a tep4 rank with MTP runs the draft
+    layer as `DecodeTarget._mtp_layer`. Off by default; set where it cannot apply, one warning."""
+    if not _switch(TEP_DRAFT_LAYER_ENV):
+        return False
+    if _tep4_layout(core) and core.mtp_enabled:
+        return True
+    logger.warning(
+        f"{TEP_DRAFT_LAYER_ENV} is set but ignored: it serves a tep4 rank with MTP; this rank has "
+        f"world size {core.mapping.world_size}, attention TP {core.attn_tp_size}, attention DP "
+        f"{core.dp_size}, {core.local_experts} of {core.num_experts} experts, MTP "
+        f"{'on' if core.mtp_enabled else 'off'}"
+    )
+    return False
 
 
 #: Off by default (a Lamport transport: race-risk, opt-in). At a tep4 rank whose trunk MoE takes
@@ -2100,8 +2149,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # The draft layer's FP8 experts: this rank's window over the whole TP group.
         self.mtp_local_experts = d.mtp_local_experts
         self.mtp_expert_offset = d.mtp_expert_offset
-        # A tep4 rank's decode forms (`TEP_FAST_DECODE_ENV`), settled with the layout.
+        # A tep4 rank's decode forms (`TEP_FAST_DECODE_ENV`), settled with the layout, and its
+        # draft layer's (`TEP_DRAFT_LAYER_ENV`).
         self.tep_fast = _tep_fast_decode(self)
+        self.tep_draft_layer = _tep_draft_layer(self)
         # The attention-DP decode forms, built after load (`post_load_weights`) on a GPU:
         # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
         self.hc_tiles = False
@@ -2318,21 +2369,27 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._tep_finar = _tep_finar_build(self, device)
 
     def _build_draft_one_rank(self, device) -> None:
-        """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
-        `[q | k | v | gate | index | pad]` attention input (`weights._attn_in_w`), and with
-        `_MTP_DENSE_FP8_ENV` the
-        packed FP8 copies of its dense projections; None / empty at every other layout."""
+        """At one rank, and at a tep4 rank under `TEP_DRAFT_LAYER_ENV` (over its heads), the
+        draft layer's operands for `DecodeTarget._mtp_layer`: the fused
+        `[q | k | v | gate | index | pad]` attention input (`weights._attn_in_w`), and at one rank
+        with `_MTP_DENSE_FP8_ENV` the packed FP8 copies of its dense projections; None / empty at
+        every other layout."""
         self._mtp_attn_in = None
         self._mtp_gemv8 = {}
-        if not self.one_rank:
+        if not (self.one_rank or self.tep_draft_layer):
             return
         w = self.w
         p = f"l{self.mtp_layer_idx}_mtp_"
         attn_in = _weights._attn_in_w(
             (w[f"{p}q_w"], w[f"{p}k_w"], w[f"{p}v_w"], w[f"{p}idx_w"]), self
         )
+        assert tuple(attn_in.shape) == (self.attn_in_width, self.hidden), (
+            f"the draft layer's fused attention input is {tuple(attn_in.shape)}; this rank's "
+            f"projection row is {self.attn_in_width} wide over hidden {self.hidden}"
+        )
         self._mtp_attn_in = attn_in.t()
-        if device.type != "cuda":
+        # The draft-side precision copies below stay one-rank switches.
+        if device.type != "cuda" or not self.one_rank:
             return
         if _switch(_MTP_DENSE_FP8_ENV):
             self._mtp_gemv8 = {
@@ -3527,6 +3584,16 @@ def _draft_embedding(input_ids: torch.Tensor, embed_tokens: torch.Tensor) -> tor
     if input_ids.dim() == 1 and input_ids.is_contiguous():
         return embed_rows(input_ids, embed_tokens, 1, True)
     return nn.functional.embedding(input_ids.clamp_min(0), embed_tokens)
+
+
+def _mtp_embed_branch(core, M: _MtpWeights, G: dict, embed_tokens, input_ids, gemm):
+    """The draft layer's embedding branch on the decode machinery (`DecodeTarget._mtp_layer`):
+    `fc_embedding` over the next token's normalized embedding, on `gemm` (or its packed FP8 copy
+    at one rank, `G`)."""
+    e = _draft_embedding(input_ids, embed_tokens)
+    return _draft_mm(
+        flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e, G.get("fc_e"), gemm
+    )
 
 
 def _mtp_front(core, M: _MtpWeights, embed_tokens, input_ids, hidden_states) -> tuple:
@@ -7677,19 +7744,35 @@ class DecodeTarget:
         reuse,
         pos3,
         coords,
+        cont=None,
     ) -> torch.Tensor:
-        """The draft layer at one rank on the decode machinery: the front end's two projections,
-        both hyper-connection sites as `_hc_site` (the front end's per-stream `x_h + x_e` is the
+        """The draft layer on the decode machinery, at one rank and at a tep4 rank under
+        `TEP_DRAFT_LAYER_ENV` (over its shard): the front end's two projections, both
+        hyper-connection sites as `_hc_site` (the front end's per-stream `x_h + x_e` is the
         first site's injection at unit weight, the attention output the second's), the attention
         as `_mtp_attention`, the MoE as `_mtp_moe`. Returns the stream with the MoE output
-        injected."""
+        injected.
+
+        At a tep4 rank the front end's embedding branch runs on the side stream beside the
+        hidden branch; the attention output is this rank's heads' partial, summed over the group
+        before the second site, and the MoE's combination and injection are one launch. With
+        `cont` (a draft-extend step's continuing rows, `_draft_continue`) every row writes its
+        K/V and index key, and only the continuing rows run on from the index scores; the result
+        holds them at their rows, the others unwritten (the worker reads only them)."""
         core = self.core
         M, G = core._mtp, core._mtp_gemv8
         gemm = core.decode_mm if md.is_cuda_graph else cublas_mm
-        e = _draft_embedding(input_ids, embed_tokens)
-        x_e = _draft_mm(
-            flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e, G.get("fc_e"), gemm
-        )
+        tp = not core.one_rank
+        main = torch.cuda.current_stream()
+        if tp:
+            # The embedding branch reads only the ids and the table: on the side stream,
+            # joined before the first site.
+            side = core._side_stream
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                x_e = _mtp_embed_branch(core, M, G, embed_tokens, input_ids, gemm)
+        else:
+            x_e = _mtp_embed_branch(core, M, G, embed_tokens, input_ids, gemm)
         _, h_n = qwen4_exp_hc_inject_norm(
             hidden_states, None, None, M.pre_h_norm, core.eps, core.hc_count
         )
@@ -7699,6 +7782,12 @@ class DecodeTarget:
             ),
             [rows, core.stream],
         )
+        if tp:
+            main.wait_stream(side)
+            if not torch.cuda.is_current_stream_capturing():
+                # Made on the side stream, read here: an eager step's allocator must not hand
+                # the block back to the side stream before this stream is done with it.
+                x_e.record_stream(main)
         x, mixed, inject = self._hc_site(
             x_h, x_e, M.unit_inject[:rows], M.ahc_norm, M.ahc_first, M.ahc_up, True
         )
@@ -7717,9 +7806,25 @@ class DecodeTarget:
             pos3,
             coords,
             gemm,
+            cont,
         )
+        if not tp:
+            x, mixed, inject = self._hc_site(
+                x, attn, inject, M.mhc_norm, M.mhc_first, M.mhc_up, True
+            )
+            return qwen4_exp_post_inject(x, self._mtp_moe(mixed), inject)
+        attn = core.tp_sum(attn)
+        full = x
+        if cont is not None:
+            kept = _draft_rows(cont.rows, {"x": x, "inject": inject})
+            x, inject = kept["x"], kept["inject"]
         x, mixed, inject = self._hc_site(x, attn, inject, M.mhc_norm, M.mhc_first, M.mhc_up, True)
-        return qwen4_exp_post_inject(x, self._mtp_moe(mixed), inject)
+        out = self._mtp_moe(mixed, gemm, post=(x, inject))
+        if cont is None:
+            return out
+        out_full = full.new_empty([rows, out.shape[1]])
+        out_full.index_copy_(0, cont.rows, out)
+        return out_full
 
     def _mtp_attention(
         self,
@@ -7737,6 +7842,7 @@ class DecodeTarget:
         pos3,
         coords,
         gemm,
+        cont=None,
     ) -> torch.Tensor:
         """The draft layer's gated GQA and QSA index branch over the draft manager's planes
         (`draft`), as `_attention_one_rank` runs a trunk layer: one input projection, the norm +
@@ -7744,7 +7850,11 @@ class DecodeTarget:
         compression on the side stream, the K/V append, the index scores and the one-launch
         top-k + expansion, the gated sparse GQA, the output projection. Under IndexShare a draft
         decode step (`reuse`) skips the index branch and rebuilds its selection from the
-        draft-extend step's capture; the draft-extend step (`share`) captures it."""
+        draft-extend step's capture; the draft-extend step (`share`) captures it.
+
+        At a tep4 rank (`TEP_DRAFT_LAYER_ENV`) everything past the K/V append runs on the
+        multi-rank decode ops the generic pass runs (`_draft_sparse`), at the continuing rows
+        `cont` when given, and the result is this rank's partial of the output projection."""
         core = self.core
         M = core._mtp
         dt, dev = x.dtype, x.device
@@ -7821,6 +7931,27 @@ class DecodeTarget:
                     mrope_section=_QSA_MROPE_SECTION,
                 )
         main.wait_stream(side)
+        if not core.one_rank:
+            return _draft_mm(
+                self._mtp_attention_tp(
+                    md,
+                    step,
+                    draft,
+                    layer_idx,
+                    proj,
+                    q_index,
+                    rows,
+                    gen_seqs,
+                    p,
+                    sparse,
+                    share,
+                    reuse,
+                    cont,
+                ),
+                M.o,
+                None,
+                gemm,
+            )
         gated = False
         if sparse:
             kv = draft.kv
@@ -7938,23 +8069,88 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
-    def _mtp_moe(self, x) -> torch.Tensor:
+    def _mtp_attention_tp(
+        self, md, step, draft, layer_idx, proj, q_index, rows, gen_seqs, p, sparse, share, reuse,
+        cont,
+    ) -> torch.Tensor:  # fmt: skip
+        """`_mtp_attention` at a tep4 rank past its norm + rope and index branch: the K/V
+        append of every row, then the generic pass's sparse core (`_draft_sparse`) at the rows
+        that go on, or the dense op over every row. Returns the gated `[n, q_width]` attention
+        output of those rows."""
+        core = self.core
+        _, k_dst, v_dst = _attn_in_heads(core, proj)
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        # `[q | k | v | gate]`: the leading columns of the projection row.
+        head = proj[:, : core.qkv_width + core.q_width]
+        if sparse:
+            _store_kv(
+                core, draft.kv, k_dst, v_dst, req_idx, logical, md.qsa_block_table,
+                md.tokens_per_block,
+            )  # fmt: skip
+            if cont is not None:
+                kept = {"head": head}
+                if not reuse:
+                    kept["q_index"] = q_index
+                kept = _draft_rows(cont.rows, kept)
+                head, q_index = kept["head"], kept.get("q_index")
+            n = head.shape[0]
+            return self._draft_sparse(
+                md,
+                draft,
+                torch.reshape(head[:, : core.q_width], [n, core.heads_q, core.head_dim]),
+                torch.reshape(head[:, core.qkv_width :], [n, core.heads_q, core.head_dim]),
+                None if reuse else q_index,
+                req_idx,
+                logical,
+                cont,
+                rows,
+                gen_seqs,
+                p,
+                share,
+                reuse,
+            )
+        qkv = torch.empty([rows, core.qkv_width], dtype=proj.dtype, device=proj.device)
+        qkv.copy_(head[:, : core.qkv_width])
+        out = thop_attention(
+            q=qkv,
+            output=torch.empty([rows, core.q_width], dtype=proj.dtype, device=proj.device),
+            local_layer_idx=layer_idx,
+            num_heads=core.heads_q,
+            num_kv_heads=core.heads_kv,
+            head_size=core.head_dim,
+            quant_mode=core.quant_mode,
+            kv_scale_orig_quant=core.kv_scale_orig_quant,
+            kv_scale_quant_orig=core.kv_scale_quant_orig,
+            **step,
+            **_CALL_CONSTANTS,
+        )
+        fused_sigmoid_mul_inplace(out, head[:, core.qkv_width :])
+        return out if cont is None else torch.index_select(out, 0, cont.rows)
+
+    def _mtp_moe(self, x, gu_mm=cublas_mm, post=None) -> torch.Tensor:
         """The draft layer's MoE at one rank: FP8 block-scale or native NVFP4 routed experts
         (FP8 can be converted with `_MTP_MOE_NVFP4_ENV`) and the bf16
         shared expert (its dense projections on `_draft_mm`), combined as `routed +
         sigmoid(gate logit) * shared`; the NVFP4 path runs the shared expert on the side
-        stream."""
+        stream.
+
+        At a tep4 rank (`TEP_DRAFT_LAYER_ENV`): `gu_mm` is the step's decode entry for the shared
+        expert's gate|up, the shared expert runs on the side stream for either expert format, the
+        routed window's partial is summed over the group, and with `post = (x, inject)` the
+        combination and its injection into `x` are one launch (`mtp_moe_combine_inject`, bitwise
+        the two launches) and the result is the injected stream."""
         core = self.core
         M, G = core._mtp, core._mtp_gemv8
 
         def shared_expert():
-            gu = _draft_mm(x, M.sh_gu, G.get("sh_gu"), cublas_mm)
+            gu = _draft_mm(x, M.sh_gu, G.get("sh_gu"), gu_mm)
             shared = _draft_mm(
                 silu_and_mul_rows(gu, core.shared_inter), M.sh_dn, G.get("sh_dn"), cublas_mm
             )
             return shared, cublas_mm(x, M.sh_gate)
 
-        if M.moe_gscale is None:
+        if core.one_rank and M.moe_gscale is None:
             routed = _mtp_moe_block(core, M, x, routed_only=True)
             shared, gate_logits = shared_expert()
             return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
@@ -7963,9 +8159,20 @@ class DecodeTarget:
         side.wait_stream(main)
         with torch.cuda.stream(side):
             shared, gate_logits = shared_expert()
-        routed = _mtp_routed_nvfp4(core, M, x)
+        if core.one_rank:
+            routed = _mtp_routed_nvfp4(core, M, x)
+        else:
+            # `_mtp_moe_block` sums the window's partial over the group for either format.
+            routed = _mtp_moe_block(core, M, x, routed_only=True)
         main.wait_stream(side)
-        return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+        if post is None:
+            return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+        x_post, inject = post
+        if _combine_inject_fits(x_post, routed, shared, inject):
+            return mtp_moe_combine_inject(x_post, routed, gate_logits, shared, inject)
+        return qwen4_exp_post_inject(
+            x_post, fused_sigmoid_gate_mul_add(routed, gate_logits, shared), inject
+        )
 
     def _hc_moe_site(self, hc, block_out, inject, L: _LayerWeights):
         """`_hc_site` at an MoE site (always with injection). Under attention TP (or at one
@@ -8600,6 +8807,25 @@ class DecodeTarget:
         cont = _draft_continue(
             core, md, kwargs.get("spec_metadata"), all_rank_num_tokens, rows, gen_seqs, p, share
         )
+        if core.tep_draft_layer:
+            return self._mtp_layer(
+                embed_tokens,
+                input_ids,
+                hidden_states,
+                md,
+                step,
+                draft,
+                layer_idx,
+                rows,
+                gen_seqs,
+                p,
+                sparse,
+                share,
+                reuse,
+                pos3,
+                coords,
+                cont,
+            )
         n = rows
         if cont is not None:
             n = gen_seqs
@@ -8624,78 +8850,24 @@ class DecodeTarget:
         if cont is not None:
             kept = _draft_rows(cont.rows, kept)
         if sparse:
-            kv = draft.kv
-            _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            topk_indices = md.qsa_topk_indices[:n]
-            if cont is None:
-                visible_blocks = md.qsa_visible_blocks[:rows]
-                seq_lens_q = md.qsa_sequence_lengths[:rows]
-                q_logical, q_req_idx = logical, req_idx
-            else:
-                visible_blocks, seq_lens_q = cont.visible, cont.seq_lens
-                q_logical, q_req_idx = cont.logical, cont.req_idx
-            selected = torch.empty(
-                [n, core.token_topk + core.compress_ratio - 1],
-                dtype=torch.int32,
-                device=qkv.device,
-            )
-            if reuse:
-                slot = draft.share_slot
-                assert slot in md.qsa_shared_topk_captured_slots, (
-                    "a draft decode step would reuse a selection that no draft-extend step of "
-                    "this loop captured"
-                )
-                qsa_mtp_reuse_topk(
-                    shared_indices=md.qsa_shared_topk_indices[slot],
-                    shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
-                    request_indices=req_idx,
-                    visible_blocks=visible_blocks,
-                    output=topk_indices,
-                )
-                selected.copy_(
-                    qsa_expand_block_indices(
-                        topk_indices,
-                        logical,
-                        seq_lens_q,
-                        compress_ratio=core.compress_ratio,
-                        token_topk=core.token_topk,
-                    )
-                )
-            else:
-                scores = _decode_index_scores(
-                    core,
-                    kept["q_index"],
-                    draft.index_cache,
-                    block_table,
-                    q_logical,
-                    q_req_idx,
-                    tokens_per_block,
-                    p if cont is None else 1,
-                )
-                _selection(
-                    core,
-                    scores,
-                    visible_blocks,
-                    q_logical,
-                    seq_lens_q,
-                    topk_indices,
-                    md.qsa_topk_row_starts[:n],
-                    selected,
-                )
-                if share:
-                    self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
-            q = _packed_q(core, kept["qkv"])
+            _store_kv(core, draft.kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
             g = kept["gate"]
-            attn = _sparse_gqa_decode(
-                core, kv, q, block_table, selected, q_req_idx, tokens_per_block, g,
-                p if cont is None else 1,
-            )  # fmt: skip
-            gated = attn is not None
-            if not gated:
-                attn = _sparse_gqa(
-                    core, kv, q, block_table, selected, q_req_idx, tokens_per_block, None
-                )
-            attn = torch.reshape(attn, [n, core.q_width])
+            attn = self._draft_sparse(
+                md,
+                draft,
+                _packed_q(core, kept["qkv"]),
+                g,
+                kept.get("q_index"),
+                req_idx,
+                logical,
+                cont,
+                rows,
+                gen_seqs,
+                p,
+                share,
+                reuse,
+            )
+            gated = True
         else:
             g = gate
             gated = False
@@ -8723,6 +8895,91 @@ class DecodeTarget:
         full = out.new_empty([rows, out.shape[1]])
         full.index_copy_(0, cont.rows, out)
         return full
+
+    def _draft_sparse(
+        self, md, draft, q, gate, q_index, req_idx, logical, cont, rows, gen_seqs, p, share, reuse
+    ) -> torch.Tensor:
+        """A multi-rank draft step's sparse core after its K/V append, at the rows that go on
+        (all `rows` without `cont`, each request's continuing row with it): the index scores and
+        the selection on the family's decode ops (`_decode_index_scores`, `_selection`), or under
+        IndexShare a draft decode step's selection rebuilt from the draft-extend step's capture
+        (`reuse`; `share` captures it), then the gated sparse GQA (`_sparse_gqa_decode`, else
+        `_sparse_gqa` and the gate apart). `q` is `[n, heads_q, head_dim]`, `gate` its output gate
+        and `q_index` the normalized index query at the same rows (None under `reuse`). Returns
+        the gated attention output `[n, q_width]`."""
+        core = self.core
+        kv = draft.kv
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+        n = q.shape[0]
+        topk_indices = md.qsa_topk_indices[:n]
+        if cont is None:
+            visible_blocks = md.qsa_visible_blocks[:rows]
+            seq_lens_q = md.qsa_sequence_lengths[:rows]
+            q_logical, q_req_idx = logical, req_idx
+        else:
+            visible_blocks, seq_lens_q = cont.visible, cont.seq_lens
+            q_logical, q_req_idx = cont.logical, cont.req_idx
+        selected = torch.empty(
+            [n, core.token_topk + core.compress_ratio - 1],
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if reuse:
+            slot = draft.share_slot
+            assert slot in md.qsa_shared_topk_captured_slots, (
+                "a draft decode step would reuse a selection that no draft-extend step of "
+                "this loop captured"
+            )
+            qsa_mtp_reuse_topk(
+                shared_indices=md.qsa_shared_topk_indices[slot],
+                shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
+                request_indices=req_idx,
+                visible_blocks=visible_blocks,
+                output=topk_indices,
+            )
+            selected.copy_(
+                qsa_expand_block_indices(
+                    topk_indices,
+                    logical,
+                    seq_lens_q,
+                    compress_ratio=core.compress_ratio,
+                    token_topk=core.token_topk,
+                )
+            )
+        else:
+            scores = _decode_index_scores(
+                core,
+                q_index,
+                draft.index_cache,
+                block_table,
+                q_logical,
+                q_req_idx,
+                tokens_per_block,
+                p if cont is None else 1,
+            )
+            _selection(
+                core,
+                scores,
+                visible_blocks,
+                q_logical,
+                seq_lens_q,
+                topk_indices,
+                md.qsa_topk_row_starts[:n],
+                selected,
+            )
+            if share:
+                self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
+        attn = _sparse_gqa_decode(
+            core, kv, q, block_table, selected, q_req_idx, tokens_per_block, gate,
+            p if cont is None else 1,
+        )  # fmt: skip
+        if attn is not None:
+            return torch.reshape(attn, [n, core.q_width])
+        attn = _sparse_gqa(core, kv, q, block_table, selected, q_req_idx, tokens_per_block, None)
+        attn = torch.reshape(attn, [n, core.q_width])
+        fused_sigmoid_mul_inplace(attn, gate)
+        return attn
 
 
 # ------------------------------------------------------------ the MTP module ---
