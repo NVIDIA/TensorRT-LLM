@@ -162,3 +162,43 @@ def test_build_without_a_route_front_still_joins_the_collective(monkeypatch):
     core, warned, sums = _build_core(monkeypatch)
     M._tep_decode_front_build(core, None, ["L0"], torch.device("cuda"))
     assert len(sums) == 1 and len(warned) == 1
+
+
+@pytest.mark.cpu_only
+def test_build_checks_every_layer(monkeypatch):
+    monkeypatch.setenv(M.TEP_MOE_FRONT_ENV, "1")
+    core, warned, sums = _build_core(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        M,
+        "_tep_decode_front_check",
+        lambda core, st, L, rows, gen: seen.append((L, rows)) or ("bad" if L == "L2" else "", 1),
+    )
+    st = _st()
+    M._tep_decode_front_build(core, st, ["L0", "L1", "L2"], torch.device("cuda"))
+    # Rows 4 and 16 compile; the check rotates over them and over every layer.
+    assert seen == [("L0", 4), ("L1", 16), ("L2", 4)]
+    assert set(st.decode) == {16} and len(sums) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("where", ["compile", "check"])
+def test_build_declines_a_raising_row_count_and_still_joins_the_collective(monkeypatch, where):
+    monkeypatch.setenv(M.TEP_MOE_FRONT_ENV, "1")
+    core, warned, sums = _build_core(monkeypatch)
+
+    def boom(rows):
+        if rows == 16:
+            raise RuntimeError("boom")
+
+    if where == "compile":
+        monkeypatch.setattr(
+            M._decode_front, "compile_front", lambda rows, *a: boom(rows) or rows != 8
+        )
+    else:
+        monkeypatch.setattr(
+            M, "_tep_decode_front_check", lambda core, st, L, rows, gen: boom(rows) or ("", 0)
+        )
+    st = _st()
+    M._tep_decode_front_build(core, st, ["L0", "L1"], torch.device("cuda"))
+    assert set(st.decode) == {4} and len(sums) == 1

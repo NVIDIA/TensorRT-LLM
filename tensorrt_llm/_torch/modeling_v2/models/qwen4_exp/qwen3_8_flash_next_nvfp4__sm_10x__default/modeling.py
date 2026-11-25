@@ -4684,9 +4684,11 @@ def _tep_front_logits(st: _RouteFront, x, L: _LayerWeights, router_mm=None):
 def _tep_decode_front_check(core, st: _RouteFront, L: _LayerWeights, rows: int, gen) -> tuple:
     """The decode front at `rows` rows over one layer, eagerly, on scratch tables: `(what
     differs, logits that differ from _decode_router's)`. The first is "" when its codes, scales,
-    experts, weights and tables are bitwise the route front's over its own logits, the staging
-    buffer is back at zero and the logits are within two bf16 steps of an fp32 GEMM rounded once;
-    the second is reported, not required (the reorder this switch makes)."""
+    experts and weights are bitwise the route front's over its own logits, its tables hold their
+    meaning for those experts (`_route_front_check_tables`: the kernel may order the rows inside
+    an expert's tile differently), the staging buffer is back at zero and the logits are within
+    two bf16 steps of an fp32 GEMM rounded once; the second is reported, not required (the
+    reorder this switch makes). `flat_b` is only the route front's scratch tables."""
     device = L.router.device
     tile = int(st.tactics[rows][0])
     x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
@@ -4728,10 +4730,13 @@ def _tep_decode_front_build(core, st: _RouteFront | None, layers, device) -> Non
     """`TEP_MOE_FRONT_ENV` at build, after the route front: fills `st.decode` / `st.stages`.
     Where the switch is set at a tep4 rank with its fast forms (host values the group shares,
     so the ranks decline together) the row counts are agreed over the group, a collective:
-    each rank compiles and checks (`_tep_decode_front_check`) the route front's row counts up to
-    `moe_decode_front.MAX_ROWS`, and only those that pass on EVERY rank are served (one
+    each rank compiles the route front's row counts up to `moe_decode_front.MAX_ROWS` and checks
+    every layer once at a row count that rotates over them (`_tep_decode_front_check`, as the
+    route front's build does), and only the row counts that pass on EVERY rank are served (one
     `core.tp_sum` of 0 / 1 flags), since a block that forms its logits one way on one rank and
-    the other way on another could serve a (row, slot) on no window or on two."""
+    the other way on another could serve a (row, slot) on no window or on two. A compile or
+    check that raises declines its row count on this rank and the rank still joins the sum: a
+    rank that left the build here would leave the others waiting in the collective."""
     if not _switch(TEP_MOE_FRONT_ENV):
         return
     if not core.tep_fast or device.type != "cuda":
@@ -4741,20 +4746,38 @@ def _tep_decode_front_build(core, st: _RouteFront | None, layers, device) -> Non
         )
         return
     cap = _decode_front.MAX_ROWS
-    mine, found = [], {}
-    if st is not None:
+    found, mine = {}, []
+    if st is not None and layers:
         gen = torch.Generator(device=device).manual_seed(20261125)
         with torch.cuda.device(device):
-            for j, rows in enumerate(r for r in sorted(st.tactics) if r <= cap):
-                tile = int(st.tactics[rows][0])
-                if not _decode_front.compile_front(
-                    rows, core.hidden, core.hidden, core.local_experts, tile
-                ):
+            built = []
+            for rows in sorted(r for r in st.tactics if r <= cap):
+                try:
+                    ok = _decode_front.compile_front(
+                        rows, core.hidden, core.hidden, core.local_experts, int(st.tactics[rows][0])
+                    )
+                except Exception as e:  # noqa: BLE001 - declined here, agreed over the group below
+                    found[rows] = f"compile raised {type(e).__name__}: {e}"
+                    continue
+                if not ok:
                     found[rows] = "not compiled"
                     continue
-                bad, moved = _tep_decode_front_check(core, st, layers[j % len(layers)], rows, gen)
-                found[rows] = bad or f"{moved} logits differ from the stock router's"
-                if not bad:
+                built.append(rows)
+            moved = dict.fromkeys(built, 0)
+            for j in range(max(len(layers), len(built)) if built else 0):
+                rows, i = built[j % len(built)], j % len(layers)
+                if rows in found:
+                    continue
+                try:
+                    bad, n = _tep_decode_front_check(core, st, layers[i], rows, gen)
+                except Exception as e:  # noqa: BLE001 - declined here, agreed over the group below
+                    bad, n = f"check raised {type(e).__name__}: {e}", 0
+                if bad:
+                    found[rows] = f"layer {i}: {bad}"
+                moved[rows] += n
+            for rows in built:
+                if rows not in found:
+                    found[rows] = f"{moved[rows]} logits differ from the stock router's"
                     mine.append(rows)
     flags = torch.zeros([cap, core.hidden], dtype=torch.bfloat16, device=device)
     for r in mine:
