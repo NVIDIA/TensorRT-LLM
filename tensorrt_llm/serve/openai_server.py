@@ -2599,9 +2599,12 @@ class OpenAIServer(_VideoRoutesMixin):
                         truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
                 if rendered.text is None:
-                    if forced_tool_begin_prefix is not None:
+                    if (forced_tool_begin_prefix is not None
+                            and not rendered.prefix_applied):
                         # The prefix is text; appending it to rendered token
                         # ids would need a re-encode that loses control tokens.
+                        # Ids that encode control-token text as text carry
+                        # the prefix already (``prefix_applied``).
                         raise ValueError(
                             "tool_choice with a named function is not "
                             "supported for this model, whose chat template "

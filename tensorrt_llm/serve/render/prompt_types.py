@@ -58,7 +58,8 @@ class RenderedPrompt:
     # The template output before any forced-tool prefix was appended.
     template_text: Optional[str] = None
     token_ids: Optional[List[int]] = None
-    # The forced named-tool prefix was appended to ``text``.
+    # The forced named-tool prefix was appended to ``text`` (to ``token_ids`` when
+    # ``text`` is None).
     prefix_applied: bool = False
     # Decisions derived from the rendered prompt (see :class:`PreparedContext`); a caller
     # that would forward the ids checks them first.
