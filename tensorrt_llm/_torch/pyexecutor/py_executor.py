@@ -65,6 +65,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..attention.backends.fmha.registry import (fmha_step_stats,
+                                                reset_fmha_step_stats,
+                                                step_stats_fmha_lib_classes)
 from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import (
@@ -103,7 +106,8 @@ from .benchmark_request_stages import (BenchmarkRequestStage,
                                        parse_benchmark_request_stages)
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         has_state_layers)
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
@@ -745,6 +749,9 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Whether an FMHA library that keeps per-step counters is enabled
+    # (TLLM_FMHA_LIBS); read once at construction, False by default.
+    _fmha_step_stats_enabled = False
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
@@ -1070,6 +1077,7 @@ class PyExecutor:
         self._intake_window = threading.Event()
         self._intake_window_started = 0.0
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
+        self._fmha_step_stats_enabled = bool(step_stats_fmha_lib_classes())
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
         # Request counts not yet reported by an IterationStats record. They
@@ -1522,6 +1530,9 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Likewise drop the warmup steps from the FMHA libraries' step counters.
+        if self._fmha_step_stats_enabled:
+            reset_fmha_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -2003,7 +2014,14 @@ class PyExecutor:
                     "is registered with a single primary pool, but VSWA "
                     "models allocate one pool per window size.")
 
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+            # A V2 cache says in its layout which layers keep recurrent state.
+            # V1 has no layout to ask, so its recurrent managers are named.
+            if is_kv_cache_manager_v2:
+                keeps_recurrent_state = has_state_layers(self.kv_cache_manager)
+            else:
+                keeps_recurrent_state = isinstance(self.kv_cache_manager,
+                                                   BaseMambaCacheManager)
+            if keeps_recurrent_state:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with Mamba / hybrid "
                     "linear-attention models. Mamba layers carry SSM state "
@@ -4162,7 +4180,9 @@ class PyExecutor:
             scheduler_mode=scheduler_mode,
             gpu_forward_time_ms=gpu_forward_time_ms,
             mm_encoder_stats=mm_encoder_stats,
-            executor_loop=loop_metrics)
+            executor_loop=loop_metrics,
+            fmha_step_stats=(fmha_step_stats(self.kv_cache_manager)
+                             if self._fmha_step_stats_enabled else None))
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -4582,8 +4602,7 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
-                    if hasattr(self.kv_cache_manager,
-                               "prepare_expect_snapshot_points"):
+                    if self.kv_cache_manager is not None:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
@@ -8963,6 +8982,8 @@ class PyExecutor:
                     raise ValueError(
                         f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
                     )
+                if not math.isfinite(val):
+                    raise ValueError("Embedding bias values must be finite")
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
@@ -10846,7 +10867,7 @@ class PyExecutor:
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
-        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+        if self.kv_cache_manager is not None:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
@@ -11949,7 +11970,7 @@ class PyExecutor:
         if self.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            if isinstance(kv_mgr, BaseMambaCacheManager):
+            if kv_mgr is not None:
                 kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
@@ -13248,9 +13269,8 @@ class PyExecutor:
                 # request has filled; give it the same finish handshake the
                 # post-batch cancellation path runs before pages are freed.
                 self._start_connector_async_save(request)
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13329,10 +13349,8 @@ class PyExecutor:
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)

@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel)
+from transformers.image_utils import is_scaled_image as _is_scaled_image
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed, Qwen2_5_VisionTransformerPretrainedModel)
@@ -84,6 +85,46 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              register_auto_model, register_vision_encoder)
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
+
+
+def _qwen_processor_for_media(processor, kwargs, images, videos):
+    """Set per-request rescaling while keeping HF's other options in their original scope."""
+    if "do_rescale" in kwargs:
+        return processor
+
+    def scaled_arrays(items):
+        # A black image or clip fits in [0, 1] even in a batch of raw pixels.
+        return isinstance(items[0], np.ndarray) and all(
+            np.issubdtype(item.dtype, np.floating) and _is_scaled_image(item)
+            for item in items if isinstance(item, np.ndarray))
+
+    rescale = {}
+    if images:
+        rescale["images_kwargs"] = not (isinstance(images[0], torch.Tensor)
+                                        or scaled_arrays(images))
+    if videos:
+        rescale["videos_kwargs"] = not (isinstance(videos[0][0], torch.Tensor)
+                                        or scaled_arrays(videos))
+    if len(set(rescale.values())) < 2 and not rescale.keys() & kwargs.keys():
+        kwargs["do_rescale"] = next(iter(rescale.values()), True)
+        return processor
+
+    local = processor
+    for name, value in rescale.items():
+        if name in kwargs:
+            kwargs[name] = {"do_rescale": value, **kwargs[name]}
+            continue
+        # Creating a modality dictionary would hide caller options such as
+        # frame sampling in Transformers 5.5. Adjust only the component default.
+        attr = "image_processor" if name == "images_kwargs" else "video_processor"
+        component = getattr(processor, attr)
+        if component.do_rescale != value:
+            if local is processor:
+                local = copy.copy(processor)
+            component = copy.copy(component)
+            component.do_rescale = value
+            setattr(local, attr, component)
+    return local
 
 
 def _prepare_qwen_vl_mrope_config(
@@ -1230,11 +1271,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
+        proc_kwargs = dict(mm_processor_kwargs)
+        processor = _qwen_processor_for_media(self.processor, proc_kwargs,
+                                              images, videos)
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
@@ -1244,13 +1283,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
         # (called from ``__init__``) installs a process-wide filter that drops
         # those keys before the validator sees them.
-        return self.processor(text=[text],
-                              images=images,
-                              videos=videos,
-                              padding=True,
-                              do_rescale=do_rescale,
-                              return_tensors='pt',
-                              **mm_processor_kwargs)
+        return processor(text=[text],
+                         images=images,
+                         videos=videos,
+                         padding=True,
+                         return_tensors='pt',
+                         **proc_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         # Keep image / vision / video placeholders in-vocab; the model engine

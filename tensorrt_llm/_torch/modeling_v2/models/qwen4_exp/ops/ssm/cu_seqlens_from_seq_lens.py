@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Integer dtypes accepted on either side. ``torch.cumsum`` silently accepts
 #: bool and floating dtypes and answers wrongly with them.
@@ -45,7 +46,7 @@ class CuSeqlensFromSeqLens(OpWrapper):
     caller's. `seq_lens` is read-only.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: lengths, in_dtype, out_dtype; `layout` "contiguous" (default) or
     # "prefix" (the first len(lengths) of a longer buffer -- the call site's

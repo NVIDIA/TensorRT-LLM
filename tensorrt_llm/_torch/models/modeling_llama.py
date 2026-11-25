@@ -33,7 +33,9 @@ from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -1472,9 +1474,17 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         # positions via ``torch.isin(input_ids, mm_token_ids)`` without the
         # legacy ``vocab_size + 1`` remap.
         # Concatenate all multimodal embeddings
-        multimodal_data = {}
-        multimodal_data["multimodal_embedding"] = torch.cat(mm_embeddings,
-                                                            dim=0)
+        multimodal_data = {
+            "multimodal_embedding":
+            torch.cat(mm_embeddings, dim=0),
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_embeddings))],
+                output_embedding_lengths=[
+                    len(embedding) for embedding in mm_embeddings
+                ],
+            ),
+        }
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
@@ -1487,9 +1497,9 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
 
         if mm_data and mm_data.get("image"):
             images = mm_data["image"]
-            img_type = type(mm_data["image"][0])
-            do_rescale = (img_type == Image)
-            assert all(isinstance(img, img_type) for img in mm_data["image"])
+            do_rescale = isinstance(images[0], Image)
+            img_type = Image if do_rescale else type(images[0])
+            assert all(isinstance(img, img_type) for img in images)
 
         truncate_kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:

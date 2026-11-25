@@ -836,13 +836,6 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
     def get_vocab_size(self) -> int:
         return self.config.get_text_config().vocab_size
 
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # A uint8 (H, W, C) array: the loaders decode a JPEG into it with
-        # torchvision, and the request's multimodal hash reads it in place.
-        # The processor converts it to the PIL image mistral-common encodes,
-        # without changing a pixel.
-        return {"image": {"format": "np"}}
-
     def get_mm_token_ids(self) -> torch.Tensor:
         return torch.tensor([
             self.processor.image_token_id,

@@ -37,7 +37,7 @@ from tensorrt_llm.llmapi import (
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .test_llm import get_model_path
+from .model_paths import get_model_path
 # isort: on
 
 # Module-scoped LLM instances keep their proxy threads across tests.

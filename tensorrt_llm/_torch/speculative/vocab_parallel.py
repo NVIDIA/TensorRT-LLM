@@ -85,19 +85,36 @@ _TARGET_PROGRAMS = 256
 # multiple of 16 and would compile a kernel variant mid-serving.
 _PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
 
-# "0" turns off the vocab-parallel greedy argmax of the stock one-model
+# "0" turns off the vocab-parallel token selection of the stock one-model
 # speculative workers (SpecWorkerBase.enable_vocab_parallel_argmax), which
-# restores the behaviour before it: the gathered target logits, except on the
-# models that take the speculative fast paths, whose workers already selected
-# their greedy and temperature-only target tokens from the shard.
+# restores the behaviour before it: their greedy and temperature-only target
+# tokens and their greedy draft tokens come from the gathered logits again,
+# except on the models that take the speculative fast paths, whose workers
+# already selected their greedy and temperature-only target tokens from the
+# shard.
 VOCAB_PARALLEL_ARGMAX_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_ARGMAX"
+# "1" also lets those workers draw the target tokens of temperature-only batches
+# on the shard (Gumbel-max in the TP key exchange); unset, "0" or any other value
+# keeps them on the gathered logits and the stock sampler. The Gumbel-max draw
+# follows the same distribution but consumes random numbers differently, so an
+# unseeded request gets different tokens than from the stock sampler (a request
+# with its own seed always takes the latter). The MTP-Eagle fast paths do not
+# read it: they draw temperature-only target tokens on the shard regardless.
+VOCAB_PARALLEL_TEMPERATURE_ENV_VAR = "TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE"
 
 
 def vocab_parallel_argmax_enabled() -> bool:
-    """Whether the stock one-model speculative workers take their greedy
-    tokens from vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``,
-    default on)."""
+    """Whether the stock one-model speculative workers take their tokens from
+    vocab-sharded logits (``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX``, default on)."""
     return os.environ.get(VOCAB_PARALLEL_ARGMAX_ENV_VAR, "1").strip() != "0"
+
+
+def vocab_parallel_temperature_enabled() -> bool:
+    """Whether those workers also draw the target tokens of temperature-only
+    batches from vocab-sharded logits by Gumbel-max
+    (``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1``, default off; it takes effect
+    only where :func:`vocab_parallel_argmax_enabled`)."""
+    return os.environ.get(VOCAB_PARALLEL_TEMPERATURE_ENV_VAR, "0").strip() == "1"
 
 
 def _gathers_even_vocab_shards(lm_head: LMHead) -> bool:
