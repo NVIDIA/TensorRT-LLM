@@ -3,7 +3,7 @@
   "minimum_client_revision": 1,
   "bsr": {
     "module": "buf.build/openengine/openengine",
-    "release": "768a93c7b44e40f28c692ad0b471a8f2"
+    "release": "b7001e32713d4b8abc70d49dd1be6113"
   },
   "generator": {
     "grpcio": "1.67.1",
@@ -16,5 +16,10 @@
   "runtime_floors": {
     "protobuf": "6.30.2",
     "grpcio": "1.73.1"
+  },
+  "source": {
+    "url": "https://github.com/ai-dynamo/openengine.git",
+    "tag": "v0.2.0",
+    "commit": "475dcf2e332c4f9975dcdf7f65838cbabd5acc31"
   }
 }

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from . import encoding_pb2 as _encoding_pb2
 from . import generation_pb2 as _generation_pb2
 from . import kv_pb2 as _kv_pb2
 from . import lifecycle_pb2 as _lifecycle_pb2

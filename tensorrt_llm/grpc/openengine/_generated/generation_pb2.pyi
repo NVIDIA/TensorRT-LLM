@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from google.protobuf import struct_pb2 as _struct_pb2
+from . import encoded_media_pb2 as _encoded_media_pb2
 from . import error_pb2 as _error_pb2
 from . import kv_pb2 as _kv_pb2
 from google.protobuf.internal import containers as _containers
@@ -57,7 +58,7 @@ class MediaItem(_message.Message):
     def __init__(self, modality: _Optional[_Union[Modality, str]] = ..., url: _Optional[str] = ..., data_uri: _Optional[str] = ..., raw_bytes: _Optional[bytes] = ..., mime_type: _Optional[str] = ..., uuid: _Optional[str] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "model", "prompt", "token_ids", "sampling", "stopping", "response", "kv", "guided", "media", "lora_name", "extra")
+    __slots__ = ("request_id", "model", "prompt", "token_ids", "sampling", "stopping", "response", "kv", "guided", "media", "lora_name", "extra", "encoded_media")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     PROMPT_FIELD_NUMBER: _ClassVar[int]
@@ -70,6 +71,7 @@ class GenerateRequest(_message.Message):
     MEDIA_FIELD_NUMBER: _ClassVar[int]
     LORA_NAME_FIELD_NUMBER: _ClassVar[int]
     EXTRA_FIELD_NUMBER: _ClassVar[int]
+    ENCODED_MEDIA_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     model: str
     prompt: str
@@ -82,7 +84,8 @@ class GenerateRequest(_message.Message):
     media: _containers.RepeatedCompositeFieldContainer[MediaItem]
     lora_name: str
     extra: _struct_pb2.Struct
-    def __init__(self, request_id: _Optional[str] = ..., model: _Optional[str] = ..., prompt: _Optional[str] = ..., token_ids: _Optional[_Union[TokenIds, _Mapping]] = ..., sampling: _Optional[_Union[SamplingParams, _Mapping]] = ..., stopping: _Optional[_Union[StoppingOptions, _Mapping]] = ..., response: _Optional[_Union[ResponseOptions, _Mapping]] = ..., kv: _Optional[_Union[KvOptions, _Mapping]] = ..., guided: _Optional[_Union[GuidedDecoding, _Mapping]] = ..., media: _Optional[_Iterable[_Union[MediaItem, _Mapping]]] = ..., lora_name: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+    encoded_media: _encoded_media_pb2.EncodedMediaRef
+    def __init__(self, request_id: _Optional[str] = ..., model: _Optional[str] = ..., prompt: _Optional[str] = ..., token_ids: _Optional[_Union[TokenIds, _Mapping]] = ..., sampling: _Optional[_Union[SamplingParams, _Mapping]] = ..., stopping: _Optional[_Union[StoppingOptions, _Mapping]] = ..., response: _Optional[_Union[ResponseOptions, _Mapping]] = ..., kv: _Optional[_Union[KvOptions, _Mapping]] = ..., guided: _Optional[_Union[GuidedDecoding, _Mapping]] = ..., media: _Optional[_Iterable[_Union[MediaItem, _Mapping]]] = ..., lora_name: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., encoded_media: _Optional[_Union[_encoded_media_pb2.EncodedMediaRef, _Mapping]] = ...) -> None: ...
 
 class SamplingParams(_message.Message):
     __slots__ = ("temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "seed", "num_sequences")
