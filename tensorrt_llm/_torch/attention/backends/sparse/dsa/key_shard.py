@@ -396,6 +396,32 @@ def _ks_select_own_scores(
 
 
 @triton.jit
+def _ks_pool_index(
+    local,
+    sel,
+    row,
+    req_ptr,
+    bt_ptr,
+    bt_stride,
+    bt_cols,
+    page_stride,
+    layer_base,
+    TPB: tl.constexpr,
+):
+    """Paged-pool indices of the selected local token indices ``local`` (int64) of one row.
+
+    The integers ``convert_req_index_to_global`` gives for an MLA pool: page ``local // TPB`` of the row's request
+    in the page table (``bt_cols`` pages wide), times ``page_stride``, plus ``layer_base + local % TPB``; ``-1``
+    for a page past the table or one the table does not hold. The table is read for selected entries only.
+    """
+    req = tl.load(req_ptr + row).to(tl.int64)
+    page_idx = local // TPB
+    in_table = sel & (page_idx < bt_cols)
+    page = tl.load(bt_ptr + req * bt_stride + page_idx, mask=in_table, other=-1).to(tl.int64)
+    return tl.where(page >= 0, page * page_stride + layer_base + local % TPB, -1)
+
+
+@triton.jit
 def _ks_merge_row(
     row,
     e,
@@ -411,18 +437,29 @@ def _ks_merge_row(
     max_spin,
     rank,
     count_ptr,
+    empty_ptr,
+    req_ptr,
+    bt_ptr,
+    bt_stride,
+    bt_cols,
+    page_stride,
+    layer_base,
     W: tl.constexpr,
     K: tl.constexpr,
     L: tl.constexpr,
     TPB: tl.constexpr,
     CH: tl.constexpr,
     OWNED: tl.constexpr,
+    EMPTY: tl.constexpr,
+    PAGED: tl.constexpr,
 ):
     """Global Top-K of one row from the ``W`` pushed candidate lists in this rank's receive slot.
 
     ``OWNED``: write only this rank's winners, as local token indices, kept entries first in output order and the
     rest ``-1``, plus their count to ``count_ptr[row]`` (Helix CP, where a rank's sparse attention reads its own
     pages only). Rank ``w``'s candidates are its own keys, so its winners are the selected entries of its segment.
+    ``EMPTY`` (with ``OWNED``): also write ``count == 0`` to ``empty_ptr[row]`` (one byte, 0 / 1).
+    ``PAGED`` (with ``OWNED``): write the winners as paged-pool indices (``_ks_pool_index``) instead.
     """
     slot = (e & 1).to(tl.int64)
     wv = tl.arange(0, W)
@@ -469,25 +506,47 @@ def _ks_merge_row(
                     sel_f = m & (_order_key(s_f, g_f) >= thr_all)
                     pos_f = off_f + tl.cumsum(sel_f.to(tl.int32), axis=0) - 1
                     if OWNED:
-                        tl.store(orow + pos_f, cc.to(tl.int32), mask=sel_f)
+                        own_f = cc.to(tl.int64)
+                        if PAGED:
+                            own_f = _ks_pool_index(
+                                own_f,
+                                sel_f,
+                                row,
+                                req_ptr,
+                                bt_ptr,
+                                bt_stride,
+                                bt_cols,
+                                page_stride,
+                                layer_base,
+                                TPB,
+                            )
+                        tl.store(orow + pos_f, own_f.to(tl.int32), mask=sel_f)
                     else:
                         tl.store(orow + pos_f, g_f.to(tl.int32), mask=sel_f)
                     off_f += tl.sum(sel_f.to(tl.int32), axis=0)
         tl.store(orow + kk, tl.full([K], -1, tl.int32), mask=kk >= off_f)
         if OWNED:
             tl.store(count_ptr + row, off_f)
+            if EMPTY:
+                tl.store(empty_ptr + row, (off_f == 0).to(tl.uint8))
     else:
         sel = valid & (flat >= thr)
         g = 4294967295 - (flat & 4294967295)
         if OWNED:
             sel = sel & ((c // L) == rank)
             g = (g // TPB) // W * TPB + g % TPB
+            if PAGED:
+                g = _ks_pool_index(
+                    g, sel, row, req_ptr, bt_ptr, bt_stride, bt_cols, page_stride, layer_base, TPB
+                )
         pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
         tl.store(orow + pos, g.to(tl.int32), mask=sel)
         nsel = tl.sum(sel.to(tl.int32), axis=0)
         tl.store(orow + kk, tl.full([K], -1, tl.int32), mask=kk >= nsel)
         if OWNED:
             tl.store(count_ptr + row, nsel)
+            if EMPTY:
+                tl.store(empty_ptr + row, (nsel == 0).to(tl.uint8))
 
 
 @triton.jit
@@ -560,12 +619,21 @@ def _ks_merge_kernel(
     max_spin,
     rank,
     count_ptr,
+    empty_ptr,
+    req_ptr,
+    bt_ptr,
+    bt_stride,
+    bt_cols,
+    page_stride,
+    layer_base,
     W: tl.constexpr,
     K: tl.constexpr,
     L: tl.constexpr,
     TPB: tl.constexpr,
     CH: tl.constexpr,
     OWNED: tl.constexpr,
+    EMPTY: tl.constexpr,
+    PAGED: tl.constexpr,
     PDL: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -585,12 +653,21 @@ def _ks_merge_kernel(
         max_spin,
         rank,
         count_ptr,
+        empty_ptr,
+        req_ptr,
+        bt_ptr,
+        bt_stride,
+        bt_cols,
+        page_stride,
+        layer_base,
         W,
         K,
         L,
         TPB,
         CH,
         OWNED,
+        EMPTY,
+        PAGED,
     )
     if PDL:
         tl.extra.cuda.gdc_wait()
@@ -740,6 +817,9 @@ class KeyShardTopKMerge:
     ``key_shard_owner_rows``.
     """
 
+    # Tokens per KV page of the token indices the merge reads and writes.
+    tokens_per_block = KEY_SHARD_TOKENS_PER_BLOCK
+
     def __init__(
         self,
         buffers: List[torch.Tensor],
@@ -859,19 +939,39 @@ class KeyShardTopKMerge:
         assert not self.owner_rows, "an owner-row workspace serves merge_owned only"
         self._merge(out, None)
 
-    def merge_owned(self, out: torch.Tensor, counts: Optional[torch.Tensor] = None) -> None:
-        """Write this rank's share of every row's global Top-K into ``out`` [rows, top_k] as local token indices.
+    def merge_owned(
+        self,
+        out: torch.Tensor,
+        counts: Optional[torch.Tensor] = None,
+        empty: Optional[torch.Tensor] = None,
+        paged: Optional[tuple] = None,
+    ) -> None:
+        """Write this rank's share of every row's global Top-K into ``out`` [rows, top_k], as local token indices
+        or, with ``paged``, as paged-pool indices.
 
         The kept entries come first, in the order ``merge`` would list them, the rest is ``-1``: the same rows as
         ``merge`` followed by ``helix_key_shard.keep_owned_local_rows``. ``counts`` [rows] int32 (optional) receives
         the kept count of each row.
+
+        The two other outputs are not served in owner-row mode:
+        ``empty`` [rows] bool (optional) receives whether a row's kept count is 0.
+        ``paged`` = ``(req_idx, block_table, page_stride, layer_base)`` (optional): write the kept entries as
+        paged-pool indices instead, the integers ``convert_req_index_to_global`` gives for these rows
+        (``req_idx`` [rows] int32 request of each row, ``block_table`` [requests, pages] int32, index = page *
+        ``page_stride`` + ``layer_base`` + token in page; ``-1`` for a missing page).
         """
-        counts = counts if counts is not None else self._counts_scratch(out.shape[0])
+        rows = out.shape[0]
+        counts = counts if counts is not None else self._counts_scratch(rows)
+        if empty is not None:
+            assert empty.dtype == torch.bool and empty.is_contiguous() and empty.shape[0] >= rows
         if self.owner_rows:
-            self.merge_owned_begin(out.shape[0])
+            assert empty is None and paged is None, (
+                "an owner-row merge writes token indices and counts only"
+            )
+            self.merge_owned_begin(rows)
             self.merge_owned_end(out, counts)
             return
-        self._merge(out, counts)
+        self._merge(out, counts, empty, paged)
 
     def merge_owned_begin(self, rows: int) -> None:
         """Owner-row mode, first step: reduce this rank's rows (``r % W == rank``) and publish their thresholds."""
@@ -943,7 +1043,13 @@ class KeyShardTopKMerge:
             self._owned_counts = scratch
         return scratch
 
-    def _merge(self, out: torch.Tensor, counts: Optional[torch.Tensor]) -> None:
+    def _merge(
+        self,
+        out: torch.Tensor,
+        counts: Optional[torch.Tensor],
+        empty: Optional[torch.Tensor] = None,
+        paged: Optional[tuple] = None,
+    ) -> None:
         rows = out.shape[0]
         if rows == 0:
             return
@@ -953,6 +1059,13 @@ class KeyShardTopKMerge:
             assert (
                 counts.dtype == torch.int32 and counts.is_contiguous() and counts.shape[0] >= rows
             )
+        assert (empty is None and paged is None) or owned
+        req_idx, block_table, page_stride, layer_base = paged or (self.state, self.state, 0, 0)
+        if paged is not None:
+            assert req_idx.dtype == torch.int32 and req_idx.is_contiguous()
+            assert req_idx.shape[0] >= rows
+            assert block_table.dtype == torch.int32 and block_table.ndim == 2
+            assert block_table.stride(1) == 1
         _ks_merge_kernel[(rows,)](
             self.keys,
             self.i32,
@@ -967,12 +1080,22 @@ class KeyShardTopKMerge:
             self.max_spin,
             self.rank,
             counts if owned else self.state,
+            # A bool tensor stores one byte per element; the kernel writes 0 / 1.
+            empty.view(torch.uint8) if empty is not None else self.state,
+            req_idx,
+            block_table,
+            block_table.stride(0) if paged is not None else 0,
+            block_table.shape[1] if paged is not None else 0,
+            page_stride,
+            layer_base,
             W=self.world,
             K=self.top_k,
             L=self.local_k,
             TPB=KEY_SHARD_TOKENS_PER_BLOCK,
             CH=2048,
             OWNED=owned,
+            EMPTY=empty is not None,
+            PAGED=paged is not None,
             PDL=self.pdl,
             num_warps=self.warps,
             launch_pdl=self.pdl,

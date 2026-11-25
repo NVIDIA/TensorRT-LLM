@@ -623,6 +623,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         names = (
             "helix_row_kv_lens_cuda",
             "helix_row_kv_lens_host",
+            "helix_row_empty_cuda",
             "helix_row_req_idx_cuda",
             "helix_row_req_idx_host",
             "helix_row_prompt_lens_cuda",
@@ -634,11 +635,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             setattr(self, name, None)
         self._helix_num_rows = 0
         self._helix_rows_set = False
+        # Generation rows whose "kept count == 0" flags a producer wrote into helix_row_empty_cuda together with
+        # the counts (0: none), and whether those flags also cover every row without local KV (see
+        # mark_helix_sparse_row_lens_set).
+        self._helix_rows_empty_count = 0
+        self._helix_rows_empty_cover_zero_kv = False
         if not self.enable_helix or self.kv_cache_manager is None:
             return
         rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
         for name, dtype in (
             ("helix_row_kv_lens_cuda", torch.int32),
+            ("helix_row_empty_cuda", torch.bool),
             ("helix_row_req_idx_cuda", torch.long),
             ("helix_row_prompt_lens_cuda", torch.int32),
         ):
@@ -681,6 +688,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         row to its kept count layer by layer.
         """
         self._helix_num_rows = 0
+        self._helix_rows_empty_count = 0
+        self._helix_rows_empty_cover_zero_kv = False
         if self.helix_row_kv_lens_cuda is None or self.num_generations <= 0:
             return
         num_contexts = self.num_contexts
@@ -747,6 +756,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             out=self.helix_row_kv_lens_cuda[num_contexts : num_contexts + gen_rows.shape[0]],
         )
         self._helix_rows_set = True
+        # Only the lengths were written.
+        self._helix_rows_empty_count = 0
+        self._helix_rows_empty_cover_zero_kv = False
 
     def helix_sparse_row_lens_out(self, num_gen_rows: int) -> Optional[torch.Tensor]:
         """The generation rows' slice of the token-sparse MLA row lengths, for a producer that writes the kept
@@ -756,10 +768,34 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_contexts = self.num_contexts
         return self.helix_row_kv_lens_cuda[num_contexts : num_contexts + num_gen_rows]
 
-    def mark_helix_sparse_row_lens_set(self) -> None:
-        """The generation rows' lengths were written through ``helix_sparse_row_lens_out``."""
+    def helix_sparse_row_empty_out(self, num_gen_rows: int) -> Optional[torch.Tensor]:
+        """The generation rows' slice of the "kept count is 0" flags (bool), for a producer that writes them
+        together with the kept counts; None without Helix sparse rows."""
+        if self._helix_num_rows <= 0:
+            return None
+        num_contexts = self.num_contexts
+        return self.helix_row_empty_cuda[num_contexts : num_contexts + num_gen_rows]
+
+    def mark_helix_sparse_row_lens_set(
+        self, num_empty_rows: int = 0, covers_zero_kv: bool = False
+    ) -> None:
+        """The generation rows' lengths were written through ``helix_sparse_row_lens_out``.
+
+        Args:
+            num_empty_rows: Generation rows whose flags the producer also wrote through
+                ``helix_sparse_row_empty_out`` (0: none).
+            covers_zero_kv: Every row this rank holds no KV for has a kept count of 0, i.e. the Top-K
+                was bounded by the rows' Helix KV bounds (``helix_spec_row_kv_lens``).
+        """
         if self._helix_num_rows > 0:
             self._helix_rows_set = True
+            self._helix_rows_empty_count = num_empty_rows
+            self._helix_rows_empty_cover_zero_kv = num_empty_rows > 0 and covers_zero_kv
+
+    def invalidate_helix_noop_rows(self) -> None:
+        """A new Top-K call starts: the flags of an earlier call no longer stand for the rows without local
+        KV (``helix_gen_noop_rows``). A call that reuses an earlier Top-K keeps that call's kept counts."""
+        self._helix_rows_empty_cover_zero_kv = False
 
     def helix_sparse_empty_rows(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
         """Generation rows whose current Top-K kept nothing on this rank, or None.
@@ -770,7 +806,26 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self._helix_num_rows <= 0 or not self._helix_rows_set:
             return None
         num_contexts = self.num_contexts
+        if num_gen_tokens <= self._helix_rows_empty_count:
+            return self.helix_row_empty_cuda[num_contexts : num_contexts + num_gen_tokens]
         return self.helix_row_kv_lens_cuda[num_contexts : num_contexts + num_gen_tokens] == 0
+
+    def helix_gen_noop_rows(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
+        """Generation rows this rank contributes nothing to in the Helix combine, or None.
+
+        Not None only for the rows of the Top-K call whose merge wrote the rows that keep nothing, when
+        those include the rows this rank holds no KV for (``mark_helix_sparse_row_lens_set``): the mask
+        then needs no kernel. Otherwise the caller combines ``helix_sparse_empty_rows`` with its own
+        zero-KV mask.
+        """
+        if (
+            not self._helix_rows_empty_cover_zero_kv
+            or not self._helix_rows_set
+            or num_gen_tokens != self._helix_rows_empty_count
+        ):
+            return None
+        num_contexts = self.num_contexts
+        return self.helix_row_empty_cuda[num_contexts : num_contexts + num_gen_tokens]
 
     def helix_spec_row_kv_lens(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
         """Per-token rank-local KV bounds of Helix verify groups, or None."""
