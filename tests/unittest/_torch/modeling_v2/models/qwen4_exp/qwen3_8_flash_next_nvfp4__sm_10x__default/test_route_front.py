@@ -290,3 +290,56 @@ def test_build_takes_the_certified_windows(monkeypatch, dp_size, local_experts):
     )
     with pytest.raises(_Reached):
         M._route_front_build(core, [], torch.device("cuda"))
+
+
+@pytest.mark.parametrize(
+    "dp_size, local, rows, value, expected",
+    [
+        (8, 64, 544, None, True),
+        (8, 64, 1024, "1", True),
+        (8, 64, 512, None, False),  # one token a warp: nothing to change
+        (8, 64, 544, "0", False),
+        (4, 128, 640, None, False),  # dep4's window: not measured
+        (1, 128, 16, None, False),
+    ],
+)
+def test_fast2_rows(monkeypatch, dp_size, local, rows, value, expected):
+    if value is None:
+        monkeypatch.delenv(M.DP_ROUTE_FAST2_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_ROUTE_FAST2_ENV, value)
+    core = SimpleNamespace(dp_size=dp_size, local_experts=local)
+    assert M._route_front_fast2(core, rows) is expected
+
+
+@pytest.mark.parametrize("fast2", [False, True])
+def test_run_passes_the_fast_path(monkeypatch, fast2):
+    """`_route_front_run` launches the row count's compiled form."""
+    seen = []
+
+    def front(logits, x, gscale, flat, tile, offset, local, f2):
+        seen.append(f2)
+        return None, None, torch.zeros(2, 10), torch.zeros(2, 10)
+
+    class Runner:
+        def run_moe_prerouted(self, *args):
+            return [torch.zeros(2, 8)]
+
+    monkeypatch.setattr(M, "moe_route_front", front)
+    st = M._RouteFront(Runner())
+    st.tactics = {544: (32, 32)}
+    st.flats = {544: [torch.zeros(4, dtype=torch.int32)]}
+    st.views = {544: [[torch.zeros(1)] * 6]}
+    if fast2:
+        st.fast2.add(544)
+    L = SimpleNamespace(moe_gscale=None)
+    for name in ("fc1_w", "fc1_s", "fc2_w", "fc2_s", "out1_scale", "out1_gate_scale", "out2_scale"):
+        setattr(L, name, None)
+    core = SimpleNamespace(
+        expert_offset=0, local_experts=64, num_experts=512, topk=10, expert_inter=640
+    )
+    try:
+        M._route_front_run(core, st, torch.zeros(544, 8), L, 0, torch.zeros(544, 512))
+    except Exception:  # noqa: BLE001 -- the runner stand-in stops short; the front ran first
+        pass
+    assert seen == [fast2]

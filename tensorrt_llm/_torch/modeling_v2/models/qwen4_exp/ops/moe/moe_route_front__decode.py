@@ -15,6 +15,9 @@ Up to `LEAN_MAX_ROWS` rows the lean form runs (one cheaper count exchange; it re
 dependent, the runner's FC1, at its start, whose own wait still holds it until this grid
 completes); past them clusters of 16 and the default release.
 
+`fast2=True` (past 512 rows, where a warp routes two tokens) routes each of a warp's two tokens
+on the kernel's one-token fast path instead of both on the full per-lane sort: the same bits.
+
 Bitwise: the experts and weights are `renorm_moe_routing_op`'s, the codes and scales
 `fp4_quantize`'s; the tables match the runner's own routing up to the row order inside an
 expert's tile, which no output depends on.
@@ -78,11 +81,24 @@ def _threads(rows: int, hidden: int, num_local: int) -> int:
     return 1024
 
 
-def compile_front(rows: int, hidden: int, row_stride: int, num_local: int, tile: int):
+#: Rows from which a warp routes two tokens (clusters of 16 CTAs of 32 warps): `fast2` changes
+#: the launch only past them.
+FAST2_MIN_ROWS = 513
+
+
+def _key(rows, hidden, row_stride, num_local, tile, fast2) -> tuple:
+    fast2 = bool(fast2) and rows >= FAST2_MIN_ROWS
+    return (rows, hidden, row_stride, num_local, tile, bool(get_env_enable_pdl()), fast2)
+
+
+def compile_front(
+    rows: int, hidden: int, row_stride: int, num_local: int, tile: int, fast2: bool = False
+):
     """Compile (once) the launch of `rows` gathered rows of `hidden` (row stride `row_stride`)
-    for a window of `num_local` experts at tile `tile`; False where the kernel does not take the
-    shape. Outside CUDA-graph capture only; `__call__` then finds it."""
-    key = (rows, hidden, row_stride, num_local, tile, bool(get_env_enable_pdl()))
+    for a window of `num_local` experts at tile `tile` (`fast2`: two tokens a warp on the
+    one-token fast path); False where the kernel does not take the shape. Outside CUDA-graph
+    capture only; `__call__` then finds it."""
+    key = _key(rows, hidden, row_stride, num_local, tile, fast2)
     if key in _COMPILED:
         return _COMPILED[key] is not None
     assert not torch.cuda.is_current_stream_capturing(), "compile outside graph capture"
@@ -114,18 +130,20 @@ def compile_front(rows: int, hidden: int, row_stride: int, num_local: int, tile:
     if not 1 <= rows <= MAX_ROWS or not MoeRouteFrontKernel.supports(**config):
         _COMPILED[key] = None
         return False
-    kernel = MoeRouteFrontKernel(use_pdl=key[-1], **config)
+    kernel = MoeRouteFrontKernel(use_pdl=key[-2], fast2=key[-1], **config)
     z = cutlass.Int64(0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     _COMPILED[key] = cute.compile(kernel, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream)
     return True
 
 
-def _cell(rows: int, offset: int, tile: int, why: str, num_local: int = 128) -> Cell:
-    return Cell(
-        why=why,
-        spec=dict(rows=rows, hidden=2560, local_offset=offset, num_local=num_local, tile=tile),
-    )
+def _cell(
+    rows: int, offset: int, tile: int, why: str, num_local: int = 128, fast2: bool = False
+) -> Cell:
+    spec = dict(rows=rows, hidden=2560, local_offset=offset, num_local=num_local, tile=tile)
+    if fast2:
+        spec["fast2"] = True
+    return Cell(why=why, spec=spec)
 
 
 class MoeRouteFront(OpWrapper):
@@ -149,6 +167,9 @@ class MoeRouteFront(OpWrapper):
         _cell(96, 448, 16, "dep8 MTP-3: 3 requests a rank (96 rows), window 7 of 64", 64),
         _cell(448, 64, 32, "dep8 MTP-3: 14 a rank (448 rows, clusters of 16), window 1", 64),
         _cell(896, 320, 64, "dep8 MTP-3: 28 a rank (896 rows), window 5, tile 64", 64),
+        _cell(544, 128, 32, "dep8 fast2: 17 a rank (544 rows), window 2, tile 32", 64, True),
+        _cell(768, 448, 32, "dep8 fast2: 24 a rank (768 rows), window 7, tile 32", 64, True),
+        _cell(1024, 0, 64, "fast2: 1024 rows, 64 tokens a CTA (two mask words)", 64, True),
     )
 
     note = """
@@ -168,12 +189,13 @@ class MoeRouteFront(OpWrapper):
         tile: int,
         local_offset: int,
         num_local: int,
+        fast2: bool = False,
     ):
         import cuda.bindings.driver as cuda
         import cutlass
 
         rows, hidden = x.shape
-        key = (rows, hidden, x.stride(0), num_local, tile, bool(get_env_enable_pdl()))
+        key = _key(rows, hidden, x.stride(0), num_local, tile, fast2)
         fn = _COMPILED.get(key)
         assert fn is not None, f"no route front compiled for {key}: `compile_front` first"
         dev = x.device
@@ -205,14 +227,18 @@ class MoeRouteFront(OpWrapper):
         tile: int,
         local_offset: int,
         num_local: int,
+        fast2: bool = False,
     ):
         """The composed path it replaces, without the tables (they are checked by their meaning,
-        `check_tables`): `fp4_quantize` with linear scales, `renorm_moe_routing_op`."""
+        `check_tables`): `fp4_quantize` with linear scales, `renorm_moe_routing_op`. `fast2`
+        moves no value."""
         xq, xsf = fp4_quantize(x, global_scale, _SF_VEC, False, False)
         ids, wts = renorm_moe_routing_op(logits, TOP_K, torch.bfloat16)
         return xq, xsf.reshape(x.shape[0], -1), ids, wts
 
-    def is_valid(self, logits, x, global_scale, tables, tile, local_offset, num_local) -> None:
+    def is_valid(
+        self, logits, x, global_scale, tables, tile, local_offset, num_local, fast2=False
+    ) -> None:
         rows, hidden = x.shape
         assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.data_ptr() % 16 == 0
         assert logits.dtype == torch.bfloat16 and logits.is_contiguous()

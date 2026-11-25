@@ -318,6 +318,7 @@ class MoeRouteFrontKernel:
         threads: int = ROUTE_THREADS,
         cluster: int = ROUTE_CLUSTER,
         lean: bool = False,
+        fast2: bool = False,
     ) -> None:
         err = _shape_error(
             num_rows=num_rows,
@@ -348,6 +349,9 @@ class MoeRouteFrontKernel:
         self.mw = -(-self.tpc // 32)  # token-mask words per expert (TPC > 32: two)
         self.warps = threads // 32
         self.tpw = -(-self.tpc // self.warps)
+        # Two tokens a warp, each routed on the one-token fast path (`_route_warp_fast`) instead
+        # of both on the full per-lane sort (`_route_warp`): the same bits, fewer issued sorts.
+        self.fast2 = fast2 and self.tpw == 2
         self.quant_clusters = quant_clusters
         self.ctas = cluster * (1 + quant_clusters)
         self.q_ctas = cluster * quant_clusters
@@ -533,6 +537,18 @@ class MoeRouteFrontKernel:
                 my_sel, my_w = self._route_warp_fast(
                     logits_ptr, local_start, smask, spick, t_first, warp, lane
                 )
+        elif const_expr(self.fast2):
+            # tokens warp and warp + #warps, one after the other on the fast path; stored here
+            for rr in cutlass.range_constexpr(2):
+                fast_tok = warp + Int32(self.warps * rr)
+                if fast_tok < n_tok:
+                    fast_sel, fast_w = self._route_warp_fast(
+                        logits_ptr, local_start, smask, spick, t_first, fast_tok, lane
+                    )
+                    if lane < top_k:
+                        fast_o = Int64(t_first + fast_tok) * Int64(top_k) + Int64(lane)
+                        _st_b32(ids_ptr + fast_o * Int64(4), fast_sel)
+                        _st_b16(wts_ptr + fast_o * Int64(2), fast_w)
         else:
             if warp < n_tok:
                 self._route_warp(
@@ -793,7 +809,8 @@ class MoeRouteFrontKernel:
     ):
         """Token ``t_first + warp``: the same bits as :meth:`_route_warp`, but each lane keeps only its 4 largest
         keys; a lane that runs dry before the last round (holds >= 5 of the top 10) sends the warp to the full
-        sort. Returns (expert id, BF16 weight bits) of pick ``lane`` (lanes < top_k)."""
+        sort. Returns (expert id, BF16 weight bits) of pick ``lane`` (lanes < top_k). ``warp`` is the token's index
+        in the CTA (up to 2 x #warps - 1 with ``fast2``)."""
         top_k: cutlass.Constexpr = self.top_k
         num_local: cutlass.Constexpr = self.num_local
         num_experts: cutlass.Constexpr = self.num_experts
@@ -848,7 +865,14 @@ class MoeRouteFrontKernel:
             lid = my_sel - local_start
             pick = _sel_lt(lid, Int32(num_local), lid, Int32(-1))
             if pick >= Int32(0):
-                _red_or_shared(smask + pick * 4, _bit(warp))
+                if const_expr(self.mw == 1):
+                    _red_or_shared(smask + pick * 4, _bit(warp))
+                else:
+                    # token warp's bit in word warp // 32 of the expert's mask words (`fast2`)
+                    _red_or_shared(
+                        smask + (pick * Int32(self.mw) + warp // Int32(32)) * 4,
+                        _bit(warp % Int32(32)),
+                    )
             _st_shared(spick + (warp * top_k + lane) * 4, pick)
         return my_sel, my_w
 

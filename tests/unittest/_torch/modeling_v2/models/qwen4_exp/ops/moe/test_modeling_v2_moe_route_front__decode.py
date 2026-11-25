@@ -59,10 +59,11 @@ def test_certified_cells(cell):
     spec, device = cell.spec, torch.device("cuda")
     seed = zlib.crc32(cell.why.encode()) % 2**31
     logits, x, global_scale, tables = _operands(spec, seed, device)
+    fast2 = spec.get("fast2", False)
     assert op.compile_front(
-        spec["rows"], spec["hidden"], x.stride(0), spec["num_local"], spec["tile"]
+        spec["rows"], spec["hidden"], x.stride(0), spec["num_local"], spec["tile"], fast2
     )
-    args = (spec["tile"], spec["local_offset"], spec["num_local"])
+    args = (spec["tile"], spec["local_offset"], spec["num_local"], fast2)
     got = op.moe_route_front(logits, x, global_scale, tables, *args)
     _assert_matches(spec, logits, x, global_scale, tables, got)
 
@@ -81,6 +82,25 @@ def test_certified_cells(cell):
         graph.replay()
         torch.cuda.synchronize()
         _assert_matches(spec, s_logits, s_x, global_scale, tables, out)
+
+
+@_GPU
+@pytest.mark.parametrize("rows, local", [(513, 64), (544, 64), (768, 64), (1024, 64), (640, 128)])
+def test_fast2_is_bitwise_the_two_token_sort(rows, local):
+    """`fast2` routes a warp's two tokens on the one-token fast path: the experts, weights,
+    codes, scales and tables are the same bits as the full two-token sort's."""
+    device = torch.device("cuda")
+    spec = dict(rows=rows, hidden=2560, local_offset=local, num_local=local, tile=32)
+    logits, x, global_scale, tables = _operands(spec, 7000 + rows, device)
+    for fast2 in (False, True):
+        assert op.compile_front(rows, 2560, x.stride(0), local, 32, fast2)
+    base = op.moe_route_front(logits, x, global_scale, tables.clone(), 32, local, local, False)
+    fast_tables = tables.clone()
+    fast = op.moe_route_front(logits, x, global_scale, fast_tables, 32, local, local, True)
+    torch.cuda.synchronize()
+    for a, b in zip(base, fast):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    _assert_matches(spec, logits, x, global_scale, fast_tables, fast)
 
 
 def _tables(ids: torch.Tensor, local_offset: int, num_local: int, tile: int) -> list:

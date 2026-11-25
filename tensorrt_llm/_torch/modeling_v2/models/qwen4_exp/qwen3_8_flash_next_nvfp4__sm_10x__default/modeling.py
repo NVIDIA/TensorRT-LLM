@@ -1362,6 +1362,17 @@ _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
 #: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
 #: a row count whose check fails keeps the runner's routing.
 _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
+#: Switch, on by default: where a route front was built over dep8's 64-expert window, its launches
+#: of `_ROUTE_FRONT_FAST2_ROWS` gathered rows (two tokens a warp) route each token on the kernel's
+#: one-token fast path (`moe_route_front(..., fast2=True)`) instead of both on the full per-lane
+#: sort. The same experts, weights, codes and tables, bit for bit (the build's check against the
+#: runner's own routing still gates every row count; a row count that fails it keeps the two-token
+#: sort). GB300 micro, us a launch: 8.72 -> 5.41 at 544 rows, 8.71 -> 6.27 at 768, 8.93 -> 7.41 at
+#: 1024; dep8 server step at 17 / 18 / 20 / 24 requests a rank: -0.15..-0.23 / -0.166 / -0.145 /
+#: -0.134 ms. `0` keeps the two-token sort. Read once, when the target is built.
+DP_ROUTE_FAST2_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FAST2"
+#: Gathered rows a launch takes the fast path at: two tokens a warp, up to the launch's last.
+_ROUTE_FRONT_FAST2_ROWS = (513, 1024)  # capacity: fixed: dispatch thresholds
 #: Switch, on by default: a tep4 rank (attention TP over four ranks without attention DP, the
 #: routed experts as 128-expert windows) runs a captured generation-only step on the forms the
 #: one-rank target runs, at its shard:
@@ -4998,6 +5009,8 @@ class _RouteFront:
         # the front's launch, and each layer's staging buffer.
         self.decode: frozenset = frozenset()
         self.stages: list = []
+        # `DP_ROUTE_FAST2_ENV`: the row counts compiled with two tokens a warp on the fast path.
+        self.fast2: set = set()
 
 
 def _route_front_tactic(runner, core, rows: int) -> tuple | None:
@@ -5082,6 +5095,7 @@ def _route_front_run(
             tile,
             core.expert_offset,
             core.local_experts,
+            rows in st.fast2,
         )
     xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
     out = st.runner.run_moe_prerouted(
@@ -5185,6 +5199,18 @@ def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows
     return ", ".join(bad)
 
 
+def _route_front_fast2(core, rows: int) -> bool:
+    """`DP_ROUTE_FAST2_ENV` for a route front of `rows` gathered rows: dep8's 64-expert window at
+    `_ROUTE_FRONT_FAST2_ROWS` with the switch on (the default)."""
+    lo, hi = _ROUTE_FRONT_FAST2_ROWS
+    return (
+        core.dp_size > 1
+        and core.local_experts == _ROUTE_FRONT_WINDOWS[8]
+        and lo <= rows <= hi
+        and _switch(DP_ROUTE_FAST2_ENV, default=True)
+    )
+
+
 def _route_front_build(core, layers, device) -> _RouteFront | None:
     """`DP_ROUTE_FRONT_ENV` at an attention-DP rank, `TEP_FAST_DECODE_ENV` at a tep4 rank
     (`core.tep_fast`), read once at build (`post_load_weights`, `layers` the decode target's):
@@ -5237,6 +5263,10 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
                 rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
             ):
                 continue
+            if _route_front_fast2(core, rows) and _route_front_compile(
+                rows, core.hidden, core.hidden, core.local_experts, int(tactic[0]), True
+            ):
+                st.fast2.add(rows)
             n = sum(table_sizes(rows, core.topk, core.local_experts, int(tactic[0])))
             fill = (torch.arange(n, device=device) % rows).to(torch.int32)
             st.tactics[rows] = tactic
@@ -5256,6 +5286,14 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             if rows not in st.tactics:
                 continue
             bad = _route_front_check(core, st, layers[i], i, rows, gen)
+            if bad and rows in st.fast2:
+                logger.warning(
+                    f"{DP_ROUTE_FAST2_ENV}: layer {i} at {rows} gathered rows on the fast path "
+                    f"differs from the runner's own routing ({bad}); that row count keeps the "
+                    "two-token sort"
+                )
+                st.fast2.discard(rows)
+                bad = _route_front_check(core, st, layers[i], i, rows, gen)
             if bad and rows in st.refs:
                 logger.warning(
                     f"{DP_ROUTE_FRONT_ENV}: layer {i} at {rows} gathered rows on the tactic "
@@ -5278,6 +5316,7 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     logger.info(
         f"MoE route front: rank {core.mapping.tp_rank} of {core.mapping.tp_size}, "
         f"{'gathered ' if dp else ''}rows {built}, tactics {[st.tactics[r] for r in built]}"
+        + (f", two tokens a warp on the fast path at {sorted(st.fast2)}" if st.fast2 else "")
     )
     return st
 
