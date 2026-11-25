@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python bindings for native OPTIONAL selection; storage contracts live in C++."""
 
+import array
 import time
 from datetime import timedelta
 
 import pytest
 import torch
 
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
@@ -54,8 +56,21 @@ def test_sparse_fetch_buffer_policy_overrides(split):
         manager.shutdown()
 
 
-@pytest.mark.parametrize("priority", [None, 80])
-def test_reuse_status_and_optional_selection_bindings(priority):
+@pytest.mark.parametrize(
+    "checkpoint_endpoint,source_end,match_end,backoff,completion,priority",
+    [
+        (None, 8, 8, 0, None, None),
+        (None, 8, 8, 0, None, 80),
+        (4, 8, 8, 0, "commit", None),
+        (3, 8, 8, 0, "resize", None),
+        (3, 8, 8, 0, "scratch_shrink", None),
+        (None, 7, 7, 0, None, None),
+        (None, 7, 5, 2, None, None),
+    ],
+)
+def test_reuse_status_and_optional_selection_bindings(
+    checkpoint_endpoint, source_end, match_end, backoff, completion, priority
+):
     layers = [
         kv.AttentionLayerConfig(
             layer_id=i,
@@ -66,7 +81,14 @@ def test_reuse_status_and_optional_selection_bindings(priority):
         for i in range(3)
     ]
     config = kv.KVCacheManagerConfig(
-        tokens_per_block=4, cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)], layers=layers
+        commit_min_snapshot=True,
+        reuse_match_backoff=backoff,
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=128 << 10)],
+        layers=layers,
+        swa_scratch_reuse=kv.SwaScratchReuseConfig(max_rewind_len=0)
+        if completion == "scratch_shrink"
+        else None,
     )
     stream = torch.cuda.Stream()
     manager = kv.KVCacheManager(config)
@@ -86,9 +108,14 @@ def test_reuse_status_and_optional_selection_bindings(priority):
             ),
         )
         caches.append(source)
+        source.enable_swa_scratch_reuse = False
         assert source.resume(stream.cuda_stream)
+        assert source.resize(4)
+        source.commit(tokens[:4])
+        encoder = manager.get_layer_group_id(1)
+        earlier_page = source.get_base_page_indices(encoder)[0]
         assert source.resize(8)
-        source.commit(tokens)
+        source.commit(tokens[4:source_end], is_end=True)
         groups = [manager.get_layer_group_id(i) for i in range(3)]
         source_indices = [source.get_base_page_indices(group).copy() for group in groups]
         source.close()
@@ -99,30 +126,167 @@ def test_reuse_status_and_optional_selection_bindings(priority):
             if priority is not None
             else None
         )
-        reader = manager.create_kv_cache(None, tokens, kv_cache_retention_config=retention)
+        reader = manager.create_kv_cache(
+            None,
+            tokens[: match_end + backoff],
+            kv_cache_retention_config=retention,
+            optional_reuse_max_backtrack=match_end,
+        )
         caches.append(reader)
+        reader.enable_swa_scratch_reuse = False
         global_group, encoder, peer = groups
         for layer, group in enumerate(groups):
             status = reader.reuse_status[group]
             assert status.group_id == group
             assert status.policy == config.layers[layer].reuse_policy
-            assert status.complete and status.endpoint == 8
-            assert list(status.coverage) == ([(0, 8)] if layer == 0 else [(4, 8)])
+            assert status.complete and status.endpoint == match_end
+            assert list(status.endpoint_ranges) == (
+                [(match_end, match_end + 1)] if layer == 0 else [(1, match_end + 1)]
+            )
+            window = None if layer == 0 else 4 if layer == 1 else 2
+            first = 0 if window is None else max(0, (match_end + 1 - window) // 4 * 4)
+            assert list(status.coverage) == [(first, match_end)]
         for invalid in ([global_group], [-1], [len(reader.reuse_status)]):
             with pytest.raises(ValueError):
                 reader.resume(stream.cuda_stream, optional_reuse_groups=invalid)
             assert not reader.is_active
-        assert reader.resume(stream.cuda_stream, optional_reuse_groups=[encoder])
-        assert reader.get_base_page_indices(encoder)[1] == source_indices[1][1]
+        if checkpoint_endpoint is not None:
+            endpoints = {encoder: checkpoint_endpoint}
+            blocker = manager.create_kv_cache(None, [])
+            caches.append(blocker)
+            blocker.enable_swa_scratch_reuse = False
+            assert blocker.resume(stream.cuda_stream)
+            capacity = 4
+            while blocker.resize(capacity):
+                capacity += 4
+            assert not reader.resume(stream.cuda_stream, optional_reuse_endpoints=endpoints)
+            assert reader.num_committed_tokens == 8
+            assert not reader.is_active
+            blocker.close()
+            assert list(reader.reuse_status[encoder].endpoint_ranges) == [
+                (checkpoint_endpoint, checkpoint_endpoint + 1)
+            ]
+            assert reader.resume(stream.cuda_stream, optional_reuse_endpoints=endpoints)
+            assert (reader.get_base_page_indices(encoder)[0] == earlier_page) == (
+                checkpoint_endpoint % 4 == 0
+            )
+            assert reader.get_base_page_indices(encoder)[1] != source_indices[1][1]
+        else:
+            assert reader.resume(stream.cuda_stream, optional_reuse_groups=[encoder])
+            assert (reader.get_base_page_indices(encoder)[1] == source_indices[1][1]) == (
+                match_end % 4 == 0
+            )
         assert reader.get_base_page_indices(peer)[1] != source_indices[2][1]
-        assert reader.get_page_priorities(encoder)[1] == (60 if priority is None else priority)
-        assert reader.get_page_priorities(peer)[1] == (35 if priority is None else priority)
-        time.sleep(1.05)
-        manager.refresh_retention()
-        assert reader.get_page_priorities(encoder)[1] == (60 if priority is None else priority)
+        if checkpoint_endpoint is None and match_end == 8:
+            expected_priority = 60 if priority is None else priority
+            assert reader.get_page_priorities(encoder)[1] == expected_priority
+            assert reader.get_page_priorities(peer)[1] == (35 if priority is None else priority)
+            time.sleep(1.05)
+            manager.refresh_retention()
+            assert reader.get_page_priorities(encoder)[1] == expected_priority
+        restored_page = reader.get_base_page_indices(encoder)[0]
         reader.suspend()
         assert reader.resume(stream.cuda_stream)
-        assert reader.get_base_page_indices(encoder)[1] == source_indices[1][1]
+        if checkpoint_endpoint is not None:
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
+            assert reader.resize(12)
+            # Reserving/rolling back capacity cannot retire uncomputed history.
+            assert reader.resize(8, 8)
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
+            for complete_optional_recovery in (False, True):
+                assert not reader.resize(
+                    1 << 20, 12, complete_optional_recovery=complete_optional_recovery
+                )
+                assert reader.history_length == 8
+                assert reader.get_base_page_indices(encoder)[0] == restored_page
+            assert reader.resize(12)
+            # Even pre-forward history growth must preserve the restored lookback.
+            assert reader.resize(12, 12)
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
+            assert reader.resize(None, 12)
+            with pytest.raises(kv.LogicError, match="Pending OPTIONAL recovery"):
+                reader.history_length = 12
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
+            reader.suspend()
+            assert reader.resume(stream.cuda_stream)
+            # Both explicit post-forward updates and commit advance recovery when
+            # the scheduler has already moved the global history marker.
+            if completion == "resize":
+                assert reader.resize(16, 12, complete_optional_recovery=True)
+                assert reader.capacity == 16
+            elif completion == "scratch_shrink":
+                reader.enable_swa_scratch_reuse = True
+                assert reader.resize(20)
+                assert reader.resize(12, 12, complete_optional_recovery=True)
+                assert reader.capacity == 12
+            else:
+                reader.commit(list(range(8, 12)))
+            assert reader.history_length == 12
+            assert reader.get_base_page_indices(encoder)[0] < 0
+            assert reader.get_base_page_indices(encoder)[1] < 0
+            assert reader.resize(complete_optional_recovery=True)
+            reader.history_length = 12
+            reader.suspend()
+            assert reader.resume(stream.cuda_stream)
+        else:
+            assert (reader.get_base_page_indices(encoder)[1] == source_indices[1][1]) == (
+                match_end % 4 == 0
+            )
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+def test_locality_domain_and_optional_backtrack_bindings(monkeypatch):
+    """Mock domains exercise argument forwarding together with earlier OPTIONAL selection."""
+    monkeypatch.setenv("TRT_LLM_MOCK_LOCALIZATION_SUPPORT", "1")
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=64 << 20, enable_locality_domains=True)],
+        layers=[
+            kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+            kv.AttentionLayerConfig(
+                layer_id=1,
+                buffers=[kv.BufferConfig(role="key", size=4096)],
+                sliding_window_size=8,
+                reuse_policy=kv.ReusePolicy.OPTIONAL,
+            ),
+        ],
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(8))
+    try:
+        assert manager.num_locality_domains == 2
+        source = manager.create_kv_cache(locality_domain_id=1, optional_reuse_max_backtrack=8)
+        caches.append(source)
+        assert source.locality_domain_id == 1
+        assert source.resume(stream.cuda_stream) and source.resize(8)
+        source.commit(tokens, is_end=True)
+        source.close()
+        encoder = manager.get_layer_group_id(1)
+        for inputs in (None, tokens, array.array("i", tokens)):
+            with pytest.raises(ValueError, match="backtrack"):
+                manager.create_kv_cache(
+                    input_tokens=inputs, locality_domain_id=1, optional_reuse_max_backtrack=-1
+                )
+            reader = manager.create_kv_cache(
+                input_tokens=inputs, locality_domain_id=1, optional_reuse_max_backtrack=8
+            )
+            caches.append(reader)
+            assert reader.locality_domain_id == 1
+            if inputs is None:
+                assert reader.resume(stream.cuda_stream)
+            else:
+                assert reader.num_committed_tokens == 8
+                assert any(
+                    first <= 7 < end for first, end in reader.reuse_status[encoder].endpoint_ranges
+                )
+                assert reader.resume(stream.cuda_stream, optional_reuse_endpoints={encoder: 7})
+                assert reader.reuse_status[encoder].endpoint == 7
+            reader.close()
     finally:
         for cache in reversed(caches):
             cache.close()
@@ -347,10 +511,11 @@ def test_sink_required_claims_sinks_and_selects_window():
         assert warm.get_base_page_indices(one_sink)[0] == old[one_sink][0]
         assert warm.get_base_page_indices(one_sink)[3] == old[one_sink][3]
 
-        # Endpoint inside a block: the window cannot be selected, the sinks are still claimed.
+        # Endpoint inside a block: the window covers it and could be selected. Left unselected,
+        # it gets fresh pages while the sinks are still claimed.
         mid = manager.create_kv_cache(None, tokens[:14])
         caches.append(mid)
-        assert mid.num_committed_tokens == 14 and not mid.reuse_status[one_sink].complete
+        assert mid.num_committed_tokens == 14 and mid.reuse_status[one_sink].complete
         assert mid.resume(stream.cuda_stream, optional_reuse_groups=[])
         assert mid.get_base_page_indices(one_sink)[0] == old[one_sink][0]
         assert mid.get_base_page_indices(one_sink)[3] != old[one_sink][3]
@@ -381,6 +546,77 @@ def test_sink_required_claims_sinks_and_selects_window():
         gone = manager.create_kv_cache(None, tokens)
         caches.append(gone)
         assert gone.num_committed_tokens == 0
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+def _key_page(manager, cache, layer_id, block):
+    """One block's key page of a layer, as device bytes."""
+    group = manager.get_buffer_group_id(layer_id, "key")
+    converter = manager.get_page_index_converter(layer_id, "key")
+    index = converter(cache.get_base_page_indices(group), kv.PageIndexMode.PER_LAYER)[block]
+    base = manager.get_mem_pool_base_address(layer_id, "key", kv.PageIndexMode.PER_LAYER)
+    stride = manager.get_page_stride(layer_id, "key")
+    return convert_to_torch_tensor(TensorWrapper(int(base) + index * stride, torch.uint8, [stride]))
+
+
+def test_sink_required_selects_window_at_partial_endpoint():
+    """A SINK_REQUIRED_ONLY window can end inside a block; each reader copies that partial block."""
+    buffers = [kv.BufferConfig(role="key", size=4096)]
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=buffers),
+        kv.AttentionLayerConfig(
+            layer_id=1,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=4,
+            reuse_policy=kv.ReusePolicy.SINK_REQUIRED_ONLY,
+        ),
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(14))
+    try:
+        source = manager.create_kv_cache(None, [], expected_prompt_length=14)
+        caches.append(source)
+        assert source.resume(stream.cuda_stream) and source.resize(14)
+        # Known bytes for tokens 12-13, the first half of block 3's page.
+        with torch.cuda.stream(stream):
+            written = torch.arange(2048, device="cuda").remainder(251).to(torch.uint8)
+            _key_page(manager, source, 1, 3)[:2048].copy_(written)
+        # The min snapshot also publishes the partial block 3 (tokens 12-13).
+        source.commit(tokens)
+        group = manager.get_layer_group_id(1)
+        old = source.get_base_page_indices(group).copy()
+        source.close()
+
+        readers = []
+        for _ in range(2):
+            reader = manager.create_kv_cache(None, tokens)
+            caches.append(reader)
+            status = reader.reuse_status[group]
+            assert reader.num_committed_tokens == 14 and status.complete
+            # The sink block, then the window from block 2 to the endpoint inside block 3.
+            assert list(status.coverage) == [(0, 4), (8, 14)]
+            assert reader.resume(stream.cuda_stream, optional_reuse_groups=[group])
+            readers.append(list(reader.get_base_page_indices(group)))
+        for pages in readers:
+            assert pages[0] == old[0] and pages[2] == old[2] and pages[3] >= 0
+        # The partial block is private to each reader, which appends to it.
+        assert readers[0][3] != readers[1][3]
+        # Each private copy holds the source's tokens 12-13.
+        stream.synchronize()
+        for reader in caches[1:]:
+            assert torch.equal(_key_page(manager, reader, 1, 3)[:2048], written)
     finally:
         for cache in reversed(caches):
             cache.close()
@@ -424,13 +660,8 @@ def test_attention_buffer_reuse_policies(length, select_optional):
         caches.append(reader)
         assert reader.num_committed_tokens == length
         assert reader.reuse_status[required].complete
-        optional_complete = length % config.tokens_per_block == 0
-        assert reader.reuse_status[optional].complete == optional_complete
+        assert reader.reuse_status[optional].complete
         assert not reader.reuse_status[private].complete
-        if select_optional and not optional_complete:
-            with pytest.raises(ValueError):
-                reader.resume(stream.cuda_stream, optional_reuse_groups=[optional])
-            select_optional = False
         assert reader.resume(
             stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
         )

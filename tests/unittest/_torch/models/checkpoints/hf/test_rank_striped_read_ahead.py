@@ -34,6 +34,10 @@ MPI.pickle.__init__(
 )
 
 
+# The real function, which `_isolated_loader_environment` replaces in every test.
+_EFFECTIVE_AVAILABLE_HOST_MEMORY = read_ahead.effective_available_host_memory
+
+
 @pytest.fixture(autouse=True)
 def _isolated_loader_environment(monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
@@ -195,15 +199,223 @@ def test_extent_plan_is_complete_disjoint_and_fair(tmp_path, monkeypatch):
     ],
 )
 def test_cgroup_admission_honors_high_ancestors_and_namespaces(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
+    assert read_ahead.cgroup_available_host_memory() == expected
+
+
+def _fake_files(monkeypatch, files):
+    """Serve `files` through `Path`: a file's text, or an exception that reading it raises.
+
+    A key ending in `/` holds an exception that listing that directory raises.
+    """
+
     def read_text(path, *args, **kwargs):
         del args, kwargs
         try:
-            return cgroup[str(path)]
+            content = files[str(path)]
         except KeyError as error:
             raise FileNotFoundError(path) from error
+        if isinstance(content, BaseException):
+            raise content
+        return content
+
+    def iterdir(path):
+        prefix = f"{path}/"
+        if isinstance(files.get(prefix), BaseException):
+            raise files[prefix]
+        names = {name[len(prefix) :].split("/", 1)[0] for name in files if name.startswith(prefix)}
+        if not names:
+            raise FileNotFoundError(path)
+        return iter(sorted(path / name for name in names))
 
     monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+
+@pytest.mark.parametrize(
+    ("cgroup", "expected"),
+    [
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": (
+                    "anon 100\nactive_file 150\ninactive_file 200\nshmem 50\n"
+                ),
+                "/sys/fs/cgroup/jobs/memory.current": "800\n",
+                "/sys/fs/cgroup/jobs/memory.max": "900\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 300\ninactive_file 100\n",
+            },
+            500,
+            id="v2-leaf-and-ancestor",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": (
+                    "active_file 5\ninactive_file 5\ntotal_active_file 40\ntotal_inactive_file 60\n"
+                ),
+            },
+            550,
+            id="v1-hierarchical-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "5:memory:/host/path\n",
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "300\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": "750\n",
+                "/sys/fs/cgroup/memory/memory.stat": "active_file 20\ninactive_file 30\n",
+            },
+            500,
+            id="v1-without-totals",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file x\ninactive_file 100\n",
+            },
+            600,
+            id="malformed-entry-ignored",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 400\ninactive_file 400\n",
+            },
+            1000,
+            id="usage-never-below-zero",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # Under the limit of `jobs`, the process's own cgroup protects all 200 of its page
+                # cache, and the sibling protects 600 of its 800.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "300\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 200\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "600\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
+            },
+            380,
+            id="v2-protected-child-cache-not-credited",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # Reclaim for the cgroup's own limit ignores the cgroup's own protection.
+                "/sys/fs/cgroup/jobs/worker/memory.min": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.current": "500\n",
+                "/sys/fs/cgroup/jobs/worker/memory.max": "1000\n",
+                "/sys/fs/cgroup/jobs/worker/memory.stat": "active_file 150\ninactive_file 200\n",
+            },
+            850,
+            id="v2-own-limit-ignores-own-protection",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1500\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1600\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 900\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/a/memory.low": "max\n",
+                "/sys/fs/cgroup/jobs/a/memory.stat": "active_file 500\ninactive_file 100\n",
+                "/sys/fs/cgroup/jobs/b/memory.min": "100\n",
+                "/sys/fs/cgroup/jobs/b/memory.low": "50\n",
+                "/sys/fs/cgroup/jobs/b/memory.stat": "inactive_file 300\n",
+                "/sys/fs/cgroup/jobs/c/memory.stat": "inactive_file 300\n",
+            },
+            600,
+            id="v2-protection-up-to-min-low-or-max",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                # Without the sibling's protection, none of the page cache counts.
+                "/sys/fs/cgroup/jobs/sibling/memory.min": PermissionError("memory.min"),
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": "active_file 800\n",
+            },
+            180,
+            id="v2-unreadable-protection-gives-no-credit",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.min": "600\n",
+                "/sys/fs/cgroup/jobs/sibling/memory.stat": PermissionError("memory.stat"),
+            },
+            180,
+            id="v2-unreadable-protected-cache-gives-no-credit",
+        ),
+        pytest.param(
+            {
+                "/proc/self/cgroup": "0::/jobs/worker\n",
+                # The children's protection is unknown when they cannot be listed.
+                "/sys/fs/cgroup/jobs/": PermissionError("jobs"),
+                "/sys/fs/cgroup/jobs/memory.current": "1100\n",
+                "/sys/fs/cgroup/jobs/memory.max": "1280\n",
+                "/sys/fs/cgroup/jobs/memory.stat": "active_file 700\ninactive_file 300\n",
+            },
+            180,
+            id="v2-unlistable-children-give-no-credit",
+        ),
+    ],
+)
+def test_cgroup_admission_counts_reclaimable_file_cache(monkeypatch, cgroup, expected):
+    _fake_files(monkeypatch, cgroup)
     assert read_ahead.cgroup_available_host_memory() == expected
+
+
+def test_kv_cache_host_tier_counts_reclaimable_file_cache(monkeypatch):
+    # KV cache manager V2 sizes its automatic pinned host tier with the same accounting, so the
+    # job's cached checkpoints count as available under its cgroup limit there too.
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+
+    monkeypatch.setattr(
+        read_ahead, "effective_available_host_memory", _EFFECTIVE_AVAILABLE_HOST_MEMORY
+    )
+    gib = 1 << 30
+    monkeypatch.setattr(
+        read_ahead.psutil, "virtual_memory", lambda: SimpleNamespace(available=4096 * gib)
+    )
+    monkeypatch.setattr(
+        kv_cache_manager_v2,
+        "Distributed",
+        SimpleNamespace(get=lambda mapping: SimpleNamespace(local_world_size=4)),
+    )
+    _fake_files(
+        monkeypatch,
+        {
+            "/proc/self/cgroup": "0::/job\n",
+            "/sys/fs/cgroup/job/memory.current": f"{900 * gib}\n",
+            "/sys/fs/cgroup/job/memory.max": f"{1000 * gib}\n",
+            "/sys/fs/cgroup/job/memory.stat": (
+                f"active_file {500 * gib}\ninactive_file {300 * gib}\n"
+            ),
+        },
+    )
+
+    limits = kv_cache_manager_v2.get_host_memory_limits(Mapping())
+
+    # 800 of the 900 GiB charged to the job are page cache, so 900 GiB of its 1000 GiB limit
+    # remain available, not 100 GiB.
+    assert limits.mem_available == 900 * gib
+    assert limits.local_ranks == 4
 
 
 def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
@@ -238,6 +450,9 @@ def test_mapping_mismatch_coordinates_fallback_before_reader_setup(monkeypatch):
     assert status.selected == "native"
     assert status.effective == "native"
     assert "mapping.world_size" in status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     warning.assert_called_once()
 
@@ -369,6 +584,9 @@ def test_ineligible_request_uses_exact_native_fallback(
     assert not status.activated
     assert status.effective == "native"
     assert status.fallback_reason
+    # The fallback load is preparation; without read-ahead there is nothing to finish.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds == 0.0
     reader_start.assert_not_called()
     if requested_policy == "rank_striped_read_ahead":
         warning.assert_called_once()
@@ -450,7 +668,11 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
         assert "model.norm.weight" in weights
 
     assert stopped.is_set()
-    assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "rank_striped_read_ahead"
+    # Preparation started the readers; finalization waited for them to stop.
+    assert status.preparation_seconds > 0
+    assert status.finalization_seconds > 0
 
 
 def test_node_major_page_faults_reads_vmstat(monkeypatch):
@@ -926,6 +1148,8 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
     assert status.fallback_reason == (
         "model materialization failed: RuntimeError: materialization failed"
     )
+    # Finishing read-ahead is timed even when the with-block fails.
+    assert status.finalization_seconds > 0
     assert "model materialization failed" in error_log.call_args.args[0]
     assert "cleanup failure" not in error_log.call_args.args[0]
 
@@ -1072,6 +1296,25 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         rank_striped_read_ahead.RankStripedReadAheadSession._run = original_run
     communicator.Barrier()
 
+    # Only one of the two files holds the prefix; a rank that cannot read headers reads both.
+    original_read_header = weight_loader._read_safetensors_header
+    if rank == world_size - 1:
+
+        def fail_header(_path):
+            raise ValueError("rank-local header failure")
+
+        weight_loader._read_safetensors_header = fail_header
+    header_loader = _rank_striped_loader()
+    try:
+        with header_loader.open_weight_session(
+            checkpoint_dir, mapping=mapping, key_prefixes=("model.norm.",)
+        ) as header_weights:
+            pass
+        header_status = header_loader.last_checkpoint_io_status
+    finally:
+        weight_loader._read_safetensors_header = original_read_header
+    communicator.Barrier()
+
     return {
         "rank": rank,
         "success": success,
@@ -1083,6 +1326,10 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
         "read_effective": read_status.effective,
         "read_reason": read_status.fallback_reason,
         "read_sum": float(read_weights["model.norm.weight"].sum()),
+        "header_effective": header_status.effective,
+        "header_reason": header_status.fallback_reason,
+        "header_sum": float(header_weights["model.norm.weight"].sum()),
+        "header_read_both_files": "lm_head.weight" in header_weights,
     }
 
 
@@ -1093,6 +1340,9 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     checkpoint_dir, expected = _write_checkpoint(tmp_path)
+    save_file(
+        {"lm_head.weight": torch.ones(6, 4)}, str(checkpoint_dir / "model-lm-head.safetensors")
+    )
     results = list(
         mpi_pool_executor.map(
             _run_real_mpi_scenarios,
@@ -1117,3 +1367,10 @@ def test_real_mpi_success_and_rank_local_failures(tmp_path, mpi_pool_executor):
     assert all(result["read_effective"] == "native" for result in results)
     assert all("rank-local read failure" in result["read_reason"] for result in results)
     assert all(result["read_sum"] == expected_sum for result in results)
+    assert all(result["header_effective"] == "native" for result in results)
+    assert all("rank-local header failure" in result["header_reason"] for result in results)
+    assert all(result["header_sum"] == expected_sum for result in results)
+    assert {result["rank"]: result["header_read_both_files"] for result in results} == {
+        0: False,
+        1: True,
+    }

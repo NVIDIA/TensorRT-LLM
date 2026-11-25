@@ -3,11 +3,13 @@
 
 import functools
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+import weakref
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
@@ -1038,6 +1040,19 @@ def lowm_fp8_mma_fits(m: int, n: int, k: int) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def lowm_mma_options() -> Tuple[bool, bool]:
+    """``(bf16_dequant, swap_ab)`` of the MMA kernel; both give the plain kernel's bits."""
+    return is_blackwell_datacenter(), is_blackwell_datacenter()
+
+
+def lowm_tiles(n: int, rows: int, group_n: int = 0) -> int:
+    """8-column tiles per CTA that let the MMA kernel swap its operands at <= 8 rows, else 1."""
+    if 0 < rows <= 8 and lowm_mma_options()[1] and n % 16 == 0 and group_n % 16 == 0:
+        return 2
+    return 1
+
+
+@functools.lru_cache(maxsize=None)
 def _compiled_mma(
     m: int,
     n: int,
@@ -1055,6 +1070,11 @@ def _compiled_mma(
     a_rope_head_dim: int = 0,
     a_rms_eps: Optional[float] = None,
     n_tiles: int = 1,
+    bf16_dequant: bool = False,
+    swap_ab: bool = False,
+    index_pack: bool = False,
+    out_swiglu_limit: float = 0.0,
+    release_after_wait: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
@@ -1076,6 +1096,11 @@ def _compiled_mma(
         a_rms_norm=a_rms_eps is not None,
         a_rms_eps=a_rms_eps or 0.0,
         n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=index_pack,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
     )
     dev = torch.device("cuda")
     groups = n // group_n if group_n else 1
@@ -1089,9 +1114,14 @@ def _compiled_mma(
         s = torch.empty((pad_up(n, 128) * pad_up(k // 32, 4),), dtype=torch.uint8, device=dev)
     else:
         s = torch.empty((n, k // 32), dtype=torch.uint8, device=dev)
-    if split_n:
+    if index_pack:
+        c = torch.empty((m, n // 2), dtype=torch.uint8, device=dev)
+        c2 = torch.empty((m, n // 32), dtype=torch.uint8, device=dev)
+    elif split_n:
         c = torch.empty((m, split_n), dtype=out_dtype, device=dev)
         c2 = torch.empty((m, n - split_n), dtype=out_dtype, device=dev)
+    elif out_swiglu_limit > 0.0:
+        c = c2 = torch.empty((m, n // 2), dtype=out_dtype, device=dev)
     else:
         c = c2 = torch.empty((m, n), dtype=out_dtype, device=dev)
     pos = torch.empty((m,), dtype=torch.int32, device=dev)
@@ -1112,6 +1142,160 @@ def _compiled_mma(
     )
 
 
+# Row counts of the MMA kernels outside decode CUDA graphs: each up to 8 rows, as decode batches
+# run, then whole 16-row tiles. A call with M rows runs the kernel of the smallest bucket that
+# holds them, on its rows padded to the bucket with whatever rows the staging buffer holds: every
+# output row comes from its own A row alone (16-row MMA tiles, a K order fixed by K), so the padding
+# leaves the real rows bitwise unchanged, and the row counts of eager steps compile at most one
+# kernel per bucket. A call whose
+# exact M already has a kernel, such as a decode CUDA graph's, runs that one unpadded. A decode
+# CUDA graph's warmup and capture keep the exact M of the graph; any other capture runs the
+# kernels its eager warmup compiled. A kernel option that a caller derives from the row count
+# (``lowm_tiles``, the CSA2 query tiles) must change only at a bucket boundary, so that all the
+# row counts of a bucket ask for the same kernel.
+_MMA_ROW_BUCKETS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64)
+# The arguments after M of every _compiled_mma call outside decode CUDA graphs so far, as
+# (positional, keyword items). Append-only, and bounded by the distinct GEMM shapes and options.
+_MMA_SIGNATURES: Dict[Tuple[tuple, tuple], None] = {}
+# (M, arguments after M) of every kernel built through _mma_kernel or the prewarm.
+_MMA_BUILT: Set[Tuple[int, Tuple[tuple, tuple]]] = set()
+# (M, arguments after M, decode-graph pass) -> (kernel, row count) of every call so far.
+_MMA_ROUTES: Dict[Tuple[int, Tuple[tuple, tuple], bool], Tuple[Any, int]] = {}
+# Serializes the updates of _MMA_BUILT and _MMA_ROUTES that follow a compile, so that host threads
+# routing one GEMM at once leave its exact kernel in place.
+_MMA_LOCK = threading.Lock()
+
+
+@functools.lru_cache(maxsize=None)
+def _decode_graph_flag() -> Callable[[], bool]:
+    """``linear.flashinfer_mxfp8_decode_graph_capture_active``, imported on first use (``linear``
+    imports this module)."""
+    from .linear import flashinfer_mxfp8_decode_graph_capture_active
+
+    return flashinfer_mxfp8_decode_graph_capture_active
+
+
+def _decode_graph_pass() -> bool:
+    """Whether the current call runs in a decode CUDA graph's warmup or capture."""
+    return _decode_graph_flag()()
+
+
+def _mma_kernel(m: int, *args, **kwargs) -> Tuple[Any, int]:
+    """The MMA kernel ``_compiled_mma`` builds for a call with ``m`` rows, and its row count.
+
+    Outside a decode CUDA graph pass a call is recorded for ``prewarm_mma_row_buckets`` and gets
+    the kernel of its row bucket, unless its exact row count already has one.
+    """
+    signature = (args, tuple(kwargs.items()))
+    graph_pass = _decode_graph_pass()
+    route = _MMA_ROUTES.get((m, signature, graph_pass))
+    if route is not None:
+        return route
+    rows = m
+    if 1 <= m <= _MMA_ROW_BUCKETS[-1] and not graph_pass:
+        _MMA_SIGNATURES.setdefault(signature, None)
+        if (m, signature) not in _MMA_BUILT:
+            rows = next(rows for rows in _MMA_ROW_BUCKETS if rows >= m)
+    fn = _compiled_mma(rows, *args, **kwargs)
+    with _MMA_LOCK:
+        if rows != m and (m, signature) in _MMA_BUILT:
+            # Another thread built the exact kernel while this one compiled the bucket's.
+            fn, rows = _compiled_mma(m, *args, **kwargs), m
+        elif rows == m and (m, signature) not in _MMA_BUILT:
+            # Eager calls of this row count now run the new exact kernel.
+            _MMA_ROUTES.pop((m, signature, False), None)
+        _MMA_BUILT.add((rows, signature))
+        route = _MMA_ROUTES[(m, signature, graph_pass)] = (fn, rows)
+    return route
+
+
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """``t`` with zero rows appended up to ``rows`` rows."""
+    if t.shape[0] >= rows:
+        return t
+    return torch.nn.functional.pad(t, (0, 0) * (t.dim() - 1) + (0, rows - t.shape[0]))
+
+
+# Per host thread, then per (stream, device, dtype, rows, row shape): the A operand buffer of padded
+# launches. Its rows past a launch's own hold earlier launches' rows, which reach only output rows
+# that launch drops. Threads that submit to one stream never share a buffer, and a thread's buffers
+# are freed when it exits.
+_A_STAGING = threading.local()
+
+
+def _staging_buffers() -> Dict[tuple, torch.Tensor]:
+    """The calling thread's staging buffers."""
+    buffers = getattr(_A_STAGING, "buffers", None)
+    if buffers is None:
+        buffers = _A_STAGING.buffers = {}
+    return buffers
+
+
+def release_mma_staging_buffers() -> None:
+    """Free the calling thread's staging buffers; its next padded eager launch allocates anew."""
+    _A_STAGING.buffers = {}
+
+
+def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
+    """The A operand of a launch on ``rows`` rows and its CuTe view: ``x`` itself when it has the
+    rows, else ``x`` copied into the first rows of a ``rows``-row buffer of the calling thread and
+    the current stream."""
+    if x.shape[0] >= rows:
+        return x, graph_safe_from_dlpack(x)
+    shape = (rows,) + tuple(x.shape[1:])
+    if torch.cuda.is_current_stream_capturing():
+        # Under capture the buffer comes from the graph's private pool: keep it to this capture.
+        buf = x.new_zeros(shape)
+        buf[: x.shape[0]].copy_(x.detach())
+        return buf, graph_safe_from_dlpack(buf)
+    staging = _staging_buffers()
+    key = (torch.cuda.current_stream(x.device).cuda_stream, x.device, x.dtype, rows, x.shape[1:])
+    buf = staging.get(key)
+    if buf is None:
+        # A normal tensor even under inference mode, so calls in and out of it can both write it.
+        with torch.inference_mode(False):
+            buf = staging[key] = x.new_zeros(shape)
+    # Detached, so a reused buffer never joins the autograd graph of a caller's input.
+    buf[: x.shape[0]].copy_(x.detach())
+    return buf, _cute_view(buf)
+
+
+def prewarm_mma_row_buckets(max_rows: Optional[int] = None) -> Tuple[int, int]:
+    """Compile the row buckets of the MMA GEMMs called so far outside decode CUDA graphs, up to the
+    first bucket that holds ``max_rows`` rows (every bucket without a bound); return how many
+    kernels it compiled and for how many GEMMs.
+
+    Run after the eager warmup forwards and before CUDA graph capture, it compiles the buckets they
+    did not reach before a capture or a request can need them. A GEMM that no call outside a decode
+    CUDA graph has run yet is not covered. A bucket that fails to compile is reported and left to
+    its first call; the other buckets still compile.
+    """
+    buckets = _MMA_ROW_BUCKETS
+    if max_rows is not None:
+        last = next((i for i, rows in enumerate(buckets) if rows >= max_rows), len(buckets) - 1)
+        buckets = buckets[: last + 1]
+    compiled = 0
+    signatures = list(_MMA_SIGNATURES)
+    for args, kwargs in signatures:
+        for rows in buckets:
+            if (rows, (args, kwargs)) in _MMA_BUILT:
+                continue
+            try:
+                _compiled_mma(rows, *args, **dict(kwargs))
+            except Exception as e:
+                # A prewarm miss only defers this compile to the first call that needs it.
+                logger.warning(
+                    f"Low-M MMA GEMM row bucket {rows} of {args} {dict(kwargs)} not prewarmed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            with _MMA_LOCK:
+                _MMA_BUILT.add((rows, (args, kwargs)))
+            compiled += 1
+        logger.debug(f"Low-M MMA GEMM row buckets compiled for {args} {dict(kwargs)}")
+    return compiled, len(signatures)
+
+
 @functools.lru_cache(maxsize=None)
 def _no_scale(device) -> torch.Tensor:
     """The scale argument of BF16 weights, which have none."""
@@ -1122,6 +1306,68 @@ def _no_scale(device) -> torch.Tensor:
 def _no_gamma(device) -> torch.Tensor:
     """The norm-weight argument of kernels without the A RMS norm."""
     return torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
+
+
+class _ThreadViews(dict):
+    """A host thread's cached CuTe views: tensor ``id`` -> (weak reference to the tensor, layout key,
+    view). The cache owns the weak references, and their callbacks hold it weakly, so a thread's
+    cache and views go with the thread even while the tensors live on."""
+
+
+# Per host thread: CuTe views of the base tensors that launches pass call after call (weights, their
+# scales, the placeholder arguments), one DLPack export per tensor and layout, dropped with the
+# tensor. A launch keeps its argument descriptors on the views it is given, so threads never share
+# a view.
+_CUTE_VIEWS = threading.local()
+
+
+def _views() -> _ThreadViews:
+    """The calling thread's cached CuTe views."""
+    views = getattr(_CUTE_VIEWS, "views", None)
+    if views is None:
+        views = _CUTE_VIEWS.views = _ThreadViews()
+    return views
+
+
+def _drop_view(cache: "weakref.ReferenceType[_ThreadViews]", tensor_id: int, ref: Any) -> None:
+    """Weak-reference callback of a cached tensor: drop its view if its thread's cache remains."""
+    views = cache()
+    if views is not None and views.get(tensor_id, (None,))[0] is ref:
+        del views[tensor_id]
+
+
+def _cute_view(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Any:
+    """``graph_safe_from_dlpack`` of ``t`` (as ``dtype``), reused by the calling thread while ``t``
+    keeps its storage and layout. A view is exported anew on every call: views are made per call."""
+    if t._base is not None:
+        return graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
+    views = _views()
+    key = (t.data_ptr(), dtype, t.shape, t.stride())
+    entry = views.get(id(t))
+    if entry is not None and entry[0]() is t:
+        if entry[1] == key:
+            return entry[2]
+        ref = entry[0]
+    else:
+        ref = weakref.ref(t, functools.partial(_drop_view, weakref.ref(views), id(t)))
+    view = graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
+    views[id(t)] = (ref, key, view)
+    return view
+
+
+# CuTe stream objects by CUDA stream handle.
+_CU_STREAMS: Dict[int, Any] = {}
+
+
+def _current_cu_stream() -> Any:
+    """The ``cuda.CUstream`` of the current CUDA stream."""
+    handle = torch.cuda.current_stream().cuda_stream
+    stream = _CU_STREAMS.get(handle)
+    if stream is None:
+        import cuda.bindings.driver as cuda
+
+        stream = _CU_STREAMS[handle] = cuda.CUstream(handle)
+    return stream
 
 
 @functools.lru_cache(maxsize=None)
@@ -1143,6 +1389,8 @@ def mxfp8_lowm_linear(
     scale_swizzled: bool = False,
     rms_norm: Optional[Tuple[torch.Tensor, float]] = None,
     n_tiles: int = 1,
+    swiglu_out_limit: Optional[float] = None,
+    release_after_wait: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
     """y = x @ dequant(weight).T for small M, in BF16.
 
@@ -1155,50 +1403,141 @@ def mxfp8_lowm_linear(
     ``rms_norm``: (gamma [K] bf16, eps) projects the RMS-normalized rows of x,
     ``rms_norm(x) * gamma``, instead of x. ``n_tiles`` (N a multiple of ``8 * n_tiles``): 8-column
     tiles per CTA, the same result with fewer CTAs.
+    ``swiglu_out_limit`` = L (``swiglu_out_supported``): ``weight`` is a ``[2I, K]`` gate | up
+    weight and the result ``swiglu(x @ dequant(weight).T, swiglu_limit=L)`` ``[M, I]``, bit for
+    bit. ``release_after_wait``: dependents are released after this launch's dependency wait.
     """
-    import cuda.bindings.driver as cuda
-
     m, k = x.shape
     n = weight.shape[0]
     if n % (8 * n_tiles):
         raise ValueError(f"N={n} is not a multiple of {8 * n_tiles}")
-    if split_n:
-        out = torch.empty((m, split_n), dtype=torch.bfloat16, device=x.device)
-        out2 = torch.empty((m, n - split_n), dtype=torch.bfloat16, device=x.device)
-    else:
-        out = out2 = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    if rope is None:
-        positions, cos_sin = _rope_placeholders(m, x.device)
-        head_dim = 0
-    else:
-        positions, cos_sin, head_dim = rope
-        positions = positions.reshape(-1).to(torch.int32)
-    fn = _compiled_mma(
+    out_swiglu_limit = 0.0
+    if swiglu_out_limit is not None:
+        if not swiglu_out_supported(m, k, weight, swiglu_out_limit):
+            raise ValueError(f"no SwiGLU output (limit {swiglu_out_limit}) for {m} x {k} x {n}")
+        if split_n or rope is not None or rms_norm is not None or scale_swizzled or n_tiles != 1:
+            raise ValueError("swiglu_out_limit takes a plain launch")
+        out_swiglu_limit = float(swiglu_out_limit)
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
         m,
         n,
         k,
         get_env_enable_pdl(),
         split_n,
         0,
-        head_dim,
-        cos_sin.shape[0] if rope is not None else 0,
+        0 if rope is None else rope[2],
+        0 if rope is None else rope[1].shape[0],
         scale_swizzled=scale_swizzled,
         a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
         n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    x, x_view = _a_operand(x, rows)
+    if out_swiglu_limit:
+        out = out2 = torch.empty((rows, n // 2), dtype=torch.bfloat16, device=x.device)
+    elif split_n:
+        out = torch.empty((rows, split_n), dtype=torch.bfloat16, device=x.device)
+        out2 = torch.empty((rows, n - split_n), dtype=torch.bfloat16, device=x.device)
+    else:
+        out = out2 = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
+    if rope is None:
+        positions, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        positions, cos_sin, _ = rope
+        positions = _pad_rows(positions.reshape(-1).to(torch.int32), rows)
+    stream = _current_cu_stream()
     fn(
-        graph_safe_from_dlpack(x),
-        graph_safe_from_dlpack(weight.view(torch.uint8)),
-        graph_safe_from_dlpack(scale_lin),
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale_lin),
         graph_safe_from_dlpack(out),
         graph_safe_from_dlpack(out2),
-        graph_safe_from_dlpack(positions),
-        graph_safe_from_dlpack(cos_sin),
-        graph_safe_from_dlpack(_no_gamma(x.device) if rms_norm is None else rms_norm[0].view(1, k)),
+        _cute_view(positions) if rope is None else graph_safe_from_dlpack(positions),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device) if rms_norm is None else rms_norm[0].view(1, k)),
         stream,
     )
+    if rows != m:
+        out, out2 = out[:m], out2[:m]
     return (out, out2) if split_n else out
+
+
+def _is_bf16_value(value: float) -> bool:
+    """Whether ``value`` (rounded to FP32) is exactly a BF16 value."""
+    import struct
+
+    return not struct.unpack("<I", struct.pack("<f", value))[0] & 0xFFFF
+
+
+def swiglu_out_supported(m: int, k: int, weight: torch.Tensor, limit: Optional[float]) -> bool:
+    """Whether ``mxfp8_lowm_linear(x [m, k], weight, ..., swiglu_out_limit=limit)`` runs: a positive
+    BF16-valued limit, an E4M3 ``[2I, k]`` weight with I a multiple of 4, m <= 64, k % 64 == 0."""
+    return (
+        limit is not None
+        and limit > 0.0
+        and _is_bf16_value(limit)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight.shape[1] == k
+        and 0 < m <= 64
+        and weight.shape[0] % 8 == 0
+        and k > 0
+        and k % 64 == 0
+    )
+
+
+def mxfp8_lowm_index_query(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_swizzled: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE'd index queries ``x @ dequant(weight).T`` as ``(data int8 [M, H, 64], scales uint8
+    [M, H, 4])``, bit for bit ``pack_index_queries_split`` of the plain ``mxfp8_lowm_linear``."""
+    m, k = x.shape
+    n = weight.shape[0]
+    if n % 128:
+        raise ValueError(f"N={n} is not a whole number of 128-wide heads")
+    heads = n // 128
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        0,
+        128,
+        cos_sin.shape[0],
+        scale_swizzled=True,
+        n_tiles=4,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=True,
+    )
+    x, x_view = _a_operand(x, rows)
+    data = torch.empty((rows, heads, 64), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((rows, heads, 4), dtype=torch.uint8, device=x.device)
+    stream = _current_cu_stream()
+    fn(
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale_swizzled),
+        graph_safe_from_dlpack(data.view(rows, heads * 64)),
+        graph_safe_from_dlpack(scales.view(rows, heads * 4)),
+        graph_safe_from_dlpack(_pad_rows(positions.reshape(-1).to(torch.int32), rows)),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
+        stream,
+    )
+    if rows != m:
+        data, scales = data[:m], scales[:m]
+    return data.view(torch.int8), scales
 
 
 def bf16_lowm_linear(
@@ -1208,14 +1547,11 @@ def bf16_lowm_linear(
 
     x: [M, K] bf16 contiguous; weight: [N, K] bf16 contiguous (N a multiple of 8).
     """
-    import cuda.bindings.driver as cuda
-
     m, k = x.shape
     n = weight.shape[0]
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     # Two weight vectors per lane and K chunk: twice the FP8 split keeps as many loads per warp.
     k_warps = 2 * default_k_warps(k)
-    fn = _compiled_mma(
+    fn, rows = _mma_kernel(
         m,
         n,
         k,
@@ -1225,20 +1561,22 @@ def bf16_lowm_linear(
         out_dtype=out_dtype,
         k_warps=k_warps if (k // 64) % k_warps == 0 else 0,
     )
-    positions, cos_sin = _rope_placeholders(m, x.device)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    x, x_view = _a_operand(x, rows)
+    out = torch.empty((rows, n), dtype=out_dtype, device=x.device)
+    positions, cos_sin = _rope_placeholders(rows, x.device)
+    stream = _current_cu_stream()
     fn(
-        graph_safe_from_dlpack(x),
-        graph_safe_from_dlpack(weight.view(torch.uint8)),
-        graph_safe_from_dlpack(_no_scale(x.device)),
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(_no_scale(x.device)),
         graph_safe_from_dlpack(out),
         graph_safe_from_dlpack(out),
-        graph_safe_from_dlpack(positions),
-        graph_safe_from_dlpack(cos_sin),
-        graph_safe_from_dlpack(_no_gamma(x.device)),
+        _cute_view(positions),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
         stream,
     )
-    return out
+    return out if rows == m else out[:m]
 
 
 def mxfp8_linear_scale(module: torch.nn.Module) -> Optional[torch.Tensor]:
@@ -1271,6 +1609,8 @@ def fp8_grouped_lowm(
     scale: torch.Tensor,
     group_n: int,
     inverse_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+    n_tiles: int = 1,
+    release_after_wait: bool = False,
 ) -> torch.Tensor:
     """Grouped small-M GEMM over FP8 weights.
 
@@ -1280,19 +1620,16 @@ def fp8_grouped_lowm(
     ``out[:, g*group_n:(g+1)*group_n] = x[:, g*K:(g+1)*K] @ dequant(weight[g]).T``.
     ``inverse_rope``: (positions [M] int32, cos/sin [P, 2, 32] fp32, head_dim) rotates the last
     64 columns of every head of x back as they load, as ``mla_rope_inplace(inverse=True)``.
+    ``n_tiles``: 8-column tiles per CTA (``group_n`` a multiple of ``8 * n_tiles``), same result.
+    ``release_after_wait``: dependents are released after this launch's dependency wait.
     """
-    import cuda.bindings.driver as cuda
-
     m = x.shape[0]
     n, k = weight.shape
+    if (group_n or n) % (8 * n_tiles):
+        raise ValueError(f"N={group_n or n} is not a multiple of {8 * n_tiles}")
     block128 = scale.dtype == torch.float32
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    if inverse_rope is None:
-        pos, cos_sin = _rope_placeholders(m, x.device)
-        head_dim = 0
-    else:
-        pos, cos_sin, head_dim = inverse_rope
-    fn = _compiled_mma(
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
         m,
         n,
         k,
@@ -1300,22 +1637,33 @@ def fp8_grouped_lowm(
         0,
         group_n,
         scale_block128=block128,
-        rope_positions=cos_sin.shape[0] if inverse_rope is not None else 0,
-        a_rope_head_dim=head_dim,
+        rope_positions=0 if inverse_rope is None else inverse_rope[1].shape[0],
+        a_rope_head_dim=0 if inverse_rope is None else inverse_rope[2],
+        n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        release_after_wait=release_after_wait,
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    x, x_view = _a_operand(x, rows)
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
+    if inverse_rope is None:
+        pos, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        pos, cos_sin, _ = inverse_rope
+        pos = _pad_rows(pos, rows)
+    stream = _current_cu_stream()
     fn(
-        graph_safe_from_dlpack(x),
-        graph_safe_from_dlpack(weight.view(torch.uint8)),
-        graph_safe_from_dlpack(scale),
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale),
         graph_safe_from_dlpack(out),
         graph_safe_from_dlpack(out),
-        graph_safe_from_dlpack(pos),
-        graph_safe_from_dlpack(cos_sin),
-        graph_safe_from_dlpack(_no_gamma(x.device)),
+        _cute_view(pos) if inverse_rope is None else graph_safe_from_dlpack(pos),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
         stream,
     )
-    return out
+    return out if rows == m else out[:m]
 
 
 __all__ = [
@@ -1327,7 +1675,12 @@ __all__ = [
     "fp8_grouped_lowm",
     "low_m_gemm_dispatcher",
     "lowm_fp8_supported",
+    "lowm_mma_options",
+    "lowm_tiles",
     "mxfp8_linear_scale",
+    "mxfp8_lowm_index_query",
     "mxfp8_lowm_linear",
     "prepare_low_m_gemm",
+    "prewarm_mma_row_buckets",
+    "release_mma_staging_buffers",
 ]

@@ -11,11 +11,10 @@ description: Load before implementing, modifying or certifying a TensorRT-LLM Mo
 ## When to load
 
 Load before entry work, including **verification without code changes**. In a
-workflow, this means a `kernel` task (onboard, verify); a tuner loads
-it only when changing an entry or its test. A primer may preload it. Model
+workflow, this means a `kernel` task (onboard, verify). A primer may preload it. Model
 assembly, survey and serving-only work do not require it.
 
-Read `tensorrt_llm/_torch/_experimental/modeling_v2/README.md`,
+Read `tensorrt_llm/_torch/modeling_v2/README.md`,
 `cpp/tensorrt_llm/modeling_v2/README.md`, `catalog/_op.py` in the ModelingV2
 package, and one same-category entry with its test. The two README guides
 are the source of truth; this skill scopes one flow task and its certification,
@@ -103,7 +102,7 @@ file is reported to the planner for ownership; it is not silently omitted.
   missing marker registration rather than editing `tests/unittest/pytest.ini`.
 - For index arguments, compute 2^31-element, 2^31/row-width and fp32 2^24+1
   boundaries. Probe those the runtime envelope reaches; record all limits,
-  guarding measured silent failures. Size from measured `runtime_facts.yaml`.
+  guarding measured silent failures. Size from the engine arguments the units run.
 - Iterate with `pytest -k`; certify once after the last edit to entry **and**
   test: run the whole test file and `test_modeling_v2_no_stale_claims.py` under
   `tests/unittest/_torch/modeling_v2`.

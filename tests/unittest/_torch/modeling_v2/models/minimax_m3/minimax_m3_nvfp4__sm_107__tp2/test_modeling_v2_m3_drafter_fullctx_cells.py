@@ -8,10 +8,8 @@ eager 41-request pass would reach the runner without a plan). CPU only."""
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (
-    modeling,
-)
 from tensorrt_llm._torch.attention.backends.fmha import manager
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import modeling
 
 pytestmark = pytest.mark.cpu_only
 

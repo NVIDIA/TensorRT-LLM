@@ -15,6 +15,15 @@
 # the License.
 #
 
+add_library(tllm_kernel_cutlass_headers INTERFACE)
+add_library(tllm::kernel_cutlass_headers ALIAS tllm_kernel_cutlass_headers)
+target_include_directories(
+  tllm_kernel_cutlass_headers
+  INTERFACE ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
+            ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
+            ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
+target_link_libraries(tllm_kernel_cutlass_headers INTERFACE tllm::common_cuda)
+
 function(add_tllm_kernel_library target)
   set(multi_value_args SOURCES LINK_LIBRARIES INCLUDE_DIRECTORIES)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "" "" "${multi_value_args}")
@@ -54,6 +63,32 @@ function(add_tllm_kernel_library target)
       PARENT_SCOPE)
 endfunction()
 
+if(ENABLE_MULTI_DEVICE)
+  add_tllm_kernel_library(
+    tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
+    LINK_LIBRARIES tllm::common_environment)
+else()
+  list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_LIST_DIR}/customAllReduceKernels.cu")
+endif()
+
+add_tllm_kernel_library(tllm_kernel_rms_norm SOURCES rmsnormKernels.cu)
+
+add_tllm_kernel_library(
+  tllm_kernel_all_reduce_fusion
+  SOURCES
+  communicationKernels/allReduceFusionKernels.cu
+  communicationKernels/allReduceWorkspace.cu
+  LINK_LIBRARIES
+  tllm::common_environment
+  tllm::runtime_ipc)
+
+if(NOT USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  add_library(tllm_kernel_gemm_all_reduce INTERFACE)
+  add_library(tllm::kernel_gemm_all_reduce ALIAS tllm_kernel_gemm_all_reduce)
+  target_link_libraries(tllm_kernel_gemm_all_reduce
+                        INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET})
+endif()
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(
@@ -87,8 +122,8 @@ add_tllm_kernel_library(tllm_kernel_mla SOURCES mlaKernels.cu LINK_LIBRARIES
                         tllm::common_environment)
 
 add_tllm_kernel_library(
-  tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu
-  INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+  tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
   tllm_kernel_moe_communication SOURCES
@@ -101,14 +136,90 @@ add_tllm_kernel_library(
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_tllm_kernel_library(
-    tllm_kernel_moe_lora SOURCES moe/cutlass/moe_lora_pointer_expand.cu
-    moe/cutlass/moe_lora_problem_builder.cu moe/cutlass/moe_lora_slot_expand.cu)
-  target_include_directories(
-    tllm_kernel_moe_lora PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+    tllm_kernel_moe_lora
+    SOURCES
+    moe/cutlass/moe_lora_pointer_expand.cu
+    moe/cutlass/moe_lora_problem_builder.cu
+    moe/cutlass/moe_lora_slot_expand.cu
+    LINK_LIBRARIES
+    tllm::kernel_cutlass_headers)
 endif()
 
 add_tllm_kernel_library(
   tllm_kernel_attention_mask SOURCES trtllmGenKernels/fmha/prepareCustomMask.cu
-  LINK_LIBRARIES trtllm_gen_fmha_interface)
-target_include_directories(tllm_kernel_attention_mask
-                           PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+  LINK_LIBRARIES trtllm_gen_fmha_interface tllm::kernel_cutlass_headers)
+
+add_tllm_kernel_library(
+  tllm_kernel_cuda_core_gemm SOURCES cudaCoreGemm/cudaCoreGemm.cu
+  LINK_LIBRARIES tllm::common_environment tllm::kernel_cutlass_headers)
+
+add_tllm_kernel_library(
+  tllm_kernel_gemm_utilities SOURCES cutlass_kernels/cutlass_heuristic.cpp
+  cutlass_kernels/cutlass_preprocessors.cpp LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
+
+list(APPEND TLLM_KERNEL_COMPONENT_TARGETS
+     trtllm_gen_fp8_block_scale_moe_routing)
+
+add_tllm_kernel_library(
+  tllm_kernel_moe_block_scale SOURCES moe/trtllmGen/DevKernel.cu LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
+
+set_property(TARGET tllm_kernel_moe_block_scale
+             PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+target_compile_options(tllm_kernel_moe_block_scale
+                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
+
+add_tllm_kernel_library(
+  tllm_kernel_cascade_attention SOURCES
+  decoderMaskedMultiheadAttention/cascadeAttentionKernel.cu LINK_LIBRARIES
+  tllm::common_environment)
+set_property(TARGET tllm_kernel_cascade_attention
+             PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+if(WIN32)
+  set(mmha_targets tllm::kernel_mmha_instantiations)
+  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS tllm_kernel_mmha_instantiations)
+else()
+  # Cascade is owned by decoder_attention_0, which exports it to consumers.
+  list(REMOVE_ITEM TLLM_KERNEL_COMPONENT_TARGETS tllm_kernel_cascade_attention)
+  set(mmha_targets ${DECODER_SHARED_TARGET_0} ${DECODER_SHARED_TARGET_1})
+endif()
+add_tllm_kernel_library(
+  tllm_kernel_mmha SOURCES decoderMaskedMultiheadAttention.cu LINK_LIBRARIES
+  ${mmha_targets})
+
+list(APPEND TLLM_KERNEL_COMPONENT_TARGETS trtllm_gen_fmha)
+
+add_tllm_kernel_library(
+  tllm_kernel_lora
+  SOURCES
+  groupGemm.cu
+  splitkGroupGemm.cu
+  lora/lora.cpp
+  lora/loraGroupGEMMParamFillRowReorderFusion.cu
+  LINK_LIBRARIES
+  tllm::common_cublas
+  tllm::kernel_cutlass_headers
+  tllm::common_environment)
+
+add_tllm_kernel_library(tllm_kernel_quantization SOURCES quantization.cu
+                        LINK_LIBRARIES tllm::common_environment)
+
+add_tllm_kernel_library(tllm_kernel_pre_quant_scale SOURCES
+                        preQuantScaleKernel.cu)
+
+add_library(tllm_kernel_moe_internal INTERFACE)
+add_library(tllm::kernel_moe_internal ALIAS tllm_kernel_moe_internal)
+target_link_libraries(
+  tllm_kernel_moe_internal
+  INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET}
+            CUDA::cuda_driver
+            tllm::kernel_gemm_utilities
+            tllm::kernel_fp8_block_scale_gemm
+            tllm::kernel_lora
+            tllm::kernel_pre_quant_scale
+            tllm::common_environment)
+if(NOT USING_OSS_CUTLASS_MOE_GEMM)
+  add_library(tllm::kernel_moe ALIAS tllm_kernel_moe_internal)
+endif()

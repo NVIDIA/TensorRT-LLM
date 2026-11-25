@@ -30,10 +30,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._utils import (
     CUASSERT,
     TensorWrapper,
     convert_to_torch_tensor,
+    current_cuda_stream,
     nvtx_range,
     prefer_pinned,
 )
@@ -175,6 +177,18 @@ def _get_replay_capture_window(
     return max(layout.window_size, pretrained_config.sliding_window)
 
 
+def _validate_encoder_replay_window(
+    enabled: bool, replay_window: int, tokens_per_block: int
+) -> None:
+    """Keep cold Encoder recovery within the configured replay window."""
+    if enabled and replay_window < tokens_per_block:
+        raise ValueError(
+            "DeepSeek-V4.1 Encoder replay requires replay_window >= tokens_per_block: "
+            f"replay_window={replay_window}, tokens_per_block={tokens_per_block}; "
+            "increase TRTLLM_V41_BOUNDED_REPLAY_TOKENS or reduce tokens_per_block"
+        )
+
+
 def _swa_cache_window(
     swa_window: int,
     replay_window: int,
@@ -271,7 +285,7 @@ class _CSA2LayerKind(Enum):
 
 
 class CSA2CacheManager(KVCacheManagerV2):
-    """Private SWA, owner-only GLOBAL main/index buffers, and ratio-two compressor state.
+    """Windowed SWA, owner-only GLOBAL main/index buffers, and ratio-two compressor state.
 
     The GLOBAL layer group carries two buffers with identical page indices: a
     288-byte main record and a 68-byte index record per compressed position.
@@ -388,6 +402,11 @@ class CSA2CacheManager(KVCacheManagerV2):
                 replay_window=max(self.layout.window_size, self._decoder_replay_window),
             )
         )
+        _validate_encoder_replay_window(
+            self._encoder_replay_enabled and kv_cache_config.enable_block_reuse,
+            self._decoder_replay_window,
+            tokens_per_block,
+        )
         self._encoder_reuse_policy = (
             ReusePolicy.OPTIONAL if self._encoder_replay_enabled else ReusePolicy.REQUIRED
         )
@@ -483,6 +502,20 @@ class CSA2CacheManager(KVCacheManagerV2):
         """Select Encoder reuse before the normal context-cache activation."""
         from .....pyexecutor.ced_replay import EncoderCheckpoint, EncoderReplay
 
+        if self._encoder_replay_enabled and req.is_disagg_generation_init_state:
+            groups = [
+                group
+                for group in self._encoder_optional_groups
+                if cache.reuse_status[group].complete
+                and cache.reuse_status[group].endpoint == cache.num_committed_tokens
+            ]
+            resumed = self._resume_and_restore(req.py_request_id, cache, groups)
+            if resumed:
+                # A received page can contain rows before the sender's cold-replay start.
+                # Stop before transfer so even close() cannot publish those rows.
+                cache.stop_committing()
+            return resumed
+
         if (
             not self._decoder_replay_window
             or req.is_dummy
@@ -500,6 +533,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 group
                 for group in self._encoder_optional_groups
                 if cache.reuse_status[group].complete
+                and cache.reuse_status[group].endpoint == cache.num_committed_tokens
             ]
             return self._resume_and_restore(req.py_request_id, cache, groups)
 
@@ -509,34 +543,82 @@ class CSA2CacheManager(KVCacheManagerV2):
             return super()._resume_context_cache(req, cache)
 
         reused = cache.num_committed_tokens
-        groups = None
         available = False
         restore = True
+        replay_start = None
+        endpoints = None
         if self._encoder_replay_enabled:
-            # TODO: Publish and restore partial Encoder checkpoints at non-block-
-            # aligned Global endpoints. Until then, incomplete OPTIONAL coverage falls
-            # back to Encoder replay without shortening the Global prefix hit.
             status = cache.reuse_status
-            available = any(status[group].complete for group in self._encoder_optional_groups)
-            restore = (
-                reused <= max(0, req.prompt_len - self._decoder_replay_window)
-                and bool(self._encoder_optional_groups)
-                and all(status[group].complete for group in self._encoder_optional_groups)
+            available = any(
+                first <= reused < end
+                for group in self._encoder_optional_groups
+                for first, end in status[group].endpoint_ranges
             )
-            groups = self._encoder_optional_groups if restore else ()
-        if not self._resume_and_restore(req.py_request_id, cache, groups):
+            # Selection is model policy. Native creation bounds candidates by R;
+            # all Encoder groups must resume at the same endpoint, with enough
+            # recomputed HC rows for the final Decoder window.
+            lower = max(1, reused - self._decoder_replay_window)
+            upper = min(reused, max(0, req.prompt_len - self._decoder_replay_window))
+            if (
+                upper == reused
+                and reused % 2
+                and any(role is CSA2CacheRole.COMPRESSOR_KV for _, _, role in self._encoder_roles)
+            ):
+                # Restoring at an odd P reads row P - 1's compressor state, which a replaying
+                # writer leaves unwritten: replay that row instead.
+                upper -= 1
+            ranges = [status[group].endpoint_ranges for group in self._encoder_optional_groups]
+            cursors = [len(group_ranges) - 1 for group_ranges in ranges]
+            candidate = upper
+            while ranges and candidate >= lower:
+                next_candidate = candidate
+                for index, group_ranges in enumerate(ranges):
+                    while cursors[index] >= 0 and group_ranges[cursors[index]][0] > candidate:
+                        cursors[index] -= 1
+                    if cursors[index] < 0:
+                        next_candidate = 0
+                        break
+                    next_candidate = min(next_candidate, group_ranges[cursors[index]][1] - 1)
+                if next_candidate == candidate:
+                    replay_start = candidate
+                    break
+                candidate = next_candidate
+            restore = replay_start == reused
+            endpoints = (
+                {group: replay_start for group in self._encoder_optional_groups}
+                if replay_start is not None
+                else {}
+            )
+        resumed = self._resume_and_restore(
+            req.py_request_id, cache, optional_reuse_endpoints=endpoints
+        )
+        if not resumed:
             return False
 
         # Publish only after activation succeeds. Retries and later chunks resume
         # the same working pages without repeating initial OPTIONAL selection.
-        req.py_ced_replay = (
-            EncoderCheckpoint(req.py_request_id, id(cache), reused)
-            if restore
-            else EncoderReplay(
-                req.py_request_id, id(cache), reused, max(0, reused - self._decoder_replay_window)
+        if replay_start is not None and replay_start < reused:
+            req.py_ced_replay = EncoderReplay(
+                req.py_request_id,
+                id(cache),
+                reused,
+                replay_start,
+                swa_read_floor=max(0, replay_start + 1 - self.layout.window_size),
             )
-        )
-        if restore:
+        elif restore:
+            req.py_ced_replay = EncoderCheckpoint(req.py_request_id, id(cache), reused)
+        else:
+            # The fresh Encoder page of P's block is published, so write it from its first row.
+            start = min(
+                reused - self._decoder_replay_window, reused - reused % self.tokens_per_block
+            )
+            req.py_ced_replay = EncoderReplay(req.py_request_id, id(cache), reused, max(0, start))
+        if replay_start is not None and replay_start < reused:
+            logger.debug(
+                f"DeepSeek-V4.1 encoder checkpoint restored: S={replay_start}, "
+                f"P={reused}; encoder replay rows={req.py_ced_replay.num_tokens}"
+            )
+        elif restore:
             label = (
                 "encoder snapshot"
                 if self._encoder_replay_enabled
@@ -561,6 +643,16 @@ class CSA2CacheManager(KVCacheManagerV2):
             return 0
         return plan.num_tokens if isinstance(plan, EncoderReplay) else None
 
+    def try_commit_blocks(self, request: LlmRequest) -> None:
+        if self._encoder_replay_enabled and request.is_generation_only_request:
+            return
+        super().try_commit_blocks(request)
+
+    def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
+        return not (
+            self._encoder_replay_enabled and request.is_generation_only_request
+        ) and super()._can_commit_generation_blocks(request)
+
     def _swa_retention(self, layer: int) -> int:
         window = _swa_cache_window(
             self.layout.window_size,
@@ -573,6 +665,9 @@ class CSA2CacheManager(KVCacheManagerV2):
         return self._window(window)
 
     def _create_kv_cache(self, request_id, lora_task_id, input_tokens, **kwargs):
+        kwargs["optional_reuse_max_backtrack"] = (
+            self._decoder_replay_window if self._encoder_replay_enabled else 0
+        )
         cache = super()._create_kv_cache(request_id, lora_task_id, input_tokens, **kwargs)
         if cache is not None:
             self._csa2_request_epoch_counter += 1
@@ -1025,7 +1120,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             inputs = (self._batch_rows, caches, list(page_versions), scratch, swa_out)
             if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
                 # The previous conversion recorded this event.
-                torch.cuda.current_stream().wait_event(self._base_rows_read[self._base_rows_slot])
+                current_cuda_stream().wait_event(self._base_rows_read[self._base_rows_slot])
                 self._num_page_table_reuses += 1
                 return None
         changed = _changed_rows(inputs, self._batch_conversion_inputs)
@@ -1540,6 +1635,26 @@ class CSA2CacheManager(KVCacheManagerV2):
             for size, window in zip(sizes, windows)
         )
 
+    def page_table_spec(self) -> PageTableSpec:
+        """Every CSA2 cache holds the same bytes on every rank. Under bounded replay on generation
+        the generation worker rebuilds the sliding-window caches past a request's split, which a
+        context-only worker keeps none of (``remote_tail_excluded_pool_views``). The persistent
+        caches hold fixed packed FP8/FP4 records whatever the staging type
+        (``kv_cache_config.dtype``) is, so the spec quantizes them as ``"csa2_packed"``. The
+        sliding windows it keeps hold draft tokens, reuse backoff and replay captures beyond the
+        window attention reads (``retention_margins``)."""
+        spec = super().page_table_spec()
+        replay = getattr(self, "bounded_replay_on_generation", False)
+        rebuilt = {CSA2CacheRole.SWA.role} if replay else set()
+        return replace(
+            spec,
+            role_layouts={},
+            default_layout=Replicated(),
+            request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
+            quant_mode="csa2_packed",
+            retention_margins=True,
+        )
+
     def get_disagg_role_mapper_kinds(self):
         return {
             Role.ALL: MapperKind.REPLICATED,
@@ -1683,6 +1798,11 @@ class CSA2CacheManager(KVCacheManagerV2):
                 max_num_tokens=max_num_tokens or getattr(model_config, "max_num_tokens", None),
                 replay_window=max(layout.window_size, replay_window),
             )
+        )
+        _validate_encoder_replay_window(
+            encoder_replay and kv_cache_config is not None and kv_cache_config.enable_block_reuse,
+            replay_window,
+            tokens_per_block,
         )
         sizes, windows, scratch_groups = _cache_size_layer_components(
             layout,

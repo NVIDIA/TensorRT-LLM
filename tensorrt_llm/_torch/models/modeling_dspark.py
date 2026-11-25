@@ -113,7 +113,7 @@ from ..modules.mhc.mhc_lowm import mhc_allreduce_post_collapse_norm
 from ..modules.multi_stream_utils import private_stream
 from ..modules.mxfp8_draft_head import quantize_mxfp8_rows
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
+from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla_dspark_drafter
 from ..speculative.dspark_ring_metadata import dspark_ring_metadata
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
@@ -3553,6 +3553,11 @@ class DSv4DSparkForCausalLM(nn.Module):
             model.lm_head, model.mtp_layers[-1].markov_head
         )
 
+    @property
+    def checkpoint_key_prefixes(self) -> tuple[str, ...]:
+        """Checkpoint key prefixes that :meth:`load_weights` reads; the model loader passes it only these keys."""
+        return tuple(f"mtp.{stage}." for stage in range(self.num_stages))
+
     def forward(self, main_hidden, bonus_token_ids, start_pos, **kwargs):
         return self.dspark_model.forward(main_hidden, bonus_token_ids, start_pos, **kwargs)
 
@@ -5445,7 +5450,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     if draft_arches and draft_arches[0] == MINIMAX_DSPARK_DRAFT_ARCH:
         drafter_cls = MiniMaxDSparkForCausalLM
-    elif is_mla(draft_config.pretrained_config):
+    elif is_mla_dspark_drafter(draft_config.pretrained_config):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,

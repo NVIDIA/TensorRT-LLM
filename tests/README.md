@@ -162,8 +162,8 @@ Mark a unit test that does not require a GPU to run with `@pytest.mark.cpu_only`
 For legacy and case management reason, the CI doesn't run unit tests directly. It uses a bridge to map multiple unit test cases into one integration test case, and manages these bridged cases.
 The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_generate_tests` function in `tests/integration/defs/conftest.py`.
 
-In `integration/test_lists/test-db`, cases with prefix `unittest/` are treated as unit test bridges. Each of them generates an instance of `test_unittests_v2` which executes a `pytest` subprocess in `tests/unittest` directory.
-The entire line will be passed as commandline arguments of `pytest` subprocess.
+In `integration/test_lists/test-db`, cases with prefix `unittest/` are treated as unit test bridges. Each of them generates an instance of `test_unittests_v2` which executes a `pytest` subprocess in the `tests` directory.
+The bridge passes the selected entry's arguments after test-list metadata preprocessing and combines any entry-level `-m` expression with the stage's unit-test marker filter.
 
 For example, `unittest/trt/attention/test_gpt_attention.py -k "partition0"` is equivalent to `cd tests; pytest unittest/trt/attention/test_gpt_attention.py -k "partition0"`.
 
@@ -182,6 +182,10 @@ pytest unittest/an_existing_file.py -m "part0 and gpu2" # run some cases in a fi
 For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not third_keyword"` which covers your filter.
 
 3. Choose a suitable CI stage and add a line to the corresponding test list config. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
+
+For CPU and GPU registration or batching changes, follow the
+[test registration and batching guidance](integration/test_lists/AGENTS.md#test-registration-and-batching),
+including effective collection, worker-count, isolation and GPU-memory checks.
 
 ## 4. Run a CI stage locally
 
@@ -256,7 +260,7 @@ To set a timeout for specific long-running test cases, follow these steps:
 
 ## 6. Set isolated execution for cases individually
 
-Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together with other tests. The `ISOLATION` marker ensures these cases run in a separate pytest process, avoiding such issues.
+Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together. In CI, `ISOLATION` runs each marked test-list entry in a separate outer pytest process. For a `unittest/` entry, its inner cases still follow the bridge's worker policy and can share worker state; this marker does not isolate every inner case or disable inner parallelism.
 
 ### When to use the `ISOLATION` marker:
 - Tests that modify global state or environment variables
@@ -298,6 +302,6 @@ Multiple markers can be combined for the same test case using commas. Both forma
 
 ### Important Notes:
 - **TIMEOUT**: Ensures the test terminates if it exceeds the specified time limit (in minutes). Useful for preventing stuck tests from blocking the pipeline.
-- **ISOLATION**: Runs the test in a separate pytest process to avoid resource conflicts and state pollution. Use sparingly as it increases execution time.
+- **ISOLATION**: Runs the test-list entry in a separate outer pytest process. Preserve required boundaries, and validate inner worker behavior when batching unit tests. Use sparingly as it increases process startup cost.
 - Ensure there is **at least one space** before and after each marker keyword
 - Both markers are case-sensitive and must be written exactly as `TIMEOUT` and `ISOLATION`

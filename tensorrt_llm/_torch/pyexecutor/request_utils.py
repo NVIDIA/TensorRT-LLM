@@ -6,10 +6,11 @@
 import dataclasses
 import os
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .executor_request_queue import RequestQueueItem
+    from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
     from .scheduler import WaitingQueue
     from .scheduler.adp_router import ADPRouter
 
@@ -168,6 +169,26 @@ def get_from_waiting_queue(
     return items
 
 
+def drain_queued_items(
+    waiting_queue: "WaitingQueue", request_queue: "ExecutorRequestQueue"
+) -> Iterator["RequestQueueItem"]:
+    """Yield waiting items, then incoming items other than the shutdown signal."""
+    while waiting_queue:
+        yield waiting_queue.pop_request()
+
+    # Also drain executor_request_queue so items already queued
+    # but not yet fetched by the main loop are not scheduled
+    # after the CUDA context is corrupted. Safe to use empty()
+    # here because is_shutdown is True and the queue's active
+    # flag is about to be set False, so no new items arrive.
+    raw_queue = request_queue.get_request_queue()
+    while not raw_queue.empty():
+        item = raw_queue.get_nowait()
+        if item.is_shutdown_request:
+            continue
+        yield item
+
+
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> tuple[list[int], list[int], int, int]:
@@ -228,6 +249,8 @@ def merge_requests_to_llm_requests(
     new_requests: list["RequestQueueItem"],
     exclude_last_generation_logits: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
@@ -247,6 +270,8 @@ def merge_requests_to_llm_requests(
             exclude_last_generation_logits,
             input_token_ids=req_item.prompt_token_ids,
             track_unique_tokens=track_unique_tokens,
+            locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -260,11 +285,14 @@ def merge_helix_requests(
     cp_size: int,
     tokens_per_block: int,
     exclude_last_generation_logits: bool,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -279,8 +307,9 @@ def merge_helix_requests(
     req_with_children = []
 
     for req_item in new_requests:
+        input_token_ids = req_item.request.get_input_token_ids_array()
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.get_input_token_ids_array(), cp_rank, cp_size, tokens_per_block
+            input_token_ids, cp_rank, cp_size, tokens_per_block
         )
 
         req = executor_request_to_llm_request(
@@ -290,9 +319,17 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        # The prompt tokens a multi-token stop word ending at the first
+        # generated token can span, which this rank's slice may not hold.
+        tail_len = max((len(word) - 1 for word in req.py_stop_words_list or ()), default=0)
+        prompt_tail = input_token_ids[max(0, len(input_token_ids) - tail_len) :].tolist()
+        for request in (req, *req.child_requests):
+            request.py_helix_prompt_tail = prompt_tail
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)
@@ -309,6 +346,8 @@ def merge_requests(
     exclude_last_generation_logits: bool,
     is_disagg: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -345,13 +384,16 @@ def merge_requests(
                     cp_size=cp_size,
                     tokens_per_block=cp_config["tokens_per_block"],
                     exclude_last_generation_logits=exclude_last_generation_logits,
+                    vocab_size=vocab_size,
                 )
-            return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
+            return merge_requests_to_llm_requests(
+                new_requests, exclude_last_generation_logits, vocab_size=vocab_size
+            )
         elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(
-        new_requests, exclude_last_generation_logits, track_unique_tokens
+        new_requests, exclude_last_generation_logits, track_unique_tokens, vocab_size=vocab_size
     )
 
 

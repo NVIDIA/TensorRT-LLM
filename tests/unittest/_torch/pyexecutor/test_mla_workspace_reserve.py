@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 import tensorrt_llm._utils
+from tensorrt_llm._errors import ResourceError
 from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_mla_context_workspace_reserve,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm.mapping import Mapping
 
 
 def _ctx_req(
@@ -259,9 +261,29 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
         model_config.max_seq_len = 8192
     w = get_attention_workspace_bytes_per_token(
         model_config,
-        SimpleNamespace(enable_attention_dp=False, tp_size=8),
+        SimpleNamespace(enable_attention_dp=False, tp_size=8, has_cp_helix=lambda: False),
     )
     assert (w == 0) if expect_zero else (w > 0)
+
+
+def test_workspace_bytes_use_helix_context_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Helix context attention runs heads / (tp * cp), so tp4 x cp2 stages the
+    # same per-token workspace as tp8 and half of plain tp4.
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")
+    model_config = _fp8_mla_model_config(None)
+
+    def w(tp_size: int, cp_size: int) -> int:
+        mapping = SimpleNamespace(
+            enable_attention_dp=False,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            has_cp_helix=lambda: cp_size > 1,
+        )
+        return get_attention_workspace_bytes_per_token(model_config, mapping)
+
+    assert w(4, 2) == w(8, 1)
+    assert w(4, 2) * 2 == w(4, 1)
 
 
 # ---- workspace reserve / admission-cap math (estimator side) ----
@@ -278,7 +300,7 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
     ],
 )
 def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
-    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap)
+    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, fixed_bytes=0)
     assert cap == expected_cap
     assert cap == int(reserve / w)  # the cap is exactly what the reserve covers
     assert reserve <= w * kv_len_cap  # never reserves beyond the worst case
@@ -297,7 +319,7 @@ def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
 )
 def test_workspace_reserve_zero_for_bad_inputs(budget, k, w, kv_len_cap):
     # Any non-positive input -> reserve nothing and carry no cap (no admission cap applied).
-    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap) == (0, None)
+    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, fixed_bytes=0) == (0, None)
 
 
 # ---- carried admission-cap read (executor side, V1/V2) ----
@@ -400,3 +422,102 @@ def test_ctx_cap_no_cap_during_warmup():
     # cap even if a cap were carried, and short-circuit before reading the manager.
     exe = _executor_with_manager(SimpleNamespace(fp8_ctx_mla_kv_len_cap=262144), is_warmup=True)
     assert exe._get_ctx_mla_kv_len_cap() is None
+
+
+@pytest.mark.parametrize(
+    "floor,profiled,expected_reserve,expected_cap",
+    [
+        (64, 0, 204.8, 102),
+        (128, 0, 256, 128),
+        (200, 0, 400, 200),
+        (200, 64, 272, 200),
+    ],
+)
+@pytest.mark.cpu_only
+def test_workspace_reserve_honors_staging_floor(
+    floor: int,
+    profiled: int,
+    expected_reserve: float,
+    expected_cap: int,
+) -> None:
+    reserve, cap = get_mla_context_workspace_reserve(
+        1024,
+        3,
+        2,
+        4096,
+        fixed_bytes=512,
+        min_workspace_tokens=floor,
+        profiled_workspace_tokens=profiled,
+    )
+    assert reserve == pytest.approx(expected_reserve)
+    assert cap == expected_cap
+
+
+@pytest.mark.cpu_only
+def test_workspace_reserve_reports_fixed_cost_without_a_staging_floor() -> None:
+    with pytest.raises(ResourceError, match="fixed KV cache cost") as raised:
+        get_mla_context_workspace_reserve(512, 3, 1, 128, fixed_bytes=512, min_workspace_tokens=0)
+    assert "lower max_num_tokens" not in str(raised.value)
+
+
+@pytest.mark.cpu_only
+def test_workspace_reserve_rejects_unaffordable_floor() -> None:
+    with pytest.raises(ResourceError, match="workspace floor"):
+        get_mla_context_workspace_reserve(
+            1024, 3, 2, 4096, fixed_bytes=512, min_workspace_tokens=256
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sparse_algorithm,has_fp4,expected",
+    [
+        (None, True, 64),
+        ("dsa", True, 0),
+        ("deepseek_v4", True, 0),
+        ("csa2", False, 0),
+        ("dsa", False, 64),
+        ("skip_softmax", True, 64),
+    ],
+)
+def test_context_mla_staging_floor_is_backend_owned(
+    monkeypatch: pytest.MonkeyPatch, sparse_algorithm: str | None, has_fp4: bool, expected: int
+) -> None:
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 103)
+    config = SimpleNamespace(
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: has_fp4)),
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        sparse_attention_config=None
+        if sparse_algorithm is None
+        else SimpleNamespace(algorithm=sparse_algorithm),
+    )
+    features = trtllm_backend.AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16)
+    assert (
+        trtllm_backend.TrtllmAttention.runtime_workspace_min_tokens(
+            config,
+            Mapping(),
+            max_num_tokens=16,
+            runtime_features=features,
+        )
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+def test_context_mla_staging_floor_reuses_bounded_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = trtllm_backend.TrtllmAttention
+    monkeypatch.setattr(
+        backend,
+        "runtime_workspace_is_chunked_prefill_bounded",
+        classmethod(lambda cls, config: False),
+    )
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    )
+    features = trtllm_backend.AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=16)
+    assert (
+        backend.runtime_workspace_min_tokens(
+            config, Mapping(), max_num_tokens=16, runtime_features=features
+        )
+        == 0
+    )
