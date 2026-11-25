@@ -212,11 +212,14 @@ def test_main_draft_and_cross_pools_are_registered_once_each(monkeypatch):
             pytest.fail("the V1 provider must use allocated_bytes")
 
     def registered_capacities():
-        return {
-            p.name: [e.size_bytes for e in p.collect() if e.basis is Basis.PHYSICAL_BACKING]
-            for p in reg.default_providers()
-            if isinstance(p, KvCacheProvider)
-        }
+        capacities = {}
+        for provider in reg.default_providers():
+            if isinstance(provider, KvCacheProvider):
+                assert provider.name not in capacities, f"duplicate KV provider: {provider.name}"
+                capacities[provider.name] = [
+                    e.size_bytes for e in provider.collect() if e.basis is Basis.PHYSICAL_BACKING
+                ]
+        return capacities
 
     reg.clear_registered_providers()
     try:
