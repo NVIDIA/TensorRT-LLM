@@ -92,9 +92,28 @@ public:
     bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages,
         cudaStream_t stream) noexcept override
     {
+        return encodePools(layerGroupId, dstBasePtr, &pageIndices, 0, numBasePages, stream);
+    }
+
+    bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        return decodePools(layerGroupId, srcBasePtr, &pageIndices, 0, numBasePages, stream);
+    }
+
+    [[nodiscard]] bool supportsPerPoolPageIndices() const noexcept override
+    {
+        return true;
+    }
+
+    //! numPools == 0: one array, pageIndices[0], for every pool (encode()).
+    bool encodePools(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* const* perPoolIndices,
+        size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept override
+    {
         try
         {
-            return dispatch<true>(findGroup(layerGroupId), dstBasePtr, nullptr, pageIndices, numBasePages, stream);
+            return dispatch<true>(
+                findGroup(layerGroupId), dstBasePtr, nullptr, perPoolIndices, numPools, numBasePages, stream);
         }
         catch (std::exception const& error)
         {
@@ -108,12 +127,13 @@ public:
         }
     }
 
-    bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
-        size_t numBasePages, cudaStream_t stream) noexcept override
+    bool decodePools(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* const* perPoolIndices,
+        size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept override
     {
         try
         {
-            return dispatch<false>(findGroup(layerGroupId), nullptr, srcBasePtr, pageIndices, numBasePages, stream);
+            return dispatch<false>(
+                findGroup(layerGroupId), nullptr, srcBasePtr, perPoolIndices, numPools, numBasePages, stream);
         }
         catch (std::exception const& error)
         {
@@ -200,14 +220,21 @@ private:
         return mGroups.at(groupIndex).get();
     }
 
+    //! perPoolIndices: one array per pool (numPools == the group's pool count), or numPools == 0 for one shared array.
     template <bool isEncode>
-    bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr, PageIndexPair const* pageIndices,
-        size_t numBasePages, cudaStream_t stream) const
+    bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr,
+        PageIndexPair const* const* perPoolIndices, size_t numPools, size_t numBasePages, cudaStream_t stream) const
     {
         if (numBasePages == 0)
         {
             return group != nullptr;
         }
+        if (group == nullptr || perPoolIndices == nullptr || (numPools != 0 && numPools != group->copyPlans.stdSize()))
+        {
+            return false;
+        }
+        auto const indicesOf = [&](size_t poolIndex) { return perPoolIndices[numPools == 0 ? 0 : poolIndex]; };
+        PageIndexPair const* const pageIndices = indicesOf(0);
         // Null stream is rejected, not defaulted: cuMemcpyBatchAsync documents "must not be legacy
         // NULL stream" and returns CUDA_ERROR_INVALID_VALUE for both 0 and CU_STREAM_LEGACY.
         if (group == nullptr || pageIndices == nullptr || (isEncode ? dstBasePtr == nullptr : srcBasePtr == nullptr)
@@ -221,8 +248,12 @@ private:
         // sanity check on the host-array path, where the scan happens to be cheap and possible.
         if (mCopier.pageIndexLocation() == PageIndexLocation::kHost)
         {
-            TLLM_CHECK_DEBUG(std::all_of(pageIndices, pageIndices + numBasePages,
-                [](PageIndexPair const& pair) { return pair.dst >= 0 && pair.src >= 0; }));
+            for (size_t poolIndex = 0; poolIndex < std::max<size_t>(numPools, 1); ++poolIndex)
+            {
+                TLLM_CHECK_DEBUG(indicesOf(poolIndex) != nullptr
+                    && std::all_of(indicesOf(poolIndex), indicesOf(poolIndex) + numBasePages,
+                        [](PageIndexPair const& pair) { return pair.dst >= 0 && pair.src >= 0; }));
+            }
         }
 
         // One dispatcher launch per pool, all on the same stream. Stream ordering serialises them,
@@ -235,12 +266,13 @@ private:
             // PoolCopyArgs is a 32-bit interface; numBasePages in particular is unbounded on the
             // HOST tier path, so narrow explicitly rather than silently.
             TLLM_CHECK(numBasePages <= std::numeric_limits<uint32_t>::max());
-            for (PoolCopyPlan const& plan : group->copyPlans)
+            for (size_t poolIndex = 0; poolIndex < group->copyPlans.stdSize(); ++poolIndex)
             {
+                PoolCopyPlan const& plan = group->copyPlans.at(PoolIndex{static_cast<PoolIndex::ValueType>(poolIndex)});
                 TLLM_CHECK(plan.hotPageBytes <= std::numeric_limits<uint32_t>::max());
                 PoolCopyArgs args{};
                 args.bytesPerPage = static_cast<uint32_t>(plan.hotPageBytes);
-                args.pairs = pageIndices;
+                args.pairs = indicesOf(poolIndex);
                 args.numPairs = static_cast<uint32_t>(numBasePages);
                 if constexpr (isEncode)
                 {
@@ -277,6 +309,35 @@ IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
 LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
 {
     return layerGroupId;
+}
+
+bool IKvCacheColdPageCodec::supportsPerPoolPageIndices() const noexcept
+{
+    return false;
+}
+
+namespace
+{
+bool samePageIndices(PageIndexPair const* const* perPoolIndices, size_t numPools) noexcept
+{
+    return perPoolIndices != nullptr && numPools > 0
+        && std::all_of(perPoolIndices, perPoolIndices + numPools,
+            [&](PageIndexPair const* indices) { return indices == perPoolIndices[0]; });
+}
+} // namespace
+
+bool IKvCacheColdPageCodec::encodePools(LayerGroupId layerGroupId, void* dstBasePtr,
+    PageIndexPair const* const* perPoolIndices, size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept
+{
+    return samePageIndices(perPoolIndices, numPools)
+        && encode(layerGroupId, dstBasePtr, perPoolIndices[0], numBasePages, stream);
+}
+
+bool IKvCacheColdPageCodec::decodePools(LayerGroupId layerGroupId, void const* srcBasePtr,
+    PageIndexPair const* const* perPoolIndices, size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept
+{
+    return samePageIndices(perPoolIndices, numPools)
+        && decode(layerGroupId, srcBasePtr, perPoolIndices[0], numBasePages, stream);
 }
 
 std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()

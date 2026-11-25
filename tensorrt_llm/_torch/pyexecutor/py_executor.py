@@ -8119,6 +8119,19 @@ class PyExecutor:
             # adjust() moves pages; a deferred close must not hold any.
             mgr.flush_deferred_closes()
 
+        if not mgr.impl.adjust_needs_suspend:
+            # Copy-based rebalancing, in place: adjust() copies the blocks of active requests on
+            # the execution stream's timeline and rewrites their block indices. Or only the host
+            # arena is re-split, which moves cached host pages and none an active request holds.
+            # Either way nothing is suspended. Quiescence is still required: no forward may be in
+            # flight.
+            try:
+                mgr.impl.adjust()
+            except OutOfPagesError as e:
+                logger.warning(f"KV pool adjust() failed: {e!r}")
+            self._kv_cache_capacity = self._read_kv_cache_capacity()
+            return
+
         paused: List[LlmRequest] = []
         for req in self.active_requests:
             if mgr.is_request_active(req.py_request_id):

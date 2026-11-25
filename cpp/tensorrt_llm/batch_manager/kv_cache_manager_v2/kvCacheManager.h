@@ -227,6 +227,11 @@ public:
 
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
+    //! Page indices [first, second) of a view over the buffer (rooted at its base address, as for
+    //! getPageIndexUpperBound) that lie in its pool's current window. Without copy-based rebalancing that is
+    //! [0, getPageIndexUpperBound()); in an arena the upper bound is the arena end, and this is the part the
+    //! pool owns now.
+    std::pair<size_t, size_t> getPageIndexRange(LayerId layerId, DataRole role) const;
 
     //! Whether this buffer was declared sparse, i.e. whether its pages are host memory
     //! read through the sparse GPU cache rather than device memory read directly.
@@ -244,6 +249,14 @@ public:
 
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
+
+    // Copy-based rebalancing with several pools in a pool group: the buffer's pool has its own slot
+    // ids, and its kernel page index is bindings[base_page_index] * scale (+ the converter's layer
+    // offset), where bindings is this table, indexed by base page index. std::nullopt when the
+    // buffer's pool uses the base page indices directly. The table changes when a rebalance moves
+    // the pool; getPageIndexBindingVersion() changes with it.
+    std::optional<std::vector<int32_t>> getPageIndexBindings(LayerId layerId, DataRole role) const;
+    uint64_t getPageIndexBindingVersion() const;
 
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;
@@ -415,9 +428,18 @@ public:
     bool isStatsExcluded(std::optional<RequestIdType> kvCacheId) const;
 
     // Mirrors Python's need_adjustment property and adjust() method.
-    // All KvCaches must be suspended before calling adjust().
+    // All KvCaches must be suspended before calling adjust(), unless adjustNeedsSuspend() is false.
     bool needAdjustment() const;
     void adjust();
+    // False when adjust() may run with ACTIVE KvCaches: with in-place relocation, or when only host arena levels
+    // need adjusting (copy-based rebalancing) and no ACTIVE cache locks a page there. A host-only re-split moves
+    // cached host pages only; the GPU pages ACTIVE caches hold keep their slots.
+    bool adjustNeedsSuspend() const;
+    // Raise the hot-level slot floors that pool rebalancing (tuner targets, adjust()) must respect to what
+    // `batch` needs, capped at the current slot counts (see StorageManager::raiseHotMinSlots). Meant for the
+    // executor right after it clamps max_seq_len to the initial split, so that rebalancing keeps one request
+    // of that length (and its prefill chunks) schedulable. Returns the hot-level floors.
+    TypedVec<PoolGroupIndex, SlotCount> raiseHotMinSlots(BatchDesc const& batch);
 
     // ---- Internals used by KvCache ----------------------------------------
 
@@ -714,8 +736,13 @@ private:
 
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
+    bool _adjustNeedsSuspend() const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
+    //! In-place relocation: the pages at `level` locked by ACTIVE caches, per pool group, each once.
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLockedPages(CacheLevel level) const;
+    //! In-place relocation: the SWA scratch slots ACTIVE caches hold, per pool group.
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> _gatherActiveScratchSlots() const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
@@ -759,6 +786,12 @@ private:
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
+    // Bumped whenever the target ratios are recomputed or set. adjust() records the generation it acted
+    // on and needAdjustment() waits for a newer one, so a target the pools cannot reach within the
+    // tolerance (min slots, granularity, the arena's clamping) is attempted once per recompute instead of
+    // on every check.
+    std::uint64_t mTargetRatioGeneration{0};
+    std::optional<std::uint64_t> mAdjustedTargetRatioGeneration;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};
