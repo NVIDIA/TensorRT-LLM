@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/qwen25_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 import re
 from typing import List
@@ -17,7 +19,7 @@ class Qwen3ToolParser(BaseToolParser):
 
     Format Structure:
     ```
-    <tool_call>\n{"name":"func1", "arguments":{...}}\n</tool_call>\n<tool_call>\n{"name":"func2", "arguments":{...}}\n</tool_call>
+    <tool_call>\n{"name": "func1", "arguments": {...}}\n</tool_call>\n<tool_call>\n{"name": "func2", "arguments": {...}}\n</tool_call>
     ```
 
     Key Components:
@@ -261,7 +263,7 @@ class Qwen3ToolParser(BaseToolParser):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin='<tool_call>\n{"name":"' + name + '", "arguments":',
+            begin='<tool_call>\n{"name": "' + name + '", "arguments": ',
             end="}\n</tool_call>",
             trigger="<tool_call>",
         )
