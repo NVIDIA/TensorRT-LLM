@@ -37,6 +37,10 @@ _HYBRID_TEMPLATE = (
 _FORCED_NON_THINKING_TEMPLATE = (
     "{%- for message in messages %}{{- '<|im_start|>' + message.role }}{%- endfor %}"
 )
+_DEEPSEEK_TOKEN_TEMPLATE = (
+    "{%- for message in messages %}{{- '<｜User｜>' + message.content }}{%- endfor %}"
+    "{%- if add_generation_prompt %}{{- '<｜Assistant｜>' }}{%- endif %}"
+)
 
 
 class _ReachedGetLlmArgs(Exception):
@@ -106,4 +110,19 @@ def test_serve_auto_reasoning_parser_rejects_undetectable_model(
     assert result.exit_code == 2, result.output
     assert "Cannot auto-detect reasoning parser" in result.output
     assert "deepseek_v3 (R1 only)" in result.output
+    assert recorded == {}
+
+
+def test_serve_auto_reasoning_parser_rejects_non_chatml_qwen3_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-ChatML Qwen3 template that never opens <think> is a usage error."""
+    model = _write_checkpoint(
+        tmp_path / "DeepSeek-R1-0528-Qwen3-8B", "qwen3", jinja=_DEEPSEEK_TOKEN_TEMPLATE
+    )
+
+    result, recorded = _invoke_serve_auto(monkeypatch, model)
+
+    assert result.exit_code == 2, result.output
+    assert "Cannot auto-detect reasoning parser" in result.output
     assert recorded == {}

@@ -1177,6 +1177,54 @@ def test_detect_qwen3_think_in_generation_prompt(tmp_path, jinja, expected):
     assert resolve_auto_reasoning_parser(model_dir) == expected
 
 
+# DeepSeek-R1-0528-Qwen3-8B layout: a Qwen3 base with a DeepSeek chat template
+# whose generation prompt never opens <think>.
+_DEEPSEEK_TOKEN_TEMPLATE = (
+    "{% if not add_generation_prompt is defined %}"
+    "{% set add_generation_prompt = false %}{% endif %}"
+    "{%- for message in messages %}{%- if message['role'] == 'user' %}"
+    "{{'<｜User｜>' + message['content'] + '<｜Assistant｜>'}}{%- endif %}"
+    "{%- if message['role'] == 'assistant' %}"
+    "{% set content = message['content'] %}"
+    "{% if '</think>' in content %}"
+    "{% set content = content.split('</think>')[-1] %}{% endif %}"
+    "{{content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endfor %}"
+    "{% if add_generation_prompt %}{{'<｜Assistant｜>'}}{% endif %}")
+
+
+@pytest.mark.parametrize("files", ["jinja", "tokenizer_config"])
+def test_detect_qwen3_non_chatml_template_is_a_failure(tmp_path, files):
+    """A non-ChatML template that never opens <think> cannot be detected."""
+    model_dir = str(tmp_path / "DeepSeek-R1-0528-Qwen3-8B")
+    if files == "jinja":
+        _write_qwen3_checkpoint(
+            model_dir,
+            jinja=_DEEPSEEK_TOKEN_TEMPLATE,
+            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+    else:
+        _write_qwen3_checkpoint(
+            model_dir,
+            tokenizer_config={"chat_template": _DEEPSEEK_TOKEN_TEMPLATE})
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None)
+    assert resolve_auto_reasoning_parser(model_dir) is None
+
+
+def test_detect_qwen3_non_chatml_forced_thinking(tmp_path):
+    """Any chat format that opens <think> in the prompt is forced thinking."""
+    model_dir = str(tmp_path / "DeepSeek-R1-Qwen3-forced-thinking")
+    jinja = _DEEPSEEK_TOKEN_TEMPLATE.replace(
+        "{{'<｜Assistant｜>'}}{% endif %}",
+        "{{'<｜Assistant｜><think>\\n'}}{% endif %}")
+    _write_qwen3_checkpoint(model_dir,
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        "deepseek-r1")
+
+
 @pytest.mark.parametrize(("name", "model_type"), [
     ("DeepSeek-V3.1", "deepseek_v3"),
     ("SomeUnknownModel", "some_unknown_type"),
