@@ -21,20 +21,7 @@ from pathlib import Path
 
 import yaml
 
-from ..conftest import get_llm_root, llm_models_root
-
-
-def _get_sm_version_safe() -> int:
-    """Return the current device SM version, or 0 if it cannot be determined.
-
-    Imported lazily so importing this module does not require CUDA to be
-    available (e.g. during static test collection).
-    """
-    try:
-        from tensorrt_llm._utils import get_sm_version
-        return get_sm_version()
-    except Exception:
-        return 0
+from ..conftest import get_llm_root, get_sm_version, llm_models_root
 
 
 def recursive_update(d: dict, u: dict) -> dict:
@@ -54,23 +41,6 @@ def _mtp(max_draft_len: int) -> dict:
     return {'decoding_type': 'MTP', 'max_draft_len': max_draft_len}
 
 
-# Hybrid models reuse prefixes up to a recurrent-state snapshot.
-_BUILTIN_PRESETS = {
-    'reuse': {
-        'kv_cache_config': {
-            'enable_block_reuse': True,
-            'mamba_state_config': {
-                'periodic_snapshot_interval': 8192
-            },
-        },
-    },
-    'noreuse': {
-        'kv_cache_config': _kv_without_reuse()
-    },
-    'mtp3': {
-        'speculative_config': _mtp(3)
-    },
-}
 _CURATED_PRESETS = {
     'deepseek-v4-pro-latency.yaml',
     'deepseek-v4-pro-throughput.yaml',
@@ -78,19 +48,26 @@ _CURATED_PRESETS = {
     'gpt-oss-120b-throughput.yaml',
     'minimax-m3-throughput.yaml',
     'musespark-open-agentic-balanced.yaml',
+    'musespark-open.yaml',
     'nemotron-3-super-throughput.yaml',
     'nemotron-3-ultra-throughput.yaml',
     'qwen3.8-flash-next.yaml',
 }
-PERF_CONFIG_PRESETS = _BUILTIN_PRESETS.keys() | _CURATED_PRESETS
+PERF_CONFIG_PRESETS = _CURATED_PRESETS | {'reuse', 'noreuse', 'mtp3'}
 
 
 @cache
 def get_perf_config_preset(selection: str) -> dict:
     """Resolve one cfg selection. Copy the cached options before merging them."""
     name, *overrides = selection.split(',')
-    if name in _BUILTIN_PRESETS and not overrides:
-        return _BUILTIN_PRESETS[name]
+    if selection == 'mtp3':
+        return {'speculative_config': _mtp(3)}
+    if selection in ('reuse', 'noreuse'):
+        kv = {'enable_block_reuse': selection == 'reuse'}
+        if selection == 'reuse':
+            # Hybrid models reuse prefixes up to a recurrent-state snapshot.
+            kv['mamba_state_config'] = {'periodic_snapshot_interval': 8192}
+        return {'kv_cache_config': kv}
     if name not in _CURATED_PRESETS:
         raise ValueError(f"Unknown cfg selection {selection!r}; known presets: "
                          f"{sorted(PERF_CONFIG_PRESETS)}")
@@ -151,16 +128,8 @@ def _apply_model_overrides(config: dict, label: str) -> None:
 
     model, _, case = label.partition('-')
 
-    muse = 'muse_spark_open_nvfp4-serve-pytorch' in label
-    muse_agentx = 'muse_spark_open_nvfp4_agentx-serve-pytorch' in label
-    if muse or muse_agentx:
-        update(disable_mm_encoder=True,
-               enable_chunked_prefill=True,
-               allreduce_strategy='NCCL',
-               moe_config={'backend': 'TRTLLM'},
-               kv_cache_config={'dtype': 'fp8'})
-    if muse:
-        update(max_seq_len=49152, cuda_graph_config={'max_batch_size': 256})
+    if model == 'muse_spark_open_nvfp4' and case.startswith('serve-pytorch'):
+        update(disable_mm_encoder=True)
 
     if 'deepseek_v41_flash_nvfp4' in label:
         update(
@@ -210,28 +179,13 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                                           'DeepSeek-V4-Pro-nvfp4-DSpark',
                                           block_size=3))
 
-    qwen_max = 'qwen3.8_max_fp4_mtp-serve-pytorch' in label
-    flash_tep4 = model == 'qwen3.8_flash_next_fp8_mtp_tep4'
-    flash_base = model in ('qwen3.8_flash_next_fp4', 'qwen3.8_flash_next_fp8')
-    flash_next = flash_base or flash_tep4
-    if qwen_max or flash_next:
-        # MAX TP8/MTP3 (#18071) and Flash-Next with PLE host offload (#18585).
-        update(
-            cuda_graph_config={'max_batch_size': 16 if flash_next else 32},
-            kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
-            speculative_config=_mtp(3),
-        )
-    if qwen_max or flash_tep4:
-        update(moe_config={'backend': 'TRTLLM'})
-    if qwen_max:
-        update(max_seq_len=8192)
-    if flash_next:
-        update(enable_chunked_prefill=True)
-    # Spark Flash-Next benchmarks use these MoE backends without MTP.
-    if flash_base and case.startswith('bench-pytorch-streaming-'):
-        backend = 'CUTEDSL' if model.endswith('_fp4') else 'CUTLASS'
-        update(moe_config={'backend': backend}, speculative_config=None)
-    if flash_tep4 and case.startswith('serve-pytorch'):
+    if 'qwen3.8_max_fp4_mtp-serve-pytorch' in label:
+        update(max_seq_len=8192,
+               cuda_graph_config={'max_batch_size': 32},
+               kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
+               moe_config={'backend': 'TRTLLM'},
+               speculative_config=_mtp(3))
+    if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
         update(
             modeling_v2='require',
             max_seq_len=9216,
@@ -328,8 +282,16 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config=_kv_without_reuse())
     if minimax_fp4 or minimax_flash:
         update(sparse_attention_config={'implementation': 'msa'})
-    if minimax_mxfp8:
-        update(enable_attention_dp=True, max_seq_len=4096)
+    minimax_serve = minimax_fp4 and case.startswith('serve-pytorch')
+    if minimax_serve or minimax_mxfp8:
+        prefix = ('serve-pytorch-float4-maxbs:128-'
+                  if minimax_serve else 'bench-pytorch-float8-maxbs:1-')
+        long_input = case.startswith(prefix +
+                                     'maxnt:2048-input_output_len:8000,1000')
+        update(enable_attention_dp=True,
+               max_seq_len=9216 if long_input else 4096)
+        if minimax_serve and long_input:
+            update(enable_chunked_prefill=True)
     if minimax_fp4:
         update(moe_config={'backend': 'CUTLASS'},
                kv_cache_config={
@@ -348,27 +310,17 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'minimax_m3.1_flash_nvfp4_dspark' in label:
         update(speculative_config=_dspark(7, 'MiniMax-M3.1-Flash/dspark'))
 
-    # Bound the serve sequence length on TP4/EP4.
-    if 'minimax_m3_fp4-serve-pytorch' in label:
-        update(enable_attention_dp=True, max_seq_len=4096)
-
-    # The two 8K input recipes need room for 1K output; serve also needs chunking.
-    long_input = 'maxnt:2048-input_output_len:8000,1000'
-    fp4_long = 'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-' + long_input in label
-    mxfp8_long = 'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-' + long_input in label
-    if fp4_long or mxfp8_long:
-        update(max_seq_len=9216)
-    if fp4_long:
-        update(enable_chunked_prefill=True)
-
     if 'gemma_4_' in label:
-        update(
-            enable_chunked_prefill=True,
-            kv_cache_config={
-                'dtype': 'fp8',
-                'enable_partial_reuse': False
-            },
-        )
+        update(enable_chunked_prefill=True,
+               kv_cache_config={
+                   'dtype': 'fp8',
+                   'enable_partial_reuse': False
+               })
+        # GB10 and SM107 NVFP4 need FlashInfer for these attention heads.
+        sm = get_sm_version()
+        nvfp4 = model in ('gemma_4_26b_a4b_nvfp4', 'gemma_4_31b_it_nvfp4')
+        if sm == 121 or (sm == 107 and nvfp4 and '-pytorch-' in label):
+            update(attn_backend='FLASHINFER')
 
     if any(pattern in label for pattern in (
             'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:512-ep:4-gpus:4',
@@ -430,21 +382,17 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                  and case.startswith('serve-pytorch-streaming-'))
     super_mtp = 'nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-' in label
     super_streaming = super_mtp or 'nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-' in label
-    super_throughput = 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
+    super_serve = super_streaming or 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
-    super_case = super_streaming or super_throughput or super_fp8
-    if lightning or super_case:
+    if lightning or super_serve or super_fp8:
+        backend = 'CUTEDSL' if lightning and 'nvfp4' in model else 'CUTLASS'
         update(enable_chunked_prefill=True,
+               moe_config={'backend': backend},
                kv_cache_config={
                    'mamba_ssm_cache_dtype': 'float16',
                    'mamba_ssm_stochastic_rounding': True,
                    'mamba_ssm_philox_rounds': 5
                })
-    bf16_lightning = lightning and 'bf16_mtp' in model
-    if super_case or bf16_lightning:
-        update(moe_config={'backend': 'CUTLASS'})
-    elif lightning:
-        update(moe_config={'backend': 'CUTEDSL'})
     if lightning:
         update(stream_interval=10,
                num_postprocess_workers=4,
@@ -457,7 +405,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                })
     if super_fp8:
         update(disable_overlap_scheduler=True)
-    if super_streaming or super_throughput:
+    if super_serve:
         update(max_seq_len=1048576)
     if super_streaming:
         update(cuda_graph_config={'max_batch_size': 8})
@@ -479,17 +427,6 @@ def get_model_yaml_config(model_label: str,
     if '-bench-pytorch' not in model_label or 'cuda_graph_config' in config:
         graph = config.setdefault('cuda_graph_config', {})
         graph.setdefault('enable_padding', True)
-
-    # Gemma4 NVFP4 needs FlashInfer for its 512-wide attention heads on SM107.
-    if (label.startswith(('gemma_4_26b_a4b_nvfp4-', 'gemma_4_31b_it_nvfp4-'))
-            and '-pytorch-' in label and _get_sm_version_safe() == 107):
-        config['attn_backend'] = 'FLASHINFER'
-
-    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly. Gemma 4
-    # NVFP4 on SM107 is forced to FLASHINFER above; other GPUs keep the
-    # model's own get_model_defaults() choice.
-    if 'gemma_4_' in label and _get_sm_version_safe() == 121:
-        config['attn_backend'] = 'FLASHINFER'
 
     if has_cfg:
         for preset in presets.split('+'):

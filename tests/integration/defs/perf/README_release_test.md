@@ -119,12 +119,14 @@ In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` 
 
 For example, both Kimi K3 serve variants disable KV block reuse and use 64 tokens per block. The DEP8 variant adds `kv_cache_config.dtype='nvfp4'` and inherits those two settings. The test list supplies the KV memory fraction through `kv_frac`.
 
-The Core test list selects existing recipes by filename, for example
+The Core and Spark test lists select existing recipes by filename, for example
 `-cfg:deepseek-v4-pro-latency.yaml`. The DeepSeek V4 Pro throughput and latency cases
 use their corresponding files in [examples/configs/curated](../../../../examples/configs/curated).
-The 24-session Muse Spark AgentX case uses [musespark-open-agentic-balanced.yaml](../../../../examples/configs/curated/musespark-open-agentic-balanced.yaml).
-Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`. Qwen3.8 Flash-Next single-GPU
-MTP cases share `qwen3.8-flash-next.yaml`. The FP4 cases select `moe:CUTEDSL` in the test list.
+Muse Spark serve cases use `musespark-open.yaml`, and the 24-session AgentX case uses
+`musespark-open-agentic-balanced.yaml`. Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
+Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases inherit
+their variant's CUDA graph settings with `cuda_graph_config=default`. The Spark streaming
+benchmarks select their MoE backend with `moe:` and omit MTP with `speculative_config=default`.
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
