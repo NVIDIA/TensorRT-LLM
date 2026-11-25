@@ -67,12 +67,9 @@ def _failed_load_manager(
     stack: ExitStack | None = None,
     world_size: int = 1,
 ) -> KvCacheConnectorManager:
-    """A manager whose worker hands failed prefix loads back for a restart.
+    """A manager whose worker reports failed loads.
 
-    The query, update and finish callbacks of a tensor-parallel manager go
-    through the leader broadcast, and the restart guard reads the world size,
-    so a non-ADP manager needs its MPI patches for the whole test: they are
-    entered into `stack`.
+    A non-ADP manager enters its MPI patches into `stack` for the whole test.
     """
     worker = ADPAdapterMock(reports_failed_loads=True)
     worker.get_finished.return_value = ([], [])
@@ -289,8 +286,7 @@ def test_tp_manager_skips_dummy_requests(
 ) -> None:
     """Without attention DP, either dummy flag keeps a request from the connector.
 
-    The early returns sit before the leader broadcast, and every TP rank sees
-    the same flags, so no rank enters a collective the others skip.
+    No rank enters the leader broadcast for it.
     """
     worker, scheduler = MagicMock(), MagicMock()
     dummy = _request(999)
@@ -1769,15 +1765,14 @@ def test_failed_sync_load_restarts_the_request_and_pads_the_batch(
     with patch("torch.cuda.current_stream"):
         assert executor._kv_connector_start_batch(batch) == (False, False)
 
-    # The request left the batch, its saves and allocation were dropped, and it
-    # is admitted again rather than skipped as an already-loaded request.
+    # The request leaves the batch, loses its saves and allocation, and is admitted again.
     assert batch.context_requests == []
     executor.kv_cache_manager.drop_context_allocation.assert_called_once_with(req)
     manager.worker.drop_bound_saves.assert_called_with([7])
     manager.worker.start_load_kv.assert_called_once()
     assert manager.should_add_sequence(req)
     assert not executor._kv_connector_failed
-    # Under attention DP the emptied batch is padded so other owners keep running.
+    # Under attention DP the emptied batch is padded so peers keep running.
     assert padded == ([0] if adp else [])
 
 
@@ -1811,7 +1806,7 @@ def test_failed_async_load_restarts_the_parked_request(
     spec_manager.free_resources.assert_called_once_with(req)
     manager.worker.drop_bound_saves.assert_called_once_with([8])
     assert req.state == LlmRequestState.CONTEXT_INIT
-    # It is asked about again rather than skipped as an already-loaded request.
+    # It is queried again, not treated as loaded.
     assert manager.should_add_sequence(req)
     assert not manager.has_pending_transfers(8)
 
@@ -1835,7 +1830,6 @@ def test_failed_async_load_in_adp_recovery_loop_is_not_resumed(
         req.context_chunk_size = 4
         manager.update_state_after_alloc(req, [5, 6])
 
-    # Reproduce the executor's already-prepared batch and initial load plan.
     manager.build_scheduler_output(batch, cache)
     manager.handle_metadata()
     executor = object.__new__(PyExecutor)
@@ -1903,8 +1897,7 @@ def test_restart_of_the_only_parked_request_ends_the_wait(
     pad_calls = 0
 
     def pad(scheduled: ScheduledRequests) -> None:
-        # Padding fails while the parked request holds its pages, and succeeds
-        # afterwards only if the freed pages are enough.
+        # Padding fails while the parked request holds its pages.
         nonlocal pad_calls
         pad_calls += 1
         assert scheduled.batch_size == 0
@@ -1968,7 +1961,7 @@ def test_failed_async_load_still_pending_is_fatal(forbid_connector_collectives: 
 def test_failed_async_load_reported_after_its_finish_is_fatal(
     forbid_connector_collectives: None,
 ) -> None:
-    """A report after the finish comes too late: the request may already be scheduled."""
+    """A failure reported after the finish is fatal: the request may already be scheduled."""
     manager = _failed_load_manager(offer=(4, True))
     req = _request(8)
     manager.get_num_new_matched_tokens(req, 0)
@@ -1980,8 +1973,6 @@ def test_failed_async_load_reported_after_its_finish_is_fatal(
     assert manager.pop_failed_async_loads() == []
     assert not manager.should_add_sequence(req)
 
-    # The scheduler can admit the request over the loaded pages; the next
-    # poll names it anyway.
     manager.worker.get_finished.return_value = ([], [])
     assert manager.get_finished() == []
     manager.worker.take_failed_async_load_requests.return_value = {8}
@@ -1991,38 +1982,33 @@ def test_failed_async_load_reported_after_its_finish_is_fatal(
 
 
 def test_loads_of_a_skipped_forward_are_waited_on_every_layer() -> None:
-    """A synchronous load is only waited for by the forward's layer hooks.
+    """A skipped forward still waits for every started layer load and then the stream.
 
-    When attention-DP peers skip the forward after this owner started its loads,
-    the owner waits for every layer, as the forward would have, and for the
-    stream, so a later SKIP cannot free pages the worker still writes.
+    Otherwise a later skip could free pages the worker is still writing.
     """
     manager = _manager()
     manager.register_load_layers([0, 1, 2])
     stream = MagicMock()
-    # One log for both, so the stream is checked to be synchronized after every layer.
+    # One log for both checks the stream synchronizes after every layer.
     events: list[tuple] = []
     manager.worker.wait_for_layer_load.side_effect = lambda layer_idx, s: events.append(
         ("wait", layer_idx, s)
     )
     stream.synchronize.side_effect = lambda: events.append(("synchronize",))
 
-    # Nothing was started: nothing to wait for.
     manager.finish_loads_of_skipped_forward(stream)
     assert events == []
 
-    # A forward ran: its layer hooks already waited.
+    # A forward that ran already waited in its layer hooks.
     manager.mark_loads_started()
     manager.mark_loads_waited()
     manager.finish_loads_of_skipped_forward(stream)
     assert events == []
 
-    # The forward is skipped: every layer is waited for once, then the stream.
     manager.mark_loads_started()
     manager.finish_loads_of_skipped_forward(stream)
     expected = [("wait", 0, stream), ("wait", 1, stream), ("wait", 2, stream), ("synchronize",)]
     assert events == expected
 
-    # A repeated call finds nothing left to wait for.
     manager.finish_loads_of_skipped_forward(stream)
     assert events == expected

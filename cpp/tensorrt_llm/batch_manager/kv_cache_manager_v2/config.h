@@ -700,8 +700,9 @@ struct KVCacheManagerConfig
     // Applied inside the match so a single tree walk yields the usable depth.
     int reuseMatchBackoff = 0;
 
-    // Candidate prefix alignment after backoff, before each coverage validation.
-    // Whole-block connectors use tokensPerBlock; 1 preserves token-granular reuse.
+    // Each match candidate is rounded down to a multiple of this after backoff and before
+    // coverage validation. Must divide tokensPerBlock: whole-block KV connectors use
+    // tokensPerBlock, and 1 keeps token-granular reuse.
     int reuseMatchAlignment = 1;
 
     // Constraint-based memory partitioning.

@@ -984,8 +984,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     // shortens the match, so the loop terminates.
     while (!matched.empty())
     {
-        // Align before validating pages: moving backwards can make stale SWA
-        // pages active. Snapshot and coverage trims retry through this boundary.
+        // Align before validating pages, since shortening the match can activate
+        // stale SWA pages. Snapshot and coverage trims loop back through here.
         if (alignment > 1)
         {
             int const remainder = numMatchedTokens(matched, mTokensPerBlock) % alignment;
@@ -1110,8 +1110,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, T
         numReusableTokensBeforeHybridPruning
             = numMatchedTokens(pruneMatch(rawMatched, std::nullopt, alignment), mTokensPerBlock);
     }
-    // Diagnostic only: the same pruning without alignment, to report the local reuse
-    // that alignment gives up. Only a whole-block connector's managers pay for it.
+    // Diagnostic only: the same pruning without alignment, to report the reuse it gives up.
     std::optional<int> numReusableTokensBeforeAlignment;
     if (alignment > 1)
     {

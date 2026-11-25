@@ -1676,7 +1676,7 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     [
         (False, False, False, False, 1, 1, [6]),
         (True, False, False, False, 1, TOKENS_PER_BLOCK, [6]),
-        # A legacy connector attribute cannot disable the runtime backoff.
+        # `drops_reuse_match_backoff` cannot disable the runtime backoff.
         (True, True, False, False, 1, TOKENS_PER_BLOCK, [6]),
         (True, True, True, False, 1, 1, [6]),
         # A paired draft pool keeps its backoff but aligns with the target.
@@ -1735,8 +1735,7 @@ def test_kv_connector_reuse_declarations_shape_the_core_match(
     assert manager.draft_prompt_lookahead == 1
     assert manager.max_attention_window_vec == expected_windows
     if expected_backoff == 0:
-        # Without the backoff the lookup stops one token short of the prompt,
-        # exactly as it does without a draft.
+        # Without the backoff the lookup stops one token short of the prompt.
         prompt = list(range(65))
         request = SimpleNamespace(
             multimodal_hashes=None,

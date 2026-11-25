@@ -12,13 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""How KVCacheManagerV2 shapes reuse matches for a whole-block connector.
+"""How KVCacheManagerV2 aligns reuse matches for a whole-block connector.
 
-A one-model draft's lookahead backoff trims a local match of whole blocks to a
-few tokens short of a boundary, and a connector that serves only from a block
-boundary could then offer nothing. The manager asks the core to align the
-match only when that combination is present. The native lookahead backoff
-remains in effect before alignment.
+A lookahead backoff can end a match just short of a block boundary, where a
+connector that serves only from boundaries could offer nothing. The manager
+then aligns the match down to a boundary, after applying the backoff.
 """
 
 from types import SimpleNamespace
@@ -55,17 +53,15 @@ def _connector(whole_blocks: bool | str, *, capacity_only: bool = False) -> Simp
     "backoff, partial_reuse, connector, is_draft, expected",
     [
         (1, False, _connector(True), False, TOKENS_PER_BLOCK),
-        # No backoff still aligns: trimming a match to the pages a sliding-window
-        # layer holds can end it mid-block.
+        # Sliding-window trimming can end a match mid-block even without backoff.
         (0, False, _connector(True), False, TOKENS_PER_BLOCK),
-        # Whole-block declarations override the default partial reuse setting.
+        # A whole-block connector overrides partial reuse.
         (1, True, _connector(True), False, TOKENS_PER_BLOCK),
-        # A connector that serves from any position needs nothing.
         (1, False, _connector(False), False, 1),
         (1, False, None, False, 1),
-        # A capacity-only connector serves nothing, so it never reshapes reuse.
+        # A capacity-only connector serves nothing, so it never aligns.
         (1, False, _connector(True, capacity_only=True), False, 1),
-        # A paired draft pool aligns too, so the joint claim stays on a boundary.
+        # The draft pool aligns too, so the joint claim stays on a boundary.
         (1, False, _connector(True), True, TOKENS_PER_BLOCK),
     ],
     ids=[
@@ -104,13 +100,11 @@ def test_external_prefix_keeps_native_lookahead(backoff: int, matched: int, expe
 @pytest.mark.parametrize(
     "unaligned_end, local_end, served_end, expected",
     [
-        # 300 reusable tokens align down to 256: the connector serves those 44 and more.
+        # 300 reusable tokens align down to 256; the 44 forfeited tokens are
+        # counted as served or recomputed by how far the connector serves.
         (300, 256, 512, (44, 0)),
-        # The connector serves nothing: all 44 are recomputed.
         (300, 256, 256, (0, 44)),
-        # The connector serves 20 of them: the other 24 are recomputed.
         (300, 256, 276, (20, 24)),
-        # A match already on a boundary gives nothing up.
         (256, 256, 512, (0, 0)),
     ],
     ids=["served", "recomputed", "partly_served", "on_a_boundary"],
@@ -129,5 +123,5 @@ def test_alignment_forfeit_is_split_by_what_the_connector_served(
     manager._record_alignment_forfeit(kv_cache, local_end, served_end)
 
     assert manager._take_alignment_forfeit() == expected
-    # Each report covers the iterations since the last one.
+    # Taking the counts resets them.
     assert manager._take_alignment_forfeit() == (0, 0)

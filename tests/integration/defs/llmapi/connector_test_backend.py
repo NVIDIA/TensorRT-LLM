@@ -209,8 +209,8 @@ class FailedLoadConnectorScheduler(KvCacheConnectorScheduler):
             self._loads[request.request_id] = block_ids[:1]
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> FailedLoadMetadata:
-        # Async requests are parked outside the compute batch, so retain their
-        # allocation feedback as well as this pass's synchronous save intents.
+        # Async loads are parked outside the compute batch, so add them to this
+        # pass's save intents.
         loads, self._loads = self._loads, {}
         saves = {req.request_id for req in scheduler_output.new_requests}
         saves.update(loads)
@@ -228,8 +228,7 @@ class FailedLoadConnectorScheduler(KvCacheConnectorScheduler):
 class FailedLoadConnectorWorker(KvCacheConnectorWorker):
     """Poison a prefix page and report failure only after the write is drained.
 
-    This injects a failed transfer into a real model/allocator execution. It
-    does not emulate network transport or claim RDMA completion coverage.
+    This injects a failed load into a real execution; it does not emulate transport.
     """
 
     supports_attention_dp = True
@@ -299,6 +298,5 @@ class FailedLoadConnectorWorker(KvCacheConnectorWorker):
     def wait_for_save(self, stream: torch.cuda.Stream) -> None:
         metadata = self.get_connector_meta()
         assert isinstance(metadata, FailedLoadMetadata)
-        # Async requests are not computed yet; their save intents are not
-        # publishable until their completion/recovery poll has run.
+        # Async failures are exempt until their completion poll drops their saves.
         assert not (metadata.saves & self._invalid_saves - self._async_failed)

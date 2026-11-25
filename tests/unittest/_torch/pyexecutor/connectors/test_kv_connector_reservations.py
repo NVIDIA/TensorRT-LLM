@@ -344,7 +344,7 @@ def test_ranks_that_disagree_about_capacity_only_are_rejected(
 def test_a_split_declaration_names_its_own_consequence(
     manager, monkeypatch, index, declaration, consequence
 ):
-    """Only capacity_only gates a collective, so only its message speaks of a hang."""
+    """Only `capacity_only` gates a collective, so only its message names the allgather."""
     manager._prefix_capability = None
 
     def split(value):

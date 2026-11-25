@@ -14,11 +14,8 @@
 # limitations under the License.
 """The KV connector manager's speculative-prefill-only mode.
 
-The mode lets one-model speculative decoding run next to a connector by
-refusing every request that is not context-only work: at admission, where only
-the request fails, and again at the connector boundary for anything that
-bypasses admission. Dummy requests and a connector that transfers no KV are
-never refused.
+The mode refuses non-context-only requests at admission and again at the
+connector boundary. Dummy requests and capacity-only connectors are exempt.
 """
 
 from contextlib import ExitStack
@@ -62,12 +59,7 @@ def _manager(
     capacity_only: bool = False,
     speculative_prefill_only: bool = True,
 ) -> KvCacheConnectorManager:
-    """A manager in the speculative-prefill-only mode by default.
-
-    A tensor-parallel manager reaches the leader broadcast on every query, so
-    it needs its MPI patches for the whole test: they are entered into
-    `stack`, and the broadcast is an identity that records its calls.
-    """
+    """Build a manager; a tensor-parallel one enters its MPI patches into `stack`."""
     worker = SpecMock(capacity_only=capacity_only)
     worker.get_finished.return_value = ([], [])
     scheduler = SpecMock()
@@ -108,7 +100,7 @@ def test_speculative_prefill_rejects_generation_before_lookup(
 
     manager.scheduler.get_num_new_matched_tokens.assert_not_called()
     if not attention_dp:
-        # Every rank raises for the same request; none waits in the broadcast.
+        # Every rank raises, so none waits in the broadcast.
         _broadcast(manager).assert_not_called()
 
 
@@ -118,7 +110,7 @@ def test_speculative_prefill_rejects_generation_before_lookup(
 def test_admission_refuses_only_non_context_requests(
     prefill_only: bool, context_only: bool, capacity_only: bool
 ) -> None:
-    """Only the refused request fails; the executor never reaches resource preparation."""
+    """Admission refuses only non-context requests, before any other validation."""
     manager = _manager(
         attention_dp=True, capacity_only=capacity_only, speculative_prefill_only=prefill_only
     )
@@ -127,8 +119,7 @@ def test_admission_refuses_only_non_context_requests(
     request = _request(7, context_only=context_only, generation_only=not context_only)
 
     if prefill_only and not context_only and not capacity_only:
-        # Nothing else is set on the executor, so this raising proves the
-        # admission check is the first thing `_validate_request` does.
+        # The executor is otherwise empty, so admission must run first.
         with pytest.raises(ValueError, match="context-only"):
             PyExecutor._validate_request(executor, request)
     else:

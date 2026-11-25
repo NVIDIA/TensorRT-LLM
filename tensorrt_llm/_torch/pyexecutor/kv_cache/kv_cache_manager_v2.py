@@ -3596,8 +3596,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._allocated_draft_lens: dict[int, int] = {}
         self._retained_generation_allocations: dict[int, int] = {}
-        # Local reuse that a whole-block connector's alignment gave up, since the last
-        # iteration stats: tokens the connector then served, and tokens recomputed.
+        # Local reuse forfeited to connector block alignment since the last stats
+        # report: tokens the connector served, and tokens recomputed.
         self._alignment_forfeited_served_tokens = 0
         self._alignment_forfeited_recomputed_tokens = 0
 
@@ -5180,8 +5180,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Keep the lookahead evidence and its backoff in the same tree match.
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
-            # The alignment is applied in the same tree match after the backoff,
-            # so the probe, the claim and the paired probes all trim once too.
+            # Alignment follows the backoff in the same match, so it also trims once.
             reuse_match_backoff=self.reuse_match_backoff,
             reuse_match_alignment=reuse_match_alignment,
             enable_stats=self.enable_stats,
@@ -5621,16 +5620,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def _connector_reuse_match_alignment(self) -> int:
         """Alignment a whole-block KV connector needs of every local prefix match.
 
-        Such a connector serves only from a block boundary, and the local match is where
-        its offer starts. Disabling partial radix matching is not enough on its own: a
-        one-model draft's lookahead backoff trims a match of whole blocks to one or more
-        tokens short of a boundary, which would leave the connector nothing to offer for
-        any request with a local hit. Without a backoff a match of whole blocks ends on a
-        boundary, but trimming it to the pages an attention layer holds (for example a
-        sliding window's coverage) can still end it mid-block, so the alignment holds
-        whether or not a backoff is in effect. Aligning trades the trimmed block for the
-        connector serving it and everything after it. Any other configuration keeps
-        token-granular reuse.
+        Such a connector serves only from a block boundary, and its offer starts where
+        the local match ends. Disabling partial matching is not enough: a lookahead
+        backoff, or trimming to the pages a layer holds (for example a sliding window),
+        can end a whole-block match mid-block and leave the connector nothing to offer.
+        Aligning gives up that partial block so the connector can serve it and the rest.
 
         Returns:
             The ledger `tokens_per_block` when the connector requires block-aligned reuse;
@@ -6907,8 +6901,8 @@ class KVCacheManagerV2(BaseResourceManager):
         request_id = req.py_request_id
         retained = self._retained_generation_allocations.pop(request_id, None)
         if retained is not None:
-            # The connector already knows these pages. Reuse the skipped step's
-            # allocation, and grow it only when this retry drafts more tokens.
+            # The connector already holds these pages: reuse the skipped step's
+            # allocation, growing it only if this retry drafts more tokens.
             draft_slots = max(retained, self._generation_draft_slots(req))
             extra_slots = draft_slots - retained
             if extra_slots > 0:
@@ -6941,20 +6935,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def _undo_generation_step(self, req: LlmRequest) -> None:
         """Unwind per-step state a subclass keeps for `req`'s skipped generation step.
 
-        Both `revert_allocate_generation` and `keep_generation_allocation` call
-        this first, so a subclass that tracks per-step state overrides it once
-        instead of both. The base manager keeps none.
+        Called first by both `revert_allocate_generation` and
+        `keep_generation_allocation`. The base manager keeps none.
         """
 
     def keep_generation_allocation(self, req: LlmRequest) -> None:
         """Keep a published allocation for the next attempt of a skipped step.
 
-        This is the connector counterpart of `revert_allocate_generation` and does not go through it. Per-step
-        state a subclass keeps is unwound through `_undo_generation_step`, as in the revert.
-
-        The pages and connector save ownership remain intact. The skipped
-        step leaves the in-flight queue until scheduling retries it, so an
-        older overlapping forward still consumes only its own allocation.
+        The connector counterpart of `revert_allocate_generation`: pages and
+        connector save ownership stay intact. The skipped step leaves the
+        in-flight queue until it is retried, so an older overlapping forward
+        consumes only its own allocation.
         """
         self._undo_generation_step(req)
         request_id = req.py_request_id
@@ -7012,20 +7003,15 @@ class KVCacheManagerV2(BaseResourceManager):
     def drop_context_allocation(self, req: LlmRequest) -> None:
         """Release a context request's allocation and rewind it to run from the start.
 
-        For a request the scheduler skipped past a connector prefix whose pages
-        could not be filled (`KvCacheConnectorWorker.reports_failed_loads`).
-        Those positions already count as computed, so the request cannot run
-        this iteration.
+        Used for a request skipped past a connector prefix whose pages could not
+        be filled (`KvCacheConnectorWorker.reports_failed_loads`), and wherever
+        the manager drops a context cache (for example `revert_allocate_context`).
 
-        `free_resources` releases unstarted prefix loads and refuses a load that
-        is still pending, which turns a misreported failure into a RuntimeError
-        rather than a use-after-free. It resets the connector state and
-        `py_connector_allocation_reported` / `py_served_prefix_end`, and closes
-        the cache without committing it: blocks reach the radix tree only in
-        `try_commit_blocks` after a forward pass, so the never-filled range is
-        not offered for reuse. The next admission therefore matches local reuse
-        and asks the connector afresh. This is the same release as the drop
-        branches of `revert_allocate_context`.
+        `free_resources` releases unstarted prefix loads, raises RuntimeError on
+        a load still pending instead of risking a use-after-free, resets the
+        request's connector state, and closes the cache uncommitted. Blocks reach
+        the radix tree only in `try_commit_blocks`, so the unfilled range is never
+        offered for reuse and the next admission queries the connector afresh.
 
         Args:
             req: The context request to restart.
@@ -7095,9 +7081,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def keep_context_allocation(self, req: LlmRequest) -> None:
         """Keep a reported context allocation for the next attempt of a skipped step.
 
-        The connector already holds the allocation's page IDs. Shrinking it would free
-        pages that a same-length retry may replace without the connector noticing.
-        `resize_context` never shrinks, so the retry reuses or extends this allocation.
+        The connector already holds its page IDs, and shrinking could free pages a
+        retry then replaces unnoticed. `resize_context` never shrinks, so the retry
+        reuses or extends this allocation.
         """
         if self.is_draft:
             req.py_draft_ctx_pre_resize_cap = None
@@ -8173,8 +8159,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 return
             end = self._connector_safe_prefix_end(req, reservation.end)
         else:
-            # Pending attempts already had their unsafe tail released. Do not
-            # subtract lookahead again when preparation revisits the attempt.
+            # A pending reservation's lookahead tail is already trimmed.
             end = reservation.end
         # Reservation transfers end at full blocks.
         end = end // self.tokens_per_block * self.tokens_per_block
@@ -8258,11 +8243,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return not req.is_disagg_generation_init_state
 
     def _connector_safe_prefix_end(self, req: LlmRequest, matched_end: int) -> int:
-        """Keep speculative lookahead inside the prefix the store matched.
+        """Trim a connector match ending at `matched_end` to the prefix it may serve.
 
-        The offer must establish that its pages belong to the matched prompt.
-        The runtime retains lookahead evidence and recomputes the unsafe tail.
-        Transfers consume full blocks when lookahead trims that tail.
+        Backs off `reuse_match_backoff` tokens for the forward pass to recompute,
+        keeps the final prompt token for logits, and rounds down to a full block
+        when a backoff applies.
         """
         end = min(matched_end - self.reuse_match_backoff, req.prompt_len - 1)
         if self.reuse_match_backoff:
@@ -8291,8 +8276,8 @@ class KVCacheManagerV2(BaseResourceManager):
             req, local_end
         )
         if req.py_connector_load_failed:
-            # A failed store read falls back to local computation for the rest
-            # of this request, even if the backend continues to advertise it.
+            # After a failed load the request computes locally, even if the
+            # connector keeps offering tokens.
             num_tokens = 0
             if load_async:
                 logger.warning_once(
@@ -8301,8 +8286,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     "local recomputation",
                     key="kv_connector_async_reload_after_failure",
                 )
-            # An asynchronous lookup may already have started a transfer.
-            # Keep its ownership until completion even though no prefix is used.
+            # A transfer an asynchronous lookup started keeps its ownership
+            # until it completes, though no prefix is used.
         offered_end = self._connector_safe_prefix_end(req, local_end + num_tokens)
         # A connector-served prefix starves a hidden-state drafter like local
         # reuse does: leave the spec recompute tail to the forward pass.
@@ -8337,19 +8322,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return position > local_end
 
     def _record_alignment_forfeit(self, kv_cache, local_end: int, served_end: int) -> None:
-        """Count the local reuse that block alignment gave up, once a request's offer settles.
+        """Count the local reuse block alignment gave up, once a request's offer settles.
 
-        Alignment rounds the local match down from the reusable prefix it would
-        otherwise take, `kv_cache._get_num_reusable_tokens_before_alignment()`, to
-        a multiple of `_connector_reuse_match_alignment()`. Of the tokens in between,
-        those the connector served in `[local_end, served_end)` count as served; the
-        rest are recomputed.
+        The forfeited tokens lie between the aligned match end and the unaligned
+        one (`kv_cache._get_num_reusable_tokens_before_alignment()`). Those in
+        `[local_end, served_end)` count as served; the rest as recomputed.
 
         Args:
             kv_cache: The request's cache.
-            local_end: Where the local match, and so the connector's offer, starts.
-            served_end: Where the connector-served prefix ends; `local_end` if it
-                served none.
+            local_end: Where the local match ends and the connector's offer starts.
+            served_end: Where the connector-served prefix ends; `local_end` if none.
         """
         alignment = self._connector_reuse_match_alignment()
         if alignment <= 1:
@@ -8364,7 +8346,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._alignment_forfeited_recomputed_tokens += forfeited - served
 
     def _take_alignment_forfeit(self) -> tuple[int, int] | None:
-        """The served and recomputed forfeited tokens since the last call, or None without alignment."""
+        """Return and reset the (served, recomputed) forfeit counts; None without alignment."""
         if self._connector_reuse_match_alignment() <= 1:
             return None
         counts = (

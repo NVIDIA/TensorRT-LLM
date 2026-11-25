@@ -394,9 +394,8 @@ public:
         // request's content diverges from the tree, independent of page
         // residency. Equal to numLookupTokens when there is no fork.
         int numReusableTokensBeforePruning;
-        // The prefix the same pruning supports before `alignment` rounds it down: the
-        // local reuse a whole-block KV connector's alignment gives up is this minus
-        // numTokens. Equal to numTokens when the alignment is 1.
+        // The prefix the same pruning supports without `alignment`. Minus numTokens,
+        // it is the local reuse alignment gives up; equal to numTokens when alignment is 1.
         int numReusableTokensBeforeAlignment;
         // Coalesced half-open ranges of valid OPTIONAL endpoints.
         TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
@@ -407,8 +406,7 @@ public:
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
     // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
     // collectOptionalMatches: also report the valid OPTIONAL endpoints (ReuseMatch::optionalEndpointRanges).
-    // alignment: each candidate is aligned after backoff and before coverage validation
-    // (see KVCacheManagerConfig::reuseMatchAlignment).
+    // alignment: see KVCacheManagerConfig::reuseMatchAlignment.
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
         bool enablePartialMatch = false, int backoff = 0, bool collectOptionalMatches = false, int alignment = 1) const;
 

@@ -520,8 +520,7 @@ public:
         return mNumReusableTokensBeforePruning;
     }
 
-    // Internal diagnostic: the reused prefix before a whole-block KV connector's
-    // alignment rounded it down (see BlockRadixTree::ReuseMatch).
+    // Internal diagnostic (see BlockRadixTree::ReuseMatch::numReusableTokensBeforeAlignment).
     int numReusableTokensBeforeAlignment() const noexcept
     {
         return mNumReusableTokensBeforeAlignment;

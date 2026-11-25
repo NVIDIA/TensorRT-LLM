@@ -14,11 +14,9 @@
 # limitations under the License.
 """Which speculative configs may run next to a KV connector.
 
-A disaggregated context server with a one-model drafter (MTP or EAGLE3) serves
-context-only requests, which never reject a draft token, so a connector whose
-two halves declare `supports_speculative_prefill` stays valid there. Every other
-combination keeps the speculative-decoding refusal, and an explicit
-KVCacheManagerV1 selection does not select speculative-prefill mode for V1.
+Speculative-prefill-only mode needs a one-model drafter (MTP or EAGLE3), a
+disaggregated context server on KVCacheManagerV2, and a connector whose worker
+and scheduler both declare `supports_speculative_prefill`.
 """
 
 from collections.abc import Callable
@@ -64,8 +62,7 @@ def _mtp_eagle() -> MTPDecodingConfig:
 
 
 def _mtp_vanilla() -> MTPDecodingConfig:
-    # Not `num_nextn_predict_layers=2`: that deprecated input is remapped to
-    # max_draft_len and leaves the mode at MTP-Eagle.
+    # `num_nextn_predict_layers=2` would leave the mode at MTP-Eagle.
     config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
     assert config.spec_dec_mode.is_mtp_vanilla()
     return config

@@ -397,12 +397,10 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
 def test_a_dropped_context_allocation_commits_nothing_and_is_asked_again(
     manager: KVCacheManagerV2, connector: FakeConnectorManager
 ) -> None:
-    """A restart after a failed connector load leaves no trace of the lost prefix.
+    """Dropping an allocation after a failed load publishes nothing and re-asks the connector.
 
-    The served range was skipped, never computed. Dropping the allocation must
-    neither publish it to the radix tree, where every later request would reuse
-    unfilled pages, nor keep the ask memo, which would leave the restarted
-    request without a connector query.
+    The served range was never computed, so publishing it would let later
+    requests reuse unfilled pages.
     """
     request = make_request()
     assert schedule(manager, request)
@@ -440,9 +438,7 @@ def test_a_dropped_context_allocation_commits_nothing_and_is_asked_again(
 @pytest.mark.parametrize(
     ("requires", "expected_local_end", "expected_backoff"),
     [
-        # A one-token backoff leaves a match of four whole blocks one short.
         (False, 4 * TOKENS_PER_BLOCK - 1, 1),
-        # Aligned down: the connector serves the trimmed block and the rest.
         (True, 3 * TOKENS_PER_BLOCK, 1),
     ],
     ids=["no_declaration", "align"],
@@ -453,11 +449,9 @@ def test_whole_block_connector_is_queried_from_a_block_boundary(
     expected_local_end: int,
     expected_backoff: int,
 ) -> None:
-    """The local match a whole-block connector is asked from, against the real tree.
+    """A one-token lookahead backoff is aligned down for a whole-block connector.
 
-    A one-model draft's lookahead backoff is stood in for by patching the
-    lookahead the manager reads at construction; the connector offers nothing,
-    so the query records the local match alone.
+    The connector offers nothing, so its query records the local match alone.
     """
     monkeypatch.setattr(
         "tensorrt_llm._torch.speculative.draft_prompt_lookahead", lambda _spec_config: 1
@@ -469,7 +463,7 @@ def test_whole_block_connector_is_queried_from_a_block_boundary(
     connector.requires_block_aligned_reuse = requires
     manager = make_manager(
         connector,
-        # The connector declaration must override the default partial reuse.
+        # The whole-block declaration must override partial reuse.
         kv_cache_config=KvCacheConfig(
             max_tokens=2048, enable_block_reuse=True, enable_partial_reuse=True
         ),
@@ -480,8 +474,7 @@ def test_whole_block_connector_is_queried_from_a_block_boundary(
             assert not manager.enable_partial_reuse
             assert not manager.kv_cache_manager_py_config.enable_partial_reuse
 
-        # Seed four whole blocks under the scope the manager derives for
-        # `make_request`, which carries no LoRA task and no cache salt.
+        # Seed four blocks under the reuse scope of `make_request`.
         seed = manager.impl.create_kv_cache(
             ReuseScope(lora_id=None, salt=manager._derive_reuse_salt(None))
         )
@@ -1034,8 +1027,7 @@ class _FailedLoadScheduler(KvCacheConnectorScheduler):
         self, request: LlmRequest, num_computed_tokens: int
     ) -> tuple[int, bool]:
         self.queries.append((num_computed_tokens, request.py_connector_load_failed))
-        # Deliberately keep offering the missing prefix after failure: the runtime
-        # must enforce recompute even if a backend's lookup remains stale.
+        # Keep offering after a failure: the runtime must recompute regardless.
         return OFFER_TOKENS, self.load_async and not request.py_connector_load_failed
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: list[int]) -> None:
@@ -1180,8 +1172,7 @@ def test_skipped_generation_retains_pages_and_mooncake_save_ownership(
     executor._num_reverted_ctx_tokens = 0
     executor.enable_joint_kv_cache_reuse = False
     request = make_request(prompt_len=TOKENS_PER_BLOCK)
-    # Exercise the production scheduler's page/token and save-ownership logic
-    # without provisioning an external store or starting background transfers.
+    # The real Mooncake scheduler logic, without an external store.
     store_scheduler = object.__new__(MooncakeStoreConnectorScheduler)
     store_scheduler._config = MooncakeStoreConnectorConfig(master_server_address="unused:1")
     store_scheduler._tokens_per_block = TOKENS_PER_BLOCK
@@ -1283,7 +1274,7 @@ def test_external_prefix_backoff_recomputes_unsafe_block(
     manager = make_manager(connector)
     request = make_request()
     try:
-        # Isolate external matching: no local prefix exists in this fresh pool.
+        # The fresh pool has no local prefix, so only the external match counts.
         manager.reuse_match_backoff = 1
         assert schedule(manager, request)
         run(manager, request)

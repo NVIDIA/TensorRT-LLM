@@ -143,8 +143,8 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
-    # Local reuse a whole-block KV connector's alignment gave up for requests admitted during this
-    # iteration, as (tokens the connector then served, tokens recomputed). None without alignment.
+    # Local reuse forfeited to KV connector block alignment this iteration, as
+    # (tokens the connector served, tokens recomputed). None without alignment.
     alignment_forfeited_tokens: tuple[int, int] | None = None
 
 

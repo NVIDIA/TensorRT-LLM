@@ -369,29 +369,26 @@ def _connector_runs_speculative_prefill_only(
         use_kv_cache_manager_v2: bool | str) -> bool:
     """Whether a KV connector may run next to this speculative decoding.
 
-    Rejected draft tokens shrink a request's page list underneath the
-    connector, which is why speculative decoding is refused next to one. A
-    context-only request on a disaggregated context server never rejects a
-    draft token, so the append-only page deltas the connector receives stay
-    valid there. One-model MTP and EAGLE3 keep their draft KV in the target
-    pool, which is registered with the connector. Generation work is refused
-    at admission and at the connector boundary
-    (`KvCacheConnectorManager.speculative_prefill_only`).
+    A context-only request on a disaggregated context server never rejects a
+    draft token, so the connector's append-only page deltas stay valid.
+    One-model MTP and EAGLE3 keep their draft KV in the target pool, which the
+    connector registers. Generation work is refused at admission and at the
+    connector boundary (`KvCacheConnectorManager.speculative_prefill_only`).
 
     Args:
         spec_config: The resolved speculative config, or None.
         worker_cls: The connector worker class.
         scheduler_cls: The connector scheduler class.
-        cache_transceiver_config: The cache transceiver config; a backend
+        cache_transceiver_config: The cache transceiver config, whose backend
             marks a disaggregated server.
-        use_kv_cache_manager_v2: The tri-state
-            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        use_kv_cache_manager_v2: `kv_cache_config.use_kv_cache_manager_v2`
+            (True, False or "auto").
 
     Returns:
         True when the connector runs in the speculative-prefill-only mode.
     """
     if use_kv_cache_manager_v2 is False:
-        # V1 has no speculative-prefill mode; this helper only selects V2 modes.
+        # The speculative-prefill-only mode requires V2.
         return False
     if spec_config is None or (spec_config.max_draft_len or 0) <= 0:
         return False
@@ -409,17 +406,14 @@ def _refuse_speculation_next_to_connector(
         connector: KvCacheConnectorManager) -> None:
     """Refuse speculative decoding next to a connector that moves KV.
 
-    Rejected draft tokens shrink a request's page list, and the freed slot
-    goes to whichever request allocates next. The connector is only told about
-    pages appended since the last report, so it would keep addressing a slot
-    another request now owns. Context-only requests never reject a draft token,
-    which is what the speculative-prefill-only mode relies on. A capacity_only
-    worker registers no KV pages, so it is exempt.
+    Rejected draft tokens free page slots that the next allocating request
+    takes, but the connector only learns of appended pages, so it would keep
+    addressing a slot another request owns. The speculative-prefill-only mode
+    and a capacity-only connector, which registers no KV pages, are exempt.
 
     Args:
         spec_config: The resolved speculative config, or None.
-        use_kv_cache_manager_v2: The tri-state
-            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        use_kv_cache_manager_v2: `kv_cache_config.use_kv_cache_manager_v2`.
         speculative_prefill_only: Whether the connector runs in that mode.
         connector: The constructed connector manager.
 
@@ -445,13 +439,12 @@ def _validate_speculative_connector(spec_config: Optional[SpeculativeConfig],
                                     connector: KvCacheConnectorManager) -> None:
     """Validate the connector against speculative decoding, or shut it down and re-raise.
 
-    The connector's worker and scheduler already exist when these checks run,
-    so a refusal must release them before the error leaves the creator.
+    The connector's worker and scheduler already exist, so a refusal releases
+    them before re-raising.
 
     Args:
         spec_config: The resolved speculative config, or None.
-        use_kv_cache_manager_v2: The tri-state
-            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        use_kv_cache_manager_v2: `kv_cache_config.use_kv_cache_manager_v2`.
         speculative_prefill_only: Whether the connector runs in that mode.
         connector: The constructed connector manager.
 
@@ -477,8 +470,6 @@ def _validate_connector_kv_cache_manager(
         use_kv_cache_manager_v2: bool | str) -> None:
     """Validate the KV cache manager a KV-moving connector needs, or shut it down and re-raise.
 
-    As in `_validate_speculative_connector`, the connector's worker and scheduler
-    already exist, so a refusal releases them before the error leaves the creator.
     A capacity-only connector moves no KV and is not checked.
 
     Args:
@@ -488,8 +479,7 @@ def _validate_connector_kv_cache_manager(
         max_beam_width: The configured beam width.
         enable_sleep: Whether sleep mode is enabled.
         capacity_scheduler_policy: The configured capacity scheduler policy.
-        use_kv_cache_manager_v2: The tri-state
-            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+        use_kv_cache_manager_v2: `kv_cache_config.use_kv_cache_manager_v2`.
 
     Raises:
         ValueError: Attention DP or speculative prefill would fall back to V1.
@@ -1555,8 +1545,8 @@ def _create_py_executor(
                 pp_size=mapping.pp_size,
                 cp_size=mapping.cp_size)
 
-        # The mode follows the classes' declarations. The speculation refusal
-        # runs after construction, because capacity_only is a worker property.
+        # The speculation refusal runs after construction, because
+        # `capacity_only` is a worker property.
         speculative_prefill_only = _connector_runs_speculative_prefill_only(
             spec_config, worker_cls, scheduler_cls, cache_transceiver_config,
             v2_selection)

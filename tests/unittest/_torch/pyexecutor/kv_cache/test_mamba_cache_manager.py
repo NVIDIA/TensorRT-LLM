@@ -6524,7 +6524,7 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     for method in ("prepare_resources", "update_resources"):
         monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
-    # The base skip paths unwind the step's per-request state first; their page bookkeeping is out of scope.
+    # Stub the base skip paths down to undoing the step's per-request state.
     for method in ("revert_allocate_generation", "keep_generation_allocation"):
         monkeypatch.setattr(
             KVCacheManagerV2, method, lambda self, req: self._undo_generation_step(req)
