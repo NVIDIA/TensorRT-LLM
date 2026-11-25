@@ -24,6 +24,8 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from test_common.serve.app_factory import AggConfig
+from test_common.serve.fakes import ScriptedOutput, ScriptedStep
 
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
@@ -148,3 +150,46 @@ def test_stream_reports_prompt_logprobs_in_the_first_chunk_only():
 def test_text_offset_starts_each_token_after_the_previous_one():
     logprobs = create_completion_logprobs([20, 21], _Tokenizer(), [-0.25, -1.5], initial_offset=4)
     assert logprobs.text_offset == [4, 9]
+
+
+def test_the_completion_route_gives_postprocessing_the_prompt_ids(serve_env):
+    # The prompt's ids reach postprocessing only through the handler; without them the echoed
+    # logprobs would have no prompt entries.
+    server = serve_env.build_openai_server(AggConfig())
+    server.generator.script(
+        ScriptedOutput(
+            steps=(
+                ScriptedStep(
+                    text="ok",
+                    token_ids=(7,),
+                    logprobs=({7: Logprob(logprob=-0.25, rank=1)},),
+                    finish_reason="length",
+                ),
+            ),
+            # "hello hi" is ids 6 and 5: entry t scores prompt token t + 1, the last one the
+            # generated token.
+            prompt_logprobs=(
+                {5: Logprob(logprob=-1.0, rank=1)},
+                {7: Logprob(logprob=-0.25, rank=1)},
+            ),
+        )
+    )
+    client = serve_env.client(server.app)
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "fake-model",
+            "prompt": "hello hi",
+            "echo": True,
+            "logprobs": 1,
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert server.generator.generate_calls[0].sampling_params.prompt_logprobs == 1
+    logprobs = response.json()["choices"][0]["logprobs"]
+    assert logprobs["tokens"] == ["hello", "hi", "ok"]
+    assert logprobs["token_logprobs"] == [None, -1.0, -0.25]
+    assert logprobs["text_offset"] == [0, 5, 7]

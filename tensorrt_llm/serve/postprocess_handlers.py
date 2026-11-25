@@ -881,6 +881,7 @@ def create_completion_logprobs(token_ids: List[int],
     token_logprobs = []
     top_logprobs_list = []
     tokens = []
+    # A token's offset is where it starts: the length of the text before it.
     offset = initial_offset
     for token_id, logprob in zip(token_ids, logprobs):
         if isinstance(logprob, dict):
