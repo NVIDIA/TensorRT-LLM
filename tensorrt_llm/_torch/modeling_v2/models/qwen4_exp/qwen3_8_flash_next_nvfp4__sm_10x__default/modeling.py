@@ -679,7 +679,9 @@ from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import (
 )
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import ss_plan as hc_tc_first_ss_plan
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
+from .ops.ssm.gdn_cached_replay_cute__verify import cached_replay_norm_update as gdn_replay_norm
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
+from .ops.ssm.gdn_cached_replay_cute__verify import norm_tpc_ok as gdn_replay_norm_ok
 from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
 
 if TYPE_CHECKING:
@@ -2289,8 +2291,10 @@ _INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
 #: the rows-on-N hc first kernel for a mixer with the injection (`DP_HC_TILES_ENV`, in place of
 #: the 64-row tile; the same K slices in the same order), the lean verify conv
 #: (`DP_GDN_CONV_LEAN_ENV`) and the conv as the input projection's epilogue
-#: (`DP_GDN_INPROJ_CONV_BF16_ENV`): the same kernels at fewer rows. Measured on dep8 at 3
-#: requests a rank with r = 2, as part of a -0.33 ms step. Read once, when the target is built.
+#: (`DP_GDN_INPROJ_CONV_BF16_ENV`) and the norm in the replay (`DP_GDN_REPLAY_NORM_BF16_ENV`, where
+#: the launch mapping gives a CTA whole v heads): the same kernels at fewer rows. Measured on dep8
+#: at 3 requests a rank with r = 2, as part of a -0.33 ms step. Read once, when the target is
+#: built.
 DP_LOWROWS_ENV = "TRTLLM_QWEN4_EXP_DP_LOWROWS"
 #: The most rows the lowered floors reach below their own ranges: 4 requests a rank.
 _DP_LOWROWS_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
@@ -2426,7 +2430,7 @@ class _GdnStep:
     requests it carried. Both trunk targets clear it before they decide; the wrapped promotion,
     the last launch of the step's state update, clears `lean` again."""
 
-    __slots__ = ("lean", "gens", "inconv")
+    __slots__ = ("lean", "gens", "inconv", "rnorm")
 
     def __init__(self) -> None:
         self.clear()
@@ -2437,6 +2441,8 @@ class _GdnStep:
         # `DP_GDN_INPROJ_CONV_BF16_ENV`: the step's GDN input projections run the lean conv as
         # their epilogue.
         self.inconv = False
+        # `DP_GDN_REPLAY_NORM_BF16_ENV`: the step's replays write the gated norm's output.
+        self.rnorm = False
 
 
 def _gdn_lean_now(core) -> bool:
@@ -2450,6 +2456,13 @@ def _gdn_inconv_now(core) -> bool:
     (`DP_GDN_INPROJ_CONV_BF16_ENV`)."""
     step = getattr(core, "_gdn_step", None)
     return step is not None and step.lean and step.inconv
+
+
+def _gdn_rnorm_now(core) -> bool:
+    """Whether the trunk step in flight runs the gated norm in its replays
+    (`DP_GDN_REPLAY_NORM_BF16_ENV`)."""
+    step = getattr(core, "_gdn_step", None)
+    return step is not None and step.lean and step.rnorm
 
 
 def _gdn_step_clear(core) -> None:
@@ -2593,7 +2606,7 @@ def _gdn_lean_selfcheck(core, conv_w, c: int, t: int, history: int, stride: int,
     return " and ".join(bad)
 
 
-def _gdn_lean_bind(core, cm) -> None:
+def _gdn_lean_bind(core, cm, max_requests: int) -> None:
     """Settle `DP_GDN_CONV_LEAN_ENV` against one bound cache manager (behind `_bound`): the
     manager's state must be the stock `GDNReplayState` laid out as `_gdn_lean_state` checks; then
     `xsave` (`[GDN layers, max_batch, T, conv_dim]` bf16) is allocated, both kernels and the PDL
@@ -2606,6 +2619,7 @@ def _gdn_lean_bind(core, cm) -> None:
     core._gdn_lean_state_ref = None
     core._gdn_xsave, core._gdn_xsave_all = {}, None
     core._gdn_inconv = {}
+    core._gdn_rnorm = frozenset()
     core._gdn_step.clear()
     state, why = _gdn_lean_state(core, cm)
     layers = list(core.gdn_layers)
@@ -2645,8 +2659,9 @@ def _gdn_lean_bind(core, cm) -> None:
         _gdn_lean_wrap(core, state)
     core._gdn_lean_state_ref = state
     core._gdn_lean_on = True
-    # `DP_GDN_INPROJ_CONV_BF16_ENV`, on top.
+    # `DP_GDN_INPROJ_CONV_BF16_ENV` and `DP_GDN_REPLAY_NORM_BF16_ENV`, on top.
     _gdn_inconv_bind(core, cm, state)
+    _gdn_rnorm_bind(core, cm, max_requests)
     logger.info(
         f"DP GDN conv lean bound ({DP_GDN_CONV_LEAN_ENV}): rank {core.dp_rank} of {core.dp_size}, "
         f"{type(cm).__name__}, verify steps of {_dp_lowrows_floor(_GDN_LEAN_ROWS[0])}.."
@@ -2706,6 +2721,11 @@ def _gdn_lean_step(core, num_gens: int, rows: int, p: int) -> None:
         _gdn_lean_seen(
             core, "conv lean", rows, "rows (gdn_conv_lean, gdn_promote_x, PDL gated norm)"
         )
+        if num_gens in getattr(core, "_gdn_rnorm", ()):
+            step.rnorm = True
+            _gdn_lean_seen(
+                core, "replay norm bf16", num_gens, "requests (the gated norm in the replay)"
+            )
         if rows in getattr(core, "_gdn_inconv", {}):
             step.inconv = True
             _gdn_lean_seen(
@@ -2714,6 +2734,117 @@ def _gdn_lean_step(core, num_gens: int, rows: int, p: int) -> None:
                 rows,
                 "rows (the lean conv in the input projection's GEMM)",
             )
+
+
+#: Switch, on by default, riding on `DP_GDN_CONV_LEAN_ENV`: the CuTe replay of a lean verify step
+#: of `_GDN_REPLAY_NORM_REQUESTS` requests a rank writes the gated RMS norm of its output itself
+#: (the verify op's norm mode, `cached_replay_norm_update`: the instructions of the registered
+#: norm's 4-row kernel on the bf16-rounded replay output, stored right after their bf16
+#: rounding), so the gated norm launch leaves the chain (36 a step) and the output projection
+#: becomes the replay's PDL dependent. The tensor is the norm launch's bit for bit, and state,
+#: history and commits are the replay's. It engages at request counts whose launch mapping gives
+#: a CTA whole v heads (tpc 8 or 24: every count of `DP_GDN_REPLAY_MAP_ENV`'s table, and 16) and
+#: an even number of rows a request. Values: unset or `1` -- `_GDN_REPLAY_NORM_REQUESTS`;
+#: `<lo>:<hi>` -- that request range, taken as written (inside it; with `DP_LOWROWS_ENV` = r its
+#: floor reaches r, so 873205's `2:64` reads as it did there); `0` -- the norm launch.
+#: `DP_LOWROWS_ENV` lowers the floor of the default range (counts whose mapping splits a v head
+#: still keep the launch). With the in-proj
+#: release and its conv epilogue, part of the -0.47..-0.49 ms dep4 trunk-loop micro; dep8 left
+#: 8-CTX share 68.3 -> 70.6% with the bf16 output projections. Read once, at each bind.
+DP_GDN_REPLAY_NORM_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_REPLAY_NORM_BF16"
+#: Requests a rank the switch above serves (the front's `5:64`).
+_GDN_REPLAY_NORM_REQUESTS = (5, 64)  # capacity: fixed: dispatch thresholds
+
+
+def _gdn_replay_norm_range() -> tuple | None:
+    """`DP_GDN_REPLAY_NORM_BF16_ENV`'s request range, or None (off); any other spelling raises.
+    A named range may start at `DP_LOWROWS_ENV`'s request count (the measured run's `2:64`)."""
+    raw = os.environ.get(DP_GDN_REPLAY_NORM_BF16_ENV, "")
+    value = raw.strip().lower()
+    lo, hi = _GDN_REPLAY_NORM_REQUESTS
+    if not value or value in _SWITCH_ON:
+        return lo, hi
+    if value in _SWITCH_OFF:
+        return None
+    lo = min(lo, _dp_lowrows() or lo)
+    a, sep, b = value.partition(":")
+    if sep and a.isdigit() and b.isdigit() and lo <= int(a) <= int(b) <= hi:
+        return int(a), int(b)
+    raise ValueError(
+        f"{DP_GDN_REPLAY_NORM_BF16_ENV}={raw!r}: expected 1 / 0 or <lo>:<hi> inside {lo}:{hi}"
+    )
+
+
+def _gdn_rnorm_bind(core, cm, max_requests: int) -> None:
+    """`DP_GDN_REPLAY_NORM_BF16_ENV` against a manager the lean conv engaged for (called at the
+    end of `_gdn_lean_bind`): `core._gdn_rnorm`, the request counts whose lean steps take the
+    norm mode, after compiling their kernels. Empty where it cannot take effect (one warning when
+    it was set, or when a set range keeps the launch at some counts)."""
+    core._gdn_rnorm = frozenset()
+    rng = _gdn_replay_norm_range()
+    if rng is None:
+        return
+    explicit = bool(os.environ.get(DP_GDN_REPLAY_NORM_BF16_ENV, "").strip())
+    # `DP_LOWROWS_ENV` lowers the default range's floor; a named range is served as written.
+    named = ":" in os.environ.get(DP_GDN_REPLAY_NORM_BF16_ENV, "")
+    xsave = core._gdn_xsave_all
+    p = xsave.shape[2]
+    bad = ""
+    if p % 2:
+        bad = f"{p} rows a request: the norm mode splits an even count over two lane halves"
+    elif core.value_dim % 8 or sum(core.in_proj_split) % 8 or core.head_v_dim != 128:
+        bad = "the input projection's z columns are not 16-byte aligned 128-wide heads"
+    elif any(core._decode._layers[i].gnorm.data_ptr() % 16 for i in core.gdn_layers):
+        bad = "a gated-norm weight is not 16-byte aligned"
+    lo = rng[0] if named else min(rng[0], _dp_lowrows() or rng[0])
+    hi = min(rng[1], max_requests, xsave.shape[1])
+    lean_lo = _dp_lowrows_floor(_GDN_LEAN_ROWS[0])
+    took, left = [], []
+    if not bad:
+        for n in range(lo, hi + 1):
+            if not lean_lo <= n * p <= _GDN_LEAN_ROWS[1]:
+                continue
+            commit = n < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+            config = _gdn_replay_map(n) if core.gdn_replay_map else None
+            (took if gdn_replay_norm_ok(n, p, commit, config) else left).append(n)
+        if not took:
+            bad = f"no request count in {lo}..{hi} launches the replay with whole v heads a CTA"
+    if not bad:
+        mm = core._bound.cm
+        try:
+            gdn_replay_precompile(
+                p,
+                core.num_k_heads,
+                core.num_v_heads,
+                0,
+                pdl=_GDN_REPLAY_PDL,
+                partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+                work_item_width=core._gdn_wi_width,
+                separate_replay_slots=_has_replay_slots(mm),
+                configs={n: _gdn_replay_map(n) for n in took} if core.gdn_replay_map else None,
+                norm_counts=tuple(took),
+            )
+        except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+            bad = f"the norm kernels raised {type(e).__name__}: {e}"
+    if bad:
+        if explicit or bad.startswith("the norm kernels"):
+            logger.warning(
+                f"{DP_GDN_REPLAY_NORM_BF16_ENV} is set but not engaged for {type(cm).__name__} at "
+                f"rank {core.dp_rank}: {bad}; every lean step keeps the gated norm launch"
+            )
+        return
+    if left and explicit:
+        logger.warning(
+            f"{DP_GDN_REPLAY_NORM_BF16_ENV}: at {left} requests the launch mapping splits a v head "
+            "over CTAs; those lean steps keep the gated norm launch"
+        )
+    core._gdn_rnorm = frozenset(took)
+    logger.info(
+        f"DP GDN replay norm bf16 ({DP_GDN_REPLAY_NORM_BF16_ENV}): rank {core.dp_rank} of "
+        f"{core.dp_size}, the gated norm in the replay at {min(took)}..{max(took)} requests"
+        + (f" ({len(left)} counts keep the launch: {left})" if left else "")
+        + f" (bind {core._binds})"
+    )
 
 
 #: Switch, on by default, riding on `DP_GDN_CONV_LEAN_ENV` and `DP_INPROJ_RELEASE_ENV`: a lean
@@ -4422,6 +4553,8 @@ def _decode_forms(core) -> str:
             "gdn conv lean": getattr(core, "_gdn_lean_want", False),
             "gdn inproj conv": _switch(DP_GDN_INPROJ_CONV_BF16_ENV, default=True)
             and getattr(core, "_gdn_lean_want", False),
+            "gdn replay norm": _gdn_replay_norm_range() is not None
+            and getattr(core, "_gdn_lean_want", False),
             "out-proj gdn rows": rows(out["gdn_out"] if out else None),
             "out-proj attn rows": rows(out["attn_o"] if out else None),
             "out-proj inject rows": rows(getattr(getattr(core, "_siteb", None), "gemm", None)),
@@ -4878,8 +5011,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._gdn_lean_state_ref = None
         self._gdn_xsave, self._gdn_xsave_all = {}, None
         self._gdn_step = _GdnStep()
-        # `DP_GDN_INPROJ_CONV_BF16_ENV`: `{rows: _InProj}` of each bind.
+        # `DP_GDN_INPROJ_CONV_BF16_ENV`: `{rows: _InProj}` of each bind;
+        # `DP_GDN_REPLAY_NORM_BF16_ENV`: the request counts of each bind.
         self._gdn_inconv = {}
+        self._gdn_rnorm = frozenset()
+        self._gdn_wi_width = 4
         # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
         self._out_proj = None
         # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
@@ -5572,6 +5708,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                     f"GDN replay launch map ({DP_GDN_REPLAY_MAP_ENV}): rank {self.dp_rank} of "
                     f"{self.dp_size}, mapped at {sorted(maps)} requests"
                 )
+            self._gdn_wi_width = mm.replay_work_items.shape[1]
             gdn_replay_precompile(
                 self.max_verify_rows,
                 self.num_k_heads,
@@ -5622,7 +5759,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             bound = bound._replace(**self._bind_step_buffers(cm, g, mm, rank_pools))
         self._bound = bound
         # `DP_GDN_CONV_LEAN_ENV`: nothing unless the build wished it.
-        _gdn_lean_bind(self, cm)
+        _gdn_lean_bind(self, cm, md.max_num_requests)
 
     def _bind_step_buffers(self, cm, g: _pool.PoolGeometry, mm, pools: _pool.RankPools) -> dict:
         """The verify step's runtime-owned buffers of one manager: every verify row's conv
@@ -6284,7 +6421,7 @@ def _tep_conv_wait(core, rows: int) -> bool:
 
 
 def _gdn_verify(
-    core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None, conv_wait=False
+    core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None, conv_wait=False, z=None
 ) -> torch.Tensor:
     """The recurrent half of a verify step: `n` generation sequences of `p` rows, written so
     that the accepted prefix, unknown until the sampler has run, can be kept.
@@ -6303,7 +6440,11 @@ def _gdn_verify(
     `mq_out` is the conv output when the input projection's GEMV ran the conv step as its
     epilogue (`fp8_gemv_conv1d_verify`, `nvfp4_split_gemv_conv1d_verify`; `mq` is then None).
     `conv_wait`: the conv is launched as a programmatic dependent of the kernel that wrote `mq`
-    (`_TEP_CONV_WAIT_ROWS`), with its x rows hoisted; the caller decides."""
+    (`_TEP_CONV_WAIT_ROWS`), with its x rows hoisted; the caller decides.
+
+    `z` (the gate columns): on a step whose replays write the gated norm
+    (`DP_GDN_REPLAY_NORM_BF16_ENV`, `_gdn_rnorm_now`) the result is the gated norm's output,
+    which `_gdn_epilogue` then takes as it is."""
     int_idx, work_items, n_writes, all_layer, replay_indices = verify
     pools = core._bound.pools
     replay = core._bound.replay
@@ -6380,7 +6521,16 @@ def _gdn_verify(
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
     old_x, old_B, old_dt, old_dA = replay.old[i]
     extra = {}
-    if cute:
+    if cute and z is not None and _gdn_rnorm_now(core):
+        # `DP_GDN_REPLAY_NORM_BF16_ENV`: the same launch in the norm mode; it writes the gated
+        # norm's bf16 output.
+        replay_op = functools.partial(
+            gdn_replay_norm,
+            norm=(torch.reshape(z, [n * p, core.num_v_heads, core.head_v_dim]), L.gnorm, core.eps),
+        )
+        if core.gdn_replay_map:
+            extra["config"] = _gdn_replay_map(n)
+    elif cute:
         replay_op = gdn_cached_replay_cute
         if core.gdn_replay_map:
             # `DP_GDN_REPLAY_MAP_ENV`: the measured launch mapping, None for the kernel's own.
@@ -12155,9 +12305,9 @@ class DecodeTarget:
             )
             z, a, b = torch.split(proj, core.in_proj_split, 1)[1:]
             out = _gdn_verify(
-                core, None, a, b, i, L, si_all, num_tokens // gen_p, gen_p, verify, mq_out
+                core, None, a, b, i, L, si_all, num_tokens // gen_p, gen_p, verify, mq_out, z=z
             )
-            return self._gdn_epilogue(out, z, L, num_tokens)
+            return self._gdn_epilogue(out, z, L, num_tokens, _gdn_rnorm_now(core))
         elif q_in is not None:
             proj = _inproj_mm(x, q_in)
         else:
@@ -12186,8 +12336,9 @@ class DecodeTarget:
                 gen_p,
                 verify,
                 conv_wait=_tep_conv_wait(core, num_tokens),
+                z=z,
             )
-            return self._gdn_epilogue(out, z, L, num_tokens)
+            return self._gdn_epilogue(out, z, L, num_tokens, _gdn_rnorm_now(core))
         if not (nv_conv or fp8_conv):
             mixed_qkv = torch.split(proj, core.in_proj_split, 1)[0]
             causal_conv1d_update(
@@ -12244,10 +12395,24 @@ class DecodeTarget:
             )
         )
 
-    def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
+    def _gdn_epilogue(self, out, z, L, num_tokens, normed=False) -> torch.Tensor:
         """A verify step's gated RMS norm (sigmoid gate, plain non-gemma weight) and the
-        output projection, whose per-rank partial is summed over the TP group."""
+        output projection, whose per-rank partial is summed over the TP group. `normed`: the
+        replay already wrote the gated norm's output (`DP_GDN_REPLAY_NORM_BF16_ENV`)."""
         core = self.core
+        if normed:
+            o = torch.reshape(out, [num_tokens, core.value_dim])
+            return core.tp_sum(
+                _out_proj(
+                    core,
+                    o,
+                    L.out,
+                    "gdn_out",
+                    lambda: _dense_mm(
+                        o, L.out, L.out8, core.decode_mm, "out", L.out_g, mid=L.out_m
+                    ),
+                )
+            )
         o = rms_norm_gated_token_major(
             torch.reshape(out, [-1, core.head_v_dim]),
             torch.reshape(z, [num_tokens, core.num_v_heads, core.head_v_dim]),

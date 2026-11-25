@@ -230,10 +230,10 @@ def test_bind_without_the_wish_touches_nothing(want, expected):
         core.gdn_layers = [0]
         core._bound = SimpleNamespace(replay=None, int_conv=None, int_idx=None)
         core.dp_rank = 0
-        M._gdn_lean_bind(core, SimpleNamespace(_speculative_state=None))
+        M._gdn_lean_bind(core, SimpleNamespace(_speculative_state=None), 64)
         assert core._gdn_lean_on is False and core._gdn_xsave_all is None
     else:
-        M._gdn_lean_bind(core, None)
+        M._gdn_lean_bind(core, None, 64)
         assert not hasattr(core, "_gdn_lean_on")
 
 
@@ -317,7 +317,9 @@ def _block_self(inconv):
     )
     seen = {}
     target = SimpleNamespace(core=core)
-    target._gdn_epilogue = lambda out, z, L, rows: seen.setdefault("epilogue", (out, z.shape))
+    target._gdn_epilogue = lambda out, z, L, rows, normed=False: seen.setdefault(
+        "epilogue", (out, z.shape, normed)
+    )
     return target, seen
 
 
@@ -337,7 +339,10 @@ def test_block_runs_the_conv_gemm_behind_a_releasing_site(monkeypatch, inconv):
         M, "_inproj_mm", lambda x, ent: calls.append(("gemm",)) or torch.zeros(20, 66)
     )
     monkeypatch.setattr(
-        M, "_gdn_verify", lambda core, mq, *a, **kw: calls.append(("verify", mq is None)) or "out"
+        M,
+        "_gdn_verify",
+        lambda core, mq, *a, **kw: calls.append(("verify", mq is None, kw.get("z") is not None))
+        or "out",
     )
     x = torch.zeros(20, 8)
     L = SimpleNamespace(in_proj_nv=None, in_proj_g=None, conv_w="taps3")
@@ -346,10 +351,177 @@ def test_block_runs_the_conv_gemm_behind_a_releasing_site(monkeypatch, inconv):
         target, x, 3, L, slots, ("rows", None, None, False, None), 4, True, q_in
     )
     if inconv:
-        assert calls == [("conv", "w3", "plan", "pool3", "rows", "xsave3", 4, 32), ("verify", True)]
+        assert calls == [
+            ("conv", "w3", "plan", "pool3", "rows", "xsave3", 4, 32),
+            ("verify", True, True),
+        ]
     else:
-        assert calls == [("gemm",), ("verify", False)]
+        assert calls == [("gemm",), ("verify", False, True)]
     assert seen["epilogue"][0] == "out"
+
+
+# --- DP_GDN_REPLAY_NORM_BF16: the gated norm in the replay -----------------------------------------
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env, lowrows, expected",
+    [
+        (None, None, (5, 64)),
+        ("1", None, (5, 64)),
+        ("0", None, None),
+        ("2:64", None, "raise"),
+        # 873205's spelling: with `DP_LOWROWS=2` a named range may start at 2 requests.
+        ("2:64", "2", (2, 64)),
+        ("1:64", "2", "raise"),
+        ("5:32", None, (5, 32)),
+        ("x", None, "raise"),
+    ],
+)
+def test_replay_norm_range(monkeypatch, env, lowrows, expected):
+    if env is None:
+        monkeypatch.delenv(M.DP_GDN_REPLAY_NORM_BF16_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_GDN_REPLAY_NORM_BF16_ENV, env)
+    if lowrows is None:
+        monkeypatch.delenv(M.DP_LOWROWS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_LOWROWS_ENV, lowrows)
+    if expected == "raise":
+        with pytest.raises(ValueError, match="expected 1 / 0"):
+            M._gdn_replay_norm_range()
+    else:
+        assert M._gdn_replay_norm_range() == expected
+
+
+def _rnorm_core(max_batch=64):
+    core = _lean_core(max_batch=max_batch)
+    layer = SimpleNamespace(gnorm=torch.zeros(128, dtype=torch.bfloat16))
+    core.__dict__.update(
+        gdn_layers=[0, 1],
+        _decode=SimpleNamespace(_layers={0: layer, 1: layer}),
+        value_dim=6144,
+        in_proj_split=[10240, 6144, 48, 48],
+        head_v_dim=128,
+        num_k_heads=16,
+        num_v_heads=48,
+        gdn_replay_map=True,
+        _bound=SimpleNamespace(cm="manager"),
+        _gdn_wi_width=5,
+        dp_size=8,
+        _binds=1,
+    )
+    return core
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lowrows, expected", [(None, (5, 48)), ("2", (5, 48))])
+def test_replay_norm_bind_takes_the_counts_with_whole_heads(monkeypatch, lowrows, expected):
+    """The bind keeps the request counts whose mapping gives a CTA whole v heads (the stand-in
+    rule: 5..48, the replay map's), inside the lean rows and the bound batch, and compiles their
+    norm kernels; `DP_LOWROWS_ENV` lowers the floor, but 2..4 requests split a v head."""
+    monkeypatch.delenv(M.DP_GDN_REPLAY_NORM_BF16_ENV, raising=False)
+    if lowrows is None:
+        monkeypatch.delenv(M.DP_LOWROWS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_LOWROWS_ENV, lowrows)
+    monkeypatch.setattr(M, "CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE", 16)
+    monkeypatch.setattr(M, "gdn_replay_norm_ok", lambda n, p, commit, config: 5 <= n <= 48)
+    monkeypatch.setattr(M, "_has_replay_slots", lambda cm: True)
+    compiled = {}
+    monkeypatch.setattr(M, "gdn_replay_precompile", lambda *a, **kw: compiled.update(kw))
+    core = _rnorm_core(max_batch=60)
+    M._gdn_rnorm_bind(core, SimpleNamespace(), 60)
+    assert (min(core._gdn_rnorm), max(core._gdn_rnorm)) == expected
+    assert compiled["norm_counts"] == tuple(sorted(core._gdn_rnorm))
+    assert compiled["work_item_width"] == 5 and compiled["separate_replay_slots"] is True
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("env, expected", [("8:40", (8, 40)), ("2:40", (5, 40)), ("1", (5, 48))])
+def test_replay_norm_bind_serves_a_named_range_as_written(monkeypatch, env, expected):
+    """With `DP_LOWROWS=2` the default range's floor drops to 2 requests, but a named range is
+    served as written: `8:40` does not reach 2..7 (the counts below 5 split a v head here)."""
+    monkeypatch.setenv(M.DP_GDN_REPLAY_NORM_BF16_ENV, env)
+    monkeypatch.setenv(M.DP_LOWROWS_ENV, "2")
+    monkeypatch.setattr(M, "CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE", 16)
+    monkeypatch.setattr(M, "gdn_replay_norm_ok", lambda n, p, commit, config: 5 <= n <= 48)
+    monkeypatch.setattr(M, "_has_replay_slots", lambda cm: True)
+    monkeypatch.setattr(M, "gdn_replay_precompile", lambda *a, **kw: None)
+    core = _rnorm_core(max_batch=60)
+    M._gdn_rnorm_bind(core, SimpleNamespace(), 60)
+    assert (min(core._gdn_rnorm), max(core._gdn_rnorm)) == expected
+
+
+@pytest.mark.cpu_only
+def test_replay_norm_off_compiles_nothing(monkeypatch):
+    monkeypatch.setenv(M.DP_GDN_REPLAY_NORM_BF16_ENV, "0")
+    monkeypatch.setattr(M, "gdn_replay_precompile", lambda *a, **kw: pytest.fail("compiled"))
+    core = _rnorm_core()
+    M._gdn_rnorm_bind(core, SimpleNamespace(), 64)
+    assert core._gdn_rnorm == frozenset()
+
+
+@pytest.mark.cpu_only
+def test_step_takes_the_norm_at_its_counts(monkeypatch):
+    monkeypatch.delenv(M.DP_LOWROWS_ENV, raising=False)
+    monkeypatch.setattr(M, "_gdn_lean_seen", lambda *a: None)
+    core = _lean_core(max_batch=64)
+    core._gdn_rnorm = frozenset({5, 6})
+    M._gdn_lean_step(core, 6, 24, 4)
+    assert M._gdn_rnorm_now(core)
+    M._gdn_step_clear(core)
+    M._gdn_lean_step(core, 7, 28, 4)
+    assert core._gdn_step.lean and not M._gdn_rnorm_now(core)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rnorm", [True, False])
+def test_verify_launches_the_norm_mode_with_z(monkeypatch, rnorm):
+    seen = []
+    monkeypatch.setattr(M, "_GDN_REPLAY_PDL", True)
+    monkeypatch.setattr(M, "gdn_conv_lean", lambda mq, *a, **kw: torch.zeros(mq.shape[0], 48))
+
+    def replay(name):
+        def run(**kw):
+            seen.append((name, kw.get("norm")))
+            return torch.zeros(kw["q"].shape[0] * kw["q"].shape[1] * 16)
+
+        return run
+
+    monkeypatch.setattr(M, "gdn_cached_replay_cute", replay("plain"))
+    monkeypatch.setattr(M, "gdn_replay_norm", replay("norm"))
+    core, mq, a, n, p = _verify_core(True)
+    core._gdn_step.rnorm = rnorm
+    core.eps = 1e-6
+    L = SimpleNamespace(conv_w="taps", a_log=None, dt_bias=None, gnorm="gnorm")
+    z = torch.zeros(n * p, 16)
+    M._gdn_verify(core, mq, a, a, 0, L, "slots", n, p, ("rows", None, None, False, None), z=z)
+    if rnorm:
+        assert seen[0][0] == "norm" and seen[0][1][1:] == ("gnorm", 1e-6)
+        assert tuple(seen[0][1][0].shape) == (n * p, 1, 16)
+    else:
+        assert seen == [("plain", None)]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("normed", [True, False])
+def test_epilogue_takes_a_normed_output_as_it_is(monkeypatch, normed):
+    norms = []
+    monkeypatch.setattr(
+        M, "rms_norm_gated_token_major", lambda x, z, **kw: norms.append(1) or torch.ones_like(x)
+    )
+    monkeypatch.setattr(M, "_out_proj", lambda core, o, w, site, dense: o)
+    core = SimpleNamespace(
+        head_v_dim=16, num_v_heads=1, value_dim=16, eps=1e-6, tp_sum=lambda x: x, _gdn_step=None
+    )
+    target = SimpleNamespace(core=core)
+    out = torch.full((1, 8, 1, 16), 3.0)
+    got = M.DecodeTarget._gdn_epilogue(
+        target, out, torch.zeros(8, 16), SimpleNamespace(gnorm=None, out=None), 8, normed
+    )
+    assert (norms == []) is normed
+    assert torch.equal(got, torch.full((8, 16), 3.0 if normed else 1.0))
 
 
 class _ReplayState:
