@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <memory>
 #include <numaif.h>
 #include <sys/mman.h>
 
@@ -423,13 +424,15 @@ void HostAccessibleDeviceAllocator::mapDeviceMemory(void* devPtr, size_t size)
         TLLM_THROW("GDR map failed for %p (%zu bytes)", devPtr, size);
     }
     // The descriptor owns no device memory, so free() would release only the host mapping, never the range.
-    auto* memDesc = new gdrcopy::GdrMemDesc{nullptr, map, 0, size, mh};
-    recordAllocation(devPtr, size, map, memDesc);
+    auto memDesc = std::make_unique<gdrcopy::GdrMemDesc>(gdrcopy::GdrMemDesc{nullptr, map, 0, size, mh});
+    recordAllocation(devPtr, size, map, memDesc.get());
+    // The allocation maps hold the descriptor until unmapDeviceMemory takes it back.
+    memDesc.release();
 }
 
 void HostAccessibleDeviceAllocator::unmapDeviceMemory(void* devPtr) noexcept
 {
-    gdrcopy::GdrMemDesc* memDesc = nullptr;
+    std::unique_ptr<gdrcopy::GdrMemDesc> memDesc;
     {
         std::unique_lock<std::shared_mutex> lock(mAllocationsMutex);
         auto it = mDeviceAllocations.find(devPtr);
@@ -439,7 +442,7 @@ void HostAccessibleDeviceAllocator::unmapDeviceMemory(void* devPtr) noexcept
             TLLM_LOG_ERROR("%p is not device memory that mapDeviceMemory mapped", devPtr);
             return;
         }
-        memDesc = it->second.memDesc;
+        memDesc.reset(it->second.memDesc);
         mHostAllocations.erase(it->second.hostPtr);
         mDeviceAllocations.erase(it);
     }
@@ -451,7 +454,6 @@ void HostAccessibleDeviceAllocator::unmapDeviceMemory(void* devPtr) noexcept
     {
         TLLM_LOG_ERROR("Unpinning device memory at %p failed", devPtr);
     }
-    delete memDesc;
 }
 
 char const* HostAccessibleDeviceAllocator::nativeMemoryLabel(bool gdr) const
