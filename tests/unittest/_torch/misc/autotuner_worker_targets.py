@@ -30,6 +30,13 @@ class RecordingRunner(TunableRunner):
         return inputs[0] * 2
 
 
+class SharedKernelRunner(RecordingRunner):
+    """A RecordingRunner each of whose tactics compiles one kernel for every profile."""
+
+    def build_key(self, inputs, profile, tactic, **kwargs):
+        return (self.directory, tactic)
+
+
 class FromShapesRunner(RecordingRunner):
     """A RecordingRunner whose build needs only its inputs' shapes; it records the device and the
     columns of the input it built on."""

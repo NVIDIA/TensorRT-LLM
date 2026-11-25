@@ -712,6 +712,34 @@ def test_grouped_gemm_runners_build_from_shapes_the_kernels_they_run(monkeypatch
     fc2_meta = fc2_inputs(c.view(torch.float4_e2m1fn_x2), c_sf, output)
     fc2.build([meta(t) for t in fc2_meta])
     assert kernels() == [1, 1]
+    # Tune mode builds once per build key: it names the kernel a runner compiled, for any
+    # rank's experts, and another kernel where the weights stop loading evict-first.
+    other_rank = dict(runner_args, local_expert_offset=num_experts)
+    many_tokens = torch.empty(
+        4 * num_tokens, hidden_size // 2, dtype=torch.uint8, device="meta"
+    ).view(torch.float4_e2m1fn_x2)
+    many_rows = torch.empty(4 * num_tokens, hidden_size, dtype=torch.bfloat16, device="meta")
+    for runner, other, built_on, more_tokens in (
+        (
+            fc1,
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(**other_rank),
+            fc1_inputs,
+            [many_tokens, *fc1_inputs[1:]],
+        ),
+        (
+            fc2,
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                output_dtype=torch.bfloat16, **other_rank
+            ),
+            fc2_meta,
+            [*fc2_meta[:5], many_rows, *fc2_meta[6:]],
+        ),
+    ):
+        key = runner.build_key(built_on, None, None)
+        assert [key[1]] == list(type(runner).kernel_cache)
+        assert other.unique_id() != runner.unique_id()
+        assert other.build_key(built_on, None, None) == key
+        assert runner.build_key(more_tokens, None, None) != key
     built_from_shapes = run()
     assert kernels() == [1, 1]
 

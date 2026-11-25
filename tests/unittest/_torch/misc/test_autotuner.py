@@ -3440,14 +3440,16 @@ def test_tuning_in_a_build_pass_shares_through_the_pool_store_not_a_refused_dir(
     assert not (tmp_path / "refused").exists()
 
 
+@pytest.mark.parametrize("shared_kernel", [False, True],
+                         ids=["kernel_per_profile", "kernel_of_all_profiles"])
 @pytest.mark.parametrize("workers_on", [False, True])
-def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
-                                                    tune_mode_workers,
-                                                    workers_on):
-    """With several tactics under INDEPENDENT tuning, a build pass runs each
-    (profile, runner, tactic) this process claims once, before profiling, and
-    leaves the items other processes claimed to them; profiling then times
-    every pair. A runner that cannot go to the worker processes (a local class)
+def test_build_across_ranks_runs_only_claimed_builds(monkeypatch, tmp_path,
+                                                     tune_mode_workers,
+                                                     workers_on, shared_kernel):
+    """With several tactics under INDEPENDENT tuning, a build pass runs each distinct build
+    (``TunableRunner.build_key``) this process claims once, before profiling, on the first
+    profile that needs it, and leaves the builds other processes claimed to them; profiling
+    then times every pair. A runner that cannot go to the worker processes (a local class)
     takes the same pass with them on."""
     tune_mode_workers.enabled = workers_on
     ran: List[tuple] = []
@@ -3462,6 +3464,11 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
                               profile: OptimizationProfile,
                               **kwargs) -> List[int]:
             return [0, 1]
+
+        def build_key(self, inputs, profile, tactic, **kwargs):
+            if shared_kernel:
+                return ("kernel", tactic)
+            return super().build_key(inputs, profile, tactic, **kwargs)
 
         def forward(self,
                     /,
@@ -3480,10 +3487,14 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
     monkeypatch.setattr(jit_share, "enabled", lambda: True)
     monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
-    real_claim = jit_share.SharedSweep.claim
-    # Other processes hold the odd items.
-    monkeypatch.setattr(jit_share.SharedSweep, "claim",
-                        lambda self, k: k % 2 == 0 and real_claim(self, k))
+    op = "autotuner_test::build_across_ranks"
+    runner = TwoTacticRunner()
+    # Other processes hold the builds of tactic 1.
+    for m in (2, 4):
+        profile = OptimizationProfile([[StaticDim(m), StaticDim(64)]])
+        [claim] = autotuner._tune_build_claims(
+            [repr((op, runner.build_key(None, profile, 1)))])
+        open(claim.claim, "w").close()
     tuner = AutoTuner.get()
     tuner.clear_cache()
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
@@ -3491,12 +3502,75 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
                           build_strategy=BuildStrategy.SHARED,
                           use_build_pool_in_warmup=workers_on)
     with tune_mode_workers.pass_scope(), autotune():
-        tuner.choose_one("autotuner_test::build_across_ranks",
-                         [TwoTacticRunner()], config,
+        tuner.choose_one(op, [runner], config,
                          [torch.zeros(4, 64, device="cuda")])
-    # Items: (2, 0), (2, 1), (4, 0), (4, 1); this process holds 0 and 2.
-    assert ran == [(2, 0), (4, 0)], ran
+    # Profiles M = 2, 4: tactic 0's builds run here, on M = 2 alone when the profiles share
+    # its kernel.
+    assert ran == ([(2, 0)] if shared_kernel else [(2, 0), (4, 0)]), ran
     assert sorted(timed) == [(2, 0), (2, 1), (4, 0), (4, 1)], timed
+
+
+def test_build_across_ranks_splits_the_builds_of_profiles_ranks_share(
+        monkeypatch, tmp_path):
+    """Ranks that tune different profiles (attention DP) split the builds of the profiles they
+    share: a rank leaves a build another rank claimed to it, whatever profiles that rank
+    tunes."""
+    ran: List[tuple] = []
+
+    class TwoTacticRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0, 1]
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            ran.append((inputs[0].shape[0], tactic))
+            return inputs[0]
+
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    runner = TwoTacticRunner()
+    # One rank tunes M = 2, 4, the next M = 4, 8 (each also tunes its input's rows).
+    for buckets in ((2, 4), (4, 8)):
+        x = torch.zeros(buckets[-1], 64, device="cuda")
+        config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, buckets), ),
+                              build_strategy=BuildStrategy.SHARED)
+        tuner._build_across_ranks("autotuner_test::ranks_share_profiles",
+                                  [runner],
+                                  tuner._optimization_profiles(config, [x]),
+                                  [x], config, lambda p: True)
+    assert ran == [(2, 0), (2, 1), (4, 0), (4, 1), (8, 0), (8, 1)], ran
+
+
+def test_cached_kernel_build_key_names_the_class_that_holds_the_cache():
+    """A runner's ``cached_kernel_build_key`` names the class whose ``kernel_cache`` it uses:
+    a subclass that keeps its kernels in its parent's cache builds the parent's kernels, one
+    with a cache of its own builds its own."""
+
+    class Base(TunableRunner):
+        kernel_cache = {}
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [0]
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            return inputs[0]
+
+    class SameCache(Base):
+        pass
+
+    class OwnCache(Base):
+        kernel_cache = {}
+
+    base, same, own = (cls().cached_kernel_build_key("key")
+                       for cls in (Base, SameCache, OwnCache))
+    assert base == same != own
+    assert own[1] == "key"
 
 
 def test_jit_share_salt_ignores_file_times(tmp_path):
@@ -3828,6 +3902,40 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
         assert tune_mode_workers._pool is None
     else:
         assert built == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_tune_mode_builds_each_kernel_once_and_leaves_claimed_ones_to_their_ranks(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """With shared JIT builds, tune mode has the rank's workers build each distinct build once
+    (a ``SharedKernelRunner``'s tactics compile one kernel for every profile), on the first
+    profile that needs it; a build another rank claimed takes no worker here."""
+    import autotuner_worker_targets as targets
+
+    builds = tmp_path / "builds"
+    builds.mkdir()
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "share"))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.SharedKernelRunner(str(builds))
+    op = "test::builds_each_kernel_once"
+    [theirs] = autotuner._tune_build_claims(
+        [repr((op, runner.build_key(None, None, 1)))])
+    open(theirs.claim, "w").close()
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        build_strategy=BuildStrategy.SHARED,
+        use_build_pool_in_warmup=True,
+    )
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one(op, [runner], config,
+                         [torch.randn(4, 8, device="cuda")])
+    assert os.listdir(builds) == ["m1-t0"]
+    assert int((builds / "m1-t0").read_text()) != os.getpid()
+    assert tune_mode_workers.counts() == {"built": 1, "claimed": 1}
     tuner.clear_cache()
 
 

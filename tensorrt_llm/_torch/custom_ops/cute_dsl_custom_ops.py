@@ -7,7 +7,7 @@ import itertools
 import math
 import os
 from dataclasses import replace
-from typing import ClassVar, List, Optional, Tuple, Type
+from typing import ClassVar, Hashable, List, Optional, Tuple, Type
 
 import torch
 
@@ -3565,6 +3565,46 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
             self.forward(inputs, tactic, launch=False)
 
+        def build_key(self, inputs: List[torch.Tensor],
+                      profile: OptimizationProfile, tactic,
+                      **kwargs) -> Hashable:
+            """The kernel's ``kernel_cache`` key, which holds no rank's expert offset: one
+            build serves every profile and rank whose key it is."""
+            *_, cache_key = self._kernel_config(inputs[5].size(0), tactic)
+            return self.cached_kernel_build_key(cache_key)
+
+        def _kernel_config(
+            self, num_tokens: int, tactic: Optional[tuple]
+        ) -> Tuple[Tuple[int, int], Tuple[int, int], bool, bool, tuple]:
+            """``tactic``'s MMA tiler, cluster shape and rasterization, whether the kernel
+            loads the expert weights evict-first for ``num_tokens`` tokens, and its key in
+            ``kernel_cache``."""
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                    self._get_default_tactic())
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
+
+            # A kernel class a subclass swaps in need not take the L2 hint. The
+            # runner's own weights_evict_first (a model-declared token bound)
+            # adds to the shape rule.
+            weight_evict_first = (
+                issubclass(
+                    self.__class__.kernel_class,
+                    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
+                and (self.weights_evict_first or
+                     (not self.use_expert_counts and _moe_weight_evict_first(
+                         num_tokens, self.top_k, self.num_experts,
+                         self.num_local_experts, self.tile_size))))
+            cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
+                         cluster_shape_mn, raster_along_m,
+                         self.use_expert_counts, self.num_local_experts,
+                         weight_evict_first)
+            return (mma_tiler_mn, cluster_shape_mn, raster_along_m,
+                    weight_evict_first, cache_key)
+
         def forward(self,
                     inputs: List[torch.Tensor],
                     tactic: Optional[tuple],
@@ -3670,29 +3710,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
-            else:
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
-                    self._get_default_tactic())
-            assert mma_tiler_mn[
-                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
-
-            # A kernel class a subclass swaps in need not take the L2 hint. The
-            # runner's own weights_evict_first (a model-declared token bound)
-            # adds to the shape rule.
-            weight_evict_first = (
-                issubclass(
-                    self.__class__.kernel_class,
-                    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel)
-                and (self.weights_evict_first or
-                     (not self.use_expert_counts and _moe_weight_evict_first(
-                         num_tokens, self.top_k, self.num_experts,
-                         self.num_local_experts, self.tile_size))))
-            cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m,
-                         self.use_expert_counts, self.num_local_experts,
-                         weight_evict_first)
+            (mma_tiler_mn, cluster_shape_mn, raster_along_m, weight_evict_first,
+             cache_key) = self._kernel_config(num_tokens, tactic)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -4488,6 +4507,45 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
             self.forward(inputs, tactic, launch=False)
 
+        def build_key(self, inputs: List, profile: OptimizationProfile, tactic,
+                      **kwargs) -> Hashable:
+            """The kernel's ``kernel_cache`` key, which holds no rank's expert offset: one
+            build serves every profile and rank whose key it is."""
+            *_, cache_key = self._kernel_config(inputs[0].size(0), tactic)
+            return self.cached_kernel_build_key(cache_key)
+
+        def _kernel_config(
+            self, orig_m: int, tactic: Optional[tuple]
+        ) -> Tuple[Tuple[int, int], Tuple[int, int], bool, bool, tuple]:
+            """``tactic``'s MMA tiler, cluster shape and rasterization, whether the kernel
+            loads the expert weights evict-first for ``orig_m`` input rows, and its key in
+            ``kernel_cache``."""
+            if isinstance(tactic, tuple):
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
+            else:
+                mma_tiler_mn = (self.tile_size, 128)
+                cluster_shape_mn = (self.tile_size // 128, 1)
+                raster_along_m = False
+            assert mma_tiler_mn[
+                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
+
+            weight_evict_first = (not self.use_expert_counts
+                                  and _moe_weight_evict_first(
+                                      orig_m, self.top_k, self.num_experts,
+                                      self.num_local_experts, self.tile_size))
+            # The SiTU betas are folded into the kernel at trace time, so they
+            # are part of the compiled-kernel identity, not just runtime args.
+            cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
+                         mma_tiler_mn, cluster_shape_mn, raster_along_m,
+                         self.activation_type, self.swiglu_limit_scalar,
+                         self.use_expert_counts, self.num_local_experts,
+                         self.situ_beta, self.situ_linear_beta,
+                         weight_evict_first)
+            if getattr(self, "zero_args", None) is not None:
+                cache_key += ("zero_fill", )
+            return (mma_tiler_mn, cluster_shape_mn, raster_along_m,
+                    weight_evict_first, cache_key)
+
         def forward(self,
                     inputs: List,
                     tactic: Optional[tuple],
@@ -4630,32 +4688,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
-            if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
-            else:
-                mma_tiler_mn = (self.tile_size, 128)
-                cluster_shape_mn = (self.tile_size // 128, 1)
-                raster_along_m = False
-            assert mma_tiler_mn[
-                0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
-
-            weight_evict_first = (not self.use_expert_counts
-                                  and _moe_weight_evict_first(
-                                      orig_m, self.top_k, self.num_experts,
-                                      self.num_local_experts, self.tile_size))
-            # The SiTU betas are folded into the kernel at trace time, so they
-            # are part of the compiled-kernel identity, not just runtime args.
-            cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
-                         mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         self.activation_type, self.swiglu_limit_scalar,
-                         self.use_expert_counts, self.num_local_experts,
-                         self.situ_beta, self.situ_linear_beta,
-                         weight_evict_first)
+            (mma_tiler_mn, cluster_shape_mn, raster_along_m, weight_evict_first,
+             cache_key) = self._kernel_config(orig_m, tactic)
             # The scheduler warp also zeroes [address, address + bytes).
             zero_args = getattr(self, "zero_args", None)
             zero_kwargs = {}
             if zero_args is not None:
-                cache_key += ("zero_fill", )
                 zero_kwargs = dict(zero_addr=cutlass.Int64(zero_args[0]),
                                    zero_bytes=cutlass.Int64(zero_args[1]))
 
@@ -13631,6 +13669,93 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Compile the kernel ``tactic`` runs on ``inputs``, without running it."""
             self.forward(inputs, tactic, launch=False, **kwargs)
 
+        def build_key(self, inputs: List[torch.Tensor],
+                      profile: OptimizationProfile, tactic,
+                      **kwargs) -> Hashable:
+            """The kernel's ``kernel_cache`` key: one build serves every batch bucket whose
+            split uses the split-KV workspace alike."""
+            *_, cache_key = self._kernel_variant(inputs, tactic)
+            return self.cached_kernel_build_key(cache_key)
+
+        def _kernel_variant(
+            self, inputs: List[torch.Tensor], tactic
+        ) -> Tuple[Tuple[int, int], Tuple[int, int], int, bool, Type, bool,
+                   Optional[torch.Tensor], tuple]:
+            """The kernel ``tactic`` runs on ``inputs`` (see :meth:`forward`): its QK and PV
+            MMA tilers, the split-KV it runs with, fitted to the workspace, whether it is
+            persistent, its output dtype, whether it uses the split-KV workspace, the
+            per-request split plan that applies (None: a uniform split), and its key in
+            ``kernel_cache``."""
+            if not (isinstance(tactic, tuple) and len(tactic) == 4):
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner.forward expected a 4-tuple "
+                    "tactic (mma_qk, mma_pv, split_kv, is_persistent), got "
+                    f"{tactic!r}.")
+            mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent = tactic
+            split_kv = int(split_kv)
+            is_persistent = bool(is_persistent)
+            mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
+            mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
+
+            q_latent, cache_seqs, o = inputs[0], inputs[5], inputs[6]
+            if o.dtype == torch.float16:
+                out_dtype = cutlass.Float16
+            elif o.dtype == torch.bfloat16:
+                out_dtype = cutlass.BFloat16
+            else:
+                out_dtype = self.in_dtype
+
+            batch_size = cache_seqs.shape[0]
+            d_latent = q_latent.shape[1]
+            split_kv_size = self.get_workspace_layout(
+                self.num_heads, self.seq_len_q, d_latent,
+                max(batch_size, self.max_batch_size), cutlass.Float32)[3]
+            # The workspace fits each batch bucket's split; a batch between two
+            # buckets shrinks its split to fit instead of JIT-compiling a variant.
+            split_kv_rows = split_kv_size // (self._MMA_TILE_M *
+                                              (d_latent + 1) *
+                                              cutlass.Float32.width // 8)
+            fitting_split_kv = split_kv_rows // (
+                batch_size *
+                self.get_num_q_tiles(self.num_heads, self.seq_len_q))
+            use_workspace = split_kv > 1 and fitting_split_kv >= 1
+            split_kv = max(1, min(split_kv, fitting_split_kv))
+
+            fixed_inputs = 12 if self.in_dtype == cutlass.Float8E4M3FN else 10
+            block_split_kvs = (inputs[fixed_inputs]
+                               if len(inputs) > fixed_inputs else None)
+            if block_split_kvs is not None and (
+                    block_split_kvs.numel() != batch_size
+                    or block_split_kvs.dtype != torch.int32
+                    or block_split_kvs.device != o.device
+                    or not block_split_kvs.is_contiguous()):
+                if AutoTuner.get().is_tuning_mode:
+                    # Profiling rebuilds cache_seqs at bucketed sizes; the
+                    # step's plan does not apply to them (uniform split).
+                    block_split_kvs = None
+                else:
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
+                        f"int32 block_split_kvs of shape ({batch_size},) on the "
+                        "output device.")
+            # The per-request plan only distributes the split-KV workspace, so
+            # it applies only when that workspace is used.
+            if not use_workspace:
+                block_split_kvs = None
+            has_kv_bounds = len(inputs) > 9 and inputs[9] is not None
+            # split_kv is a runtime Int32; only the workspace use is compiled in.
+            cache_key = self.unique_id() + (
+                out_dtype,
+                mma_qk_tiler_mn,
+                mma_pv_tiler_mn,
+                use_workspace,
+                is_persistent,
+                has_kv_bounds,
+                block_split_kvs is not None,
+            )
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent,
+                    out_dtype, use_workspace, block_split_kvs, cache_key)
+
         def forward(
             self,
             inputs: List[torch.Tensor],
@@ -13688,9 +13813,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # FP8 KV keeps its scales on the device so neither the first call
             # nor CUDA graph replay needs a host read of the scale tensors.
             has_fp8_input = self.in_dtype == cutlass.Float8E4M3FN
-            fixed_inputs = 12 if has_fp8_input else 10
-            block_split_kvs = (inputs[fixed_inputs]
-                               if len(inputs) > fixed_inputs else None)
             if has_fp8_input:
                 if len(inputs) not in (12, 13):
                     raise RuntimeError(
@@ -13711,26 +13833,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 softmax_scale = float(kwargs.get("softmax_scale", 1.0))
                 output_scale = float(kwargs.get("output_scale", 1.0))
 
-            if not (isinstance(tactic, tuple) and len(tactic) == 4):
-                raise RuntimeError(
-                    "CuteDSLNVMlaDecodeBlackwellRunner.forward expected a 4-tuple "
-                    "tactic (mma_qk, mma_pv, split_kv, is_persistent), got "
-                    f"{tactic!r}.")
-            mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent = tactic
-            split_kv = int(split_kv)
-            is_persistent = bool(is_persistent)
-            mma_qk_tiler_mn = tuple(mma_qk_tiler_mn)
-            mma_pv_tiler_mn = tuple(mma_pv_tiler_mn)
+            (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent,
+             out_dtype, use_workspace, block_split_kvs,
+             cache_key) = self._kernel_variant(inputs, tactic)
+            is_var_split_kv = block_split_kvs is not None
 
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
-
-            if o.dtype == torch.float16:
-                out_dtype = cutlass.Float16
-            elif o.dtype == torch.bfloat16:
-                out_dtype = cutlass.BFloat16
-            else:
-                out_dtype = self.in_dtype
 
             seq_len_q = self.seq_len_q
 
@@ -13779,15 +13888,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Kernel split-KV intermediates start AFTER the reserved LSE region.
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
-            # The workspace fits each batch bucket's split; a batch between two
-            # buckets shrinks its split to fit instead of JIT-compiling a variant.
-            split_kv_rows = split_kv_size // (self._MMA_TILE_M *
-                                              (d_latent + 1) *
-                                              cutlass.Float32.width // 8)
-            fitting_split_kv = split_kv_rows // (
-                batch_size * self.get_num_q_tiles(self.num_heads, seq_len_q))
-            use_workspace = split_kv > 1 and fitting_split_kv >= 1
-            split_kv = max(1, min(split_kv, fitting_split_kv))
 
             if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
                 # Profiling rebuilds cache_seqs at bucketed sizes but input 9
@@ -13809,35 +13909,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{expected_bounds_shape}, got shape="
                         f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
 
-            if block_split_kvs is not None and (
-                    block_split_kvs.numel() != batch_size
-                    or block_split_kvs.dtype != torch.int32
-                    or block_split_kvs.device != o.device
-                    or not block_split_kvs.is_contiguous()):
-                if AutoTuner.get().is_tuning_mode:
-                    # Profiling rebuilds cache_seqs at bucketed sizes; the
-                    # step's plan does not apply to them (uniform split).
-                    block_split_kvs = None
-                else:
-                    raise RuntimeError(
-                        "CuteDSLNVMlaDecodeBlackwellRunner requires contiguous "
-                        f"int32 block_split_kvs of shape ({batch_size},) on the "
-                        "output device.")
-            # The per-request plan only distributes the split-KV workspace, so
-            # it applies only when that workspace is used.
-            if not use_workspace:
-                block_split_kvs = None
-            is_var_split_kv = block_split_kvs is not None
-            # split_kv is a runtime Int32; only the workspace use is compiled in.
-            cache_key = self.unique_id() + (
-                out_dtype,
-                mma_qk_tiler_mn,
-                mma_pv_tiler_mn,
-                use_workspace,
-                is_persistent,
-                kv_bounds is not None,
-                is_var_split_kv,
-            )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
                 # for seconds -- always log enough to identify the variant.

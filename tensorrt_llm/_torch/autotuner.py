@@ -19,6 +19,7 @@ import copy
 import enum
 import errno
 import fcntl
+import hashlib
 import inspect
 import itertools
 import json
@@ -39,8 +40,9 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm import _jit_share as jit_share
-from tensorrt_llm._torch.build_pool import (FAILED, REFUSED, Build, BuildPool,
-                                            BuildStrategy)
+from tensorrt_llm._torch.build_pool import (BUILT, CLAIMED, FAILED, PRESENT,
+                                            REFUSED, Build, BuildPool,
+                                            BuildStrategy, Claim)
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.modules.multi_stream_utils import no_eager_forks
 from tensorrt_llm._torch.nccl_window_graph import (
@@ -181,7 +183,8 @@ class TuningConfig:
             with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
             For decode-sized GEMMs whose weights never stay in L2 between uses.
         use_build_pool_in_warmup (bool): In the memory-profiling warmup (a build pass), tune mode
-            first builds every (profile, runner, tactic) on the rank's build-pool worker processes
+            first builds the kernels of every (profile, runner, tactic), each distinct build once
+            (``TunableRunner.build_key``), on the rank's build-pool worker processes
             (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. For ops whose
             builds are long enough to repay a worker. The runners and tactics must pickle and must
             not be collective. Warmups without a build pass build as without it.
@@ -381,13 +384,29 @@ class TunableRunner(ABC):
         """
         self(inputs, tactic=tactic, **kwargs)
 
-    def build_key(self, profile: "OptimizationProfile",
-                  tactic: Any) -> Hashable:
-        """Builds with equal keys compile the same kernels, so only one of them runs.
+    def build_key(self, inputs: List[torch.Tensor],
+                  profile: "OptimizationProfile", tactic: Any,
+                  **kwargs) -> Hashable:
+        """Builds with equal keys compile the same kernels, so only one of them runs, whatever
+        the profile and runner; tune mode splits the distinct ones across the ranks that share
+        JIT builds. ``inputs`` are the profile's tuning inputs.
 
-        This default distinguishes every profile and tactic.
+        This default distinguishes every runner class and ``unique_id``, profile and tactic. A
+        runner that compiles one kernel for many shapes returns what names that kernel
+        (:meth:`cached_kernel_build_key`).
         """
-        return (profile.get_opt_shapes(), str(tactic))
+        return (f"{type(self).__module__}.{type(self).__qualname__}",
+                str(self.unique_id()), profile.get_opt_shapes(), str(tactic))
+
+    def cached_kernel_build_key(self, cache_key: Hashable) -> Hashable:
+        """A :meth:`build_key` for the kernel stored under ``cache_key`` in the ``kernel_cache``
+        the runner's class uses: runners of every class that shares that cache build the same
+        kernel for equal keys."""
+        owner = next(
+            (cls
+             for cls in type(self).__mro__ if "kernel_cache" in cls.__dict__),
+            type(self))
+        return (f"{owner.__module__}.{owner.__qualname__}", cache_key)
 
 
 # A tensor spec keeps the values of a tensor whose storage has up to this many elements: scales,
@@ -470,6 +489,32 @@ class _TensorSpec:
                               device="meta").view(value.dtype)
         return storage.as_strided(value.shape, value.stride,
                                   value.storage_offset)
+
+
+def _tune_build_claims(keys: List[str]) -> List[Optional[Claim]]:
+    """The claims through which the ranks that share JIT builds split the tune-mode builds of
+    ``keys`` (``repr((custom_op, build_key))``), in ``<TLLM_JIT_SHARE_DIR>/autotuner``. None
+    for every key when the ranks share no directory or it cannot be used, and for a key that
+    holds an object address, which no other process names the same."""
+    share_dir = os.environ.get(jit_share.SHARE_DIR_ENV)
+    if not share_dir or not jit_share.enabled():
+        return [None] * len(keys)
+    directory = os.path.join(share_dir, "autotuner")
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return [None] * len(keys)
+    identity = jit_share._cute_identity()
+    claims: List[Optional[Claim]] = []
+    for key in keys:
+        if " at 0x" in key:
+            claims.append(None)
+            continue
+        base = os.path.join(
+            directory,
+            hashlib.sha256(f"{identity}|{key}".encode()).hexdigest()[:32])
+        claims.append(Claim(base + ".claim", base + ".done", base + ".failed"))
+    return claims
 
 
 def _build_in_worker(runner: "TunableRunner", tactic: Any, specs: List[Any],
@@ -1724,12 +1769,13 @@ class AutoTuner:
         instead of compiling it.
 
         Every (profile, runner, tactic) is built, whatever share of the tactics this rank then
-        profiles (PARALLEL), since any of them may win, once per build key
-        (``TunableRunner.build_key``). With shared JIT builds the ranks claim the items, and
-        each builds the ones it claims; the profiling waits for the others.
-        Returns False, before claiming any item, when the runners cannot go to a worker (they
-        do not pickle), and the caller builds as without the pool. An item whose inputs cannot
-        go to a worker is left to the profiling.
+        profiles (PARALLEL), since any of them may win, but each distinct build once
+        (``TunableRunner.build_key``), across the profiles and the calls of this process. With
+        shared JIT builds and a store the ranks share, the ranks claim the builds: the worker
+        that starts a build first makes it, and the profiling waits for the ones other ranks
+        make. Returns False, before any build, when the runners cannot go to a worker (they do
+        not pickle), and the caller builds as without the pool. A build whose inputs cannot go
+        to a worker is left to the profiling.
         """
         pool = BuildPool.get()
         # A runner's builds are a family of their own: the pool learns each family's memory.
@@ -1755,54 +1801,75 @@ class AutoTuner:
             "do_preparation" in inspect.signature(r.forward).parameters
             for r in runners
         ]
-        items = []
         specs: Dict[int, List[Any]] = {}
-        for i, p in enumerate(pending):
-            tensors = self._tuning_tensors(p, inputs, tuning_config)
+
+        def keep(i: int, tensors: List[torch.Tensor]) -> None:
             specs[i] = [_TensorSpec.of(t, keep_values) for t in tensors]
-            for r, runner in enumerate(runners):
-                items.extend((i, r, tactic)
-                             for tactic in runner.get_valid_tactics(
-                                 tensors, p, **kwargs))
-            del tensors
-        if not items:
+
+        unique, items = self._unique_builds(custom_op, runners, pending, inputs,
+                                            tuning_config, keep, **kwargs)
+        new = [b for b in unique if b[3] not in self._pool_build_keys]
+        if not new:
             return True
-        sweep = (jit_share.SharedSweep(
-            repr((custom_op, [p.get_opt_shapes() for p in pending],
-                  items))) if share_builds else None)
-        start = int(jit_share.start_fraction() *
-                    len(items)) if share_builds else 0
-        order = list(range(start, len(items))) + list(range(start))
-        builds, claimed = [], []
-        for k in order:
-            i, r, tactic = items[k]
-            runner = runners[r]
-            key = repr(
-                (custom_op, type(runner).__name__, str(runner.unique_id()),
-                 runner.build_key(pending[i], tactic)))
-            if key in self._pool_build_keys:
-                continue
-            if sweep is not None and not sweep.claim(k):
-                continue
+        shared = share_builds and pool.shares_store()
+        claims = (_tune_build_claims([key for *_, key in new])
+                  if shared else [None] * len(new))
+        start = int(jit_share.start_fraction() * len(new)) if shared else 0
+        builds = []
+        for k in list(range(start, len(new))) + list(range(start)):
+            i, r, tactic, key = new[k]
             self._pool_build_keys.add(key)
             builds.append(
                 Build("tensorrt_llm._torch.autotuner:_build_in_worker",
-                      (runner, tactic, specs[i], kwarg_specs, prepares[r]),
-                      families[r]))
-            claimed.append(k)
+                      (runners[r], tactic, specs[i], kwarg_specs, prepares[r]),
+                      families[r], claims[k]))
         begin = time.perf_counter()
-        # Each item ends, built or left to the profiling, for the ranks that wait for it.
-        results = pool.build(builds,
-                             on_done=(lambda j, _: sweep.done(claimed[j]))
-                             if sweep is not None else None)
-        failed = sum(result.status == FAILED for result in results)
-        refused = sum(result.status == REFUSED for result in results)
+        counts = Counter(result.status for result in pool.build(builds))
         self._debug_logger(
-            f"[Autotuner] {custom_op}: {len(builds) - refused} of {len(items)} (profile, "
-            f"runner, tactic) items of {len(pending)} profiles built in worker processes "
-            f"({failed} failed, {refused} left to profiling) in "
+            f"[Autotuner] {custom_op}: {len(unique)} distinct builds of {items} (profile, "
+            f"runner, tactic) items of {len(pending)} profiles, {len(builds)} not asked for "
+            f"before: {counts[BUILT]} built in worker processes, "
+            f"{counts[PRESENT] + counts[CLAIMED]} by other ranks, {counts[FAILED]} failed, "
+            f"{counts[REFUSED]} left to profiling, in "
             f"{time.perf_counter() - begin:.1f}s")
         return True
+
+    def _unique_builds(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        pending: List[OptimizationProfile],
+        inputs: List[torch.Tensor],
+        tuning_config: TuningConfig,
+        keep: Optional[Callable[[int, List[torch.Tensor]], None]] = None,
+        **kwargs,
+    ) -> Tuple[List[Tuple[int, int, Any, str]], int]:
+        """The distinct builds that profiling the ``pending`` profiles needs, and the number of
+        (profile, runner, tactic) items they come from.
+
+        A build is ``(profile index, runner index, tactic, key)``: one per key, ``repr((custom_op,
+        build_key))`` (``TunableRunner.build_key``), on the first profile in ``pending`` with an
+        item of that key. The profiles' tuning inputs are made one profile at a time;
+        ``keep(index, inputs)`` gets those of each profile a build is on.
+        """
+        builds: List[Tuple[int, int, Any, str]] = []
+        seen: Set[str] = set()
+        items = 0
+        for i, p in enumerate(pending):
+            tensors = self._tuning_tensors(p, inputs, tuning_config)
+            listed = len(builds)
+            for r, runner in enumerate(runners):
+                for tactic in runner.get_valid_tactics(tensors, p, **kwargs):
+                    items += 1
+                    key = repr((custom_op,
+                                runner.build_key(tensors, p, tactic, **kwargs)))
+                    if key not in seen:
+                        seen.add(key)
+                        builds.append((i, r, tactic, key))
+            if keep is not None and len(builds) > listed:
+                keep(i, tensors)
+            del tensors
+        return builds, items
 
     def _build_across_ranks(self, custom_op: str, runners: List[TunableRunner],
                             profiles: List[OptimizationProfile],
@@ -1813,38 +1880,35 @@ class AutoTuner:
         """Build the kernels that profiling the pending profiles needs, split across the
         processes that share JIT builds.
 
-        Each (profile, runner, tactic) runs once, on the process that claims it, so its
-        kernels are built there and published for the others; one whose kernel another
-        process is still building is skipped. Results are discarded and failures are left
-        to the profiling that follows, which loads each kernel built here or elsewhere, or
-        waits for one still being built.
+        Each distinct build (``TunableRunner.build_key``), whatever the profiles it serves, runs
+        once, on the process that claims it, so its kernels are built there and published for
+        the others; one whose kernel another process is still building is skipped. Results are
+        discarded and failures are left to the profiling that follows, which loads each kernel
+        built here or elsewhere, or waits for one still being built.
         """
         pending = [p for p in profiles if is_pending(p)]
-        items = []
-        for i, p in enumerate(pending):
-            tensors = self._tuning_tensors(p, inputs, tuning_config)
-            for r, runner in enumerate(runners):
-                items.extend((i, r, tactic)
-                             for tactic in runner.get_valid_tactics(
-                                 tensors, p, **kwargs))
-        if not items:
+        unique, items = self._unique_builds(custom_op, runners, pending, inputs,
+                                            tuning_config, **kwargs)
+        if not unique:
             return
-        sweep = jit_share.SharedSweep(
-            repr((custom_op, [p.get_opt_shapes() for p in pending], items)))
-        start = int(jit_share.start_fraction() * len(items))
-        ran = busy = 0
+        claims = _tune_build_claims([key for *_, key in unique])
+        start = int(jit_share.start_fraction() * len(unique))
+        ran = busy = failed = taken = 0
         current, tensors, prepared = None, None, set()
         begin = time.perf_counter()
         with jit_share.defer_busy_builds():
-            for k in list(range(start, len(items))) + list(range(start)):
-                if not sweep.claim(k):
+            for k in list(range(start, len(unique))) + list(range(start)):
+                claim = claims[k]
+                if claim is not None and not claim.take():
+                    taken += 1
                     continue
-                i, r, tactic = items[k]
+                i, r, tactic, _ = unique[k]
                 if i != current:
                     current, prepared = i, set()
                     tensors = self._tuning_tensors(pending[i], inputs,
                                                    tuning_config)
                 runner = runners[r]
+                error = None
                 try:
                     if r not in prepared and "do_preparation" in inspect.signature(
                             runner.forward).parameters:
@@ -1857,14 +1921,19 @@ class AutoTuner:
                     torch.cuda.current_stream().synchronize()
                     ran += 1
                 except Exception as e:  # noqa: BLE001 - profiling reports failures
-                    busy += jit_share.is_busy(e)
-                finally:
-                    sweep.done(k)
+                    if jit_share.is_busy(e):
+                        busy += 1
+                    else:
+                        failed += 1
+                        error = f"{type(e).__name__}: {e}"
+                if claim is not None:
+                    claim.end(error)
         self._debug_logger(
-            f"[Autotuner] {custom_op}: shared JIT builds over {len(items)} (profile, "
-            f"runner, tactic) items of {len(pending)} profiles: ran {ran} claimed here and "
-            f"skipped {busy} whose kernel another process was building, in "
-            f"{time.perf_counter() - begin:.1f}s")
+            f"[Autotuner] {custom_op}: shared JIT builds of {len(unique)} distinct builds of "
+            f"{items} (profile, runner, tactic) items of {len(pending)} profiles: ran "
+            f"{ran + failed} claimed here ({failed} failed), skipped {taken} claimed before "
+            f"or by other processes and {busy} whose kernel another process was building, "
+            f"in {time.perf_counter() - begin:.1f}s")
 
     def _profile_sharing_jit_builds(
             self, custom_op: str, profiles: List[OptimizationProfile],

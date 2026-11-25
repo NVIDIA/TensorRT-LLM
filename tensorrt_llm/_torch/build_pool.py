@@ -128,6 +128,25 @@ class Claim(NamedTuple):
     done: str
     failed: str
 
+    def take(self) -> bool:
+        """Claim the build for this process; False when another process holds the claim. Where
+        the directory takes no claims (permissions, quota, I/O errors), this process makes it."""
+        from tensorrt_llm import _jit_share
+
+        try:
+            return _jit_share._claim(self.claim)
+        except OSError:
+            return True
+
+    def end(self, error: Optional[str] = None) -> None:
+        """Record that the build this process claimed ended: made, or failed with ``error``."""
+        if error is not None:
+            from tensorrt_llm import _jit_share
+
+            _jit_share._mark_failed(self.failed, error)
+        elif not os.path.exists(self.done):
+            _touch(self.done)
+
 
 class Build(NamedTuple):
     """One build for a worker process: ``function`` (``"module:qualname"`` of a module-level
@@ -424,6 +443,11 @@ class BuildPool:
     def accepting(self) -> bool:
         """Whether a worker takes a build asked for now."""
         return self.enabled and not self.in_worker and self._depth > 0
+
+    def shares_store(self) -> bool:
+        """Whether the workers build into the store the ranks of the launch share, from which
+        every rank loads the CuTe DSL kernels any rank's workers built."""
+        return self._existing_store() is not None and self._shared
 
     def takes(self, args: tuple) -> bool:
         """Whether a worker takes a build asked for now with ``args`` (see :meth:`build`)."""
@@ -1176,30 +1200,24 @@ def _built_or_claimed(claim: Optional[Claim]) -> Optional[str]:
 def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
     """In a worker process: make one build; with a ``claim``, only when no other rank's worker
     claimed it first."""
-    from tensorrt_llm import _jit_share
-
     if claim is not None:
         if os.path.exists(claim.done):
             return (PRESENT, 0.0, "")
-        try:
-            claimed = _jit_share._claim(claim.claim)
-        except OSError:
-            claimed = True  # The directory takes no claims: build it here.
-        if not claimed:
+        if not claim.take():
             return (PRESENT if os.path.exists(claim.done) else CLAIMED, 0.0, "")
     t0 = time.perf_counter()
     try:
         made = _resolve(function)(*args)
     except Exception as e:  # noqa: BLE001 - reported to the rank, which builds it itself
         if claim is not None:
-            _jit_share._mark_failed(claim.failed, f"{type(e).__name__}: {e}")
+            claim.end(f"{type(e).__name__}: {e}")
         detail = traceback.format_exc()[-_STDERR_TAIL:]
         seconds = time.perf_counter() - t0
         return (FAILED, seconds, f"{type(e).__name__}: {e}\n{detail}", _release_gpu_memory())
     seconds = time.perf_counter() - t0
     peak = _release_gpu_memory()
-    if claim is not None and not os.path.exists(claim.done):
-        _touch(claim.done)
+    if claim is not None:
+        claim.end()
     # False: the function found its kernel built already.
     return (PRESENT if made is False else BUILT, seconds, "", peak)
 

@@ -143,7 +143,10 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
     if built_from_shapes:
         monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "kernel_cache", {})
         runner.build([_meta(t) for t in inputs], tactic=tactic, **scale_kwargs)
-        assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == 1
+        # Tune mode builds once per build key, which names the kernel the runner compiled.
+        assert list(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == [
+            runner.build_key(inputs, None, tactic)[1]
+        ]
     runner.forward(inputs, tactic=tactic, **scale_kwargs)
     if built_from_shapes:
         assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == 1

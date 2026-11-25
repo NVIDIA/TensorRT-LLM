@@ -72,9 +72,11 @@ Every other compiler invocation (``--version`` and the like) runs the real
 compiler unchanged. With ``TLLM_JIT_SHARE_LOG=1`` each kernel adds a line
 ``<start> <seconds> <action> <key>`` to ``<dir>/log/<host>-<pid>.txt``.
 
-A caller that runs a list of builds (the autotuner) splits the list across
-the processes with :class:`SharedSweep` claims, and starts at an offset of its
-own (:func:`start_fraction`).
+A caller that runs a list of builds splits the list across the processes with
+claims, and starts at an offset of its own (:func:`start_fraction`): the
+autotuner claims each distinct tune-mode build as
+``<dir>/autotuner/<name>.claim``, and the profiles it runs to build DeepGEMM's
+kernels as items of a :class:`SharedSweep`.
 
 Only the standard library may be imported at module scope: :func:`install`
 runs before ``torch`` is imported, and the compiler runs this file in a bare
