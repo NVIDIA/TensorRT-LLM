@@ -1957,6 +1957,14 @@ class _TorchLLM(BaseLLM):
                 _usage.record_llm_initialization_failure(
                     (info or classify_startup_error(exc)).category)
             raise
+        catalog_context = os.environ.get("TRTLLM_CI_CONSTRUCTOR_CONTEXT")
+        if catalog_context:
+            try:
+                from ._ci_constructor_record import write_constructor_record
+
+                write_constructor_record(catalog_context, model, self.args)
+            except Exception as exc:
+                logger.warning("CI constructor record unavailable: %s", exc)
         mark_llm_initialized()
 
         try:

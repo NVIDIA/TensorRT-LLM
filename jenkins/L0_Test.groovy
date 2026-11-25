@@ -3629,7 +3629,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
-                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
+                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' -o -name 'llm-constructor-records' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                 def timeoutLogCmd = Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(
                     "grep -aF -e 'TRTLLM_PYTEST_TIMEOUT ' -e 'TRTLLM_PYTEST_ATTEMPT ' -- '${slurmJobLogPath}' || true"))
