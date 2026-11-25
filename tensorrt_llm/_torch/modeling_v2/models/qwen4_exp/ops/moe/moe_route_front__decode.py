@@ -121,9 +121,10 @@ def compile_front(rows: int, hidden: int, row_stride: int, num_local: int, tile:
     return True
 
 
-def _cell(rows: int, offset: int, tile: int, why: str) -> Cell:
+def _cell(rows: int, offset: int, tile: int, why: str, num_local: int = 128) -> Cell:
     return Cell(
-        why=why, spec=dict(rows=rows, hidden=2560, local_offset=offset, num_local=128, tile=tile)
+        why=why,
+        spec=dict(rows=rows, hidden=2560, local_offset=offset, num_local=num_local, tile=tile),
     )
 
 
@@ -145,13 +146,17 @@ class MoeRouteFront(OpWrapper):
         _cell(1024, 0, 64, "dep4 MTP-3: 64 a rank (1024 rows, the launch's last), tile 64"),
         _cell(4, 384, 8, "tep4 MTP-3: 1 request (4 rows, the rank's own), window 3, tile 8"),
         _cell(16, 128, 8, "tep4 MTP-3: 4 requests (16 rows, the rank's own), window 1, tile 8"),
+        _cell(96, 448, 16, "dep8 MTP-3: 3 requests a rank (96 rows), window 7 of 64", 64),
+        _cell(448, 64, 32, "dep8 MTP-3: 14 a rank (448 rows, clusters of 16), window 1", 64),
+        _cell(896, 320, 64, "dep8 MTP-3: 28 a rank (896 rows), window 5, tile 64", 64),
     )
 
     note = """
     Source: `kernels/blackwell/moe_route_front` (CuTe DSL clusters; lean to 256 rows), compiled
     per shape by `compile_front` outside capture. Certified for 128-expert windows of the
     512-expert / top-10 layer at hidden 2560 on GB300 (dep4's gathered rows, tep4's own 4-16
-    rows), tiles 8 to 64. Not certified: a 64-expert (dep8) window, other routing geometries.
+    rows), tiles 8 to 64; written for 64-expert windows (dep8's gathered rows, the last three
+    cells). Not certified: other routing geometries.
     """
 
     def __call__(

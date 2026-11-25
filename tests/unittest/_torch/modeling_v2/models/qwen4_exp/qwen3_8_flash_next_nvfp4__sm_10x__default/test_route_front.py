@@ -5,12 +5,14 @@
 
 * The tactic a gathered row count pins: `_ROUTE_FRONT_TACTICS`' where the runner lists it for
   the window, else the base table's, else none (that row count keeps the runner's routing). A
-  tep4 rank pins the runner's own bucket tactic (`DECODE_TACTICS`).
+  tep4 rank pins the runner's own bucket tactic (`DECODE_TACTICS`). dep8's 64-expert window pins
+  `_ROUTE_FRONT_TACTICS_W64`'s, with a listed reference where the runner does not list it, which
+  the build check runs the runner's own routing at.
 * `_routed_experts` takes the route front only on a captured step with the decode router, at a
   row count the build compiled: under attention DP on the gathered rows without a mixer-side
   activation, at a tep4 rank on its own rows with the site's activation, which the runner reads.
 * The build is off with the switch at 0, away from attention DP and tep4, on host weights, and
-  away from the certified window (128 experts, dep4 / tep4) and GPU (SM103).
+  away from the certified windows (128 experts at dep4 / tep4, 64 at dep8) and GPU (SM103).
 
 The ops are recorders; no kernel runs.
 """
@@ -30,11 +32,11 @@ CORE = SimpleNamespace(topk=10, hidden=2560, expert_inter=640, local_experts=128
 
 
 class _Runner:
-    def __init__(self, valid):
-        self.valid = valid
+    def __init__(self, valid, window=128):
+        self.valid, self.window = valid, window
 
     def get_valid_configs(self, top_k, hidden, inter, num_experts, rows):
-        assert (top_k, hidden, inter, num_experts) == (10, 2560, 640, 128)
+        assert (top_k, hidden, inter, num_experts) == (10, 2560, 640, self.window)
         return [list(t) for t in self.valid]
 
 
@@ -52,6 +54,67 @@ class _Runner:
 )
 def test_pinned_tactic(rows, valid, expected):
     assert M._route_front_tactic(_Runner(valid), CORE, rows) == expected
+
+
+W64 = SimpleNamespace(topk=10, hidden=2560, expert_inter=640, local_experts=64)
+
+
+@pytest.mark.parametrize(
+    "rows, valid, expected",
+    [
+        (64, [(8, 53), (16, 32)], ((8, 53), None)),  # 2 requests a rank, listed
+        (96, [(16, 32)], ((16, 32), None)),
+        # 14 requests a rank: tile 32 is not listed at 448 rows; held to the listed same tile
+        (448, [(64, 4), (32, 20)], ((32, 32), (32, 20))),
+        # 24 a rank (768 rows): no tile 32 listed, held to the first listed config
+        (768, [(64, 4), (128, 4)], ((32, 32), (64, 4))),
+        (896, [(64, 5), (128, 4)], ((64, 5), None)),
+        (1024, [(128, 4)], ((64, 5), (128, 4))),
+        (1024, [], (None, None)),
+    ],
+)
+def test_dep8_pinned_tactic(rows, valid, expected):
+    assert M._route_front_w64_tactic(_Runner(valid, 64), W64, rows) == expected
+
+
+@pytest.mark.parametrize("ref", [None, (32, 20)])
+def test_check_runs_the_runners_routing_at_the_listed_reference(monkeypatch, ref):
+    """The build check's stock window call runs at the listed reference where the pinned tactic
+    is not listed, else at the pinned tactic itself."""
+    seen = []
+
+    class Runner:
+        def run_moe(self, *args):
+            seen.append(tuple(args[26]))
+            return (torch.zeros(2, 8),)
+
+    monkeypatch.setattr(M, "cublas_mm", lambda x, w: torch.zeros(x.shape[0], 512))
+    monkeypatch.setattr(M, "fp4_quantize", lambda *a: (torch.zeros(1), torch.zeros(1)))
+    monkeypatch.setattr(
+        M, "renorm_moe_routing_op", lambda *a, **k: (torch.zeros(2, 10), torch.zeros(2, 10))
+    )
+    out = (
+        torch.zeros(2, 8),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.zeros(2, 10),
+        torch.zeros(2, 10),
+    )
+    monkeypatch.setattr(M, "_route_front_run", lambda *a, **k: out)
+    monkeypatch.setattr(M, "_route_front_check_tables", lambda *a: "")
+    st = M._RouteFront(Runner())
+    st.tactics = {2: (32, 32)}
+    if ref is not None:
+        st.refs = {2: ref}
+    st.views = {2: [None]}
+    L = SimpleNamespace(router=torch.zeros(8, 512), moe_gscale=None)
+    for name in ("fc1_w", "fc1_s", "fc2_w", "fc2_s", "out1_scale", "out1_gate_scale", "out2_scale"):
+        setattr(L, name, None)
+    core = SimpleNamespace(
+        hidden=8, num_experts=512, topk=10, expert_inter=640, expert_offset=0, local_experts=64
+    )
+    assert M._route_front_check(core, st, L, 0, 2, torch.Generator()) == ""
+    assert seen == [ref or (32, 32)]
 
 
 def _engage(monkeypatch, capturing: bool, built_rows=(48,), dp_size=4):
@@ -171,13 +234,21 @@ def test_build_declines_away_from_attention_dp(monkeypatch, dp_size, backend, de
 
 @pytest.mark.parametrize(
     "dp_size, local_experts, capability",
-    [(4, 64, (10, 3)), (4, 256, (10, 3)), (4, 128, (10, 7)), (1, 128, (10, 7))],
-    ids=["dep8_window", "dep2_window", "sm_107", "tep4_sm_107"],
+    [
+        (4, 64, (10, 3)),
+        (8, 128, (10, 3)),
+        (2, 256, (10, 3)),
+        (4, 128, (10, 7)),
+        (8, 64, (10, 7)),
+        (1, 128, (10, 7)),
+    ],
+    ids=["dep4_64", "dep8_128", "dep2_window", "sm_107", "dep8_sm_107", "tep4_sm_107"],
 )
 def test_build_declines_away_from_the_certified_window_and_arch(
     monkeypatch, dp_size, local_experts, capability
 ):
-    """The tactic tables and the op's cells cover the dep4 / tep4 window on SM103 only."""
+    """The tactic tables and the op's cells cover the dep4 / tep4 (128 experts) and dep8 (64)
+    windows on SM103 only."""
     monkeypatch.delenv(M.DP_ROUTE_FRONT_ENV, raising=False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     core = SimpleNamespace(
@@ -190,3 +261,32 @@ def test_build_declines_away_from_the_certified_window_and_arch(
         local_experts=local_experts,
     )
     assert M._route_front_build(core, [], torch.device("cuda")) is None
+
+
+class _Reached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("dp_size, local_experts", [(4, 128), (8, 64)], ids=["dep4", "dep8"])
+def test_build_takes_the_certified_windows(monkeypatch, dp_size, local_experts):
+    """dep4's 128-expert and dep8's 64-expert windows on SM103 reach the runner's tables."""
+    monkeypatch.delenv(M.DP_ROUTE_FRONT_ENV, raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+
+    def runner():
+        raise _Reached
+
+    monkeypatch.setattr(M, "_moe_runner", runner)
+    core = SimpleNamespace(
+        dp_size=dp_size,
+        tep_fast=False,
+        one_rank=False,
+        trunk_moe_backend="TRTLLM",
+        num_experts=512,
+        topk=10,
+        local_experts=local_experts,
+        max_verify_rows=4,
+        model_config=SimpleNamespace(cuda_graph_batch_sizes=[3, 12]),
+    )
+    with pytest.raises(_Reached):
+        M._route_front_build(core, [], torch.device("cuda"))

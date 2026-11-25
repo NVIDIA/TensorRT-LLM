@@ -1107,7 +1107,8 @@ _MOE_ONE_LAUNCH_MAX_ROWS = 24576  # capacity: fixed: the routed op's certified r
 # runs on trtllm-gen.
 _MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
 #: Switch, on by default: a captured generation-only step at an attention-DP rank on SM103
-#: (trtllm-gen trunk MoE, a 128-expert window of the 512 experts: dep4) runs each trunk MoE block's
+#: (trtllm-gen trunk MoE, a 128-expert window of the 512 experts at dep4, a 64-expert one at dep8,
+#: `_ROUTE_FRONT_WINDOWS`) runs each trunk MoE block's
 #: routing, the window's pre-routed tables and the NVFP4 quantization of the gathered rows in
 #: one launch (`ops/moe/moe_route_front__decode`) and enters the runner pre-routed at the tactic
 #: the tables were built for (`_ROUTE_FRONT_TACTICS`): it replaces `fp4_quantize` and the
@@ -1116,9 +1117,12 @@ _MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
 DP_ROUTE_FRONT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT"
 #: Gathered rows a route front serves: from 3 requests of 4 rows at dep4 to the kernel's last.
 _ROUTE_FRONT_MIN_ROWS = 48  # capacity: fixed: a dispatch threshold
-#: The expert window the route front and `_ROUTE_FRONT_TACTICS` are certified for (dep4). Other
-#: windows (dep2's 256, dep8's 64, whose tactics are not ported) keep the runner's routing.
+#: The expert window the route front and `_ROUTE_FRONT_TACTICS` are certified for (dep4, tep4).
 _ROUTE_FRONT_WINDOW = 128  # capacity: fixed: the certified window, not a buffer size
+#: The window an attention-DP group of this size serves the route front at: dep4's 128 experts
+#: (`_ROUTE_FRONT_TACTICS`) and dep8's 64 (`_ROUTE_FRONT_TACTICS_W64`). dep2's 256 keeps the
+#: runner's routing.
+_ROUTE_FRONT_WINDOWS = {4: _ROUTE_FRONT_WINDOW, 8: 64}  # capacity: fixed: certified windows
 #: `(gathered rows below, (tileN, FC1 x FC2 config))`: the trtllm-gen tactic pinned per row
 #: count, the tile the tables are built for. A 128-expert window under real routing is hit by
 #: 45-100 experts with a few pairs each, so the smaller tiles cut an expert into more tiles than
@@ -1126,6 +1130,17 @@ _ROUTE_FRONT_WINDOW = 128  # capacity: fixed: the certified window, not a buffer
 #: runner does not list for the shape falls back to `_ROUTE_FRONT_TACTICS_BASE`'s.
 _ROUTE_FRONT_TACTICS = ((96, (8, 53)), (192, (16, 32)), (704, (32, 32)), (1025, (64, 4)))
 _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
+#: The same for dep8's 64-expert window (8 ranks of 3..32 requests of four rows). The runner sizes
+#: its configs for "every pick of a row lands in this window" (a dep8 window gets 1.25 of a row's
+#: 10 picks), so it lists tile 32 only at 256 rows, tile 64 and up at 512-768 and tile 128 and up
+#: from 1024; the smaller tiles below run fewer, fuller tiles. GB300, 8 ranks over two nodes, each
+#: on its own window under recorded routing: [32, 32] 40.2 against the listed [64, 4] 41.8 us a
+#: layer at 512 rows, [64, 5] 50.6 against [128, 4] 54.6 at 1024; [32, 32] up to 895 rows took
+#: -0.10 / -0.05 ms a step at 20 / 24 requests a rank against [64, 4] from 640 rows. A tactic the
+#: runner does not list for the row count is pinned only once its window output is bitwise a
+#: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
+#: a row count whose check fails keeps the runner's routing.
+_ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
 #: Switch, on by default: a tep4 rank (attention TP over four ranks without attention DP, the
 #: routed experts as 128-expert windows) runs a captured generation-only step on the forms the
 #: one-rank target runs, at its shard:
@@ -4025,6 +4040,9 @@ class _RouteFront:
     def __init__(self, runner) -> None:
         self.runner = runner
         self.tactics: dict = {}
+        # Per row count whose pinned tactic the runner does not list (dep8): the listed tactic
+        # the build check holds its window output to.
+        self.refs: dict = {}
         self.views: dict = {}
         self.flats: dict = {}
         self.layers: dict = {}
@@ -4044,6 +4062,26 @@ def _route_front_tactic(runner, core, rows: int) -> tuple | None:
         if list(tactic) in valid:
             return tactic
     return None
+
+
+def _route_front_w64_tactic(runner, core, rows: int) -> tuple:
+    """dep8's `(tactic, ref)` for `rows` gathered rows over its 64-expert window:
+    `_ROUTE_FRONT_TACTICS_W64`'s tactic, and None where the runner lists it, else a tactic it lists
+    (of the same tile where it lists one) that the build holds the pinned one's window output to;
+    `(None, None)` where the runner lists nothing."""
+    valid = sorted(
+        tuple(int(v) for v in t)
+        for t in runner.get_valid_configs(
+            core.topk, core.hidden, core.expert_inter, core.local_experts, rows
+        )
+    )
+    tactic = next((t for below, t in _ROUTE_FRONT_TACTICS_W64 if rows < below), None)
+    if tactic is None or not valid:
+        return None, None
+    if tactic in valid:
+        return tactic, None
+    same_tile = [t for t in valid if t[0] == tactic[0]]
+    return tactic, (same_tile or valid)[0]
 
 
 def _tep_route_front_tactic(runner, core, rows: int) -> tuple | None:
@@ -4115,9 +4153,10 @@ def _route_front_run(
 
 def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows: int, gen):
     """One layer at one row count, eagerly, against today's chain at the same tactic (router
-    logits -> `fp4_quantize` -> the runner's own routing over this rank's window), and the
-    tables against their meaning: "" when the window output, the NVFP4 codes and scales, the
-    experts and the weights are bitwise equal and the tables hold, else what differs."""
+    logits -> `fp4_quantize` -> the runner's own routing over this rank's window), or at the
+    listed reference tactic where the pinned one is not listed (`st.refs`), and the tables
+    against their meaning: "" when the window output, the NVFP4 codes and scales, the experts and
+    the weights are bitwise equal and the tables hold, else what differs."""
     x = torch.randn([rows, core.hidden], generator=gen, device=L.router.device).to(torch.bfloat16)
     logits = cublas_mm(x, L.router)
     xq0, xsf0 = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, False)
@@ -4148,7 +4187,7 @@ def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows
         None,
         ROUTING_RENORMALIZE,
         True,
-        list(st.tactics[rows]),
+        list(st.refs.get(rows) or st.tactics[rows]),
         None,
         None,
         None,
@@ -4180,13 +4219,15 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     (`core.tep_fast`), read once at build (`post_load_weights`, `layers` the decode target's):
     None where it is off or cannot take effect (another layout, not the trtllm-gen trunk MoE over
     CUDA weights, another routing geometry, no CUDA-graph batch size in the row range) or where
-    the op is not certified (`moe_route_front.ARCHS`, SM103, and its 128-expert window: dep4's
-    gathered rows, `_ROUTE_FRONT_TACTICS`; tep4's own rows up to `_TEP_ROUTE_FRONT_MAX_ROWS`,
-    `_tep_route_front_tactic`). For every row count a graph batch size gives it compiles the
-    route front at the pinned tactic's tile, makes each layer's table buffer (pre-filled with
-    valid row indices: the kernel writes only the live entries), and checks every layer once at
-    a row count that rotates over the built ones (`_route_front_check`). A failed check leaves
-    the whole switch off, with one warning."""
+    the op is not certified (`moe_route_front.ARCHS`, SM103, and its windows: dep4's 128 experts
+    over the gathered rows, `_ROUTE_FRONT_TACTICS`; dep8's 64, `_route_front_w64_tactic`; tep4's
+    own rows up to `_TEP_ROUTE_FRONT_MAX_ROWS`, `_tep_route_front_tactic`). For every row count a
+    graph batch size gives it compiles the route front at the pinned tactic's tile, makes each
+    layer's table buffer (pre-filled with valid row indices: the kernel writes only the live
+    entries), and checks every layer once at a row count that rotates over the built ones
+    (`_route_front_check`). A row count pinned to a tactic the runner does not list whose check
+    fails keeps the runner's routing (one warning); any other failed check leaves the whole
+    switch off, with one warning."""
     dp = core.dp_size > 1
     if dp and not _switch(DP_ROUTE_FRONT_ENV, default=True):
         return None
@@ -4196,7 +4237,8 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
         and core.trunk_moe_backend == "TRTLLM"
         and device.type == "cuda"
         and (core.num_experts, core.topk) == (_ROUTE_FRONT_EXPERTS, _ROUTE_FRONT_TOP_K)
-        and core.local_experts == _ROUTE_FRONT_WINDOW
+        and core.local_experts
+        == (_ROUTE_FRONT_WINDOWS.get(core.dp_size) if dp else _ROUTE_FRONT_WINDOW)
         and torch.cuda.get_device_capability(device) == archs.SM_103
     ):
         return None
@@ -4209,11 +4251,17 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     rows_list = sorted({per_batch * int(b) for b in sizes if lo <= per_batch * int(b) <= hi})
     if not rows_list:
         return None
-    pin = _route_front_tactic if dp else _tep_route_front_tactic
+
+    def pin(runner, rows: int) -> tuple:
+        """`(tactic, listed reference or None)` of `rows`."""
+        if dp and core.local_experts == _ROUTE_FRONT_WINDOWS[8]:
+            return _route_front_w64_tactic(runner, core, rows)
+        return (_route_front_tactic if dp else _tep_route_front_tactic)(runner, core, rows), None
+
     st = _RouteFront(_moe_runner())
     with torch.cuda.device(device):
         for rows in rows_list:
-            tactic = pin(st.runner, core, rows)
+            tactic, ref = pin(st.runner, rows)
             if tactic is None or not _route_front_compile(
                 rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
             ):
@@ -4221,6 +4269,8 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             n = sum(table_sizes(rows, core.topk, core.local_experts, int(tactic[0])))
             fill = (torch.arange(n, device=device) % rows).to(torch.int32)
             st.tactics[rows] = tactic
+            if ref is not None:
+                st.refs[rows] = ref
             st.flats[rows] = [fill.clone() for _ in range(core.num_layers)]
             st.views[rows] = [
                 table_views(flat, rows, core.topk, core.local_experts, int(tactic[0]))
@@ -4232,13 +4282,25 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
         gen = torch.Generator(device=device).manual_seed(20261119)
         for j in range(max(len(layers), len(built)) if built else 0):
             rows, i = built[j % len(built)], j % len(layers)
+            if rows not in st.tactics:
+                continue
             bad = _route_front_check(core, st, layers[i], i, rows, gen)
-            if bad:
+            if bad and rows in st.refs:
+                logger.warning(
+                    f"{DP_ROUTE_FRONT_ENV}: layer {i} at {rows} gathered rows on the tactic "
+                    f"{list(st.tactics[rows])}, which the runner does not list, differs from its "
+                    f"listed {list(st.refs[rows])} ({bad}); that row count keeps the runner's "
+                    "routing"
+                )
+                for table in (st.tactics, st.refs, st.flats, st.views):
+                    table.pop(rows, None)
+            elif bad:
                 logger.warning(
                     f"{DP_ROUTE_FRONT_ENV if dp else TEP_FAST_DECODE_ENV}: layer {i} at {rows} "
                     f"rows differs from the runner's own routing ({bad}); every MoE block keeps it"
                 )
                 return None
+        built = sorted(st.tactics)
         torch.cuda.synchronize(device)
     if not built:
         return None
