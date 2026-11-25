@@ -266,7 +266,9 @@ Ask with one multi-select question:
   in-process and cannot drive a disaggregated server.
 - **Multimodal chosen:** add MMMU with the same rules as GSM8K (reference
   score or measured or required baseline, same tolerance, same feature set),
-  and ask where its data comes from as for GSM8K.
+  and ask where its data comes from as for GSM8K. For a Modeling V2 target,
+  include the V2 multimodal tip below. Use the [multimodal onboarding guide](../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#modeling-v2-targets)
+  to identify which features the target's towers and processor support.
   **Multimodal model but not chosen:** add the text-only tip.
 
 ## Finish
@@ -343,6 +345,7 @@ Fill the `<...>` slots; keep the wording.
 - Spec/disagg, no notes: `"<Speculative decoding|Disaggregated serving>: the algorithm and configuration are left to the planner to infer from the checkpoint and the codebase."`
 - Spec, no notes, MTP checkpoint: `"Speculative decoding: the checkpoint has <N> MTP layer(s) (<CONFIG KEY>); the algorithm and configuration are left to the planner to infer from the checkpoint and the codebase."`
 - Text only: `"Text model only; the vision tower and projector are out of scope."`
+- V2 multimodal: `"Follow the qwen4_exp example and the Multimodal targets section of tensorrt_llm/_torch/modeling_v2/README.md. Declare llm_class and mm_encoders with MultimodalEncoderSpec on MultimodalModelForCausalLM. Keep shared grouped encoding and cache-aware preparation. Use llm_requires_input_ids when the decoder places mm_embeds itself. Verify the adopted features. With disable_mm_encoder, check that the wrapper builds no towers and skips their keys when loading its weight mapping."`
 
 ## Output shape
 
