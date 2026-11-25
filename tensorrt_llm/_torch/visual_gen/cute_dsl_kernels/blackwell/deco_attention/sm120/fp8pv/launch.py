@@ -18,7 +18,7 @@ Launches of a call, on the current stream; each compiles once per process, devic
     * The attention kernel (kernel.py) over the whole units (query tile, head, batch), then the key-range pieces of
       the split tail; its host function builds the TMA atoms of K', V, the K' scales and v_mean.
     * The merge of the pieces (epilogue.py).
-    * For fewer than 128 keys instead: one launch of the single-tile kernel (small.py).
+A call holds at least one key tile: deco_attention.api rejects a shorter sequence.
 """
 
 from collections.abc import Callable
@@ -34,7 +34,6 @@ from ...runtime import compiled, current_stream, gmem_ptr, num_sms
 from .epilogue import PART_N, merge_partial_kernel
 from .kernel import attn_kernel
 from .layout import EP, K_STEPS, KA_BYTES, KT, LEN_BYTES, NTHR, QT, SF_BYTES, SMEM_BYTES
-from .small import SMALL_SMEM_BYTES, small_kernel
 
 MAX_SPLIT = 6  # key-range pieces per unit of the split tail, at most
 
@@ -166,43 +165,8 @@ def merge_launch(
     )
 
 
-@cute.jit
-def small_launch(
-    q_ptr: cute.Pointer,
-    k_ptr: cute.Pointer,
-    qsf_ptr: cute.Pointer,
-    ksf_ptr: cute.Pointer,
-    score_scale_ptr: cute.Pointer,
-    v_ptr: cute.Pointer,
-    vs_ptr: cute.Pointer,
-    vm_ptr: cute.Pointer,
-    o_ptr: cute.Pointer,
-    lens_ptr,
-    S: Int32,
-    H: Int32,
-    B: Int32,
-    stream: cuda.CUstream,
-):
-    small_kernel(
-        q_ptr,
-        k_ptr,
-        qsf_ptr,
-        ksf_ptr,
-        score_scale_ptr,
-        v_ptr,
-        vs_ptr,
-        vm_ptr,
-        o_ptr,
-        S,
-        H,
-        lens_ptr,
-    ).launch(grid=[1, H, B], block=[NTHR, 1, 1], smem=SMALL_SMEM_BYTES, stream=stream)
-
-
 def scratch(B: int, S: int, H: int, nsm: int) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
     """Return the scratch of the attention, name -> (dtype, shape), which every call writes before it reads it."""
-    if S < KT:
-        return {}
     nT = (S + KT - 1) // KT
     _, n_tail, parts = split_plan(nT * H * B, nT, nsm)
     return {"partial": (torch.float32, (max(1, n_tail * parts * PART_N * NTHR),))}
@@ -240,9 +204,6 @@ def run(
         args = (*ptrs, lens_ptr, *(Int32(n) for n in sizes), stream)
         compiled(_compiled, key, lambda: fn, *args)(*ptrs, lens_ptr, *sizes, stream)
 
-    if S < KT:
-        launch(small_launch, ptrs, (S, H, B))
-        return
     nT = (S + KT - 1) // KT
     plan = split_plan(nT * H * B, nT, num_sms(dev))
     partial = gmem_ptr(cutlass.Float32, buffers["partial"], 16)

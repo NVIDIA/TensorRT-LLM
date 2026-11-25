@@ -37,11 +37,19 @@ Calls:
 
 import torch
 
-from ..constants import DEFAULT_RANK
+from ..constants import DEFAULT_RANK, KEY_TILE
 from ..runtime import carve, num_sms, workspace_bytes
 from . import fp8pv, nvfp4pv
 
-__all__ = ["DEFAULT_PV", "attention", "prepare", "pv_formats", "ranks", "workspace_size"]
+__all__ = [
+    "DEFAULT_PV",
+    "attention",
+    "min_seq_len",
+    "prepare",
+    "pv_formats",
+    "ranks",
+    "workspace_size",
+]
 
 # PV format -> the package of its kernel
 _KERNELS = {"fp8": fp8pv, "nvfp4": nvfp4pv}
@@ -51,6 +59,11 @@ DEFAULT_PV = "nvfp4"
 def pv_formats() -> tuple[str, ...]:
     """Return the PV formats of the kernels of this family."""
     return tuple(_KERNELS)
+
+
+def min_seq_len(pv: str) -> int:
+    """Return the shortest sequence of the kernel of PV format pv: one key tile for "fp8", one token for "nvfp4"."""
+    return {"fp8": KEY_TILE, "nvfp4": 1}[pv]
 
 
 def ranks() -> tuple[int, ...]:

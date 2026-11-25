@@ -41,7 +41,15 @@ from ..runtime import carve, num_sms, workspace_bytes
 from . import fp8pv
 from .qk import ranks
 
-__all__ = ["DEFAULT_PV", "attention", "prepare", "pv_formats", "ranks", "workspace_size"]
+__all__ = [
+    "DEFAULT_PV",
+    "attention",
+    "min_seq_len",
+    "prepare",
+    "pv_formats",
+    "ranks",
+    "workspace_size",
+]
 
 # PV format -> the package of its kernel
 _KERNELS = {"fp8": fp8pv}
@@ -51,6 +59,11 @@ DEFAULT_PV = "fp8"
 def pv_formats() -> tuple[str, ...]:
     """Return the PV formats of the kernels of this family."""
     return tuple(_KERNELS)
+
+
+def min_seq_len(pv: str) -> int:
+    """Return the shortest sequence of the kernel of PV format pv: one token."""
+    return 1
 
 
 def workspace_size(b: int, s: int, h: int, device: torch.device | str, pv: str, rank: int) -> int:

@@ -24,7 +24,7 @@ Files (kernel.py describes the attention):
     softmax.py   the P pass: I-ExpCast landing into E4M3, lazy rescale (T = 4 binades), row and block sums
     epilogue.py  output rows, partials of the split tail and their merge launch
     scan.py      the per-tile flags of a non-finite V or v_mean
-    small.py     the kernel for fewer than 128 keys
+The kernel takes sequences of at least one key tile (128 tokens).
 """
 
 import torch

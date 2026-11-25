@@ -28,8 +28,9 @@ Kernels:
     * pv, one of pv_formats(): "fp8" (NVFP4 QK, FP8 PV) or "nvfp4" (NVFP4 QK, NVFP4 PV; on sm120, where it is the
       default); None is the family's default.
     * rank, one of ranks(): the rank of the QK compensation; 32 (the default) on every target, 64 where listed.
-    * A family package deco_attention/<family> exports pv_formats, ranks, workspace_size, prepare and attention; the
-      functions here check the caller's arguments (ValueError) and forward to it.
+    * Sequences of at least min_seq_len(pv) tokens: one token, or one key tile of 128 for "fp8" on sm120.
+    * A family package deco_attention/<family> exports pv_formats, ranks, min_seq_len, workspace_size, prepare and
+      attention; the functions here check the caller's arguments (ValueError) and forward to it.
 
 CUDA graphs:
     * prepare and attention can be captured: every scale stays on the device, nothing is read back or allocated.
@@ -92,6 +93,20 @@ def _kernel(pv: str | None, rank: int) -> tuple[ModuleType, str]:
             f"{family.ranks()}"
         )
     return family, pv
+
+
+def min_seq_len(pv: str | None = None) -> int:
+    """Return the shortest sequence that the kernel of PV format pv (None: the family's default) takes."""
+    family, pv = _kernel(pv, DEFAULT_RANK)
+    return family.min_seq_len(pv)
+
+
+def _check_seq_len(family: ModuleType, pv: str, seq_len: int) -> None:
+    if seq_len < family.min_seq_len(pv):
+        raise ValueError(
+            f"pv {pv!r} on {target.arch()} takes sequences of at least {family.min_seq_len(pv)} tokens, "
+            f"got {seq_len}"
+        )
 
 
 # The kernels move q, k, v and out through TMA descriptors and vector stores built on 256-byte aligned base addresses,
@@ -162,6 +177,7 @@ def workspace_size(
     """Return the bytes of workspace that one call of this shape needs on `device`, whose SM count sets the launch
     plans: the operands, the scratch of the preparation and the scratch of the attention."""
     family, pv = _kernel(pv, rank)
+    _check_seq_len(family, pv, seq_len)
     return family.workspace_size(batch, seq_len, heads, device, pv, rank)
 
 
@@ -197,6 +213,7 @@ def prepare(
     """
     family, pv = _kernel(pv, rank)
     shape, device = _check(None, None, token_views=True, q=q, k=k, v=v)
+    _check_seq_len(family, pv, shape[1])
     if (
         not torch.is_tensor(workspace)
         or workspace.dtype != torch.uint8

@@ -209,14 +209,12 @@ def test_deco_selection(deco_recipe) -> None:
     )
     # The algorithm selects a class on CUTEDSL only, as the config validator binds it, and
     # VC-Attention runs in the class of its backend.
-    assert (
-        get_visual_gen_attention_backend("VANILLA", quant_algorithm="deco_attention")
-        is get_visual_gen_attention_backend("VANILLA")
-    )
-    assert (
-        get_visual_gen_attention_backend("TRTLLM", quant_algorithm="vc_attention")
-        is get_visual_gen_attention_backend("TRTLLM")
-    )
+    assert get_visual_gen_attention_backend(
+        "VANILLA", quant_algorithm="deco_attention"
+    ) is get_visual_gen_attention_backend("VANILLA")
+    assert get_visual_gen_attention_backend(
+        "TRTLLM", quant_algorithm="vc_attention"
+    ) is get_visual_gen_attention_backend("TRTLLM")
     assert DeCoAttention.support_key_padding_mask()
     assert DeCoAttention.requires_trailing_padding()
     assert not DeCoAttention.support_valid_seq_len()
@@ -326,6 +324,8 @@ def test_deco_forward_matches_sdpa(
     """The output follows the scores: its error against FP32 SDPA stays below half the error of
     an attention that ignores Q and K (uniform weights) on rows that a few keys dominate."""
     device = require_deco_kernels(v_dtype)
+    if seq_len < deco_attention.min_seq_len(v_dtype):
+        pytest.skip(f"The {v_dtype} PV kernel of this GPU takes at least one key tile.")
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
     attn = _backend(num_heads, deco_recipe(v_dtype))
 
@@ -927,28 +927,22 @@ def test_deco_batch_stride_past_2_to_the_24_tokens(require_deco_kernels) -> None
     assert not out[:, valid:].any()
 
 
-def test_deco_sm120_short_sequence_takes_the_valid_length(require_deco_kernels) -> None:
-    """The SM120 FP8 kernel of a sequence shorter than one key tile attends the valid prefix of
-    a padded sample only, whatever the padding holds, and returns zero rows after it."""
+def test_deco_sm120_fp8_takes_at_least_one_key_tile(require_deco_kernels) -> None:
+    """FP8 PV on SM120 has no kernel for a sequence shorter than one key tile: the kernel API
+    names the limit and rejects a shorter sequence, while NVFP4 PV takes any length."""
     device = require_deco_kernels()
     if deco_attention.target.kernel_family() != "sm120":
-        pytest.skip("The short-sequence kernel is an SM120 kernel.")
-    seq_len, valid_seq_len, num_heads = 65, 33, 2
-    q, k, v = _random_qkv(1, seq_len, num_heads, device, q_scale=4.0)
-    lens = torch.tensor([valid_seq_len], dtype=torch.int32, device=device)
-
-    out = _kernels(q, k, v, valid_seq_lens=lens)
-
-    assert not out[:, valid_seq_len:].any()
-    prefix = out[:, :valid_seq_len].clone()
-    ref = _sdpa(q[:, :valid_seq_len], k[:, :valid_seq_len], v[:, :valid_seq_len])
-    uniform_weights = v[:, :valid_seq_len].float().mean(dim=1, keepdim=True).expand_as(ref)
-    assert _relative_error(prefix, ref) < max(0.5 * _relative_error(uniform_weights, ref), 0.02)
-    for tensor in (q, k, v):
-        tensor[:, valid_seq_len:] = float("nan")
-    out = _kernels(q, k, v, valid_seq_lens=lens)
-    assert torch.equal(out[:, :valid_seq_len], prefix)
-    assert not out[:, valid_seq_len:].any()
+        pytest.skip("The limit is that of the SM120 FP8-PV kernel.")
+    assert deco_attention.min_seq_len("fp8") == 128
+    assert deco_attention.min_seq_len("nvfp4") == 1
+    num_heads = 2
+    q, k, v = _random_qkv(1, 127, num_heads, device)
+    with pytest.raises(ValueError, match="at least 128 tokens"):
+        deco_attention.workspace_size(1, 127, num_heads, device, "fp8")
+    num_bytes = deco_attention.workspace_size(1, 128, num_heads, device, "fp8")
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="at least 128 tokens"):
+        deco_attention.prepare(q, k, v, workspace, "fp8")
 
 
 def test_deco_sm120_nvfp4_split_units_merge_a_padded_half(require_deco_kernels) -> None:

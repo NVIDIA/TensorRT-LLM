@@ -18,7 +18,7 @@ One of the three modules of the package, see its docstring. Sections:
     MMA and descriptors                 mma.sync of E4M3 (the PV of the 32-key quarters) and of BF16 (the means
                                         term), each with its ldmatrix loads behind an indexed branch
     conversions and packed arithmetic   the comparison, a per-lane zero, the step of a ring stage, and the
-                                        blocks of the softmax (fp8pv/softmax.py, fp8pv/small.py): the I-ExpCast
+                                        blocks of the softmax (fp8pv/softmax.py): the I-ExpCast
                                         landing, the E4M3 words, row sums, block sums and flags of P
     memory access                       transposed byte ldmatrix, predicated streaming stores, the release-count atomic
 """
@@ -173,7 +173,7 @@ def _landed_bits(t):
     return int((15 + t) * SUBNORMAL_ULPS)
 
 
-# the blocks of the softmax (softmax.py, small.py), down to expcast_transpose4; n ULP has the f32 bits n, TO_GRID 2^-139
+# the blocks of the softmax (softmax.py), down to packed_pv_needed; n ULP has the f32 bits n, TO_GRID 2^-139
 ULP = 2.0**-149
 TO_GRID = f32_literal(SUBNORMAL_ULPS * ULP)
 
@@ -441,39 +441,6 @@ def land_finish(xs, l0, l1, qsel, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def block_sums_of_p(P, qsel, *, loc=None, ip=None):
-    """Return the B fragments of the means MMA: the BF16 sums of P over the 16-key blocks 2 q, 2 q + 1 per row."""
-    # $0, $1: the block sums; then the operands P and qsel
-    pi, qseli = 2, 18
-    body = ["{", ".reg .b16 hl, hh;", ".reg .b32 a, b, y<8>;"] + _block_sums_decl()
-    for r in range(2):
-        for i in range(4):
-            for j, e in enumerate((2 * r, 2 * r + 1)):
-                body += [
-                    f"mov.b32 {{hl, hh}}, ${pi + 4 * i + e};",
-                    "cvt.rn.f16x2.e4m3x2 a, hl;",
-                    "cvt.rn.f16x2.e4m3x2 b, hh;",
-                ]
-                if j == 0:
-                    body.append(f"add.rn.f16x2 y{4 * r + i}, a, b;")
-                else:
-                    body += [
-                        "add.rn.f16x2 a, a, b;",
-                        f"add.rn.f16x2 y{4 * r + i}, y{4 * r + i}, a;",
-                    ]
-    body += _block_sums_ptx([f"y{k}" for k in range(8)], ["$0", "$1"], f"${qseli}")
-    body.append("}")
-    return asm(
-        "\n".join(body),
-        [i32(P[i]) for i in range(16)] + [i32(qsel)],
-        [early(Int32)] * 2,
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def packed_pv_needed(P, v_nan, *, loc=None, ip=None):
     """Return warp-uniform 1 if a word of P or v_nan is nonzero on any lane, else 0: whether the tile needs its PV MMAs.
 
@@ -501,67 +468,6 @@ def packed_pv_needed(P, v_nan, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
-
-
-@dsl_user_op
-def expcast_transpose4(acc, base: int, sc, anchor0, anchor1, sum0, sum1, *, loc=None, ip=None):
-    """Return four n-tiles (acc[base .. base + 3]) of I-ExpCast on the bit grid of FP32 as P^T words; no side effects.
-
-    * d = fma(s, sc, -anchor) in one rounding, so that one path serves every positive score scale.
-    * (d + 127 + T) 2^23 converted to u32 is the bit pattern of the FP32 2^(d + T) with a linear mantissa
-      (T = RESCALE_THRESHOLD), which cvt.rn.satfinite.e4m3x2.f32 takes directly.
-    * The conversion clamps negative values, -inf (the masked keys) and NaN to zero. The anchor is the tile max, so a
-      finite d is at most 0 and P at most 2^T: no positive overflow on this path.
-    * sum0, sum1 (rows g, g + 8; tied to their results) get the values of the quantized P (E4M3 back to f32, exact).
-    """
-    inputs = [acc[base + n][e] for n in range(4) for e in range(4)] + [sc, anchor0, anchor1]
-    # $0 .. $3: the P words; then the results sumi (the sums); then the operands: the scores, sc and the anchors
-    sumi, acci, sci, m0i, m1i = 4, 6, 22, 23, 24
-    # the offset of the conversion: d = 0 becomes the bit pattern of 2^T
-    bias = f32_literal((127 + RESCALE_THRESHOLD) * 2.0**23)
-    body = [
-        "{",
-        ".reg .f32 p<16>, z, d, nm0, nm1, f0, f1;",
-        ".reg .b32 u, w;",
-        ".reg .b16 lo, hi, h0, h1;",
-        f"neg.f32 nm0, ${m0i};",
-        f"neg.f32 nm1, ${m1i};",
-    ]
-    for n in range(4):
-        for e in range(4):
-            k = 4 * n + e
-            body += [
-                f"fma.rn.f32 d, ${acci + k}, ${sci}, nm{e // 2};",
-                f"fma.rn.f32 z, d, {f32_literal(2.0**23)}, {bias};",
-                "cvt.rzi.u32.f32 u, z;",
-                f"mov.b32 p{k}, u;",
-            ]
-    for e in range(4):
-        body += [
-            f"cvt.rn.satfinite.e4m3x2.f32 lo, p{4 + e}, p{e};",
-            f"cvt.rn.satfinite.e4m3x2.f32 hi, p{12 + e}, p{8 + e};",
-            f"mov.b32 ${e}, {{lo, hi}};",
-        ]
-        # the four values of word e belong to row e // 2: add their E4M3 values to its sum
-        for half in ("lo", "hi"):
-            body += [
-                f"cvt.rn.f16x2.e4m3x2 w, {half};",
-                "mov.b32 {h0, h1}, w;",
-                "cvt.f32.f16 f0, h0;",
-                "cvt.f32.f16 f1, h1;",
-                f"add.f32 ${sumi + e // 2}, ${sumi + e // 2}, f0;",
-                f"add.f32 ${sumi + e // 2}, ${sumi + e // 2}, f1;",
-            ]
-    body.append("}")
-    r = asm(
-        "\n".join(body),
-        [f32(x) for x in inputs] + [tied(sumi, f32(sum0)), tied(sumi + 1, f32(sum1))],
-        [early(Int32)] * 4 + [early(Float32)] * 2,
-        side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-    return r[:4], r[4], r[5]
 
 
 # -------------------------------------------------------------------------------- Memory access

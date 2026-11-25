@@ -41,12 +41,14 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
 | Function | Result |
 |---|---|
 | `pv_formats()`, `ranks()` | The PV formats and the ranks of the current GPU; `NotImplementedError` on a GPU without kernels. |
+| `min_seq_len(pv)` | The shortest sequence of the kernel: one token, or 128 for `"fp8"` on `sm120`. |
 | `workspace_size(batch, seq_len, heads, device, pv, rank)` | The bytes of workspace of a call, a small multiple of the bytes of `q`. |
 | `prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens)` | The operands of the attention, views into the workspace that hold until it is written again. |
 | `attention(operands, out)` | `out`, written by the attention kernel. |
 | `sample_rows(seq_len, device, token_tags, rank)` | The default `rows` of `prepare`. |
 
-`workspace_size` and `prepare` raise `ValueError` for a PV format or rank that the GPU does not offer.
+`workspace_size` and `prepare` raise `ValueError` for a PV format or rank that the GPU does not offer and for a
+sequence shorter than `min_seq_len(pv)`.
 
 - **Tensors.** `q`, `k`, `v` and `out` are BF16 tensors of one shape on one device, at 256-byte aligned addresses:
   every allocation is, and a view into one at an offset of a multiple of 128 elements. `out` is contiguous; `q`, `k`
