@@ -128,9 +128,9 @@ from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, get_attached_mm_bytes,
-                          get_draft_token_length, get_mm_context_chunk_start,
-                          get_mm_items_for_chunk, get_mm_pending_items,
+                          MultimodalEncoderRequestError, get_draft_token_length,
+                          get_mm_context_chunk_start, get_mm_items_for_chunk,
+                          get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
@@ -9860,10 +9860,7 @@ class PyExecutor:
         Chunked DEFAULT scheduling charges only the current chunk; EAGER
         also charges future items. New requests preserve waiting-queue FCFS
         order: once the head cannot make encoder progress, later requests
-        are deferred and prepended to the waiting queue. Requests with
-        attached precomputed embeddings are charged their bytes against the
-        encoder-output budget, once per sequence, net of the attached bytes
-        active requests still hold.
+        are deferred and prepended to the waiting queue.
         """
         remaining_batch_slots = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
@@ -9903,19 +9900,6 @@ class PyExecutor:
                 consume_pending(state.encoder_token_lengths,
                                 pending_item_indices)
 
-        # Attached precomputed embeddings skip the encoder but sit on the
-        # device whole until prefill strips them; their sum shares the
-        # encoder-output byte budget.
-        attached_budget_bytes = self.model_engine.mm_encoder_output_budget_bytes
-        bytes_per_embedding = (self.model_engine.bytes_per_mm_encoder_embedding
-                               or 0)
-        remaining_attached_bytes = None
-        if attached_budget_bytes is not None:
-            remaining_attached_bytes = attached_budget_bytes - sum(
-                get_attached_mm_bytes(request.py_multimodal_data,
-                                      bytes_per_embedding)
-                for request in self.active_requests)
-
         admitted = []
         deferred = []
         blocked = False
@@ -9929,16 +9913,6 @@ class PyExecutor:
                                  if isinstance(mm_data, dict) else None)
                 if item_metadata is not None:
                     item_metadata.validate()
-                has_full_embedding = (isinstance(mm_data, dict)
-                                      and mm_data.get("multimodal_embedding")
-                                      is not None)
-                attached_bytes = None
-                if has_full_embedding and remaining_attached_bytes is not None:
-                    # Each child sequence holds its own copy of the parent's
-                    # multimodal data.
-                    num_sequences = 1 + len(queue_item.child_req_ids or ())
-                    attached_bytes = num_sequences * get_attached_mm_bytes(
-                        mm_data, bytes_per_embedding)
             except (TypeError, ValueError):
                 # Admission only estimates capacity. Pass malformed requests
                 # through so the normal request-scoped validation path can
@@ -9948,17 +9922,9 @@ class PyExecutor:
                 continue
             costs = (item_metadata.encoder_token_lengths
                      if item_metadata is not None else None)
-            if attached_bytes is not None:
-                if attached_bytes > attached_budget_bytes:
-                    # Request validation rejects the sequence group with
-                    # guidance.
-                    admitted.append(queue_item)
-                    continue
-                if attached_bytes > remaining_attached_bytes:
-                    blocked = True
-                    deferred.append(queue_item)
-                    continue
-                remaining_attached_bytes -= attached_bytes
+            has_full_embedding = (isinstance(mm_data, dict)
+                                  and mm_data.get("multimodal_embedding")
+                                  is not None)
             if costs and any(cost > self.model_engine.encoder_max_num_tokens
                              for cost in costs):
                 # Admit the invalid request so normal request validation can

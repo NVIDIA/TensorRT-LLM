@@ -1484,7 +1484,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_logits_post_processors=(self.py_logits_post_processors.copy()
                                        if self.py_logits_post_processors
                                        is not None else None),
-            py_multimodal_data=deepcopy(self.py_multimodal_data),
+            py_multimodal_data=deepcopy(
+                self.py_multimodal_data,
+                _shared_attachment_memo(self.py_multimodal_data)),
             encoder_input_features=self.py_encoder_input_features,
             locality_domain_id=self.py_locality_domain_id,
         )
@@ -1587,45 +1589,20 @@ def format_multimodal_encoder_output_budget_error(
         f"{chunking_hint}")
 
 
-def get_attached_mm_bytes(mm_data: Any,
-                          bytes_per_encoder_embedding: int) -> int:
-    """Return the bytes of precomputed MM embeddings attached to a request.
+def _shared_attachment_memo(
+        mm_data: Optional[Dict[str, Any]]) -> Dict[int, torch.Tensor]:
+    """Return a deepcopy memo that shares attached embedding tensors.
 
-    Attached embeddings bypass the encoder and its output cache, and prefill
-    moves them to the device whole, so all of them are resident at once. The
-    tensors' own sizes count; embeddings not yet restored to tensors count
-    their declared rows at the model's row size. Returns 0 when nothing is
-    attached, including after prefill stripped the embeddings. Raises
-    `ValueError` when non-tensor embeddings declare no output lengths.
+    Prefill only reads the attachment, so the sequences of an n>1 request can
+    share it instead of each holding a copy.
     """
-    if not isinstance(mm_data, dict):
-        return 0
-    embedding = mm_data.get("multimodal_embedding")
-    if embedding is None:
-        return 0
+    embedding = (mm_data.get("multimodal_embedding") if isinstance(
+        mm_data, dict) else None)
     tensors = embedding if isinstance(embedding, (list, tuple)) else [embedding]
-    if all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-    item_metadata = get_multimodal_item_metadata(mm_data)
-    lengths = (item_metadata.output_embedding_lengths
-               if item_metadata is not None else None)
-    if lengths is None:
-        raise ValueError("Attached multimodal embeddings that are not tensors "
-                         "require output_embedding_lengths")
-    return sum(lengths) * bytes_per_encoder_embedding
-
-
-def format_attached_mm_embedding_budget_error(
-        required_bytes: int,
-        budget_bytes: int,
-        request_id: Optional[int] = None) -> str:
-    """Format guidance for attached embeddings that exceed the MM output budget."""
-    request_label = ("Multimodal request" if request_id is None else
-                     f"Multimodal request {request_id}")
-    return (f"{request_label} attaches {required_bytes} bytes of precomputed "
-            "embeddings but the encoder output budget is only "
-            f"{budget_bytes} bytes; raise encoder_max_num_tokens to serve "
-            "embeddings of this size")
+    return {
+        id(tensor): tensor
+        for tensor in tensors if isinstance(tensor, torch.Tensor)
+    }
 
 
 def get_mm_max_resident_embeddings(
@@ -1681,8 +1658,9 @@ def initialize_multimodal_encoder_request(
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the outputs that must be resident at once could never fit
-    (see `get_mm_max_resident_embeddings`), or the attached precomputed
-    embeddings of the request and its child sequences alone exceed it.
+    (see `get_mm_max_resident_embeddings`), or attached precomputed
+    embeddings do not fill exactly the prompt's embedding slots, which
+    prefill slices them by.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1708,22 +1686,19 @@ def initialize_multimodal_encoder_request(
                 f"Multimodal item requires {largest} encoder tokens, exceeding "
                 f"the effective startup maximum {max_num_tokens}")
 
-    if has_full_embedding and max_output_bytes is not None:
-        # Admission passes malformed metadata through uncharged; reject it here.
-        item_metadata = get_multimodal_item_metadata(mm_data)
-        if item_metadata is not None:
-            item_metadata.validate()
-        # Each child sequence holds its own copy of the parent's multimodal
-        # data, so the parent is charged for the whole sequence group.
-        num_sequences = 1 + len(request.child_requests)
-        attached_bytes = num_sequences * get_attached_mm_bytes(
-            mm_data, bytes_per_encoder_embedding)
-        if attached_bytes > max_output_bytes:
-            raise ValueError(
-                format_attached_mm_embedding_budget_error(
-                    attached_bytes,
-                    max_output_bytes,
-                    request_id=request.py_request_id))
+    if has_full_embedding:
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        embedding = mm_data["multimodal_embedding"]
+        tensors = (embedding if isinstance(embedding,
+                                           (list, tuple)) else [embedding])
+        if cumsum is not None and all(
+                isinstance(tensor, torch.Tensor) for tensor in tensors):
+            rows = sum(tensor.shape[0] for tensor in tensors)
+            slots = int(cumsum[-1]) if len(cumsum) else 0
+            if rows != slots:
+                raise ValueError(
+                    f"Attached multimodal embeddings have {rows} rows but the "
+                    f"prompt has {slots} multimodal embedding slots")
 
     request.py_mm_encoder_state = None
     if token_lengths is not None:

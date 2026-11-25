@@ -659,6 +659,32 @@ class MultimodalItemScheduler:
             expected_dtype = self.model.model_config.torch_dtype
         return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
 
+    def _slice_attached_embedding(
+        self, request: LlmRequest, runtime: MultimodalRuntimeData | None
+    ) -> dict[str, Any] | None:
+        """Attach only this forward's rows of precomputed embeddings.
+
+        The request keeps the full attachment on the host, so the device holds
+        at most one forward's rows of it, as with encoder outputs. Without
+        runtime row placement, prefill is one-shot and uses every row.
+        """
+        multimodal_data = request.py_multimodal_data
+        embedding = (
+            multimodal_data.get("multimodal_embedding")
+            if isinstance(multimodal_data, dict)
+            else None
+        )
+        if embedding is None or runtime is None:
+            return multimodal_data
+        start = runtime.num_cached_mm_tokens
+        pieces = list(embedding) if isinstance(embedding, (list, tuple)) else [embedding]
+        rows = _join_embeddings(pieces, start=start, end=start + runtime.num_mm_tokens_in_chunk)
+        dtype, _ = self._embedding_dtype_and_width()
+        multimodal_data = dict(multimodal_data)
+        multimodal_data["multimodal_embedding"] = rows.to(dtype)
+        multimodal_data["multimodal_embedding_is_chunk"] = True
+        return multimodal_data
+
     def build_multimodal_data_for_llm(
         self, request: LlmRequest, runtime: MultimodalRuntimeData | None = None
     ) -> dict[str, Any] | None:
@@ -672,7 +698,7 @@ class MultimodalItemScheduler:
         """
         state = request.py_mm_encoder_state
         if state is None:
-            return request.py_multimodal_data
+            return self._slice_attached_embedding(request, runtime)
         encoder_cache = self.encoder_cache
         if encoder_cache is None:
             raise RuntimeError("MM request state requires an encoder cache")

@@ -1809,7 +1809,13 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
     def test_item_scheduled_chunk_embedding_is_not_retained(self) -> None:
         """The per-forward item-scheduler payload must not replace the
         request's own multimodal data, or each chunked prefill would keep its
-        last chunk's joined embedding rows until prefill completes."""
+        last chunk's joined embedding rows until prefill completes. Attached
+        embeddings have no encoder state but are sliced the same way."""
+        for attached in (False, True):
+            with self.subTest(attached=attached):
+                self._check_chunk_embedding_is_not_retained(attached)
+
+    def _check_chunk_embedding_is_not_retained(self, attached: bool) -> None:
         (preparer, kv_cache_manager) = self.enterContext(input_preparer_and_kv_cache())
         preparer.model.config.vocab_size = 100
         attn_metadata = AttentionMetadata(
@@ -1820,7 +1826,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_chunk_size = 2
         context.py_seq_slot = 0
-        context.py_mm_encoder_state = object()
+        context.py_mm_encoder_state = None if attached else object()
         multimodal_data = {
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("image", 0)], output_embedding_lengths=[2]

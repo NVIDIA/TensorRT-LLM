@@ -1643,7 +1643,9 @@ class DecoderInputPreparer:
             # joined rows. Keep it off the request so chunked prefill does not retain rows
             # outside the encoder-cache budget, and keeps its full CPU payload for later
             # items and a restarted prefill. Legacy requests keep their generation payload.
-            if request.py_mm_encoder_state is None:
+            if request.py_mm_encoder_state is None and not multimodal_params.multimodal_data.get(
+                "multimodal_embedding_is_chunk", False
+            ):
                 request.py_multimodal_data = multimodal_params.multimodal_data
             multimodal_params_list.append(multimodal_params)
 

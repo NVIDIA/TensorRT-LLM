@@ -27,7 +27,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     MultimodalEncoderRequestError,
     MultimodalEncoderRequestState,
-    get_attached_mm_bytes,
     get_mm_items_for_chunk,
     get_multimodal_encoder_token_lengths,
     initialize_multimodal_encoder_request,
@@ -892,8 +891,6 @@ def _executor_for_mm_admission(active_requests, *, max_batch_size=8, max_num_tok
         model_engine=SimpleNamespace(
             encoder_batch_size=max_batch_size,
             encoder_max_num_tokens=max_num_tokens,
-            mm_encoder_output_budget_bytes=None,
-            bytes_per_mm_encoder_embedding=None,
         ),
         active_requests=active_requests,
     )
@@ -1020,165 +1017,6 @@ def test_mm_admission_marks_only_admitted_requests():
 
     assert [item.id for item in admitted] == [1]
     assert marked == [[1]]
-
-
-def _attached_request(request_id: int, rows: int, width: int = 4) -> LlmRequest:
-    """Make a request carrying `rows` precomputed float32 embedding rows."""
-    params = MultimodalParams.from_embeddings(
-        [torch.zeros(rows, width)],
-        MultimodalItemMetadata(
-            item_refs=[("image", 0)],
-            encoder_token_lengths=[rows],
-            output_embedding_lengths=[rows],
-        ),
-        multimodal_positions=[1],
-        multimodal_lengths=[rows],
-    )
-    return make_llm_request(request_id, multimodal_data=params.multimodal_data)
-
-
-def _attached_waiting_item(request_id: int, rows: int) -> RequestQueueItem:
-    return RequestQueueItem(request_id, _attached_request(request_id, rows))
-
-
-def test_attached_embeddings_larger_than_output_budget_fail_the_request() -> None:
-    request = _attached_request(1, rows=3)  # 3 rows * 4 floats * 4 bytes = 48
-    budget = dict(max_num_tokens=8, bytes_per_encoder_embedding=16)
-    initialize_multimodal_encoder_request(request, max_output_bytes=48, **budget)
-    assert request.py_mm_encoder_state is None
-    with pytest.raises(ValueError, match="attaches 48 bytes of precomputed") as exc_info:
-        initialize_multimodal_encoder_request(request, max_output_bytes=47, **budget)
-    assert "Multimodal request 1" in str(exc_info.value)
-    assert "raise encoder_max_num_tokens" in str(exc_info.value)
-
-
-def test_attached_non_tensor_embeddings_are_sized_by_declared_rows() -> None:
-    request = _attached_request(1, rows=3)
-    request.py_multimodal_data["multimodal_embedding"] = ["handle"]
-    budget = dict(max_num_tokens=8, bytes_per_encoder_embedding=16)
-    assert get_attached_mm_bytes(request.py_multimodal_data, 16) == 48
-    initialize_multimodal_encoder_request(request, max_output_bytes=48, **budget)
-    with pytest.raises(ValueError, match="attaches 48 bytes of precomputed"):
-        initialize_multimodal_encoder_request(request, max_output_bytes=47, **budget)
-
-
-def test_mm_admission_defers_attached_embeddings_beyond_shared_budget() -> None:
-    """Concurrent attached requests share the budget in FCFS order."""
-    waiting = FCFSWaitingQueue(
-        [
-            _attached_waiting_item(1, rows=2),  # 32 bytes
-            _attached_waiting_item(2, rows=2),  # 32 bytes, exceeds the remaining 16
-            _waiting_item(3, [1]),  # held behind the blocked head
-        ]
-    )
-    executor = _executor_for_mm_admission([])
-    executor.model_engine.mm_encoder_output_budget_bytes = 48
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
-
-    assert [item.id for item in admitted] == [1]
-    assert [item.id for item in waiting] == [2, 3]
-
-
-def test_mm_admission_charges_attached_bytes_per_child_sequence() -> None:
-    """Child sequences copy the attachment, so an n=2 request is charged twice."""
-    parent = _attached_waiting_item(1, rows=2)  # 32 bytes per sequence
-    parent.child_req_ids = [10]
-    waiting = FCFSWaitingQueue([_attached_waiting_item(2, rows=1), parent])
-    executor = _executor_for_mm_admission([])
-    executor.model_engine.mm_encoder_output_budget_bytes = 64
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
-
-    assert [item.id for item in admitted] == [2]
-    assert [item.id for item in waiting] == [1]
-
-
-def test_attached_sequence_group_over_budget_fails_the_parent() -> None:
-    """Each child copies the attachment, so the parent is charged for the whole group."""
-    request = _attached_request(1, rows=2)  # 32 bytes per sequence
-    budget = dict(max_num_tokens=8, bytes_per_encoder_embedding=16)
-    initialize_multimodal_encoder_request(request, max_output_bytes=48, **budget)
-    request.child_requests.append(_attached_request(10, rows=2))
-    with pytest.raises(ValueError, match="attaches 64 bytes of precomputed"):
-        initialize_multimodal_encoder_request(request, max_output_bytes=48, **budget)
-
-
-def test_mm_admission_passes_sequence_group_over_budget_to_validation() -> None:
-    group = _attached_waiting_item(1, rows=2)  # 32 bytes per sequence, 64 in all
-    group.child_req_ids = [10]
-    executor = _executor_for_mm_admission([])
-    executor.model_engine.mm_encoder_output_budget_bytes = 48
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    waiting = FCFSWaitingQueue([group, _attached_waiting_item(2, rows=1)])
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
-
-    assert [item.id for item in admitted] == [1, 2]
-    assert not waiting
-
-
-def test_mm_admission_charges_attached_bytes_until_prefill_strips_them() -> None:
-    active = _attached_request(1, rows=2)  # holds 32 of 48 bytes
-    executor = _executor_for_mm_admission([active])
-    executor.model_engine.mm_encoder_output_budget_bytes = 48
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    waiting = FCFSWaitingQueue([_attached_waiting_item(2, rows=2)])
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
-    assert not admitted
-    assert [item.id for item in waiting] == [2]
-
-    del active.py_multimodal_data["multimodal_embedding"]
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
-    assert [item.id for item in admitted] == [2]
-    assert not waiting
-
-
-def test_mm_admission_passes_attached_embeddings_over_budget_to_validation() -> None:
-    waiting = FCFSWaitingQueue([_attached_waiting_item(1, rows=4), _waiting_item(2, [1])])
-    executor = _executor_for_mm_admission([])
-    executor.model_engine.mm_encoder_output_budget_bytes = 48
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
-
-    assert [item.id for item in admitted] == [1, 2]
-    assert not waiting
-
-
-def test_attached_embeddings_with_malformed_metadata_fail_the_request() -> None:
-    """Admission passes them through uncharged, so validation must reject them."""
-    request = _attached_request(1, rows=2)
-    request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = object()
-    with pytest.raises(TypeError):
-        initialize_multimodal_encoder_request(
-            request, max_num_tokens=8, max_output_bytes=48, bytes_per_encoder_embedding=16
-        )
-
-
-def test_attached_non_tensor_embeddings_without_lengths_fail_the_request() -> None:
-    """Unsized handles fail the request at validation and pass admission through."""
-    request = _attached_request(1, rows=2)
-    request.py_multimodal_data["multimodal_embedding"] = ["handle"]
-    request.py_multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-        item_refs=[("image", 0)], encoder_token_lengths=[2]
-    )
-    with pytest.raises(ValueError, match="require output_embedding_lengths"):
-        initialize_multimodal_encoder_request(
-            request, max_num_tokens=8, max_output_bytes=48, bytes_per_encoder_embedding=16
-        )
-
-    waiting = FCFSWaitingQueue([RequestQueueItem(1, request), _waiting_item(2, [1])])
-    executor = _executor_for_mm_admission([])
-    executor.model_engine.mm_encoder_output_budget_bytes = 48
-    executor.model_engine.bytes_per_mm_encoder_embedding = 16
-
-    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
-
-    assert [item.id for item in admitted] == [1, 2]
 
 
 def test_item_encoder_slices_and_restores_selected_item_order():

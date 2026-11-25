@@ -947,6 +947,101 @@ def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
     assert "image" in request.py_multimodal_data
 
 
+class _FloatModel(MultimodalModelMixin):
+    embedding_dtype = torch.float32
+
+
+def _attached_request(
+    embedding: torch.Tensor | list[torch.Tensor], embed_mask_cumsum: list[int]
+) -> LlmRequest:
+    return make_llm_request(
+        1,
+        multimodal_data={
+            "multimodal_embedding": embedding,
+            "multimodal_embed_mask_cumsum": torch.tensor(embed_mask_cumsum),
+        },
+        input_tokens=list(range(len(embed_mask_cumsum))),
+    )
+
+
+@pytest.mark.parametrize("as_list", [False, True], ids=["tensor", "list"])
+@pytest.mark.parametrize(
+    ("window", "rows"),
+    [((0, 8), (0, 5)), ((0, 3), (0, 2)), ((3, 8), (2, 5)), ((3, 5), (2, 2))],
+    ids=["whole", "first_chunk", "reused_prefix", "text_only_chunk"],
+)
+def test_attached_embedding_is_sliced_to_the_forward_rows(
+    as_list: bool, window: tuple[int, int], rows: tuple[int, int]
+) -> None:
+    mm_item_scheduler = bare_mm_item_scheduler(_FloatModel())
+    mm_item_scheduler.bytes_per_embedding = 8
+    attachment = torch.arange(10, dtype=torch.float16).reshape(5, 2)
+    embedding = [attachment[:2], attachment[2:]] if as_list else attachment
+    # Two image-A slots, a text-only gap, then three image-B slots.
+    request = _attached_request(embedding, [0, 1, 2, 2, 2, 3, 4, 5])
+    initialize_multimodal_encoder_request(request, max_num_tokens=8)
+    runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
+        past_seen_token_num=window[0],
+        chunk_end_pos=window[1],
+    )
+
+    multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+
+    output = multimodal_data["multimodal_embedding"]
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, attachment[rows[0] : rows[1]].float())
+    assert multimodal_data["multimodal_embedding_is_chunk"]
+    # The request keeps the whole attachment for later chunks.
+    assert request.py_multimodal_data["multimodal_embedding"] is embedding
+    assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
+
+
+def test_attached_embedding_without_row_placement_is_attached_whole() -> None:
+    mm_item_scheduler = bare_mm_item_scheduler(_FloatModel())
+    request = make_llm_request(1, multimodal_data={"multimodal_embedding": torch.ones(2, 2)})
+    initialize_multimodal_encoder_request(request, max_num_tokens=8)
+
+    assert mm_item_scheduler.build_multimodal_data_for_llm(request) is request.py_multimodal_data
+
+
+@pytest.mark.parametrize("embed_mask_cumsum", [[0, 1, 2, 2], [0, 1, 2, 3, 4, 5, 6]])
+def test_attached_embedding_rows_must_fill_prompt_embedding_slots(
+    embed_mask_cumsum: list[int],
+) -> None:
+    request = _attached_request(torch.ones(5, 2), embed_mask_cumsum)
+    with pytest.raises(ValueError, match="have 5 rows but the prompt has"):
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
+
+
+def test_child_sequences_share_the_attached_embedding() -> None:
+    sampling_config = tensorrt_llm.bindings.SamplingConfig()
+    sampling_config.num_return_sequences = 2
+    attachment = [torch.ones(2, 2), torch.zeros(3, 2)]
+    parent = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[0, 1, 2],
+        sampling_config=sampling_config,
+        is_streaming=False,
+        py_multimodal_data={
+            "multimodal_embedding": attachment,
+            "multimodal_embed_mask_cumsum": torch.tensor([0, 1, 2]),
+        },
+    )
+
+    parent.create_child_request(2)
+
+    child_data = parent.child_requests[0].py_multimodal_data
+    assert child_data is not parent.py_multimodal_data
+    assert child_data["multimodal_embedding"] is not attachment
+    assert all(a is b for a, b in zip(child_data["multimodal_embedding"], attachment))
+    assert (
+        child_data["multimodal_embed_mask_cumsum"]
+        is not parent.py_multimodal_data["multimodal_embed_mask_cumsum"]
+    )
+
+
 class MultimodalSetupTestCase(unittest.TestCase):
     def test_build_request_multimodal_input_skips_when_cache_disabled(self) -> None:
         request = LlmRequest(
