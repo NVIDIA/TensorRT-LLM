@@ -411,6 +411,13 @@ _TP4 = dict(
 )
 # Attention replicated, each rank serving its own requests; the routed experts by expert.
 _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
+# The same over two nodes of four GPUs.
+_DEP8 = dict(
+    tensor_parallel_size=8,
+    moe_expert_parallel_size=8,
+    enable_attention_dp=True,
+    gpus_per_node=4,
+)
 
 # The quantized KV pools: NVFP4 at tp4 with the breakable prefill graph (routed at attention
 # TP only); FP8 at dep4 (MTP under attention DP, each rank drafting for its own requests); FP8
@@ -427,7 +434,11 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # another K split; SM103 only), and once more with the two opt-in attention-DP row ranges: the
 # grouped sparse GQA from 2 requests a rank (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another
 # summation order than split-K) and the cluster top-k up to 256 rows
-# (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`).
+# (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`). Then the whole attention-DP stack the AgentX
+# front points run, every opt-in form together on top of the default ones (host-indexed Lamport
+# slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
+# widest; SM103 only), at dep4 and at dep8 (two nodes of one rack).
+_DP_FRONT_STACK = dict(lamport="lamport_step", router_front=True, out_proj_bf16="all", dp_rows=True)
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -470,6 +481,28 @@ _QUANTIZED_KV = [
         ),
     ),
     pytest.param(
+        _DEP4,
+        "fp8",
+        _DP_FRONT_STACK,
+        id="dep4_fp8_kv_front_stack",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP8,
+        "fp8",
+        _DP_FRONT_STACK,
+        id="dep8_fp8_kv_front_stack",
+        marks=[
+            skip_not_in_a_world_across_nodes,
+            pytest.mark.skip_less_mpi_world_size(8),
+            pytest.mark.skipif(
+                get_sm_version() != 103, reason="the Lamport MoE round trip runs on SM103"
+            ),
+        ],
+    ),
+    pytest.param(
         _TEP4,
         "fp8",
         dict(flashinfer_ring=True),
@@ -494,12 +527,6 @@ _QUANTIZED_KV = [
 # dep8 (attention DP over two nodes of four GPUs), the last once more with the MoE round trip on
 # the Lamport transport with host-indexed slots (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport_step`,
 # SM103 only; MNNVL peer memory, so both nodes in one rack). Each case: (layout, extra env).
-_DEP8 = dict(
-    tensor_parallel_size=8,
-    moe_expert_parallel_size=8,
-    enable_attention_dp=True,
-    gpus_per_node=4,
-)
 _MTP3_LAYOUTS = [
     pytest.param(
         dict(
