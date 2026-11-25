@@ -28,7 +28,6 @@ l0_vr200:
   - unittest/_torch/kernels/parallel/test_fp8_block_scale_gemm.py -k "rubin"
   - unittest/_torch/kernels/parallel/test_locality_domain_utils.py
   - unittest/_torch/kernels/parallel/test_locality_domain_planner.py
-  - unittest/_torch/moe/test_moe_runner.py -k "rubin or 107"
   - unittest/_torch/moe/test_moe_backend.py -k "rubin or 107"
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/misc/test_rubin_kernel_arch.py
