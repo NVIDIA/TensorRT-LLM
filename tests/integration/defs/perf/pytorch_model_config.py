@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from ..conftest import get_llm_root, get_sm_version, llm_models_root
+from ._model_paths import MODEL_PATH_DICT
 
 
 def recursive_update(d: dict, u: dict) -> dict:
@@ -37,8 +38,11 @@ def _kv_without_reuse(**options: object) -> dict:
     return {'enable_block_reuse': False, **options}
 
 
-def _mtp(max_draft_len: int) -> dict:
-    return {'decoding_type': 'MTP', 'max_draft_len': max_draft_len}
+def _speculative(decoding_type: str, max_draft_len: int,
+                 **options: object) -> dict:
+    return dict(decoding_type=decoding_type,
+                max_draft_len=max_draft_len,
+                **options)
 
 
 _CURATED_PRESETS = {
@@ -56,21 +60,7 @@ _CURATED_PRESETS = {
 PERF_CONFIG_PRESETS = _CURATED_PRESETS | {'reuse', 'noreuse', 'mtp3'}
 
 
-@cache
-def get_perf_config_preset(selection: str) -> dict:
-    """Resolve one cfg selection. Copy the cached options before merging them."""
-    name, *overrides = selection.split(',')
-    if selection == 'mtp3':
-        return {'speculative_config': _mtp(3)}
-    if selection in ('reuse', 'noreuse'):
-        kv = {'enable_block_reuse': selection == 'reuse'}
-        if selection == 'reuse':
-            # Hybrid models reuse prefixes up to a recurrent-state snapshot.
-            kv['mamba_state_config'] = {'periodic_snapshot_interval': 8192}
-        return {'kv_cache_config': kv}
-    if name not in _CURATED_PRESETS:
-        raise ValueError(f"Unknown cfg selection {selection!r}; known presets: "
-                         f"{sorted(PERF_CONFIG_PRESETS)}")
+def _load_curated_config(name: str) -> dict:
     path = Path(get_llm_root()) / 'examples/configs/curated' / name
     with path.open() as stream:
         config = yaml.safe_load(stream)
@@ -80,44 +70,66 @@ def get_perf_config_preset(selection: str) -> dict:
                   'max_num_tokens'):
         config.pop(field, None)
     config.get('kv_cache_config', {}).pop('free_gpu_memory_fraction', None)
+    return config
+
+
+@cache
+def get_perf_config_preset(selection: str) -> dict:
+    """Resolve a preset or a comma-separated list of case-specific fields."""
+    if selection == 'mtp3':
+        return {'speculative_config': _speculative('MTP', 3)}
+    if selection in ('reuse', 'noreuse'):
+        kv = {'enable_block_reuse': selection == 'reuse'}
+        if selection == 'reuse':
+            # Hybrid models reuse prefixes up to a recurrent-state snapshot.
+            kv['mamba_state_config'] = {'periodic_snapshot_interval': 8192}
+        return {'kv_cache_config': kv}
+
+    overrides = selection.split(',')
+    config = {}
+    if '=' not in overrides[0]:
+        name = overrides.pop(0)
+        if name not in _CURATED_PRESETS:
+            raise ValueError(
+                f"Unknown cfg selection {selection!r}; known presets: "
+                f"{sorted(PERF_CONFIG_PRESETS)}")
+        config = _load_curated_config(name)
+
+    boolean_fields = ('print_iter_log', 'enable_attention_dp',
+                      'enable_chunked_prefill', 'disable_overlap_scheduler')
     integer_fields = ('max_seq_len', 'stream_interval',
-                      'num_postprocess_workers')
+                      'num_postprocess_workers', 'max_draft_len', 'block_size',
+                      'periodic_snapshot_interval')
     for override in overrides:
         field, _, value = override.partition('=')
         if value == 'default' and field in config:
-            # Inherit the value from the model, bench or serve.
             del config[field]
-        elif field == 'print_iter_log' and value in ('true', 'false'):
+        elif field in boolean_fields and value in ('true', 'false'):
             config[field] = value == 'true'
+        elif field == 'decoding_type' and value == 'DSpark':
+            config.setdefault('speculative_config', {})[field] = value
         elif (field in integer_fields and value.isascii() and value.isdecimal()
               and (int(value) > 0 or field == 'num_postprocess_workers')):
-            config[field] = int(value)
+            target = config
+            if field in ('max_draft_len', 'block_size'):
+                target = config.setdefault('speculative_config', {})
+            elif field == 'periodic_snapshot_interval':
+                target = config.setdefault('kv_cache_config', {}).setdefault(
+                    'mamba_state_config', {})
+            target[field] = int(value)
         else:
-            raise ValueError(f"Invalid override {override!r} for {name}")
+            raise ValueError(f"Invalid override {override!r} in {selection!r}")
     return config
 
 
-def _dspark(max_draft_len: int,
-            draft_model: str | None = None,
-            *,
-            block_size: int | None = None) -> dict:
-    config = {'decoding_type': 'DSpark', 'max_draft_len': max_draft_len}
-    if draft_model is not None:
-        config['speculative_model'] = f'{llm_models_root()}/{draft_model}'
-    if block_size is not None:
-        config['block_size'] = block_size
-    return config
-
-
-def _eagle3(draft_model: str) -> dict:
-    return {
-        'enable_autotuner': False,
-        'speculative_config': {
-            'decoding_type': 'Eagle',
-            'max_draft_len': 3,
-            'speculative_model_dir': f'{llm_models_root()}/{draft_model}',
-        },
-    }
+_DEEPSEEK_PRO_DSPARK = {
+    'deepseek_v4_pro_dspark', 'deepseek_v4_pro_nvfp4_dspark'
+}
+_EAGLE3_DRAFTS = {
+    'qwen3_235b_a22b_fp4_eagle3': 'Qwen3/qwen3-235B-eagle3',
+    'gpt_oss_120b_eagle3': 'gpt_oss/gpt-oss-120b-Eagle3',
+    'gpt_oss_120b_eagle3_throughput': 'gpt_oss/gpt-oss-120b-Eagle3-throughput',
+}
 
 
 def _apply_model_overrides(config: dict, label: str) -> None:
@@ -148,26 +160,19 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             sparse_attention_config={'algorithm': 'csa2'},
         )
 
-    if 'deepseek_v41_flash_nvfp4_dspark' in label:
-        update(speculative_config=_dspark(5, block_size=5))
-
     flash = 'deepseek_v4_flash-bench' in label
     flash_base = 'deepseek_v4_flash_base' in label
-    dspark = 'deepseek_v4_pro_dspark' in label
-    nvfp4_dspark = 'deepseek_v4_pro_nvfp4_dspark' in label
-    if flash or flash_base or dspark or nvfp4_dspark:
+    dspark = model in _DEEPSEEK_PRO_DSPARK
+    if flash or flash_base or dspark:
         update(enable_attention_dp=True, max_seq_len=10240)
     if flash:
         update(moe_config={'backend': 'TRTLLM'}, enable_chunked_prefill=True)
-    if dspark or nvfp4_dspark:
+    if dspark:
         update(kv_cache_config=_kv_without_reuse(),
                enable_chunked_prefill=False,
                disable_overlap_scheduler=True,
                custom_tokenizer='deepseek_v4')
-    if dspark:
-        update(moe_config={'backend': 'MEGAMOE_DEEPGEMM'},
-               speculative_config=_dspark(5, 'DeepSeek-V4-Pro-DSpark'))
-    if nvfp4_dspark:
+    if model == 'deepseek_v4_pro_nvfp4_dspark':
         # Single-node adaptation of the disaggregated NVFP4 recipe for 8K prefill.
         update(enable_lm_head_tp_in_adp=True,
                moe_config={
@@ -175,16 +180,14 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                    'use_low_precision_moe_combine': True
                },
                kv_cache_config={'dtype': 'fp8'},
-               speculative_config=_dspark(3,
-                                          'DeepSeek-V4-Pro-nvfp4-DSpark',
-                                          block_size=3))
+               speculative_config=_speculative('DSpark', 3, block_size=3))
 
     if 'qwen3.8_max_fp4_mtp-serve-pytorch' in label:
         update(max_seq_len=8192,
                cuda_graph_config={'max_batch_size': 32},
                kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
                moe_config={'backend': 'TRTLLM'},
-               speculative_config=_mtp(3))
+               speculative_config=_speculative('MTP', 3))
     if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
         update(
             modeling_v2='require',
@@ -234,11 +237,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(enable_chunked_prefill=True,
                max_seq_len=16384,
                kv_cache_config=_kv_without_reuse())
-        if glm_fp8:
-            update(kv_cache_config={'dtype': 'fp8'},
-                   moe_config={'backend': 'DEEPGEMM'},
-                   stream_interval=10)
-        else:
+        if not glm_fp8:
             update(disable_mm_encoder=True,
                    cuda_graph_config={'max_batch_size': 64})
         if glm_flash_fp8:
@@ -260,7 +259,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             else:
                 update(max_seq_len=8192, kv_cache_config={'dtype': 'fp8'})
         if '_mtp' in model:
-            update(speculative_config=_mtp(3))
+            update(speculative_config=_speculative('MTP', 3))
 
     # GLM-5.2 NVFP4 uses the MLA + DSA path with CuteDSL routed experts.
     if 'glm_5.2_fp4' in label:
@@ -282,22 +281,14 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config=_kv_without_reuse())
     if minimax_fp4 or minimax_flash:
         update(sparse_attention_config={'implementation': 'msa'})
-    minimax_serve = minimax_fp4 and case.startswith('serve-pytorch')
-    if minimax_serve or minimax_mxfp8:
-        prefix = ('serve-pytorch-float4-maxbs:128-'
-                  if minimax_serve else 'bench-pytorch-float8-maxbs:1-')
-        long_input = case.startswith(prefix +
-                                     'maxnt:2048-input_output_len:8000,1000')
-        update(enable_attention_dp=True,
-               max_seq_len=9216 if long_input else 4096)
-        if minimax_serve and long_input:
-            update(enable_chunked_prefill=True)
     if minimax_fp4:
         update(moe_config={'backend': 'CUTLASS'},
                kv_cache_config={
                    'dtype': 'fp8',
                    'free_gpu_memory_fraction': 0.6
                })
+        if case.startswith('serve-pytorch'):
+            update(enable_attention_dp=True, max_seq_len=4096)
     if minimax_flash:
         update(modeling_v2='require',
                max_seq_len=16384,
@@ -308,7 +299,9 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                    'fuse_qkv_index_projection': True
                })
     if 'minimax_m3.1_flash_nvfp4_dspark' in label:
-        update(speculative_config=_dspark(7, 'MiniMax-M3.1-Flash/dspark'))
+        draft = f'{llm_models_root()}/MiniMax-M3.1-Flash/dspark'
+        update(speculative_config=_speculative(
+            'DSpark', 7, speculative_model=draft))
 
     if 'gemma_4_' in label:
         update(enable_chunked_prefill=True,
@@ -321,12 +314,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         nvfp4 = model in ('gemma_4_26b_a4b_nvfp4', 'gemma_4_31b_it_nvfp4')
         if sm == 121 or (sm == 107 and nvfp4 and '-pytorch-' in label):
             update(attn_backend='FLASHINFER')
-
-    if any(pattern in label for pattern in (
-            'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:512-ep:4-gpus:4',
-            'qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:256-ep:8-gpus:8',
-    )):
-        update(enable_attention_dp=True)
 
     # Long-context and shared-prefix cases.
     if any(pattern in label
@@ -349,22 +336,21 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                num_postprocess_workers=4,
                stream_interval=10)
         if model.endswith('_mtp'):
-            update(speculative_config=_mtp(1))
+            update(speculative_config=_speculative('MTP', 1))
         else:
             update(kv_cache_config={'enable_block_reuse': True})
 
-    if 'qwen3_235b_a22b_fp4_eagle3-bench-pytorch' in label:
-        update(**_eagle3('Qwen3/qwen3-235B-eagle3'),
-               enable_chunked_prefill=False)
-    if ('gpt_oss_120b_eagle3-bench-pytorch' in label
-            or 'gpt_oss_120b_eagle3-serve-pytorch' in label):
-        update(**_eagle3('gpt_oss/gpt-oss-120b-Eagle3'),
-               kv_cache_config=_kv_without_reuse(),
-               enable_chunked_prefill=True)
-    if 'gpt_oss_120b_eagle3_throughput-bench-pytorch' in label:
-        # See NVBug 5832481 for the throughput variant.
-        update(**_eagle3('gpt_oss/gpt-oss-120b-Eagle3-throughput'),
-               disable_overlap_scheduler=True)
+    if model in _EAGLE3_DRAFTS and (case.startswith('bench-pytorch') or
+                                    (model == 'gpt_oss_120b_eagle3'
+                                     and case.startswith('serve-pytorch'))):
+        draft = f'{llm_models_root()}/{_EAGLE3_DRAFTS[model]}'
+        update(enable_autotuner=False,
+               speculative_config=_speculative('Eagle',
+                                               3,
+                                               speculative_model_dir=draft))
+        if model == 'gpt_oss_120b_eagle3':
+            update(kv_cache_config=_kv_without_reuse(),
+                   enable_chunked_prefill=True)
 
     nano_30b = 'nemotron_3_nano_30b' in label
     nano_omni = 'nemotron_3_nano_omni_nvfp4' in label
@@ -385,23 +371,12 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     super_serve = super_streaming or 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
     if lightning or super_serve or super_fp8:
-        backend = 'CUTEDSL' if lightning and 'nvfp4' in model else 'CUTLASS'
         update(enable_chunked_prefill=True,
-               moe_config={'backend': backend},
+               moe_config={'backend': 'CUTLASS'},
                kv_cache_config={
                    'mamba_ssm_cache_dtype': 'float16',
                    'mamba_ssm_stochastic_rounding': True,
                    'mamba_ssm_philox_rounds': 5
-               })
-    if lightning:
-        update(stream_interval=10,
-               num_postprocess_workers=4,
-               speculative_config=_mtp(3),
-               kv_cache_config={
-                   'free_gpu_memory_fraction': 0.8,
-                   'mamba_state_config': {
-                       'periodic_snapshot_interval': 8192
-                   }
                })
     if super_fp8:
         update(disable_overlap_scheduler=True)
@@ -432,6 +407,13 @@ def get_model_yaml_config(model_label: str,
         for preset in presets.split('+'):
             recursive_update(config,
                              copy.deepcopy(get_perf_config_preset(preset)))
+
+    model = label.partition('-')[0]
+    spec = config.get('speculative_config') or {}
+    if (model in _DEEPSEEK_PRO_DSPARK and spec.get('decoding_type') == 'DSpark'
+            and 'speculative_model' not in spec):
+        draft = MODEL_PATH_DICT[model]
+        spec['speculative_model'] = f'{llm_models_root()}/{draft}'
 
     if 'pytorch' in model_label and 'loras' in model_label:
         lora_count = 1

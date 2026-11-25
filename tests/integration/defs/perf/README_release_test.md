@@ -130,12 +130,17 @@ benchmarks select their MoE backend with `moe:` and omit MTP with `speculative_c
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
-A case can set `max_seq_len`, `stream_interval`, `num_postprocess_workers` or
-`print_iter_log` after the filename, for example
-`cfg:minimax-m3-throughput.yaml,max_seq_len=2560` or
-`cfg:nemotron-3-super-throughput.yaml,num_postprocess_workers=0,print_iter_log=false`.
-Use `field=default` to omit a top-level field from this recipe and inherit the model or runtime setting.
-For example, `cuda_graph_config=default` lets bench derive capture sizes from the case's batch size.
+Use `cfg:field=value` for a case-specific setting, for example the two Qwen3 235B
+throughput cases use `cfg:enable_attention_dp=true`. Separate fields with commas, or
+append them to a curated filename as in `cfg:minimax-m3-throughput.yaml,max_seq_len=2560`.
+Use `field=default` to omit a top-level recipe field. For example, `cuda_graph_config=default`
+lets bench derive capture sizes from the case's batch size.
+
+For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
+`speculative_config`. For Nemotron Lightning, `periodic_snapshot_interval` sets the
+interval in `kv_cache_config.mamba_state_config`. Use the existing `moe:`, `kv_frac:`
+and `kv_cache_dtype:` labels for the MoE backend, KV memory fraction and KV dtype.
+Draft checkpoint paths are resolved from the model root at run time.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files
