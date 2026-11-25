@@ -89,7 +89,7 @@ The storage tier count is encoded in the sign bit of the 32-bit block index that
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_v1_vs_v2_architecture.png" width="900">
+  <img src="../media/tech_blog34_v1_vs_v2_architecture.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: V1 and V2 KV cache manager architectures.</em></sub></p>
@@ -168,7 +168,7 @@ It is worth being precise about how this differs from V1, because V1 coalesces a
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_lifecycle_coalescing.png" width="900">
+  <img src="../media/tech_blog34_lifecycle_coalescing.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Lifecycles group buffers into big pages, and why the grouping must be by lifecycle.</em></sub></p>
@@ -196,7 +196,7 @@ That last clause is why sliding-window prefix reuse works at all. A sliding-wind
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_one_tree_many_lifecycles.png" width="800">
+  <img src="../media/tech_blog34_one_tree_many_lifecycles.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: A radix-tree block holds one page slot per lifecycle.</em></sub></p>
@@ -220,7 +220,7 @@ A page also need not keep the same representation on every tier. A **cold-page c
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_page_states_and_tiers.png" width="800">
+  <img src="../media/tech_blog34_page_states_and_tiers.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Page status and tier migration.</em></sub></p>
@@ -255,7 +255,7 @@ So each GPU pool reserves a virtual address range once and maps physical chunks 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_elastic_pools_vmm.png" width="800">
+  <img src="../media/tech_blog34_elastic_pools_vmm.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Elastic pools over CUDA virtual memory.</em></sub></p>
@@ -348,7 +348,7 @@ V1 is not a legacy path. It is a mature, heavily tested implementation that rema
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_e2e_throughput.png" width="900">
+  <img src="../media/tech_blog34_e2e_throughput.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: End-to-end serving impact on models that exercise V2's structural advantages.</em></sub></p>
