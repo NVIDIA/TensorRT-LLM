@@ -1276,12 +1276,12 @@ def _gdn_replay_map_on(core, cm, device, ring: bool) -> bool:
 #: to 32 rows, cuBLASLt without PDL above). The GEMM streams its weight before its wait, so it
 #: overlaps the gated norm (which releases its dependents early) or the attention's last
 #: launch. Same bf16 operands and fp32 accumulation; the K split differs, so the output moves
-#: at bf16 rounding level (0 of 18 greedy texts equal on GB300 dep4, 837174). Values: `1` -- the
-#: GDN out projection at every row count of the table, the attention o projection at
+#: at bf16 rounding level (GB300 dep4: none of 18 greedy texts stayed identical). Values: `1` --
+#: the GDN out projection at every row count of the table, the attention o projection at
 #: `_OUT_PROJ_ATTN_ROWS` (where its producer does not release early and the micro measured a
 #: gain); `gdn` -- the GDN site only; `all` -- both sites at every row count of the table. Only
 #: the row counts of the CUDA-graph batch sizes engage (their kernels are compiled at build).
-#: GB300: 3-ctx dep4 cap 12 step -0.14 ms (837700 vs 837701); the GDN site saves 36..111 us a
+#: GB300 dep4 at 12 requests a rank: -0.14 ms a step; the GDN site saves 36..111 us a
 #: step of 36 launches at 20..128 rows. Read once, when the target is built.
 DP_OUT_PROJ_BF16_ENV = "TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"
 #: `(first rows, last rows, MMA N, plan)`: the GEMM of a row count, measured on GB300 (the
