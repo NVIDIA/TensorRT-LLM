@@ -1644,6 +1644,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             flush=True,
         )
 
+    def release_host_resident_weights(self) -> None:
+        """Release the host-resident n-gram table (`ple_host_table`), in `node` its chunks and
+        the broker threads that serve them to the host's other processes. The engine calls it
+        when it releases the model (`model_loader.release_host_resident_weights`), so they do not
+        wait for this core to be collected."""
+        _weights._close_ngram_table(self)
+
     # ---------------------------------------------------------------- bind ---
 
     def _bind_cache_manager(self, md, position_ids) -> None:

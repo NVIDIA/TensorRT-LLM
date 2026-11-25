@@ -399,26 +399,45 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
             f"attn_backend='{model_config.attn_backend}'.")
 
 
+def _release_under(model: torch.nn.Module, method: str, what: str) -> None:
+    """Call ``method`` on every module under ``model`` that has it, on all of
+    them even when one fails, then raise the first error."""
+    errors = []
+    for module in model.modules():
+        release = getattr(module, method, None)
+        if release is not None:
+            # Keep going: a module that fails must not strand the later ones.
+            try:
+                release()
+            except Exception as error:  # noqa: BLE001 - re-raised below
+                errors.append(error)
+    for error in errors[1:]:
+        logger.error(f"Releasing {what} also failed: {error!r}")
+    if errors:
+        raise errors[0]
+
+
 def release_localized_moe_weights(model: torch.nn.Module) -> None:
     """Unmap every die-local MoE weight bank (MEGAMOE_UGPU_LAYOUT) under ``model``.
 
     The banks are driver mappings outside PyTorch's allocator, so dropping the
     model does not free them. Call only once no CUDA graph can replay them.
     """
-    errors = []
-    for module in model.modules():
-        release = getattr(module, "release_ugpu_localized_weights", None)
-        if release is not None:
-            # Keep going: a module that fails must not strand the banks after it.
-            try:
-                release()
-            except Exception as error:  # noqa: BLE001 - re-raised below
-                errors.append(error)
-    for error in errors[1:]:
-        logger.error(
-            f"Releasing a localized MoE weight bank also failed: {error!r}")
-    if errors:
-        raise errors[0]
+    _release_under(model, "release_ugpu_localized_weights",
+                   "a localized MoE weight bank")
+
+
+def release_host_resident_weights(model: torch.nn.Module) -> None:
+    """Release every host-resident weight table under ``model`` that a module
+    keeps outside PyTorch's allocator (``release_host_resident_weights()``).
+
+    Such a table, e.g. one shared by the processes of a host, with the threads
+    that serve it to them, is otherwise freed only when its module is collected,
+    which any other reference to the model (an error's traceback) postpones.
+    Call only once no CUDA graph or pending work can read the tables.
+    """
+    _release_under(model, "release_host_resident_weights",
+                   "a host-resident weight table")
 
 
 def validate_lm_head_output_dtype(model: torch.nn.Module,
@@ -1467,8 +1486,9 @@ class ModelLoader:
         self._metrics = {}
         # Directories _timed_load read checkpoint files from.
         self._checkpoint_dirs_read: list[str] = []
-        # Track the model until it is returned: localized MoE banks are driver
-        # mappings that outlive it, so any failure before then must release them.
+        # Track the model until it is returned: localized MoE banks and
+        # host-resident weight tables live outside PyTorch's allocator and
+        # outlive it, so any failure before then must release them.
         self._model_in_load = None
         try:
             with timing_metric(
@@ -1499,6 +1519,12 @@ class ModelLoader:
                 except Exception as release_error:  # noqa: BLE001 - logged
                     logger.error(
                         "Releasing localized MoE weights after a failed "
+                        f"load also failed: {release_error!r}")
+                try:
+                    release_host_resident_weights(self._model_in_load)
+                except Exception as release_error:  # noqa: BLE001 - logged
+                    logger.error(
+                        "Releasing host-resident weights after a failed "
                         f"load also failed: {release_error!r}")
             raise
         finally:

@@ -184,6 +184,7 @@ class _DummyModelEngine:
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.warmup_purpose = None
+        self.cleanups = 0
         self.attn_runtime_features = attn_runtime_features
         self.metrics = {}
         self.max_seq_len = max_seq_len
@@ -212,6 +213,10 @@ class _DummyModelEngine:
     def set_warmup_purpose(self, purpose):
         """Record the label the creator gives the following warmup passes."""
         self.warmup_purpose = purpose
+
+    def cleanup(self):
+        """Count the releases of the engine's model resources."""
+        self.cleanups += 1
 
 
 def _make_llm_args():
@@ -284,6 +289,8 @@ def _run_create_py_executor(
     ctx_chunk_configs: list | None = None,
     kv_cache_creator_cls: type[_DummyKvCacheCreator] = _DummyKvCacheCreator,
     is_mla_model: bool = True,
+    executor_error: BaseException | None = None,
+    model_engines: list | None = None,
 ) -> tuple[bool, bool, bool]:
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
@@ -305,6 +312,8 @@ def _run_create_py_executor(
         ctx_chunk_configs: Optional list that receives the executor chunk config.
         kv_cache_creator_cls: Mock cache creator, including optional capacity estimation.
         is_mla_model: Whether the model uses MLA.
+        executor_error: Raised by the executor's construction (as a failed warmup raises).
+        model_engines: Optional list that receives the model engine.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
@@ -366,7 +375,7 @@ def _run_create_py_executor(
     )
 
     def _create_model_engine(**kwargs):
-        return _DummyModelEngine(
+        engine = _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
             attn_backend=attn_backend,
@@ -374,6 +383,9 @@ def _run_create_py_executor(
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )
+        if model_engines is not None:
+            model_engines.append(engine)
+        return engine
 
     monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
 
@@ -382,6 +394,8 @@ def _run_create_py_executor(
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:
             ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
+        if executor_error is not None:
+            raise executor_error
         executor = _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
@@ -417,6 +431,22 @@ def _run_create_py_executor(
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
+
+
+def test_a_failed_construction_releases_the_model_engine_it_built(monkeypatch):
+    """An error after the model engine is built (here the executor's warmup) releases the engine
+    before the error reaches the caller, whose traceback would otherwise keep the model, and the
+    memory and threads it owns outside PyTorch's allocator, until the caller drops the error."""
+    engines = []
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        _run_create_py_executor(
+            monkeypatch,
+            sm_version=100,
+            kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+            executor_error=RuntimeError("warmup failed"),
+            model_engines=engines,
+        )
+    assert [engine.cleanups for engine in engines] == [1]
 
 
 @pytest.mark.parametrize("requires_encoder_features", [False, True])

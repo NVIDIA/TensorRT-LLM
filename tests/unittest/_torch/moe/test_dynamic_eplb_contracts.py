@@ -646,6 +646,9 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
             "release_localized_moe_weights": lambda _model: events.append(
                 "release_localized_moe_weights"
             ),
+            "release_host_resident_weights": lambda _model: events.append(
+                "release_host_resident_weights"
+            ),
         },
     )
     engine = engine_cls()
@@ -674,6 +677,7 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
         "release_graphs",
         ("manager.shutdown", True),
         "release_localized_moe_weights",
+        "release_host_resident_weights",
         "release_gc",
     ]
     assert engine.moe_load_balancer is None

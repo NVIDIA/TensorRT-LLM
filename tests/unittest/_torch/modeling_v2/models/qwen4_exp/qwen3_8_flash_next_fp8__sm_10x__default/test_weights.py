@@ -994,6 +994,55 @@ def test_host_table_modes(mode: str, monkeypatch, dtype: torch.dtype) -> None:
         t.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
+@pytest.mark.parametrize(
+    "target",
+    ["qwen3_8_flash_next_fp8__sm_10x__default", "qwen3_8_flash_next_nvfp4__sm_10x__default"],
+)
+def test_engine_release_closes_a_node_table_the_model_still_holds(target: str, monkeypatch):
+    """`release_host_resident_weights`, which the engine calls when it releases the model, closes
+    a core's `node` table at once: its broker threads stop and the host's other processes can own
+    its chunks. The model is still referenced here, as a failed engine construction's traceback
+    references it, so the table cannot be collected and its finalizer does not run."""
+    import threading
+    import uuid
+
+    from torch import nn
+
+    from tensorrt_llm._torch.pyexecutor.model_loader import release_host_resident_weights
+
+    PH = _host_table_module()
+    if not _vmm_host_numa():
+        pytest.skip("no CUDA VMM host NUMA allocation on this platform")
+    package = f"tensorrt_llm._torch.modeling_v2.models.qwen4_exp.{target}"
+    modeling, weights = import_module(f"{package}.modeling"), import_module(f"{package}.weights")
+    rows_per_shard, shards, cols = 40960, 8, 160
+    data, keys, stored = _fake_shards(rows_per_shard, shards, cols, seed=11)
+    identity = uuid.uuid4().hex
+    (table,) = _host_tables(monkeypatch, PH.NODE, 1, data, keys, stored, rows_per_shard, identity)
+    brokers = f"ple-broker-{identity[:12]}"
+    assert table.mode == PH.NODE, table.describe()
+    assert sum(t.name == brokers for t in threading.enumerate()) == PH.CHUNKS
+    # The core as the loader leaves it, without building the rest of the model.
+    core = object.__new__(modeling.Qwen4ExpDefaultModelingV2)
+    nn.Module.__init__(core)
+    core.w = nn.ParameterDict()
+    core._ple_table_host = table
+    weights._bind_ngram_table(core)
+    model = nn.Module()
+    model.model = core
+    del table
+
+    release_host_resident_weights(model)
+    release_host_resident_weights(model)
+
+    assert not any(t.name == brokers for t in threading.enumerate())
+    segment = PH._broker.try_own(f"{identity}-c0")
+    assert segment is not None, "another process could not own the released chunk"
+    segment.close()
+    assert core._ple_table_host is None and core.w["ple_table"].is_meta
+
+
 def _check_tables(tables, data, mode) -> None:
     """Every rank runs `mode` and holds exactly `data`'s bytes (its rows under `server`), in
     host memory."""
