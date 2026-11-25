@@ -547,12 +547,14 @@ class Authority:
         if state in expected:
             replied = {r for r in active if self._rank_replied(r, reports, expected[state])}
             waited_on = rank_mask(set(active) - replied, self.world_size)
-        # During the startup a rank that started waits on every rank that has not.
+        # During the startup the authority waits on every connected rank that has not started, and
+        # so does every rank that started.
         not_started = 0
         if state == MembershipState.STARTING:
             not_started = rank_mask(
                 (r for r in active if not reports.get(r, RankReport()).started), self.world_size
             )
+            waited_on |= not_started & connected
         # A rank's waits count only while its reports advance.
         waits: dict[int, int] = {}
         rounds: dict[int, set[tuple]] = {}
