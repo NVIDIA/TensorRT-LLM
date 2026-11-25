@@ -94,7 +94,7 @@ from typing import Iterator
 
 import torch
 
-from tensorrt_llm._startup_errors import OomKind, _exception_chain, out_of_memory_kind
+from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
 from tensorrt_llm.logger import logger
 
 from . import providers
@@ -612,6 +612,22 @@ def _on_out_of_memory(
         )
 
 
+def _allocation_messages(error: BaseException | str) -> Iterator[str]:
+    """Only the escaping error and its explicit causes can identify an allocation."""
+    if isinstance(error, str):
+        # Python's formatted traceback includes the already handled exception first.
+        yield error.rpartition(
+            "\nDuring handling of the above exception, another exception occurred:\n"
+        )[2]
+        return
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield str(current)
+        current = current.__cause__
+
+
 def _failed_allocation_of(armed: _Armed, *messages: str) -> _FailedAllocation | None:
     """The recorded allocation for this executor, if the reported error chain matches.
 
@@ -701,8 +717,9 @@ def notify_error(
         if not is_device_oom(text if error is None else error):
             return
         first_line = _headline_line(text)
-        chain = _exception_chain(error) if error is not None else ()
-        failed = _failed_allocation_of(armed, text, *(str(exc) for exc in chain))
+        failed = _failed_allocation_of(
+            armed, *_allocation_messages(error if error is not None else text)
+        )
         if failed is not None:
             headline = f"OUT OF MEMORY: {failed.describe()}. Error: {first_line}"
         else:
