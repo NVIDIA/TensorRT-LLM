@@ -337,8 +337,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MidWeight,
+    mid_mm_raw,
     mid_rows_mm_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import Plan as MidPlan
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     precompile as mid_rows_precompile,
 )
@@ -383,6 +385,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_lowrank_act import (
     qwen4_exp_hc_lowrank_act,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
+    precompile as hc_up_precompile,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
     qwen4_exp_hc_up_gate_mean,
@@ -545,7 +550,12 @@ from .ops.attention.qsa_fp8_pages_to_bf16__prefill import qsa_fp8_pages_to_bf16
 from .ops.attention.qsa_sparse_gqa_rowtile__prefill import qsa_sparse_gqa_rowtile
 from .ops.attention.qwen4_exp_attn_decode_prologue__decode import qwen4_exp_attn_decode_prologue
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import MAX_ROWS as _HC_TC_FIRST_ROWS
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import ROWSN_ROWS as _HC_ROWSN_ROWS
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import TILE64_MAX_ROWS as _HC_TILE64_MAX_ROWS
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import precompile as hc_tc_first_precompile
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import (
+    precompile_rowsn as hc_tc_first_precompile_rowsn,
+)
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
@@ -1144,6 +1154,213 @@ def _tep_finar_mode() -> str:
     raise ValueError(f"{TEP_FINAR_ENV}={raw!r}: expected 0, 1 or early")
 
 
+#: Switch, on by default: at an attention-DP rank on SM103 the hyper-connection mixers of a
+#: decode or short prefill step take row-count plans of their two tcgen05 kernels that sum the
+#: same K slices in the same order as the 128-row plans, so every output is bitwise:
+#: - `qwen4_exp_hc_decode_tc_first` on a 64-row M tile at `_HC_TILE64_ROWS` rows (half the
+#:   normed bytes a CTA streams), and for a mixer with the injection the rows-on-N kernel (the
+#:   weight rows on a 64-row MMA M, the normed rows on the MMA N in 16-row steps) at
+#:   `_HC_ROWSN_ROWS` rows, where tcgen05 has no M tile between 64 and 128;
+#: - `qwen4_exp_hc_up_gate_mean` on one 64-row M tile at `_HC_TILE64_ROWS` rows, and on two at
+#:   `_HC_UP2_ROWS` rows where it does not release its dependents early (`DP_INPROJ_RELEASE_ENV`:
+#:   two tiles are slower there).
+#: GB300 micros, a site: the first kernel 5.1-5.6 -> 4.4-4.9 us at 8-64 rows, the rows-on-N
+#: kernel -0.55..-0.60 us at 65..80 rows and -0.14..-0.23 at 81..96, the up kernel on two tiles
+#: -0.45..-0.48 us at 105..128 rows; dep4 steps at 17..24 requests a rank -0.02..-0.06 ms.
+#: `0` keeps the 128-row plans. Read once, when the target is built.
+DP_HC_TILES_ENV = "TRTLLM_QWEN4_EXP_DP_HC_TILES"
+#: Rows at which both kernels take one 64-row tile: up to 4 rows the first kernel keeps its
+#: 10-way split.
+_HC_TILE64_ROWS = (5, _HC_TILE64_MAX_ROWS)  # capacity: fixed: dispatch thresholds
+#: Rows at which an up kernel that does not release early takes two 64-row tiles.
+_HC_UP2_ROWS = (65, 128)  # capacity: fixed: dispatch thresholds
+#: Switch, on by default: at an attention-DP rank on SM103 with PDL, trunk site A of a decode
+#: step (the mixer in front of a GDN or attention block) releases its dependents before its own
+#: wait (`qwen4_exp_hc_up_gate_mean(release_early=True)`), and the block's bf16 input projection
+#: runs on `mid_rows_mm`'s bf16 tcgen05 GEMM over the checkpoint's `[N, K]` weight (a view, no
+#: copy) at the plan `_INPROJ_RELEASE_PLANS` names for the weight geometry and row count. That
+#: GEMM is launched with PDL, streams its weight before its wait and reads `mixed` after it, so
+#: it is the launch that runs beside the released up kernel (the stock entry, `low_m_bf16_mm`,
+#: runs cuBLAS without PDL at these rows, and a release in front of it moves nothing). It
+#: engages at the row counts of the CUDA-graph batch sizes inside `_INPROJ_RELEASE_ROWS`, for
+#: which the GEMM is compiled at build. The build compares the GEMM with the stock entry on this
+#: rank's weights at every compiled row count and keeps the switch only when every element is
+#: equal (fp32 accumulation of K in order and one rounding on both sides at these shapes; GB300:
+#: 0 of 2.1e7..1.7e8 elements a row count differ at 28..224 rows on the checkpoint's weights).
+#: GB300 dep4 trunk-loop micro, with the GDN forms of `DP_GDN_LEAN_ENV`: -0.47..-0.49 ms a step at
+#: 7..56 requests a rank. `0` keeps the stock entry and the up kernel's end-of-kernel release.
+#: Read once, when the target is built.
+DP_INPROJ_RELEASE_ENV = "TRTLLM_QWEN4_EXP_DP_INPROJ_RELEASE"
+#: Rows a rank at which the switch above can engage (`mid_rows_mm`'s rows past the GEMV's).
+_INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
+#: Measured plans of the bf16 GEMM behind a releasing site A (GB300 dep4 trunk-loop micro at 28 /
+#: 48 / 96 / 120 / 224 rows, 13 plan sets): weight geometry `(N, K)` -> `((largest rows, MMA N
+#: rule, Plan(ks, kpb, stages, l2, epi)), ...)`. MMA N rule "op": `mid_rows_mm`'s (32 / 64 / 128 /
+#: 256); "fine": `max(32, rows rounded up to 16)`. Up to 64 rows 8 k-blocks a stage and 2
+#: k-tiles of L2 prefetch, 65..128 rows the op's ring with 4 k-tiles of prefetch, above the
+#: fine N with the deepest ring. No plan splits K. A geometry not listed does not engage.
+_INPROJ_RELEASE_PLANS: dict = {
+    # GDN in_proj (q|k|v|z|a|b)
+    (16480, 2560): (
+        (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (128, "op", MidPlan(1, 4, 6, 4, 16)),
+        (256, "fine", MidPlan(1, 4, 5, 1, 16)),
+    ),
+    # attention in-proj (q|gate|k|v|index)
+    (14080, 2560): (
+        (64, "op", MidPlan(1, 8, 5, 2, 16)),
+        (128, "op", MidPlan(1, 4, 6, 4, 16)),
+        (256, "fine", MidPlan(1, 4, 5, 1, 16)),
+    ),
+}
+
+
+def _dp_decode_rank(core, device) -> bool:
+    """Whether this core is an attention-DP rank (no attention TP) on an SM103 GPU: where the
+    attention-DP decode forms (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`, ...) are measured."""
+    return (
+        not core.one_rank
+        and core.dp_size > 1
+        and core.attn_tp_size == 1
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    )
+
+
+def _graph_rows(core, lo: int, hi: int) -> list[int]:
+    """This rank's decode row counts (`max_verify_rows` x a CUDA-graph batch size) in lo..hi."""
+    p = core.max_verify_rows
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    return sorted({p * int(b) for b in sizes if lo <= p * int(b) <= hi})
+
+
+def _hc_tiles_build(core, device) -> bool:
+    """`DP_HC_TILES_ENV`, read once at build (`post_load_weights`): True at an attention-DP rank
+    on SM103 with the switch on (default), after compiling every plan `_hc_first` and `_hc_mixer`
+    can then launch; False elsewhere."""
+    if not (_switch(DP_HC_TILES_ENV, default=True) and _dp_decode_rank(core, device)):
+        return False
+    hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64=True)
+    bns = sorted({-(-r // 16) * 16 for r in range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1)})
+    hc_tc_first_precompile_rowsn(core.stream, core.hc_lowrank, core.hc_count, device, bns)
+    variants = [(False, 64), (True, 64), (True, 128)]
+    hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, variants)
+    logger.info(
+        f"hc mixer plans: rank {core.dp_rank} of {core.dp_size}, 64-row tiles at "
+        f"{_HC_TILE64_ROWS[0]}..{_HC_TILE64_ROWS[1]} rows, rows on N at {_HC_ROWSN_ROWS[0]}.."
+        f"{_HC_ROWSN_ROWS[1]}, two up tiles at {_HC_UP2_ROWS[0]}..{_HC_UP2_ROWS[1]}"
+    )
+    return True
+
+
+class _InProj(NamedTuple):
+    """`DP_INPROJ_RELEASE_ENV`: one trunk layer's input projection at one row count, as
+    `DecodeTarget.forward` hands it to the layer's block (`q_in`)."""
+
+    layer: int
+    #: The checkpoint's bf16 `[N, K]` weight (contiguous).
+    w: torch.Tensor
+    #: The MMA N and the plan the GEMM runs at.
+    mpad: int
+    plan: MidPlan
+
+
+def _inproj_plan(n: int, k: int, rows: int) -> tuple | None:
+    """`_INPROJ_RELEASE_PLANS`: `(MMA N, plan)` of geometry `(n, k)` at `rows` rows, or None."""
+    for bound, rule, plan in _INPROJ_RELEASE_PLANS.get((n, k), ()):
+        if rows <= bound:
+            if rule == "fine":
+                return max(32, -(-rows // 16) * 16), plan
+            return next(b for b in (32, 64, 128, 256) if rows <= b), plan
+    return None
+
+
+def _inproj_mm(x: torch.Tensor, ent: _InProj) -> torch.Tensor:
+    """`DP_INPROJ_RELEASE_ENV`: `x [rows, K]` bf16 @ `ent.w`^T on `mid_mm_raw` (bf16 operands,
+    PDL, the entry's MMA N and plan). Returns a fresh bf16 `[rows, N]`."""
+    return mid_mm_raw(x, ent.w, ent.plan, pdl=True, mpad=ent.mpad)
+
+
+def _inproj_name(core, i: int) -> str:
+    return f"l{i}_attn_in_w" if core.is_attn[i] else f"l{i}_in_proj_w"
+
+
+def _inproj_release_build(core, device) -> dict | None:
+    """`DP_INPROJ_RELEASE_ENV`, read once at build after the decode target: `{layer: {rows:
+    _InProj}}` at an attention-DP rank on SM103 with PDL and the switch on (default), for every
+    trunk layer whose input projection is a bf16 `[N, K]` weight with a plan at the CUDA-graph
+    row counts and no other decode copy (`_mid`, packed FP8 / NVFP4: tp1 only today). Every
+    entry's GEMM is compiled here and compared with the stock entry on this rank's weight over
+    one random activation a row count; a difference anywhere leaves the switch off (one
+    warning). None where it is off or cannot take effect."""
+    if not (
+        _switch(DP_INPROJ_RELEASE_ENV, default=True)
+        and _dp_decode_rank(core, device)
+        and _DECODE_PROJ_PDL
+    ):
+        return None
+    rows_list = _graph_rows(core, *_INPROJ_RELEASE_ROWS)
+    table: dict = {}
+    gen = torch.Generator(device=device).manual_seed(20261125)
+    checked = {}
+    for i in range(core.num_layers):
+        name = _inproj_name(core, i)
+        w = core.w[name] if name in core.w else None
+        if (
+            w is None
+            or w.dtype != torch.bfloat16
+            or w.dim() != 2
+            or not w.is_contiguous()
+            or w.data_ptr() % 16
+            or name in core._mid
+            or name in core._gemv8
+            or name in core._gemv_nv
+        ):
+            continue
+        geom = (int(w.shape[0]), int(w.shape[1]))
+        ents = {}
+        for rows in rows_list:
+            plan = _inproj_plan(*geom, rows)
+            if plan is not None:
+                ents[rows] = _InProj(i, w, plan[0], plan[1])
+        if not ents:
+            continue
+        if geom not in checked:
+            # The stock entry the block runs without the switch (`_dense_mm`'s bf16 branch).
+            stock = core.decode_mm if core.is_attn[i] else core.decode_in_mm
+            x = torch.randn(max(ents), geom[1], generator=gen, device=device).to(torch.bfloat16)
+            bad = 0
+            for rows, ent in ents.items():
+                got = _inproj_mm(x[:rows], ent)
+                ref = stock(x[:rows], w.t())
+                bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+            checked[geom] = bad
+        if checked[geom]:
+            logger.warning(
+                f"{DP_INPROJ_RELEASE_ENV}: the bf16 mid-rows GEMM of a {geom[0]} x {geom[1]} "
+                f"input projection differs from the stock entry in {checked[geom]} elements at "
+                f"rank {core.dp_rank}; every site and input projection keeps the stock forms"
+            )
+            return None
+        table[i] = ents
+    if not table:
+        return None
+    torch.cuda.synchronize(device)
+    hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, [(True, 128)])
+    logger.info(
+        f"input projections behind a releasing hc site: rank {core.dp_rank} of {core.dp_size}, "
+        f"{len(table)} layers, rows {sorted({r for t in table.values() for r in t})}"
+    )
+    return table
+
+
+def _inproj_release_at(core, i: int, rows: int) -> _InProj | None:
+    """`DP_INPROJ_RELEASE_ENV`: trunk layer `i`'s input projection at `rows` rows, or None where
+    its site A and projection stay the stock forms. Host side, a per-capture constant."""
+    table = core._inproj_release
+    return None if table is None else table.get(i, {}).get(rows)
+
+
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
     """Whether the trunk keeps the CuteDSL-layout expert copy: at one rank only (every expert
     is local, the layout the CuteDSL MoE is certified at), only under trtllm-gen, only when a
@@ -1534,6 +1751,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.mtp_expert_offset = d.mtp_expert_offset
         # A tep4 rank's decode forms (`TEP_FAST_DECODE_ENV`), settled with the layout.
         self.tep_fast = _tep_fast_decode(self)
+        # The attention-DP decode forms, built after load (`post_load_weights`) on a GPU:
+        # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
+        self.hc_tiles = False
+        self._inproj_release = None
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -1714,6 +1935,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
+        if device.type == "cuda":
+            self.hc_tiles = _hc_tiles_build(self, device)
+            self._inproj_release = _inproj_release_build(self, device)
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
             _route_front_build(self, self._decode._layers, device)
@@ -3274,8 +3498,20 @@ def _hc_first(core, normed, first, with_inject):
     `[down; block_inject; 0]` (fp32 logits), then the SiLU and injection activations.
     Returns `(low, inject)`; `inject` is None without `with_inject`. Up to
     `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture constant) it is one tcgen05 launch; larger
-    steps run cuBLAS's fp32 logits and the activation kernel."""
-    if normed.shape[0] <= _HC_TC_FIRST_MAX_ROWS:
+    steps run cuBLAS's fp32 logits and the activation kernel. With `core.hc_tiles`
+    (`DP_HC_TILES_ENV`) the launch takes the 64-row tile or the rows-on-N kernel at their rows
+    (bitwise)."""
+    rows = normed.shape[0]
+    if rows <= _HC_TC_FIRST_MAX_ROWS:
+        if core.hc_tiles:
+            if with_inject and _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1]:
+                return qwen4_exp_hc_decode_tc_first(
+                    normed, first, core.hc_lowrank, core.hc_count, True, rows_on_n=True
+                )
+            if _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]:
+                return qwen4_exp_hc_decode_tc_first(
+                    normed, first, core.hc_lowrank, core.hc_count, with_inject, tm=64
+                )
         return qwen4_exp_hc_decode_tc_first(
             normed, first, core.hc_lowrank, core.hc_count, with_inject
         )
@@ -3288,12 +3524,26 @@ def _hc_first(core, normed, first, with_inject):
     )
 
 
-def _hc_mixer(core, normed, first, up, with_inject):
+def _hc_mixer(core, normed, first, up, with_inject, release: bool = False):
     """One hyper-connection mixer from the site's normed stream: `_hc_first`, then the up
     projection with the sigmoid gate and the stream mean in its epilogue. Returns
-    `(mixed, inject)`; `inject` is None without `with_inject` (the stack-final mixer)."""
+    `(mixed, inject)`; `inject` is None without `with_inject` (the stack-final mixer).
+    `release` (`DP_INPROJ_RELEASE_ENV`, trunk site A only): the up kernel releases its
+    dependents before its own wait; the caller answers for the launch after it (one that reads
+    `mixed` after its own wait). With `core.hc_tiles` the up kernel runs on 64-row tiles at
+    `_HC_TILE64_ROWS` rows, and at `_HC_UP2_ROWS` rows unless it releases (bitwise)."""
     low, inject = _hc_first(core, normed, first, with_inject)
-    return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+    rows = normed.shape[0]
+    tm = 128
+    if core.hc_tiles and (
+        _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]
+        or (not release and _HC_UP2_ROWS[0] <= rows <= _HC_UP2_ROWS[1])
+    ):
+        tm = 64
+    if tm == 128 and not release:
+        return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+    mixed = qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count, release_early=release, tm=tm)
+    return mixed, inject
 
 
 def _hc_moe_mixer(core, normed, L: _LayerWeights):
@@ -6513,9 +6763,10 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return _dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
+    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage, q_in=None):
         """One gated GQA layer plus its QSA index branch for a generation-only batch, at this
-        rank's heads.
+        rank's heads. `q_in` (`DP_INPROJ_RELEASE_ENV`): the `_InProj` the input projection runs
+        on behind a releasing site A.
 
         The four input projections are one GEMM against the fused operand; the norm + rope of
         both planes runs on it; one compact copy of its leading `[q | k | v]` feeds the dense
@@ -6546,9 +6797,12 @@ class DecodeTarget:
             sparse,
         ) = qsa
         num_tokens = x.shape[0]
-        proj = _dense_mm(
-            x, L.attn_in, L.attn_in8, core.decode_mm, "in", L.attn_in_g, mid=L.attn_in_m
-        )
+        if q_in is not None:
+            proj = _inproj_mm(x, q_in)
+        else:
+            proj = _dense_mm(
+                x, L.attn_in, L.attn_in8, core.decode_mm, "in", L.attn_in_g, mid=L.attn_in_m
+            )
         qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -6670,7 +6924,19 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return core.tp_sum(_dense_mm(out, L.o, L.o8, core.decode_mm, "out", L.o_g, mid=L.o_m))
 
-    def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
+    def _hc_site(
+        self,
+        hc,
+        block_out,
+        inject,
+        norm,
+        first,
+        up,
+        with_inject,
+        normed=None,
+        moe=None,
+        release=False,
+    ):
         """One hyper-connection site: the previous block's injection (none at the stack's first
         site and after the PLE add), this site's grouped norm and its mixer. Returns `(hc, mixed,
         inject)`. At one rank, and at a tep4 rank (`hc_decode_pairs`), the row count, a
@@ -6685,11 +6951,16 @@ class DecodeTarget:
         After a MoE block `block_out` is its routed output and `moe` the `(gate_logits, shared,
         topk_weights, topk_rows)` `_moe` left uncombined: the site's first kernel forms the
         block output itself; with the top-k pair `block_out` is the runner's permuted FC2 rows
-        and that kernel also forms their finalize."""
+        and that kernel also forms their finalize.
+
+        `release` (`DP_INPROJ_RELEASE_ENV`, an attention-DP rank's trunk site A): the mixer's up
+        kernel releases its dependents before its wait; only the inject-norm route takes it, the
+        one an attention-DP rank runs."""
         core = self.core
         gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
         n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
         fast = core.hc_decode_pairs
+        assert not (release and fast), "the early release serves the inject-norm route only"
         if fast and _HC_DECODE_GEMV_MAX_ROWS < hc.shape[0] <= _HC_DECODE_ROWS_MAX:
             hc, low, inject, rstd = qwen4_exp_hc_decode_rows_first(
                 hc,
@@ -6738,7 +7009,7 @@ class DecodeTarget:
                 topk_w,
                 topk_rows,
             )
-        mixed, inject = _hc_mixer(core, normed, first, up, with_inject)
+        mixed, inject = _hc_mixer(core, normed, first, up, with_inject, release)
         return hc, mixed, inject
 
     def _mtp_layer(
@@ -7129,7 +7400,7 @@ class DecodeTarget:
         main.wait_stream(side)
         return rows, (gate_logits, shared, topk_w, topk_rows)
 
-    def _gdn_block(self, x, i, L, si_all, verify, gen_p, captured=False) -> torch.Tensor:
+    def _gdn_block(self, x, i, L, si_all, verify, gen_p, captured=False, q_in=None) -> torch.Tensor:
         """One Gated-DeltaNet layer over a generation-only batch, one token per sequence, at
         this rank's heads: one GEMM for all four input projections (q|k|v, z, a and b are
         column views of its output), the conv step over the q|k|v columns in place, then the
@@ -7146,7 +7417,10 @@ class DecodeTarget:
         as their epilogue -- a single-token step's and, up to `_VERIFY_CONV_FUSED_MAX_ROWS`
         rows, a verify step's with its window snapshots and the pool advance -- reading the
         pool, taps and slots before their PDL wait, bitwise the projection + conv they
-        replace."""
+        replace.
+
+        `q_in` (`DP_INPROJ_RELEASE_ENV`): the `_InProj` the input projection runs on behind a
+        releasing site A (attention DP; the layer has no other decode copy)."""
         core = self.core
         pools = core._bound.pools
         num_tokens = x.shape[0]
@@ -7156,6 +7430,8 @@ class DecodeTarget:
             if L.in_proj_nv is not None and num_tokens <= _INPROJ_NVFP4_MAX_ROWS and _gemv_ready(x)
             else None
         )
+        if q_in is not None:
+            assert nv is None and L.in_proj_g is None, f"layer {i}: another in_proj copy"
         nv_conv = nv is not None and captured and not is_verify
         fp8_conv = (
             not nv_conv
@@ -7203,6 +7479,8 @@ class DecodeTarget:
             )
         elif nv is not None:
             proj = nvfp4_split_gemv_op(x, nv)
+        elif q_in is not None:
+            proj = _inproj_mm(x, q_in)
         else:
             # FlashInfer's low-M kernels at the rows its table names (a verify step's few rows
             # a request), cuBLAS past them; the dense FP8 copies where `_dense_mm` takes them.
@@ -7496,15 +7774,29 @@ class DecodeTarget:
                     hc = qwen4_exp_post_inject(hc, block_out, inject)
                     block_out = inject = moe = None
                 hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm, is_verify)
+            # `DP_INPROJ_RELEASE_ENV`: where the block's input projection runs on the PDL bf16
+            # GEMM (`q_in`, None with the switch off), site A releases its dependents early.
+            q_in = _inproj_release_at(core, i, num_tokens)
             hc, mixed, inject = self._hc_site(
-                hc, block_out, inject, L.ahc_norm, L.ahc_first, L.ahc_up, True, normed, moe
+                hc,
+                block_out,
+                inject,
+                L.ahc_norm,
+                L.ahc_first,
+                L.ahc_up,
+                True,
+                normed,
+                moe,
+                release=q_in is not None,
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify, q_in
                 )
             else:
-                block_out = self._gdn_block(mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph)
+                block_out = self._gdn_block(
+                    mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph, q_in
+                )
             hc, mixed, inject, fp4 = self._hc_moe_site(hc, block_out, inject, L)
             block_out, moe = self._moe(
                 mixed,

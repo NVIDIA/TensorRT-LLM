@@ -65,9 +65,10 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
-    low, inject = op(*args)
+    kw = {k: cell.spec[k] for k in ("tm", "rows_on_n") if k in cell.spec}
+    low, inject = op(*args, **kw)
     assert low.shape == (cell.spec["rows"], RANK)
-    _compare((low, inject), op.reference(*args))
+    _compare((low, inject), op.reference(*args, **kw))
 
 
 def test_guard_refuses_more_than_two_tiles_of_rows() -> None:
@@ -93,3 +94,51 @@ def test_cuda_graph_capture_and_replay(rows) -> None:
     torch.cuda.synchronize()
     low, inject = op(fresh, first, rank, c, wi)
     assert torch.equal(g_low, low) and torch.equal(g_inject, inject)
+
+
+@pytest.mark.parametrize("inject", [True, False])
+@pytest.mark.parametrize("rows", [5, 8, 17, 36, 63, 64])
+def test_tile64_is_bitwise_the_default_plan(rows, inject) -> None:
+    """`tm=64` sums the same K slices in the same order as the 128-row tile: the same bits,
+    eagerly and replayed from a CUDA graph."""
+    normed, first, rank, c, wi = _build(dict(rows=rows, inject=inject), seed=700 + rows)
+    ref = op(normed, first, rank, c, wi)
+    got = op(normed, first, rank, c, wi, tm=64)
+    torch.cuda.synchronize()
+    for a, b in zip(ref, got):
+        assert (a is None) == (b is None) and (a is None or torch.equal(a, b))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = op(normed, first, rank, c, wi, tm=64)
+    fresh = _build(dict(rows=rows, inject=inject), seed=800 + rows)[0]
+    normed.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    for a, b in zip(g_out, op(fresh, first, rank, c, wi)):
+        assert (a is None) == (b is None) and (a is None or torch.equal(a, b))
+
+
+@pytest.mark.parametrize("rows", [65, 72, 80, 81, 88, 96])
+def test_rows_on_n_is_bitwise_the_default_plan(rows) -> None:
+    """The rows-on-N kernel (65..96 rows, MMA N rounded up to 16) gives the 128-row tile's
+    bits for a mixer with the injection, eagerly and replayed."""
+    normed, first, rank, c, wi = _build(dict(rows=rows), seed=900 + rows)
+    ref = op(normed, first, rank, c, wi)
+    got = op(normed, first, rank, c, wi, rows_on_n=True)
+    torch.cuda.synchronize()
+    assert torch.equal(ref[0], got[0]) and torch.equal(ref[1], got[1])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_low, g_inject = op(normed, first, rank, c, wi, rows_on_n=True)
+    fresh = _build(dict(rows=rows), seed=1000 + rows)[0]
+    normed.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    low, inject = op(fresh, first, rank, c, wi)
+    assert torch.equal(g_low, low) and torch.equal(g_inject, inject)
+
+
+def test_guard_refuses_rows_on_n_outside_its_rows() -> None:
+    normed, first, rank, c, wi = _build(dict(rows=97), seed=7)
+    with validating(op), pytest.raises(AssertionError, match="rows on N"):
+        op(normed, first, rank, c, wi, rows_on_n=True)
