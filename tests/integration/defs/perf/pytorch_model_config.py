@@ -16,14 +16,12 @@
 """PyTorch model configuration for the performance benchmarks."""
 
 import copy
+from functools import cache
 from pathlib import Path
 
 import yaml
 
-from ..conftest import llm_models_root
-
-with Path(__file__).with_name('pytorch_config_presets.yml').open() as presets:
-    PERF_CONFIG_PRESETS = yaml.safe_load(presets)
+from ..conftest import get_llm_root, llm_models_root
 
 
 def _get_sm_version_safe() -> int:
@@ -54,6 +52,49 @@ def _kv_without_reuse(**options: object) -> dict:
 
 def _mtp(max_draft_len: int) -> dict:
     return {'decoding_type': 'MTP', 'max_draft_len': max_draft_len}
+
+
+# Hybrid models reuse prefixes up to a recurrent-state snapshot.
+_BUILTIN_PRESETS = {
+    'reuse': {
+        'kv_cache_config': {
+            'enable_block_reuse': True,
+            'mamba_state_config': {
+                'periodic_snapshot_interval': 8192
+            },
+        },
+    },
+    'noreuse': {
+        'kv_cache_config': _kv_without_reuse()
+    },
+    'mtp3': {
+        'speculative_config': _mtp(3)
+    },
+}
+_CURATED_PRESETS = {
+    'deepseek-v4-pro-latency.yaml',
+    'deepseek-v4-pro-throughput.yaml',
+    'musespark-open-agentic-balanced.yaml',
+}
+PERF_CONFIG_PRESETS = _BUILTIN_PRESETS.keys() | _CURATED_PRESETS
+
+
+@cache
+def _get_preset(name: str) -> dict:
+    if name in _BUILTIN_PRESETS:
+        return _BUILTIN_PRESETS[name]
+    if name not in _CURATED_PRESETS:
+        raise KeyError(name)
+    path = Path(get_llm_root()) / 'examples/configs/curated' / name
+    with path.open() as stream:
+        config = yaml.safe_load(stream)
+    # The test case supplies the topology, capacity and KV memory budget.
+    for field in ('tensor_parallel_size', 'pipeline_parallel_size',
+                  'moe_expert_parallel_size', 'max_batch_size',
+                  'max_num_tokens'):
+        config.pop(field, None)
+    config.get('kv_cache_config', {}).pop('free_gpu_memory_fraction', None)
+    return config
 
 
 def _dspark(max_draft_len: int,
@@ -437,6 +478,7 @@ def get_model_yaml_config(model_label: str,
                           lora_dirs: list[str] | None = None) -> dict:
     """Build the benchmark YAML config for a PerfTestConfig.to_string() label."""
     config = {'print_iter_log': True}
+    model_label, has_cfg, presets = model_label.partition('-cfg:')
     label = model_label.lower()
     _apply_model_overrides(config, label)
     # Throughput supplies its own padded graph config unless YAML overrides it.
@@ -455,11 +497,9 @@ def get_model_yaml_config(model_label: str,
     if 'gemma_4_' in label and _get_sm_version_safe() == 121:
         config['attn_backend'] = 'FLASHINFER'
 
-    for part in model_label.split('-'):
-        if part.startswith('cfg:'):
-            for preset in part.removeprefix('cfg:').split('+'):
-                recursive_update(config,
-                                 copy.deepcopy(PERF_CONFIG_PRESETS[preset]))
+    if has_cfg:
+        for preset in presets.split('+'):
+            recursive_update(config, copy.deepcopy(_get_preset(preset)))
 
     if 'pytorch' in model_label and 'loras' in model_label:
         lora_count = 1

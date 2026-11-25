@@ -694,8 +694,11 @@ class PerfTestConfig:
         Populate the config properties given the test param string.
         """
 
-        # Extract configs from test param labels.
-        labels = test_param_labels.split("-")
+        # Keep hyphens in curated YAML filenames within the final cfg label.
+        case, separator, presets = test_param_labels.partition("-cfg:")
+        labels = case.split("-")
+        if separator:
+            labels.append(f"cfg:{presets}")
 
         self.model_name = labels.pop(0)
 
