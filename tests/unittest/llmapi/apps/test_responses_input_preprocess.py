@@ -910,9 +910,9 @@ def _parse_for(model_type, messages):
     """The conversation the chat template is given for ``model_type``."""
     config = type("_StubConfig", (), {"model_type": model_type})()
     conversation, mm_coroutine, placeholder_counts, _ = parse_chat_messages_coroutines(
-        messages, config, None
+        messages, config, None, resolve_media=False
     )
-    mm_coroutine.close()
+    asyncio.run(mm_coroutine)
     return conversation, placeholder_counts
 
 
