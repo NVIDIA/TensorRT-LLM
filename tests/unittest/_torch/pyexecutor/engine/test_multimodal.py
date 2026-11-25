@@ -70,103 +70,110 @@ def test_disabled_encoder_does_not_initialize_processor() -> None:
     processor.get_mm_max_tokens_per_item.assert_not_called()
 
 
-@pytest.mark.parametrize("release_nccl_window_owners", [False, True])
-def test_encoder_graph_capture_follows_metadata_setup_and_runs_once(
+@pytest.mark.parametrize("release_nccl_window_owners,audio_cap", [(False, 512), (True, 4096)])
+def test_encoder_graph_setup_encodes_one_item_per_enabled_tower(
     release_nccl_window_owners: bool,
+    audio_cap: int,
 ) -> None:
     events = []
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
-        def __init__(self, name: str, config: MultimodalEncoderCudaGraphConfig | None) -> None:
+        def __init__(self, modality: str) -> None:
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.empty(1))
-            self.name = name
-            self.encoder_cuda_graph_config = config
-            self._blocks_graph_runner = None
+            if modality == "audio":
+                self.register_buffer("indices", torch.arange(1))
+            else:
+                self.weight = torch.nn.Parameter(torch.ones(1))
+            self.encoder_cuda_graph_modality = modality
             self.runner = Mock()
-            self.runner.capture_all.side_effect = lambda device: events.append(
-                (self.name, "capture", device)
-            )
 
-        def setup_attn_metadata(
-            self,
-            max_num_tokens: int,
-            attention_metadata_capacity: dict[str, int] | None = None,
-        ) -> None:
-            events.append((self.name, "metadata", max_num_tokens))
+        def setup_attn_metadata(self, max_num_tokens: int) -> None:
+            events.append((self.encoder_cuda_graph_modality, "setup", max_num_tokens))
 
-        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
-            assert events.index((self.name, "metadata", 1024)) >= 0
-            assert config is self.encoder_cuda_graph_config
+        def _build_blocks_graph_runner(self, config, inputs, attn_metadata):
+            events.append((self.encoder_cuda_graph_modality, "build", config.max_num_tokens))
+            assert inputs["x"].is_floating_point()
             return self.runner
 
-    config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
+        def _encoder_graph_fn(self, inputs, attn_metadata):
+            return inputs
+
     model = torch.nn.Module()
-    model.first = Encoder("first", config)
-    model.second = Encoder("second", config)
-    model.disabled = Encoder("disabled", None)
-    model.shared = model.first
-    model.unrelated = torch.nn.Linear(1, 1)
+    config = MultimodalConfig(
+        encoder_cuda_graph={"vision": {}, "audio": {"max_num_tokens": audio_cap}}
+    )
+    model.vision = Encoder("vision")
+    model.audio = Encoder("audio")
+    model.disabled = Encoder("other")
+    model.shared = model.vision
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_mm_max_tokens_per_item.return_value = {}
 
-    setup_mm_encoder_attn_metadata(model, object(), 1024, None)
-    setup_mm_encoder_cuda_graphs(model)
-    setup_mm_encoder_cuda_graphs(model)
+    def dummy_data(*, mm_counts, max_num_encoder_tokens, dtype):
+        [(modality, count)] = mm_counts.items()
+        assert count == 1
+        assert dtype == (None if modality == "audio" else torch.float32)
+        assert max_num_encoder_tokens == (audio_cap if modality == "audio" else 2048)
+        return {"modality": modality, "x": torch.ones(1, dtype=dtype)}
 
+    processor.get_dummy_mm_data.side_effect = dummy_data
+
+    def encode(params):
+        data = params[0].multimodal_data
+        return getattr(model, data["modality"])._run_blocks({"x": data["x"]}, None)
+
+    model.encode_multimodal_inputs = encode
+    compiled = torch.compile(model, backend="eager")
+    model.audio.set_attn_max_seq_len = Mock()
+    setup_mm_encoder_attn_metadata(model, processor, 2048, None, multimodal_config=config)
+    model.audio.set_attn_max_seq_len.assert_called_once_with(max(2048, audio_cap))
+    for _ in range(2):
+        setup_mm_encoder_cuda_graphs(
+            compiled, config.encoder_cuda_graph, input_processor=processor, max_num_tokens=2048
+        )
+    assert processor.get_dummy_mm_data.call_count == 2
     assert events == [
-        ("first", "metadata", 1024),
-        ("second", "metadata", 1024),
-        ("disabled", "metadata", 1024),
-        ("first", "capture", torch.device("cpu")),
-        ("second", "capture", torch.device("cpu")),
+        ("vision", "setup", 2048),
+        ("audio", "setup", 2048),
+        ("other", "setup", 2048),
+        ("vision", "build", 2048),
+        ("audio", "build", audio_cap),
     ]
-    assert model.first._blocks_graph_runner is model.first.runner
-    assert model.second._blocks_graph_runner is model.second.runner
-    model.disabled.runner.capture_all.assert_not_called()
-
-    for encoder in (model.first, model.second, model.disabled):
-        encoder.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
-        encoder.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
-        assert encoder._blocks_graph_runner is None
-    for encoder in (model.first, model.second):
-        encoder.runner.clear.assert_called_once_with(
+    assert config.encoder_cuda_graph["vision"].max_num_tokens is None
+    for tower in (model.vision, model.audio):
+        tower.runner.capture_all.assert_called_once_with(torch.device("cpu"))
+        tower.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
+        tower.clear_blocks_cuda_graph(release_nccl_window_owners=release_nccl_window_owners)
+        tower.runner.clear.assert_called_once_with(
             release_nccl_window_owners=release_nccl_window_owners
         )
-    model.disabled.runner.clear.assert_not_called()
-
-    setup_mm_encoder_cuda_graphs(model)
-    assert model.first.runner.capture_all.call_count == 2
-    assert model.second.runner.capture_all.call_count == 2
     model.disabled.runner.capture_all.assert_not_called()
 
 
-def test_encoder_graph_configs_are_selected_per_tower_and_validated_together() -> None:
-    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
-        def __init__(self, modality: str, mm_config: MultimodalConfig) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self.encoder_cuda_graph_modality = modality
-            self.configure_encoder_cuda_graph(mm_config)
-            self.runner = Mock()
+def test_missing_encoder_dummy_fails_during_setup() -> None:
+    class Encoder(torch.nn.Linear, MultimodalEncoderMixin):
+        encoder_cuda_graph_modality = "audio"
 
-        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
-            assert config is self.encoder_cuda_graph_config
-            return self.runner
+        def _encoder_graph_fn(self, inputs, attn_metadata):
+            return inputs
 
-    vision_config = MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
-    audio_config = MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])
-    mm_config = MultimodalConfig(
-        encoder_cuda_graph={"vision": vision_config, "audio": audio_config}
-    )
-    model = torch.nn.Module()
-    model.vision = Encoder("vision", mm_config)
-    model.audio = Encoder("audio", mm_config)
-    assert model.vision.encoder_cuda_graph_config is vision_config
-    assert model.audio.encoder_cuda_graph_config is audio_config
+    model = Encoder(1, 1)
+    model.configure_encoder_cuda_graph(MultimodalConfig(encoder_cuda_graph={"audio": {}}))
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_dummy_mm_data.side_effect = NotImplementedError
+    with pytest.raises(ValueError, match="audio.*get_dummy_mm_data"):
+        setup_mm_encoder_cuda_graphs(model, input_processor=processor, max_num_tokens=256)
+    assert model._blocks_graph_runner is None
 
-    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
-    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph)
-    model.vision.runner.capture_all.assert_called_once_with(torch.device("cpu"))
-    model.audio.runner.capture_all.assert_called_once_with(torch.device("cpu"))
+
+def test_encoder_graph_rejects_inherited_vanilla_backend() -> None:
+    from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+
+    encoder = MultimodalEncoderMixin()
+    with pytest.raises(ValueError, match="VANILLA"):
+        encoder._build_blocks_graph_runner(
+            MultimodalEncoderCudaGraphConfig(), {}, Mock(spec=VanillaAttentionMetadata)
+        )
 
 
 def test_unsupported_encoder_graph_modality_fails_before_any_capture() -> None:
@@ -181,44 +188,6 @@ def test_unsupported_encoder_graph_modality_fails_before_any_capture() -> None:
     graph_configs = {"audio": MultimodalEncoderCudaGraphConfig(buckets=[(1024, 1)])}
     with pytest.raises(ValueError, match="Unsupported.*audio.*Supported.*vision"):
         setup_mm_encoder_cuda_graphs(model, graph_configs)
-
-
-def test_automatic_encoder_graph_budgets_are_resolved_per_tower_without_mutating_config() -> None:
-    class Encoder(torch.nn.Module, MultimodalEncoderMixin):
-        def __init__(self, modality: str, mm_config: MultimodalConfig) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.ones(1))
-            self.encoder_cuda_graph_modality = modality
-            self.configure_encoder_cuda_graph(mm_config)
-            self.build_runner = Mock(return_value=Mock())
-
-        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
-            return self.build_runner(config)
-
-    mm_config = MultimodalConfig(
-        encoder_cuda_graph={
-            "vision": {"max_batch_size": 8},
-            "audio": {"max_batch_size": 4, "max_num_tokens": 512},
-        }
-    )
-    model = torch.nn.Module()
-    model.vision = Encoder("vision", mm_config)
-    model.audio = Encoder("audio", mm_config)
-    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph, max_num_tokens=2048)
-    setup_mm_encoder_cuda_graphs(model, mm_config.encoder_cuda_graph, max_num_tokens=2048)
-
-    vision_config = model.vision.build_runner.call_args.args[0]
-    audio_config = model.audio.build_runner.call_args.args[0]
-    assert vision_config.max_batch_size == 8
-    assert vision_config.max_num_tokens == 2048
-    assert audio_config.max_batch_size == 4
-    assert audio_config.max_num_tokens == 512
-    assert mm_config.encoder_cuda_graph["vision"].max_num_tokens is None
-    assert mm_config.encoder_cuda_graph["audio"].max_num_tokens == 512
-    model.vision.build_runner.assert_called_once()
-    model.audio.build_runner.assert_called_once()
-    model.vision._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
-    model.audio._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
 
 
 def test_automatic_encoder_graphs_need_a_token_budget_before_capture() -> None:
@@ -249,13 +218,17 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
             self.set_attn_max_seq_len = Mock()
             self.build_runner = Mock(return_value=Mock())
 
-        def _build_blocks_graph_runner(self, config: MultimodalEncoderCudaGraphConfig) -> Mock:
+        def _encoder_graph_fn(self, inputs, attn_metadata):
+            return inputs
+
+        def _build_blocks_graph_runner(self, config, inputs, attn_metadata):
             return self.build_runner(config)
 
     mm_config = MultimodalConfig(encoder_cuda_graph={"vision": {"max_batch_size": 8}})
     mapping = Mapping()
     model = torch.nn.Module()
     model.encoder = Encoder(mm_config)
+    model.forward = lambda params: model.encoder._run_blocks(params[0].multimodal_data, None)
     model.config = SimpleNamespace(torch_dtype=torch.float32)
     model.model_config = SimpleNamespace(
         pretrained_config=model.config,
@@ -296,7 +269,10 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
     monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
-    monkeypatch.setattr(model_engine, "create_input_processor", Mock(return_value=object()))
+    processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+    processor.get_mm_max_tokens_per_item.return_value = {}
+    processor.get_dummy_mm_data.return_value = {"x": torch.ones(1)}
+    monkeypatch.setattr(model_engine, "create_input_processor", Mock(return_value=processor))
     monkeypatch.setattr(
         model_engine, "resolve_mrope_position_deltas_cache", Mock(return_value=None)
     )

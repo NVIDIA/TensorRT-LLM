@@ -691,7 +691,10 @@ def build_mm_encoder_runner(
             if budget is not None
         )
         input_processor = create_engine_input_processor(model_path, llm_args)
-        setup_mm_encoder_attn_metadata(loaded.model, input_processor, encoder_max_num_tokens, None)
+        mm_config = llm_args.multimodal_config
+        setup_mm_encoder_attn_metadata(
+            loaded.model, input_processor, encoder_max_num_tokens, None, multimodal_config=mm_config
+        )
         compiled = compile_model(
             loaded.model,
             llm_args=llm_args,
@@ -700,10 +703,10 @@ def build_mm_encoder_runner(
             max_num_tokens=loaded.max_num_tokens,
             prefill_capture_num_tokens=loaded.prefill_capture_num_tokens,
         )
-        mm_config = llm_args.multimodal_config
         setup_mm_encoder_cuda_graphs(
             compiled.model,
             mm_config.encoder_cuda_graph if mm_config is not None else None,
+            input_processor=input_processor,
             max_num_tokens=encoder_max_num_tokens,
         )
         yield EncoderBuild(

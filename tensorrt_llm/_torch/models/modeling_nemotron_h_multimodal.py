@@ -690,10 +690,6 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         }
         self.vision_model.load_weights(vision_encoder_weights)
 
-    def enable_radio_cuda_graph(self) -> None:
-        """Enable CUDA graph replay for RADIO transformer blocks."""
-        self.vision_model.enable_blocks_cuda_graph()
-
     @torch.compile
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()

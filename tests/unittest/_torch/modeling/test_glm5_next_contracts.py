@@ -34,7 +34,6 @@ from tensorrt_llm._torch.models.modeling_glm5_next_vision import (
     Glm5NextVLM,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_masks, is_glm5_next
-from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_cuda_graphs
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -1207,14 +1206,17 @@ def test_vision_attention_dp_is_local_and_matches_single_rank(encoder_cuda_graph
             )
             local.load_state_dict(reference.state_dict())
             local.visual.setup_attn_metadata(max_num_tokens=128)
-            setup_mm_encoder_cuda_graphs(local)
+            dummy_pixels = torch.zeros(16, 3 * 2 * 2 * 2, device="cuda", dtype=torch.bfloat16)
+            local.visual.enable_blocks_cuda_graph(
+                dummy_encode=lambda: local.encode_batched(dummy_pixels, torch.tensor([[1, 4, 4]]))
+            )
             if not width:
                 continue
             pixels = torch.randn(4 * width, 3 * 2 * 2 * 2, device="cuda", dtype=torch.bfloat16)
             grid = torch.tensor([[1, 4, width]])
             expected = reference.encode_batched(pixels, grid)
             with patch.object(
-                local.visual, "_run_blocks_eager", wraps=local.visual._run_blocks_eager
+                local.visual, "_encoder_graph_fn", wraps=local.visual._encoder_graph_fn
             ) as eager_blocks:
                 actual = local.encode_batched(pixels, grid)
             if encoder_cuda_graph:

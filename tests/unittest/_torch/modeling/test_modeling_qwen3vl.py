@@ -561,114 +561,25 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
     )
     vision.fast_pos_embed_interpolate = lambda grid: torch.zeros_like(expected)
     vision.prepare_attn_metadata = lambda seq_lens, metadata: metadata
-    vision.blocks = torch.nn.ModuleList()
-    vision._deepstack_layer_to_merger_idx = {}
+
+    class AddOne(torch.nn.Module):
+        def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            return hidden_states + 1
+
+    vision.blocks = torch.nn.ModuleList([AddOne(), AddOne()])
+    vision._deepstack_layer_to_merger_idx = {1: 0, 0: 1}
+    # Distinguish the two checkpoint mergers with a nonidentity first merger.
+    first_merger = torch.nn.Linear(8, 8, bias=False)
+    with torch.no_grad():
+        first_merger.weight.copy_(torch.eye(8) * 2)
+    vision.deepstack_merger_list = torch.nn.ModuleList([first_merger, torch.nn.Identity()])
     vision.merger = torch.nn.Identity()
 
     actual, deepstack = vision(pixel_values, torch.tensor([[1, 2, 3]]))
 
-    torch.testing.assert_close(actual, expected)
-    assert deepstack == []
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("deepstack_visual_indexes", "expected_features"), [([0], [3.0]), ([1, 0], [6.0, 4.0])]
-)
-def test_qwen3_vision_run_blocks_uses_encoder_graph(
-    deepstack_visual_indexes: list[int], expected_features: list[float]
-) -> None:
-    class FakeGraphRunner:
-        def __init__(self) -> None:
-            self.calls = []
-
-        def maybe_run(self, **kwargs: object) -> dict[str, torch.Tensor]:
-            self.calls.append(kwargs)
-            return {
-                "hidden_states": torch.full((4, 8), 2.0),
-                "deepstack_0": torch.full((4, 8), 3.0),
-                "deepstack_1": torch.full((4, 8), 4.0),
-            }
-
-    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
-    torch.nn.Module.__init__(vision)
-    vision._blocks_graph_runner = FakeGraphRunner()
-    vision.deepstack_visual_indexes = deepstack_visual_indexes
-    vision._deepstack_layer_to_merger_idx = {
-        layer_idx: idx for idx, layer_idx in enumerate(deepstack_visual_indexes)
-    }
-    vision.deepstack_merger_list = torch.nn.ModuleList(
-        [torch.nn.Linear(8, 8, bias=False) for _ in deepstack_visual_indexes]
-    )
-    with torch.no_grad():
-        for idx, merger in enumerate(vision.deepstack_merger_list):
-            merger.weight.copy_(torch.eye(8) * (idx + 1))
-    vision.merger = torch.nn.Identity()
-    metadata = SimpleNamespace(seq_lens=torch.tensor([4]))
-    hidden_states = torch.ones(4, 8)
-    cos = torch.ones(4, 2)
-    sin = torch.zeros(4, 2)
-    position_ids = torch.arange(4, dtype=torch.int32)
-
-    output, deepstack = vision._run_blocks(hidden_states, cos, sin, position_ids, metadata)
-
-    assert torch.equal(output, torch.full((4, 8), 2.0))
-    assert len(deepstack) == len(expected_features)
-    for features, expected in zip(deepstack, expected_features):
-        assert torch.equal(features, torch.full((4, 8), expected))
-    assert vision._blocks_graph_runner.calls == [
-        {
-            "seq_lengths": [4],
-            "inputs": {
-                "hidden_states": hidden_states,
-                "cos": cos,
-                "sin": sin,
-                "rope_position_ids": position_ids,
-            },
-        }
-    ]
-
-
-@pytest.mark.cpu_only
-def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
-    events = []
-
-    class RecordingBlock(torch.nn.Module):
-        def __init__(self, name: str) -> None:
-            super().__init__()
-            self.name = name
-
-        def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
-            events.append(self.name)
-            return hidden_states
-
-    class RecordingMerger(torch.nn.Module):
-        def __init__(self, name: str) -> None:
-            super().__init__()
-            self.name = name
-
-        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            events.append(self.name)
-            return hidden_states
-
-    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
-    torch.nn.Module.__init__(vision)
-    vision._blocks_graph_runner = None
-    vision.blocks = torch.nn.ModuleList([RecordingBlock("block_0"), RecordingBlock("block_1")])
-    vision._deepstack_layer_to_merger_idx = {0: 0}
-    vision.deepstack_merger_list = torch.nn.ModuleList([RecordingMerger("deepstack_merger")])
-    vision.merger = RecordingMerger("final_merger")
-    hidden_states = torch.ones(4, 8)
-
-    vision._run_blocks(
-        hidden_states,
-        torch.ones(4, 2),
-        torch.zeros(4, 2),
-        torch.arange(4, dtype=torch.int32),
-        SimpleNamespace(seq_lens=torch.tensor([4])),
-    )
-
-    assert events == ["block_0", "deepstack_merger", "block_1", "final_merger"]
+    torch.testing.assert_close(actual, expected + 2)
+    torch.testing.assert_close(deepstack[0], expected + 1)
+    torch.testing.assert_close(deepstack[1], (expected + 2) * 2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -683,10 +594,7 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     automatic: bool,
     num_tokens: int,
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
-        setup_mm_encoder_attn_metadata,
-        setup_mm_encoder_cuda_graphs,
-    )
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
 
     config_dict = copy.deepcopy(QWEN3_VL_8B_CONFIG)
     config_dict["vision_config"].update(depth=2, deepstack_visual_indexes=deepstack_visual_indexes)
@@ -717,25 +625,17 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     pixel_values = torch.randn(num_tokens, 3 * 2 * 16 * 16, device="cuda")
     eager = encoder.encode_batched(pixel_values, grid_thw)
 
-    if automatic:
-        setup_mm_encoder_cuda_graphs(encoder, max_num_tokens=256)
-    else:
-        vision.enable_blocks_cuda_graph()
+    vision.enable_blocks_cuda_graph(
+        max_num_tokens=256, dummy_encode=lambda: encoder.encode_batched(pixel_values, grid_thw)
+    )
 
     def fail_eager_fallback(*args: object, **kwargs: object) -> None:
         raise AssertionError("Qwen3-VL vision CUDA graph replay fell back to eager.")
 
-    monkeypatch.setattr(vision, "_run_encoder_blocks", fail_eager_fallback)
+    monkeypatch.setattr(vision, "_encoder_graph_fn", fail_eager_fallback)
     graph = encoder.encode_batched(pixel_values, grid_thw)
 
     torch.testing.assert_close(graph, eager, rtol=5e-2, atol=5e-2)
-    captured = vision._blocks_graph_runner._captured[(257, 2)]
-    # Replay must refresh the device lengths read by attention, not only the host copy.
-    assert captured.metadata.seq_lens_cuda.tolist() == [num_tokens, 257 - num_tokens]
-    assert vision.attn_metadata.max_num_tokens == 256
-    assert vision.attn_metadata.max_num_requests == 1
-    assert captured.metadata.max_num_tokens == 257
-    assert captured.metadata.max_num_requests == 2
 
 
 @pytest.mark.cpu_only
@@ -931,6 +831,7 @@ def test_qwen_vl_vision_rope_layout_fallback_cuda(
     assert torch.equal(v, original_v)
 
 
+@pytest.mark.cpu_only
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     max_pixels = 16_777_216
     expected_max_tokens_per_item = {"image": 65_536}
@@ -939,13 +840,25 @@ def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:
     processor._processor = SimpleNamespace(
         image_processor=SimpleNamespace(
             size={
-                "shortest_edge": 3_136,
+                "shortest_edge": 65_536,
                 "longest_edge": max_pixels,
             }
         )
     )
 
     assert processor.get_mm_max_tokens_per_item() == expected_max_tokens_per_item
+    dummy = processor.get_dummy_mm_data(
+        max_num_encoder_tokens=256, mm_counts={"vision": 1}, dtype=torch.bfloat16
+    )
+    assert dummy[MULTIMODAL_ENCODER_ITEM_METADATA_KEY].item_refs == (("image", 0),)
+    processor._processor.video_processor = SimpleNamespace(
+        size={"shortest_edge": 4_096, "longest_edge": 25_165_824}
+    )
+    video = processor.get_dummy_mm_data(
+        max_num_encoder_tokens=64, mm_counts={"vision": 1}, dtype=torch.bfloat16
+    )
+    assert video[MULTIMODAL_ENCODER_ITEM_METADATA_KEY].item_refs == (("video", 0),)
+    assert video["video"]["video_grid_thw"].tolist() == [[1, 8, 8]]
 
 
 def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):

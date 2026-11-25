@@ -10,7 +10,9 @@ the runner family axis -- it has no warmup or graph-capture phase.
 """
 
 from collections.abc import Hashable, Mapping
-from typing import Any
+from functools import partial
+from itertools import chain
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -38,6 +40,7 @@ from tensorrt_llm.inputs.registry import (
     InputProcessor,
 )
 from tensorrt_llm.llmapi.llm_args import (
+    MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
     MultimodalEncoderSchedulingPolicy,
     TorchLlmArgs,
@@ -167,6 +170,7 @@ def setup_mm_encoder_cuda_graphs(
     model: nn.Module,
     graph_configs: Mapping[str, MultimodalEncoderCudaGraphConfig] | None = None,
     *,
+    input_processor: InputProcessor | None = None,
     max_num_tokens: int | None = None,
 ) -> None:
     """Validate local encoder capabilities, then capture graphs before KV sizing.
@@ -175,9 +179,11 @@ def setup_mm_encoder_cuda_graphs(
         model: Loaded model whose local encoders have already initialized their metadata.
         graph_configs: Model-wide modality configs. Validate against all local towers together;
             models without local encoders may delegate encoding to another process.
+        input_processor: Supplies one processed item for each enabled tower.
         max_num_tokens: Encoder token budget before any scheduling-only increase for large items.
             Supplies the default capture capacity for automatic configs in each tower.
     """
+    model = getattr(model, "_orig_mod", model)
     encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
     if graph_configs is not None and encoders:
         supported_modalities = {
@@ -191,8 +197,53 @@ def setup_mm_encoder_cuda_graphs(
                 f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unsupported)}. "
                 f"Supported modalities: {sorted(supported_modalities)}."
             )
+
+    def dummy_encode(module: MultimodalEncoderMixin) -> None:
+        config = module.encoder_cuda_graph_config
+        modality = module.encoder_cuda_graph_modality
+        if not isinstance(input_processor, BaseMultimodalDummyInputsBuilder):
+            raise ValueError(
+                f"Cannot capture {modality} encoder graphs: a dummy input processor is required"
+            )
+        assert config is not None and modality is not None
+        capture_budget = (
+            max(t for t, _ in config.buckets) if config.buckets else config.max_num_tokens
+        )
+        budget = capture_budget or max_num_tokens
+        assert budget is not None
+        tower = cast(nn.Module, module)
+        tensor = next(chain(tower.parameters(), tower.buffers()), None)
+        dtype = tensor.dtype if tensor is not None and tensor.is_floating_point() else None
+        device = tensor.device if tensor is not None else torch.device("cuda")
+        try:
+            data = input_processor.get_dummy_mm_data(
+                max_num_encoder_tokens=budget, mm_counts={modality: 1}, dtype=dtype
+            )
+        except NotImplementedError as exc:
+            raise ValueError(
+                f"Cannot capture {modality} encoder graphs: "
+                f"{type(input_processor).__name__} must implement get_dummy_mm_data"
+            ) from exc
+        if not data:
+            raise ValueError(f"Processor returned no dummy data for {modality} encoder graphs")
+        params = MultimodalParams(multimodal_data=data)
+        params.to_device(
+            "multimodal_data",
+            str(device),
+            pin_memory=prefer_pinned(),
+            target_keywords=getattr(model, "multimodal_data_device_paths", None),
+        )
+        with discard_nccl_window_tensor_outputs([params]):
+            encode = getattr(model, "encode_multimodal_inputs", model)
+            encode([params])
+
     for module in encoders:
-        module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
+        modality = module.encoder_cuda_graph_modality
+        if modality is not None and graph_configs is not None and modality in graph_configs:
+            module.encoder_cuda_graph_config = graph_configs[modality]
+        module.enable_blocks_cuda_graph(
+            max_num_tokens=max_num_tokens, dummy_encode=partial(dummy_encode, module)
+        )
 
 
 def setup_mm_encoder_attn_metadata(
@@ -200,6 +251,8 @@ def setup_mm_encoder_attn_metadata(
     input_processor: InputProcessor,
     encoder_max_num_tokens: int,
     attention_metadata_capacity: dict[str, int] | None,
+    *,
+    multimodal_config: MultimodalConfig | None = None,
 ) -> None:
     """Construct AttentionMetadata for any multimodal encoders inside the loaded model,
     using the engine's encoder token budget (``encoder_max_num_tokens``, falling back to
@@ -214,6 +267,7 @@ def setup_mm_encoder_attn_metadata(
     Runs for every multimodal model, not just item-scheduled ones, so it is a module-level
     function rather than a ``MultimodalItemScheduler`` method: the scheduler is ``None``
     whenever item scheduling is off.
+    Resolve each tower's graph configuration before sizing its per-segment capacity.
     """
     encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
     if not encoders:
@@ -225,6 +279,8 @@ def setup_mm_encoder_attn_metadata(
         max_seq_len = max(max_seq_len, max(max_tokens_per_item.values(), default=0))
 
     for module in encoders:
+        if module.encoder_cuda_graph_config is None and multimodal_config is not None:
+            module.configure_encoder_cuda_graph(multimodal_config)
         setup_kwargs: dict[str, Any] = dict(max_num_tokens=encoder_max_num_tokens)
         encoder_max_seq_len = max_seq_len
         if attention_metadata_capacity is not None:

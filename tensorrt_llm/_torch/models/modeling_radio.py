@@ -6,8 +6,8 @@ import copy
 import dataclasses
 import math
 from collections import namedtuple
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Mapping,
-                    NamedTuple, Optional, Sequence, Tuple, Type, Union)
+from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Literal,
+                    Mapping, NamedTuple, Optional, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -22,14 +22,9 @@ from tensorrt_llm._torch.attention.backends import \
     interface as attention_interface
 from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
-    MultimodalEncoderMixin
-from tensorrt_llm._torch.models.multimodal_encoder_graph import (
-    EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
-    MultimodalEncoderGraphRunner)
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    MultimodalEncoderMixin, prepare_encoder_attn_metadata)
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
-from tensorrt_llm._torch.utils import torch_compiling
-from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 if TYPE_CHECKING:
@@ -752,18 +747,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             model_config.attn_backend).Metadata
         self._attn_backend = model_config.attn_backend
 
-        # Establish default encoder AttentionMetadata at construction (legacy
-        # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
-        # / metadata provider can read `self.attn_metadata` before the engine
-        # re-sizes it via `setup_attn_metadata`.
         self.setup_attn_metadata(max_num_tokens=model_config.max_num_tokens)
-
-        # CUDA-graph runner for the block stack. None means graphs are off and
-        # the eager path is always taken; the caller opts in via
-        # `enable_blocks_cuda_graph`. Initialized here (not in
-        # `setup_attn_metadata`) so it is always present regardless of call
-        # order.
-        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
     def setup_attn_metadata(
         self,
@@ -790,29 +774,10 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
-    def prepare_attn_metadata(
-            self, batch_size: int, seq_lengths: List[int],
-            attn_metadata: AttentionMetadata) -> AttentionMetadata:
-        """
-        To simplify the usage of the model, this function aims to fill the metadata for Attention
-        Call this function before forward pass
-        """
-        prompt_lens = seq_lengths
-        seq_lens = torch.tensor(seq_lengths,
-                                dtype=torch.int32,
-                                pin_memory=prefer_pinned())
-        request_ids = list(range(1, batch_size + 1))
-
-        attn_metadata.seq_lens = seq_lens
-        attn_metadata.num_contexts = batch_size
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lens
-        # Use fixed max_seq_len to keep the C++ attention op cache key stable.
-        # The actual per-sequence lengths are passed separately and used for computation.
-        attn_metadata.max_seq_len = self._fixed_max_seq_len
-
-        attn_metadata.prepare()
-        return attn_metadata
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        # Graph padding can exceed one CPE image. Eager-only attention keeps its CPE bound.
+        if self.encoder_cuda_graph_config is not None:
+            self._fixed_max_seq_len = max(self._fixed_max_seq_len, max_seq_len)
 
     def forward_features(self,
                          x: torch.Tensor,
@@ -826,147 +791,38 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
             num_frames: Number of video frames. When provided with
                 temporal_patch_size > 1, enables temporal compression.
         """
-        T = self.temporal_patch_size
-        packed_batch_size = None  # set when we pack tubelets
-
         x = self.patch_generator(x,
                                  image_sizes=image_sizes,
                                  num_frames=num_frames)
-
-        if num_frames is not None and T > 1:
-            packed_batch_size, seq_per_tubelet, hidden_size = x.shape
-            # Pack all tubelets into one sequence for attention.
-            x = x.reshape(1, -1, hidden_size)
-            seq_lengths = [seq_per_tubelet] * packed_batch_size
-            batch_size = packed_batch_size
-        elif image_sizes is not None:
+        shape = x.shape
+        if image_sizes is not None and not (num_frames is not None
+                                            and self.temporal_patch_size > 1):
             # Dynamic resolution: each image is a separate "context".
             num_skip = self.patch_generator.num_skip
             seq_lengths = [
                 calc_seq_len(size, self.patch_size) + num_skip
                 for size in image_sizes
             ]
-            batch_size = len(image_sizes)
         else:
-            batch_size, seq_len, _ = x.shape
-            seq_lengths = [seq_len] * batch_size
+            seq_lengths = [shape[1]] * shape[0]
 
-        attn_metadata = self.prepare_attn_metadata(batch_size, seq_lengths,
-                                                   self.attn_metadata)
+        attn_metadata = prepare_encoder_attn_metadata(
+            seq_lengths,
+            self.attn_metadata,
+            max_seq_len=self._fixed_max_seq_len)
 
-        hidden_size = x.shape[-1]
-        # Need flatten batch/seq_len for trtllm attention.
-        x = x.reshape(-1, hidden_size)
-        x = self._run_blocks(x, attn_metadata)
+        x = self._run_blocks({"x": x.flatten(0, 1)}, attn_metadata)["x"]
+        return self.norm(x.reshape(shape))
 
-        # Reshape back from flattened.
-        if packed_batch_size is not None:
-            x = x.reshape(packed_batch_size, seq_per_tubelet, hidden_size)
-        elif image_sizes is not None:
-            x = x.reshape(1, -1, hidden_size)
-        else:
-            x = x.reshape(batch_size, seq_lengths[0], hidden_size)
-
-        x = self.norm(x)
-        return x
-
-    def _build_blocks_graph_runner(
-        self, config: "MultimodalEncoderCudaGraphConfig"
-    ) -> MultimodalEncoderGraphRunner:
-        input_specs = {
-            "x":
-            EncoderGraphTensorSpec(shape=(self.embed_dim, ),
-                                   dtype=self.model_config.torch_dtype,
-                                   token_dim=0),
-        }
-        output_specs = {"x": 0}
-        return MultimodalEncoderGraphRunner(
-            encoder_fn=self._encoder_graph_fn,
-            metadata_provider=_VisionEncoderMetadataProvider(self),
-            input_specs=input_specs,
-            output_specs=output_specs,
-            config=config,
-        )
-
-    # This is what gets passed to the `MultimodalEncoderGraphRunner`.
     def _encoder_graph_fn(
         self,
         inputs: Mapping[str, torch.Tensor],
-        md: AttentionMetadata,
+        attn_metadata: AttentionMetadata,
     ) -> Dict[str, torch.Tensor]:
-        return {"x": self._run_blocks_eager(inputs["x"], md)}
-
-    def _run_blocks(self, x: torch.Tensor,
-                    attn_metadata: AttentionMetadata) -> torch.Tensor:
-        # RADIO runs outside the compiled LM region and receives its vision
-        # metadata explicitly. Keep both graph replay and eager fallback off
-        # the custom-op path, which resolves the LM metadata from extra_attrs.
-        with torch_compiling(False):
-            if self._blocks_graph_runner is not None:
-                seq_lengths = attn_metadata.seq_lens.tolist()
-                output = self._blocks_graph_runner.maybe_run(
-                    seq_lengths=seq_lengths,
-                    inputs={"x": x},
-                )
-                if output is not None:
-                    return output["x"]
-            return self._run_blocks_eager(x, attn_metadata)
-
-    def _run_blocks_eager(self, x: torch.Tensor,
-                          attn_metadata: AttentionMetadata) -> torch.Tensor:
+        x = inputs["x"]
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
-        return x
-
-
-class _VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]
-                                     ):
-    """Bridges the multimodal encoder graph runner to the model's eager metadata path.
-
-    `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
-    `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
-    `attention/backends/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
-    to run against captured CUDA graphs.
-
-    The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
-    """
-
-    # `_seq_lens_cuda` is the on-device buffer the captured attention kernels read sequence lengths
-    # from; the `seq_lens` setter copies into it in place when `is_cuda_graph=True`.
-    # FlashInfer also owns a persistent workspace buffer that backs its captured ragged-prefill run.
-    graph_critical_attrs: Sequence[str]
-
-    def __init__(self, vit: VisionTransformer) -> None:
-        self._vit = vit
-        self.graph_critical_attrs = ("_seq_lens_cuda", )
-        if vit.model_config.attn_backend == "FLASHINFER":
-            self.graph_critical_attrs += (
-                "workspace_buffer",
-                "_ragged_qo_indptr_buf",
-                "_ragged_kv_indptr_buf",
-            )
-
-    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
-        vit = self._vit
-        metadata_kwargs = dict(
-            max_num_requests=max(vit.attn_metadata.max_num_requests,
-                                 key.num_contexts),
-            max_num_tokens=max(vit.attn_metadata.max_num_tokens,
-                               key.total_tokens),
-            kv_cache_manager=None,
-        )
-        if vit.model_config.attn_backend == "FLASHINFER":
-            metadata_kwargs["kv_layout"] = "NHD"
-        md = vit.metadata_cls(**metadata_kwargs)
-        md.is_cuda_graph = True
-        return md
-
-    def refresh_in_place(self, metadata: AttentionMetadata,
-                         padded_seq_lengths: Sequence[int]) -> None:
-        # Reuse the eager path so both modes go through the same setter logic; the captured graph
-        # holds the metadata's tensor addresses.
-        self._vit.prepare_attn_metadata(len(padded_seq_lengths),
-                                        list(padded_seq_lengths), metadata)
+        return {"x": x}
 
 
 class RADIOVisionModelBase(nn.Module):
@@ -1342,13 +1198,16 @@ class RADIOVisionModel(PreTrainedModel):
     def enable_blocks_cuda_graph(
         self,
         *,
+        dummy_encode: Callable[[], object] | None = None,
         device: Optional[torch.device] = None,
     ) -> None:
         """Forward the configuration to the inner VisionTransformer."""
         if self._encoder_cuda_graph_config is None:
             return
         self.radio_model.model.enable_blocks_cuda_graph(
-            self._encoder_cuda_graph_config, device=device)
+            self._encoder_cuda_graph_config,
+            dummy_encode=dummy_encode,
+            device=device)
 
     def forward(self,
                 x: torch.Tensor,

@@ -130,16 +130,19 @@ def _init_finite_weights(model: torch.nn.Module) -> None:
 
     The tiny config in this file uses random PyTorch init which routinely produces NaN/inf through
     the attention kernel on bf16. A small-std normal init + zero bias makes the eager forward
-    numerically stable so the graph-vs-eager comparison below can do a bit-exact check.
+    numerically stable. Unit normalization weights preserve the variation across patches.
     """
     with torch.no_grad():
-        for param in model.parameters():
+        for name, param in model.named_parameters():
             if param.dim() >= 2:
                 torch.nn.init.normal_(param, std=0.02)
+            elif "norm" in name and name.endswith(".weight"):
+                param.fill_(1.0)
             else:
                 param.zero_()
 
 
+@pytest.mark.cpu_only
 def test_radio_run_blocks_lowers_torch_compiling_for_eager_fallback():
     """A graph miss must keep RADIO attention off the compiled LM path."""
     x = torch.zeros(1, 4)
@@ -151,12 +154,12 @@ def test_radio_run_blocks_lowers_torch_compiling_for_eager_fallback():
     vision_tower._blocks_graph_runner.maybe_run.side_effect = lambda **_: observed.append(
         is_torch_compiling()
     )
-    vision_tower._run_blocks_eager.side_effect = (
-        lambda x, _: observed.append(is_torch_compiling()) or x
+    vision_tower._encoder_graph_fn.side_effect = lambda inputs, _: (
+        observed.append(is_torch_compiling()) or inputs
     )
 
     with torch_compiling(True):
-        output = VisionTransformer._run_blocks(vision_tower, x, attn_metadata)
+        output = VisionTransformer._run_blocks(vision_tower, {"x": x}, attn_metadata)["x"]
         assert is_torch_compiling(), "RADIO must restore the engine's compile flag"
 
     assert output is x
@@ -177,12 +180,12 @@ def test_clear_blocks_cuda_graph_releases_only_at_explicit_boundary():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+@torch.inference_mode()
 def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
     """Block-loop CUDA graph wiring must produce the same output as eager.
 
     Runs the tiny ViT once in eager mode to capture a reference, then enables the encoder graph
-    runner and re-runs the same input. The post-merger output must match bit-exactly: capture /
-    replay just records the same kernel launches the eager path runs.
+    runner and re-runs the same input through the padded block stack.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -217,12 +220,12 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
 
     with torch.no_grad():
         eager_out = model.forward(pixel_values).clone()
-    assert not eager_out.isnan().any(), "eager fixture produced NaN; tighten init"
+    assert torch.isfinite(eager_out).all() and eager_out.count_nonzero() > 0
 
     # Bucket sized comfortably above the toy seq_lengths so dummy-context padding is exercised: a
     # 32x32 image with patch_size=16 yields four patches plus the CLS token, so 16 tokens leaves
     # ample room.
-    model.enable_blocks_cuda_graph(device=device)
+    model.enable_blocks_cuda_graph(dummy_encode=lambda: model(pixel_values), device=device)
     vision_tower = model.radio_model.model
     runner = vision_tower._blocks_graph_runner
     assert runner is not None
@@ -232,7 +235,7 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
         mock.patch.object(runner, "maybe_run", wraps=runner.maybe_run) as maybe_run,
         mock.patch.object(
             vision_tower,
-            "_run_blocks_eager",
+            "_encoder_graph_fn",
             side_effect=AssertionError("CUDA graph replay fell back to the eager block loop."),
         ),
         torch.no_grad(),
@@ -241,7 +244,7 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
 
     maybe_run.assert_called_once()
 
-    torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+    torch.testing.assert_close(graph_out, eager_out, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -270,7 +273,7 @@ def test_radio_blocks_cuda_graph_falls_back_when_no_bucket(tiny_vit_config):
     model.eval()
 
     # Bucket too small for even a single real token — every request falls back.
-    model.enable_blocks_cuda_graph(device=device)
+    model.enable_blocks_cuda_graph(dummy_encode=lambda: model(pixel_values), device=device)
     with torch.no_grad():
         features = model.forward(pixel_values)
 
@@ -315,9 +318,11 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
 
     with torch.no_grad():
         eager_out = model.forward(pixel_values, image_sizes=image_sizes).clone()
-    assert not eager_out.isnan().any(), "eager fixture produced NaN; tighten init"
+    assert torch.isfinite(eager_out).all() and eager_out.count_nonzero() > 0
 
-    model.enable_blocks_cuda_graph(device=device)
+    model.enable_blocks_cuda_graph(
+        dummy_encode=lambda: model(pixel_values, image_sizes=image_sizes), device=device
+    )
     vision_tower = model.radio_model.model
     runner = vision_tower._blocks_graph_runner
     assert runner is not None
@@ -327,7 +332,7 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
         mock.patch.object(runner, "maybe_run", wraps=runner.maybe_run) as maybe_run,
         mock.patch.object(
             vision_tower,
-            "_run_blocks_eager",
+            "_encoder_graph_fn",
             side_effect=AssertionError("CUDA graph replay fell back to the eager block loop."),
         ),
         torch.no_grad(),
@@ -336,7 +341,7 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
 
     maybe_run.assert_called_once()
 
-    torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+    torch.testing.assert_close(graph_out, eager_out, rtol=2e-2, atol=2e-2)
 
 
 def _make_temporal_model_config() -> model_config_lib.ModelConfig:

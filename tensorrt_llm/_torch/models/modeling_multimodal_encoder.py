@@ -16,8 +16,8 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal, Optional, Type, cast
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Literal, Optional, Type
 
 import torch
 import torch.nn as nn
@@ -236,16 +236,11 @@ class MultimodalEncoderMixin:
         self,
         config: "MultimodalEncoderCudaGraphConfig | None" = None,
         *,
+        dummy_encode: Callable[[], object] | None = None,
         device: torch.device | None = None,
         max_num_tokens: int | None = None,
     ) -> None:
-        """Capture configured block graphs once, after weights and metadata are ready.
-
-        The engine drives this lifecycle for every local multimodal encoder.
-        Standalone callers may provide an explicit config and device. Automatic
-        configs use their own token cap or the engine's original encoder budget;
-        raising the scheduling budget for an oversized item does not enlarge captures.
-        """
+        """Observe block inputs during one startup encode, then capture before KV sizing."""
         config = config if config is not None else self._encoder_cuda_graph_config
         if config is None or self._blocks_graph_runner is not None:
             return
@@ -255,9 +250,42 @@ class MultimodalEncoderMixin:
                                  "from the config or engine.")
             config = config.model_copy(
                 update={"max_num_tokens": max_num_tokens})
-        runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(cast(nn.Module, self).parameters()).device
+        if type(self
+                )._encoder_graph_fn is MultimodalEncoderMixin._encoder_graph_fn:
+            raise ValueError(
+                f"{type(self).__name__} must implement _encoder_graph_fn")
+        if dummy_encode is None:
+            raise ValueError(
+                f"{type(self).__name__} needs a dummy encode to capture block graphs"
+            )
+
+        runner = None
+        run_blocks = self._run_blocks
+
+        def observe_blocks(
+                inputs: dict[str, torch.Tensor],
+                attn_metadata: AttentionMetadata | None
+        ) -> dict[str, torch.Tensor]:
+            nonlocal runner, device
+            if runner is None:
+                runner = self._build_blocks_graph_runner(
+                    config, inputs, attn_metadata)
+                if device is None:
+                    device = next(iter(inputs.values())).device
+            return run_blocks(inputs, attn_metadata)
+
+        # Observe the eager prelude only during this encode. Serving has no pending capture state.
+        self._run_blocks = observe_blocks
+        try:
+            # Eager attention wrappers may update their buffers on later no-grad calls.
+            with torch.no_grad():
+                dummy_encode()
+        finally:
+            del self._run_blocks
+        if runner is None:
+            raise ValueError(
+                f"Dummy encode did not execute the blocks of {type(self).__name__}"
+            )
         runner.capture_all(device)
         self._blocks_graph_runner = runner
 

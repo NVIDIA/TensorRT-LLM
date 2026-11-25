@@ -6,7 +6,7 @@ import dataclasses
 import math
 import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
 
 import numpy as np
@@ -83,15 +83,6 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
-from .multimodal_encoder_graph import (
-    EncoderGraphKey,
-    EncoderGraphTensorSpec,
-    EncoderMetadataProvider,
-    MultimodalEncoderGraphRunner,
-)
-
-if TYPE_CHECKING:
-    from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 
 
 def _expand_prompt_token_ids_for_mm_handoff(
@@ -1064,7 +1055,6 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
         self.attn_metadata: Optional[AttentionMetadata] = None
         self._fixed_max_seq_len = self.model_config.max_num_tokens
-        self._blocks_graph_runner: MultimodalEncoderGraphRunner | None = None
 
         self.configure_encoder_cuda_graph(self.model_config.multimodal_config)
 
@@ -1264,122 +1254,23 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             seq_lens, attn_metadata, max_seq_len=self._fixed_max_seq_len
         )
 
-    def _build_blocks_graph_runner(
-        self, config: "MultimodalEncoderCudaGraphConfig"
-    ) -> MultimodalEncoderGraphRunner:
-        rotary_cos_sin = self.rotary_pos_emb.rotary_cos_sin
-        rotary_dim = rotary_cos_sin.shape[-1] * 2
-        # Match the dtypes of the eager tensors so the static-buffer copy never casts.
-        input_specs = {
-            "hidden_states": EncoderGraphTensorSpec(
-                shape=(self.config.hidden_size,), dtype=self.patch_embed.proj.weight.dtype
-            ),
-            "cos": EncoderGraphTensorSpec(shape=(rotary_dim,), dtype=rotary_cos_sin.dtype),
-            "sin": EncoderGraphTensorSpec(shape=(rotary_dim,), dtype=rotary_cos_sin.dtype),
-            "rope_position_ids": EncoderGraphTensorSpec(shape=(), dtype=torch.int32),
-        }
-        output_specs = {"hidden_states": 0}
-        output_specs.update(
-            {f"deepstack_{idx}": 0 for idx in range(len(self.deepstack_visual_indexes))}
-        )
-        return MultimodalEncoderGraphRunner(
-            encoder_fn=self._encoder_graph_fn,
-            metadata_provider=_Qwen3VisionEncoderMetadataProvider(self),
-            input_specs=input_specs,
-            output_specs=output_specs,
-            config=config,
-        )
-
     def _encoder_graph_fn(
-        self,
-        inputs: TypingMapping[str, torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        self, inputs: TypingMapping[str, torch.Tensor], attn_metadata: AttentionMetadata
     ) -> dict[str, torch.Tensor]:
-        hidden_states, deepstack_hidden_states = self._run_encoder_blocks(
-            inputs["hidden_states"],
-            inputs["cos"],
-            inputs["sin"],
-            inputs["rope_position_ids"],
-            attn_metadata,
-            merge_deepstack=False,
-        )
-        outputs = {"hidden_states": hidden_states}
-        outputs.update(
-            {
-                f"deepstack_{idx}": hidden_state
-                for idx, hidden_state in enumerate(deepstack_hidden_states)
-            }
-        )
-        return outputs
-
-    def _run_blocks(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        rope_position_ids: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        if self._blocks_graph_runner is not None:
-            graph_outputs = self._blocks_graph_runner.maybe_run(
-                seq_lengths=attn_metadata.seq_lens.tolist(),
-                inputs={
-                    "hidden_states": hidden_states,
-                    "cos": cos,
-                    "sin": sin,
-                    "rope_position_ids": rope_position_ids,
-                },
-            )
-            if graph_outputs is not None:
-                # Replay outputs borrow graph-owned buffers; the mergers run
-                # eagerly so the returned features own their storage.
-                # Blocks emit deepstack states in layer order; each merger's
-                # checkpoint index follows deepstack_visual_indexes instead.
-                mergers = [
-                    self.deepstack_merger_list[merger_idx]
-                    for _, merger_idx in sorted(self._deepstack_layer_to_merger_idx.items())
-                ]
-                return self.merger(graph_outputs["hidden_states"]), [
-                    merger(graph_outputs[f"deepstack_{idx}"]) for idx, merger in enumerate(mergers)
-                ]
-
-        hidden_states, deepstack_features = self._run_encoder_blocks(
-            hidden_states,
-            cos,
-            sin,
-            rope_position_ids,
-            attn_metadata,
-            merge_deepstack=True,
-        )
-        return self.merger(hidden_states), deepstack_features
-
-    def _run_encoder_blocks(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        rope_position_ids: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        *,
-        merge_deepstack: bool,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        position_embeddings = (cos, sin)
-        deepstack_outputs = []
-        for layer_num, block in enumerate(self.blocks):
+        hidden_states = inputs["hidden_states"]
+        position_embeddings = (inputs["cos"], inputs["sin"])
+        outputs = {}
+        for layer_idx, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
-                position_ids=rope_position_ids,
+                position_ids=inputs["rope_position_ids"],
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
             )
-            merger_idx = self._deepstack_layer_to_merger_idx.get(layer_num)
-            if merger_idx is not None:
-                deepstack_outputs.append(
-                    self.deepstack_merger_list[merger_idx](hidden_states)
-                    if merge_deepstack
-                    else hidden_states
-                )
-        return hidden_states, deepstack_outputs
+            if layer_idx in self._deepstack_layer_to_merger_idx:
+                outputs[f"deepstack_{layer_idx}"] = hidden_states
+        outputs["hidden_states"] = hidden_states
+        return outputs
 
     @torch.inference_mode()
     def forward(
@@ -1431,46 +1322,21 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                 seq_len, dtype=torch.int32, device=self.device
             )
         rope_position_ids = self._rope_position_ids_buffer[:seq_len]
-        return self._run_blocks(hidden_states, cos, sin, rope_position_ids, self.attn_metadata)
-
-
-class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]):
-    """Own fixed-address attention metadata for Qwen3-VL graph buckets."""
-
-    def __init__(self, vision: Qwen3VisionModel) -> None:
-        self._vision = vision
-        self.graph_critical_attrs: Sequence[str] = (
-            "_seq_lens_cuda",
-            "cu_q_seqlens",
-            "cu_kv_seqlens",
+        outputs = self._run_blocks(
+            {
+                "hidden_states": hidden_states,
+                "cos": cos,
+                "sin": sin,
+                "rope_position_ids": rope_position_ids,
+            },
+            self.attn_metadata,
         )
-        if vision.model_config.attn_backend == "FLASHINFER":
-            self.graph_critical_attrs += (
-                "workspace_buffer",
-                "_ragged_qo_indptr_buf",
-                "_ragged_kv_indptr_buf",
-            )
-
-    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
-        vision = self._vision
-        metadata = vision.metadata_cls(
-            max_num_requests=key.num_contexts,
-            max_num_tokens=key.total_tokens,
-            kv_cache_manager=None,
-        )
-        metadata.is_cuda_graph = True
-        metadata.seq_lens = torch.ones(key.num_contexts, dtype=torch.int32)
-        bind_seq_lens = getattr(metadata, "bind_encoder_cuda_graph_seq_lens", None)
-        if callable(bind_seq_lens):
-            bind_seq_lens(metadata.seq_lens, key.num_contexts)
-        return metadata
-
-    def refresh_in_place(
-        self,
-        metadata: AttentionMetadata,
-        padded_seq_lengths: Sequence[int],
-    ) -> None:
-        self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
+        # Features follow block order; merger weights follow the checkpoint's index order.
+        deepstack = [
+            self.deepstack_merger_list[merger_idx](outputs[f"deepstack_{layer_idx}"])
+            for layer_idx, merger_idx in sorted(self._deepstack_layer_to_merger_idx.items())
+        ]
+        return self.merger(outputs["hidden_states"]), deepstack
 
 
 def _qwen3vl_build_batched_input(
