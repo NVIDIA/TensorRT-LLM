@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import torch
 import torch.nn as nn
@@ -31,8 +32,12 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .wan_vae import WanVAE, WanVAEConfig, _nvfp4_supported_sm_names, _supports_nvfp4_device
 
+if TYPE_CHECKING:
+    from .wino_vae import WinoVae, WinoVaeOptions
+
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
+_VaeT = TypeVar("_VaeT", bound=WanVAE)
 
 
 def _resolve_nvfp4_device_support(
@@ -298,19 +303,31 @@ def _load_nvfp4_wan_vae(
     return wan_vae
 
 
-def _load_native_wan_vae(
+def _load_native_vae(
+    vae_cls: type[_VaeT],
     checkpoint_dir: str,
     device: torch.device,
     dtype: torch.dtype,
-) -> WanVAE:
+    **model_kwargs: Any,
+) -> _VaeT:
+    """Build ``vae_cls`` from the checkpoint's VAE config and ``model_kwargs`` and load its
+    unquantized weights."""
     vae_dir = Path(checkpoint_dir) / "vae"
-    wan_vae = WanVAE(WanVAEConfig.from_json_file(vae_dir / "config.json"))
+    wan_vae = vae_cls(WanVAEConfig.from_json_file(vae_dir / "config.json"), **model_kwargs)
     state_dict = WeightLoader(components=PipelineComponent.VAE).load_weights(
         checkpoint_dir,
         Mapping(),
     )
     wan_vae.load_state_dict(state_dict, strict=True)
     return wan_vae.to(device=device, dtype=dtype).eval()
+
+
+def _load_native_wan_vae(
+    checkpoint_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> WanVAE:
+    return _load_native_vae(WanVAE, checkpoint_dir, device, dtype)
 
 
 def _select_dynamic_fp4_convs(vae: WanVAE, quant_config: QuantConfig) -> set[str]:
@@ -424,3 +441,40 @@ def load_wan_vae(
         if n_static:
             raise RuntimeError("Load-time NVFP4 quantization unexpectedly produced static scales")
     return wan_vae
+
+
+def load_wino_vae(
+    checkpoint_dir: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    options: "WinoVaeOptions | dict[str, Any] | None" = None,
+) -> "WinoVae":
+    """Load the checkpoint's Wan VAE as a ``WinoVae``.
+
+    Args:
+        checkpoint_dir: Pipeline checkpoint root containing the ``vae`` component.
+        device: Device the loaded VAE is moved to.
+        dtype: Dtype of the VAE parameters. ``WinoVae`` runs in ``torch.bfloat16`` only.
+        options: Run-time settings of the model; ``None`` takes ``WinoVaeOptions()``.
+
+    Returns:
+        The loaded ``WinoVae`` in eval mode.
+
+    Raises:
+        ValueError: If ``dtype`` is not ``torch.bfloat16``, ``TRTLLM_USE_DIFFUSER_VAE``
+            selects the Diffusers VAE, or the checkpoint's VAE is NVFP4-quantized.
+    """
+    from .wino_vae import WinoVae
+
+    if dtype != torch.bfloat16:
+        raise ValueError(f"WinoVae runs in torch.bfloat16 only, got dtype={dtype}.")
+    if _use_diffuser_vae_env():
+        raise ValueError(
+            f"WinoVae has no Diffusers implementation; unset {TRTLLM_USE_DIFFUSER_VAE_ENV}."
+        )
+    if _is_nvfp4_vae_ckpt(Path(checkpoint_dir) / "vae"):
+        raise ValueError(
+            f"WinoVae has no NVFP4 convolutions, and the VAE in {checkpoint_dir} is "
+            "NVFP4-quantized."
+        )
+    return _load_native_vae(WinoVae, checkpoint_dir, device, dtype, options=options)

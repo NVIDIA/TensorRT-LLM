@@ -74,6 +74,31 @@ def _load_transfer_controls(extra_params: dict[str, Any]) -> None:
         extra_params[key] = hint
 
 
+def _action_extra_params(path: str) -> dict[str, Any]:
+    """Read an ``--action_json`` file into ``extra_params`` entries.
+
+    The file holds the trajectory (or state) itself, or an object
+    ``{"action": [T, D], "domain_names": [T]}`` that also names the embodiment
+    of each action row; other keys of the object are ignored. The names are
+    passed on as a ``domain_name`` list, which the pipeline resolves against
+    the checkpoint's embodiment table.
+    """
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        return {"action": payload}
+    if "action" not in payload:
+        raise ValueError(
+            f"--action_json {path!r} holds an object without an 'action' key "
+            f"(keys: {sorted(payload)})."
+        )
+    extra_params = {"action": payload["action"]}
+    names = payload.get("domain_names")
+    if names:
+        extra_params["domain_name"] = names
+    return extra_params
+
+
 def _json_object(text: str) -> dict[str, Any]:
     """Argparse type for a JSON *object*.
 
@@ -269,14 +294,15 @@ def _default_action_output_path(output_path: str) -> str:
 def _save_action_output(
     output,
     path: str,
-    args: argparse.Namespace,
+    extra_params: dict[str, Any],
     *,
     action_mode: str,
 ) -> None:
     """Write the trajectory plus the request that produced it.
 
     The mode and embodiment are request-side facts, so they are not echoed
-    back through the output schema. A policy manifest may supply ``action_mode``.
+    back through the output schema: the embodiment is read from the request's
+    ``extra_params``. A policy manifest may supply ``action_mode``.
     """
     if output.action is None:
         return
@@ -291,8 +317,8 @@ def _save_action_output(
 
     payload = {
         "action_mode": action_mode,
-        "domain_name": args.domain_name,
-        "domain_id": args.domain_id,
+        "domain_name": extra_params.get("domain_name"),
+        "domain_id": extra_params.get("domain_id"),
         "raw_action_dim": action.shape[-1],
         "shape": shape,
         "dtype": str(action.dtype).replace("torch.", ""),
@@ -312,7 +338,7 @@ def main():
         default="nvidia/Cosmos3-Nano",
         help="Model path or HuggingFace Hub ID "
         "(nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super, nvidia/Cosmos3-Edge, "
-        "nvidia/Cosmos3-Edge-Policy-DROID)",
+        "nvidia/Cosmos3-Edge-Policy-DROID, nvidia/Cosmos3-Nano-Sim-Bimanual)",
     )
     parser.add_argument(
         "--visual_gen_args",
@@ -417,7 +443,9 @@ def main():
         default=None,
         help=(
             "JSON file with an action trajectory [T, D] for forward_dynamics, "
-            "or current model-space state [D]/[1, D] for a state-conditioned policy"
+            "or current model-space state [D]/[1, D] for a state-conditioned policy. "
+            'For Cosmos3-Nano-Sim-Bimanual it may be an object {"action": [T, D], '
+            '"domain_names": [T]}; the name per action row replaces --domain_name'
         ),
     )
     parser.add_argument(
@@ -435,6 +463,12 @@ def main():
         default=None,
         choices=[256, 480, 704, 720],
         help=("Resolution bucket for action image sizing. Defaults to the domain preset or 480."),
+    )
+    parser.add_argument(
+        "--frame_rate",
+        type=float,
+        default=None,
+        help="Output frame rate. Defaults to the mode or domain preset.",
     )
     parser.add_argument(
         "--action_fps",
@@ -541,11 +575,12 @@ def main():
         params.extra_params["action_resolution"] = args.action_resolution
     if args.action_fps is not None:
         params.extra_params["action_fps"] = args.action_fps
+    if args.frame_rate is not None:
+        params.frame_rate = args.frame_rate
     if args.view_point is not None:
         params.extra_params["view_point"] = args.view_point
     if args.action_json is not None:
-        with open(args.action_json, encoding="utf-8") as f:
-            params.extra_params["action"] = json.load(f)
+        params.extra_params.update(_action_extra_params(args.action_json))
     if args.video_path is not None:
         params.video_reference = [MediaRef(content=args.video_path, format="path")]
     if args.extra_params:
@@ -574,7 +609,7 @@ def main():
         # generic --action_mode discriminator.
         action_mode = args.action_mode or "policy"
         action_path = args.action_output_path or _default_action_output_path(output_path)
-        _save_action_output(output, action_path, args, action_mode=action_mode)
+        _save_action_output(output, action_path, params.extra_params, action_mode=action_mode)
         print(f"Saved action: {action_path}")
         print(f"Action shape: {tuple(output.action.shape)}")
     elif args.action_mode is not None:

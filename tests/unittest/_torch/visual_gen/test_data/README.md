@@ -69,4 +69,6 @@ resolves every entry, so a new export whose files disagree in a way the resolver
 does not expect fails the test.
 
 Regenerate by fetching `https://huggingface.co/<repo>/raw/main/<file>` for every
-`file:key` that `resolve_checkpoint` names and keeping only those paths.
+`file:key` that `resolve_checkpoint` names and keeping only those paths. Keep a
+`null` found at such a path: the rollout window (`window_frames`) reads a declared
+`null` as full history and a missing key as not declared.

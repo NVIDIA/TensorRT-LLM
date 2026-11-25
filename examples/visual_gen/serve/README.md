@@ -493,6 +493,44 @@ before format resolution, so omitting both `action_mode` and `format` still
 resolves `format=auto` to `safetensors`. An explicit `-F 'format=safetensors'`
 is optional.
 
+### Cosmos3 Nano Sim (JSON)
+
+Serve `nvidia/Cosmos3-Nano-Sim-Bimanual` with
+`--visual_gen_args ../configs/cosmos3-nano-sim-1gpu.yaml`. The request carries
+the first frame and the action trajectory. `actions.json` here is the object
+`{"action": [T, D], "domain_names": [T]}`: one row of action values and one
+embodiment name per row. The pipeline resolves the names against the
+checkpoint's embodiment table; `domain_name` may also be a single name.
+`action_chunk_size` is the number of action rows and `fps` the rate they were
+recorded at.
+
+```bash
+jq -n --rawfile image <(base64 -w0 first_frame.png) --slurpfile sim actions.json '{
+    prompt: "Smooth out a messy brown shorts with both arms and spread it flat.",
+    image_reference: {content: $image, format: "base64"},
+    fps: 30,
+    extra_params: {
+      action_mode: "forward_dynamics",
+      action: $sim[0].action,
+      domain_name: $sim[0].domain_names,
+      action_chunk_size: ($sim[0].action | length)
+    }
+  }' > sim_request.json
+
+curl -X POST "http://localhost:8000/v1/videos/sync" \
+  -H "Content-Type: application/json" \
+  -d @sim_request.json \
+  -o sim_rollout.safetensors
+```
+
+The tensor payload contains `video` and `action`. Setting `action_mode` makes
+`format=auto` resolve to `safetensors`, so `format` may be omitted. A tensor
+file is the only form the result takes: `"format": "mp4"` or `"avi"` is
+rejected with HTTP 400. `video` is stored as uint8 `[T, H, W, 3]`, so the file
+grows with the rollout: about 1.08 GB for 901 frames at 832x480 (900 action
+rows). See [Tensor-format consumer contract](#tensor-format-consumer-contract)
+for reading it.
+
 ### Check Video Status
 ```bash
 curl -X GET "http://localhost:8000/v1/videos/{video_id}"

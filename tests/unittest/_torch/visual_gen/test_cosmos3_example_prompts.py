@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prompt resolution in the Cosmos3 example CLI.
+"""Prompt and action-file resolution in the Cosmos3 example CLI.
 
 ``--prompt``/``--negative_prompt`` take literal text or a file path; the
 ``*_file`` variants take a path only. Passing a checkpoint's structured caption
 file to ``--prompt`` used to silently generate from the path string itself.
+
+``--action_json`` takes the trajectory itself, or an object that also names the
+embodiment of each action row.
 """
 
 import importlib.util
@@ -242,6 +245,43 @@ class TestNegativePromptFile:
     def test_missing_file_raises(self):
         with pytest.raises(ValueError, match="does not exist"):
             cosmos3.load_negative_prompt_file("no/such/negative.json")
+
+
+class TestActionJson:
+    """``--action_json`` holds the trajectory itself, or an object with the trajectory
+    and the embodiment of each action row."""
+
+    ROWS = [[0.0, 0.5], [1.0, 1.5], [2.0, 2.5]]
+
+    def _extra_params(self, tmp_path, payload):
+        path = tmp_path / "action.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return cosmos3._action_extra_params(str(path))
+
+    def test_bare_trajectory_is_the_action(self, tmp_path):
+        assert self._extra_params(tmp_path, self.ROWS) == {"action": self.ROWS}
+
+    def test_row_names_become_the_domain_name_list(self, tmp_path):
+        """The names go out under the request's ``domain_name``; other keys are dropped."""
+        names = ["agibotworld", "agibotworld", "abc_yam"]
+        payload = {"action": self.ROWS, "domain_names": names, "fps": 30}
+
+        assert self._extra_params(tmp_path, payload) == {"action": self.ROWS, "domain_name": names}
+
+    @pytest.mark.parametrize("row_names", [{}, {"domain_names": []}, {"domain_names": None}])
+    def test_object_without_row_names_sets_no_domain(self, tmp_path, row_names):
+        """No ``domain_name`` entry, so one given on the command line stays in the request."""
+        payload = {"action": self.ROWS, **row_names}
+
+        assert self._extra_params(tmp_path, payload) == {"action": self.ROWS}
+
+    def test_object_without_action_raises(self, tmp_path):
+        payload = {"trajectory": self.ROWS, "domain_names": ["agibotworld"]}
+        with pytest.raises(
+            ValueError,
+            match=r"object without an 'action' key \(keys: \['domain_names', 'trajectory'\]\)",
+        ):
+            self._extra_params(tmp_path, payload)
 
 
 class TestShippedPromptFiles:

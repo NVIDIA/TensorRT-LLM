@@ -311,6 +311,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `nvidia/Cosmos3-Edge-FP8` | Text-to-Image, Text-to-Video, Image-to-Video (static ModelOpt FP8, W8A8/W8A16 step policy) |
+| `nvidia/Cosmos3-Nano-Sim-Bimanual` | Action-conditioned video (forward dynamics from a first frame and an action trajectory, generated chunk by chunk over a K/V cache) |
 
 ### Feature Matrix
 
@@ -327,4 +328,6 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
-| **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| **Cosmos3** [^26] | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+
+[^26]: `nvidia/Cosmos3-Nano-Sim-Bimanual` generates the video chunk by chunk over a K/V cache instead of denoising the whole clip, and needs the `CUDNN` or `TRTLLM` attention backend. For this checkpoint, CUDA Graph and `trtllm-serve` are supported. CFG parallelism and torch.compile do not apply: guidance is baked into the weights, and torch.compile covers a forward path the chunked generation does not run. The remaining columns have not been validated on this checkpoint.

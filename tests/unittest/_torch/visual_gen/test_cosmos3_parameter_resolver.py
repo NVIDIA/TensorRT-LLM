@@ -17,6 +17,7 @@ synthetic inputs, the checkpoint settings on synthetic files and on the publishe
 checkpoints, and the per-request settings."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,12 +35,15 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     OVERRIDE,
     REQUEST,
     SCHEDULER_FILE,
+    SIM_CONFIG_KEY,
     TRANSFORMER_FILE,
     UNSET,
     VAE_FILE,
     CheckpointFiles,
     Conflict,
     Cosmos3CheckpointSettings,
+    Cosmos3Embodiment,
+    Cosmos3RolloutSettings,
     ParameterResolver,
     RequestParameters,
     fill_pretrained_config,
@@ -100,6 +104,35 @@ class TestCheckpointFiles:
         r = files.read("a", f"{CONFIG_FILE}:a", f"{MODEL_INDEX_FILE}:a", f"{CHECKPOINT_FILE}:a")
         assert r.value == 2
         assert files.read("b", f"{CONFIG_FILE}:b") is None
+
+    def test_nullable_keeps_an_explicit_null(self, tmp_path):
+        files = _files_on_disk(tmp_path, {CONFIG_FILE: {"a": None}, MODEL_INDEX_FILE: {"a": 2}})
+        keys = (f"{CONFIG_FILE}:a", f"{MODEL_INDEX_FILE}:a")
+        r = files.read("a", *keys, nullable=True)
+        assert (r.value, r.where) == (None, "config.json:a")
+        assert r.disagreeing == ("model_index.json:a=2",)
+        assert files.read("a", *keys).value == 2
+        assert files.read("b", f"{CONFIG_FILE}:b", nullable=True) is None
+
+    def test_every_later_key_is_compared_with_the_winner(self, tmp_path):
+        files = _files_on_disk(
+            tmp_path,
+            {
+                MODEL_INDEX_FILE: {"a": 1},
+                TRANSFORMER_FILE: {"a": 1},
+                CHECKPOINT_FILE: {"a": 3},
+                VAE_FILE: {"a": 4},
+            },
+        )
+        keys = tuple(
+            f"{file}:a"
+            for file in (CONFIG_FILE, MODEL_INDEX_FILE, TRANSFORMER_FILE, CHECKPOINT_FILE, VAE_FILE)
+        )
+        r = files.read("a", *keys)
+        assert (r.value, r.where) == (1, "model_index.json:a")
+        assert r.disagreeing == ("checkpoint.json:a=3", "vae/config.json:a=4")
+        with pytest.raises(ValueError, match=r"checkpoint\.json:a=3; vae/config\.json:a=4"):
+            files.read("a", *keys, conflict=Conflict.ERROR)
 
     def test_conflict_policies(self, tmp_path):
         files = _files_on_disk(tmp_path, {CONFIG_FILE: {"a": 1}, MODEL_INDEX_FILE: {"a": 2}})
@@ -219,9 +252,189 @@ class TestCheckpoint:
         assert declared.temporal_compression_factor_sound == 1
 
 
+SIM_CONDITIONING = {
+    "action_tokens_per_frame": 4,
+    "embodiments": {"agibotworld": {"domain_id": 15, "input_action_dim": 59}},
+    "default_embodiment": "agibotworld",
+}
+
+
+def _sim_files(**sim_overrides) -> dict[str, dict]:
+    """A checkpoint that generates chunk by chunk: the rollout block in the transformer
+    config, with copies of some of its keys in the diffusers index and ``checkpoint.json``."""
+    block = {
+        "chunk_size": 2,
+        "window_frames": None,
+        "sink_frames": 0,
+        "text_cache_max_len": 1024,
+        "video_temporal_causal": True,
+        "fixed_step_sampler_config": {"t_list": T_LIST},
+        "conditioning": dict(SIM_CONDITIONING),
+        **sim_overrides,
+    }
+    return {
+        TRANSFORMER_FILE: {SIM_CONFIG_KEY: block},
+        SCHEDULER_FILE: {"fixed_step_sampler_config": {"t_list": T_LIST}},
+        CONFIG_FILE: {"model": {"config": {"vlm_config": {"use_system_prompt": False}}}},
+        MODEL_INDEX_FILE: {
+            "default_use_system_prompt": True,
+            f"_{SIM_CONFIG_KEY}": {"text_cache_max_len": 512},
+        },
+        CHECKPOINT_FILE: {SIM_CONFIG_KEY: {"chunk_partition": [1, 2], "text_cache_max_len": 512}},
+        VAE_FILE: dict(VAE_CONFIG),
+    }
+
+
+class TestSim:
+    def test_training_config_beats_the_diffusers_index(self, tmp_path):
+        cfg = _resolve(tmp_path, _sim_files())
+        assert cfg.prompt.use_system_prompt is False
+        assert cfg.resolved["prompt.use_system_prompt"].source == (
+            "checkpoint (config.json:model.config.vlm_config.use_system_prompt)"
+        )
+        assert cfg.rollout.text_cache_max_len == 1024
+        assert len(cfg.resolved["rollout.text_cache_max_len"].disagreeing) == 2
+
+    def test_rollout_sections(self, tmp_path):
+        cfg = _resolve(tmp_path, _sim_files())
+        rollout = cfg.rollout
+        assert rollout is not None
+        assert (rollout.chunk_frames, rollout.chunk_partition) == (2, (1, 2))
+        assert (rollout.inference_size, rollout.sink_frames) == (None, 0)
+        assert rollout.history_frames is None
+        assert cfg.sampling.fixed_sigmas == tuple(T_LIST)
+        assert rollout.action_tokens_per_frame == 4
+
+    def test_partition_must_match_the_reference_rollout(self, tmp_path):
+        files = _sim_files()
+        files[CHECKPOINT_FILE][SIM_CONFIG_KEY]["chunk_partition"] = [1, 4]
+        with pytest.raises(ValueError, match="reference rollout"):
+            _resolve(tmp_path, files)
+
+    def test_missing_partition_follows_the_reference_rollout(self, tmp_path):
+        files = _sim_files()
+        del files[CHECKPOINT_FILE][SIM_CONFIG_KEY]["chunk_partition"]
+        cfg = _resolve(tmp_path, files)
+        assert cfg.rollout.chunk_partition == (1, 2)
+        assert cfg.resolved["rollout.chunk_partition"].source == "default (reference rollout)"
+
+    def test_window_overrides_full_history(self, tmp_path):
+        """The reference recipe: 64 frames counting 8 sinks and the frame itself."""
+        files = _sim_files()
+        files[CONFIG_FILE]["model"]["config"].update(
+            kv_cache_inference_size=None, attention_sink_size=0
+        )
+        cfg = _resolve(tmp_path, files)
+        rollout = cfg.rollout.with_window(64, 8)
+        assert (rollout.inference_size, rollout.sink_frames) == (64, 8)
+        assert rollout.history_frames == 55
+        assert rollout == replace(cfg.rollout, inference_size=64, sink_frames=8)
+        assert cfg.resolved["rollout.sink_frames"].disagreeing == ()
+
+    def test_unset_window_keeps_the_checkpoint(self, tmp_path):
+        files = _sim_files()
+        files[CONFIG_FILE]["model"]["config"].update(
+            kv_cache_inference_size=None, attention_sink_size=0
+        )
+        cfg = _resolve(tmp_path, files)
+        rollout = cfg.rollout.with_window(None, None)
+        assert rollout.inference_size is None and rollout.sink_frames == 0
+        assert cfg.resolved["rollout.inference_size"].source == (
+            "checkpoint (config.json:model.config.kv_cache_inference_size)"
+        )
+
+    def test_sim_block_window_counts_the_chunk_first_frame(self, tmp_path):
+        rollout = _resolve(tmp_path, _sim_files(window_frames=96)).rollout
+        assert (rollout.inference_size, rollout.history_frames) == (96, 95)
+
+    def test_sim_block_window_counts_the_sinks(self, tmp_path):
+        """The block's window is the training config's size under another name: 64
+        with 8 sinks leaves 55 recent frames, whichever of the two declares it."""
+        cfg = _resolve(tmp_path, _sim_files(window_frames=64, sink_frames=8))
+        rollout = cfg.rollout
+        assert (rollout.inference_size, rollout.sink_frames) == (64, 8)
+        assert rollout.history_frames == 55
+        assert rollout == cfg.rollout.with_window(64, 8)
+
+    def test_schedule_copies_must_agree(self, tmp_path):
+        files = _sim_files(fixed_step_sampler_config={"t_list": [1.0, 0.5]})
+        with pytest.raises(ValueError, match="sampling.fixed_sigmas"):
+            _resolve(tmp_path, files)
+
+    def test_schedule_from_the_rollout_block_alone(self, tmp_path):
+        files = _sim_files()
+        del files[SCHEDULER_FILE]["fixed_step_sampler_config"]
+        cfg = _resolve(tmp_path, files)
+        assert cfg.sampling.fixed_sigmas == tuple(T_LIST)
+        assert cfg.resolved["sampling.fixed_sigmas"].where.startswith(TRANSFORMER_FILE)
+
+    def test_action_rows_must_match_the_vae_temporal_compression(self, tmp_path):
+        files = _sim_files(conditioning=dict(SIM_CONDITIONING, action_tokens_per_frame=2))
+        with pytest.raises(ValueError, match="action_tokens_per_frame is 2"):
+            _resolve(tmp_path, files)
+
+    def test_default_embodiment_must_be_declared(self, tmp_path):
+        """A request that names no embodiment takes the checkpoint's default, so a Sim
+        checkpoint must declare one, among its embodiments and with a domain id."""
+        conditioning = dict(SIM_CONDITIONING, default_embodiment="AgiBotWorld")
+        rollout = _resolve(tmp_path, _sim_files(conditioning=conditioning)).rollout
+        assert rollout.default_embodiment == "agibotworld"
+        conditioning["default_embodiment"] = "droid"
+        with pytest.raises(ValueError, match="'droid'.*not one of the checkpoint's embodiments"):
+            _resolve(tmp_path, _sim_files(conditioning=conditioning))
+        del conditioning["default_embodiment"]
+        with pytest.raises(ValueError, match="cannot resolve rollout.default_embodiment"):
+            _resolve(tmp_path, _sim_files(conditioning=conditioning))
+        no_table = {"action_tokens_per_frame": 4, "default_embodiment": "agibotworld"}
+        with pytest.raises(ValueError, match="cannot resolve rollout.embodiments"):
+            _resolve(tmp_path, _sim_files(conditioning=no_table))
+        no_id = dict(SIM_CONDITIONING, embodiments={"agibotworld": {"input_action_dim": 59}})
+        with pytest.raises(ValueError, match="'agibotworld'.*has no domain_id"):
+            _resolve(tmp_path, _sim_files(conditioning=no_id))
+
+    def test_resolution_tier_is_read_from_the_training_config(self, tmp_path):
+        files = _sim_files()
+        assert _resolve(tmp_path, files).rollout.resolution is None
+        files[CONFIG_FILE]["model"]["config"]["resolution"] = "480"
+        cfg = _resolve(tmp_path, files)
+        assert cfg.rollout.resolution == "480"
+        assert cfg.resolved["rollout.resolution"].source == (
+            "checkpoint (config.json:model.config.resolution)"
+        )
+
+    def test_sinks_need_a_window(self, tmp_path):
+        files = _sim_files()
+        files[CONFIG_FILE]["model"]["config"].update(kv_cache_inference_size=None)
+        rollout = _resolve(tmp_path, files).rollout
+        with pytest.raises(ValueError, match="need a kv_cache_inference_size"):
+            rollout.with_window(None, 8)
+
+    def test_sinks_must_leave_a_recent_frame(self, tmp_path):
+        rollout = _resolve(tmp_path, _sim_files()).rollout
+        assert rollout.with_window(10, 8).history_frames == 1
+        with pytest.raises(ValueError, match="leave no recent frame"):
+            rollout.with_window(10, 9)
+        with pytest.raises(ValueError, match="leave no recent frame"):
+            rollout.with_window(1, None)
+
+    def test_whole_clip_checkpoint_has_no_rollout_sections(self, tmp_path):
+        files = {k: v for k, v in _sim_files().items() if k in (CONFIG_FILE, VAE_FILE)}
+        files[TRANSFORMER_FILE] = {}
+        cfg = _resolve(tmp_path, files)
+        assert cfg.rollout is None
+        assert not any(name.startswith("rollout.") for name in cfg.resolved)
+
+    def test_system_prompt_must_be_declared(self, tmp_path):
+        files = _sim_files()
+        del files[CONFIG_FILE]["model"]["config"]["vlm_config"]["use_system_prompt"]
+        del files[MODEL_INDEX_FILE]["default_use_system_prompt"]
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            _resolve(tmp_path, files)
+
+
 # Disagreements between a checkpoint's own files that the resolver expects and resolves.
 EXPECTED_DISAGREEMENTS = {
-    "nvidia/Cosmos3-Nano-Sim-Bimanual": {"prompt.use_system_prompt"},
+    "nvidia/Cosmos3-Nano-Sim-Bimanual": {"prompt.use_system_prompt", "rollout.text_cache_max_len"},
 }
 
 EXPECTED = {
@@ -238,6 +451,22 @@ EXPECTED = {
     "nvidia/Cosmos3-Nano-Sim-Bimanual": (False, False, True, None),
 }
 
+# The checkpoints that generate chunk by chunk, with the rollout they declare; the
+# embodiment table is checked on its own.
+EXPECTED_ROLLOUT = {
+    "nvidia/Cosmos3-Nano-Sim-Bimanual": Cosmos3RolloutSettings(
+        chunk_frames=2,
+        chunk_partition=(1, 2),
+        inference_size=None,
+        sink_frames=0,
+        text_cache_max_len=1024,
+        action_tokens_per_frame=4,
+        embodiments={},
+        default_embodiment="agibotworld",
+        resolution="480",
+    ),
+}
+
 
 @pytest.mark.parametrize("repo", sorted(EXPECTED))
 def test_published_checkpoint_resolves(tmp_path, repo):
@@ -251,6 +480,30 @@ def test_published_checkpoint_resolves(tmp_path, repo):
     assert (cfg.vae.temporal_compression, cfg.vae.spatial_compression) == (4, 16)
     disagreeing = {name for name, r in cfg.resolved.items() if r.disagreeing}
     assert disagreeing == EXPECTED_DISAGREEMENTS.get(repo, set())
+    rollout = EXPECTED_ROLLOUT.get(repo)
+    if rollout is None:
+        assert cfg.rollout is None
+    else:
+        assert replace(cfg.rollout, embodiments={}) == rollout
+        assert cfg.rollout.history_frames is None
+
+
+def test_published_sim_checkpoint_declares_its_embodiments(tmp_path):
+    files = json.loads(FIXTURE.read_text())["nvidia/Cosmos3-Nano-Sim-Bimanual"]
+    embodiments = _resolve(tmp_path, files).rollout.embodiments
+    assert embodiments["agibotworld"] == Cosmos3Embodiment(domain_id=15, action_dim=59)
+    assert {name: e.domain_id for name, e in embodiments.items()} == {
+        "abc_yam": 16,
+        "agibot_gear_gripper": 15,
+        "agibot_gear_gripper_ext": 15,
+        "agibotworld": 15,
+        "behavior1k_lerobot": 22,
+        "camera_pose": 2,
+        "hand_pose": 3,
+        "molmoact2_yam": 16,
+        "xdof_yam": 16,
+    }
+    assert {e.action_dim for e in embodiments.values()} == {59}
 
 
 def test_fixture_covers_every_expected_checkpoint():
@@ -416,3 +669,28 @@ class TestRequest:
         assert origins["use_system_prompt"] == OVERRIDE
         _, _, origins = _resolver()._resolve(RequestParameters())
         assert origins["use_system_prompt"] == CHECKPOINT
+
+    def test_checkpoint_embodiment_table_declares_the_action_width(self, tmp_path):
+        """The generic table has AgiBot at 29 values per action row; a checkpoint that
+        lists the embodiment says how wide its own rows are."""
+        config = _resolve(tmp_path, _sim_files())
+        resolver = ParameterResolver("qwen3", config, log=False)
+        request = RequestParameters(action_mode="forward_dynamics", domain_name="agibotworld")
+
+        params, warnings, origins = resolver._resolve(request)
+        assert (params.raw_action_dim, origins["raw_action_dim"]) == (59, CHECKPOINT)
+        assert warnings == []
+        params, warnings, origins = resolver._resolve(replace(request, raw_action_dim=59))
+        assert (params.raw_action_dim, origins["raw_action_dim"]) == (59, REQUEST)
+        assert warnings == []
+        by_id, _, origins = resolver._resolve(replace(request, domain_name=None, domain_id=15))
+        assert (by_id.raw_action_dim, origins["raw_action_dim"]) == (59, CHECKPOINT)
+
+        # An embodiment the checkpoint does not list keeps the generic width, and a
+        # checkpoint without the table recommends the generic one.
+        other, _, origins = resolver._resolve(replace(request, domain_name="av"))
+        assert (other.raw_action_dim, origins["raw_action_dim"]) == (9, DEFAULT)
+        _, warnings, _ = _resolver()._resolve(replace(request, raw_action_dim=59))
+        assert warnings == [
+            "Cosmos3 raw_action_dim=59 differs from recommended 29 for domain 'agibotworld'."
+        ]

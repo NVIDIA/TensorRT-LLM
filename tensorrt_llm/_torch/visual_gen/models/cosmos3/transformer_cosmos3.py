@@ -17,7 +17,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, ContextManager, Optional, Tuple
+from typing import Any, Callable, ContextManager, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,10 +31,13 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, ForwardPlan
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.checkpoint_keys import (
     remap_cosmos3_checkpoint_key,
 )
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import FramePacking
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
     install_step_precision,
@@ -43,10 +46,11 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .parameter_resolver import fill_pretrained_config
+from .parameter_resolver import SIM_CONFIG_KEY, fill_pretrained_config
 
 
 def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:
@@ -425,6 +429,75 @@ def compute_mrope_position_ids_action(
     )
 
 
+def sim_rotary_positions(
+    packing: FramePacking,
+    *,
+    first_frame: int,
+    grid_h: int,
+    grid_w: int,
+    text_len: int,
+    temporal_modality_margin: int,
+    fps: float,
+    action_fps: float,
+    base_fps: float,
+    temporal_compression_factor: int,
+    enable_fps_modulation: bool,
+) -> torch.Tensor:
+    """3-D rotary position ids ``[3, packing.num_tokens]`` of a Sim chunk starting at
+    latent frame ``first_frame``, in the packed token order.
+
+    Time positions count from the start of the rollout: the chunk takes the positions
+    its frames would have in one long clip, so evicting history renumbers nothing. The
+    prompt keeps its own positions before them; its tokens are read from the K/V cache
+    and are not part of the chunk.
+
+    Vision tokens of absolute frame ``f`` sit at time ``text_len + margin +
+    f * base_fps / fps``; frame ``f``'s ``A`` action rows sit ``1/A`` of a frame apart
+    just before it, ending at its time, like the bidirectional model's actions
+    for frames ``1 ..`` with ``action_start_frame_offset = 1``. Frame 0's rows are
+    the null action and all sit at frame 0's time.
+    """
+    if grid_h * grid_w != packing.vision_tokens:
+        raise ValueError(
+            f"grid {grid_h}x{grid_w} has {grid_h * grid_w} tokens, packing expects "
+            f"{packing.vision_tokens}"
+        )
+    _, text_end = compute_mrope_position_ids_text(text_len, temporal_offset=0)
+    media_offset = text_end + temporal_modality_margin
+    n, a = packing.num_frames, packing.action_tokens
+    vision, _ = compute_mrope_position_ids_vision(
+        n,
+        grid_h,
+        grid_w,
+        temporal_offset=media_offset,
+        fps=fps,
+        base_fps=base_fps,
+        temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=first_frame,
+    )
+    # Action rows run at frame rate: row j of frame f is source frame
+    # f*tcf - (tcf - 1 - j), i.e. the tcf rows that lead into f.
+    action, _ = compute_mrope_position_ids_action(
+        n * a,
+        temporal_offset=media_offset,
+        action_fps=action_fps,
+        base_fps=base_fps,
+        base_temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=first_frame * temporal_compression_factor - (a - 1),
+    )
+    dtype = torch.promote_types(vision.dtype, action.dtype)
+    action = action.to(dtype).view(3, n, a)
+    vision = vision.to(dtype).view(3, n, packing.vision_tokens)
+    if first_frame == 0:
+        # Frame 0 has no action before it: its rows are the null action, which the
+        # reference places at frame 0's own time rather than leading into it.
+        action[0, 0] = vision[0, 0, 0]
+    per_frame = torch.cat([action, vision], dim=2)
+    return per_frame.reshape(3, packing.num_tokens)
+
+
 class DomainAwareLinear(nn.Module):
     """Linear projection with one weight/bias pair per action embodiment domain."""
 
@@ -461,6 +534,21 @@ class DomainAwareLinear(nn.Module):
                 f"Cosmos3 action domain_id must be in [0, {self.num_domains}), "
                 f"got {domain_id.tolist()}."
             )
+
+    def project_domain(
+        self, x: torch.Tensor, domain: int, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``x`` ``[N, input_size]`` through the weight and bias of one domain, read in
+        place from the tables. ``domain`` is a host integer; a value outside
+        ``[0, num_domains)`` raises ``ValueError``. Returns ``[N, output_size]``,
+        written into ``out`` when given, which needs autograd off."""
+        if not 0 <= domain < self.num_domains:
+            raise ValueError(
+                f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain}."
+            )
+        weight = self.fc.weight[domain].view(self.input_size, self.output_size)
+        out = torch.mm(x, weight, out=out)
+        return out.add_(self.bias.weight[domain])
 
     def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
         if domain_id.ndim == 0:
@@ -676,9 +764,16 @@ class Cosmos3CrossAttention(Attention):
         module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
-        resolved_backend = _resolve_cosmos3_cross_attention_backend(
-            original_backend,
-            model_config.visual_gen_mapping,
+        # The Sim path runs this attention over the K/V cache and keeps whatever
+        # backend the config asks for; the bidirectional path needs one that keeps
+        # padded cross-attention semantics.
+        is_sim = getattr(model_config.pretrained_config, SIM_CONFIG_KEY, None) is not None
+        resolved_backend = (
+            original_backend
+            if is_sim
+            else _resolve_cosmos3_cross_attention_backend(
+                original_backend, model_config.visual_gen_mapping
+            )
         )
         if resolved_backend != original_backend:
             model_config.attention.backend = resolved_backend
@@ -718,6 +813,15 @@ class Cosmos3CrossAttention(Attention):
         eps = model_config.pretrained_config.rms_norm_eps
         self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        # For the fused norm+RoPE kernel: these norms' eps, and rotate-half RoPE.
+        self.eps = eps
+        self.interleave = False
+        # trtllm-gen takes the packed QKV projection as it is, and only on the causal
+        # path: behind a sequence-parallel wrapper it gets split Q/K/V like any backend.
+        self._attn_is_trtllm = isinstance(self.attn, TrtllmAttention)
+        self._runs_on_trtllm = self._attn_is_trtllm or isinstance(
+            getattr(self.attn, "inner_backend", None), TrtllmAttention
+        )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
@@ -809,6 +913,11 @@ class Cosmos3CrossAttention(Attention):
             [B, S_gen, hidden_size] cross-attention output
         """
         batch_size, seq_len_gen = hidden_states.shape[:2]
+        if self._runs_on_trtllm:
+            raise NotImplementedError(
+                "Cosmos3 bidirectional cross-attention does not run on the TRTLLM backend; "
+                "a Sim checkpoint keeps it for the causal path (forward_causal) only."
+            )
 
         q, k, v = self.get_qkv(hidden_states)
 
@@ -859,6 +968,58 @@ class Cosmos3CrossAttention(Attention):
             )
 
         return self.to_out[0](out)
+
+    def attend_causal(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        *,
+        kv: ForwardPlan,
+    ) -> torch.Tensor:
+        """Attention over the K/V cache: the prompt and the history are read from it,
+        the chunk's own K/V are written to it. ``hidden_states`` is ``[1, S_rows, D]``,
+        this rank's shard with padding under sequence parallelism; ``kv`` carries the
+        chunk's real token count and its causal blocks. Returns the attention output
+        before the output projection."""
+        batch_size, rows = hidden_states.shape[:2]
+        qkv = self.qkv_proj(hidden_states)  # [1, rows, (H + 2 H_kv) * D]
+        # One kernel: per-head RMSNorm of Q and K and rotate-half RoPE, in place.
+        self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
+        if self._attn_is_trtllm:
+            heads = self.local_num_attention_heads + 2 * self.local_num_key_value_heads
+            out = self.attn.forward(
+                q=qkv.view(batch_size, rows, heads, self.head_dim),
+                k=None,
+                v=None,
+                batch_size=batch_size,
+                seq_len=rows,
+                seq_len_kv=rows,
+                attention_mask=PredefinedAttentionMask.FULL,
+                kv=kv,
+            )
+            out = out.reshape(batch_size, rows, -1)
+        else:
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+            out = self._attn_impl(
+                q,
+                k,
+                v,
+                attention_mask=PredefinedAttentionMask.FULL,
+                kv=kv,
+            )
+        return out
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        *,
+        kv: ForwardPlan,
+    ) -> torch.Tensor:
+        """``attend_causal`` through the output projection."""
+        return self.to_out[0](self.attend_causal(hidden_states, freqs_cos, freqs_sin, kv=kv))
 
 
 def _build_cosmos3_mlp(
@@ -1024,6 +1185,42 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        freqs: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        kv: ForwardPlan,
+    ) -> torch.Tensor:
+        """``hidden_states`` is the layer's input already normalised by
+        ``input_layernorm``; ``residual`` is the residual stream, updated in place.
+        Returns the MLP output, not yet added: the caller fuses that add with the
+        next norm."""
+        cos, sin = freqs
+        attn = self.cross_attention.forward_causal(hidden_states, cos, sin, kv=kv)
+        B, S, D = attn.shape
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm(
+            attn.view(-1, D),
+            residual.view(-1, D),
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        return self.mlp(attn.view(-1, D)).view(B, S, D)
+
+    def stage_kv_causal(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        kv: ForwardPlan,
+    ) -> None:
+        """Write this layer's K/V of the chunk into the cache, for a forward whose
+        layer output nothing reads: no output projection, no MLP, no residual update.
+        ``hidden_states`` as in ``forward_causal``."""
+        cos, sin = freqs
+        self.cross_attention.attend_causal(hidden_states, cos, sin, kv=kv)
 
 
 def _compute_default_rope_parameters(
@@ -1269,6 +1466,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         ulysses_size = vgm.ulysses_size if vgm else 1
         ring_size = vgm.ring_size if vgm else 1
         head_divisibility_factor = tp_size * ulysses_size
+        # K/V heads one rank's attention backend holds: tensor parallelism shards
+        # the projections, Ulysses splits what is left across its ranks.
+        self.cache_kv_heads = self.num_kv_heads // head_divisibility_factor
+        self._ulysses_rank = vgm.ulysses_rank if vgm else 0
+        self._sim_rope: Optional[tuple] = None  # (key, (cos, sin)) of the current chunk shape
+        # (key, (cos, sin)) of the prompt tower's positions; the same for every prompt
+        self._prompt_rope: Optional[tuple] = None
 
         if (ulysses_size > 1 or tp_size > 1) and (
             self.num_attention_heads % head_divisibility_factor != 0
@@ -1630,6 +1834,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
+        self._sim_rope = None
         self.domain_ids_validated = False
 
     def _run_gen_stack(
@@ -1683,6 +1888,293 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
         return self.norm_moe_gen(hidden_gen)
+
+    # -------------------------------------------------------------------------
+    # Sim: the chunked causal rollout
+    # -------------------------------------------------------------------------
+
+    @torch.no_grad()
+    def write_prompt_kv(
+        self,
+        kv_cache: BlockCausalKVCacheManager,
+        text_ids: torch.Tensor,
+        text_len: int,
+        tower_len: int,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> None:
+        """Run the reasoner tower and write every layer's K/V of the prompt at the start
+        of ``kv_cache``: this rank's heads. ``text_ids`` ``[1, S]`` holds the prompt's
+        ``text_len`` tokens first. The tower runs over ``tower_len`` positions, the
+        prompt followed by masked padding, so it has one shape for every prompt; it is
+        causal, so the padding does not change the prompt's rows, and only those are
+        written. The caller opens the cache with at least ``text_len`` pinned tokens
+        and commits them afterwards."""
+        if text_ids.shape[0] != 1:
+            raise ValueError("Cosmos3 Sim runs one video at a time.")
+        if not 0 < text_len <= min(text_ids.shape[1], tower_len):
+            raise ValueError(
+                f"prompt length {text_len} is outside the {text_ids.shape[1]} positions given "
+                f"or the {tower_len} the tower runs over"
+            )
+        if text_len > kv_cache.pin_tokens:
+            raise ValueError(
+                f"prompt of {text_len} tokens does not fit the {kv_cache.pin_tokens} pinned "
+                "tokens the cache was opened with"
+            )
+        device, dtype = text_ids.device, self.vae2llm.weight.dtype
+        ids = text_ids.new_zeros((1, tower_len))
+        ids[:, :text_len] = text_ids[:, :text_len]
+        mask = text_ids.new_zeros((1, tower_len))
+        mask[:, :text_len] = 1
+        key = (tower_len, device, dtype)
+        if self._prompt_rope is None or self._prompt_rope[0] != key:
+            # Text tokens count up from 0 on all three rotary axes.
+            position_ids = torch.arange(tower_len, device=device).unsqueeze(0)
+            cos, sin = self.language_model.rotary_emb(
+                torch.empty(0, dtype=dtype, device=device), position_ids=position_ids
+            )
+            self._prompt_rope = (key, (cos.unsqueeze(2), sin.unsqueeze(2)))
+        with offload_context("reasoner"):
+            layers_kv = self.language_model(ids, mask, self._prompt_rope[1])
+        heads = self.cache_kv_heads
+        first = self._ulysses_rank * heads
+        for layer, (k, v) in enumerate(layers_kv):
+            kv_cache.write_range(
+                layer,
+                0,
+                k[0, :text_len, first : first + heads],
+                v[0, :text_len, first : first + heads],
+            )
+
+    @torch.no_grad()
+    def embed_action_rows(
+        self, action_latents: torch.Tensor, domain_runs: Sequence[Tuple[int, int]]
+    ) -> torch.Tensor:
+        """Action rows ``[1, N, action_dim]`` as generator tokens ``[1, N, hidden_size]``:
+        each row through the input projection of its embodiment, plus the action
+        modality embedding, without a time embedding. ``domain_runs`` gives the
+        embodiment of consecutive rows as ``(row_count, domain_id)`` pairs, in row
+        order, adding up to ``N``."""
+        if not self.action_gen:
+            raise ValueError("Cosmos3 Sim needs the transformer's action modules.")
+        rows = self.pack_action(action_latents)
+        if rows.shape[0] != 1:
+            raise ValueError("Cosmos3 Sim runs one video at a time.")
+        if rows.dtype != self.action_proj_in.dtype:
+            raise ValueError(
+                "Cosmos3 action latents must match the action projection dtype: "
+                f"latents={rows.dtype}, projection={self.action_proj_in.dtype}."
+            )
+        covered = sum(count for count, _ in domain_runs)
+        if covered != rows.shape[1]:
+            raise ValueError(f"embodiments given for {covered} of {rows.shape[1]} action rows")
+        hidden = torch.empty(
+            1, rows.shape[1], self.hidden_size, device=rows.device, dtype=rows.dtype
+        )
+        start = 0
+        for count, domain in domain_runs:
+            stop = start + count
+            self.action_proj_in.project_domain(
+                rows[0, start:stop], domain, out=hidden[0, start:stop]
+            )
+            start = stop
+        return hidden.add_(self.action_modality_embed)
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        raw_timestep: Optional[torch.Tensor],
+        *,
+        kv_cache: BlockCausalKVCacheManager,
+        first_frame: int,
+        text_len: int,
+        action_hidden: torch.Tensor,
+        clean_pass: bool = False,
+        fps: float | None = None,
+        action_fps: float | None = None,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> Optional[TransformerOutput]:
+        """One forward of a chunk over the K/V cache.
+
+        ``hidden_states`` ``[1, C, n, H, W]`` are the chunk's ``n`` latent frames,
+        starting at absolute latent frame ``first_frame``; ``action_hidden``
+        ``[1, n * A, hidden_size]`` their action rows as tokens
+        (``embed_action_rows``), frame-major. Each frame is packed as its ``A``
+        action rows then its vision tokens.
+
+        A denoising forward (``clean_pass=False``) takes the scheduler's
+        ``raw_timestep`` ``[1]``, attends the whole chunk as one causal block over
+        the prompt and the history and returns the video velocity. The clean pass
+        runs the finished chunk without a time embedding (``raw_timestep`` is
+        ``None``) as one causal block per frame, so each frame's stored K/V saw only
+        frames up to itself, and returns ``None``: only the K/V it leaves in the
+        cache matter. A clean pass that starts at frame 0 stores that frame's action
+        rows with zero values, whatever ``action_hidden`` holds for them: frame 0 has
+        no action before it. The caller commits the chunk afterwards.
+        """
+        if hidden_states.shape[0] != 1:
+            raise ValueError("Cosmos3 Sim runs one video at a time.")
+        if not self.action_gen:
+            raise ValueError("Cosmos3 Sim needs the transformer's action modules.")
+        if clean_pass != (raw_timestep is None):
+            raise ValueError(
+                "Cosmos3 Sim: a denoising forward takes raw_timestep, a clean pass takes None."
+            )
+        T, H, W = hidden_states.shape[2:]
+        Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
+        if action_hidden.shape[1] % T:
+            raise ValueError(
+                f"{action_hidden.shape[1]} action rows do not split over {T} latent frames"
+            )
+        if action_hidden.shape[2] != self.hidden_size or action_hidden.dtype != hidden_states.dtype:
+            raise ValueError(
+                f"Cosmos3 Sim action tokens must be [1, rows, {self.hidden_size}] in "
+                f"{hidden_states.dtype}, got {tuple(action_hidden.shape)} in {action_hidden.dtype}."
+            )
+        packing = FramePacking(T, action_hidden.shape[1] // T, Hp * Wp)
+
+        # fp32 tables: what the fused per-head norm+RoPE kernel reads.
+        cos, sin = self._sim_rope_tables(
+            packing,
+            (Hp, Wp),
+            first_frame,
+            text_len,
+            fps,
+            action_fps,
+            hidden_states.device,
+            torch.float32,
+        )
+        # Denoising attends the chunk as one causal block; the clean pass as one per frame.
+        kv = kv_cache.plan(packing.num_tokens, packing.tokens_per_frame if clean_pass else None)
+        out = self._forward_causal_core(
+            hidden_states,
+            raw_timestep,
+            cos,
+            sin,
+            action_hidden,
+            kv=kv,
+            packing=packing,
+            clean_pass=clean_pass,
+            offload_context=offload_context,
+        )
+        if out is None:
+            if first_frame == 0:
+                # Frame 0 carries the null action: its rows keep their keys, so later
+                # frames attend as in training, and lose their values, so they
+                # contribute nothing (the reference zeroes V). The slots follow the
+                # prompt's length, so this runs here and not in the captured core.
+                action_slots, _ = packing.frame_slices(0)
+                start = kv_cache.staging_offset + action_slots.start
+                for layer_idx in range(len(self.gen_layers)):
+                    kv_cache.zero_values(layer_idx, start, packing.action_tokens)
+            return None
+        return TransformerOutput(video=out, image=out)
+
+    def _forward_causal_core(
+        self,
+        hidden_states: torch.Tensor,
+        raw_timestep: Optional[torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        action_hidden: torch.Tensor,
+        *,
+        kv: ForwardPlan,
+        packing: FramePacking,
+        clean_pass: bool,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> Optional[torch.Tensor]:
+        """The device work of ``forward_causal``: everything after validation and the
+        rotary tables. Tensors in, the video velocity out (``None`` for the clean
+        pass), no host reads, so the pipeline can run it under a CUDA graph keyed on
+        the tensor shapes, the packing, the pass and ``kv.graph_key``."""
+        T, H, W = hidden_states.shape[2:]
+        hidden_vis = self.vae2llm(self.patchify(hidden_states, T, H, W))
+        if not clean_pass:
+            # Only noised tokens carry the timestep embedding. Action rows are
+            # conditioning on this path and the clean pass holds finished frames,
+            # so neither gets it.
+            with torch.autocast("cuda", enabled=True, dtype=torch.float32):
+                time_embed = self.time_embedder(raw_timestep * self.timestep_scale)
+            hidden_vis.add_(time_embed.to(hidden_vis.dtype).unsqueeze(1))
+        hidden = packing.interleave(hidden_vis, action_hidden)
+
+        num_tokens = packing.num_tokens
+        hidden = self.sharder.shard(hidden, dim=1, pad_to_multiple=True)
+        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
+        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
+
+        # The residual stream lives in ``residual``; ``x`` is the normalised input of
+        # the next sub-block. Each layer's output add and the following norm are one
+        # kernel, including the final norm.
+        residual = hidden.contiguous()
+        D = residual.shape[-1]
+        x = torch.ops.trtllm.flashinfer_rmsnorm(
+            residual.view(-1, D),
+            self.gen_layers[0].input_layernorm.weight,
+            self.gen_layers[0].input_layernorm.variance_epsilon,
+        ).view_as(residual)
+        last = len(self.gen_layers) - 1
+        with offload_context("generator"):
+            for i, layer in enumerate(self.gen_layers):
+                if clean_pass and i == last:
+                    # Nothing reads the last layer's output on a clean pass; the cache
+                    # still needs its K/V.
+                    layer.stage_kv_causal(x, (cos, sin), kv=kv)
+                    return None
+                x = layer.forward_causal(x, residual, (cos, sin), kv=kv)
+                next_norm = (
+                    self.gen_layers[i + 1].input_layernorm if i < last else self.norm_moe_gen
+                )
+                torch.ops.trtllm.flashinfer_fused_add_rmsnorm(
+                    x.view(-1, D),
+                    residual.view(-1, D),
+                    next_norm.weight,
+                    next_norm.variance_epsilon,
+                )
+        hidden = x
+
+        hidden = self.sharder.gather(hidden, dim=1, unpad_to=num_tokens)
+        return self.unpatchify(self.llm2vae(packing.vision(hidden)), T, H, W)
+
+    def _sim_rope_tables(
+        self,
+        packing: FramePacking,
+        grid: Tuple[int, int],
+        first_frame: int,
+        text_len: int,
+        fps: float | None,
+        action_fps: float | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rotary cos/sin ``[1, S, 1, D]`` of a chunk, built once per chunk shape and
+        position: the denoising forwards and the clean pass share them."""
+        fps = fps if fps is not None else self.base_fps
+        action_fps = action_fps if action_fps is not None else fps
+        key = (packing, grid, first_frame, text_len, fps, action_fps, device, dtype)
+        if self._sim_rope is not None and self._sim_rope[0] == key:
+            return self._sim_rope[1]
+        ids = sim_rotary_positions(
+            packing,
+            first_frame=first_frame,
+            grid_h=grid[0],
+            grid_w=grid[1],
+            text_len=text_len,
+            temporal_modality_margin=self.unified_3d_mrope_temporal_modality_margin,
+            fps=fps,
+            action_fps=action_fps,
+            base_fps=self.base_fps,
+            temporal_compression_factor=self.temporal_compression_factor,
+            enable_fps_modulation=self.enable_fps_modulation,
+        )
+        # Pinned, so the copy is queued behind the previous chunk's work instead of the
+        # host waiting for it.
+        position_ids = maybe_pin_memory(ids.unsqueeze(1)).to(device, non_blocking=True)
+        _dummy = torch.tensor([], dtype=dtype, device=device)
+        cos, sin = self.language_model.rotary_emb(_dummy, position_ids=position_ids)
+        tables = (cos.unsqueeze(2), sin.unsqueeze(2))
+        self._sim_rope = (key, tables)
+        return tables
 
     def forward(
         self,

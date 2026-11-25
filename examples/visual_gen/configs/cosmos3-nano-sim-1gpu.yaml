@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 1-GPU Cosmos3 Nano Sim deployment (chunked causal rollout over a K/V cache).
+# Model: nvidia/Cosmos3-Nano-Sim-Bimanual
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+#
+# The causal rollout reads finished frames from a paged K/V cache, which needs
+# an attention backend that can attend over it: CUDNN or TRTLLM (trtllm-gen).
+# tests/microbenchmarks/bench_block_causal_attention.py times the two on this
+# checkpoint's attention geometry.
+# Chunk size, denoising schedule and action layout come from the checkpoint.
+attention_config:
+  backend: CUDNN
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+# The chunk forward replays as CUDA graphs (one per chunk shape and pass).
+cuda_graph_config:
+  enable: true
+# Warmup sends requests as clients do, with a first frame of each size listed
+# here as [height, width]: 832x480 is the first frame of the Cosmos3 README
+# example. List the first-frame sizes clients send. A first frame of another
+# size is served, but its first request captures graphs and compiles kernels.
+# Without this key warmup uses the largest frame size of the checkpoint's
+# resolution tier (480p) only. The K/V cache then takes its share of the memory
+# the warmup requests' peak leaves.
+# A script that generates once can set skip_warmup: true here: the first
+# request then does that work, and the cache is sized from the memory free
+# when it starts.
+compilation_config:
+  resolutions: [[480, 832]]
+pipeline_config:
+  # Share of the GPU memory left after warmup that the K/V cache takes.
+  kv_cache_free_gpu_memory_fraction: 0.9
+  # The history window. These two values are the recipe the cosmos-framework
+  # example runs this checkpoint with: each latent frame attends to 64 latent
+  # frames counting itself, of which the first 8 of the video stay visible for
+  # the whole rollout, so a frame sees those 8 and the 55 before it. Remove both
+  # keys to run what the checkpoint declares.
+  # With a window the cache does not limit how long a request may be. With full
+  # history it does: a request whose frames do not fit the cache is refused.
+  kv_cache_inference_size: 64
+  attention_sink_size: 8
+  # Each finished chunk is decoded to pixels before the next one denoises. With a
+  # second GPU, name it here and the decode runs there while the rollout continues:
+  # vae_decode_device: cuda:1

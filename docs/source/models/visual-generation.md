@@ -49,6 +49,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `nvidia/Cosmos3-Edge-FP8` | Text-to-Image, Text-to-Video, Image-to-Video (static ModelOpt FP8, W8A8/W8A16 step policy) |
+| `nvidia/Cosmos3-Nano-Sim-Bimanual` | Action-conditioned video (forward dynamics from a first frame and an action trajectory, generated chunk by chunk over a K/V cache) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
 | `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
@@ -74,13 +75,15 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
-| **Cosmos3** | Yes | Yes | No | No | Yes\*\* | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
+| **Cosmos3**\*\*\* | Yes | Yes | No | No | Yes\*\* | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | No | Yes | No | No | No | No | No |
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
 \*\* SeaCache on Cosmos3: single-GPU base (non-distilled) checkpoints, multi-frame video generation without audio, action or transfer controls; see [SeaCache](#seacache).
+
+\*\*\* `nvidia/Cosmos3-Nano-Sim-Bimanual` generates the video chunk by chunk over a K/V cache instead of denoising the whole clip, and needs the `CUDNN` or `TRTLLM` attention backend. For this checkpoint, CUDA Graph and `trtllm-serve` are supported. CFG parallelism, SeaCache and torch.compile do not apply: guidance is baked into the weights, SeaCache rejects few-step checkpoints, and torch.compile covers a forward path the chunked generation does not run. The remaining columns have not been validated on this checkpoint.
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 

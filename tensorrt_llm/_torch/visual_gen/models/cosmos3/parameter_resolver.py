@@ -117,6 +117,9 @@ TRANSFORMER_FILE = "transformer/config.json"
 SCHEDULER_FILE = "scheduler/scheduler_config.json"
 VAE_FILE = "vae/config.json"
 
+SIM_CONFIG_KEY = "cosmos3_nano_sim_bimanual"
+"""The block of ``transformer/config.json`` that marks a Sim checkpoint."""
+
 
 class Conflict(Enum):
     """What it means when a lower-priority checkpoint file holds a different value."""
@@ -164,32 +167,39 @@ class CheckpointFiles:
             self._docs[file] = doc
         return self._docs[file]
 
-    def value(self, key: str) -> Any:
-        """The value at ``"file:dotted.path"``; a ``null`` there counts as absent."""
+    def _lookup(self, key: str) -> Any:
         file, path = key.split(":", 1)
         doc = self.doc(file)
-        value = _MISSING if doc is None else _walk(doc, path)
+        return _MISSING if doc is None else _walk(doc, path)
+
+    def value(self, key: str) -> Any:
+        """The value at ``"file:dotted.path"``; a ``null`` there counts as absent."""
+        value = self._lookup(key)
         return None if value is _MISSING else value
 
     def read(
-        self, name: str, *keys: str, conflict: Conflict = Conflict.IGNORE
+        self,
+        name: str,
+        *keys: str,
+        conflict: Conflict = Conflict.IGNORE,
+        nullable: bool = False,
     ) -> Optional[Resolved]:
         """The setting ``name`` from the first of ``keys`` that holds it, tagged
-        ``CHECKPOINT`` with the key it came from; ``None`` when no file holds it. The
-        next file holding it is compared with the winner and a disagreement is
-        rejected, logged or only recorded, as ``conflict`` says."""
+        ``CHECKPOINT`` with the key it came from; ``None`` when no file holds it. Every
+        later key that holds it is compared with the winner and a disagreement is
+        rejected, logged or only recorded, as ``conflict`` says. With ``nullable`` a
+        ``null`` declares the setting, which then resolves to ``None``; otherwise a
+        ``null`` counts as absent."""
         winner: Optional[Resolved] = None
         disagreeing: list[str] = []
         for key in keys:
-            value = self.value(key)
-            if value is None:
+            value = self._lookup(key)
+            if value is _MISSING or (value is None and not nullable):
                 continue
             if winner is None:
                 winner = Resolved(value, CHECKPOINT, key)
-                continue
-            if value != winner.value:
+            elif value != winner.value:
                 disagreeing.append(f"{key}={value!r}")
-            break
         if winner is None:
             return None
         if disagreeing and conflict is not Conflict.IGNORE:
@@ -235,13 +245,86 @@ class Cosmos3ActionSettings:
 
 
 @dataclass(frozen=True)
+class Cosmos3Embodiment:
+    """One embodiment a checkpoint's action conditioning declares."""
+
+    domain_id: Optional[int]
+    action_dim: Optional[int]
+    """Values per action row; ``None`` where the checkpoint does not say."""
+
+
+def _check_window(inference_size: Optional[int], sink_frames: int) -> None:
+    if inference_size is None:
+        if sink_frames:
+            raise ValueError(
+                f"Cosmos3 config: {sink_frames} attention sinks need a kv_cache_inference_size; "
+                "full history has nothing to keep them past."
+            )
+    elif not 0 <= sink_frames <= inference_size - 2:
+        raise ValueError(
+            f"Cosmos3 config: {sink_frames} attention sinks leave no recent frame in a "
+            f"kv_cache_inference_size of {inference_size}."
+        )
+
+
+@dataclass(frozen=True)
+class Cosmos3RolloutSettings:
+    """What a checkpoint that generates the video chunk by chunk over a K/V cache
+    declares. Frames are latent frames."""
+
+    chunk_frames: int
+    """Frames generated together once the leading chunks of ``chunk_partition`` are done."""
+    chunk_partition: tuple[int, ...]
+    """Leading chunk sizes; the last one repeats and the final chunk is cut to what
+    is left."""
+    inference_size: Optional[int]
+    """Frames a generated frame attends to, counting the sinks and itself; ``None``:
+    full history."""
+    sink_frames: int
+    """Leading frames that stay visible for the whole rollout."""
+    text_cache_max_len: int
+    """Most prompt tokens the cache holds."""
+    action_tokens_per_frame: int
+    """Action rows packed with each frame."""
+    embodiments: Mapping[str, Cosmos3Embodiment]
+    """The declared embodiments by lower-case name."""
+    default_embodiment: str
+    """The embodiment of a request that names none: one of ``embodiments``, with a
+    domain id."""
+    resolution: Optional[str]
+    """The frame-size tier the checkpoint was trained at (``model.config.resolution`` of
+    the training config); ``None`` where the checkpoint does not say."""
+
+    @property
+    def history_frames(self) -> Optional[int]:
+        """Recent frames before a frame that it attends to, sinks excluded; ``None``:
+        all of them."""
+        if self.inference_size is None:
+            return None
+        return self.inference_size - self.sink_frames - 1
+
+    def with_window(
+        self, inference_size: Optional[int], sink_frames: Optional[int]
+    ) -> "Cosmos3RolloutSettings":
+        """These settings with ``inference_size`` and ``sink_frames`` in place of the
+        checkpoint's; ``None`` keeps the checkpoint's value. Raises when the sinks do
+        not fit the window."""
+        size = self.inference_size if inference_size is None else int(inference_size)
+        sinks = self.sink_frames if sink_frames is None else int(sink_frames)
+        _check_window(size, sinks)
+        return replace(self, inference_size=size, sink_frames=sinks)
+
+
+@dataclass(frozen=True)
 class Cosmos3CheckpointSettings:
     vae: Cosmos3VAESettings
     sampling: Cosmos3SamplingSettings
     prompt: Cosmos3PromptSettings
     action: Cosmos3ActionSettings
     resolved: Mapping[str, Resolved]
-    """Every setting above by dotted name (``vae.temporal_compression``), with origin."""
+    """Every setting by dotted name (``vae.temporal_compression``), with origin."""
+    rollout: Optional[Cosmos3RolloutSettings] = None
+    """``None`` unless the checkpoint generates chunk by chunk."""
 
     def require_vae_compression(self, checkpoint_dir: str) -> None:
         """Raise unless ``vae/config.json`` declares both compression factors, as a
@@ -285,6 +368,199 @@ REQUIRED_SETTINGS = ("prompt.use_system_prompt",)
 """Settings some checkpoint file must declare; nothing stands in for them."""
 
 
+_ROLLOUT_FILES = (CONFIG_FILE, TRANSFORMER_FILE, CHECKPOINT_FILE, MODEL_INDEX_FILE)
+
+
+def _rollout_keys(path: str, *files: str) -> tuple[str, ...]:
+    """``path`` inside the rollout block of each of ``files``. The diffusers index
+    names the block with a leading underscore."""
+    return tuple(
+        f"{file}:{'_' if file == MODEL_INDEX_FILE else ''}{SIM_CONFIG_KEY}.{path}" for file in files
+    )
+
+
+def _resolve_rollout(
+    files: CheckpointFiles, resolved: dict[str, Resolved], fixed_sigmas: Any
+) -> Optional[Cosmos3RolloutSettings]:
+    """The settings of a checkpoint whose ``transformer/config.json`` carries the
+    rollout block, each recorded in ``resolved`` under ``rollout.*``; ``None`` for
+    any other checkpoint."""
+    if files.value(f"{TRANSFORMER_FILE}:{SIM_CONFIG_KEY}") is None:
+        return None
+
+    def read(
+        name: str,
+        *keys: str,
+        conflict: Conflict = Conflict.WARN,
+        nullable: bool = False,
+        required: bool = True,
+    ) -> Any:
+        r = files.read(name, *keys, conflict=conflict, nullable=nullable)
+        if r is None:
+            if required:
+                raise ValueError(
+                    f"Cosmos3 config: cannot resolve {name}; the checkpoint declares none of "
+                    f"{', '.join(keys)}."
+                )
+            return None
+        resolved[name] = r
+        return r.value
+
+    if fixed_sigmas is None:
+        raise ValueError(
+            "Cosmos3 config: a Sim checkpoint needs its fixed denoising schedule, "
+            "fixed_step_sampler_config.t_list; none is declared."
+        )
+    conditioning = (TRANSFORMER_FILE, CHECKPOINT_FILE)
+    text_cache = read(
+        "rollout.text_cache_max_len", *_rollout_keys("text_cache_max_len", *_ROLLOUT_FILES)
+    )
+    action_rows = read(
+        "rollout.action_tokens_per_frame",
+        *_rollout_keys("conditioning.action_tokens_per_frame", *conditioning),
+        conflict=Conflict.ERROR,
+    )
+    declared = read(
+        "rollout.embodiments", *_rollout_keys("conditioning.embodiments", *conditioning)
+    )
+    default_embodiment = read(
+        "rollout.default_embodiment",
+        *_rollout_keys("conditioning.default_embodiment", *conditioning),
+    )
+    resolution = read(
+        "rollout.resolution", f"{CONFIG_FILE}:model.config.resolution", required=False
+    )
+    input_action_dim = read(
+        "rollout.input_action_dim",
+        *_rollout_keys("conditioning.input_contract.action_dim", *conditioning),
+        required=False,
+    )
+    chunk_frames = read(
+        "rollout.chunk_frames",
+        *_rollout_keys("chunk_size", *_ROLLOUT_FILES),
+        f"{CONFIG_FILE}:model.config.teacher_forcing_frames_per_chunk",
+        conflict=Conflict.ERROR,
+    )
+    partition = read(
+        "rollout.chunk_partition",
+        *_rollout_keys("chunk_partition", CHECKPOINT_FILE, TRANSFORMER_FILE),
+        required=False,
+    )
+    causal = read(
+        "rollout.video_temporal_causal",
+        f"{CONFIG_FILE}:model.config.video_temporal_causal",
+        *_rollout_keys("video_temporal_causal", *_ROLLOUT_FILES),
+        conflict=Conflict.ERROR,
+    )
+    sinks = int(
+        read(
+            "rollout.sink_frames",
+            f"{CONFIG_FILE}:model.config.attention_sink_size",
+            *_rollout_keys("sink_frames", *_ROLLOUT_FILES),
+        )
+    )
+    # The training config's size and the block's window are the same quantity: the
+    # frames a frame attends to, counting the sinks and the frame itself. A null in
+    # either one is full history.
+    size = read(
+        "rollout.inference_size",
+        f"{CONFIG_FILE}:model.config.kv_cache_inference_size",
+        nullable=True,
+        required=False,
+    )
+    if "rollout.inference_size" not in resolved:
+        window = read(
+            "rollout.window_frames",
+            *_rollout_keys("window_frames", *_ROLLOUT_FILES),
+            nullable=True,
+            required=False,
+        )
+        if "rollout.window_frames" not in resolved:
+            raise ValueError(
+                "Cosmos3 config: cannot resolve rollout.inference_size; the checkpoint "
+                "declares neither kv_cache_inference_size nor window_frames."
+            )
+        size = None if window is None else int(window)
+        resolved["rollout.inference_size"] = Resolved(
+            size, CHECKPOINT, resolved["rollout.window_frames"].where
+        )
+
+    if not causal:
+        raise ValueError(
+            "Cosmos3 config: a Sim checkpoint must declare video_temporal_causal; "
+            "this one declares it false."
+        )
+    for name, value in (
+        ("rollout.chunk_frames", chunk_frames),
+        ("rollout.text_cache_max_len", text_cache),
+        ("rollout.action_tokens_per_frame", action_rows),
+    ):
+        if int(value) <= 0:
+            raise ValueError(f"Cosmos3 config: {name} must be positive, got {value}.")
+    chunk_frames = int(chunk_frames)
+    # A request carries one action row per pixel frame after the first, and the rotary
+    # positions place a frame's rows on the pixel frames that lead into it.
+    compression = resolved["vae.temporal_compression"]
+    if int(action_rows) != int(compression.value):
+        raise ValueError(
+            f"Cosmos3 config: rollout.action_tokens_per_frame is {action_rows} "
+            f"({resolved['rollout.action_tokens_per_frame'].where}) but the VAE packs "
+            f"{compression.value} pixel frames into a latent frame ({compression.source}); "
+            "the two must be equal."
+        )
+    # The reference rollout cuts chunks [1, C, C, ...] and reads no partition from
+    # the checkpoint; a declared one must agree with that.
+    reference = (1, chunk_frames)
+    if partition is None:
+        resolved["rollout.chunk_partition"] = Resolved(reference, DEFAULT, "reference rollout")
+    elif tuple(int(n) for n in partition) != reference:
+        raise ValueError(
+            f"Cosmos3 config: rollout.chunk_partition {list(partition)} from "
+            f"{resolved['rollout.chunk_partition'].where} differs from the reference "
+            f"rollout's [1, {chunk_frames}, ...]."
+        )
+    size = None if size is None else int(size)
+    _check_window(size, sinks)
+
+    embodiments = {}
+    for name, spec in declared.items():
+        # Each embodiment names its own width, or shares the input contract's.
+        width = spec.get("input_action_dim")
+        if width is None:
+            width = spec.get("raw_action_dim", input_action_dim)
+        domain_id = spec.get("domain_id")
+        embodiments[str(name).lower()] = Cosmos3Embodiment(
+            domain_id=None if domain_id is None else int(domain_id),
+            action_dim=None if width is None else int(width),
+        )
+    # A request that names no embodiment is projected with the default's weights, so
+    # the default must be an embodiment with a domain id.
+    default_embodiment = str(default_embodiment).lower()
+    if default_embodiment not in embodiments:
+        raise ValueError(
+            f"Cosmos3 config: rollout.default_embodiment {default_embodiment!r} "
+            f"({resolved['rollout.default_embodiment'].where}) is not one of the "
+            f"checkpoint's embodiments: {', '.join(sorted(embodiments))}."
+        )
+    if embodiments[default_embodiment].domain_id is None:
+        raise ValueError(
+            f"Cosmos3 config: rollout.default_embodiment {default_embodiment!r} "
+            f"({resolved['rollout.default_embodiment'].where}) has no domain_id in the "
+            "checkpoint's embodiments."
+        )
+    return Cosmos3RolloutSettings(
+        chunk_frames=chunk_frames,
+        chunk_partition=reference,
+        inference_size=size,
+        sink_frames=sinks,
+        text_cache_max_len=int(text_cache),
+        action_tokens_per_frame=int(action_rows),
+        embodiments=embodiments,
+        default_embodiment=default_embodiment,
+        resolution=None if resolution is None else str(resolution),
+    )
+
+
 def resolve_checkpoint(checkpoint_dir: str, *, log: bool = True) -> Cosmos3CheckpointSettings:
     """Read the checkpoint's files into a :class:`Cosmos3CheckpointSettings`. Raises on a
     required setting no file declares, or on a disagreement between files that is an
@@ -321,7 +597,13 @@ def resolve_checkpoint(checkpoint_dir: str, *, log: bool = True) -> Cosmos3Check
         f"{MODEL_INDEX_FILE}:use_native_flow_schedule",
         default=False,
     )
-    setting("sampling.fixed_sigmas", f"{SCHEDULER_FILE}:fixed_step_sampler_config.t_list")
+    # A checkpoint with a rollout block repeats the schedule there; the copies must agree.
+    setting(
+        "sampling.fixed_sigmas",
+        f"{SCHEDULER_FILE}:fixed_step_sampler_config.t_list",
+        *_rollout_keys("fixed_step_sampler_config.t_list", TRANSFORMER_FILE, CONFIG_FILE),
+        conflict=Conflict.ERROR,
+    )
     setting("sampling.flow_shift", f"{SCHEDULER_FILE}:flow_shift")
     setting("action.policy", f"{CHECKPOINT_FILE}:policy")
 
@@ -354,6 +636,7 @@ def resolve_checkpoint(checkpoint_dir: str, *, log: bool = True) -> Cosmos3Check
             f"Cosmos3 config: {SCHEDULER_FILE}:flow_shift must be a positive finite number, "
             f"got {flow_shift!r}."
         )
+    rollout = _resolve_rollout(files, resolved, sigmas)
     return Cosmos3CheckpointSettings(
         vae=Cosmos3VAESettings(
             temporal_compression=int(get("vae.temporal_compression")),
@@ -367,6 +650,7 @@ def resolve_checkpoint(checkpoint_dir: str, *, log: bool = True) -> Cosmos3Check
         prompt=Cosmos3PromptSettings(use_system_prompt=bool(get("prompt.use_system_prompt"))),
         action=Cosmos3ActionSettings(policy=get("action.policy")),
         resolved=resolved,
+        rollout=rollout,
     )
 
 
@@ -523,6 +807,25 @@ class ParameterResolver:
         """The checkpoint-level settings, defaults filled where the files are silent."""
         return self._config
 
+    def _embodiment_width(
+        self, domain_name: Optional[str], domain_id: Optional[int]
+    ) -> Optional[int]:
+        """Values per action row that the checkpoint's embodiment table declares for
+        this domain; ``None`` when the checkpoint has no table or does not list it."""
+        rollout = self._config.rollout
+        if rollout is None:
+            return None
+        name = normalize_domain_name(domain_name)
+        if name is not None:
+            spec = rollout.embodiments.get(name)
+        elif domain_id is not None:
+            spec = next(
+                (e for e in rollout.embodiments.values() if e.domain_id == int(domain_id)), None
+            )
+        else:
+            spec = None
+        return None if spec is None else spec.action_dim
+
     def override(
         self,
         name: str,
@@ -664,8 +967,11 @@ class ParameterResolver:
         }
         if in_action:
             known_width = resolve_raw_action_dim(domain_name=p.domain_name, domain_id=p.domain_id)
+            declared_width = policy.get("raw_action_dim")
+            if declared_width is None:
+                declared_width = self._embodiment_width(p.domain_name, p.domain_id)
             candidates["raw_action_dim"] = Candidates(
-                p.raw_action_dim, policy.get("raw_action_dim"), recommended=known_width
+                p.raw_action_dim, declared_width, recommended=known_width
             )
             candidates["action_chunk_size"] = Candidates(
                 p.action_chunk_size,

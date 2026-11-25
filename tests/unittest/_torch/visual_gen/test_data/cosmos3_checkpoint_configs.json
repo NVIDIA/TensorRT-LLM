@@ -94,18 +94,93 @@
     }
   },
   "nvidia/Cosmos3-Nano-Sim-Bimanual": {
+    "checkpoint.json": {
+      "cosmos3_nano_sim_bimanual": {
+        "chunk_partition": [
+          1,
+          2
+        ],
+        "chunk_size": 2,
+        "conditioning": {
+          "action_tokens_per_frame": 4,
+          "default_embodiment": "agibotworld",
+          "embodiments": {
+            "abc_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            },
+            "agibot_gear_gripper": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "agibot_gear_gripper_ext": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "agibotworld": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "behavior1k_lerobot": {
+              "domain_id": 22,
+              "input_action_dim": 59
+            },
+            "camera_pose": {
+              "domain_id": 2,
+              "input_action_dim": 59
+            },
+            "hand_pose": {
+              "domain_id": 3,
+              "input_action_dim": 59
+            },
+            "molmoact2_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            },
+            "xdof_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            }
+          },
+          "input_contract": {
+            "action_dim": 59
+          }
+        },
+        "sink_frames": 0,
+        "text_cache_max_len": 512,
+        "video_temporal_causal": true,
+        "window_frames": null
+      }
+    },
     "config.json": {
       "model": {
         "config": {
           "vlm_config": {
             "use_system_prompt": false
-          }
+          },
+          "teacher_forcing_frames_per_chunk": 2,
+          "video_temporal_causal": true,
+          "resolution": "480"
         }
+      },
+      "cosmos3_nano_sim_bimanual": {
+        "chunk_size": 2,
+        "sink_frames": 0,
+        "text_cache_max_len": 1024,
+        "video_temporal_causal": true,
+        "window_frames": null
       }
     },
     "model_index.json": {
       "default_use_system_prompt": true,
-      "use_native_flow_schedule": false
+      "use_native_flow_schedule": false,
+      "_cosmos3_nano_sim_bimanual": {
+        "chunk_size": 2,
+        "sink_frames": 0,
+        "text_cache_max_len": 512,
+        "video_temporal_causal": true,
+        "window_frames": null
+      }
     },
     "scheduler/scheduler_config.json": {
       "fixed_step_sampler_config": {
@@ -118,7 +193,59 @@
       }
     },
     "transformer/config.json": {
-      "temporal_compression_factor": 4
+      "temporal_compression_factor": 4,
+      "cosmos3_nano_sim_bimanual": {
+        "chunk_size": 2,
+        "conditioning": {
+          "action_tokens_per_frame": 4,
+          "default_embodiment": "agibotworld",
+          "embodiments": {
+            "abc_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            },
+            "agibot_gear_gripper": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "agibot_gear_gripper_ext": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "agibotworld": {
+              "domain_id": 15,
+              "input_action_dim": 59
+            },
+            "behavior1k_lerobot": {
+              "domain_id": 22,
+              "input_action_dim": 59
+            },
+            "camera_pose": {
+              "domain_id": 2,
+              "input_action_dim": 59
+            },
+            "hand_pose": {
+              "domain_id": 3,
+              "input_action_dim": 59
+            },
+            "molmoact2_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            },
+            "xdof_yam": {
+              "domain_id": 16,
+              "input_action_dim": 59
+            }
+          },
+          "input_contract": {
+            "action_dim": 59
+          }
+        },
+        "sink_frames": 0,
+        "text_cache_max_len": 1024,
+        "video_temporal_causal": true,
+        "window_frames": null
+      }
     },
     "vae/config.json": {
       "scale_factor_temporal": 4,
