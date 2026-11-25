@@ -3442,10 +3442,20 @@ def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
     return _SSE_EVENT_DELIMITER, _TERMINAL_FRAME_STARTS
 
 
+class _UpstreamStreamEOFError(EOFError):
+    """The upstream SSE stream ended in the middle of an event."""
+
+
+_SSE_DELIMITER_RE = re.compile(rb"\r?\n\r?\n")
+_SSE_DELIMITER_MAX_LEN = 4
+
+
 def classify_stream_termination(exc: Exception) -> str:
     """Attribute a stream-ending exception to a cause."""
     if isinstance(exc, (RequestError, EngineDeadError)):
         return STREAM_TERMINATION_ENGINE_ERROR
+    if isinstance(exc, _UpstreamStreamEOFError):
+        return STREAM_TERMINATION_UPSTREAM_ERROR
     # By module, to keep the HTTP client library out of this layer.
     if type(exc).__module__.split(".")[0] in ("aiohttp", "httpx", "httpcore"):
         return STREAM_TERMINATION_UPSTREAM_ERROR
@@ -3493,11 +3503,11 @@ async def guard_responses_stream(
     completed = False
     try:
         async for chunk in stream:
-            if not completed:
+            if not completed and chunk:
+                delimiter, markers = _sse_delimiter_and_markers(chunk)
                 if tail is None:
-                    tail = chunk[:0]
+                    tail = delimiter
                 text = tail + chunk
-                delimiter, markers = _sse_delimiter_and_markers(text)
                 events_sent += text.count(delimiter) - tail.count(delimiter)
                 if in_terminal_frame:
                     # A delimiter that ends the frame takes a byte of this chunk.
@@ -3732,6 +3742,53 @@ async def keep_responses_stream_alive(
 _OPENING_FRAME_STARTS = ("event: response.created\n", _IN_PROGRESS_FRAME_START)
 
 
+async def iter_complete_sse_frames(
+    stream: AsyncGenerator[Union[str, bytes],
+                           None], ) -> AsyncGenerator[str, None]:
+    r"""Yield complete ``\n\n``- or ``\r\n\r\n``-delimited SSE frames from ``stream``.
+
+    Fragments are accumulated in a single buffer and scanned incrementally from
+    the previous search boundary. If the upstream stream raises or ends
+    mid-frame, the truncated fragment is discarded rather than forwarded; a
+    clean EOF with a non-empty trailing fragment raises
+    ``_UpstreamStreamEOFError`` so an enclosing stream guard can emit terminal
+    error events after the last valid frame. ``stream`` is closed when
+    iteration ends.
+    """
+    pending = bytearray()
+    search_from = 0
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            if not chunk:
+                continue
+            pending.extend(chunk)
+            start = 0
+            while True:
+                match = _SSE_DELIMITER_RE.search(pending, search_from)
+                if match is None:
+                    break
+                event = pending[start:match.start()].lstrip(b"\r\n")
+                start = match.end()
+                search_from = start
+                if event:
+                    frame = (
+                        event.decode(errors="replace").replace("\r\n", "\n") +
+                        _SSE_EVENT_DELIMITER)
+                    yield frame
+            if start:
+                del pending[:start]
+            search_from = max(0, len(pending) - _SSE_DELIMITER_MAX_LEN + 1)
+        if pending.strip(b"\r\n"):
+            # Discard the incomplete frame and signal premature EOF to the guard.
+            raise _UpstreamStreamEOFError("Responses stream ended mid-event")
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 async def relay_after_opening(stream: AsyncGenerator[Union[str, bytes], None],
                               events_sent: int) -> AsyncGenerator[str, None]:
     """Relay a worker's Responses stream to a client that already has its opening.
@@ -3748,26 +3805,15 @@ async def relay_after_opening(stream: AsyncGenerator[Union[str, bytes], None],
     as ``keep_responses_stream_alive`` takes them, wherever ``stream`` splits
     it. ``stream`` is closed when the relay ends.
     """
-    delimiter = _SSE_EVENT_DELIMITER.encode()
-    pending = b""
+    frames = iter_complete_sse_frames(stream)
     try:
-        async for chunk in stream:
-            if isinstance(chunk, str):
-                chunk = chunk.encode()
-            *events, pending = (pending + chunk).split(delimiter)
-            for event in events:
-                frame = event.decode(errors="replace") + _SSE_EVENT_DELIMITER
-                if not event or frame.startswith(_OPENING_FRAME_STARTS):
-                    continue
-                yield _stamp_sequence_number(frame, events_sent)
-                events_sent += 1
-        if pending:
-            # The stream stopped inside an event.
-            yield pending.decode(errors="replace")
+        async for frame in frames:
+            if frame.startswith(_OPENING_FRAME_STARTS):
+                continue
+            yield _stamp_sequence_number(frame, events_sent)
+            events_sent += 1
     finally:
-        aclose = getattr(stream, "aclose", None)
-        if aclose is not None:
-            await aclose()
+        await frames.aclose()
 
 
 class ServerArrivalTimeMiddleware:

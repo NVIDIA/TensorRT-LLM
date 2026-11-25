@@ -1485,16 +1485,17 @@ async def test_the_relay_numbers_a_failure_the_worker_reported_before_its_openin
 
 
 @pytest.mark.asyncio
-async def test_the_relay_passes_on_an_event_its_stream_stopped_inside():
+async def test_the_relay_discards_an_incomplete_event_and_signals_eof():
     cut = 'event: response.output_text.delta\ndata: {"type":"response.out'
     worker = _frame("response.output_text.delta", 2, delta="hi") + cut
 
     relayed = responses_utils.relay_after_opening(_transport(worker, 7), 2)
+    frames = []
+    with pytest.raises(EOFError):
+        async for frame in relayed:
+            frames.append(frame)
 
-    assert [frame async for frame in relayed] == [
-        _frame("response.output_text.delta", 2, delta="hi"),
-        cut,
-    ]
+    assert frames == [_frame("response.output_text.delta", 2, delta="hi")]
 
 
 @pytest.mark.asyncio
@@ -1513,3 +1514,177 @@ async def test_the_relay_closes_its_stream_when_it_stops_early():
     await relayed.aclose()
 
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clean_eof", [False, True], ids=["disconnect_error", "clean_eof"])
+async def test_the_relay_discards_truncated_frame_when_stream_stops_mid_json(
+    tmp_path, monkeypatch, clean_eof
+):
+    """If GEN disconnects or hits EOF mid-JSON payload, no truncated SSE event precedes response.failed."""
+    _short_waits(monkeypatch)
+
+    class _WorkersTruncatedMidJson(_WorkersFailingAfterTheFirstOutput):
+        async def generation_stream(self, received: ResponsesRequest):
+            self.frames = _generation_frames(received)[:3]
+            for frame in self.frames:
+                yield frame.encode()
+            await self.output_relayed.wait()
+            yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel'
+            if not clean_eof:
+                raise aiohttp.ClientPayloadError("Response payload is not completed")
+
+    async def context_phase():
+        await asyncio.sleep(0.2)
+
+    workers = _WorkersTruncatedMidJson(context_phase)
+    with _responses_server(tmp_path, "context_first", workers) as server:
+        sent = await _post_responses(server.app, on_send=workers.on_send)
+
+    assert _status(sent) == 200
+    events = _sse_events(sent)
+    assert [event for event, _ in events if event != "response.in_progress"] == [
+        "response.created",
+        "response.output_text.delta",
+        "error",
+        "response.failed",
+    ]
+    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+    assert events[-2][1]["code"] == "upstream_error"
+    assert events[-1][1]["response"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("piece", [1, 3, 4096])
+async def test_a_relayed_generation_stream_preserves_crlf_delimited_frames(tmp_path, piece):
+    """On the fast-pipeline path, CRLF-delimited worker frames survive arbitrary chunk splits."""
+
+    class _FastWorkersCrlf(_Workers):
+        async def generation_stream(self, received: ResponsesRequest):
+            self.frames = _generation_frames(received)
+            data = "".join(self.frames).replace("\n", "\r\n").encode()
+            for start in range(0, len(data), piece):
+                yield data[start : start + piece]
+
+    async def context_phase():
+        pass
+
+    workers = _FastWorkersCrlf(context_phase)
+    with _responses_server(tmp_path, "context_first", workers) as server:
+        sent = await _post_responses(server.app)
+
+    assert _status(sent) == 200
+    events = _sse_events(sent)
+    assert [event for event, _ in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+async def test_iter_complete_sse_frames_allows_trailing_blank_line_at_eof(trailing):
+    """A trailing blank line after a complete terminal event ends normally without EOF error."""
+    raw = _frame("response.completed", 2).encode()
+    if trailing == b"\r\n":
+        raw = raw.replace(b"\n", b"\r\n")
+    raw += trailing
+
+    async def source():
+        for start in range(0, len(raw), 3):
+            yield raw[start : start + 3]
+
+    frames = [frame async for frame in responses_utils.iter_complete_sse_frames(source())]
+    assert frames == [_frame("response.completed", 2)]
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_generation_stream_discards_truncated_frame_before_error_event(tmp_path):
+    """On the fast-pipeline path, a mid-JSON disconnect discards the fragment before the error event."""
+
+    class _FastWorkersTruncatedMidJson(_WorkersFailingAfterTheFirstOutput):
+        async def generation_stream(self, received: ResponsesRequest):
+            self.frames = _generation_frames(received)[:3]
+            for frame in self.frames:
+                yield frame.encode()
+            await self.output_relayed.wait()
+            yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hel'
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+
+    async def context_phase():
+        pass
+
+    workers = _FastWorkersTruncatedMidJson(context_phase)
+    sent = []
+
+    def on_send(message):
+        sent.append(message)
+        workers.on_send(message)
+
+    with _responses_server(tmp_path, "context_first", workers) as server:
+        with contextlib.suppress(aiohttp.ClientPayloadError):
+            await _post_responses(server.app, on_send=on_send)
+
+    assert _status(sent) == 200
+    events = _sse_events(sent)
+    assert [event for event, _ in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_text.delta",
+        "error",
+    ]
+    assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [_frame("response.completed", 2).encode()],
+        [b"even", _frame("response.completed", 2).encode()[4:]],
+        [b"", _frame("response.completed", 2).encode()],
+    ],
+    ids=["whole_frame", "split_header", "leading_empty_chunk"],
+)
+async def test_the_guard_detects_a_terminal_event_at_the_start_of_a_stream(chunks):
+    """A terminal frame at stream start is recognized across arbitrary chunk boundaries."""
+
+    async def source():
+        for chunk in chunks:
+            yield chunk
+        raise aiohttp.ClientPayloadError("late close error")
+
+    guarded = responses_utils.guard_responses_stream(
+        source(),
+        lambda cause, detail, n: responses_utils.stream_error_event(cause, detail, 2 + n),
+    )
+    frames = []
+    with pytest.raises(aiohttp.ClientPayloadError):
+        async for frame in guarded:
+            frames.append(frame)
+
+    assert b"".join(frames) == _frame("response.completed", 2).encode()
+
+
+@pytest.mark.asyncio
+async def test_the_relay_reassembles_a_large_chunked_event_without_rescanning_prefix():
+    """Incremental delimiter search handles a 1 MiB event delivered in 4 KiB chunks."""
+    big_delta = "x" * (1024 * 1024)
+    worker = (
+        _frame("response.created", 0)
+        + _frame("response.in_progress", 1)
+        + _frame("response.output_text.delta", 2, delta=big_delta)
+        + _frame("response.completed", 3)
+    )
+
+    relayed = [
+        frame async for frame in responses_utils.relay_after_opening(_transport(worker, 4096), 2)
+    ]
+
+    assert relayed == [
+        _frame("response.output_text.delta", 2, delta=big_delta),
+        _frame("response.completed", 3),
+    ]

@@ -77,7 +77,8 @@ from tensorrt_llm.serve.responses_utils import (
     STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
     ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
     get_steady_clock_now_in_seconds, guard_responses_stream,
-    keep_responses_stream_alive, relay_after_opening, stream_error_event)
+    iter_complete_sse_frames, keep_responses_stream_alive, relay_after_opening,
+    stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
@@ -260,8 +261,9 @@ def _guard_relayed_responses_stream(answer: Response,
         return answer
     return _ResponsesStreamingResponse(
         pipeline=pipeline,
-        content=guard_responses_stream(answer.body_iterator,
-                                       stream_error_event))
+        content=guard_responses_stream(
+            iter_complete_sse_frames(answer.body_iterator),
+            stream_error_event))
 
 
 def _error_response_failure(response: Response) -> tuple[str, str]:
@@ -662,13 +664,14 @@ class OpenAIDisaggServer:
                     cause, detail, len(opening)):
                 yield frame
             return
-        # The guard reads the worker's stream as it comes, so it knows whether
-        # the terminal event went out; its events are numbered on with the
-        # worker's by relay_after_opening.
-        frames = relay_after_opening(
-            guard_responses_stream(answer.body_iterator,
-                                   processor.get_stream_failed_events),
-            len(opening))
+        # Relay first so a mid-frame worker disconnect discards the truncated
+        # payload instead of closing it with a delimiter; the outer guard then
+        # appends error and response.failed numbered after the last valid event.
+        frames = guard_responses_stream(
+            relay_after_opening(answer.body_iterator, len(opening)),
+            lambda cause, detail, relayed: processor.get_stream_failed_events(
+                cause, detail, len(opening) + relayed),
+        )
         try:
             async for frame in frames:
                 yield frame
