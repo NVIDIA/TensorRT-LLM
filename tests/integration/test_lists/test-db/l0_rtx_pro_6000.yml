@@ -36,7 +36,6 @@ l0_rtx_pro_6000:
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_deco.py
-  - unittest/_torch/visual_gen/test_wan22_t2v_a14b_component.py::test_deco_attention_loss_budget
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   - unittest/_torch/attention/test_pixtral_head104_attention.py
