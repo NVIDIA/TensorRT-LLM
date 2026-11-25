@@ -298,7 +298,7 @@ We will keep pushing Modeling V2 forward in the three directions below. Some of 
 
 Modeling V2 trades shared code for isolation. To keep that trade worth it, we will keep refining the architecture:
 
-- **Clearer boundaries for each ModelCore.** A ModelCore should state precisely which deployments it serves: checkpoint format, hardware, parallel layout and server role. It should refuse everything else, so that each ModelCore's scope is obvious to the people and agents who route to it, review it and maintain it.
+- **Clearer boundaries for each ModelCore and Target.** A ModelCore should state precisely which deployments it serves: checkpoint format, hardware, parallel layout and server role. A Target should state precisely which steps it serves. Each should refuse everything else, so that its scope is obvious to the people and agents who route to it, review it and maintain it.
 - **Clearer ranges where each Target and op leads.** Each Target and each op should state the problem sizes where it delivers state-of-the-art performance: batch sizes, token counts, sequence lengths. Outside those ranges, the generic path is just as good. This tells us which specialized code earns its cost and where new work should go.
 - **A retirement mechanism.** A Target, op or ModelCore that no longer leads anywhere, or a model that is no longer served, should be removed, not kept forever. Retirement keeps the total code size under control, so the redundancy we accept stays bounded.
 

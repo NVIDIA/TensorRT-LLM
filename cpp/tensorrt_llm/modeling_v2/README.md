@@ -3,22 +3,25 @@
 
 # Modeling V2 native code
 
-This guide covers C++/CUDA code owned by a Modeling V2 family or target. For
+This guide covers C++/CUDA code owned by a Modeling V2 family or ModelCore. For
 model development in general, see the
 [Modeling V2 guide](../../../tensorrt_llm/_torch/modeling_v2/README.md).
+Build identifiers such as `add_modeling_v2_target`, `load_target_ops` and
+`TRTLLM_MODELING_V2_TARGETS` predate the ModelCore term and refer to a
+ModelCore.
 
 Native code lives next to the Python code that uses it, under
 `tensorrt_llm/_torch/modeling_v2/models/`:
 
 * `<family>/csrc/` holds the family's `CMakeLists.txt` and code shared by its
-  targets.
-* `<family>/<target>/csrc/` holds one target's own code.
+  ModelCores.
+* `<family>/<model_core>/csrc/` holds one ModelCore's own code.
 
 The build finds every `models/<family>/csrc/CMakeLists.txt` and builds one
 library per family, `libth_modeling_v2_<family>.so`, installed next to
 `libth_common.so`. Nothing in it is linked into the other TensorRT-LLM
 libraries. [`_native.py`](../../../tensorrt_llm/_torch/modeling_v2/_native.py)
-loads the library only when routing selects one of the family's targets.
+loads the library only when routing selects one of the family's ModelCores.
 Adding a family with native code does not require changes under `cpp/`.
 
 ## Shared infrastructure
@@ -29,19 +32,19 @@ This directory holds only what every family shares:
 |---|---|
 | [CMakeLists.txt](CMakeLists.txt) | Finds the family build files and builds their libraries. |
 | [modeling_v2.cmake](../../cmake/modules/modeling_v2.cmake) | Defines `add_modeling_v2_family`, `add_modeling_v2_shared` and `add_modeling_v2_target`. |
-| [common/namespace.h](common/namespace.h) | Gives each target, and each family's shared code, its own C++ namespace. |
+| [common/namespace.h](common/namespace.h) | Gives each ModelCore, and each family's shared code, its own C++ namespace. |
 | [common/torchLibrary.h](common/torchLibrary.h) | Registers Torch ops in the namespace of the code being compiled. |
 | [common/familyLibrary.version](common/familyLibrary.version) | Keeps all symbols local, so two family libraries can define the same C++ names. |
 
-## Adding native code to a target
+## Adding native code to a ModelCore
 
 Paths below are relative to `tensorrt_llm/_torch/modeling_v2/`.
-The steps use a target `foo_nvfp4__sm_103__tp4` in family `foo`. GPT-OSS is a
+The steps use a ModelCore `foo_nvfp4__sm_103__tp4` in family `foo`. GPT-OSS is a
 small working example: see its
 [build file](../../../tensorrt_llm/_torch/modeling_v2/models/gpt_oss/csrc/CMakeLists.txt)
-and its target's `csrc/` directory.
+and its ModelCore's `csrc/` directory.
 
-1. Declare the family and the target in `models/foo/csrc/CMakeLists.txt`:
+1. Declare the family and the ModelCore in `models/foo/csrc/CMakeLists.txt`:
 
    ```cmake
    add_modeling_v2_family(foo)
@@ -49,7 +52,7 @@ and its target's `csrc/` directory.
                           ARCHS 103a SOURCES *.cu *.cpp)
    ```
 
-   `SOURCES` paths and globs are relative to the target's `csrc/` directory.
+   `SOURCES` paths and globs are relative to the ModelCore's `csrc/` directory.
 
 2. Write the sources in `models/foo/foo_nvfp4__sm_103__tp4/csrc/`:
 
@@ -68,7 +71,7 @@ and its target's `csrc/` directory.
      directly; the build generates the `TORCH_LIBRARY` block for each
      namespace, and a second one fails when the library loads.
 
-3. In the target's `__init__.py`, load the ops and call them through the
+3. In the ModelCore's `__init__.py`, load the ops and call them through the
    returned namespace:
 
    ```python
@@ -77,24 +80,24 @@ and its target's `csrc/` directory.
    native_ops = load_target_ops(__name__)  # torch.ops.mv2_foo_foo_nvfp4_sm_103_tp4
    ```
 
-4. Register fake implementations in the target's `fake_ops.py`, using
+4. Register fake implementations in the ModelCore's `fake_ops.py`, using
    `namespace_of(__name__)` for the namespace. The loader imports this file
-   after it finds the target in the family library.
+   after it finds the ModelCore in the family library.
 
 5. Add tests for the ops, their PyTorch references and their fakes.
 
 ## Sharing native code within a family
 
-Put code used by several targets in `models/<family>/csrc/` and declare it with
+Put code used by several ModelCores in `models/<family>/csrc/` and declare it with
 `add_modeling_v2_shared(<family> ARCHS ... SOURCES ...)`. Call its ops through
 `load_family_ops(__name__)` from any module of the family, and register its
 fakes in `models/<family>/fake_ops.py`.
 
-A target that uses only the shared code still needs an
+A ModelCore that uses only the shared code still needs an
 `add_modeling_v2_target(...)` call, without `SOURCES`, placed after
 `add_modeling_v2_shared`. Its `__init__.py` still calls
 `load_target_ops(__name__)`: that call checks that this build includes the
-target. Kimi K3 (`models/kimi_k3_vl/`) is an example.
+ModelCore. Kimi K3 (`models/kimi_k3_vl/`) is an example.
 
 ## Build options
 
@@ -102,22 +105,22 @@ target. Kimi K3 (`models/kimi_k3_vl/`) is an example.
 
 | Option | Values |
 |---|---|
-| `ARCHS` (required) | `NN`, `NNa` or `NNf`, kept only if the build requests a matching architecture. For example, `103a` builds SM103-specific code when the build includes SM103. `100f` builds family-portable code when the build includes any SM 10.x architecture from SM100 up; use it for `sm_10x` targets. |
+| `ARCHS` (required) | `NN`, `NNa` or `NNf`, kept only if the build requests a matching architecture. For example, `103a` builds SM103-specific code when the build includes SM103. `100f` builds family-portable code when the build includes any SM 10.x architecture from SM100 up; use it for `sm_10x` ModelCores. |
 | `DEPS` | Any of `cublas`, `cublaslt`, `cuda_driver`, `flashmla`, `internal_cutlass`, `nccl`, `trtllm_gen_fmha_interface`. |
 | `REQUIRES` | Any of `MULTI_DEVICE`, `NVSHMEM`. |
 
 On aarch64 builds that use Clang, code that declares `flashmla` is compiled
 with GCC as nvcc's host compiler, the way `cpp/tensorrt_llm/flash_mla` is:
-Clang rejects the inline assembly in FlashMLA's headers there. For a target,
-this applies to every target of its family.
+Clang rejects the inline assembly in FlashMLA's headers there. For a ModelCore,
+this applies to every ModelCore of its family.
 
-A target is not built if none of its `ARCHS` is requested, if a `REQUIRES`
+A ModelCore is not built if none of its `ARCHS` is requested, if a `REQUIRES`
 feature is disabled, or if `TRTLLM_MODELING_V2_TARGETS` excludes it. CMake
-prints the reason as `modeling_v2: <family>/<target> not built: ...`.
+prints the reason as `modeling_v2: <family>/<model_core> not built: ...`.
 
 ## Loading errors
 
-If the family library is missing, or the build did not include the target,
+If the family library is missing, or the build did not include the ModelCore,
 loading raises `NoTarget`. Under `modeling_v2="auto"` the engine then uses
 Modeling V1.
 
@@ -128,13 +131,13 @@ fall back.
 
 ## Building
 
-To build only some Modeling V2 targets, pass a filter to
+To build only some Modeling V2 ModelCores, pass a filter to
 `scripts/build_wheel.py`, for example `-D "TRTLLM_MODELING_V2_TARGETS=foo/*"`.
-The pattern matches `<family>/<target>`; `all` (the default) and `none` are
+The pattern matches `<family>/<model_core>`; `all` (the default) and `none` are
 also accepted. `build_wheel.py` splits `-D` values at `;`, so pass a single
 pattern through it. The rest of TensorRT-LLM still
 builds. CMake caches the value in the build directory, so pass
-`-D "TRTLLM_MODELING_V2_TARGETS=all"` to build every target again.
+`-D "TRTLLM_MODELING_V2_TARGETS=all"` to build every ModelCore again.
 
 To rebuild one family's library after a change:
 
