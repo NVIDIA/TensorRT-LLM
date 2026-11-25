@@ -250,6 +250,60 @@ def test_sparse_gqa_tep4_shard_on_splitk(monkeypatch, tep_fast, rows, dtype, sel
 
 
 @pytest.mark.parametrize(
+    "switch, rows, supports, expected",
+    [
+        (True, 4, True, "e4m3"),  # the shard's rows on the e4m3 entry
+        (True, 16, True, "e4m3"),
+        (True, 20, True, None),  # past the shard's rows: neither kernel
+        (True, 16, False, "splitk"),  # the entry declines the operands: the split-K kernel
+        (False, 16, True, "splitk"),  # the switch off
+    ],
+)
+def test_sparse_gqa_tep4_shard_on_e4m3(monkeypatch, switch, rows, supports, expected):
+    """`TEP_GQA_E4M3_ENV`: the rows the shared split-K serves at the shard go to the e4m3 entry
+    where it takes the operands."""
+    calls = _gqa(monkeypatch, False, False)
+    monkeypatch.setattr(M, "_e4m3_gqa_supports", lambda *a: supports)
+    monkeypatch.setattr(
+        M,
+        "qsa_paged_sparse_gqa_e4m3_decode",
+        lambda *a: calls.append(("e4m3", a[-1] is not None, None)) or "e4m3",
+    )
+    core = SimpleNamespace(**{**vars(CORE), "tep_fast": True, "tep_gqa_e4m3": switch})
+    k = torch.zeros(8, 1, 32, 256, dtype=torch.float8_e4m3fn)
+    kv = SimpleNamespace(k=k, v=k, k_scale=None)
+    q = torch.zeros(rows, 6, 256, dtype=torch.bfloat16)
+    sel = torch.zeros(rows, 2051, dtype=torch.int32)
+    out = M._sparse_gqa_decode(core, kv, q, None, sel, None, 32, torch.zeros(rows, 1), 4)
+    if expected is None:
+        assert out is None and calls == []
+    else:
+        assert out == expected and calls == [(expected, True, None)]
+
+
+@pytest.mark.parametrize(
+    "env, tep_fast, sm, expected, warns",
+    [
+        (None, True, (10, 3), False, False),
+        ("1", True, (10, 3), True, False),
+        ("1", False, (10, 3), False, True),  # another layout
+        ("1", True, (10, 0), False, True),  # another arch
+    ],
+)
+def test_tep_gqa_e4m3_switch(monkeypatch, env, tep_fast, sm, expected, warns):
+    warned = []
+    if env is None:
+        monkeypatch.delenv(M.TEP_GQA_E4M3_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.TEP_GQA_E4M3_ENV, env)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: sm)
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    core = SimpleNamespace(tep_fast=tep_fast)
+    assert M._tep_gqa_e4m3(core, SimpleNamespace(type="cuda")) is expected
+    assert bool(warned) is warns
+
+
+@pytest.mark.parametrize(
     "cluster, cta, expected",
     [(True, True, "cluster"), (False, True, "cta"), (False, False, "apart")],
 )

@@ -432,7 +432,8 @@ _DEP8 = dict(
 # launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only), and once with every opt-in tep4 form on
 # (the draft layer on the one-rank form, the router GEMM in the route front's launch, the split-K
 # projections past the low-M table, the fused finalize all-reduce with the shared-expert quarter
-# at 3-4 requests, the verify index keys read before the PDL wait at 1-2 requests; SM103 only).
+# at 3-4 requests, the verify index keys read before the PDL wait at 1-2 requests, the decode GQA
+# on the half-height e4m3 entry; SM103 only).
 # FP8 at dep4 once
 # more with both output projections on the bf16 mid-rows GEMM
 # (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in, another K split; SM103 only), and once more
@@ -983,6 +984,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 "PROJ_SPLITK",
                 "FINAR_SHARED",
                 "INDEX_PREFETCH",
+                "GQA_E4M3",
             ):
                 env[f"TRTLLM_QWEN4_EXP_TEP_{name}"] = "1"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"

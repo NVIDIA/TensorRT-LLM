@@ -80,7 +80,9 @@ expert at `_TEP_FINAR_SHARED_ROWS` rows;
 with `TEP_MOE_FRONT_ENV` (opt-in) its router GEMM runs in the front's launch
 (`ops/moe/moe_decode_front__decode`). With `TEP_INDEX_PREFETCH_ENV` (opt-in) a verify step's
 trunk index scores at 1-2 requests read their keys before the PDL wait on the attention decode
-prologue. With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
+prologue. With `TEP_GQA_E4M3_ENV` (opt-in) the decode GQA of the trunk and the draft layer runs
+on the half-height e4m3 entry (`qsa_paged_sparse_gqa_e4m3_decode`) instead of the split-K one.
+With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
 draft step runs the draft layer on the one-rank decode form at the rank's shard
 (`DecodeTarget._mtp_layer`), a draft-extend step's continuing rows included.
 
@@ -258,6 +260,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sp
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_decode import (
     supports as _sparse_decode_supports,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_e4m3_decode import (  # noqa: E501
+    qsa_paged_sparse_gqa_e4m3_decode,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_e4m3_decode import (  # noqa: E501
+    supports as _e4m3_gqa_supports,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4 import (
     qsa_paged_sparse_gqa_nvfp4,
@@ -1457,6 +1465,37 @@ TEP_PROJ_ENV = "TRTLLM_QWEN4_EXP_TEP_PROJ_SPLITK"
 _TEP_PLE_WIDE_MIN_ROWS = 9  # capacity: fixed: a dispatch threshold
 
 
+#: Off by default (opt-in: another kernel of the same precision for the rows the shared split-K
+#: serves; to be decided by an A/B against it). At a tep4 rank with its fast forms on SM103, the
+#: gated sparse GQA of a decode or verify step of up to `_TEP_SPLITK_MAX_ROWS`' rows over the
+#: e4m3 pool -- the trunk's and the draft layer's -- runs `qsa_paged_sparse_gqa_e4m3_decode`
+#: instead of `qsa_sparse_gqa_splitk_cute`: half-height warp MMAs (the shard's 6 query heads fill
+#: rows 0..7), K and V fragments built from the raw e4m3 rows with an exact widen, q and P in
+#: bf16, fp32 accumulation, an online softmax over a split's 64-token tiles, then the bf16 decode
+#: entry's merge with the output gate. The output moves by an ulp on some elements against the
+#: split-K kernel. Read once, when the target is built; set where it cannot apply it warns and
+#: does nothing.
+TEP_GQA_E4M3_ENV = "TRTLLM_QWEN4_EXP_TEP_GQA_E4M3"
+
+
+def _tep_gqa_e4m3(core, device) -> bool:
+    """`TEP_GQA_E4M3_ENV` at this core: whether a tep4 rank with its fast forms on SM103 sends its
+    decode GQA to the e4m3 entry. Set where it cannot apply, one warning."""
+    if not _switch(TEP_GQA_E4M3_ENV):
+        return False
+    if (
+        core.tep_fast
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    ):
+        return True
+    logger.warning(
+        f"{TEP_GQA_E4M3_ENV} is set but ignored: it serves a tep4 rank with "
+        f"{TEP_FAST_DECODE_ENV} on, on SM103"
+    )
+    return False
+
+
 def _tep_index_prefetch(core) -> bool:
     """`TEP_INDEX_PREFETCH_ENV` at this core: whether a tep4 rank with its fast forms prefetches
     its verify steps' index keys. Set where it cannot apply, one warning."""
@@ -2575,6 +2614,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.tep_proj = _tep_proj(self)
         # A tep4 rank's verify-step index keys before the PDL wait (`TEP_INDEX_PREFETCH_ENV`).
         self.tep_index_prefetch = _tep_index_prefetch(self)
+        # A tep4 rank's decode GQA on the e4m3 entry (`TEP_GQA_E4M3_ENV`).
+        self.tep_gqa_e4m3 = _tep_gqa_e4m3(self, device)
         self.decode_mm = (
             _one_rank_projection
             if one_rank
@@ -6270,14 +6311,22 @@ def _decode_index_scores(
 
 def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p: int):
     """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
-    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: the
+    generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: at a
+    tep4 rank under `TEP_GQA_E4M3_ENV` the half-height e4m3 one at the rows split-K serves; the
     request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows (an
     attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`), else the per-row split-K one up to its rows
-    (`_splitk_serves`). None where neither serves the call (an NVFP4 pool, a head geometry or
-    row count they were not measured at): the caller then runs `_sparse_gqa` and the gate
-    apart."""
+    (`_splitk_serves`). None where none serves the call (an NVFP4 pool, a head geometry or row
+    count they were not measured at): the caller then runs `_sparse_gqa` and the gate apart."""
     if kv.k_scale is not None:
         return None
+    if (
+        getattr(core, "tep_gqa_e4m3", False)
+        and _splitk_serves(core, q, kv.k, selected)
+        and _e4m3_gqa_supports(q, kv.k, kv.v, block_table, selected, req_idx, tpb)
+    ):
+        return qsa_paged_sparse_gqa_e4m3_decode(
+            q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, gate
+        )
     min_requests = getattr(core, "dp_gqa_min_requests", _GROUPED_DECODE_MIN_REQUESTS)
     if (
         p > 1
