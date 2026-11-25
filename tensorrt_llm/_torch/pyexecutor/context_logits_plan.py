@@ -91,7 +91,13 @@ def _keeps_context_logits(request: LlmRequest) -> bool:
 
 
 class ContextLogitsPlan:
-    """Consume context chunks directly; return only rows needed by the sampler."""
+    """Store context logits and select the rows needed by the sampler.
+
+    Args:
+        batch: Requests scheduled for the current step.
+        project_in_forward: When True, project and store context logits during
+            the forward. When False, normalize full-row logits after the forward.
+    """
 
     def __init__(self, batch: ScheduledRequests, *, project_in_forward: bool = True) -> None:
         self.batch = batch
@@ -144,7 +150,18 @@ class ContextLogitsPlan:
         return rows
 
     def store_full_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Store logical prompt rows and keep one sampling row per context plus the decode tail."""
+        """Store raw prompt logits and retain the rows needed for sampling.
+
+        The stored prompt logits precede per-request logits post-processing.
+
+        Args:
+            logits: [physical_rows, vocab] logits in packing order, with each
+                context request's replay rows before its new prompt rows.
+
+        Returns:
+            [num_contexts + tail_rows, vocab] logits containing the last new
+            prompt row for each context request followed by the decode tail.
+        """
         contexts = self.batch.context_requests
         chunks = self._chunk_rows(contexts)
         context_rows = chunks[-1].stop if chunks else 0

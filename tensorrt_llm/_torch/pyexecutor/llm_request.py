@@ -611,6 +611,17 @@ class PyResult:
                               *,
                               reusable: bool = False,
                               retain_owned: bool = False) -> None:
+        """Store context logits and record the current chunk for rank updates.
+
+        Args:
+            context_logits: Logits with shape [tokens, vocab] or
+                [tokens, beam_width, vocab].
+            reusable: The source can be overwritten immediately after this
+                call, so a host copy must complete before returning.
+            retain_owned: Keep the stored destination view in the rank diff.
+                A pending host copy completes before context_logits is read or
+                snapshot, get_diff, or drop_context_logits returns.
+        """
         if self._context_logits:
             self._context_logits.append(context_logits, reusable=reusable)
             if reusable or retain_owned:
