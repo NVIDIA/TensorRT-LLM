@@ -350,28 +350,6 @@ size_t Serialization::serializedSize(LoraConfig const& config)
     return totalSize;
 }
 
-// SocketState
-kv_cache::SocketState Serialization::deserializeSocketState(std::istream& is)
-{
-    auto port = su::deserialize<decltype(kv_cache::SocketState::mPort)>(is);
-    auto ip = su::deserialize<decltype(kv_cache::SocketState::mIp)>(is);
-    return kv_cache::SocketState{port, std::move(ip)};
-}
-
-void Serialization::serialize(kv_cache::SocketState const& state, std::ostream& os)
-{
-    su::serialize(state.mPort, os);
-    su::serialize(state.mIp, os);
-}
-
-size_t Serialization::serializedSize(kv_cache::SocketState const& state)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(state.mPort);
-    totalSize += su::serializedSize(state.mIp);
-    return totalSize;
-}
-
 // AgentState
 kv_cache::AgentState Serialization::deserializeAgentState(std::istream& is)
 {

@@ -8963,6 +8963,8 @@ class PyExecutor:
                     raise ValueError(
                         f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
                     )
+                if not math.isfinite(val):
+                    raise ValueError("Embedding bias values must be finite")
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
@@ -13243,9 +13245,8 @@ class PyExecutor:
                 # request has filled; give it the same finish handshake the
                 # post-batch cancellation path runs before pages are freed.
                 self._start_connector_async_save(request)
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13324,10 +13325,8 @@ class PyExecutor:
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
