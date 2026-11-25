@@ -827,6 +827,14 @@ _GEMV_NARROW_N = 8  # capacity: fixed: a dispatch threshold, not a buffer size
 #: history (which nothing in the step writes ahead of it) while the conv runs, and reads the
 #: conv's output only after `griddepcontrol.wait`. `TRTLLM_ENABLE_PDL`, on by default.
 _GDN_REPLAY_PDL = get_env_enable_pdl()
+#: Verify rows (1..8 requests of four) at which a tep4 rank's fast forms (`TEP_FAST_DECODE_ENV`)
+#: launch the verify step's conv as a programmatic dependent of the input projection that writes
+#: its `x` (`causal_conv1d_triton_update(launch_with_pdl_wait=True, hoist_x=True)`): the slots,
+#: taps, pool and snapshot rows are read before `griddepcontrol.wait`, every x row after it and
+#: before the first store. Same kernel, values and arithmetic: bitwise. GB300 tep4, together with
+#: the finalize all-reduce's early release and the draft shared expert on the side stream,
+#: -0.040..-0.077 ms a step at 1-4 requests.
+_TEP_CONV_WAIT_ROWS = (4, 32)  # capacity: fixed: a dispatch range
 _SOFTPLUS_THRESHOLD = 20.0
 _L2_NORM_EPS = 1e-6
 _PLE_CLAMP_MIN = 1e-6
@@ -1261,6 +1269,8 @@ _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (10
 #:   codes are bitwise (build-checked); the runner runs `DECODE_TACTICS`' tactic where the stock
 #:   window call runs the AutoTuner's, so the block is bitwise today's as far as the trtllm-gen
 #:   tactics agree (measured bitwise one another on the whole layer, not on the window).
+#: - the GDN verify conv at `_TEP_CONV_WAIT_ROWS` rows as a PDL dependent of the input projection
+#:   (bitwise).
 #: The first two are same-precision reorders: a draft or target token can move at a near-tie.
 #: `0` keeps today's forms. Read once, when the target is built; set to 1 at another layout it
 #: warns and does nothing.
@@ -3632,7 +3642,16 @@ def _verify_state(core, mm, num_decodes: int, num_prefills: int = 0) -> tuple:
     return int_idx, work_items, n_writes, all_layer, replay_indices
 
 
-def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.Tensor:
+def _tep_conv_wait(core, rows: int) -> bool:
+    """Whether a verify step of `rows` rows launches its conv as a programmatic dependent of the
+    input projection: a tep4 rank with its fast forms, PDL on, `_TEP_CONV_WAIT_ROWS` rows."""
+    lo, hi = _TEP_CONV_WAIT_ROWS
+    return bool(getattr(core, "tep_fast", False)) and _GDN_REPLAY_PDL and lo <= rows <= hi
+
+
+def _gdn_verify(
+    core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None, conv_wait=False
+) -> torch.Tensor:
     """The recurrent half of a verify step: `n` generation sequences of `p` rows, written so
     that the accepted prefix, unknown until the sampler has run, can be kept.
 
@@ -3648,7 +3667,9 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
     manager. Returns `[1, n * p, num_v_heads, head_v_dim]`.
 
     `mq_out` is the conv output when the input projection's GEMV ran the conv step as its
-    epilogue (`fp8_gemv_conv1d_verify`, `nvfp4_split_gemv_conv1d_verify`; `mq` is then None)."""
+    epilogue (`fp8_gemv_conv1d_verify`, `nvfp4_split_gemv_conv1d_verify`; `mq` is then None).
+    `conv_wait`: the conv is launched as a programmatic dependent of the kernel that wrote `mq`
+    (`_TEP_CONV_WAIT_ROWS`), with its x rows hoisted; the caller decides."""
     int_idx, work_items, n_writes, all_layer, replay_indices = verify
     pools = core._bound.pools
     replay = core._bound.replay
@@ -3672,6 +3693,8 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
             intermediate_conv_window=core._bound.int_conv[i],
             intermediate_state_indices=int_idx,
             launch_dependent_kernels=pdl,
+            launch_with_pdl_wait=conv_wait,
+            hoist_x=conv_wait,
         )
         # Back to token-major: one contiguous copy, which the kernel reads q/k/v from directly.
         mq_out = torch.reshape(torch.transpose(conv_out, 1, 2), [n * p, core.conv_dim])
@@ -8830,6 +8853,7 @@ class DecodeTarget:
                 num_tokens // gen_p,
                 gen_p,
                 verify,
+                conv_wait=_tep_conv_wait(core, num_tokens),
             )
             return self._gdn_epilogue(out, z, L, num_tokens)
         if not (nv_conv or fp8_conv):

@@ -98,6 +98,8 @@ def _build(spec, seed):
         window_buf[0],
         rows_idx,
         spec.get("launch_dependent_kernels", False),
+        spec.get("launch_with_pdl_wait", False),
+        spec.get("hoist_x", False),
     ]
     return args, dict(buf=buf, pool_buf=pool_buf, window_buf=window_buf)
 
