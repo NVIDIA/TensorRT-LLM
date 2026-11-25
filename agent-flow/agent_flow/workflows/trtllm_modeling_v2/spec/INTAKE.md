@@ -145,6 +145,39 @@ built), and say so in `notes`; a benchmark you start by hand runs captured too.
   landing that names a base's `e2e` with its speculator's `e2e` at the same member, the
   speculator's runs alone; the base's runs once the work is done, unless what it reads is
   unchanged since it passed.
+- **Stage placement and landing budget.** Keep `landing` lean: every landing check sits in the
+  agent loop, so aim for **<= ~60 minutes of pure test execution across all `landing` checks**
+  (excluding model load), with each individual `landing` test in the 5-15 minute tier. Put
+  heavy benchmarks, reasoning/thinking runs, and multi-member (`members: all`) custom checks on
+  `stage: delivery`, and combine datasets that share the same feature, member and engine
+  `config` into one test so the model is loaded once. `--dry-run` summarizes the `landing` vs
+  `delivery` check counts, estimates pure `landing` run time from the reference table below,
+  and warns when `landing` looks heavy.
+
+  Reference run times below **exclude model load** (weight load + JIT cache + CUDA graph
+  capture takes ~4-6 min on TEP4/DEP4 and ~8-9 min on TP4 for the ~1T-class MoE anchor; ~1-2
+  min for a ~30B dense model on 1x B200). Measured anchors are from a ~1T-class (~50B active)
+  NVFP4 MoE on 4x GB300 with CUDA graphs and batch 16; `est.` entries scale from their
+  `accuracy_core.py` workload shape:
+
+  | workload / dataset | shape (`accuracy_core.py`) | ~1T-class MoE ref run (excl. load) | suggested `stage` |
+  |---|---|---|---|
+  | module `pytest` (`devices: 1`) | no full-model load | seconds - 1 min | `landing` |
+  | `generate` / `acceptance` | 2-3 / 32 prompts | < 1 min / ~1-3 min (est.) | `landing` |
+  | `json_mode_eval` / `cnn_dailymail` | 100 x 512 / 512 x 100 | ~1-4 min (est.) | `landing` |
+  | `gsm8k` (non-thinking) | 1319 x 256 out | **~4-6 min** (DEP ~4m, TEP/TP ~6m) | `landing` |
+  | `mmlu` / `mmmu` | 4096 x 2 out / 900 x 512 + vision | ~5-15 min (est.) | `landing` at 1 member; `delivery` for `all` |
+  | `passkey_retrieval_64k` / `128k` | 20 x 64k / 128k, 50 out | ~8-15 min (est.) | `landing` at 1 member; `delivery` for `all` |
+  | `gpqa_diamond` | 198 x 32768 out (~1.1M gen tok) | **~20-32 min** (DEP ~20m, TEP/TP ~32m) | `delivery` |
+  | `longbench_v1` / `longbench_v2` | multi-task / 215 x 120k in, 32k out | ~45-60+ min (est.) | `delivery` |
+
+  For a ~30B BF16 dense model on 1x B200, `e2e` (`generate` + `gsm8k`) runs in ~1-2 min
+  excluding load (~3-5 min total). Scale the table up when:
+  - `chat_template_kwargs.enable_thinking: true`: short-output benchmarks expand into long CoT
+    (~5-20x slower) — keep thinking-mode evaluations on `stage: delivery`;
+  - `max_batch_size` is constrained well below 16 (e.g. very long context): run time grows
+    roughly inversely with batch size;
+  - `members: all` multiplies both run time and model-load overhead by the member count.
 - **The catalog.** `generate` (the boot prompts), `acceptance` (a speculator's acceptance length),
   and the `accuracy_core` benchmarks by their references file: `gsm8k`, `mmlu`,
   `gpqa_diamond`, `mmmu`, `cnn_dailymail`, `json_mode_eval`, `longbench_v1`, `longbench_v2`,

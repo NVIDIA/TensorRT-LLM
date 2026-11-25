@@ -319,9 +319,14 @@ def _note_coverage(workflow, log) -> None:
     The coverage (``requirements.py``) goes to ``coverage.yaml``. A feature no
     check covers is said here and stops nothing.
     """
-    workflow._contract = contract_mod.compile_contract(
-        workflow.task_data, workflow._gate_env().world_size
+    world_size = workflow._gate_env().world_size
+    workflow._contract = contract_mod.compile_contract(workflow.task_data, world_size)
+    workflow._landing_budget = contract_mod.landing_budget(
+        workflow.task_data, workflow._contract, world_size
     )
+    print_message(f"→ {escape_markup(workflow._landing_budget.summary_line())}", log)
+    for warning in workflow._landing_budget.warnings:
+        print_message(f"[bold yellow]⚠ {escape_markup(warning)}[/bold yellow]", log)
     coverage = workflow._coverage = requirements_mod.feature_checks(
         workflow.task_data, workflow._contract
     )
@@ -339,9 +344,13 @@ def _note_coverage(workflow, log) -> None:
 def _write_contract(workflow) -> None:
     """Write the contract compiled with the coverage, and say what it holds."""
     contract_mod.write_contract(workflow.workspace, workflow._contract)
+    rendered = workflow._contract.render()
+    budget = getattr(workflow, "_landing_budget", None)
+    if budget is not None:
+        rendered = f"{rendered}\n\n{budget.render()}"
     workflow.journal.section(
         f"contract: {len(workflow._contract.required())} required check(s)",
-        workflow._contract.render(),
+        rendered,
     )
     workflow.journal.section(
         "coverage: the checks behind each feature",

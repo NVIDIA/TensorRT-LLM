@@ -185,6 +185,155 @@ class Contract:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class LandingBudget:
+    """Advisory breakdown of ``landing`` vs ``delivery`` checks and reference run time."""
+
+    landing_checks: int
+    delivery_checks: int
+    #: Sum of estimated pure run time (minutes, excluding model load) across required
+    #: ``landing`` checks that run on their own (not answered by another check).
+    estimated_minutes: float
+    #: Required ``landing`` checks with no catalog timing estimate (custom ``pytest`` / disagg test).
+    unestimated_checks: int = 0
+    #: Non-blocking hints for keeping ``landing`` lean (heavy datasets, thinking mode, over budget).
+    warnings: tuple[str, ...] = ()
+
+    def summary_line(self) -> str:
+        """One-line stage breakdown with the reference ``landing`` run-time estimate."""
+        details: list[str] = []
+        if self.estimated_minutes > 0:
+            details.append(
+                f"~{round(self.estimated_minutes)} min est. run time on ~1T-class MoE ref, "
+                "excl. model load"
+            )
+        if self.unestimated_checks:
+            prefix = "+ " if details else ""
+            details.append(f"{prefix}{self.unestimated_checks} unestimated")
+        landing = f"{self.landing_checks} landing"
+        if details:
+            landing += f" ({'; '.join(details)})"
+        return f"stages: {landing}, {self.delivery_checks} delivery"
+
+    def render(self) -> str:
+        """The summary line followed by any advisory warnings."""
+        lines = [self.summary_line()]
+        for warning in self.warnings:
+            lines.append(f"- warning: {warning}")
+        return "\n".join(lines)
+
+
+def _effective_evaluator_kwargs(
+    spec: Mapping[str, Any], test: verification_mod.Test
+) -> dict[str, Any]:
+    """``accuracy.evaluator_kwargs`` with ``test.evaluator_kwargs`` laid over it."""
+    merged = dict((spec.get("accuracy") or {}).get("evaluator_kwargs") or {})
+    merged.update(test.evaluator_kwargs or {})
+    return merged
+
+
+def landing_budget(
+    task_data: Mapping[str, Any], contract: Contract, world_size: int
+) -> LandingBudget:
+    """Summarize ``landing`` vs ``delivery`` checks and warn when ``landing`` looks heavy.
+
+    Estimates use :data:`verification.DATASET_REF_MINUTES` (pure run time excluding model
+    load on a ~1T-class MoE reference) and skip checks answered by another check.
+    Advisory only: never rejects a spec or blocks launch.
+    """
+    tests = {(t.feature, t.name): t for t in run_tests(task_data, world_size)}
+    specs: dict[str, Mapping[str, Any]] = {}
+    required = contract.required()
+    landing = [c for c in required if c.stage == STAGE_LANDING]
+    delivery = [c for c in required if c.stage == STAGE_DELIVERY]
+
+    estimated = 0.0
+    unestimated = 0
+    heavy_hits: list[str] = []
+    thinking_hits: list[str] = []
+
+    for check in landing:
+        if check.answered_by:
+            continue
+        test = tests.get((check.unit, check.gate))
+        if test is None:
+            unestimated += 1
+            continue
+        if variants_mod.is_variant(task_data, check.unit) and check.unit not in specs:
+            specs[check.unit] = check_config.variant_spec(
+                task_data, check.unit, world_size=world_size
+            )
+        spec = specs.get(check.unit, task_data)
+        kwargs = _effective_evaluator_kwargs(spec, test)
+
+        if test.runner == RUN_DISAGG:
+            accuracy = spec.get("accuracy") or {}
+            disagg_block = accuracy.get("disagg") or {}
+            if isinstance(disagg_block, Mapping) and disagg_block.get("test"):
+                unestimated += 1
+                continue
+            benchmark = str(
+                resolve_per_unit(accuracy, "benchmark", check.unit) or DEFAULT_BENCHMARK
+            )
+            minutes = verification_mod.DATASET_REF_MINUTES.get(benchmark)
+            if minutes is None:
+                unestimated += 1
+                continue
+            if benchmark in verification_mod.HEAVY_DATASETS:
+                heavy_hits.append(f"{check.key} ({benchmark})")
+            if (
+                verification_mod.thinking_enabled(kwargs)
+                and benchmark not in verification_mod.LONG_OUTPUT_BENCHMARKS
+            ):
+                minutes *= verification_mod.THINKING_MULTIPLIER
+                thinking_hits.append(check.key)
+            estimated += minutes
+            continue
+
+        minutes = verification_mod.estimate_run_minutes(test, evaluator_kwargs=kwargs)
+        if minutes is None:
+            unestimated += 1
+            continue
+        estimated += minutes
+
+        heavy = [d for d in test.datasets if d in verification_mod.HEAVY_DATASETS]
+        if heavy:
+            heavy_hits.append(f"{check.key} ({', '.join(heavy)})")
+        if verification_mod.thinking_enabled(kwargs) and any(
+            b not in verification_mod.LONG_OUTPUT_BENCHMARKS for b in test.benchmarks
+        ):
+            thinking_hits.append(check.key)
+
+    warnings: list[str] = []
+    if heavy_hits:
+        warnings.append(
+            "heavy benchmark(s) at landing: "
+            + ", ".join(heavy_hits)
+            + " — consider setting stage: delivery"
+        )
+    if thinking_hits:
+        warnings.append(
+            "enable_thinking: true on landing benchmark(s): "
+            + ", ".join(thinking_hits)
+            + " (5-20x longer decode) — consider disabling thinking at landing or setting "
+            "stage: delivery"
+        )
+    if estimated > verification_mod.LANDING_BUDGET_MINUTES:
+        warnings.append(
+            f"landing checks estimate ~{round(estimated)} min of pure run time on the ~1T-class "
+            f"MoE reference (excluding model load), past the "
+            f"{verification_mod.LANDING_BUDGET_MINUTES} min landing budget — consider moving "
+            "heavier or multi-member checks to stage: delivery"
+        )
+    return LandingBudget(
+        landing_checks=len(landing),
+        delivery_checks=len(delivery),
+        estimated_minutes=round(estimated, 1),
+        unestimated_checks=unestimated,
+        warnings=tuple(warnings),
+    )
+
+
 def _per_unit(key: str) -> Callable[[Mapping[str, Any], str], Any]:
     return lambda accuracy, unit: resolve_per_unit(accuracy, key, unit)
 
@@ -1241,6 +1390,7 @@ __all__ = [
     "Contract",
     "ContractStatus",
     "Evaluation",
+    "LandingBudget",
     "MILESTONE_BRINGUP",
     "MILESTONE_CORRECTNESS",
     "MILESTONE_FILENAME",
@@ -1264,6 +1414,7 @@ __all__ = [
     "run_tests",
     "test_members",
     "evaluate",
+    "landing_budget",
     "latest_milestone",
     "load_cells",
     "measured_commit",

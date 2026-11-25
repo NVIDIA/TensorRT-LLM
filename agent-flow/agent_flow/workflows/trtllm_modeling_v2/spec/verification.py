@@ -162,6 +162,33 @@ BENCHMARKS: dict[str, str] = {
 }
 DATASETS: tuple[str, ...] = (DATASET_GENERATE, DATASET_ACCEPTANCE, *BENCHMARKS)
 
+#: Reference pure execution time in minutes per dataset (excluding model load) on a
+#: ~1T-class (~50B active) NVFP4 MoE on 4x GB300 with CUDA graphs and batch 16
+#: (``spec/INTAKE.md``, "Stage placement and landing budget"). Used only for advisory
+#: ``--dry-run`` landing-budget estimates; never enforced as a runtime timeout.
+DATASET_REF_MINUTES: dict[str, float] = {
+    DATASET_GENERATE: 0.5,
+    DATASET_ACCEPTANCE: 2.0,
+    "json_mode_eval": 2.0,
+    "cnn_dailymail": 3.0,
+    "gsm8k": 6.0,
+    "mmlu": 10.0,
+    "mmmu": 12.0,
+    "passkey_retrieval_64k": 8.0,
+    "passkey_retrieval_128k": 15.0,
+    "gpqa_diamond": 32.0,
+    "longbench_v1": 45.0,
+    "longbench_v2": 60.0,
+}
+#: Benchmarks whose default output/context budget makes them poor fits for ``stage: landing``.
+HEAVY_DATASETS: frozenset[str] = frozenset({"gpqa_diamond", "longbench_v1", "longbench_v2"})
+#: Benchmarks whose reference timing already assumes a 32k reasoning/CoT output budget.
+LONG_OUTPUT_BENCHMARKS: frozenset[str] = frozenset({"gpqa_diamond", "longbench_v2"})
+#: Advisory reference budget (minutes, excluding model load) across all ``landing`` checks.
+LANDING_BUDGET_MINUTES = 60
+#: Conservative multiplier applied to short-output benchmarks when ``enable_thinking: true``.
+THINKING_MULTIPLIER = 5.0
+
 #: Who declared a test: the flow (``contract.flow_tests``), the flow with the
 #: spec changing it, or the spec alone.
 ORIGIN_FLOW = "flow"
@@ -275,6 +302,39 @@ class Test:
 def module_member(devices: int) -> str:
     """The member a module test's check is recorded at: ``tp<N>``, its devices."""
     return f"tp{int(devices)}"
+
+
+def thinking_enabled(evaluator_kwargs: Mapping[str, Any] | None) -> bool:
+    """Whether ``evaluator_kwargs`` explicitly turns on reasoning/thinking mode."""
+    if not isinstance(evaluator_kwargs, Mapping):
+        return False
+    chat_kwargs = evaluator_kwargs.get("chat_template_kwargs")
+    return isinstance(chat_kwargs, Mapping) and bool(chat_kwargs.get("enable_thinking"))
+
+
+def estimate_run_minutes(
+    test: Test, *, evaluator_kwargs: Mapping[str, Any] | None = None
+) -> float | None:
+    """Estimated pure execution time (minutes, excluding model load) for one run of ``test``.
+
+    Returns ``None`` for tests whose workload is not from :data:`DATASETS` (arbitrary
+    ``pytest`` nodes and ``disagg`` tests). When ``evaluator_kwargs`` enables thinking mode,
+    short-output benchmarks are scaled by :data:`THINKING_MULTIPLIER`.
+    """
+    if test.runner == RUN_SERVE:
+        return DATASET_REF_MINUTES[DATASET_GENERATE]
+    if test.runner != RUN_DATASETS or not test.datasets:
+        return None
+    thinking = thinking_enabled(evaluator_kwargs)
+    total = 0.0
+    for name in test.datasets:
+        minutes = DATASET_REF_MINUTES.get(name)
+        if minutes is None:
+            return None
+        if thinking and name in BENCHMARKS and name not in LONG_OUTPUT_BENCHMARKS:
+            minutes *= THINKING_MULTIPLIER
+        total += minutes
+    return total
 
 
 def _strings(value: Any) -> tuple[str, ...]:
@@ -783,6 +843,7 @@ __all__ = [
     "DATASETS",
     "DATASET_ACCEPTANCE",
     "DATASET_GENERATE",
+    "DATASET_REF_MINUTES",
     "DEFAULT_TIMEOUT_S",
     "DISAGG",
     "E2E",
@@ -790,7 +851,10 @@ __all__ = [
     "FEATURE_PLACEHOLDER",
     "FLOW_TEST_NAMES",
     "HANDOVER_ENV",
+    "HEAVY_DATASETS",
+    "LANDING_BUDGET_MINUTES",
     "LLM_OPTIONS_ENV",
+    "LONG_OUTPUT_BENCHMARKS",
     "MEMBER_ENV",
     "MEMBER_PLACEHOLDER",
     "MODEL_ENV",
@@ -808,6 +872,7 @@ __all__ = [
     "STAGE_LANDING",
     "TEST_KEYS",
     "TEST_NAME",
+    "THINKING_MULTIPLIER",
     "Test",
     "VERIFICATION_FIELD",
     "apply",
@@ -815,6 +880,8 @@ __all__ = [
     "declared",
     "defined",
     "entries",
+    "estimate_run_minutes",
     "module_member",
+    "thinking_enabled",
     "validate",
 ]

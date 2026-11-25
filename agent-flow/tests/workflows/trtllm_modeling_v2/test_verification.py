@@ -1093,3 +1093,157 @@ def test_a_check_reads_its_own_results_not_a_workers_run_of_the_same_test(tmp_pa
     )
     assert not check.passed and lines == [] and check.measured is None
     assert "NoTarget" in check.detail and "89.4" not in check.detail
+
+
+# ----------------------------------------------------------------------------- landing budget
+
+
+def test_every_catalog_dataset_has_a_positive_reference_timing():
+    assert set(verification_mod.DATASET_REF_MINUTES) == set(verification_mod.DATASETS)
+    assert all(m > 0 for m in verification_mod.DATASET_REF_MINUTES.values())
+    assert verification_mod.HEAVY_DATASETS <= set(verification_mod.BENCHMARKS)
+    assert verification_mod.LONG_OUTPUT_BENCHMARKS <= verification_mod.HEAVY_DATASETS
+
+
+def test_estimate_run_minutes_scales_thinking_without_double_counting_long_cot():
+    gsm = verification_mod.Test(
+        name="e2e",
+        feature="core",
+        purpose="p",
+        runner=verification_mod.RUN_DATASETS,
+        datasets=("generate", "gsm8k"),
+    )
+    gpqa = verification_mod.Test(
+        name="gpqa",
+        feature="core",
+        purpose="p",
+        runner=verification_mod.RUN_DATASETS,
+        datasets=("gpqa_diamond",),
+    )
+    serve_test = verification_mod.Test(
+        name="serve",
+        feature="core",
+        purpose="p",
+        runner=verification_mod.RUN_SERVE,
+        datasets=("generate",),
+    )
+    pytest_test = verification_mod.Test(
+        name="routing",
+        feature="core",
+        purpose="p",
+        runner=verification_mod.RUN_PYTEST,
+        nodes=(ROUTING,),
+        devices=1,
+    )
+    thinking = {"chat_template_kwargs": {"enable_thinking": True}}
+    no_thinking = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    assert verification_mod.estimate_run_minutes(gsm) == 6.5
+    assert verification_mod.estimate_run_minutes(gsm, evaluator_kwargs=no_thinking) == 6.5
+    assert verification_mod.estimate_run_minutes(gsm, evaluator_kwargs=thinking) == 30.5
+    # gpqa_diamond already budgets 32k output tokens; thinking does not multiply it again.
+    assert verification_mod.estimate_run_minutes(gpqa, evaluator_kwargs=thinking) == 32.0
+    assert verification_mod.estimate_run_minutes(serve_test) == 0.5
+    assert verification_mod.estimate_run_minutes(pytest_test) is None
+
+
+def test_landing_budget_summarizes_stages_and_warns_on_heavy_or_over_budget(tmp_path):
+    # Lean landing: 2 e2e (generate+gsm8k = 6.5m each) + 1 pytest (unestimated); 2 delivery checks.
+    data = _load(tmp_path, _spec(tmp_path, _tests()))
+    contract = contract_mod.compile_contract(data, world_size=4)
+    budget = contract_mod.landing_budget(data, contract, world_size=4)
+    assert budget.landing_checks == 3
+    assert budget.delivery_checks == 2
+    assert budget.estimated_minutes == 13.0
+    assert budget.unestimated_checks == 1
+    assert budget.warnings == ()
+    assert "3 landing (~13 min est. run time" in budget.summary_line()
+    assert "+ 1 unestimated" in budget.summary_line()
+    assert "2 delivery" in budget.summary_line()
+
+    # Adding gpqa_diamond at landing on both members triggers heavy + over-budget warnings.
+    heavy_tests = {
+        "core": {
+            "reasoning": {
+                "purpose": "hard science reasoning holds",
+                "datasets": ["gpqa_diamond"],
+                "members": "all",
+            }
+        }
+    }
+    heavy_data = _load(tmp_path, _spec(tmp_path, heavy_tests))
+    heavy_contract = contract_mod.compile_contract(heavy_data, world_size=4)
+    heavy_budget = contract_mod.landing_budget(heavy_data, heavy_contract, world_size=4)
+    assert heavy_budget.estimated_minutes == 77.0
+    assert any(
+        "heavy benchmark(s) at landing" in w and "gpqa_diamond" in w for w in heavy_budget.warnings
+    )
+    assert any("past the 60 min landing budget" in w for w in heavy_budget.warnings)
+
+    # Moving it to delivery clears both warnings and drops it from the landing estimate.
+    heavy_tests["core"]["reasoning"]["stage"] = "delivery"
+    moved_data = _load(tmp_path, _spec(tmp_path, heavy_tests))
+    moved_contract = contract_mod.compile_contract(moved_data, world_size=4)
+    moved_budget = contract_mod.landing_budget(moved_data, moved_contract, world_size=4)
+    assert moved_budget.estimated_minutes == 13.0
+    assert moved_budget.delivery_checks == 2
+    assert moved_budget.warnings == ()
+
+
+def test_landing_budget_warns_on_thinking_mode_and_skips_answered_checks(tmp_path):
+    # A subset check answered by core:e2e is not double-counted; enable_thinking warns & scales.
+    spec = _spec(
+        tmp_path,
+        {
+            "core": {
+                "dup_gsm8k": {
+                    "purpose": "same gsm8k measurement as e2e",
+                    "datasets": ["gsm8k"],
+                    "members": "tep4",
+                }
+            }
+        },
+    )
+    spec["accuracy"]["evaluator_kwargs"] = {"chat_template_kwargs": {"enable_thinking": True}}
+    data = _load(tmp_path, spec)
+    contract = contract_mod.compile_contract(data, world_size=4)
+    checks = {c.key: c for c in contract.checks}
+    assert checks["core:dup_gsm8k@tep4"].answered_by == "core:e2e@tep4"
+
+    budget = contract_mod.landing_budget(data, contract, world_size=4)
+    # Two e2e checks × (0.5 + 6.0 * 5) = 61.0 min; dup_gsm8k is answered_by and not double-counted.
+    assert budget.estimated_minutes == 61.0
+    assert any("enable_thinking: true" in w for w in budget.warnings)
+    assert any("past the 60 min landing budget" in w for w in budget.warnings)
+
+
+def test_bootstrap_prints_and_journals_landing_budget(tmp_path):
+    from rich.console import Console
+
+    from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
+
+    tests = {
+        "core": {
+            "reasoning": {
+                "purpose": "hard science reasoning holds",
+                "datasets": ["gpqa_diamond"],
+                "members": "tep4",
+            }
+        }
+    }
+    data = _load(tmp_path, _spec(tmp_path, tests))
+    workflow = _workflow(tmp_path, data)
+    workflow._gate_env = lambda: _environment(world_size=4)
+    sections: list[tuple[str, str]] = []
+    workflow.journal = SimpleNamespace(section=lambda title, body: sections.append((title, body)))
+    console = Console(record=True, width=200)
+
+    bootstrap._note_coverage(workflow, console)
+    bootstrap._write_contract(workflow)
+
+    printed = console.export_text()
+    assert "3 landing (~45 min est. run time" in printed
+    assert "heavy benchmark(s) at landing" in printed
+    contract_section = next(body for title, body in sections if title.startswith("contract:"))
+    assert "stages: 3 landing" in contract_section
+    assert "- warning: heavy benchmark(s) at landing" in contract_section

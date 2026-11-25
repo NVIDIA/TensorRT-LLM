@@ -78,7 +78,11 @@ features: []
 # of the tree, judged by their JUnit report (a skip fails it); with `members` once per member
 # with that member's configuration (`MV2FLOW_LLM_OPTIONS`, `MV2FLOW_MODEL`, `MV2FLOW_FEATURE`,
 # `MV2FLOW_MEMBER`), with `devices` (default 1) once. A test runs at a stage: `landing` (the
-# default, when a landing names it) or `delivery` (once the work is done). Its checks are
+# default, when a landing names it) or `delivery` (once the work is done). Keep `landing` lean
+# (~60 min total pure run time excluding model load on a ~1T-class MoE reference; see
+# spec/INTAKE.md "Stage placement and landing budget") and put heavy benchmarks (`gpqa_diamond`,
+# `longbench_v1`, `longbench_v2`), thinking-mode runs, or `members: all` custom tests on
+# `stage: delivery` (`--dry-run` reports the stage breakdown and warns past budget). Its checks are
 # `<feature>:<name>@<member>`. `e2e` is each feature's foundation test, not cut down and about
 # no particular path; a path that runs only at some length or switch is a test of its own, with
 # `config` (LLM-API options laid over the feature's at the member), `evaluator_kwargs` (laid
@@ -98,6 +102,7 @@ features: []
 #       config: {max_seq_len: 70000, enable_chunked_prefill: true}
 #       extra_checks: [sparse_topk_exceeded]
 #       members: all
+#       stage: delivery
 #     moe_routing:
 #       purpose: the router picks the experts the HF reference picks, on 64 prompts
 #       pytest: tests/unittest/_torch/modeling_v2/test_moe_routing.py
