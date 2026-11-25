@@ -5237,6 +5237,10 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
         def problem_desc_require(cls) -> dict:
             return {}
 
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {}
+
         def get_workspace_sizes(self) -> Tuple[int, int]:
             return 0, 4096
 

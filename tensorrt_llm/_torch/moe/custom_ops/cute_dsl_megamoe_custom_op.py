@@ -1366,10 +1366,18 @@ def _megamoe_ugpu_tactic() -> tuple:
         1,
         (1, 1),
     )
-def megamoe_kernel_routes_adaptive(kernel_cls) -> bool:
-    """Whether ``kernel_cls``'s dispatch router maps and counts an adaptive balancer's routes
-    (it declares ``adaptive_route_experts``)."""
-    return "adaptive_route_experts" in kernel_cls.impl_desc_require()
+
+
+def megamoe_kernel_routes_adaptive(kernel) -> bool:
+    """Whether ``kernel`` (a kernel class, or a built kernel) maps and counts an adaptive balancer's
+    routes in its dispatch router: the class declares ``adaptive_route_experts``, and a built
+    kernel's token comm builds a router that declares it too (a bucket's router depends on the
+    problem, e.g. the one-round router of small buckets at EP16 and wider)."""
+    kernel_cls = kernel if isinstance(kernel, type) else type(kernel)
+    if "adaptive_route_experts" not in kernel_cls.impl_desc_require():
+        return False
+    router = getattr(getattr(kernel, "token_comm", None), "_router", None)
+    return router is None or "adaptive_route_experts" in type(router).impl_desc_require()
 
 
 def _construct_megamoe_kernel(
@@ -2952,7 +2960,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_workspace_bytes=int(shared_bytes),
             supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
             masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
-            routes_adaptive=megamoe_kernel_routes_adaptive(type(probe)),
+            routes_adaptive=megamoe_kernel_routes_adaptive(probe),
         )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:

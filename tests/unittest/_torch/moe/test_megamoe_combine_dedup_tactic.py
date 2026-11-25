@@ -305,9 +305,9 @@ def test_an_adaptive_route_never_reaches_a_kernel_without_it(
 ) -> None:
     """The SM107 kernels declare no adaptive route. The generic one still forwards the option to its
     router, which then maps expert ids while the kernel passes it no route table (the router's
-    "adaptive_route is passed iff" ValueError at the first launch); the gen-phase one drops it and
-    reads expert ids as slots. Both are refused at construction, and the properties tell the
-    backend to route those buckets through the adaptive EPLB route op."""
+    "adaptive_route is passed iff" ValueError at the first launch); the gen-phase one refuses it,
+    which would fall back to the generic kernel. Both are refused at construction, and the
+    properties tell the backend to route those buckets through the adaptive EPLB route op."""
     common = _kernel_common(capacity, adaptive_route_experts=384)
     with pytest.raises(NotImplementedError, match="no adaptive route in its dispatch router"):
         op._construct_megamoe_kernel(sm_version=107, common=common, combine_format="bf16")
@@ -315,6 +315,33 @@ def test_an_adaptive_route_never_reaches_a_kernel_without_it(
     assert kernel.implementation["adaptive_route_experts"] == 384
     assert not any(map(op.megamoe_kernel_routes_adaptive, (_GenphaseMetadata, _GenericMetadata)))
     assert op.megamoe_kernel_routes_adaptive(_AdaptiveRouteMetadata)
+
+
+def test_a_built_kernel_routes_adaptively_only_through_a_router_that_declares_it(
+    op: types.ModuleType,
+) -> None:
+    """A kernel class that declares the adaptive route still routes a bucket adaptively only when
+    the router its token comm built for that bucket declares it too."""
+
+    def built(router_cls):
+        kernel = _AdaptiveRouteMetadata()
+        kernel.token_comm = types.SimpleNamespace(_router=router_cls())
+        return kernel
+
+    class _Router:
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {}
+
+    class _AdaptiveRouter(_Router):
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {"adaptive_route_experts": int}
+
+    assert op.megamoe_kernel_routes_adaptive(_AdaptiveRouteMetadata)
+    assert op.megamoe_kernel_routes_adaptive(built(_AdaptiveRouter))
+    assert not op.megamoe_kernel_routes_adaptive(built(_Router))
+    assert not op.megamoe_kernel_routes_adaptive(_GenericMetadata)
 
 
 def test_the_properties_tell_whether_a_bucket_routes_adaptively(op: types.ModuleType) -> None:
