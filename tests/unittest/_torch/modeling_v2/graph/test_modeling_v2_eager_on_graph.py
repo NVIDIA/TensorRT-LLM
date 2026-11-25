@@ -18,9 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
-    eager_on_graph as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph as op
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,

@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from .activation import MoEActivation, SwigluActivation, activation_constant_names
 from .cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
@@ -110,6 +111,8 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
+    # The only CuteDSL leaf publishing ``mxfp8``.
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     # The TRTLLM-Gen leaves. Order among them does not matter: the ``quant``
     # segments are disjoint, so at most one leaf can admit a given problem.
     TrtllmTrtllmGenBf16Impl,
@@ -132,7 +135,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 # ``moe_backend`` literal and a pinned identity reach the same class for the
 # DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
-    # Includes the two ``fp8_block_scales`` leaves, whose technique is not
+    # Includes the three ``fp8_block_scales`` leaves, whose technique is not
     # ``cutlass``: the literal serves FP8 block scales on SM90 and SM120/121.
     "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
@@ -144,6 +147,9 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
             TrtllmCutedslGroupedGemmNvfp4Impl,
             TrtllmCutedslGroupedGemmNvfp4PlusImpl,
             TrtllmCutedslGroupedGemmBf16Impl,
+            # ``moe_backend: CUTEDSL`` is how an MXFP8 checkpoint reaches the
+            # CuteDSL fused FC12 kernel; no grouped-GEMM leaf serves MXFP8.
+            TrtllmCutedslFusedFc12Mxfp8Impl,
         }
     ),
     "CUTEDSL_FC12": frozenset({TrtllmCutedslFusedFc12Nvfp4Impl}),

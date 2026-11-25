@@ -281,6 +281,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        kv_balanced_admission_planner=None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -358,6 +359,7 @@ class ADPRouter(ABC):
             kv_balanced_admission=(
                 attention_dp_config is not None and attention_dp_config.enable_kv_balanced_admission
             ),
+            kv_balanced_admission_planner=kv_balanced_admission_planner,
         )
 
     @abstractmethod
@@ -495,6 +497,23 @@ class ADPRouter(ABC):
         if self.dist.has_cp_helix:
             self._use_max_load_across_cp(local_state)
         return local_state
+
+    def gather_iter_stats(self, iter_stats_payload: RankIterStatsPayload | None) -> list[RankState]:
+        """Allgather only this rank's pending iteration stats across DP ranks.
+
+        Unlike ``gather_all_rank_states`` this enters no CP collective, so
+        under helix CP each TP group can call it a different number of times.
+
+        Args:
+            iter_stats_payload: Pending iteration stats payload, if any.
+
+        Returns:
+            One state per DP rank, holding its rank and iteration stats and no load.
+        """
+        local_state = RankState(rank=self.dist.tp_rank)
+        local_state.copy_iter_stats_from(iter_stats_payload)
+        responses = self.dist.tp_allgather(local_state.serialize())
+        return [RankState.deserialize(data=resp) for resp in responses]
 
     def _use_max_load_across_cp(self, local_state: RankState) -> None:
         """Replace this DP rank's request and token counts with their CP-group maximum.
@@ -658,9 +677,18 @@ class DefaultADPRouter(ADPRouter):
         dist: Distributed,
         has_seq_slot_headroom: bool = False,
         kv_balanced_admission: bool = False,
+        kv_balanced_admission_planner=None,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self.kv_balanced_admission = kv_balanced_admission
+        # A model's RuntimeHooks.kv_balanced_admission_planner; None: the window
+        # and plan_kv_balanced_admission below.
+        self._kv_balanced_admission_planner = kv_balanced_admission_planner
+        if kv_balanced_admission and kv_balanced_admission_planner is not None:
+            logger.info(
+                "Attention DP: KV-balanced admission uses the model's planner "
+                f"{type(kv_balanced_admission_planner).__name__}"
+            )
         # Request id -> admitting rounds it was passed over in the window.
         self._kv_balance_skipped_rounds: Dict[int, int] = {}
 
@@ -699,8 +727,11 @@ class DefaultADPRouter(ADPRouter):
         free_slots = sum(
             max(0, max_num_active_requests - s.num_active_requests) for s in all_rank_states
         )
+        planner = self._kv_balanced_admission_planner
         window = waiting_queue.peek_requests(
-            max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
+            planner.window(max_new_requests, free_slots)
+            if planner is not None
+            else max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
         )
         if not window or not all(_is_kv_balanced_request(item) for item in window):
             return super().pop_requests(
@@ -708,7 +739,7 @@ class DefaultADPRouter(ADPRouter):
             )
 
         skipped_rounds = self._kv_balance_skipped_rounds
-        plan = plan_kv_balanced_admission(
+        plan = (planner.plan if planner is not None else plan_kv_balanced_admission)(
             candidate_tokens=[_item_num_input_tokens(item) for item in window],
             candidate_forced=[
                 skipped_rounds.get(item.id, 0) >= KV_BALANCE_MAX_SKIPPED_ROUNDS for item in window

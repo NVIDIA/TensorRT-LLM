@@ -100,6 +100,7 @@ class StubRequest:
         self.py_request_id = request_id
         self.is_first_context_chunk = True
         self.is_disagg_generation_init_state = False
+        self.is_context_only_request = False
         self.is_dummy = False
         self.lora_task_id = lora_task_id
         self.cache_salt = cache_salt

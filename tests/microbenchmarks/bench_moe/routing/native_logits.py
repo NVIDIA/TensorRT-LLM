@@ -45,7 +45,10 @@ _NATIVE_PROJECTION_CAPABILITIES: Dict[str, str] = {
     "SigmoidRenormMoeRoutingMethod": "exact_ids",
     "Llama4RenormalizeMoeRoutingMethod": "top1_exact",
     "MiniMaxM2MoeRoutingMethod": "exact_with_zero_bias",
+    "MiniMaxM3MoeRoutingMethod": "exact_ids",
+    "MuseSparkOpenRoutingMethod": "exact_ids",
     "DeepSeekV3MoeRoutingMethod": "projected_or_exact",
+    "DeepSeekV4MoeRoutingMethod": "exact_ids",
     "SparseMixerMoeRoutingMethod": "unsupported",
 }
 
@@ -300,10 +303,13 @@ def _maybe_install_routing_control_patch(
         return
 
     routing_target = moe
+    # Wrapper attribute writes must reach the MoE that actually executes forward_impl.
+    while "moe" in getattr(routing_target, "_modules", {}):
+        routing_target = routing_target._modules["moe"]
     apply_method_orig = routing_target.routing_method.apply
-    inner_backend = getattr(moe, "backend", moe)
+    inner_backend = getattr(routing_target, "backend", routing_target)
     run_moe_orig = None
-    forward_impl_orig = moe.forward_impl
+    forward_impl_orig = routing_target.forward_impl
 
     try:
         routing_target.routing_method.apply = _make_supplied_topk_apply(
@@ -313,13 +319,13 @@ def _maybe_install_routing_control_patch(
         if isinstance(inner_backend, TRTLLMGenFusedMoE):
             run_moe_orig = inner_backend.run_moe
             inner_backend.run_moe = _make_supplied_topk_run_moe(
-                inner_backend, run_moe_orig, materialized_ids, materialized_scales
+                routing_target, run_moe_orig, materialized_ids, materialized_scales
             )
 
-        moe.forward_impl = make_forward_impl_check(moe, forward_impl_orig)
+        routing_target.forward_impl = make_forward_impl_check(routing_target, forward_impl_orig)
         yield
     finally:
         routing_target.routing_method.apply = apply_method_orig
         if run_moe_orig is not None:
             inner_backend.run_moe = run_moe_orig
-        moe.forward_impl = forward_impl_orig
+        routing_target.forward_impl = forward_impl_orig

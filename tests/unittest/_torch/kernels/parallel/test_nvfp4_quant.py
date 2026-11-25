@@ -205,11 +205,26 @@ def test_nvfp4_quant_graph_dependency_chain(rows: int) -> None:
     scale = torch.tensor([100.0], device="cuda")
 
     def chain() -> tuple[torch.Tensor, torch.Tensor]:
-        _producer[(triton.cdiv(x.numel(), 1024),)](source, x, x.numel(), pdl, launch_pdl=pdl)
+        _producer[(triton.cdiv(x.numel(), 1024),)](
+            source,
+            x,
+            x.numel(),
+            pdl,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=pdl,
+        )
         q, sf = nvfp4_quant(x, scale)
         out_q, out_sf = torch.empty_like(q), torch.empty_like(sf)
         _consumer[(triton.cdiv(q.numel(), 1024),)](
-            q, sf, out_q, out_sf, q.numel(), sf.numel(), pdl, launch_pdl=pdl
+            q,
+            sf,
+            out_q,
+            out_sf,
+            q.numel(),
+            sf.numel(),
+            pdl,
+            # pyrefly: ignore [unexpected-keyword]
+            launch_pdl=pdl,
         )
         return out_q, out_sf
 

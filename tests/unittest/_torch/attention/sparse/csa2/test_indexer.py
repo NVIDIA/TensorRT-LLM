@@ -195,12 +195,6 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
         if implementation == "self_sampling" or (implementation == "default" and is_prefill)
         else TopKImplementation.CUTE_DSL_RADIX
     )
-    if (
-        implementation == "self_sampling"
-        and not is_prefill
-        and torch.cuda.get_device_capability() == (10, 7)
-    ):
-        expected_impl = TopKImplementation.CUDA_RADIX
     assert (
         selector.prefill_implementation if is_prefill else selector.decode_implementation
     ) == expected_impl
@@ -1085,6 +1079,23 @@ def test_packed_prefill_logits_schedule_matches_grid_stride(monkeypatch):
         grid_stride = run()
     torch.testing.assert_close(scheduled, grid_stride, atol=0, rtol=0)
     torch.testing.assert_close(again, grid_stride, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with monkeypatch.context() as context:
+        context.setattr(csa2_indexer, "get_mqa_logits_metadata", counted)
+        with torch.cuda.graph(graph):
+            captured = run()
+    # Capture must build a live schedule rather than reuse the eager schedule.
+    assert len(built) == 2
+    original_visible = visible.clone()
+    for shrink in (512, 0):
+        visible.copy_((original_visible - shrink).clamp_min(0))
+        graph.replay()
+        actual = captured.clone()
+        with monkeypatch.context() as context:
+            context.setattr(CSA2Indexer, "_packed_group_schedule", lambda *args: None)
+            expected = run()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _single_request_state(heads=8, two_owners=False):
@@ -2047,7 +2058,7 @@ def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
         # SM100 metadata plans no prefix for decode rows, so they must take the
         # native paged sparse decode.
         with monkeypatch.context() as context:
-            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a: None)
+            context.setattr(state.metadata, "prepare_sparse_indexer", lambda *a, **k: None)
             with pytest.raises(ValueError, match="native paged sparse decode"):
                 _candidate_decode_run(indexer, state, monkeypatch)
     # An admitted domain wider than the candidate pool changes nothing: only

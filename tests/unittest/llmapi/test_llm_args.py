@@ -855,7 +855,8 @@ def test_context_parallelism_mapping_keeps_cp_config():
         "cp_type": CpType.HELIX,
         "tokens_per_block": 32
     }
-    assert not args._kv_cache_estimation_runs()
+    # Aggregated Helix (no cache transceiver) profiles a forward to size KV.
+    assert args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
@@ -963,6 +964,23 @@ kv_cache_config:
         llm_args = TorchLlmArgs.from_yaml(yaml_path)
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
+
+    def test_from_yaml_enable_locality_domains(self, tmp_path):
+        assert TorchLlmArgs(
+            model=llama_model_path).enable_locality_domains is False
+
+        yaml_path = tmp_path / "locality_domains.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump({
+                "model": str(llama_model_path),
+                "enable_locality_domains": True,
+            }),
+            encoding="utf-8",
+        )
+
+        llm_args = TorchLlmArgs.from_yaml(yaml_path)
+
+        assert llm_args.enable_locality_domains is True
 
     def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
@@ -1333,6 +1351,22 @@ def test_dspark_requires_positive_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_dspark_ancestral_draft_sampling_rejects_embedded_drafter(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type": "deepseek_v4"}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    use_rejection_sampling=True,
+                                    use_ancestral_draft_sampling=True)
+
+    with pytest.raises(ValueError, match="drafter embedded in the target"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+@pytest.mark.cpu_only
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
     """post_processor_hook + skip_tokenizer_init must fail fast.
 
@@ -1369,11 +1403,225 @@ class TestModelDefaults:
         assert "_rank_info_auth_key" not in args.model_dump(
         )["cache_transceiver_config"]
 
+    @pytest.mark.parametrize(
+        "model,sm,backend,mtp,expected_backend,expected_scratch",
+        [
+            ("gemma3", 80, None, False, "TRTLLM", False),
+            ("gemma3", 86, None, False, "TRTLLM", False),
+            ("gemma3", 89, "trtllm", False, "trtllm", False),
+            ("gemma3", 90, None, False, "TRTLLM", True),
+            ("gemma3", 100, None, False, "TRTLLM", True),
+            ("gemma3", 103, None, False, "TRTLLM", True),
+            ("gemma3", 120, None, False, "TRTLLM", False),
+            ("gemma3", 121, None, False, "TRTLLM", False),
+            ("gemma3", 100, "trtllm", False, "trtllm", True),
+            ("gemma3", 100, "FLASHINFER", False, "FLASHINFER", False),
+            ("gemma3", 100, "VANILLA", False, "VANILLA", False),
+            ("gemma4", 100, None, False, "TRTLLM", True),
+            ("gemma4", 90, None, False, "FLASHINFER", False),
+            ("gemma4", 100, "FLASHINFER", False, "FLASHINFER", False),
+            ("gemma4", 90, "TRTLLM", False, "TRTLLM", True),
+            ("gemma4", 86, "TRTLLM", False, "TRTLLM", False),
+            ("gemma4", 120, None, False, "FLASHINFER", False),
+            ("gemma4", 120, "TRTLLM", False, "TRTLLM", False),
+            ("gemma4", 100, "trtllm", False, "trtllm", True),
+            ("gemma4", 100, None, True, "FLASHINFER", False),
+            ("gemma4", 100, "TRTLLM", True, "TRTLLM", False),
+            ("gemma3_vlm", 100, None, False, "TRTLLM", False),
+            ("gemma4_vlm", 100, None, False, "TRTLLM", False),
+            ("gemma4_unified", 100, None, False, "TRTLLM", False),
+        ],
+    )
+    @pytest.mark.parametrize("kv_setting",
+                             ["omitted", "dict", "object", "opt_out"])
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
+    def test_gemma_scratch_defaults(self, monkeypatch: pytest.MonkeyPatch,
+                                    model: str, sm: int, backend: str | None,
+                                    mtp: bool, expected_backend: str,
+                                    expected_scratch: bool, kv_setting: str,
+                                    enable_block_reuse: bool) -> None:
+        from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
+        from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+        from tensorrt_llm._torch.models.modeling_gemma4_unified import \
+            Gemma4UnifiedForConditionalGeneration
+        from tensorrt_llm._torch.models.modeling_gemma4mm import \
+            Gemma4ForConditionalGeneration
+
+        model_cls = {
+            "gemma3": Gemma3ForCausalLM,
+            "gemma3_vlm": Gemma3VLM,
+            "gemma4": Gemma4ForCausalLM,
+            "gemma4_vlm": Gemma4ForConditionalGeneration,
+            "gemma4_unified": Gemma4UnifiedForConditionalGeneration,
+        }[model]
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+            lambda: sm)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+            lambda: 100 <= sm < 110)
+        kwargs = {}
+        if backend is not None:
+            kwargs["attn_backend"] = backend
+        if mtp:
+            kwargs["speculative_config"] = MTPDecodingConfig(max_draft_len=1)
+        if kv_setting != "omitted":
+            kv_config = {"enable_block_reuse": enable_block_reuse}
+            if kv_setting == "opt_out":
+                kv_config["enable_swa_scratch_reuse"] = False
+            kwargs["kv_cache_config"] = (KvCacheConfig(
+                **kv_config) if kv_setting == "object" else kv_config)
+        args = TorchLlmArgs(model="/tmp/dummy_model", **kwargs)
+        if hasattr(model_cls, "get_model_defaults"):
+            with patch("tensorrt_llm.logger.logger.info") as log_info:
+                defaults = model_cls.get_model_defaults(args)
+            log_info.assert_not_called()
+            apply_model_defaults_to_llm_args(args, defaults)
+
+        assert args.attn_backend == expected_backend
+        assert args.kv_cache_config.enable_swa_scratch_reuse == (
+            expected_scratch and kv_setting != "opt_out"
+            and not args.kv_cache_config.enable_block_reuse)
+        if kv_setting != "omitted":
+            assert args.kv_cache_config.enable_block_reuse is enable_block_reuse
+
+    @pytest.mark.parametrize("model", ["gemma3", "gemma4"])
+    @pytest.mark.parametrize("kv_setting", ["dict", "object"])
+    @pytest.mark.parametrize("enable_block_reuse", [False, True])
+    @pytest.mark.parametrize("scratch", [None, False, True])
+    def test_gemma_scratch_reuse_opt_in(self, monkeypatch: pytest.MonkeyPatch,
+                                        model: str, kv_setting: str,
+                                        enable_block_reuse: bool,
+                                        scratch: bool | None) -> None:
+        from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+            lambda: 100)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+            lambda: True)
+        kv_config = {"enable_block_reuse": enable_block_reuse}
+        if scratch is not None:
+            kv_config["enable_swa_scratch_reuse"] = scratch
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(
+                **kv_config) if kv_setting == "object" else kv_config)
+        model_cls = Gemma3ForCausalLM if model == "gemma3" else Gemma4ForCausalLM
+        with patch("tensorrt_llm.logger.logger.info") as log_info:
+            defaults = model_cls.get_model_defaults(args)
+        apply_model_defaults_to_llm_args(args, defaults)
+
+        assert args.kv_cache_config.enable_swa_scratch_reuse is (
+            not enable_block_reuse if scratch is None else scratch)
+        log_info.assert_not_called()
+
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
+
+    def test_applied_defaults_leave_other_fields_unset(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model", max_batch_size=8)
+        before = set(llm_args.model_fields_set)
+        apply_model_defaults_to_llm_args(llm_args, {
+            "enable_chunked_prefill": False,
+            "max_batch_size": 4,
+        })
+        assert llm_args.max_batch_size == 8
+        assert not llm_args.enable_chunked_prefill
+        assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
+        assert "modeling_v2" not in llm_args.model_fields_set
+
+    def test_applied_defaults_leave_nested_fields_unset(self):
+        """Nested configs keep only the fields the user set or a default applied."""
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config={"free_gpu_memory_fraction": 0.5},
+            sparse_attention_config={
+                "algorithm": "deepseek_v4",
+                "index_n_heads": 64,
+            },
+        )
+        sparse_before = set(llm_args.sparse_attention_config.model_fields_set)
+        assert "index_topk" not in sparse_before
+        scheduler_before = set(llm_args.scheduler_config.model_fields_set)
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "kv_cache_config": {
+                    "tokens_per_block": 128,
+                    "free_gpu_memory_fraction": 0.9,
+                }
+            })
+        assert llm_args.kv_cache_config.free_gpu_memory_fraction == 0.5
+        assert llm_args.kv_cache_config.tokens_per_block == 128
+        assert llm_args.kv_cache_config.model_fields_set == {
+            "free_gpu_memory_fraction", "tokens_per_block"
+        }
+        assert llm_args.sparse_attention_config.model_fields_set == sparse_before
+        assert llm_args.scheduler_config.model_fields_set == scheduler_before
+
+    def test_applied_defaults_leave_configs_in_containers_unset(self):
+        """Configs held in a dict keep only the fields the user set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                multimodal_config={
+                                    "encoder_side_stream_max_ahead": 0,
+                                    "encoder_cuda_graph": {
+                                        "image": {
+                                            "max_batch_size": 4
+                                        }
+                                    },
+                                })
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"enable_chunked_prefill": False})
+        image = llm_args.multimodal_config.encoder_cuda_graph["image"]
+        assert image.max_batch_size == 4
+        assert image.model_fields_set == {"max_batch_size"}
+
+    def test_config_object_default_keeps_its_nested_fields_set(self):
+        """A default given as a config object counts its nested fields as set."""
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        apply_model_defaults_to_llm_args(
+            llm_args, {
+                "scheduler_config":
+                SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+            })
+        scheduler_config = llm_args.scheduler_config
+        assert scheduler_config.gen_preemption.tpot_budget == 0.1
+        assert scheduler_config.model_fields_set == {"gen_preemption"}
+        assert scheduler_config.gen_preemption.model_fields_set == {
+            "tpot_budget"
+        }
+        assert llm_args.model_dump(exclude_unset=True)["scheduler_config"] == {
+            "gen_preemption": {
+                "tpot_budget": 0.1
+            }
+        }
+
+    def test_empty_nested_default_counts_as_set(self):
+        """An empty nested default still counts as set.
+
+        It constructs the config, so the field must survive
+        ``model_dump(exclude_unset=True)``.
+        """
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert llm_args.attention_dp_config is None
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {"attention_dp_config": {}}
+        assert llm_args.attention_dp_config is not None
+        assert "attention_dp_config" in llm_args.model_fields_set
+        assert "attention_dp_config" in llm_args.model_dump(exclude_unset=True)
+
+    def test_empty_nested_default_under_a_user_setting_applies_nothing(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                attention_dp_config={"enable_balance": True})
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {}
+        assert llm_args.attention_dp_config.enable_balance
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -1921,6 +2169,10 @@ def test_KvCacheConfig_declaration(offload_field):
         BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+    assert BlockReuseConfig(policy="per_conversation",
+                            drop_extended_turns=True).drop_extended_turns
+    with pytest.raises(ValidationError, match="drop_extended_turns"):
+        BlockReuseConfig(drop_extended_turns=True)
 
 
 @pytest.mark.cpu_only
@@ -6797,6 +7049,26 @@ class TestDSparkConfidenceScheduling:
         with pytest.raises(ValidationError,
                            match="confidence_min_predicted_gain"):
             self._scheduled(confidence_min_predicted_gain=-0.01)
+
+    @pytest.mark.parametrize("kw", [
+        {
+            "draft_len_schedule": {
+                4: 5,
+                8: 2
+            }
+        },
+        {
+            "max_concurrency": 8
+        },
+    ])
+    def test_scheduling_excludes_a_draft_len_schedule(self, kw):
+        with pytest.raises(ValueError,
+                           match="draft_len_schedule or max_concurrency"):
+            self._scheduled(**kw)
+
+    def test_draft_len_schedule_is_accepted_without_scheduling(self):
+        c = self._cfg(draft_len_schedule={8: 2, 4: 5})
+        assert c.draft_len_schedule == {4: 5, 8: 2}
 
     @pytest.mark.parametrize("field", [
         "validate_confidence_artifact_freshness",

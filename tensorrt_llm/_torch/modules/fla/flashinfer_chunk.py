@@ -75,7 +75,7 @@ _INDEXED_STATE_IO_MAX_SEQS = 32
 # Casting at every direct launch cost one eager copy kernel per GDN layer per
 # prefill iteration (45 launches, ~2 ms of host time on a 397B mixed iteration).
 # The metadata rewrites those buffers exactly once per iteration, in
-# Mamba2Metadata.prepare, which invalidates this cache first; within the
+# GDNMambaMetadata.prepare, which invalidates this cache first; within the
 # iteration a cast keyed by (storage, length, device) is therefore valid and
 # shared by every layer. (Inference-mode tensors carry no version counter, so
 # the invalidation is explicit rather than version-keyed.)

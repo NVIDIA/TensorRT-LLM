@@ -81,11 +81,13 @@ from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.recurrent_state_spec import RecurrentStateSpec
     from tensorrt_llm.llmapi.llm_args import (
         MultimodalConfig,
         MultimodalEncoderCudaGraphConfig,
         TorchLlmArgs,
     )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -2911,6 +2913,11 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
+
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
         super().__init__(config)
@@ -3069,6 +3076,17 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
     ) -> Literal["PYTHON"]:
         """Match the NemotronH backbone's Python disaggregated route."""
         return NemotronHForCausalLM.get_preferred_transceiver_runtime(pretrained_config)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional["QuantConfig"] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the NemotronH backbone's declaration, read from ``llm_config``."""
+        llm_config = getattr(pretrained_config, "llm_config", None) or pretrained_config
+        return NemotronHForCausalLM.get_recurrent_state_spec(llm_config, quant_config=quant_config)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine

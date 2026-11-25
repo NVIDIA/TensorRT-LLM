@@ -382,8 +382,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
                     0
                 ].disaggregated_params
-                if ctx_response_disagg_params.disagg_request_id is not None:
-                    disagg_request_id = ctx_response_disagg_params.disagg_request_id
+                effective_disagg_id = (
+                    ctx_response_disagg_params.disagg_request_id
+                    if ctx_response_disagg_params.disagg_request_id is not None
+                    else (
+                        ctx_req.disaggregated_params.disagg_request_id
+                        if ctx_req.disaggregated_params is not None
+                        else None
+                    )
+                )
+                if effective_disagg_id is not None:
+                    disagg_request_id = effective_disagg_id
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                     if reply_named:

@@ -68,6 +68,19 @@ def _device():
     return _dev_mod
 
 
+_tallws_mod = None
+
+
+def _tallws():
+    """Lazy import of the tall-batch engine module (reached only by the batches it serves)."""
+    global _tallws_mod
+    if _tallws_mod is None:
+        from . import gvr_topk_decode_tall_ws as _m
+
+        _tallws_mod = _m
+    return _tallws_mod
+
+
 _DET_SORTING = (None, "ascending")
 
 
@@ -125,6 +138,186 @@ SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
+# ---- device targets ----------------------------------------------------------
+# GVR V2 runs on Hopper (sm_90), datacenter Blackwell (sm_100, sm_103) and Rubin (sm_107): all have
+# thread-block clusters, distributed shared memory and st.async, and the device module
+# compiles for either. The dispatch reads the device as (num_sms, sm_version):
+#   - ``num_sms`` sizes the register-resident waves on every target;
+#   - ``wave_sms`` sizes decode streaming and clustered-register waves: Blackwell/Rubin use
+#     148 SMs, Hopper uses its SM count; prefill uses physical counts on Hopper/Rubin;
+#   - ``cluster_fits`` keeps clustered plans to the clusters a Hopper GPU co-schedules.
+SUPPORTED_SM_VERSIONS = (90, 100, 103, 107)
+_BLACKWELL_SM_VERSIONS = (100, 103, 107)
+_BLACKWELL_WAVE_SMS = 148
+# Targets that take the register rungs and compile options below measured on hardware
+# (tuned on datacenter Blackwell, measured on Hopper H100 and H200 SXM and H20).
+_TUNED_SM_VERSIONS = (90, 100, 103)
+
+
+def wave_sms(num_sms: int, sm_version: int) -> int:
+    """SM budget of the decode streaming and clustered-register wave arithmetic."""
+    return _BLACKWELL_WAVE_SMS if sm_version in _BLACKWELL_SM_VERSIONS else num_sms
+
+
+def _prefill_wave_sms(num_sms: int, sm_version: int) -> int:
+    """Prefill keeps Blackwell's fixed budget and uses physical SM counts on Hopper/Rubin."""
+    return _BLACKWELL_WAVE_SMS if sm_version in (100, 103) else num_sms
+
+
+# Co-resident clusters per cluster size at one CTA per SM (cudaOccupancyMaxActiveClusters), by
+# SM count: H100 and H200 SXM (132 SMs) and H20 (78 SMs). GPC floorsweeping hosts fewer clusters
+# than SMs / cluster size, and no H20 GPC holds a cluster of more than 12 CTAs. Other Hopper SM
+# counts scale the 132-SM row and keep to portable clusters, which every SM90 GPU launches.
+_HOPPER_CLUSTER_ROWS = {
+    132: {
+        2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15, 9: 9,
+        10: 7, 11: 7, 12: 7, 13: 7, 14: 7, 15: 7, 16: 7,
+    },
+    78: {
+        2: 39, 3: 18, 4: 15, 5: 10, 6: 8, 7: 7, 8: 7, 9: 3,
+        10: 3, 11: 1, 12: 1, 13: 0, 14: 0, 15: 0, 16: 0,
+    },
+}  # fmt: skip
+_HOPPER_PORTABLE_CLUSTER = 8
+
+
+def hopper_cluster_rows(cluster_size: int, num_sms: int) -> int:
+    """Clusters of ``cluster_size`` CTAs, one CTA per SM, that a Hopper GPU co-schedules."""
+    measured = _HOPPER_CLUSTER_ROWS.get(num_sms)
+    if measured is not None:
+        return measured[cluster_size]
+    if cluster_size > _HOPPER_PORTABLE_CLUSTER:
+        return 0
+    return _HOPPER_CLUSTER_ROWS[132][cluster_size] * num_sms // 132
+
+
+def cluster_fits(cluster_size: int, rows: int, num_sms: int, sm_version: int) -> bool:
+    """Whether ``rows`` clusters of ``cluster_size`` CTAs, one CTA per SM, run in one wave.
+
+    Blackwell's clustered rungs carry their own tuned row limits, so this holds there, and a
+    single CTA is no cluster.
+    """
+    if sm_version in _BLACKWELL_SM_VERSIONS or cluster_size < 2:
+        return True
+    return rows <= hopper_cluster_rows(cluster_size, num_sms)
+
+
+def _regsel_rows(dtype: torch.dtype, num_rows: int, num_sms: int) -> bool:
+    """Whether a BF16 batch reads its survivors back from the tile registers (``regsel``).
+
+    Only the 256-thread slab holds the tile that long; the 512-thread slab spends those registers
+    on its load prefetch.
+    """
+    return dtype is torch.bfloat16 and num_rows > 4 * num_sms
+
+
+# Hopper SM counts whose DRAM bandwidth per SM is close to datacenter Blackwell's: the 78-SM H20
+# streams 1.4x (H200) to 2x (H100 SXM) the DRAM bytes per SM of a 132-SM part. Its 256-thread slab
+# stays faster below 128K scores per row, and re-reading staged survivors costs it little.
+_HOPPER_BLACKWELL_BANDWIDTH_SMS = (78,)
+
+
+def _wide_slab(
+    b: int,
+    n: int,
+    k: int,
+    wave: int,
+    sm_version: int,
+    regsel: bool = False,
+    fp16: bool = False,
+) -> bool:
+    """Whether a main slab that is not ``big`` runs 512-thread CTAs (two per SM) rather than 256.
+
+    Batches of up to two waves do on every target. Hopper also streams long K <= 1024 rows of
+    taller batches with them, whose register prefetch pays off from 64K scores per row (128K on
+    the H20); at K = 1024 rows below 128K scores whose survivors are read from registers
+    (``regsel``) stay on 256 threads. FP16 K = 2048 rows take them as well: the 256-thread slab
+    stages those rows' survivors as indices and re-reads their values, which Hopper's L2 no longer
+    holds, while the 512-thread slab stages the values.
+    """
+    if b <= 2 * wave:
+        return True
+    if (
+        sm_version in _BLACKWELL_SM_VERSIONS
+        or k > (2048 if fp16 else 1024)
+        or n < (131072 if wave in _HOPPER_BLACKWELL_BANDWIDTH_SMS else 65536)
+    ):
+        return False
+    return not (regsel and k == 1024 and n < 131072)
+
+
+def _three_cta_clusters(b: int, num_sms: int, sm_version: int) -> bool:
+    """Whether ``b`` rows whose 4-CTA clusters a Hopper GPU cannot co-schedule take 3-CTA ones.
+
+    The 132-SM parts co-schedule 39 clusters of three CTAs but only 30 of four, so this holds for
+    31-39 rows there. The streaming rungs split rows over four CTAs only in batches of up to 32
+    rows, so their 31- and 32-row batches can split a row over three CTAs rather than two (each
+    rung adds its own row conditions); FP16 K=2048 code-radix clusters just above 32K and 64K
+    scores take three CTAs at 31-39 rows. The H20 keeps its 2-CTA plans.
+    """
+    return (
+        sm_version not in _BLACKWELL_SM_VERSIONS
+        and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+        and not cluster_fits(4, b, num_sms, sm_version)
+        and cluster_fits(3, b, num_sms, sm_version)
+    )
+
+
+# Tall decode batches on the 132-SM Hopper parts (H100 / H200 SXM) run the persistent
+# warp-specialized engine of ``gvr_topk_decode_tall_ws``, which streams a CTA's next row while it
+# selects the current one. A launch of R = ceil(rows / SMs) rows per CTA on G = ceil(rows / R) CTAs
+# runs it when a band (min R, min G, min n, n bound) of its (K, logits element bytes) admits it, n
+# being the envelope clamped to the row stride. Fewer CTAs stream slower than the one-row plans'
+# waves, and 16-bit rows stage so many survivors per streamed byte that they gain only on longer
+# rows or with more rows per CTA.
+_TALLWS_PROFILE = (132, 90)
+_TALLWS_BANDS = {
+    (2048, 4): ((1, 64, 32768, math.inf),),
+    (2048, 2): ((1, 128, 65536, math.inf),),
+    (1024, 4): ((1, 128, 24576, math.inf), (3, 110, 24576, math.inf)),
+    (1024, 2): ((2, 128, 98304, math.inf), (3, 110, 98304, math.inf), (4, 110, 49152, math.inf)),
+    (512, 4): ((2, 128, 24576, 196608), (3, 110, 24576, 196608)),
+    (512, 2): ((2, 128, 98304, math.inf), (3, 110, 98304, math.inf), (4, 110, 49152, math.inf)),
+}
+
+
+def _tallws_gate(
+    num_rows: int,
+    n_kernel: int,
+    k: int,
+    num_sms: int,
+    sm_version: int,
+    dtype: torch.dtype,
+    det: bool,
+) -> bool:
+    """Whether a varlen decode launch runs the tall-batch engine (``n_kernel``: the launch
+    envelope clamped to the row stride)."""
+    if (num_sms, sm_version) != _TALLWS_PROFILE or det or num_rows < 1:
+        return False
+    per_cta = -(-num_rows // num_sms)
+    grid = -(-num_rows // per_cta)
+    bands = _TALLWS_BANDS.get((k, 4 if dtype is torch.float32 else 2), ())
+    return any(per_cta >= r and grid >= g and lo <= n_kernel < hi for r, g, lo, hi in bands)
+
+
+def _even_chunk_u(vectors: int, u: int) -> int:
+    """U of a 3-CTA ``clus`` plan over rows of ``vectors`` 4-element vectors.
+
+    ``gvr_clus`` deals a row's chunks of 1024 * U vectors to the cluster ranks in turn, so with
+    three ranks one rank can stream up to 1.5x an even third of a row of three or more chunks.
+    ``u`` halves (down to 1) while the most loaded rank holds more than 5/4 of an even third. The
+    16-bit arms then halve U for their 8-element vectors, which keeps the same chunks.
+    """
+    while u > 1:
+        step = 1024 * u
+        loads = [0, 0, 0]
+        for chunk in range(-(-vectors // step)):
+            loads[chunk % 3] += min(step, vectors - chunk * step)
+        if 12 * max(loads) <= 5 * vectors:
+            break
+        u //= 2
+    return u
+
 
 def route(
     b: int,
@@ -134,34 +327,36 @@ def route(
     num_sms: int = 148,
     sm_version: int = 100,
     det: bool = False,
+    r_cap: int = 0,
 ) -> dict[str, object]:
-    """Select a kernel and launch resources from the shape and device properties."""
+    """Select a kernel and launch resources from the shape and device properties; ``r_cap`` > 0
+    caps the streaming split's CTAs per row (a split of 2..8 takes the cluster family)."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
         raise RuntimeError(f"route requires num_sms >= 1, got {num_sms}")
-    # Only the register-resident rungs scale with the available SM count. The
-    # streaming and clustered-register paths below retain their independently
-    # tuned 148/296 constants.
+    # The register-resident rungs scale with the available SM count, the streaming
+    # and clustered-register paths with the target's wave budget.
     wide = b <= num_sms
+    wave = wave_sms(num_sms, sm_version)
 
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
     QC = 160
     CURE = not (n < 2 * k and b > num_sms)
-    if not wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024:
+    if not wide and k == 2048 and sm_version in _TUNED_SM_VERSIONS and 512 < n4 <= 1024:
         CURE = True
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
     long_register = (
         not wide
-        and sm_version in (100, 103)
+        and sm_version in _TUNED_SM_VERSIONS
         and n4 > 2048
         and ((k == 2048 and n4 <= 3072) or (512 < k <= 1024 and n4 <= 5 * 512))
     )
-    short_wide = wide and k == 2048 and sm_version in (100, 103) and 512 < n4 <= 1024
+    short_wide = wide and k == 2048 and sm_version in _TUNED_SM_VERSIONS and 512 < n4 <= 1024
     NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
     if long_register or short_wide:
         NBSEL = NB
@@ -228,18 +423,18 @@ def route(
                     "ws": False,
                 }
             return _reg(1024, 1, 1, 2 * NB)
-        if sm_version in (100, 103) and k == 2048 and n4 <= 768:
+        if sm_version in _TUNED_SM_VERSIONS and k == 2048 and n4 <= 768:
             return _reg(256, 3, 4, NB)
         return _reg(512, 2, 4, NB)
 
-    if k == 1024 and b in (512, 1024) and 1024 < n4 <= 1536 and sm_version in (100, 103):
+    if k == 1024 and b in (512, 1024) and 1024 < n4 <= 1536 and sm_version in _TUNED_SM_VERSIONS:
         return _reg(256, (n4 + 255) // 256, 4, NB)
 
     # Seven/eight resident fragments use rematerialized bins in the varlen launcher.
-    if k == 1024 and b in (512, 1024) and 1536 < n4 <= 2048 and sm_version in (100, 103):
+    if k == 1024 and b in (512, 1024) and 1536 < n4 <= 2048 and sm_version in _TUNED_SM_VERSIONS:
         return _reg(256, (n4 + 255) // 256, 4, NB)
 
-    if k == 512 and sm_version in (100, 103):
+    if k == 512 and sm_version in _TUNED_SM_VERSIONS:
         if b > 6 * num_sms and 1024 < n4 <= 2560:
             if n4 <= 2048:
                 return _reg(512, (n4 + 511) // 512, 4, NB)
@@ -249,14 +444,14 @@ def route(
 
     # Wide K=2048 rows that fit one wave of register CTAs (<= 4 streaming splits).
     k2048_reg_rung = False
-    if wide and k == 2048 and sm_version in (100, 103) and n4 <= 8192:
-        streaming_splits = min(148 // b, (n4 + 1023) // 1024) if b <= 32 else 1
+    if wide and k == 2048 and sm_version in _TUNED_SM_VERSIONS and n4 <= 8192:
+        streaming_splits = min(wave // b, (n4 + 1023) // 1024) if b <= 32 else 1
         k2048_reg_rung = streaming_splits <= 4 or (b <= 16 and n == 32768)
 
     # ---- clustered register-resident path ----
     # K=2048 runs with two hint slots per thread (tuple slot KH); the one-wave rung keeps its rows.
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and (k <= BLKC or (k == 2 * BLKC and not k2048_reg_rung)):
-        av = 148 // (b if b > 0 else 1)  # truncating
+        av = wave // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
@@ -271,7 +466,7 @@ def route(
                     c <<= 1
                 if c == 8 and b > 15:  # the veto
                     continue
-                if c <= amax:
+                if c <= amax and cluster_fits(c, b, num_sms, sm_version):
                     vsel = v
                     cs = c
                     break
@@ -291,15 +486,24 @@ def route(
     # 4K < n <= 8K: select register geometry from the row count and K.
     if n4 <= 2048:
         if wide:
-            if k == 2048 and sm_version in (100, 103) and n4 <= 1536:
+            if k == 2048 and sm_version in _TUNED_SM_VERSIONS and n4 <= 1536:
                 return _reg(512, 3, 1, 2 * NB)
             return _reg(1024, 2, 1, 2 * NB)
-        sm103_large_batch_k2048 = (
-            sm_version in (100, 103) and num_sms == 148 and 512 <= b <= 1024 and k == 2048
+        # the large-batch K=2048 register rung: 148-SM Blackwell and Hopper
+        large_batch_k2048 = (
+            sm_version in _TUNED_SM_VERSIONS
+            and (num_sms == 148 or sm_version not in _BLACKWELL_SM_VERSIONS)
+            and 512 <= b <= 1024
+            and k == 2048
         )
-        if b <= 2 * num_sms or sm103_large_batch_k2048:
+        if b <= 2 * num_sms or large_batch_k2048:
             if n4 <= 1536:
-                if sm_version in (100, 103) and k == 2048 and n4 <= 1280 and b > 2 * num_sms:
+                if (
+                    sm_version in _TUNED_SM_VERSIONS
+                    and k == 2048
+                    and n4 <= 1280
+                    and b > 2 * num_sms
+                ):
                     sparse_final_slot = n4 <= 4 * 256 + 128
                     if b <= 4 * num_sms or (b > 6 * num_sms and sparse_final_slot):
                         return _reg(256, 5, 4, NB)
@@ -324,7 +528,7 @@ def route(
     # ====================== streaming / collect path ========================
     R = 1
     if b <= 32:
-        r1 = 148 // b
+        r1 = wave // b
         if r1 < 1:
             r1 = 1
         r2 = ((n >> 2) + 1023) // 1024
@@ -333,8 +537,10 @@ def route(
         R = r1 if r1 < r2 else r2
         if R < 1:
             R = 1
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
+    elif b <= wave // 2 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
         R = 2
+    if r_cap > 0 and R > r_cap:
+        R = r_cap
 
     useclus = False
     if 2 <= R <= 8 and k <= 1024:
@@ -345,10 +551,22 @@ def route(
         # register path; same veto, same b > 15 threshold.
         if p2 == 8 and b > 15:
             p2 = 4
+        while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
+            p2 >>= 1
+        # FP32 rows take 3-CTA clusters where U=8 chunks split evenly over them: sm_90a spills the
+        # U=4 builds, and the smaller-U builds of the batch-uniform deterministic arm
+        if (
+            p2 == 2
+            and R >= 3
+            and _three_cta_clusters(b, num_sms, sm_version)
+            and ((n >> 2) + 2) // 3 >= 8 * 1024
+            and _even_chunk_u(n >> 2, 8) == 8
+        ):
+            p2 = 3
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    big = b * R <= wave
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -404,8 +622,9 @@ def route(
     if useclus:
         if n > SCAP and n4s >= 4:  # QUAD override
             sel = SFAC * n // aim
-            if sel < 256:
-                sel = 256
+            sel_floor = 3072 if R == 3 else 256  # the kernel's 3-CTA sample floor
+            if sel < sel_floor:
+                sel = sel_floor
             if sel > n // 2:
                 sel = n // 2
             quads = sel >> 4
@@ -431,7 +650,9 @@ def route(
         smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        CS = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            U = _even_chunk_u(n4s, U)
+        CS = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, U, 1, SNB, CS),
@@ -454,7 +675,8 @@ def route(
             "ws": False,
         }
 
-    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
+    wide_slab = _wide_slab(b, n, k, wave, sm_version)
+    smem_main = (SCAP + 4) * (8 if (R > 1 or wide_slab) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
         # KPT ladder 1/2/4/8; grid = (R, b).
@@ -493,7 +715,7 @@ def route(
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, U, R > 1)  # SPLIT iff R>1
-    if b <= 296:
+    if wide_slab:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
@@ -569,8 +791,10 @@ def route_static(
     return st
 
 
-def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object], int]:
-    """Recompute the redacted n-continuous scalars from (static, n).
+def route_dynamic(
+    static: dict[str, object], n: int, wave: int = _BLACKWELL_WAVE_SMS
+) -> tuple[dict[str, object], int]:
+    """Recompute the redacted n-continuous scalars from (static, n) for wave budget ``wave``.
     Returns (rt_updates, smem). Must stay equivalent to route(); the
     device-side per-row engine mirrors exactly these formulas."""
     fam = static["kernel"]
@@ -596,7 +820,7 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     else:
         R = static["rt"]["R"]
         scap = static["rt"]["SCAP_"]
-    big = b * R <= 148
+    big = b * R <= wave
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
@@ -631,7 +855,8 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     q_ = (n4s + R - 1) // R
     if fam == "clus" and n > scap and n4s >= 4:
         sel = sfac * n // aim
-        sel = 256 if sel < 256 else sel
+        sel_floor = 3072 if R == 3 else 256
+        sel = sel_floor if sel < sel_floor else sel
         sel = n // 2 if sel > n // 2 else sel
         quads = max(sel >> 4, 1)
         quarter = max(n4s >> 2, 1)
@@ -657,7 +882,7 @@ def route_split(
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
     st = route_static(b, n, npad, k, num_sms, sm_version)
-    dyn, smem = route_dynamic(st, n)
+    dyn, smem = route_dynamic(st, n, wave_sms(num_sms, sm_version))
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
     plan["smem"] = smem
@@ -665,7 +890,17 @@ def route_split(
 
 
 def route_streaming(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    force_main: bool = False,
+    num_sms: int = 148,
+    sm_version: int = 100,
+    regsel: bool = False,
+    fp16: bool = False,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -673,15 +908,18 @@ def route_streaming(
     skipped even when the envelope n would normally land on them.  Where
     route() itself lands on main/clus this is IDENTICAL to route().
     force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    min(r1, r2) R matches the CUDA else-branch exactly. regsel: the rows read
+    their survivors back from registers (BF16, see ``_regsel_rows``). fp16: FP16
+    logits (their K = 2048 rows take Hopper's 512-thread slab, see ``_wide_slab``)."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
     R = 1
     if b <= 32:
-        r1 = max(148 // b, 1)
+        r1 = max(wave // b, 1)
         r2 = max(((n >> 2) + 1023) // 1024, 1)
         R = max(min(r1, r2), 1)
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:
+    elif b <= wave // 2 and (n >> 2) >= 16384 and k <= 1024:
         R = 2
     useclus = False
     if not force_main and 2 <= R <= 8 and k <= 1024:
@@ -690,9 +928,21 @@ def route_streaming(
             p2 <<= 1
         if p2 == 8 and b > 15:
             p2 = 4
+        while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
+            p2 >>= 1
+        # FP32 rows take 3-CTA clusters where U=8 chunks split evenly over them: sm_90a spills the
+        # U=4 builds, and the smaller-U builds of the batch-uniform deterministic arm
+        if (
+            p2 == 2
+            and R >= 3
+            and _three_cta_clusters(b, num_sms, sm_version)
+            and ((n >> 2) + 2) // 3 >= 8 * 1024
+            and _even_chunk_u(n >> 2, 8) == 8
+        ):
+            p2 = 3
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = b * R <= wave
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -725,7 +975,7 @@ def route_streaming(
     q_ = (n4s + R - 1) // R
     if useclus:
         if n > scap and n4s >= 4:
-            sel = min(max(sfac * n // aim, 256), n // 2)
+            sel = min(max(sfac * n // aim, 3072 if R == 3 else 256), n // 2)
             quads = min(max(sel >> 4, 1), max(n4s >> 2, 1))
             quarter = max(n4s >> 2, 1)
             ss2 = max(quarter // quads, 1)
@@ -735,7 +985,9 @@ def route_streaming(
         smc = SNB * 8 + (scap + 4) * 8 + cmp_ * 8
         per = q_ >> 10
         u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        cs = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            u_ = _even_chunk_u(n4s, u_)
+        cs = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, u_, 1, SNB, cs),
@@ -757,7 +1009,8 @@ def route_streaming(
             "smem": smc,
             "ws": False,
         }
-    smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
+    wide_slab = _wide_slab(b, n, k, wave, sm_version, regsel, fp16)
+    smem_main = (scap + 4) * (8 if (R > 1 or wide_slab) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
         kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
@@ -789,7 +1042,7 @@ def route_streaming(
         per = q_ >> 10
         u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, u_, R > 1)
-    if b <= 296:
+    if wide_slab:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
@@ -859,10 +1112,10 @@ def _route_table_16bit(
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
         raise RuntimeError(f"route requires num_sms >= 1, got {num_sms}")
-    # Only the register-resident rungs scale with the available SM count. The
-    # streaming and clustered-register paths below retain their independently
-    # tuned 148/296 constants.
+    # The register-resident rungs scale with the available SM count, the streaming
+    # and clustered-register paths with the target's wave budget.
     wide = b <= num_sms
+    wave = wave_sms(num_sms, sm_version)
 
     # ======================= register-resident block ========================
     n4 = n >> 2
@@ -939,7 +1192,7 @@ def _route_table_16bit(
 
     # ---- clustered register-resident path ----
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
-        av = 148 // (b if b > 0 else 1)  # truncating
+        av = wave // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
@@ -954,7 +1207,7 @@ def _route_table_16bit(
                     c <<= 1
                 if c == 8 and b > 15:  # the veto
                     continue
-                if c <= amax:
+                if c <= amax and cluster_fits(c, b, num_sms, sm_version):
                     vsel = v
                     cs = c
                     break
@@ -992,7 +1245,7 @@ def _route_table_16bit(
     # ====================== streaming / collect path ========================
     R = 1
     if b <= 32:
-        r1 = 148 // b
+        r1 = wave // b
         if r1 < 1:
             r1 = 1
         r2 = ((n >> 2) + 1023) // 1024
@@ -1001,7 +1254,7 @@ def _route_table_16bit(
         R = r1 if r1 < r2 else r2
         if R < 1:
             R = 1
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
+    elif b <= wave // 2 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
         R = 2
 
     useclus = False
@@ -1013,10 +1266,15 @@ def _route_table_16bit(
         # register path; same veto, same b > 15 threshold.
         if p2 == 8 and b > 15:
             p2 = 4
+        while p2 > 2 and not cluster_fits(p2, b, num_sms, sm_version):
+            p2 >>= 1
+        if p2 == 2 and R >= 3 and _three_cta_clusters(b, num_sms, sm_version) and n > 3 * 65536:
+            # rows of more than 192K scores: each of the three ranks still streams 64K or more
+            p2 = 3
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    big = b * R <= wave
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -1072,8 +1330,9 @@ def _route_table_16bit(
     if useclus:
         if n > SCAP and n4s >= 4:  # QUAD override
             sel = SFAC * n // aim
-            if sel < 256:
-                sel = 256
+            sel_floor = 3072 if R == 3 else 256  # the kernel's 3-CTA sample floor
+            if sel < sel_floor:
+                sel = sel_floor
             if sel > n // 2:
                 sel = n // 2
             quads = sel >> 4
@@ -1099,7 +1358,9 @@ def _route_table_16bit(
         smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
-        CS = 2 if R == 2 else (4 if R == 4 else 8)
+        if R == 3:
+            U = _even_chunk_u(n4s, U)
+        CS = R if R in (2, 3, 4) else 8
         return {
             "kernel": "clus",
             "tpl": (1024, U, 1, SNB, CS),
@@ -1122,7 +1383,8 @@ def _route_table_16bit(
             "ws": False,
         }
 
-    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
+    wide_slab = _wide_slab(b, n, k, wave, sm_version)
+    smem_main = (SCAP + 4) * (8 if (R > 1 or wide_slab) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
         # KPT ladder 1/2/4/8; grid = (R, b).
@@ -1161,13 +1423,20 @@ def _route_table_16bit(
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, U, R > 1)  # SPLIT iff R>1
-    if b <= 296:
+    if wide_slab:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
 
 def _route_override_16bit(
-    b: int, n: int, npad: int, k: int, kernel: str, dtype: torch.dtype
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    kernel: str,
+    dtype: torch.dtype,
+    num_sms: int = 148,
+    sm_version: int = 100,
 ) -> dict | None:
     """Shape-specific 16-bit plan that replaces the table plan of family ``kernel``; None keeps it.
 
@@ -1184,7 +1453,7 @@ def _route_override_16bit(
         elif bf16 and k in (512, 1024) and 131000 < n <= 131100 and b == 16:
             # needs the single-code window: linear bins lose on this geometry
             cluster = (4, 4, True)
-        if cluster is not None:
+        if cluster is not None and cluster_fits(cluster[1], b, num_sms, sm_version):
             vpt, cs, window = cluster
             return {
                 "kernel": "reg_clus",
@@ -1226,8 +1495,10 @@ def _route_override_16bit(
     }
 
 
-def _clus_plan_bf16(b: int, n: int, npad: int, k: int, R: int) -> dict:
-    big = b * R <= 148
+def _clus_plan_bf16(
+    b: int, n: int, npad: int, k: int, R: int, wave: int = _BLACKWELL_WAVE_SMS
+) -> dict:
+    big = b * R <= wave
     scap = 8192 if big else 4096
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = 2 * k if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
@@ -1250,6 +1521,8 @@ def _clus_plan_bf16(b: int, n: int, npad: int, k: int, R: int) -> dict:
     q_ = (n4s + R - 1) // R
     per = q_ >> 10
     u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+    if R == 3:
+        u_ = _even_chunk_u(n4s, u_)
     return {
         "kernel": "clus",
         "tpl": (1024, u_, 1, SNB, R),
@@ -1289,7 +1562,14 @@ def _route_16bit(
     replace it, and the remaining 16-bit adjustments (16-byte-vector U halving, register capacity
     fitting, histogram bin counts) edit it in place. Rules that differ by dtype test ``dtype``.
     """
-    if dtype is torch.float16 and k == 2048 and 32768 < n <= 32768 + 64 and 32 < b <= 64:
+    wave = wave_sms(num_sms, sm_version)
+    if (
+        dtype is torch.float16
+        and k == 2048
+        and 32768 < n <= 32768 + 64
+        and 32 < b <= 64
+        and cluster_fits(2, b, num_sms, sm_version)
+    ):
         return {
             "kernel": "reg_clus",
             "tpl": (BLKC, 2, 2, k),
@@ -1300,7 +1580,13 @@ def _route_16bit(
             "smem": (3 * NB + 2 * CMPC) * 4,
             "ws": False,
         }
-    if dtype is torch.float16 and k == 2048 and 163000 < n <= 164000 and b <= 8:
+    if (
+        dtype is torch.float16
+        and k == 2048
+        and 163000 < n <= 164000
+        and b <= 8
+        and cluster_fits(10, b, num_sms, sm_version)
+    ):
         return {
             "kernel": "reg_clus",
             "tpl": (BLKC, 2, 10, k),
@@ -1311,7 +1597,7 @@ def _route_16bit(
             "smem": (3 * NB + 2 * CMPC) * 4,
             "ws": False,
         }
-    if dtype is torch.float16 and k == 2048 and 16384 < n <= 16448 and b <= 148:
+    if dtype is torch.float16 and k == 2048 and 16384 < n <= 16448 and b <= wave:
         cmp_r = n
         tpl = (512, 8, 1, 4, True, False, False, 1024)
         return {
@@ -1333,22 +1619,27 @@ def _route_16bit(
             and k in (512, 1024)
             and n >= 196608
             and b == 8
+            and cluster_fits(8, b, num_sms, sm_version)
         ):
-            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 8), b, n, k)
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 8, wave), b, n, k)
         if (
-            b == 16 and ((k == 512 and n >= 196608) or (k in (512, 1024) and 131070 < n <= 131080))
-        ) or (b in (8, 16) and k == 1024 and n >= 196608):
-            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4), b, n, k)
-        if k == 2048 and b in (16, 32) and n >= 163000:
-            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4), b, n, k)
-    override = _route_override_16bit(b, n, npad, k, plan["kernel"], dtype)
+            (
+                b == 16
+                and ((k == 512 and n >= 196608) or (k in (512, 1024) and 131070 < n <= 131080))
+            )
+            or (b in (8, 16) and k == 1024 and n >= 196608)
+        ) and cluster_fits(4, b, num_sms, sm_version):
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4, wave), b, n, k)
+        if k == 2048 and b in (16, 32) and n >= 163000 and cluster_fits(4, b, num_sms, sm_version):
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4, wave), b, n, k)
+    override = _route_override_16bit(b, n, npad, k, plan["kernel"], dtype, num_sms, sm_version)
     if override is not None:
         return override
-    if plan["kernel"] in ("reg", "regimg") and k == 512 and (n <= 1280) and (b > 148):
+    if plan["kernel"] in ("reg", "regimg") and k == 512 and (n <= 1280) and (b > wave):
         plan["tpl"] = (256, 1, 8, 1, True, True, False, 512)
         plan["block"] = 256
     pk16 = npad <= 65536 and n <= 65536 and (b > 15)
-    if plan["kernel"] == "main" and (not plan["tpl"][5]) and (b > 148):
+    if plan["kernel"] == "main" and (not plan["tpl"][5]) and (b > wave):
         n4q = n >> 2
         if 1152 < n4q <= 3072 and (
             b <= 256
@@ -1361,7 +1652,7 @@ def _route_16bit(
             # kernel's block64 sampling pays off only on the K <= 1024 rows there)
             CMP = n if n < 2560 else 2560
             QC = 160  # route's register-plan rank gate
-            CURE = not (n < 2 * k and b > 148)
+            CURE = not (n < 2 * k and b > wave)
             vptx = (n4q + 511) // 512
             kpt = 1 if k <= 512 else 2
             nbins = 2048 if n4q > 2048 else 1024  # FP32's NBSEL for the not-wide register plans
@@ -1389,7 +1680,7 @@ def _route_16bit(
         if 1024 < n4q <= 1152:
             CMP = n if n < 2560 else 2560
             QC = 160  # route's register-plan rank gate
-            CURE = not (n < 2 * k and b > 148)
+            CURE = not (n < 2 * k and b > wave)
             DEGE = n <= 3 * k or n <= 4 * k + 64
             if DEGE and CMP < n:
                 CMP = n
@@ -1410,7 +1701,7 @@ def _route_16bit(
             else:
                 kpt = 1 if k <= 512 else 2
                 tpl = (512, vptx, 4, kpt, CURE, False, False, 512)
-            if b > 296 and 2 * vptx <= 4 and (k <= 1024):
+            if b > 2 * wave and 2 * vptx <= 4 and (k <= 1024):
                 tpl = (256, 2 * vptx, 8) + tuple(tpl[3:])
             return {
                 "kernel": "reg",
@@ -1425,7 +1716,7 @@ def _route_16bit(
             }
     if (
         plan["kernel"] == "main"
-        and b <= 148
+        and b <= wave
         and (1024 * 4 * 4 + 1024 >= n)
         and (n >> 2 > 1152)
         and (not (b <= 2 and k > BLKC and (2 * BLKC * 8 + BLKC >= n)))
@@ -1433,7 +1724,7 @@ def _route_16bit(
         n4q = n >> 2
         CMP = n if n < 2560 else 2560
         QC = 160  # route's register-plan rank gate
-        CURE = not (n < 2 * k and b > 148)
+        CURE = not (n < 2 * k and b > wave)
         DEGE = n <= 3 * k or n <= 4 * k + 64
         if DEGE and CMP < n:
             CMP = n
@@ -1454,7 +1745,7 @@ def _route_16bit(
             "ws": False,
         }
     if plan["kernel"] == "main" and plan["tpl"][5] and (b <= 32) and (k <= 2 * BLKC):
-        av = 148 // (b if b > 0 else 1)
+        av = wave // (b if b > 0 else 1)
         amax = 1
         while amax << 1 <= av and amax < 16:
             amax <<= 1
@@ -1471,10 +1762,22 @@ def _route_16bit(
                     continue
                 if c >= 16 and n >= 131072 and (b >= 8):
                     continue
-                if c <= amax:
+                if c <= amax and cluster_fits(c, b, num_sms, sm_version):
                     vsel = v
                     cs = c
                     break
+                if dtype is torch.bfloat16 and v == 2 and 8 <= c <= amax:
+                    # A Hopper GPU that does not co-schedule these clusters (H20: 8 rows of 8 CTAs,
+                    # any 16-CTA cluster): K=2048 rows take twice the vectors on half the CTAs,
+                    # K <= 1024 rows stream through 4-CTA clusters; both beat the split main slab
+                    if k == 2048 and cluster_fits(c // 2, b, num_sms, sm_version):
+                        vsel = 4
+                        cs = c // 2
+                        break
+                    if k <= 1024 and cluster_fits(4, b, num_sms, sm_version):
+                        return _halve_u_streaming_16bit(
+                            _clus_plan_bf16(b, n, npad, k, 4, wave), b, n, k
+                        )
         if vsel and cs >= 2:
             return {
                 "kernel": "reg_clus",
@@ -1486,10 +1789,21 @@ def _route_16bit(
                 "smem": (3 * NB + 2 * CMPC) * 4,
                 "ws": False,
             }
+        if (
+            k == 2048
+            and n <= 262144
+            and sm_version not in _BLACKWELL_SM_VERSIONS
+            and not cluster_fits(4, b, num_sms, sm_version)
+            and cluster_fits(2, b, num_sms, sm_version)
+        ):
+            # Hopper K=2048 rows whose 4-CTA clusters do not co-reside (32 rows) stream through
+            # 3-CTA clusters where those co-reside, else 2-CTA ones; both beat the split main slab
+            ranks = 3 if _three_cta_clusters(b, num_sms, sm_version) else 2
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, ranks, wave), b, n, k)
     if plan["kernel"] in ("main", "clus"):
         plan = _halve_u_streaming_16bit(plan, b, n, k)
     elif plan["kernel"] == "reg_clus":
-        av = 148 // (b if b > 0 else 1)
+        av = wave // (b if b > 0 else 1)
         amax = 1
         while amax << 1 <= av and amax < 8:
             amax <<= 1
@@ -1502,7 +1816,7 @@ def _route_16bit(
                     c <<= 1
                 if c == 8 and b > 15:
                     continue
-                if c <= amax:
+                if c <= amax and cluster_fits(c, b, num_sms, sm_version):
                     vsel = v
                     cs = c
                     break
@@ -1533,7 +1847,10 @@ def _route_16bit(
         elif tpl[7] > target_nbh:
             tpl[7] = target_nbh
         if (
-            (b > 296 or (dtype is torch.bfloat16 and b > 148 and not (k == 1024 and tpl[1] == 2)))
+            (
+                b > 2 * wave
+                or (dtype is torch.bfloat16 and b > wave and not (k == 1024 and tpl[1] == 2))
+            )
             and k <= 1024
             and (tpl[0] == 512)
             and (tpl[2] == 4)
@@ -1599,16 +1916,34 @@ def _route_streaming_16bit(
     k: int,
     force_main: bool = False,
     dtype: torch.dtype = torch.bfloat16,
+    num_sms: int = 148,
+    sm_version: int = 100,
+    *,
+    wave_budget: int | None = None,
 ) -> dict[str, object]:
     """16-bit form of ``route_streaming``.
 
-    ``dtype`` is accepted for call-site parity and no rule reads it. Adjusts the FP32 streaming
-    plan's block size, split count, vector width and U for 16-bit vectors. A 16-byte tile spans
-    BLK*8 elements and cannot shrink below U == 1, so for K != 2048 a split main plan at U == 1
-    (n >= 16384, b*R < 148) whose chunk fills less than 3/4 of that tile takes the 8-byte-vector
-    engine (``vec4``: FP32 tile geometry, all threads active).
+    Adjusts the FP32 streaming plan's block size, split count, vector width and U for 16-bit
+    vectors; ``dtype`` only marks the BF16 batches that read their survivors from registers
+    (``_regsel_rows``), which picks their slab. A 16-byte tile spans BLK*8 elements and cannot
+    shrink below U == 1, so for K != 2048 a split main plan at U == 1 (n >= 16384, b*R < wave)
+    whose chunk fills less than 3/4 of that tile takes the 8-byte-vector engine (``vec4``: FP32
+    tile geometry, all threads active).
     """
-    plan = route_streaming(b, n, npad, k, force_main=force_main)
+    wave = wave_sms(num_sms, sm_version) if wave_budget is None else wave_budget
+    regsel = _regsel_rows(dtype, b, num_sms)
+    plan = route_streaming(
+        b,
+        n,
+        npad,
+        k,
+        force_main,
+        num_sms,
+        sm_version,
+        regsel,
+        dtype is torch.float16,
+        wave_budget=wave,
+    )
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
         if (
@@ -1622,7 +1957,7 @@ def _route_streaming_16bit(
             r512 = ((n >> 2) + 511) // 512
             kpt = 1 if k <= 512 else 2 if k <= 1024 else 4
             g1_ok = k < 1024 or _degen_gate_ok(int(tpl[0]), int(tpl[4]), 512, kpt)
-            if r512 > int(plan["rt"]["R"]) and b * r512 <= 148 and g1_ok:
+            if r512 > int(plan["rt"]["R"]) and b * r512 <= wave and g1_ok:
                 tpl = (512, 1, 1, tpl[3], kpt, True, tpl[6])
                 plan["tpl"] = tpl
                 plan["grid"] = (r512, b)
@@ -1637,10 +1972,10 @@ def _route_streaming_16bit(
             and (int(tpl[1]) == 1)
             and ("rt" in plan)
             and (int(plan["rt"].get("R", 1)) > 1)
-            and (b * int(plan["rt"].get("R", 1)) >= 148)
+            and (b * int(plan["rt"].get("R", 1)) >= wave)
             and ((n + int(plan["rt"]["R"]) - 1) // int(plan["rt"]["R"]) < 6144)
         ):
-            r1_8 = max(148 // b, 1)
+            r1_8 = max(wave // b, 1)
             r2_8 = max(((n >> 3) + 1023) // 1024, 1)
             r_n8 = max(min(r1_8, r2_8), 1)
             if r_n8 > 1 and r_n8 != int(plan["rt"]["R"]):
@@ -1663,7 +1998,7 @@ def _route_streaming_16bit(
             and (n >= 16384)
             and ("rt" in plan)
             and (int(plan["rt"].get("R", 1)) > 1)
-            and (b * int(plan["rt"].get("R", 1)) < 148)
+            and (b * int(plan["rt"].get("R", 1)) < wave)
         ):
             r_const = int(plan["rt"]["R"])
             chunk = (n + r_const - 1) // r_const
@@ -1735,29 +2070,33 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
     return _VARLEN_CACHE
 
 
-# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows whose plan is the
-# non-split gvr_main with 512-thread CTAs (two per SM) run it as one 1,024-thread CTA per row: twice
-# the loads in flight per row, so the batch's longest rows finish sooner. Same exact Top-K.
+# With wide_cta_rows (caller opt-in), varlen decode batches of this many rows can run the
+# non-split gvr_main as one 1,024-thread CTA per row: twice the loads in flight per row.
+# Rubin's shorter envelopes retain the sampling slab. Same exact Top-K.
 _WIDE_CTA_ROWS = (149, 296)
 
 
-def _varlen_key_flags(det: bool, wide_cta_rows: bool) -> tuple:
+def _varlen_key_flags(det: bool, wide_cta_rows: bool, pdl: bool = False, r_cap: int = 0) -> tuple:
     """``_VARLEN_CACHE`` key suffix of the opt-in launch flags (empty for the default launch)."""
-    return ((True,) if det else ()) + (("wide_cta_rows",) if wide_cta_rows else ())
+    return (
+        ((True,) if det else ())
+        + (("wide_cta_rows",) if wide_cta_rows else ())
+        + (("pdl",) if pdl else ())
+        + ((("r_cap", r_cap),) if r_cap else ())
+    )
 
 
 # ---- prefill launcher cache ------------------------------------------------
-# Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
-# launcher depends only on the row tier, k, the envelope bucket, the dtype and (16-bit
-# tier 2) whether npad fits 16-bit indices — never on the exact row count or npad — so
-# the cache stays bounded on a long-running server.
+# Prefill forces R==1 (route_streaming gives R>1 only for b <= wave / 2). The compiled
+# launcher depends only on the row tier, k, the envelope bucket, the dtype, (16-bit
+# tier 2) whether npad fits 16-bit indices and the device wave budget — never on the
+# exact row count or npad — so the cache stays bounded on a long-running server.
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
-_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
 # The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
 # gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
 # path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
-# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+# 8192 for k > 1024); launches of at most ``wave`` rows take it when the envelope is above
 # that gate by a margin (just above the gate the freshly sampling BLK=512 plan
 # is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
 # (above that the BLK=1024 plan samples too and is the better slab).
@@ -1775,8 +2114,13 @@ def _prefill_scpb_tier1(k: int) -> int:
     return 8192 if k > 1024 else 4096
 
 
-def _prefill_tier(rows: int, n_env: int, k: int) -> int:
-    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+def _prefill_tier_rows(wave: int) -> tuple[int, int, int]:
+    """Representative row counts of the prefill tiers (rows <= wave, <= 2 * wave, above)."""
+    return (wave // 2 + 1, wave + 1, 2 * wave + 1)
+
+
+def _prefill_tier(rows: int, n_env: int, k: int, wave: int = _BLACKWELL_WAVE_SMS) -> int:
+    tier = 0 if rows <= wave else 1 if rows <= 2 * wave else 2
     if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
         tier = 1
     return tier
@@ -1793,7 +2137,13 @@ def _prefill_v16(tier: int, dtype: torch.dtype, npad: int) -> bool:
 
 
 def _prefill_cache_key(
-    tier: int, k: int, n_bucket: int, dtype_tag: str = "f32", det: bool = False, v16: bool = False
+    tier: int,
+    k: int,
+    n_bucket: int,
+    dtype_tag: str = "f32",
+    det: bool = False,
+    v16: bool = False,
+    wave: int = _BLACKWELL_WAVE_SMS,
 ):
     # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
     # to one key so warmup covers them with a single launch.
@@ -1801,6 +2151,7 @@ def _prefill_cache_key(
         (tier, k, n_bucket if tier == 0 else 0, dtype_tag)
         + ((True,) if det else ())
         + (("v16",) if v16 else ())
+        + ((("wave", wave),) if wave != _BLACKWELL_WAVE_SMS else ())
     )
 
 
@@ -1811,6 +2162,8 @@ def _prefill_launcher(
     dtype: torch.dtype = torch.float32,
     det: bool = False,
     v16: bool = False,
+    num_sms: int = 148,
+    sm_version: int = 100,
 ) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
@@ -1822,16 +2175,29 @@ def _prefill_launcher(
     low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det, v16)
+    wave = _prefill_wave_sms(num_sms, sm_version)
+    key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det, v16, wave)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
-    b_route = _PREFILL_TIER_ROWS[tier]
+    b_route = _prefill_tier_rows(wave)[tier]
     n_route = max(n_bucket, k + 1)
     if low:
-        plan = _route_streaming_16bit(b_route, n_route, n_route, k, force_main=True, dtype=dtype)
+        plan = _route_streaming_16bit(
+            b_route,
+            n_route,
+            n_route,
+            k,
+            True,
+            dtype,
+            num_sms,
+            sm_version,
+            wave_budget=wave,
+        )
     else:
-        plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+        plan = route_streaming(
+            b_route, n_route, n_route, k, True, num_sms, sm_version, wave_budget=wave
+        )
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -1908,13 +2274,13 @@ def _main_env_samples(n, k, aim_base, sfac, amin, sd_en, scpb, r_const):
     return smp, tgt, ss2, tgt2
 
 
-def _clus_env_samples(n, k, cs, num_rows, scap, floor):
+def _clus_env_samples(n, k, cs, num_rows, scap, floor, wave=_BLACKWELL_WAVE_SMS):
     """Sampling schedule the clus kernel derives for a row of exactly n valid columns."""
     x6 = 6 * n
     ri = math.isqrt(x6)
     r6 = ri + 1 if x6 - ri * ri > ri else ri
     aim = 2 * k
-    if num_rows * cs > 148:
+    if num_rows * cs > wave:
         aim = (11 * k) >> 3 if k >= 1024 else (3 * k) >> 1
     aim = max(aim, r6)
     amin = 3 * k if cs == 2 else (7 * k) >> 1
@@ -1940,7 +2306,9 @@ def _clus_env_samples(n, k, cs, num_rows, scap, floor):
     return smp, tgt, ss2, tgt2
 
 
-def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None) -> bool:
+def _reg_code_radix(
+    k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None, wave: int = _BLACKWELL_WAVE_SMS
+) -> bool:
     """Code-radix choice for a 16-bit register plan, before the launcher's per-dtype overrides.
 
     ``_REG_CODE_RADIX_FORCE`` True forces it onto register plans with VPT <= 8; False, or clearing
@@ -1952,7 +2320,7 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
     if _REG_CODE_RADIX_FORCE is True:
         return plan["kernel"] in ("reg", "regimg") and plan["tpl"][1] <= 8
     if dtype is not torch.float16:
-        return _reg_code_radix_base(k, n_kernel, num_rows, plan)
+        return _reg_code_radix_base(k, n_kernel, num_rows, plan, wave)
     if (
         dtype is torch.float16
         and plan["kernel"] in ("reg", "regimg")
@@ -1960,7 +2328,7 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
         and 1280 < n_kernel <= 8207
         and plan["tpl"][1] <= 8
         and plan["tpl"][7] >= 1024
-        and not (k == 1024 and n_kernel <= 2 * k + 64 and num_rows <= 148)
+        and not (k == 1024 and n_kernel <= 2 * k + 64 and num_rows <= wave)
     ):
         return True
     if (
@@ -1968,7 +2336,7 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
         and plan["kernel"] in ("reg", "regimg")
         and k == 1024
         and 16000 < n_kernel <= 16400
-        and num_rows <= 148
+        and num_rows <= wave
         and plan["tpl"][1] <= 8
         and plan["tpl"][7] >= 1024
     ):
@@ -1978,7 +2346,7 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
         and plan["kernel"] in ("reg", "regimg")
         and k == 1024
         and 2048 < n_kernel <= 2 * k + 64
-        and num_rows <= 148
+        and num_rows <= wave
         and plan["tpl"][1] <= 8
         and plan["tpl"][7] >= 1024
     ):
@@ -1988,7 +2356,7 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
         and plan["kernel"] == "reg"
         and k == 2048
         and 16384 < n_kernel <= 16448
-        and num_rows <= 148
+        and num_rows <= wave
     ):
         return True
     if (
@@ -1996,25 +2364,27 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
         and plan["kernel"] in ("reg", "regimg")
         and k == 512
         and 16384 < n_kernel <= 16448
-        and num_rows <= 148
+        and num_rows <= wave
         and plan["tpl"][1] <= 8
         and plan["tpl"][7] >= 1024
     ):
         return True
-    return _reg_code_radix_base(k, n_kernel, num_rows, plan)
+    return _reg_code_radix_base(k, n_kernel, num_rows, plan, wave)
 
 
-def _reg_code_radix_base(k: int, n_kernel: int, num_rows: int, plan: dict) -> bool:
+def _reg_code_radix_base(
+    k: int, n_kernel: int, num_rows: int, plan: dict, wave: int = _BLACKWELL_WAVE_SMS
+) -> bool:
     """Base code-radix rule for a 16-bit register plan (geometry only, so capture-stable).
 
     True for K=512 rows with N <= 1280, or N <= 2051 at >= 512 rows, and for K=2048 rows with
-    N <= 8207 at <= 148 rows; False for other plans and while ``_REG_CODE_RADIX_16BIT`` is off.
+    N <= 8207 at <= ``wave`` rows; False for other plans and while ``_REG_CODE_RADIX_16BIT`` is off.
     """
     if not _REG_CODE_RADIX_16BIT or plan["kernel"] not in ("reg", "regimg"):
         return False
     if k == 512:
         return n_kernel <= 1280 or (n_kernel <= 2051 and num_rows >= 512)
-    return k == 2048 and num_rows <= 148 and n_kernel <= 8207
+    return k == 2048 and num_rows <= wave and n_kernel <= 8207
 
 
 def _main_samp_rounds_fp16(n, k, blk, kpt, split, r_const, aim_base, sfac, amin, sd_en):
@@ -2050,62 +2420,80 @@ def _main_samp_rounds_fp16(n, k, blk, kpt, split, r_const, aim_base, sfac, amin,
     return min(rounds, 4) if rounds >= 2 else 0
 
 
-def _code_radix_cluster_plan_fp16(k: int, n_kernel: int, num_rows: int, num_sms: int):
-    """FP16 cluster code-radix geometry ``(blk, vpt, cluster_size, candidate_list)``, or None.
+def _code_radix_cluster_plans_fp16(
+    k: int, n_kernel: int, num_rows: int, num_sms: int, sm_version: int = 100
+):
+    """FP16 cluster code-radix geometries, preferred first.
 
-    Only envelopes just above 8K, 16K, 32K, 64K and 128K, or just below 160K and 256K, have one;
-    the choice depends on K and on how many rows fit the SMs.
+    Each is ``(blk, vpt, cluster_size, candidate_list)``. Only envelopes just above 8K, 16K, 32K,
+    64K and 128K, or just below 160K and 256K, have any; the choice depends on K and on how many
+    rows fit the SMs (Hopper rows of 3-CTA clusters: ``_three_cta_clusters``).
     """
     if 8192 < n_kernel <= 8192 + 64 and (
         (k == 512 and num_rows <= 32) or (k == 2048 and num_rows <= 2)
     ):
-        return (256, 2, 4, False)
+        yield (256, 2, 4, False)
     if k == 1024 and 8192 < n_kernel <= 8192 + 64:
         if num_rows * 4 <= num_sms:
-            return (256, 2, 4, False)
+            yield (256, 2, 4, False)
         if num_rows * 2 <= num_sms:
-            return (512, 2, 2, False)
+            yield (512, 2, 2, False)
     if 16384 < n_kernel <= 16384 + 512:
         if num_rows <= 8:
-            return (256, 2, 8, False)
+            yield (256, 2, 8, False)
         if num_rows * 4 <= num_sms:
-            return (512, 2, 4, False)
+            yield (512, 2, 4, False)
         if num_rows * 2 <= num_sms and k <= 1024:
-            return (512, 4, 2, False)
+            yield (512, 4, 2, False)
     if 32768 < n_kernel <= 32768 + 512:
         if num_rows <= 8:
-            return (512, 2, 8, False)
+            yield (512, 2, 8, False)
         if num_rows * 4 <= num_sms:
-            return (512, 4, 4, False)
+            yield (512, 4, 4, False)
         if k <= 1024 and num_rows * 2 <= num_sms:
-            return (512, 8, 2, True)
+            yield (512, 8, 2, True)
+        if k == 2048 and _three_cta_clusters(num_rows, num_sms, sm_version):
+            yield (1024, 3, 3, True)
     if 65536 < n_kernel <= 65536 + 512:
         if num_rows <= 8 or (k == 2048 and num_rows <= 18):
-            return (512, 4, 8, True)
+            yield (512, 4, 8, True)
         if num_rows * 4 <= num_sms:
-            if k <= 1024:
-                return (512, 8, 4, True)
-            return (1024, 4, 4, True)
+            yield (512, 8, 4, True) if k <= 1024 else (1024, 4, 4, True)
         if num_rows <= 64:
-            return (512, 8, 4, True)
+            yield (512, 8, 4, True)
+        if k == 2048 and _three_cta_clusters(num_rows, num_sms, sm_version):
+            yield (1024, 6, 3, True)
         if num_rows * 2 <= num_sms:
-            return (1024, 8, 2, True)
+            yield (1024, 8, 2, True)
     if 131072 < n_kernel <= 131072 + 512:
         if num_rows <= 8:
-            return (512, 8, 8, True)
+            yield (512, 8, 8, True)
         if num_rows * 4 <= num_sms:
-            return (1024, 8, 4, True)
+            yield (1024, 8, 4, True)
     if 163840 - 128 < n_kernel <= 163840 and num_rows <= 8:
-        return (512, 8, 10, True)
+        yield (512, 8, 10, True)
     if k == 2048 and 163840 - 128 < n_kernel <= 163840 and 9 <= num_rows <= 16:
-        return (1024, 7, 6, True)
+        yield (1024, 7, 6, True)
     if 163840 - 128 < n_kernel <= 163840 and num_rows * 5 <= num_sms and num_rows <= 16:
-        return (1024, 8, 5, True)
+        yield (1024, 8, 5, True)
     if 262144 - 64 < n_kernel <= 262144 and num_rows <= 4:
-        return (512, 8, 16, True)
+        yield (512, 8, 16, True)
     if 262144 - 64 < n_kernel <= 262144 and num_rows <= 8:
-        return (1024, 8, 8, True)
-    return None
+        yield (1024, 8, 8, True)
+
+
+def _code_radix_cluster_plan_fp16(
+    k: int, n_kernel: int, num_rows: int, num_sms: int, sm_version: int = 100
+):
+    """The first FP16 cluster code-radix geometry whose clusters run in one wave, or None."""
+    return next(
+        (
+            plan
+            for plan in _code_radix_cluster_plans_fp16(k, n_kernel, num_rows, num_sms, sm_version)
+            if cluster_fits(plan[2], num_rows, num_sms, sm_version)
+        ),
+        None,
+    )
 
 
 def _row_window_16bit(blk: int, vpt: int, clus: int = 1) -> int:
@@ -2135,6 +2523,29 @@ def _fit_row_window_16bit(
     return blk, vpt, minb
 
 
+def _tallws_launcher(
+    num_rows: int,
+    npad: int,
+    k: int,
+    next_n: int,
+    cr_shift: int,
+    num_sms: int,
+    dtype: torch.dtype,
+) -> tuple:
+    """Tall-batch engine launcher in the main-family ABI ``fn(logits, pre_idx, out, ws, *pre,
+    kv_lens, *tail)`` with ``pre`` = (grid, npad, rows, aim_base, sfac, sd_en): one persistent
+    launch of ``grid_of(rows, num_sms)`` CTAs with the sampling ladder of K, which reads neither
+    the hints nor the workspace."""
+    tall = _tallws()
+    fn = tall.get_compiled__tallws(_DTYPE_TAG[dtype], k, next_n=next_n, cr_shift=cr_shift)
+
+    def launch(logits, pre_idx, out, workspace, grid, npad_, rows, aim_base, sfac, sd_en, kv_lens):
+        fn(logits, out, kv_lens, grid, npad_, rows, aim_base, sfac, sd_en)
+
+    pre = (tall.grid_of(num_rows, num_sms), npad, num_rows, *tall.WS_LADDER[k])
+    return ("tallws", launch, pre, ())
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -2149,12 +2560,16 @@ def _varlen_launcher(
     device_index: int | None = None,
     det: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher for one logits dtype.
 
     FP32 picks the family with ``route``; the 16-bit dtypes pick it with ``_route_16bit`` and add
     their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
-    ``complement`` launcher. Every choice is a function of capture-stable quantities only.
+    ``complement`` launcher. Batches ``_tallws_gate`` admits run the tall-batch engine. Every
+    choice is a function of capture-stable quantities only.
+    ``pdl`` (FP32): the main and clus families wait, then release.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
@@ -2162,13 +2577,14 @@ def _varlen_launcher(
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
     profile = _pack_device_profile(num_sms, sm_version)
+    wave = wave_sms(num_sms, sm_version)
     if low:
         if device_index is None:
             raise RuntimeError("16-bit launcher requires a device index")
         key = (num_rows, npad, k, n_env, next_n, cr, device_index, profile)
     else:
         key = (num_rows, npad, k, n_env, next_n, cr, profile) + _varlen_key_flags(
-            det, wide_cta_rows
+            det, wide_cta_rows, pdl, r_cap
         )
     cache = _varlen_cache_for(dtype)
     hit = cache.get(key)
@@ -2179,6 +2595,10 @@ def _varlen_launcher(
     n_kernel = min(n_env, npad)
     n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
+    if _tallws_gate(num_rows, n_kernel, k, num_sms, sm_version, dtype, det):
+        lc = _tallws_launcher(num_rows, npad, k, next_n, cr_shift, num_sms, dtype)
+        cache[key] = lc
+        return lc
     dev = _device()
     dtype_options = {"dtype": _DTYPE_TAG[dtype]} if low else {}
     # Near-K envelopes (k < n <= k + 3): the complement kernel finds the at most three
@@ -2199,7 +2619,7 @@ def _varlen_launcher(
     if low:
         plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
-        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
+        plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det, r_cap=r_cap)
     if (
         dtype is torch.float16
         and k == 2048
@@ -2272,13 +2692,13 @@ def _varlen_launcher(
             "cr2_large": True,
         }
     crc = (
-        _code_radix_cluster_plan_fp16(k, n_kernel, num_rows, num_sms)
+        _code_radix_cluster_plan_fp16(k, n_kernel, num_rows, num_sms, sm_version)
         if dtype is torch.float16
         and _REG_CODE_RADIX_16BIT
         and _REG_CODE_RADIX_FORCE is not False
         and plan_free["kernel"] in ("reg", "reg_clus", "main", "clus")
         and n_kernel > k
-        and sm_version in (100, 103)
+        and sm_version in _TUNED_SM_VERSIONS
         else None
     )
     if crc is not None:
@@ -2408,7 +2828,7 @@ def _varlen_launcher(
             reg_options["packed_signcount_bf16"] = num_rows <= 8
         if low:
             reg_options["pk16"] = bool(plan_free.get("pk16", False))
-            if k == 2048 and num_rows <= 148 and n_kernel > 2048:
+            if k == 2048 and num_rows <= wave and n_kernel > 2048:
                 reg_options["binproof"] = True
                 if plan_free["kernel"] == "reg" and plan_free["tpl"][4]:
                     tpl = list(plan_free["tpl"])
@@ -2432,7 +2852,7 @@ def _varlen_launcher(
             )
             reg_options["code_radix"] = (
                 bool(plan_free.get("cr2_large", False))
-                or _reg_code_radix(k, n_kernel, num_rows, plan_free, dtype)
+                or _reg_code_radix(k, n_kernel, num_rows, plan_free, dtype, wave)
                 or (
                     dtype is torch.float16
                     and k == 512
@@ -2510,7 +2930,7 @@ def _varlen_launcher(
             reg_options["cr2"] = bool(
                 dtype is torch.float16
                 and reg_options["code_radix"]
-                and sm_version in (100, 103)
+                and sm_version in _TUNED_SM_VERSIONS
                 and (
                     n_kernel > 8448
                     or (num_rows > num_sms and not (n_kernel <= 2112 and num_rows <= 2 * num_sms))
@@ -2748,12 +3168,20 @@ def _varlen_launcher(
         if low:
             # FP32's register-path option rules, then the 16-bit overrides
             small_k_resident_16bit = (
-                k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
+                k == 512
+                and num_rows > num_sms
+                and n_kernel > 4096
+                and sm_version in _TUNED_SM_VERSIONS
             )
             stage_output = num_rows > num_sms and not (
                 k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
             )
-            if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
+            if (
+                k == 2048
+                and n_kernel > k
+                and num_rows <= num_sms
+                and sm_version in _TUNED_SM_VERSIONS
+            ):
                 stage_output = True
             if (
                 dtype is torch.bfloat16
@@ -2768,7 +3196,7 @@ def _varlen_launcher(
                 and reg_options["code_radix"]
                 and n_kernel > k
                 and num_rows <= num_sms
-                and sm_version in (100, 103)
+                and sm_version in _TUNED_SM_VERSIONS
             ):
                 stage_output = True
             if reg_parts > 1:
@@ -2792,7 +3220,7 @@ def _varlen_launcher(
                     or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 )
                 and n_kernel > k
-                and sm_version in (100, 103)
+                and sm_version in _TUNED_SM_VERSIONS
                 else None
             )
             if (
@@ -2827,6 +3255,21 @@ def _varlen_launcher(
                 and not reg_options.get("cr2", False)
             ):
                 reg_options["fp16_radix_impl"] = 2
+            if (
+                dtype is torch.bfloat16
+                and sm_version not in _BLACKWELL_SM_VERSIONS
+                and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+                and reg_options.get("code_radix", False)
+                and not pcw
+                and int(plan_free["tpl"][0]) * int(plan_free["tpl"][2]) <= 1024
+                and num_rows > wave * int(plan_free["tpl"][2])
+            ):
+                # A batch taller than one wave of co-resident one-row CTAs runs kern_cr in lock-step
+                # waves that alternate row loads with an SM-bound select: once its row has landed,
+                # each CTA's BF16 window prefetches the row one wave ahead into L2, so the next
+                # wave's loads overlap this wave's select. Plans at the 32-register wall (blk * minb
+                # = 2048 threads per SM) keep it off: there it gained nothing (up to 5 % slower).
+                reg_options["succ_la"] = wave * int(plan_free["tpl"][2])
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -2839,10 +3282,14 @@ def _varlen_launcher(
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,
                 bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8256 else 1,
-                warp_rank=n_kernel > k and sm_version in (100, 103),
+                warp_rank=n_kernel > k and sm_version in _TUNED_SM_VERSIONS,
                 parts=reg_parts,
                 pcw=pcw,
-                pcw_cluster=pcw and reg_parts > 1 and (reg_parts < 8 or reg_parts * num_rows <= 64),
+                # the cluster only co-schedules a row's parts, which pays off on Blackwell only
+                pcw_cluster=pcw
+                and reg_parts > 1
+                and (reg_parts < 8 or reg_parts * num_rows <= 64)
+                and sm_version in _BLACKWELL_SM_VERSIONS,
                 pcw_bins=512 if (pcw and dtype is torch.bfloat16 and k == 2048) else 1024,
                 **reg_options,
             )
@@ -2850,12 +3297,28 @@ def _varlen_launcher(
             stage_output = num_rows > num_sms and not (
                 k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
             )
-            if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
+            if (
+                k == 2048
+                and n_kernel > k
+                and num_rows <= num_sms
+                and sm_version in _TUNED_SM_VERSIONS
+            ):
                 stage_output = True
             small_k_resident = (
-                k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
+                k == 512
+                and num_rows > num_sms
+                and n_kernel > 4096
+                and sm_version in _TUNED_SM_VERSIONS
             )
             static_k = None if k <= 512 and tuple(plan_free["tpl"][:2]) == (1024, 1) else k
+            # Hopper runs K=1024 batches beyond two waves of rows above 4K scores faster with the
+            # row stride read at run time than compiled in
+            runtime_npad = (
+                sm_version not in _BLACKWELL_SM_VERSIONS
+                and k == 1024
+                and num_rows > 2 * num_sms
+                and n_kernel > 4096
+            )
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -2873,7 +3336,8 @@ def _varlen_launcher(
                     or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 )
                 and n_kernel > k
-                and sm_version in (100, 103)
+                and sm_version in _TUNED_SM_VERSIONS
+                and not runtime_npad
                 else None,
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,
@@ -2881,14 +3345,14 @@ def _varlen_launcher(
                 warp_rank=(
                     ((k == 2048 and num_rows <= num_sms) or small_k_resident or k == 1024)
                     and n_kernel > k
-                    and sm_version in (100, 103)
+                    and sm_version in _TUNED_SM_VERSIONS
                 ),
                 rematerialize_bins=(
                     small_k_resident and (num_rows > 2 * num_sms or n_kernel <= 8192)
                 )
                 or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 or (
-                    sm_version in (100, 103)
+                    sm_version in _TUNED_SM_VERSIONS
                     and k == 2048
                     and num_rows > 6 * num_sms
                     and tuple(plan_free["tpl"][:3]) == (256, 5, 4)
@@ -2916,24 +3380,35 @@ def _varlen_launcher(
             and int(plan_free["tpl"][4]) == 4
             and (k >= 1024 or n_kernel <= 196608)
         ):
-            clus_options["sample_floor_bf16"] = 3072
+            clus_options["sample_floor"] = 3072
         if (
             dtype is torch.bfloat16
             and int(plan_free["tpl"][4]) == 8
             and k == 1024
             and n_kernel > 196608
         ):
-            clus_options["sample_floor_bf16"] = 3072
+            clus_options["sample_floor"] = 3072
+        if (
+            low
+            and int(plan_free["tpl"][4]) == 2
+            and k == 2048
+            and sm_version not in _BLACKWELL_SM_VERSIONS
+        ):
+            # the Hopper 2-CTA fallback of 32-row K=2048 batches samples like the 4-CTA K=2048 rung
+            clus_options["sample_floor"] = 3072
+        if int(plan_free["tpl"][4]) == 3:
+            # 3-CTA clusters take the cs != 2 sampling factor with a row split over only three
+            # CTAs; below 3072 samples their first attempt misses K on many rows
+            clus_options["sample_floor"] = 3072
         if dtype is torch.bfloat16:
             clus_options["envf"] = True
         if dtype is torch.bfloat16:
             clus_options["async_refine_bf16"] = True
-        if dtype is torch.bfloat16 and int(plan_free["tpl"][4]) >= 4:
+        if dtype is torch.bfloat16 and int(plan_free["tpl"][4]) >= 3:
             clus_options["fused_merge_bf16"] = True
         if dtype is torch.bfloat16 and k <= 1024:
             clus_options["push_merge_bf16"] = True
-        fn = dev.get_compiled__clus(
-            tuple(plan_free["tpl"]),
+        compile_kwargs = dict(
             scap=rt_f["SCAP"],
             cmp_=rt_f["CMP"],
             varlen=True,
@@ -2941,8 +3416,11 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             det=det,
+            wave_sms=wave,
             **clus_options,
+            pdl=pdl and not det and not low,
         )
+        fn = dev.get_compiled__clus(tuple(plan_free["tpl"]), **compile_kwargs)
         e_smp, e_tgt, e_ss2, e_tgt2 = 0, 0, 0, 0
         if clus_options.get("envf", False):
             e_smp, e_tgt, e_ss2, e_tgt2 = _clus_env_samples(
@@ -2951,18 +3429,22 @@ def _varlen_launcher(
                 int(plan_free["tpl"][4]),
                 num_rows,
                 rt_f["SCAP"],
-                int(clus_options.get("sample_floor_bf16", 256)),
+                int(clus_options.get("sample_floor", 256)),
+                wave,
             )
         lc = (
             "clus",
             fn,
             (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
+            (tuple(plan_free["tpl"]), compile_kwargs),
         )
     else:
         if low:
-            plan = _route_streaming_16bit(num_rows, n_route, npad, k, force_main=True, dtype=dtype)
+            plan = _route_streaming_16bit(
+                num_rows, n_route, npad, k, True, dtype, num_sms, sm_version
+            )
         else:
-            plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
+            plan = route_streaming(num_rows, n_route, npad, k, True, num_sms, sm_version)
         tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
         rt = plan["rt"]
         r_const = rt["R"]
@@ -2993,34 +3475,92 @@ def _varlen_launcher(
                     )
                 ):
                     main_options["dense"] = False
-                if dtype is torch.bfloat16 and num_rows > 4 * num_sms:
+                if _regsel_rows(dtype, num_rows, num_sms):
                     main_options["regsel"] = True
                 if dtype is torch.bfloat16:
                     main_options["envf"] = True
-                if dtype is torch.bfloat16 and sm_version in (100, 103):
+                if dtype is torch.bfloat16 and sm_version in _TUNED_SM_VERSIONS:
                     main_options["warp_rank"] = True
-                    if r_const == 1 and (k == 2048 or main_options["v16"]):
+                    # a compile-time K pays off on Hopper from K = 1024
+                    if (
+                        r_const == 1
+                        and (k == 2048 or main_options["v16"])
+                        and (k >= 1024 or sm_version in _BLACKWELL_SM_VERSIONS)
+                    ):
                         main_options["staged_k"] = k
                 if dtype is torch.float16 and not tpl[5]:
-                    main_options["p2"] = (
-                        int(tpl[0]) < 512 or n_kernel * num_rows <= 48 * 1024 * 1024
+                    # 256-thread slabs of 132-SM Hopper parts skip the p2 pass, which re-reads
+                    # the staged survivors' values after their L2 has dropped them
+                    rereads_cheap = (
+                        sm_version in _BLACKWELL_SM_VERSIONS
+                        or num_sms in _HOPPER_BLACKWELL_BANDWIDTH_SMS
                     )
+                    main_options["p2"] = (int(tpl[0]) < 512 and rereads_cheap) or (
+                        int(tpl[0]) >= 512
+                        and n_kernel * num_rows <= 48 * 1024 * 1024
+                        and (
+                            rereads_cheap
+                            or num_rows > 2 * wave
+                            or n_kernel * num_rows < 16 * 1024 * 1024
+                        )
+                    )
+                    if not rereads_cheap and not (main_options["p2"] and num_rows > 2 * wave):
+                        # ... and rank survivors per warp with a compile-time K, staging the output
+                        # row in smem (16-B copy-out instead of scattered 4-B index stores), as BF16;
+                        # batches beyond two waves that keep p2 lose with either option
+                        main_options["warp_rank"] = True
+                        if r_const == 1 and (
+                            k == 2048 or main_options["v16"] or (k == 1024 and int(tpl[0]) == 512)
+                        ):
+                            main_options["staged_k"] = k
         else:
-            if k == 512 and num_rows > 2 * num_sms and sm_version in (100, 103):
+            if k == 512 and num_rows > 2 * num_sms and sm_version in _TUNED_SM_VERSIONS:
                 n4 = n_route >> 2
                 if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
                     tpl = (256, 4, 4, tpl[3], 2, False, False)
             wide_min, wide_max = _WIDE_CTA_ROWS
-            if wide_cta_rows and wide_min <= num_rows <= wide_max and tpl[0] < 1024 and not tpl[5]:
+            if (
+                wide_cta_rows
+                and wide_min <= num_rows <= wide_max
+                and tpl[0] < 1024
+                and not tpl[5]
+                # The 1,024-thread slab skips sampling up to 16K columns for K <= 1,024.
+                # Rubin keeps the sampling slab for those shorter envelopes.
+                and (sm_version != 107 or k > 1024 or n_kernel > 16384)
+            ):
                 kpt = 1 if k <= 1024 else (2 if k <= 2048 else (4 if k <= 4096 else 8))
                 tpl = (1024, tpl[1], 1, tpl[3], kpt, tpl[5], tpl[6])
             main_options.update(
                 det=det,
                 fused_k=k,
-                warp_rank=k == 2048 and sm_version in (100, 103),
-                staged_k=k if k == 2048 and r_const == 1 and sm_version in (100, 103) else 0,
+                warp_rank=k == 2048 and sm_version in _TUNED_SM_VERSIONS,
+                staged_k=k
+                if k == 2048 and r_const == 1 and sm_version in _TUNED_SM_VERSIONS
+                else 0,
+                pdl=pdl and not det,
             )
-        big = num_rows * r_const <= 148
+        big = num_rows * r_const <= wave
+        if (
+            sm_version not in _BLACKWELL_SM_VERSIONS
+            and num_sms not in _HOPPER_BLACKWELL_BANDWIDTH_SMS
+            and not tpl[5]
+            and not det
+            and n_kernel >= 32 * k
+            and (
+                (
+                    num_rows * r_const <= wave * int(tpl[2])
+                    and k <= 4 * int(tpl[0])
+                    and (n_kernel >= 128 * k if big else n_kernel * (2 if low else 4) <= 3 << 18)
+                )
+                or (main_options.get("regsel") and num_rows * r_const <= 2 * wave * int(tpl[2]))
+            )
+        ):
+            # One wave of co-resident CTAs streams its rows past the other rows' sampled lines, which
+            # a Hopper L2 then drops before their row pass reads them: the row-pass loads mark their
+            # lines evict_first. Rows below 32 * K scores (128 * K at one CTA per SM), rows above
+            # 768 KB at two or more CTAs per SM, 256-thread K = 2048 slabs and later waves re-read
+            # streamed lines; BF16 rows that select from registers re-read none up to two waves
+            main_options["l2ef"] = True
         if low:
             if r_const > 2 and k > 1024:
                 split_aim = 13 * k // 8 if num_rows > 8 else 7 * k // 4
@@ -3033,9 +3573,12 @@ def _varlen_launcher(
             tsh_en = 1 if tpl[5] else 0
         else:
             split_aim = 2 * k
-            split_sfac = 32 if r_const == 2 else 48 if k > 1024 else 16
+            # Rows above K = 1024 sample with the same factor at every split; two parts (32-row
+            # K=2048 batches on the 78-SM H20) took the K <= 1024 factor and some rows retried
+            # for up to 9x the time
+            split_sfac = 48 if k > 1024 else 32 if r_const == 2 else 16
             unsplit_aim = 4 * k if k >= 1024 else 2 * k
-            amin = 3 * k if r_const == 2 else 7 * k // 2
+            amin = 3 * k if r_const == 2 and k <= 1024 else 7 * k // 2
             # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
             # num_rows > 15 would strand small batches in SPLIT-main without the
             # staged floor (a distribution-dependent tail regression); the kernel
@@ -3048,6 +3591,17 @@ def _varlen_launcher(
             if k >= 1024
             else 3 * k // 2
         )
+        if low:
+            # 16-bit rows at K = 1024 from 128K scores, or from 64K when their survivors are read
+            # back from registers (regsel), where the extra staged survivors cost little
+            long_row = k == 1024 and n_kernel >= (65536 if main_options.get("regsel") else 131072)
+        else:
+            long_row = k <= 1024 and n_kernel >= 65536
+        if long_row and not big and sm_version not in _BLACKWELL_SM_VERSIONS:
+            # A retried attempt re-reads the row from DRAM; Hopper's lower bandwidth makes long
+            # rows sample with the full staging headroom (the kernel clamps aim to SCAP / 2).
+            # Below 128K scores, rows at K < 1024 sample with 2k, the aim of their big batches.
+            aim_base = 4 * k if k >= 1024 or n_kernel >= 131072 else 2 * k
         if (
             dtype is torch.bfloat16
             and k == 1024
@@ -3081,15 +3635,18 @@ def _varlen_launcher(
                 amin,
                 sd_en,
             )
-            if not tpl[5] and (
-                int(tpl[0]) == 256
-                or (
+            if int(tpl[0]) >= 512 and num_rows > 2 * wave:
+                # Hopper's 512-thread slabs of batches beyond two waves (``_wide_slab``) issue
+                # the sample loads first up to the batch size that takes p2
+                env_first = n_kernel * num_rows <= 48 * 1024 * 1024
+            else:
+                env_first = int(tpl[0]) == 256 or (
                     k <= 1024
                     and 131072 < n_kernel <= 131584
                     and num_rows > num_sms
                     and int(tpl[0]) >= 512
                 )
-            ):
+            if not tpl[5] and env_first:
                 main_options["env_first"] = True
             if (
                 not tpl[5]
@@ -3393,6 +3950,11 @@ def _device_num_sms(dev_index: int) -> int:
     return _unpack_device_profile(_device_profile_key(dev_index))[0]
 
 
+def _device_prefill_wave_sms(dev_index: int) -> int:
+    """Return the prefill tier budget of a CUDA device."""
+    return _prefill_wave_sms(*_unpack_device_profile(_device_profile_key(dev_index)))
+
+
 # ---------------------------------------------------------------------------
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
@@ -3445,7 +4007,9 @@ def _build_launcher(b, n, npad, k, num_sms, sm_version=100, det=False):
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
         #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
         # varlen slot in batch-uniform mode (cached dummy tensor)
-        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"], det=det)
+        fn = dev.get_compiled__clus(
+            tpl, scap=rt["SCAP"], cmp_=rt["CMP"], det=det, wave_sms=wave_sms(num_sms, sm_version)
+        )
         args = (
             rt["n"],
             rt["npad"],
@@ -3663,14 +4227,19 @@ def run_varlen(
     deterministic: bool = False,
     sorting: str | None = None,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
+    finalize: dict | None = None,
 ) -> None:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
 
     ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
     every row (requires deterministic). The default path is the original kernel, unchanged.
-    ``wide_cta_rows=True`` runs the non-split gvr_main plan of ``_WIDE_CTA_ROWS``-row batches with
-    1,024-thread CTAs.
+    ``wide_cta_rows=True`` opts non-split gvr_main plans of ``_WIDE_CTA_ROWS``-row batches into
+    1,024-thread CTAs; Rubin retains the sampling slab for envelopes <= 16K at K <= 1,024.
+    FP32 only: ``pdl`` (see ``_varlen_launcher``), ``r_cap`` (see ``route``) and ``finalize``
+    (CSA2's paged finalize, run by a clus launch that then sets ``finalize["done"]``).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -3776,6 +4345,8 @@ def run_varlen(
     k = indices.shape[1]
     if not (indices.is_contiguous() and kv_lens.is_contiguous()):
         raise RuntimeError("indices/kv_lens must be contiguous")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
     # logits: accept row-major views with a wider row stride (the DSL
     # paged-MQA logits arena is 256-aligned and column-sliced — a legal
     # NON-contiguous view). The kernel only needs (base, row stride):
@@ -3823,8 +4394,12 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     det = _check_det_args(deterministic, sorting)
+    pdl = bool(pdl) and not det
+    r_cap = max(0, int(r_cap))
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(det, wide_cta_rows)
+    key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
+        det, wide_cta_rows, pdl, r_cap
+    )
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -3843,6 +4418,8 @@ def run_varlen(
             sm_version,
             det=det,
             wide_cta_rows=wide_cta_rows,
+            pdl=pdl,
+            r_cap=r_cap,
         )
     idx = indices
     if idx.shape[1] != k:
@@ -3861,7 +4438,33 @@ def run_varlen(
     elif lc[0] == "clus":
         # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
         #                SCAP, CMP, dead DYN x5)
-        lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
+        fn = None
+        if finalize is not None and not det and k % 2 == 0 and k <= 1024:
+            # Each row's rank-0 CTA also runs CSA2's paged finalize (not compiled in a capture).
+            tpl, compile_kwargs = lc[3]
+            fn = _device().get_compiled__clus(
+                tpl,
+                **compile_kwargs,
+                fin_k=k,
+                fin_page=int(finalize["page"]),
+                cached_only=_is_capturing(),
+            )
+        if fn is not None:
+            valid = finalize["valid"].view(torch.uint8)
+            fn(
+                lg,
+                pre_arg,
+                kv_lens,
+                idx,
+                *lc[2],
+                valid.reshape(-1),
+                finalize["visible"],
+                int(finalize["width"]),
+                int(valid.stride(0)),
+            )
+            finalize["done"] = True
+        else:
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     else:
         _, fn, pre, tail = lc
         fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
@@ -3943,6 +4546,8 @@ def _run_varlen_16bit(
     k = indices.shape[1]
     if not (indices.is_contiguous() and kv_lens.is_contiguous()):
         raise RuntimeError("indices/kv_lens must be contiguous")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
     if logits.stride(1) != 1:
         raise RuntimeError("logits inner stride must be 1")
     npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
@@ -4117,18 +4722,20 @@ def run_prefill(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), npad)
     n_bucket = _prefill_bucket(n_env)
+    num_sms, sm_version = _unpack_device_profile(_device_profile_key(d))
+    wave = _prefill_wave_sms(num_sms, sm_version)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0, n_env, k)
+        tier = _prefill_tier(r1 - r0, n_env, k, wave)
         v16 = _prefill_v16(tier, logits.dtype, npad)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, dtype_tag, det, v16))
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, dtype_tag, det, v16, wave))
         if lc is None:
             if _is_capturing():
                 raise RuntimeError(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket, logits.dtype, det, v16)
+            lc = _prefill_launcher(tier, k, n_bucket, logits.dtype, det, v16, num_sms, sm_version)
         _, fn, (scap, cmp_), tail = lc
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
@@ -4161,10 +4768,11 @@ def prefill_ready(
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
+    wave = _device_prefill_wave_sms(logits.get_device())
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k, wave)
         v16 = _prefill_v16(tier, logits.dtype, npad)
-        key = _prefill_cache_key(tier, k, n_bucket, dtype_tag, bool(deterministic), v16)
+        key = _prefill_cache_key(tier, k, n_bucket, dtype_tag, bool(deterministic), v16, wave)
         if key not in _PREFILL_CACHE:
             return False
     return True
@@ -4178,14 +4786,16 @@ def varlen_ready(
     max_seq_len: int | None = None,
     deterministic: bool = False,
     wide_cta_rows: bool = False,
+    pdl: bool = False,
+    r_cap: int = 0,
 ) -> bool:
     """True iff ``run_varlen(logits, kv_lens, indices, next_n, compress_ratio,
-    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows)``
-    without a workspace would launch without compiling: the launcher key it looks up (rows, row
-    stride, k, envelope, next_n, compression, device profile, dtype, det, wide_cta_rows) is cached
-    and the device's default workspace exists, so a caller can route around the engine under
-    CUDA graph capture. Host-only. Without ``max_seq_len`` run_varlen reads
-    ``kv_lens.max()`` on the host, so the answer is False."""
+    max_seq_len=max_seq_len, deterministic=deterministic, wide_cta_rows=wide_cta_rows, pdl=pdl,
+    r_cap=r_cap)`` without a workspace would launch without compiling: the launcher key it looks
+    up (rows, row stride, k, envelope, next_n, compression, device profile, dtype, det,
+    wide_cta_rows, pdl, r_cap) is cached and the device's default workspace exists, so a caller
+    can route around the engine under CUDA graph capture. Host-only. Without ``max_seq_len``
+    run_varlen reads ``kv_lens.max()`` on the host, so the answer is False."""
     if logits.dim() != 2 or indices.dim() != 2:
         return False
     num_rows = logits.shape[0]
@@ -4207,7 +4817,7 @@ def varlen_ready(
         key = (num_rows, npad, k, n_env, nn, cr, d, profile)
     else:
         key = (num_rows, npad, k, n_env, nn, cr, profile) + _varlen_key_flags(
-            deterministic, wide_cta_rows
+            deterministic, wide_cta_rows, bool(pdl) and not deterministic, max(0, int(r_cap))
         )
     return key in _varlen_cache_for(logits.dtype) and d in _ws_hot
 
@@ -4349,7 +4959,18 @@ def warmup_varlen(
                 sm_version,
                 det=bool(deterministic),
             )
-            if plan_free["kernel"] == "reg_clus":
+            if _tallws_gate(
+                r,
+                min(n_env_c, npad_c),
+                int(top_k),
+                num_sms,
+                sm_version,
+                dtype,
+                bool(deterministic),
+            ):
+                # one tall-batch engine per (K, next_n, compression): its first row count
+                ekey = ("tallws", int(top_k), nn, int(compress_ratio))
+            elif plan_free["kernel"] == "reg_clus":
                 ekey = ("reg_clus", tuple(plan_free["tpl"]))
             elif plan_free["kernel"] in ("reg", "regimg"):
                 ekey = ("reg", tuple(plan_free["tpl"]))
@@ -4359,7 +4980,9 @@ def warmup_varlen(
                     max(min(n_env_c, npad_c), int(top_k) + 1),
                     npad_c,
                     int(top_k),
-                    force_main=True,
+                    True,
+                    num_sms,
+                    sm_version,
                 )
                 ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
             if ekey not in seen_keys:
@@ -4449,15 +5072,16 @@ _PREFILL_WARMUP_LOCK = threading.Lock()
 def warmup_prefill(
     top_k: int,
     max_cols: int,
-    num_rows_list: Sequence[int] = (1, 149, 297),
+    num_rows_list: Sequence[int] | None = None,
     row_stride: int | None = None,
     deterministic: bool = False,
     dtype: torch.dtype = torch.float32,
 ) -> None:
     """Compile every prefill engine ``run_prefill`` can request before serving:
-    the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
-    (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
-    one launch each. ``max_cols`` is the compressed max column count;
+    the tier-0 arm per pow2 envelope bucket where a launch of at most the prefill wave's rows
+    keeps it (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
+    one launch each. ``num_rows_list`` defaults to one row count per tier.
+    ``max_cols`` is the compressed max column count;
     ``dtype`` selects the fp32, bf16 or fp16 engines (16-bit: the tier-2 engine
     with v16 staging and, when rows of ``max_cols`` columns can have a row stride
     above 65536, without it); idempotent per done-key."""
@@ -4467,6 +5091,9 @@ def warmup_prefill(
     if dtype in _DTYPES_16BIT and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
+    wave = _device_prefill_wave_sms(dev)
+    if num_rows_list is None:
+        num_rows_list = (1, wave + 1, 2 * wave + 1)
     k = int(top_k)
     max_cols = int(max_cols)
     lo = _prefill_bucket(k + 1)
@@ -4493,11 +5120,13 @@ def warmup_prefill(
                 # rows whose stride exceeds 16-bit indices keep the 32-bit staging engine
                 strides.append(_PREFILL_V16_MAX_NPAD + 256)
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
-                tier = _prefill_tier(int(rows), n_env, k)
+                tier = _prefill_tier(int(rows), n_env, k, wave)
                 for s in strides:
                     v16 = _prefill_v16(tier, dtype, s)
                     keys.setdefault(
-                        _prefill_cache_key(tier, k, bk, _DTYPE_TAG[dtype], deterministic, v16),
+                        _prefill_cache_key(
+                            tier, k, bk, _DTYPE_TAG[dtype], deterministic, v16, wave
+                        ),
                         (tier, bk, n_env, s),
                     )
     done_key = (
@@ -4513,7 +5142,7 @@ def warmup_prefill(
         if done_key in _PREFILL_WARMUP_DONE:
             return
     for tier, bk, n_env, stride in keys.values():
-        rows = _PREFILL_TIER_ROWS[tier]
+        rows = _prefill_tier_rows(wave)[tier]
         logits = torch.zeros((rows, stride), dtype=dtype, device=dev)
         ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
         ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)

@@ -4,11 +4,9 @@
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import STANDARD
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import STANDARD
+from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention as op
 
 __extra_import_path__ = ["../../../../attention", "../../../.."]
 import test_modeling_v2_thop_attention as shared  # noqa: E402
@@ -62,6 +60,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ("fresh decode-sized prefill", (0,), (1,), 1),
             ("fresh prefill", (0,), (129,), 1),
             ("prefix reuse", (64,), (17,), 1),
+            ("prefix reuse beyond window", (576,), (17,), 1),
             ("prefill beyond window", (0,), (513,), 1),
             ("prefix at window", (512,), (1,), 1),
             ("decode across window", (511, 512, 513), (1, 1, 1), 0),

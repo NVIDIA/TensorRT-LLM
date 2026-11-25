@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +23,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
     Services,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
+from agent_flow.workflows.trtllm_modeling_v2.run.validation import test_jobs
 from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import TaskNotStarted
 
 _orchestrator_CONTRACT = c.Contract(
@@ -119,13 +119,534 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
     assert "FAILED core:accuracy[gsm8k]@tp1" in turns[1].evaluation.render()
 
 
+_STANDING = c.Contract(
+    checks=(
+        c.Check("core", "boot", "tp1", c.TIER_INNER),
+        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("mtp", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
+    ),
+    confirm="mtp:accuracy[gsm8k]@tp1",
+)
+_CORE = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
+_MTP = ["mtp:accuracy[gsm8k]@tp1", "mtp:acceptance@tp1"]
+
+
+def _moving_target(plan, *, failing=lambda key, marker: False, lost=()):
+    """Services whose target changes each time a task's work ends; ``ran`` is (check, state) pairs.
+
+    ``lost``: the (check, state) runs whose session is lost, each once.
+    """
+    landed = []
+    ran = []
+    lost = list(lost)
+
+    def work(task):
+        landed.append(task.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        marker = f"m{len(landed)}"
+        ran.append((chk.key, marker))
+        if (chk.key, marker) in lost:
+            lost.remove((chk.key, marker))
+            raise RuntimeError("the session was lost")
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not failing(chk.key, marker))  # fmt: skip
+
+    services = Services(
+        plan=plan, work=work, check=check, free_gpus=lambda: 4, marker=lambda: f"m{len(landed)}"
+    )
+    services.ran = ran  # type: ignore[attr-defined]
+    return services
+
+
+def _standing_run(tmp_path, services) -> str:
+    status = c.ContractStatus.load(tmp_path)
+    return GraphOrchestrator(services, _STANDING, status, tmp_path, poll_s=0).run()
+
+
+def test_a_check_that_passed_stands_when_a_later_task_lands(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE), _task("mtp", "feature", _MTP, deps=["core"])
+    )
+    services = _moving_target(plan)
+    assert _standing_run(tmp_path, services) == "delivered"
+    # Each check ran once, where its own task landed. The core's were not run again on
+    # the state mtp left, and mtp's own checks, which ran on the final tree, confirm it.
+    assert sorted(services.ran) == sorted([(k, "m1") for k in _CORE] + [(k, "m2") for k in _MTP])
+
+
+def test_the_final_tree_is_confirmed_by_one_check_when_none_ran_on_it(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("mtp", "feature", _MTP, deps=["core"]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+    services = _moving_target(plan)
+    assert _standing_run(tmp_path, services) == "delivered"
+    # `tidy` claims no check and changed the target last: one check runs on what it left.
+    assert services.ran[-1] == ("mtp:accuracy[gsm8k]@tp1", "m3")
+    assert sorted(services.ran[:-1]) == sorted(
+        [(k, "m1") for k in _CORE] + [(k, "m2") for k in _MTP]
+    )
+
+
+def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final_tree(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(*_STANDING.checks[:2], serve), confirm=_CORE[1])
+    plan = _plan_once(
+        _task("core", "assemble", [*_CORE, serve.key]),
+        _task("tidy", "kernel", deps=["core"], touches=["catalog/k.py"]),
+    )
+    services = _moving_target(plan)
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The delivery tier ran on what `tidy` left and answered. That is not a score: the
+    # benchmark runs there too.
+    assert services.ran[-2:] == [(serve.key, "m2"), (_CORE[1], "m2")]
+
+
+@pytest.mark.parametrize("claims, served_on", [(True, "m3"), (False, "m2")])
+def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
+    tmp_path, claims, served_on
+):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("the check of the final tree failed" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            fix = _task("fix", "assemble", [serve.key] if claims else [], touches=["models/core/"])
+            graph.tasks.append(fix)
+            return PlannerAnswer("GRAPH_UPDATED", "repair", graph)
+        if not repaired:
+            tasks = [
+                _task("core", "assemble", [_CORE[1], serve.key]),
+                _task("tidy", "kernel", deps=["core"], touches=["catalog/k.py"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        return PlannerAnswer("DONE", "all green")
+
+    # The serve passes on what `tidy` left (m2); the benchmark fails there, and a repair lands (m3).
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[1], "m2"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    assert status.latest()[_CORE[1]].marker == "m3"
+    # A repair that claims the serve has it run on what the repair left. One that does not
+    # leaves the serve's pass standing, as any other check's.
+    assert status.latest()[serve.key].marker == served_on
+
+
+def _naming(services, named):
+    """``services`` whose worker names ``named[task.id]`` as the checks its landing runs."""
+    work = services.work
+
+    def name(task):
+        if task.id in named:
+            task.satisfies = list(named[task.id])  # what the stage takes from its answer
+        return work(task)
+
+    services.work = name
+    return services
+
+
+def test_a_landing_runs_the_checks_its_worker_names(tmp_path):
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("mtp", "feature", _MTP, deps=["core"]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+    # mtp's worker changed a path the core's benchmark runs; tidy's changed nothing a
+    # check reaches, though the plan had it run the core's benchmark.
+    named = {"mtp": [*_MTP, _CORE[1]], "tidy": []}
+    services = _naming(_moving_target(plan), named)
+    assert _standing_run(tmp_path, services) == "delivered"
+    assert sorted(k for k, m in services.ran if m == "m2") == sorted([*_MTP, _CORE[1]])
+    # Nothing ran at tidy's landing; the final tree is confirmed by the one benchmark.
+    assert [k for k, m in services.ran if m == "m3"] == [_STANDING.confirm]
+
+
+def test_a_check_no_landing_ran_runs_once_the_work_is_done(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    services = _naming(_moving_target(_plan_once(_task("core", "assemble", _CORE))), {
+        "core": _CORE[1:]})  # fmt: skip
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # Its worker named the benchmark only; the boot, which never passed, runs once the
+    # work is done.
+    assert services.ran == [(_CORE[1], "m1"), (_CORE[0], "m1")]
+
+
+def test_the_worker_names_the_checks_its_landing_runs():
+    from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import TaskResult
+    from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
+
+    stage = SimpleNamespace(workflow=SimpleNamespace(_contract=_STANDING))
+    task = _task("mtp", "feature", _MTP)
+    said = TaskResult("UNIT_READY", data={"satisfies": [_MTP[1], _CORE[1], "core:boot@tp9"]})
+    ExecutionStage._take_named_checks(stage, task, said)
+    assert task.satisfies == [_MTP[1], _CORE[1]]
+    assert "named the checks its landing runs" in said.note and "core:boot@tp9" in said.note
+    # Without an answer, the plan's stand.
+    task, quiet = _task("mtp", "feature", _MTP), TaskResult("UNIT_READY", data={})
+    ExecutionStage._take_named_checks(stage, task, quiet)
+    assert task.satisfies == _MTP and quiet.note == ""
+    # The worker is told where the run's checks are and what its task's plan named.
+    stage.workflow.workspace, stage._soft_block = Path("/ws"), lambda task: ""
+    said = ExecutionStage._task_context(stage, [], "mtp", task)
+    assert "`/ws/contract.yaml`" in said and f"`{_MTP[0]}`, `{_MTP[1]}`" in said
+
+
+def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(_moving_target(_plan_once()), contract, status, tmp_path)
+    recheck = _task("recheck", "check", [serve.key], touches=[])
+    assert orchestrator._start_check_task(recheck).result()[1] == []
+    # Like a worker's landing, it has the serve run with the delivery tier, though it passed.
+    assert serve.key in orchestrator._owed
+
+
+def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
+    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    state = {"tree": 1, "land": ""}  # land: where a task lands and claims the serve
+    runs = []
+
+    def land(at):
+        if state["land"] == at:
+            state["land"], state["tree"] = "", state["tree"] + 1
+            orchestrator._claim([serve.key])
+
+    def marker():
+        tree = f"m{state['tree']}"
+        land("after the run read the target")
+        return tree
+
+    def check(chk):
+        runs.append(f"m{state['tree']}")
+        land("while the check runs")
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=True)  # fmt: skip
+
+    services = Services(
+        plan=lambda turn: PlannerAnswer("DONE", ""),
+        work=lambda task: "UNIT_READY",
+        check=check,
+        free_gpus=lambda: 4,
+        marker=marker,
+    )
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(services, c.Contract(checks=(serve,)), status, tmp_path)
+    orchestrator._claim([serve.key])
+    for land_at in ("while the check runs", "", "after the run read the target", ""):
+        state["land"] = land_at
+        orchestrator._run_check_once(serve)
+        # A claim that came after the run read the target is not answered by it.
+        assert (serve.key in orchestrator._owed) == bool(land_at)
+    # m1 and m2 were measured; the pass on m2 did not answer the claim m3 made.
+    assert runs == ["m1", "m2", "m3"]
+
+
+def test_a_failure_on_the_final_tree_reaches_the_planner(tmp_path):
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            tasks = [
+                _task("core", "assemble", _CORE),
+                _task("mtp", "feature", _MTP, deps=["core"]),
+                _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        if any(
+            f"the check of the final tree failed: {_STANDING.confirm}" in e for e in turn.events
+        ):
+            return PlannerAnswer("CEILING", "the last change broke the drafter")
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: marker == "m3")
+    assert _standing_run(tmp_path, services) == "ceiling"
+    assert services.ran[-1] == (_STANDING.confirm, "m3")
+
+
+def test_a_pass_stands_and_a_failure_counts_where_it_was_measured(tmp_path):
+    boot, benchmark = _STANDING.checks[:2]
+    contract = c.Contract(checks=(boot, benchmark), confirm=benchmark.key)
+    status = c.ContractStatus.load(tmp_path)
+
+    def result(check, passed):
+        return SimpleNamespace(name=check.gate, member=check.member, passed=passed, detail="")
+
+    status.record("core", result(boot, True), marker="m1")
+    status.record("core", result(benchmark, False), marker="m1")
+    here = c.evaluate(contract, status, marker="m1")
+    assert [x.key for x in here.passed] == [boot.key]
+    assert [x.key for x, _ in here.failed] == [benchmark.key]
+    # On the state a later change left, the pass stands and the failure is due again.
+    later = c.evaluate(contract, status, marker="m2")
+    assert [x.key for x in later.passed] == [boot.key]
+    assert not later.failed and [x.key for x in later.missing] == [benchmark.key]
+    # Standing is not having run there, and a boot that passed here does not say the
+    # target scores here: the benchmark confirms it.
+    assert not c.confirmed(contract, status, "m1") and not c.confirmed(contract, status, "m2")
+    status.record("core", result(benchmark, True), marker="m2")
+    assert c.confirmed(contract, status, "m2") and not c.confirmed(contract, status, "m3")
+    assert c.passed_here(contract, status, boot, "m1")
+    assert not c.passed_here(contract, status, boot, "m2")
+    # The delivery report says where the standing pass was measured.
+    table = c.measured_where(later, status, "m2", since=lambda tree: "3")
+    assert "| core:boot@tp1 | unknown | 3 |" in table
+    assert "0, the final tree" in c.measured_where(here, status, "m1")
+
+
+def test_a_failed_check_runs_again_after_a_repair_that_does_not_name_it(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("checks failed: core:boot@tp1" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(_task("fix", "assemble", touches=["models/core/"]))
+            return PlannerAnswer("GRAPH_UPDATED", "a repair that claims no check", graph)
+        if not repaired:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[0], "m1"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The task that claimed the boot failed with it, and the repair names no check. The boot
+    # still runs on what the repair left.
+    assert (_CORE[0], "m2") in services.ran and status.latest()[_CORE[0]].passed
+
+
+def test_the_checks_of_a_task_whose_work_did_not_finish_are_not_run_for_it(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("CEILING", "the core cannot be built")
+
+    ran = []
+    services = Services(
+        plan=plan,
+        work=lambda task: "BLOCKED",
+        check=lambda chk: ran.append(chk.key),
+        free_gpus=lambda: 4,
+    )
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "ceiling"
+    # No check ran and failed: there is nothing to run again.
+    assert ran == []
+
+
+def test_a_check_a_task_asked_for_runs_again_when_its_run_was_lost(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("again", "assemble", _CORE[:1], deps=["core"], touches=["models/core/"]),
+    )
+    services = _moving_target(plan, lost=[(_CORE[0], "m2")])
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # `again` changed the core and asked for its boot again. The run that was lost recorded
+    # nothing, and the boot's pass on m1 does not answer for it: it runs once more on m2.
+    assert [where for key, where in services.ran if key == _CORE[0]] == ["m1", "m2", "m2"]
+    assert status.latest()[_CORE[0]].marker == "m2"
+
+
+def test_a_check_task_whose_run_is_lost_leaves_its_check_owed(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    recheck = g.Task(
+        id="recheck", kind="check", goal="the boot again", depends_on=["again"], satisfies=_CORE[:1]
+    )
+    plan = _plan_once(
+        _task("core", "assemble", _CORE),
+        _task("again", "assemble", _CORE[1:], deps=["core"], touches=["models/core/"]),
+        recheck,
+    )
+    # Lost on both of the task's starts: the task fails, and the boot's pass on m1 stands.
+    services = _moving_target(plan, lost=[(_CORE[0], "m2"), (_CORE[0], "m2")])
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The planner asked for the boot on what `again` left, and it ran there before delivery.
+    assert status.latest()[_CORE[0]].marker == "m2"
+
+
+def test_an_owed_check_that_passed_on_this_tree_is_owed_no_more(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    status = c.ContractStatus.load(tmp_path)
+    for check in contract.checks:
+        result = SimpleNamespace(name=check.gate, member=check.member, passed=True, detail="")
+        status.record("core", result, marker="m1")
+    # What an earlier process left: the boot owed, though it has passed on this tree since.
+    (tmp_path / "planner_events.json").write_text('{"owed": ["core:boot@tp1"]}')
+    core = replace(_task("core", "assemble", _CORE), status="done")
+    plan = _plan_once(core)
+    landed = ["core"]
+    ran = []
+
+    def check(chk):
+        ran.append(chk.key)
+        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
+
+    services = Services(
+        plan=plan, work=lambda task: "UNIT_READY", check=check, free_gpus=lambda: 4,
+        marker=lambda: f"m{len(landed)}",
+    )  # fmt: skip
+    orchestrator = GraphOrchestrator(services, contract, status, tmp_path, poll_s=0)
+    assert orchestrator.run() == "delivered"
+    assert ran == [] and not orchestrator._owed
+
+
+def _three_benchmarks():
+    """Three units' benchmarks at tp1, as a spec with one `accuracy` block for every unit owes."""
+    checks = tuple(
+        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER)
+        for unit in ("core", "multimodal", "mtp")
+    )
+    return c.Contract(checks=checks, confirm=checks[-1].key)
+
+
+def test_a_check_passes_by_its_own_verdict_only(tmp_path):
+    contract = _three_benchmarks()
+    core, multimodal, _ = contract.checks
+    status = c.ContractStatus.load(tmp_path)
+
+    def result(check, passed):
+        return SimpleNamespace(name=check.gate, member=check.member, passed=passed, detail="")
+
+    status.record("core", result(core, True), marker="m1")
+    status.record("multimodal", result(multimodal, False), marker="m2")
+    # Another task lands. The failure is due again; the core's pass on m1 says nothing of it.
+    later = c.evaluate(contract, status, marker="m3")
+    assert multimodal.key in [x.key for x in later.missing]
+    # Nor does a pass of the same benchmark by another unit on this very tree: the two
+    # units serve with different features on.
+    status.record("mtp", result(contract.checks[2], True), marker="m3")
+    same_tree = c.evaluate(contract, status, marker="m3")
+    assert multimodal.key in [x.key for x in same_tree.missing]
+    assert not c.passed_here(contract, status, multimodal, "m3")
+
+
+def test_a_run_is_not_delivered_on_a_failure_it_measured(tmp_path):
+    contract = _three_benchmarks()
+    core, multimodal, mtp = (x.key for x in contract.checks)
+    landed, ran, turns = [], [], []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            tasks = [
+                _task("core", "assemble", [core]),
+                _task("multimodal", "feature", [multimodal], deps=["core"]),
+                _task("mtp", "feature", [mtp], deps=["core"]),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=tasks))
+        return PlannerAnswer("DONE", "all green")  # a planner that repairs nothing
+
+    def work(task):
+        if task.id == "mtp":  # lands once the multimodal benchmark has been judged
+            deadline = time.monotonic() + 20
+            while multimodal not in ran and time.monotonic() < deadline:
+                time.sleep(0.01)
+        landed.append(task.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        ran.append(chk.key)
+        # The multimodal landing broke the text benchmark served without drafts, from then on.
+        broken = chk.key in (core, multimodal) and len(landed) >= 2
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not broken)  # fmt: skip
+
+    services = Services(
+        plan=plan, work=work, check=check, free_gpus=lambda: 4, marker=lambda: f"m{len(landed)}"
+    )
+    status = c.ContractStatus.load(tmp_path)
+    verdict = GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run()
+    # The core passed before the break and mtp passed after it. Neither speaks for the
+    # multimodal benchmark, which the run measured once and saw fail.
+    assert landed == ["core", "multimodal", "mtp"] and ran.count(mtp) == 1
+    assert verdict != "delivered"
+    assert any("the contract does not hold" in e for turn in turns for e in turn.events)
+
+
+def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
+    spec = {
+        "checkpoint_path": "/ckpt/m",
+        "parallel": "unified",
+        "features": ["mtp"],
+        "members": ["tp1", "tp4"],
+        "accuracy": {"benchmark": "gsm8k"},
+    }
+
+    def boots(data):
+        return [x.key for x in c.compile_contract(data, world_size=4).checks if x.gate == "boot"]
+
+    # The core's benchmark and the drafter's acceptance load every member's engine.
+    assert boots(spec) == []
+    assert c.compile_contract(spec, world_size=4).confirm == "mtp:accuracy[gsm8k]@tp1"
+    # The reuse probe is the boot's (and the acceptance gate's), not the benchmark's.
+    reuse = {**spec, "runtime": {"default": {"kv_cache_reuse": True}}}
+    assert boots(reuse) == ["core:boot@tp1", "core:boot@tp4"]
+    # A variant boots at the members its benchmark does not run at.
+    fp8 = {"base": "core", "gates": ["boot", "accuracy"]}
+    fp8["llm_api_options"] = {"kv_cache_config": {"dtype": "fp8"}}
+    assert boots({**spec, "features": [], "variants": {"kv_fp8": fp8}}) == ["kv_fp8:boot@tp1"]
+    # The smoke profile owes the boot alone, which then confirms the final tree.
+    smoke = c.compile_contract({**spec, "features": [], "profile": "smoke"}, world_size=4)
+    assert [x.gate for x in smoke.checks] == ["boot", "boot"] and smoke.confirm == "core:boot@tp1"
+    # A later unit on the smoke profile does not take the confirmation from a benchmark.
+    mixed = {**spec, "features": ["multimodal"], "profile": {"multimodal": "smoke"}}
+    assert c.compile_contract(mixed, world_size=4).confirm == "core:accuracy[gsm8k]@tp1"
+    # Where no unit owes a benchmark, a variant's confirms it, not the core's boot.
+    variant = {**spec, "features": [], "profile": {"core": "smoke"}, "variants": {"kv_fp8": fp8}}
+    assert c.compile_contract(variant, world_size=4).confirm == "kv_fp8:accuracy[gsm8k]@tp4"
+
+
+def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):
+    contract = c.Contract(checks=_STANDING.checks[:2], confirm=_CORE[1])
+    repaired = []
+
+    def plan(turn):
+        if any("checks failed: core:boot@tp1" in e for e in turn.events):
+            repaired.append(turn)
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(_task("fix", "assemble", _CORE[:1], touches=["models/core/"]))
+            return PlannerAnswer("GRAPH_UPDATED", "repair", graph)
+        if not repaired:
+            core = _task("core", "assemble", _CORE)
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core]))
+        return PlannerAnswer("DONE", "all green")
+
+    services = _moving_target(plan, failing=lambda key, marker: (key, marker) == (_CORE[0], "m1"))
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, contract, status, tmp_path, poll_s=0).run() == "delivered"
+    # The repair claims the boot, which runs on what it left. The benchmark that passed
+    # beside the failure stands; it runs once more, to score the final tree.
+    assert services.ran[-2:] == [(_CORE[0], "m2"), (_CORE[1], "m2")]
+    assert sorted(services.ran[:-2]) == [(_CORE[1], "m1"), (_CORE[0], "m1")]
+
+
 @pytest.mark.parametrize(
     "decision, retried",
     [("raised TimeoutError: no answer from the driver", True), ("BLOCKED", False)],
 )
 def test_only_an_infrastructure_failure_is_retried_and_only_once(tmp_path, decision, retried):
     def failing(orchestrator):
-        task = _task("tune", "tune", touches=[])
+        task = _task("core", "assemble", touches=[])
         task.status = "running"
         orchestrator.graph = g.Graph(tasks=[task])
         orchestrator._finish(task, decision, [])
@@ -136,118 +657,6 @@ def test_only_an_infrastructure_failure_is_retried_and_only_once(tmp_path, decis
     )
     # The count is kept with the planner's events: a restarted process does not retry again.
     assert failing(_orchestrator_orchestrator(tmp_path, _services(_plan_once()))) == "failed"
-
-
-def test_a_campaign_starts_once_its_checks_hold_and_the_run_does_not_wait_for_it(tmp_path):
-    """The campaign follows the onboarding; the onboarding's verdict never waits for it."""
-    logs: list[str] = []
-    started: list[tuple[str, tuple[str, ...]]] = []
-    release = threading.Event()
-
-    def work(task):
-        started.append((task.id, tuple(services.ran_checks)))
-        if task.kind == "tune":
-            assert release.wait(10)
-            return "TUNED\ntuned: best branch `tune/x/best`"
-        return "UNIT_READY"
-
-    # Listed first, the campaign still waits for the checks it is gated on.
-    services = _services(
-        _plan_once(_task("tune", "tune", touches=[]), _task("core", "assemble", _KEYS))
-    )
-    services.work, services.log = work, logs.append
-    services.marker = lambda: "v1"
-
-    def correct(marker, evaluation):
-        milestone = c.Milestone(sha="a" * 40, marker=marker, checks=len(evaluation.passed))
-        c.record_milestone(tmp_path, milestone)
-        return milestone
-
-    services.correct = correct
-    orchestrator = _orchestrator_orchestrator(
-        tmp_path, services, required_kinds=("tune",), start_after={"tune": _KEYS}
-    )
-    try:
-        assert orchestrator.run() == "delivered"
-        # Delivered with the campaign still running: handed over, not waited for.
-        assert orchestrator.campaign is not None and not orchestrator.campaign.done()
-    finally:
-        release.set()
-    assert started[0] == ("core", ()) and started[1][0] == "tune"
-    assert set(_KEYS) <= set(started[1][1])
-    assert orchestrator.campaign.result(10)[0].startswith("TUNED")
-    assert [m.marker for m in c.milestones(tmp_path)] == ["v1"]
-    # While the core works, the journal says what the campaign waits for, once per change.
-    waits = [line for line in logs if line.startswith("[gated] tune (tune) waits for")]
-    assert waits and waits[0].endswith(f"{', '.join(_KEYS)} to pass")
-    assert len(waits) == len(set(waits))
-
-
-def test_an_escalation_does_not_wait_for_a_campaign(tmp_path):
-    turns, escalated, release = [], threading.Event(), threading.Event()
-
-    def plan(turn):
-        turns.append(turn)
-        if len(turns) == 1:
-            graph = g.Graph(
-                tasks=[
-                    _task("vision", "feature", ["core:boot@tp1"]),
-                    _task("core", "assemble", _KEYS[1:]),
-                    _task("tune", "tune", touches=[]),
-                ]
-            )
-            return PlannerAnswer("GRAPH_UPDATED", "plan", graph)
-        escalated.set()
-        return PlannerAnswer("ESCALATE", "the checkpoint has no image processor")
-
-    def work(task):
-        if task.id == "vision":
-            return "BLOCKED"
-        if task.kind == "tune":
-            assert release.wait(10)
-            return "TUNED"
-        assert escalated.wait(10)
-        return "UNIT_READY"
-
-    services = _services(plan)
-    services.work = work
-    orchestrator = _orchestrator_orchestrator(
-        tmp_path, services, required_kinds=("tune",), start_after={"tune": [_KEYS[1]]}
-    )
-    try:
-        assert orchestrator.run() == "escalated"
-        assert orchestrator.campaign is not None and not orchestrator.campaign.done()
-    finally:
-        release.set()
-    assert orchestrator.campaign.result(10)[0] == "TUNED"
-
-
-def test_a_campaign_takes_at_most_two_agent_slots_while_the_onboarding_works(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
-
-    loop = _orchestrator_orchestrator(tmp_path, _services(_plan_once()), max_parallel=9)
-    idle = loop.idle_agent_slots()
-    assert idle > orchestrator_mod.CAMPAIGN_SLOTS_BESIDE_ONBOARDING == 2
-    campaign = _task("tune", "tune", touches=[])
-    campaign.status = "running"
-    loop.graph = g.Graph(tasks=[campaign, _task("vision", "feature")])
-    assert loop.campaign_agent_slots() == 2
-    loop._foreground_demand = idle - 1
-    assert loop.campaign_agent_slots() == 1
-    # The onboarding's work all ended: the campaign may take every idle slot.
-    loop.graph.by_id()["vision"].status = "done"
-    loop._foreground_demand = 0
-    assert loop.campaign_agent_slots() == idle
-
-
-def test_unavailable_tune_measurement_leaves_a_resumable_task_without_failure(tmp_path):
-    orch = _orchestrator_orchestrator(tmp_path, _services(_plan_once()))
-    task = _task("tune", "tune", touches=[])
-    task.status = "running"
-    orch.graph = g.Graph(tasks=[task])
-    orch._finish(task, "TUNE_PENDING\nallocation expired", [])
-    assert task.status == "pending" and task.id in orch._deferred_campaigns
-    assert not any("failed" in str(event) for event in orch.events)
 
 
 @pytest.fixture
@@ -353,6 +762,40 @@ def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_ru
     assert "it was adopted" in g.long_goals(failed, retry)[0]
 
 
+def test_an_attempt_the_environment_ended_does_not_spend_a_worker_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent_flow.workflows.trtllm_modeling_v2.run.orchestrator.ENVIRONMENT_RETRIES", 2
+    )
+    orchestrator = _orchestrator_orchestrator(tmp_path, _services(_plan_once()))
+    task = _task("core", "assemble", _KEYS)
+    orchestrator.graph = g.Graph(tasks=[task])
+
+    def ends(attempt, decision):
+        task.attempts, task.status = attempt, "running"
+        orchestrator._finish(task, decision, [])
+        return task.status
+
+    # A lost session, then a provider that fails the turn past its one infrastructure retry.
+    assert ends(1, "BLOCKED\nblocked_reason environment; no gates session") == "failed"
+    raised = "raised RuntimeError: Claude Code turn failed: API Error: 502 Bad Gateway"
+    assert [ends(2, raised), ends(2, raised)] == ["pending", "failed"]
+    # A BLOCKED on the task's own work is its try, and so is one past the environment's budget.
+    assert ends(3, "BLOCKED\nblocked_reason accuracy_shortfall; loads, then NaN") == "failed"
+    assert ends(4, "BLOCKED\nblocked_reason environment; no gates session") == "failed"
+    assert orchestrator.not_started_attempts == {"core": [1, 2]}
+    told = [e.text for e in orchestrator.events if " ended " in e.text]
+    assert ["not counted" in text for text in told] == [True, False, True, False, False]
+    # Two of its four attempts were not its tries: the planner may still ask for its third.
+    retry = g.Graph(tasks=[_task("core", "assemble", _KEYS)])
+    adopted, refused = g.apply_revision(
+        g.Graph(tasks=[task]),
+        retry,
+        "the site is back",
+        not_started_attempts=orchestrator.not_started_attempts,
+    )
+    assert not refused and adopted.tasks[0].attempts == 5
+
+
 _CONCURRENT_CONTRACT = c.Contract(
     checks=(
         c.Check("core", "boot", "tp1", c.TIER_INNER),
@@ -421,6 +864,51 @@ def test_feature_work_on_the_core_waits_for_its_boot(tmp_path):
     assert started.index("mtp") > started.index("core")
 
 
+def test_feature_work_starts_once_the_cores_benchmark_has_scored_though_under_its_floor(tmp_path):
+    benchmark = _STANDING.checks[1]
+    contract = c.Contract(checks=_STANDING.checks[1:3], confirm=_MTP[0])
+    started, turns = [], []
+
+    def task(tid, kind, ref, satisfies=(), **kw):
+        return g.Task(id=tid, kind=kind, ref=ref, goal=f"do {tid}", touches=[f"models/{tid}.py"],
+                      gpus=1, est_minutes=10, satisfies=list(satisfies), **kw)  # fmt: skip
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            mtp = task("mtp", "feature", "mtp", _MTP[:1], depends_on_soft=["core"])
+            core = task("core", "assemble", "core", [benchmark.key])
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=[core, mtp]))
+        if "repair" not in started:
+            graph = g.Graph.load(tmp_path / g.GRAPH_FILENAME)
+            graph.tasks.append(task("repair", "assemble", "core", [benchmark.key]))
+            return PlannerAnswer("GRAPH_UPDATED", "repair the core's numerics", graph)
+        return PlannerAnswer("DONE", "all green")
+
+    def work(t):
+        if t.id == "repair":  # the long part of a bring-up
+            deadline = time.monotonic() + 20
+            while "mtp" not in started and time.monotonic() < deadline:
+                time.sleep(0.01)
+        started.append(t.id)
+        return "UNIT_READY"
+
+    def check(chk):
+        low = chk.key == benchmark.key and "repair" not in started
+        return SimpleNamespace(name=chk.gate, member=chk.member, detail="", tree_state="",
+                               passed=not low, measured=41.0 if low else 93.0)  # fmt: skip
+
+    services = Services(plan=plan, work=work, check=check, free_gpus=lambda: 8)
+    orchestrator = GraphOrchestrator(
+        services, contract, c.ContractStatus.load(tmp_path), tmp_path, poll_s=0.01,
+        after_core=(["mtp"], [benchmark.key]),
+    )  # fmt: skip
+    assert orchestrator.run() == "delivered"
+    # The core's benchmark came back with 41: its engine answers. The feature's work on the
+    # core starts beside the repair, not after the repair's benchmark has passed.
+    assert started.index("mtp") < started.index("repair")
+
+
 def test_a_burst_of_operator_steers_reaches_the_planner_as_one(tmp_path):
     long = inbox.post(tmp_path, "x" * (inbox.MESSAGE_MAX_CHARS + 1))
     inbox.post(tmp_path, "drop the vision work")
@@ -440,153 +928,7 @@ def test_a_burst_of_operator_steers_reaches_the_planner_as_one(tmp_path):
 _WAIT = 10.0
 
 
-_PKG = "tensorrt_llm/_torch/_experimental/modeling_v2"
-
-
-_TARGET = f"{_PKG}/models/fam/newmodel__sm_100__unified"
-
-
-_OWN = g.own_paths(_TARGET)
-
-
-_BOOT = "core:boot@tp1"
-
-
-_regression_batches_CONTRACT = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER),))
-
-
-def _shared(tid, status="pending", **kw):
-    return g.Task(
-        id=tid,
-        kind="kernel",
-        goal=f"do {tid}",
-        touches=[f"{_PKG}/catalog/{tid}.py"],
-        status=status,
-        **kw,
-    )
-
-
-def _core(**kw):
-    return g.Task(
-        id="core",
-        kind="assemble",
-        goal="core",
-        touches=[f"{_TARGET}/modeling.py"],
-        satisfies=[_BOOT],
-        **kw,
-    )
-
-
-def _review(tid, deps=(), status="pending", **kw):
-    return g.Task(
-        id=tid,
-        kind=g.CHECK_KIND,
-        goal="regression check",
-        depends_on=list(deps),
-        regression=True,
-        status=status,
-        **kw,
-    )
-
-
-def _regression_batches_orchestrator(tmp_path, plan, work, regression=None, **kw):
-    services = Services(
-        plan=plan,
-        work=work,
-        check=lambda chk: SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail=""),
-        free_gpus=lambda: 8,
-        regression=regression or (lambda task: []),
-    )
-    kw.setdefault("poll_s", 0.01)
-    status = c.ContractStatus.load(tmp_path)
-    return GraphOrchestrator(
-        services, _regression_batches_CONTRACT, status, tmp_path, own_paths=_OWN, **kw
-    )
-
-
-def _plan(*answers):
-    """A planner whose turns answer in order; DONE once they run out."""
-    turns = []
-
-    def plan(turn):
-        turns.append(turn)
-        if len(turns) <= len(answers):
-            answer = answers[len(turns) - 1]
-            return answer(turn) if callable(answer) else answer
-        return PlannerAnswer("DONE", "all green")
-
-    plan.turns = turns  # type: ignore[attr-defined]
-    return plan
-
-
-def _graph(*tasks):
-    return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=list(tasks)))
-
-
-def _wait_for(predicate):
-    deadline = time.monotonic() + _WAIT
-    while not predicate():
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
-
-
-def test_one_check_runs_at_a_time_and_the_next_takes_what_landed_meanwhile(tmp_path):
-    orchestrator, reviewed = None, []
-
-    def work(task):
-        if task.id == "k2":
-            # k2 lands while r1 runs: it is r1's to leave for the next check.
-            _wait_for(lambda: orchestrator.graph.by_id()["r1"].status == "running")
-        return "LANDED" if task.kind == "kernel" else "UNIT_READY"
-
-    def regression(task):
-        if task.id == "r1":
-            _wait_for(lambda: orchestrator.graph.by_id()["k2"].status == "done")
-        reviewed.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _shared("k2"), _core(), _review("r1", ["k1"]),
-                        _review("r2", ["k2"]), _review("r3", ["k2"])))  # fmt: skip
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, work, regression=regression)
-    assert orchestrator.run() == "delivered"
-    by_id = orchestrator.graph.by_id()
-    assert reviewed == ["r1", "r2"]
-    assert by_id["r1"].covers == ["k1@1"] and by_id["r2"].covers == ["k2@1"]
-    assert by_id["r3"].status == "done" and by_id["r3"].covers == []
-    events = [
-        *(e for t in plan.turns for e in t.events),
-        *(event.text for event in orchestrator.events),
-    ]
-    said = [e for e in events if e.startswith("task r3")]
-    assert said == [
-        "task r3 (regression check) closed: no change to shared code was left for it to "
-        "check: r2 covered what it follows"
-    ]
-
-
-def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):
-    orchestrator, order = None, []
-
-    def check(chk):
-        _wait_for(lambda: orchestrator.graph.by_id()["k1"].status == "done")
-        time.sleep(0.2)  # long enough for a regression check to have started beside it
-        assert orchestrator.graph.by_id()["r1"].status == "pending"
-        order.append(chk.key if hasattr(chk, "key") else "gate")
-        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
-
-    def regression(task):
-        order.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _core(), _review("r1", ["k1"])))
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, lambda task: "LANDED" if task.kind == "kernel"
-                                 else "UNIT_READY", regression=regression)  # fmt: skip
-    orchestrator.s.check = check
-    assert orchestrator.run() == "delivered"
-    assert order[-1] == "r1" and len(order) >= 2
-
-
-def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
+def test_test_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
     # Two-hour allocations handing over 30 min before their end: a two-hour job never starts.
     sessions = (
         SessionSpec("gates", "/g", time_limit_s=7200, handover_lead_s=1800),
@@ -602,9 +944,9 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
                 returncode=0, stdout="MV2FLOW_TEST_ENV 0123456789abcdef\n", stderr=""
             )
 
-    monkeypatch.setattr(regression, "select_command_executor", lambda *args, **kwargs: Executor())
+    monkeypatch.setattr(test_jobs, "select_command_executor", lambda *args, **kwargs: Executor())
     wf = SimpleNamespace(task_data={"trtllm_repo_path": str(tmp_path)}, _gate_env=lambda: env)
-    tree_at, run, python = regression.job_runner(wf, "regression")
+    tree_at, run, python = test_jobs.job_runner(wf, "delivery-tests")
     files = [f"tests/test_{i}.py" for i in range(6)]
 
     def recorded(cache, commit, env_digest=""):
@@ -613,7 +955,7 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         return test_results.Results(commit, env_digest, {f: {"outcome": "passed"} for f in done})
 
     monkeypatch.setattr(test_results, "recorded", recorded)
-    results, jobs, _, _ = regression.record_at(
+    results, jobs, _, _ = test_jobs.record_at(
         "c0ffee",
         files,
         cache_dir=tmp_path,
@@ -623,7 +965,7 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         python=python,
     )
     # The probe is short, and the three two-hour jobs' budget is four 90-minute ones.
-    assert [r.timeout_s for r in observed] == [regression.PROBE_TIMEOUT_S, *[5400] * 4]
+    assert [r.timeout_s for r in observed] == [test_jobs.PROBE_TIMEOUT_S, *[5400] * 4]
     assert jobs == 4 and results.unrun(files) == files[4:]
     assert "--selection" in observed[1].argv
     # A shorter declared default wall bounds the window; off a spool a job runs two hours.
@@ -631,14 +973,14 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
         "g", "/g", time_limit_s=7200, handover_lead_s=1800, scheduler={"default_wall": "75m"}
     )
     walled_env = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled,))
-    assert regression.job_timeout(walled_env) == 4500
-    assert regression.job_timeout(RunEnvironment("local", "p")) == regression.JOB_TIMEOUT_S
+    assert test_jobs.job_timeout(walled_env) == 4500
+    assert test_jobs.job_timeout(RunEnvironment("local", "p")) == test_jobs.JOB_TIMEOUT_S
     # Only the sessions gate jobs reach size them: a longer `work` session on another spool
     # never receives one, while an `any` session on its own spool does.
     longer = SessionSpec("other", "/o", role="work", time_limit_s=4 * 3600, handover_lead_s=600)
     both = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, longer))
-    assert regression.job_timeout(both) == 4500
+    assert test_jobs.job_timeout(both) == 4500
     shared = replace(longer, role="any")
     pooled = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, shared))
-    assert regression.job_timeout(pooled) == regression.JOB_TIMEOUT_S
-    assert regression.max_jobs(regression.JOB_TIMEOUT_S) == 3
+    assert test_jobs.job_timeout(pooled) == test_jobs.JOB_TIMEOUT_S
+    assert test_jobs.max_jobs(test_jobs.JOB_TIMEOUT_S) == 3

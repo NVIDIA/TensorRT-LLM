@@ -18,7 +18,7 @@ Simulates two chained speculative-verification rounds through
 ``KimiKDALinearAttention.forward_verify`` in both worlds:
 
 * Sequential world: the legacy intermediate-buffer path
-  (``forward_verify_sequential``) plus the manager's legacy promotion
+  (``forward_verify_fla``) plus the manager's legacy promotion
   (copy the accepted step's conv window / SSM state into the live pools).
 * Fused world: the ``trtllm::kda_mtp_decode`` replay path
   (``forward_verify_fused``) with per-slot replay caches, in-place state
@@ -426,9 +426,7 @@ def test_fused_vs_sequential_two_rounds(
     # ---- Round 1 (no pending drafts) ----
     x1 = tokens()
     out1_seq = rt_seq._project_output(
-        rt_seq.forward_verify_sequential(
-            x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
+        rt_seq.forward_verify_fla(x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices)
     )
     with with_multi_stream(True):
         out1_fused = rt_fused._project_output(
@@ -456,9 +454,7 @@ def test_fused_vs_sequential_two_rounds(
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
     out2_seq = rt_seq._project_output(
-        rt_seq.forward_verify_sequential(
-            x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
+        rt_seq.forward_verify_fla(x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices)
     )
     core2_fused = x2.new_empty(B * T, num_heads, K)
     with with_multi_stream(True):

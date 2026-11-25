@@ -1004,7 +1004,7 @@ def _as_a_worker_parses(request):
     return type(request).model_validate(msgspec.msgpack.decode(_encode_request_body(request)))
 
 
-def _context_worker(finish_reason="length", retried_as=None):
+def _context_worker(finish_reason="length", retried_as=None, omit_response_disagg_id=False):
     """A context worker; a Responses answer is named after the request_id it parsed.
 
     The request is handed off to generation unless ``finish_reason`` says the
@@ -1027,8 +1027,8 @@ def _context_worker(finish_reason="length", retried_as=None):
         response.prompt_token_ids = [1, 2, 3]
         response.disaggregated_params = DisaggregatedParams(
             request_type="context_only",
-            ctx_request_id=disagg_request_id,
-            disagg_request_id=disagg_request_id,
+            ctx_request_id=None if omit_response_disagg_id else disagg_request_id,
+            disagg_request_id=None if omit_response_disagg_id else disagg_request_id,
         )
         return response
 
@@ -1176,8 +1176,13 @@ async def test_a_reply_follows_a_retried_context_request_to_its_new_disagg_reque
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+@pytest.mark.parametrize(
+    "omit_response_disagg_id",
+    [False, True],
+    ids=["with_response_disagg_id", "early_finish_no_response_disagg_id"],
+)
 async def test_a_reply_the_context_phase_finishes_after_a_retry_carries_the_new_id(
-    monkeypatch, stream
+    monkeypatch, stream, omit_response_disagg_id
 ):
     """The context worker answered under the name from before the retry; the reply does not.
 
@@ -1187,7 +1192,11 @@ async def test_a_reply_the_context_phase_finishes_after_a_retry_carries_the_new_
         monkeypatch,
         "context_first",
         _generation_worker_answer,
-        _context_worker(finish_reason="stop", retried_as=202),
+        _context_worker(
+            finish_reason="stop",
+            retried_as=202,
+            omit_response_disagg_id=omit_response_disagg_id,
+        ),
     )
 
     async def reply_names(**fields):

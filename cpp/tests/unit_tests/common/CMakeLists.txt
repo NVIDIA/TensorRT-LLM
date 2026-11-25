@@ -54,6 +54,17 @@ add_tllm_gtest(
   LABELS
   "unit;common;host")
 add_tllm_gtest(
+  nativeMemoryTest
+  OWNER
+  common
+  SOURCES
+  nativeMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::common_native_memory
+  CUDA::cudart
+  LABELS
+  "unit;common;gpu")
+add_tllm_gtest(
   optionalRefTest
   OWNER
   common
@@ -136,3 +147,14 @@ add_tllm_gtest(
   Threads::Threads
   LABELS
   "unit;common;host")
+
+add_tllm_gtest(
+  ncclWindowSupportTest
+  OWNER
+  common
+  SOURCES
+  ncclWindowSupportTest.cpp
+  LINK_LIBRARIES
+  tllm::common_nccl
+  LABELS
+  "unit;common;nccl;host")

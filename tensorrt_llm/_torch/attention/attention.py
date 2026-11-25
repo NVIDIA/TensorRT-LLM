@@ -179,21 +179,24 @@ def _helix_sanitize_empty_kv(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
     zero_kv_mask: Optional[torch.Tensor],
+    is_lse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Force zero-local-KV rows to a no-op contribution for the Helix combine.
 
     A CP rank that owns no KV blocks for a token attends to zero keys, so the
     attention kernel normalizes by a zero softmax sum and yields NaN. The combine
     weights each rank by sum * exp(max - global_max), so such rows must contribute
-    softmax_stats of (-inf, 0) and a zeroed partial_o to act as a no-op. The rows
+    softmax_stats of (-inf, 0), or base-2 LSE of -inf, and a zeroed partial_o. The rows
     are selected by zero_kv_mask, which is robust regardless of what the kernel
     wrote. Passing None disables sanitization.
 
     Args:
         partial_o: Partial attention output, shape [num_tokens, ...].
-        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2].
+        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2],
+            or base-2 LSE with final dimension 1.
         zero_kv_mask: Bool tensor of shape [num_tokens], True where this rank has
             zero local KV.
+        is_lse: Whether softmax_stats contains compact base-2 LSE.
     """
     if zero_kv_mask is None:
         return partial_o, softmax_stats
@@ -202,13 +205,24 @@ def _helix_sanitize_empty_kv(
     # masked_fill overwrites masked rows regardless of their current (possibly NaN)
     # value and is CUDA-graph safe due to static shapes.
     partial_o = partial_o.masked_fill(mask, 0.0)
+    if is_lse:
+        return partial_o, softmax_stats.masked_fill(mask.unsqueeze(-1),
+                                                    float("-inf"))
     sm_max = softmax_stats[..., 0].masked_fill(mask, float("-inf"))
     sm_sum = softmax_stats[..., 1].masked_fill(mask, 0.0)
     softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
     return partial_o, softmax_stats
 
 
-# Distinct input specializations the NCCL reformat helpers below have been
+# Dynamo counts recompiles per code object for the lifetime of the process and,
+# past the limit (8 by default), runs the frame eagerly without raising. The
+# compiled NCCL reformat helpers below specialize once per CUDA-graph batch
+# shape, and a server can capture more batch sizes than that, so give them
+# their own headroom. The cap exists to catch runaway recompilation, not as a
+# correctness property.
+_HELIX_NCCL_RECOMPILE_LIMIT = 256
+
+# Distinct input specializations the compiled NCCL reformat helpers have been
 # asked to compile. ``dynamic=False`` specializes on the input shapes and
 # ``cp_size``, so this set tracks the same thing dynamo's per-frame cache does.
 _HELIX_NCCL_SHAPES: set = set()
@@ -218,12 +232,12 @@ _HELIX_NCCL_LIMIT_REPORTED = False
 def _helix_note_nccl_specialization(partial_o: torch.Tensor,
                                     softmax_stats: torch.Tensor,
                                     cp_size: int) -> None:
-    """Warn once if the Helix NCCL reformat is past dynamo's recompile budget.
+    """Warn once if the compiled Helix NCCL reformat is past its recompile budget.
 
-    Past ``cache_size_limit`` dynamo stops compiling and runs the frame eagerly
-    without raising, which silently gives back the fusion these helpers exist
-    for. Report it once per process so the regression is visible in the log
-    instead of only in a kernel trace.
+    Past ``_HELIX_NCCL_RECOMPILE_LIMIT`` dynamo stops compiling and runs the
+    frame eagerly without raising, which silently gives back the fusion these
+    helpers exist for. Report it once per process so the regression is visible
+    in the log instead of only in a kernel trace.
     """
     global _HELIX_NCCL_LIMIT_REPORTED
     if _HELIX_NCCL_LIMIT_REPORTED:
@@ -232,55 +246,34 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
     if key in _HELIX_NCCL_SHAPES:
         return
     _HELIX_NCCL_SHAPES.add(key)
-    try:
-        import torch._dynamo as _dynamo
-        limit = getattr(_dynamo.config, "cache_size_limit", None)
-    except ImportError:
-        limit = None
-    if limit is None or len(_HELIX_NCCL_SHAPES) <= limit:
+    if len(_HELIX_NCCL_SHAPES) <= _HELIX_NCCL_RECOMPILE_LIMIT:
         return
     _HELIX_NCCL_LIMIT_REPORTED = True
     logger.warning(
-        "Helix NCCL all-to-all reformat has seen %d distinct input "
-        "specializations, above torch._dynamo.config.cache_size_limit=%d. "
-        "Dynamo stops recompiling past that limit and runs these helpers "
-        "eagerly without raising, losing the sanitize/transpose fusion. "
-        "Reduce the number of CUDA-graph batch buckets or raise "
-        "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
+        "Helix NCCL all-to-all reformat has seen %d distinct CUDA-graph input "
+        "specializations, above its recompile limit of %d. Dynamo stops "
+        "recompiling past that limit and runs these helpers eagerly without "
+        "raising, losing the sanitize/transpose fusion.",
+        len(_HELIX_NCCL_SHAPES), _HELIX_NCCL_RECOMPILE_LIMIT)
 
 
-# NCCL needs each all-to-all chunk to be contiguous. Inductor can pad the
-# transposed buffers that the chunks are split from, even with
-# ``pad_outputs=False``, so turn padding off for this helper. This keeps the
-# fused kernels and avoids a copy of each chunk after the compiled call.
-@torch.compile(dynamic=False, options={"comprehensive_padding": False})
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
     zero_kv_mask: Optional[torch.Tensor],
     cp_size: int,
+    is_lse: bool = False,
 ) -> List[torch.Tensor]:
     """Sanitize zero-local-KV rows and reformat into the alltoall send layout.
 
-    ``_helix_sanitize_empty_kv`` followed by the transpose and split
-    ``_helix_post_process`` used to do inline. Both live in one compiled region
-    so inductor folds the fill into the transposed store instead of writing
-    ``partial_o`` and reading it straight back. Dynamo inlines the call, so the
-    sanitize has exactly one definition and the fusion is unaffected.
-
-    ``dynamic=False`` is deliberate. With dynamic shapes inductor emits a much
-    slower transposed store, and picks different grids on different ranks for
-    the same shape, which cancels the win at the collective.
-
-    The cost is one specialization per CUDA-graph batch bucket. Exceeding
-    dynamo's ``cache_size_limit`` falls back to eager SILENTLY -- the symptom is
-    ``triton_poi_fused_*`` disappearing from the trace, not an error, so
-    ``_helix_note_nccl_specialization`` counts the distinct shapes at the call
-    site and says so once.
+    When compiled, inductor folds the fill into the transposed store instead of
+    writing ``partial_o`` and reading it straight back. Dynamo inlines the
+    sanitize call, so it has exactly one definition and the fusion is
+    unaffected.
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o,
                                                         softmax_stats,
-                                                        zero_kv_mask)
+                                                        zero_kv_mask, is_lse)
     chunks = []
     for t in (partial_o, softmax_stats):
         t = t.transpose(1, 0).contiguous()
@@ -288,11 +281,38 @@ def _helix_nccl_pre_alltoall(
     return chunks
 
 
-@torch.compile(dynamic=False)
 def _helix_nccl_post_alltoall(
         gathered: List[torch.Tensor]) -> List[torch.Tensor]:
     """Reformat the gathered partials into the helix_post_process layout."""
     return [t.transpose(1, 2).contiguous() for t in gathered]
+
+
+def _compile_helix_nccl_reformat(fn, options: Optional[dict] = None):
+    """Compile an NCCL reformat helper for CUDA-graph batches.
+
+    ``dynamic=False`` is deliberate. With dynamic shapes inductor emits a much
+    slower transposed store, and picks different grids on different ranks for
+    the same shape, which cancels the win at the collective. The cost is one
+    specialization per captured batch shape, compiled during graph warmup.
+    """
+    compiled_fn = torch.compile(fn, dynamic=False, options=options)
+
+    def wrapper(*args):
+        with torch._dynamo.config.patch(
+                recompile_limit=_HELIX_NCCL_RECOMPILE_LIMIT):
+            return compiled_fn(*args)
+
+    return wrapper
+
+
+# NCCL needs each all-to-all chunk to be contiguous. Inductor can pad the
+# transposed buffers that the chunks are split from, even with
+# ``pad_outputs=False``, so turn padding off for this helper. This keeps the
+# fused kernels and avoids a copy of each chunk after the compiled call.
+_helix_nccl_pre_alltoall_compiled = _compile_helix_nccl_reformat(
+    _helix_nccl_pre_alltoall, options={"comprehensive_padding": False})
+_helix_nccl_post_alltoall_compiled = _compile_helix_nccl_reformat(
+    _helix_nccl_post_alltoall)
 
 
 def _helix_post_process(
@@ -304,6 +324,8 @@ def _helix_post_process(
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
     zero_kv_mask: Optional[torch.Tensor] = None,
+    is_cuda_graph: bool = False,
+    is_lse: bool = False,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -313,27 +335,42 @@ def _helix_post_process(
     (``head_dim`` for MHA; for MLA ``kv_lora_rank``, or ``v_head_dim`` when
     the V up-projection runs before the exchange).
 
+    All ranks use the same normalizer format: natural-log max/sum pairs by
+    default, or compact base-2 LSE with final dimension one when is_lse=True.
+
     zero_kv_mask marks tokens this CP rank owns no KV for; those rows are forced
     to a no-op contribution before the exchange, exactly once per backend:
       NCCL     in _helix_nccl_pre_alltoall, fused with the reformat
       fifo v2  in the all-to-all sender, while the entry is in shared memory
       fifo v1  here, via _helix_sanitize_empty_kv
 
+    is_cuda_graph selects the compiled NCCL reformat. CUDA-graph batches are
+    padded to the captured batch sizes, so all of their compiles happen during
+    graph warmup. Any other batch, such as a mixed context and generation
+    batch, carries an arbitrary generation-token count, so it runs the same
+    reformat eagerly instead of compiling a new variant mid-serving.
+
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
     """
+    stats_width = 1 if is_lse else 2
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
         # inductor can fuse it into the reformat.
-        _helix_note_nccl_specialization(partial_o, softmax_stats,
-                                        mapping.cp_size)
-        chunks = _helix_nccl_pre_alltoall(partial_o, softmax_stats,
-                                          zero_kv_mask, mapping.cp_size)
-        gathered = alltoall_helix(chunks, mapping.cp_group)
-        gathered = _helix_nccl_post_alltoall(gathered)
+        if is_cuda_graph:
+            _helix_note_nccl_specialization(partial_o, softmax_stats,
+                                            mapping.cp_size)
+            pre_alltoall = _helix_nccl_pre_alltoall_compiled
+            post_alltoall = _helix_nccl_post_alltoall_compiled
+        else:
+            pre_alltoall = _helix_nccl_pre_alltoall
+            post_alltoall = _helix_nccl_post_alltoall
+        chunks = pre_alltoall(partial_o, softmax_stats, zero_kv_mask,
+                              mapping.cp_size, is_lse)
+        gathered = post_alltoall(alltoall_helix(chunks, mapping.cp_group))
         return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
-                                                   1.0)
+                                                   1.0, is_lse)
     else:
         # FIFO-based implementation using MNNVL workspace.
         helix = HelixAllToAllNative.get(mapping)
@@ -343,7 +380,7 @@ def _helix_post_process(
 
         if fifo_version == 1:
             partial_o, softmax_stats = _helix_sanitize_empty_kv(
-                partial_o, softmax_stats, zero_kv_mask)
+                partial_o, softmax_stats, zero_kv_mask, is_lse)
 
             def reshape_o():
                 return partial_o.view(num_tokens, cp_size, num_heads_tp_cp,
@@ -351,7 +388,8 @@ def _helix_post_process(
 
             def reshape_s():
                 return softmax_stats.view(num_tokens, cp_size, num_heads_tp_cp,
-                                          2).transpose(1, 2).contiguous()
+                                          stats_width).transpose(
+                                              1, 2).contiguous()
 
             if aux_stream is not None and ln_events is not None:
                 partial_o, softmax_stats = maybe_execute_in_parallel(
@@ -366,9 +404,9 @@ def _helix_post_process(
                 softmax_stats = reshape_s()
 
             partial_o_out, softmax_stats_out = helix.alltoall_native(
-                partial_o, softmax_stats)
+                partial_o, softmax_stats, is_lse=is_lse)
             return torch.ops.trtllm.helix_post_process_native(
-                partial_o_out, softmax_stats_out, 1.0, 2)
+                partial_o_out, softmax_stats_out, 1.0, 2, is_lse)
         else:
             # fifo_v2: one entry is one token, and the sender already streams
             # every byte through shared memory, so the sanitize rides along
@@ -376,16 +414,19 @@ def _helix_post_process(
             partial_o = partial_o.view(num_tokens, cp_size,
                                        num_heads_tp_cp * value_dim)
             softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                               num_heads_tp_cp * 2)
+                                               num_heads_tp_cp * stats_width)
             partial_o_out, softmax_stats_out = helix.alltoall_native(
-                partial_o, softmax_stats,
-                None if zero_kv_mask is None else zero_kv_mask[:num_tokens])
+                partial_o,
+                softmax_stats,
+                None if zero_kv_mask is None else zero_kv_mask[:num_tokens],
+                is_lse=is_lse)
             gathered_o = partial_o_out.view(num_tokens, cp_size,
                                             num_heads_tp_cp, value_dim)
             gathered_stats = softmax_stats_out.view(num_tokens, cp_size,
-                                                    num_heads_tp_cp, 2)
+                                                    num_heads_tp_cp,
+                                                    stats_width)
             return torch.ops.trtllm.helix_post_process_native(
-                gathered_o, gathered_stats, 1.0, 1)
+                gathered_o, gathered_stats, 1.0, 1, is_lse)
 
 
 def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
@@ -493,6 +534,14 @@ def maybe_allgather_for_helix_cp(
         hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states
+
+
+def _is_forward_metadata(attn_metadata: AttentionMetadata) -> bool:
+    """Whether ``attn_metadata`` is the metadata registered for the current model forward."""
+    extra_attrs = get_model_extra_attrs()
+    metadata_ref = (extra_attrs.get("attention_metadata")
+                    if extra_attrs is not None else None)
+    return metadata_ref is not None and metadata_ref() is attn_metadata
 
 
 class Attention(nn.Module):
@@ -753,6 +802,7 @@ class Attention(nn.Module):
             use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
         self.quant_config = config.get_quant_config()
+        self._preserve_kv_cache_quant_algo = config._preserve_kv_cache_quant_algo
         self.attn_backend = config.attn_backend
 
         sparse_attn_cfg = config.sparse_attention_config
@@ -986,7 +1036,8 @@ class Attention(nn.Module):
                                    self.mapping,
                                    self.num_heads_tp_cp,
                                    self.head_dim,
-                                   zero_kv_mask=zero_kv_mask)
+                                   zero_kv_mask=zero_kv_mask,
+                                   is_cuda_graph=attn_metadata.is_cuda_graph)
 
     def _attn_impl(
         self,
@@ -1178,7 +1229,7 @@ class Attention(nn.Module):
             if "mrope_position_deltas" in mrope_config:
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
-        use_custom_inplace_op = self._use_custom_inplace_op()
+        use_custom_inplace_op = self._use_custom_inplace_op(attn_metadata)
         # A GQA decode layer offers its output gate to the backend kernels; the custom op cannot carry it.
         backend_gate = (output_gate if self.use_gqa_decode_fmha
                         and self.sparse_attn_hooks is None
@@ -1234,14 +1285,21 @@ class Attention(nn.Module):
 
         return output
 
-    def _use_custom_inplace_op(self) -> bool:
+    def _use_custom_inplace_op(self, attn_metadata: AttentionMetadata) -> bool:
         """Whether forward_impl runs the backend through attn_custom_op_inplace (torch.compile or breakable CUDA
-        graph)."""
+        graph).
+
+        Under a breakable CUDA graph, metadata other than the forward's registered one (e.g. a draft
+        view) runs the backend directly when the backend needs no host-side plan for it.
+        """
         # Currently only TRTLLM and FLASHINFER support the custom inplace op.
         return (self.register_to_config
                 and (self.attn_backend == "TRTLLM"
                      or self.attn_backend == "FLASHINFER")
-                and (is_torch_compiling() or is_in_breakable_cuda_graph())
+                and (is_torch_compiling() or
+                     (is_in_breakable_cuda_graph() and
+                      (_is_forward_metadata(attn_metadata)
+                       or not self.attn.runs_without_host_plan(attn_metadata))))
                 and not self.is_marlin_enabled)
 
     def forward(
@@ -1308,7 +1366,7 @@ class Attention(nn.Module):
         # The custom op cannot carry a KV-append plan to the backend.
         q, k, v, gate, kv_append = self.preprocess_qkv(
             qkv, position_ids, attn_metadata if self.use_gqa_decode_fmha
-            and not self._use_custom_inplace_op() else None)
+            and not self._use_custom_inplace_op(attn_metadata) else None)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:

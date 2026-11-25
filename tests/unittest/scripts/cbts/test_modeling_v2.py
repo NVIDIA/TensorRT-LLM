@@ -31,8 +31,8 @@ from cbts.rules.modeling_v2 import ModelingV2Rule
 
 pytestmark = pytest.mark.cpu_only
 
-_SRC = "tensorrt_llm/_torch/_experimental/modeling_v2"
-_ABS = "tensorrt_llm._torch._experimental.modeling_v2"
+_SRC = "tensorrt_llm/_torch/modeling_v2"
+_ABS = "tensorrt_llm._torch.modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2"
 _ACC = "accuracy/modeling_v2"
 

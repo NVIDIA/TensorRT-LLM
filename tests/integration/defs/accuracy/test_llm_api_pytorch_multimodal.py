@@ -20,6 +20,8 @@ from typing import ClassVar
 import numpy as np
 import pytest
 from PIL import Image
+from pytest_mock import MockerFixture
+from test_common.moe_tactics import skip_unless_moe_tactic_runs_here
 from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
@@ -317,9 +319,9 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(183000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_tactic",
         [
-            (4, 1, 4, False, True, True, "TRTLLM"),
+            (4, 1, 4, False, True, True, "trtllm_gen"),
         ],
         ids=[
             "latency_moe_trtllm",
@@ -327,15 +329,16 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus(
         self,
-        tp_size,
-        pp_size,
-        ep_size,
-        attention_dp,
-        cuda_graph,
-        overlap_scheduler,
-        moe_backend,
-        mocker,
-    ):
+        tp_size: int,
+        pp_size: int,
+        ep_size: int,
+        attention_dp: bool,
+        cuda_graph: bool,
+        overlap_scheduler: bool,
+        moe_tactic: str,
+        mocker: MockerFixture,
+    ) -> None:
+        skip_unless_moe_tactic_runs_here(moe_tactic)
         mocker.patch.dict(
             MMMU.EVALUATE_KWARGS,
             {
@@ -346,7 +349,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            moe_config=MoeConfig(backend=moe_backend),
+            moe_config=MoeConfig(tactic=moe_tactic),
         )
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
@@ -512,6 +515,9 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(
                 max_batch_size=self.MAX_BATCH_SIZE, enable_padding=True
             ),
+            # Stays on a backend literal: on SM103 the default modeling_v2
+            # routes this checkpoint to the Qwen3.8-Flash-Next target, which
+            # honors no tactic, so a tactic would build the built-in model.
             moe_config=MoeConfig(backend=moe_backend),
             speculative_config=MTPDecodingConfig(max_draft_len=3),
         ) as llm:

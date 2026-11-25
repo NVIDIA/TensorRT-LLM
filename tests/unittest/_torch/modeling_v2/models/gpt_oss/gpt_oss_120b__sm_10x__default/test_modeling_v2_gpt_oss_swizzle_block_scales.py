@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
     native_ops,
     weights,
 )

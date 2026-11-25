@@ -8,10 +8,10 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.modeling import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.modeling import (  # noqa: E501
     M3Eagle3Worker,
     _M3ShardDraftLogits,
 )

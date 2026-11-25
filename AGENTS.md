@@ -119,7 +119,9 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/PAGE_TABLE_SPEC_GUIDE.md` | The page table spec each KV cache manager states for disaggregated transfer and KV cache sharing — **read before changing a KV cache manager's roles, layer naming or page table spec** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md` | Recurrent state (Mamba2, GDN, KDA): the state a model declares, how shared runtime code finds the declaration, and what a family provides to its cache manager — **read before adding a recurrent family or a check on a recurrent model or cache manager** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -132,6 +134,7 @@ Encoder and LLM forward Params are execution views.
 | **Attention backends** | `TorchLlmArgs.attn_backend` selects kernel: `TRTLLM` (default), `FlashInfer`, `FlashAttention` |
 | **Distributed execution** | Tensor/pipeline parallelism via `Mapping` class, multiple backends (MPI, Ray, RPC) |
 | **Auto-discovery** | Models self-register via `automodel.py`, resolved by HF config `architectures` field |
+| **Per-step device copies** | New per-step H2D/D2D copies in runtime code go through `_torch/pyexecutor/device_copy.py` with a named `CopySite`; a model opts in by declaring a `CopyPlan` (`copy_plan`). The step-input pack (`step_inputs.py`, `h2d_cache.py`, `tensorrt_llm/_device_copy.py`, `RuntimeHooks.pack_*` / `skip_unchanged_h2d`) is legacy: keep its users working, add no new ones. See [the copy plan guide](docs/source/developer-guide/device-copy-plan.md) |
 
 ## VisualGen
 
@@ -153,10 +156,11 @@ Key files:
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
 - **Protected APIs exist** — changes to LLM API signatures will fail `tests/unittest/api_stability` tests. Get code owner review.
-- **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
+- **Test hardware and model weights** — set `LLM_MODELS_ROOT` for tests that use model weights. Unit tests can also require GPUs; only `cpu_only`-marked unit tests run in the CPU-only stages.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
+- **Replacing a shared runtime mechanism** — add the new one beside the old, opt-in and off by default, so code on the old one keeps its behavior and performance; move models in follow-up PRs and delete the old mechanism last. Do not delete or change the old API in the PR that introduces the new one.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow
@@ -185,6 +189,9 @@ The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub
 
 ## CI / Testing
 
+Before adding or changing tests, CI registrations or waivers, read the shared
+[test guidance](tests/AGENTS.md) and the applicable scoped guides it links to.
+
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 | Layer | Location | Notes |
@@ -208,8 +215,8 @@ Jenkins runs a full-project check with path/module and symbol exclusions.
 Whole-project checks always return success; file-list checks can opt into
 `--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
 section in `pyproject.toml` defines product roots, diagnostics, and native exclusions.
-`[tool.pyrefly-tests]` in the same file defines test roots, helper search paths,
-and diagnostic overrides. The wrapper generates a temporary test configuration
+`[tool.pyrefly-tests]` in the same file defines test roots and helper search paths.
+The wrapper generates a temporary test configuration
 that inherits shared rules and exclusions, runs each scope separately, and
 combines the diagnostics into one report. Temporary configurations are removed
 after the check. Mixed file
@@ -221,43 +228,19 @@ PyTorch, generated bindings, and configured third-party libraries. In test file-
 mode, missing imports of declared dependencies that are not installed are also
 filtered; full-project scans retain them. Release-Check installs pytest so that
 `pytest.skip()` remains recognizable as a terminating call.
-The test configuration disables `missing-argument`, `unexpected-keyword`, and
-`bad-argument-count`; these diagnostics remain enabled for product code. Other
-configured diagnostics, including `unbound-name` and `missing-import`, remain
-enabled for tests. Product import resolution uses only the project root as its
-search path, with fallback resolution disabled. The broader helper search paths
+Tests use the same diagnostics as product code, including `missing-argument`,
+`unexpected-keyword`, and `bad-argument-count`. The wrapper reads literal
+`__extra_import_path__` lists or tuples under `tests/` without running test code and adds
+existing directories to the shared search path for all test files. Ancestors of
+the declaring file are skipped because fallback searches them per file. Product
+checks use only the project root, with fallback disabled. The broader helper search paths
 and fallback resolution apply only to the test pass. `--no-path-module-filter`
 disables exclusions in both passes while preserving their separate search paths
-and diagnostic settings.
+and shared diagnostics.
 
-New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
-`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
-CI controls test concurrency through `parallel_run_ctest`. `google-tests`
-continues to build all C++ tests; component aggregate targets build migrated tests.
-C++ integration fixtures build the collected tests with incremental native targets.
-`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
-`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
-legacy and full-stack executables. OWNER aggregates are component subsets and
-are not interchangeable with these directory targets.
-The Linux Release source-build fixture reuses the installed CI library for the
-RNN formatter test. CI source and wheel use the same commit and image per
-architecture. Link/load errors fail the tests. Direct CMake builds use source
-libraries unless explicitly configured otherwise.
-`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
-and publishes the `cpp_test_bundle` CMake component as a separate
-`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
-programs. Only `-CPP-` stages using this build configuration fetch and unpack
-the companion into `src/cpp/build`, including fat-image consumers. Build reuse
-requires both artifacts. Linux Release integration fixtures use this bundle
-directly, retaining CTest selection and retries. The two FMHA tests share a
-test-only library packaged next to their executables; other runtime libraries
-come from the matching installed wheel. Test artifacts keep symbols but omit
-BOLT's extra relocation records.
-CPP stages collect only `tests/integration/defs/cpp` and use the standard test
-environment setup. CTest discovers cases on the test node, so the build stage
-does not need a GPU. Without a bundle, or with
-an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
+Before changing C++ test sources, build targets, packaging or the integration
+fixtures under `tests/integration/defs/cpp/`, read the scoped
+[C++ test guidance](cpp/tests/AGENTS.md).
 
 ### Vendor source tools and promotion
 

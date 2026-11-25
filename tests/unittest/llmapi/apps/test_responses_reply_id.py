@@ -127,15 +127,16 @@ def _rendering_faked(monkeypatch):
 
         return list(messages), no_media(), {}, None
 
-    async def render(resources, **kwargs):
-        return SimpleNamespace(token_ids=[1, 2, 3], text=None)
+    async def render(resources, mm_coroutines, **kwargs):
+        media = await mm_coroutines
+        return SimpleNamespace(token_ids=[1, 2, 3], text=None), media
 
     resources = SimpleNamespace(extension=SimpleNamespace(serialize_tool=lambda tool: tool))
     monkeypatch.setattr(responses_utils, "parse_chat_messages_coroutines", parse)
     monkeypatch.setattr(
         responses_utils, "RenderResources", SimpleNamespace(from_parts=lambda **kw: resources)
     )
-    monkeypatch.setattr(responses_utils, "render_conversation", render)
+    monkeypatch.setattr(responses_utils, "render_conversation_with_media", render)
     monkeypatch.setattr(responses_utils, "resolve_top_level_model_type", lambda cfg: "qwen3")
     monkeypatch.setattr(
         responses_utils, "add_thinking_budget_logits_processor", lambda *a, **k: None

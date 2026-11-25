@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Optional
@@ -27,18 +28,30 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparsePa
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNIntermediateState,
+    GDNMtpReplayState,
     GDNReplayState,
     ReplayStateUpdateMetadata,
     create_gdn_state,
     estimate_gdn_replay_bytes_per_slot,
     validate_gdn_layout,
 )
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import (
+    InforwardSnapshotHost,
+    InforwardSnapshots,
+)
+from tensorrt_llm._torch.modules.fla.replay_region import REPLAY_STATE_REGION, GDNReplayRegion
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MambaAcceptanceBatch,
     _get_local_mamba_cache_layout,
+    _is_disagg_context_server,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -48,6 +61,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, Pag
 
 if TYPE_CHECKING:
     import transformers
+
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # Storage-layout constants; model geometry comes from QSASparseParams.
 _IDENTITY_PAGE_INDEX_EXPANSION = 1
@@ -168,12 +183,13 @@ def _qwen4_exp_ple_state_bytes_per_rank(
     return local_ple_layers * ple_bytes_per_layer
 
 
-class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
+class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2):
     """Hybrid GDN/KV manager with lifecycle-coupled sparse side buffers.
 
     QSA adds a per-layer index-K cache and request-wide position coordinates.
     These buffers share the main K/V allocation, eviction, and prefix-reuse
-    lifecycle. This manager owns GDN replay and PLE state, while the parent
+    lifecycle. This manager owns GDN replay and PLE state, and the in-forward
+    snapshots of both when the model implements the split, while the parent
     manages common pool allocation and request lifecycles.
 
     Index geometry is resolved from the same serving/checkpoint configuration
@@ -183,12 +199,39 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
     _supports_mixed_precision_kv = False
+    mamba_metadata_cls = GDNMambaMetadata
+    _replay_region: GDNReplayRegion | None = None
+    _context_only = False
+    # A model that implements the in-forward snapshot split opts in per instance
+    # (inforward_snapshot_min_main).
+    _supports_inforward_snapshot = False
+    # Whether the model's GDN layers verify drafts with the fused kernels, which
+    # commit in-layer at every batch size.
+    gdn_fused_verify = False
+    # Whether the model's GDN layers can verify drafts with the GDN MTP replay
+    # kernels (modules/mamba/gdn_mixer.py) instead of the cached replay.
+    gdn_mtp_replay = False
 
     # The parent opts in because its draft pool is attention-only. QSA's is
     # not: each draft layer adds a Role.INDEX_KEY buffer and a
     # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.
     # KvCacheCreator reads this off the class, so dense Qwen4-Exp opts out too.
     _supports_draft_reuse_match_backoff = False
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """PLE state is computed from replicated inputs and index positions are request-wide
+        coordinates, so every rank holds the same bytes; so do the packed side planes. They carry
+        no head axis, which splitting them by the rank's KV heads would assume."""
+        spec = super().page_table_spec()
+        if self._replay_region is not None:
+            spec = replace(
+                spec, untransferred_roles=spec.untransferred_roles | self._replay_region.roles
+            )
+        roles = (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES)
+        return replace(
+            spec, role_layouts={**spec.role_layouts, **{role: Replicated() for role in roles}}
+        )
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
@@ -210,10 +253,24 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         layer_mask=None,
         use_replay_state_update: bool | None = None,
         qwen4_exp_ple_cache_params: Qwen4ExpPLECacheParams | None = None,
+        gdn_fused_verify: bool = False,
+        gdn_mtp_replay: bool = False,
+        inforward_snapshot_min_main: int = 0,
         **kwargs,
     ) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
+        self.gdn_fused_verify = gdn_fused_verify
+        self.gdn_mtp_replay = gdn_mtp_replay
+        # A disaggregated context server never decodes and keeps no replay history.
+        self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
+        self._replay_region = None
+        # The model implements the in-forward snapshot split (GDN and PLE state at P) and opts in
+        # by naming its fewest chunk tokens before P; 0 leaves the path off.
+        self._supports_inforward_snapshot = inforward_snapshot_min_main > 0
+        self._inforward_min_main_request = inforward_snapshot_min_main
+        self._inforward_snapshots = InforwardSnapshots()
+        self._inforward_stage_ple: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._ple_params = qwen4_exp_ple_cache_params
         self._pretrained_config = pretrained_config
         self.qsa_index_dim = self.qsa_index_kv_heads = 0
@@ -674,6 +731,57 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             f"[{num_state_slots}, {self._ple_ngram_context_shape[0]}] (int64)"
         )
 
+    @override
+    def _setup_inforward_snapshots(self) -> None:
+        """Add staging rows for each local PLE layer's conv state and n-gram history.
+
+        They share the GDN slot, so the snapshot at P stages them too, and their windows at P must
+        lie inside the chunk, which raises the floor on chunk tokens before P.
+        """
+        super()._setup_inforward_snapshots()
+        snapshots = self._inforward_snapshots
+        rows = snapshots.rows
+        if rows == 0:
+            return
+        min_main = max(snapshots.min_main, self._inforward_min_main_request)
+        device = self.all_ssm_states[0].device
+        for layer_id in self._ple_layer_ids:
+            if layer_id not in self.layer_offsets:
+                continue
+            self._inforward_stage_ple[layer_id] = (
+                torch.empty(
+                    [rows] + self._ple_conv_state_shape,
+                    dtype=self._ple_conv_state_dtype,
+                    device=device,
+                ),
+                torch.empty(
+                    [rows] + self._ple_ngram_context_shape, dtype=torch.long, device=device
+                ),
+            )
+            min_main = max(
+                min_main, self._ple_conv_state_shape[-1], self._ple_ngram_context_shape[0]
+            )
+        snapshots.min_main = min_main
+        logger.info(
+            f"In-forward Mamba snapshots: PLE staging for layers {sorted(self._inforward_stage_ple)}, "
+            f"at least {min_main} chunk tokens before the snapshot point"
+        )
+
+    def inforward_ple_stage_views(
+        self, layer_idx: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """A PLE layer's staging rows: conv state ``[rows, channels, state_len]`` and n-gram
+        history ``[rows, ngram_size - 1]``; None without in-forward snapshots."""
+        return self._inforward_stage_ple.get(layer_idx)
+
+    @override
+    def _inforward_extra_restore_buffers(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        buffers = []
+        for layer_id, (stage_conv, stage_ngram) in self._inforward_stage_ple.items():
+            buffers.append((self._ple_conv_states[layer_id], stage_conv))
+            buffers.append((self._ple_ngram_contexts[layer_id], stage_ngram))
+        return buffers
+
     def ple_layer_cache(self, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Return persistent ``(conv_state, ngram_context)`` pools for a layer."""
         conv = self._ple_conv_states.get(layer_idx)
@@ -715,25 +823,159 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         )
         return state
 
+    def get_replay_dummy_request_mask(self) -> torch.Tensor | None:
+        """The batch-ordered dummy-request mask of the last state-index setup.
+
+        The GDN MTP replay skips dummy rows; the buffer address stays fixed.
+        """
+        return self._dummy_request_mask
+
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay and one all-layer checkpoint commit; other
+        batches commit inside each layer, as the fused target verify of the
+        model's GDN layers (gdn_fused_verify) does at every batch size."""
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if (
+            not isinstance(self._speculative_state, GDNReplayState)
+            or self._context_only
+            or not self.mamba_pp_layers
+        ):
+            return providers
+        self._replay_region = GDNReplayRegion(
+            self._speculative_state,
+            self._state_layout,
+            self.layer_offsets,
+            self._index_mapper_capacity,
+            self.kv_cache_config.max_util_for_resume,
+        )
+        return (*providers, self._replay_region)
+
     @override
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
         buffers = super()._get_recurrent_buffer_configs(global_layer_id)
+        if self._replay_region is not None:
+            buffers += self._replay_region.shared_buffers(global_layer_id)
         if global_layer_id in self._ple_layer_ids:
             buffers.extend(self._ple_buffer_configs())
         return buffers
 
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """The generation worker starts the replay history afresh."""
+        roles = super().get_disagg_ignored_roles()
+        if self._replay_region is not None:
+            roles |= self._replay_region.roles
+        return roles
+
     @classmethod
     @override
-    def _estimate_private_replay_bytes_per_slot(cls, model_config, mapping, **kwargs) -> int:
-        return estimate_gdn_replay_bytes_per_slot(
-            model_config, mapping, flashinfer_ring=False, **kwargs
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config,
+        **kwargs,
+    ) -> int:
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
+        return GDNReplayRegion.estimate_fixed_bytes(
+            estimate_gdn_replay_bytes_per_slot(
+                model_config, mapping, flashinfer_ring=False, **kwargs
+            ),
+            mapping,
+            max_batch_size,
+            kv_cache_config.max_util_for_resume,
+            **kwargs,
         )
 
     @override
     def _setup_model_state(self) -> None:
+        region = self._replay_region
+        if region is not None:
+            region.bind(
+                self._get_state_buffer,
+                self.layer_offsets,
+                self.get_region_group_ids(REPLAY_STATE_REGION),
+                self._host_state_indices.shape[0],
+                self.cuda_state_indices.device,
+            )
         super()._setup_model_state()
         if self.local_num_mamba_layers:
             self._setup_ple_states(self._state_layout.slot_capacity)
+        self._setup_inforward_snapshots()
+
+    @override
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        super().prepare_resources(scheduled_batch)
+        self._plan_inforward_snapshots(scheduled_batch)
+
+    @property
+    def replay_layer_group_id(self) -> int | None:
+        """Layer group of the replay history's own slots; None when it shares the state slots."""
+        region = self._replay_region
+        return region.group_id if region is not None else None
+
+    @property
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        region = self._replay_region
+        return (
+            region.cuda_indices(self.cuda_state_indices)
+            if region is not None
+            else self.cuda_state_indices
+        )
+
+    def get_replay_state_indices(
+        self, request_ids: list[int] | None = None
+    ) -> torch.Tensor | list[int]:
+        """Replay slots like get_state_indices(), without touching the dummy mask."""
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        region = self._replay_region
+        if region is None or region.group_id is None:
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return region.request_indices(request_ids)
+
+    @override
+    def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._replay_region is not None and self.local_num_mamba_layers:
+            self._replay_region.prepare(
+                requests,
+                self.kv_cache_map,
+                self.cuda_state_indices,
+                self._host_state_indices,
+                num_contexts,
+                self._skips_steady_state_index_upload,
+            )
+
+    @override
+    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+        if self._replay_region is None:
+            super()._reset_context_mamba_slots(num_contexts)
+        else:
+            self._replay_region.reset_context(
+                num_contexts, self.cuda_state_indices, self._host_state_indices
+            )
+
+    @override
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        if self._replay_region is None:
+            super()._update_model_state(batch)
+        else:
+            self._replay_region.update(batch, self.cuda_state_indices)
+
+    @override
+    def free_resources(self, request, pin_on_release: bool = False) -> None:
+        if self._replay_region is not None:
+            self._replay_region.release(request.py_request_id)
+        super().free_resources(request, pin_on_release)
 
     @classmethod
     @override
@@ -761,8 +1003,12 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def shutdown(self) -> None:
+        if self._replay_region is not None:
+            self._replay_region.shutdown()
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
+        self._inforward_snapshots.shutdown()
+        self._inforward_stage_ple = {}
         super().shutdown()
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
@@ -777,7 +1023,15 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         state = self._speculative_state
-        return isinstance(state, GDNReplayState) and state.has_bound_states
+        return (
+            isinstance(state, GDNReplayState)
+            and not isinstance(state, GDNMtpReplayState)
+            and state.has_bound_states
+        )
+
+    @property
+    def use_gdn_mtp_replay(self) -> bool:
+        return isinstance(self._speculative_state, GDNMtpReplayState)
 
 
 def get_qwen4_exp_ple_cache_params(config, *, total_layers: int, is_draft: bool):

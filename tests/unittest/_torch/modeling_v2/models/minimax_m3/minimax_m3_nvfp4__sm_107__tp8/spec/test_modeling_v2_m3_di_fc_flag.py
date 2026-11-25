@@ -8,7 +8,7 @@ of hanging when no bump comes."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_fc_wait,
 )
 
@@ -18,6 +18,7 @@ N = 1 << 16
 
 
 def _wait(counts, spins=m3_fc_wait.MAX_SPINS):
+    # pyrefly: ignore [unexpected-keyword]
     m3_fc_wait.fc_wait_kernel[(1,)](counts, MAX_SPINS=spins, num_warps=1, launch_pdl=True)
 
 

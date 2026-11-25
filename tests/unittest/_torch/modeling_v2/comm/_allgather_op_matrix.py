@@ -956,7 +956,7 @@ def _run_one_rank(device: Optional[int] = None) -> int:
     # that measurably wedges a watchdog at exit.
     dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", device))
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allgather as entry
 
     # One partial instead of a per-call argument: every check's call site keeps
     # the certified shape, and the wrapper hands the boxed group to the _pg

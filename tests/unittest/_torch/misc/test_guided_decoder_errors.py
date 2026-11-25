@@ -164,6 +164,7 @@ def _loop_executor(monkeypatch, decoder, batches, log):
     executor.draft_model_engine = None
     executor.use_spec_decode = False
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor.speculation_gate = None
     executor.sampler = Mock()
     executor.execution_stream = None
