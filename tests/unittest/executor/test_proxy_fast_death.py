@@ -652,37 +652,37 @@ class _FakeRequest:
         self.id = request_id
 
 
-def test_submit_rechecks_engine_death_after_registration(monkeypatch):
-    """Close the submit-vs-death race.
-
-    If the engine dies between the top-of-submit guard and registering the
-    result in _results (so _mark_engine_dead's one-shot sweep misses it),
-    submit() must still fail fast and not leak the dangling result.
-    """
+@pytest.mark.cpu_only
+def test_submit_rechecks_engine_death_after_registration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject recorded death after result registration, before transport writes."""
     proxy = _bare_proxy()
     proxy._fatal_error = None
-    proxy._engine_dead = False
-    proxy._results = {}
-    proxy._start_dispatch_threads = lambda: None
-    proxy._get_next_client_id = lambda: 42
-    proxy._get_logprob_params = lambda request: None
-    proxy._handle_background_error = lambda *a, **k: None
-
+    monkeypatch.setattr(proxy, "_start_dispatch_threads", lambda: None)
+    monkeypatch.setattr(proxy, "_get_next_client_id", lambda: 42)
+    monkeypatch.setattr(proxy, "_get_logprob_params", lambda request: None)
+    monkeypatch.setattr(proxy, "_handle_background_error", lambda: None)
+    send = Mock()
+    monkeypatch.setattr(proxy, "_send_generation_request", send)
     fake_result = _FakeResult()
+    monkeypatch.setattr(proxy_module, "GenerationResult", lambda *args, **kwargs: fake_result)
+    cause = RuntimeError("worker died after registration")
+    registered = []
 
-    def fake_generation_result(*args, **kwargs):
-        # Simulate the error-monitor thread marking the engine dead mid-submit,
-        # after the top guard passed but as the result is being created.
-        proxy._engine_dead = True
-        return fake_result
+    class DeathAfterRegistration(dict[int, _FakeResult]):
+        def __setitem__(self, request_id: int, result: _FakeResult) -> None:
+            super().__setitem__(request_id, result)
+            registered.append(request_id)
+            proxy._engine_dead = True
+            proxy._fatal_error = cause
 
-    monkeypatch.setattr("tensorrt_llm.executor.proxy.GenerationResult", fake_generation_result)
-
-    with pytest.raises(EngineDeadError):
+    proxy._results = DeathAfterRegistration()
+    with pytest.raises(EngineDeadError) as raised:
         proxy.submit(_FakeRequest())
 
-    # The raced result must not be left dangling in _results.
-    assert 42 not in proxy._results
+    assert registered == [42]
+    assert raised.value.root_cause is cause
+    assert not proxy._results
+    send.assert_not_called()
 
 
 @pytest.mark.cpu_only
