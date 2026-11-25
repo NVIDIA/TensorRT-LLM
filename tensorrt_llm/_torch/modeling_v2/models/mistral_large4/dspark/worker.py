@@ -20,7 +20,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
@@ -57,25 +56,16 @@ class MistralLarge4DSparkWorker(DSparkWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        return DFlashWorker._sample_block_draft_tokens(
-            self,
-            draft_model,
-            gen_logits,
-            gen_hidden_states,
-            inputs,
-            spec_metadata,
-            num_contexts,
-            batch_size,
+        num_gens, block_len = gen_logits.shape[:2]
+        draft_hidden = (
+            None
+            if gen_hidden_states is None
+            else gen_hidden_states.reshape(num_gens, block_len, -1)
         )
-
-    def _refine_block_logits(
-        self,
-        draft_model,
-        gen_logits: torch.Tensor,
-        inputs: dict,
-        spec_metadata,
-        draft_hidden_states: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return draft_model.apply_markov_chain_logits(
-            gen_logits, inputs["first_prev_tokens"], hidden_states=draft_hidden_states
+        gen_logits = draft_model.apply_markov_chain_logits(
+            gen_logits, inputs["first_prev_tokens"], hidden_states=draft_hidden
         )
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]

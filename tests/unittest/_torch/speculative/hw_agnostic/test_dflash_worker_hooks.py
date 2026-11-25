@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DFlash worker's override points for drafters that differ from the standalone DFlash one.
 
-A worker subclass whose drafter embeds its own block, reads the step's attention metadata in
-its block forward, or refines its logits from the block's draft hidden states overrides
-``_draft_block_embedding``, ``_draft_block_forward``, ``_uses_fused_paged_latent_prepare`` and
-``_refine_block_logits``. These tests pin the defaults every other drafter keeps, and that the
-refinement receives the block's draft hidden states.
+A worker subclass whose drafter embeds its own block or reads the step's attention metadata in
+its block forward overrides ``_draft_block_embedding``, ``_draft_block_forward``, and
+``_uses_fused_paged_latent_prepare``. These tests pin the defaults every other drafter keeps
+and that ``_refine_block_logits`` keeps its 4-argument contract.
 """
 
 from types import SimpleNamespace
@@ -59,26 +58,23 @@ def test_fused_paged_latent_prepare_serves_single_latent_drafters_but_lilicorr(
     assert _worker()._uses_fused_paged_latent_prepare(draft, kv_factor) is expected
 
 
-@pytest.mark.parametrize("with_hidden_states", [False, True])
-def test_refinement_receives_the_block_draft_hidden_states(with_hidden_states):
+def test_refinement_keeps_four_argument_signature():
     class Refined(Exception):
         pass
 
     seen = {}
 
-    class RecordingWorker(DFlashWorker):
-        def _refine_block_logits(
-            self, draft_model, gen_logits, inputs, spec_metadata, draft_hidden_states=None
-        ):
-            seen["hidden_states"] = draft_hidden_states
+    class FourArgWorker(DFlashWorker):
+        def _refine_block_logits(self, draft_model, gen_logits, inputs, spec_metadata):
+            seen["args"] = (draft_model, gen_logits, inputs, spec_metadata)
             raise Refined
 
-    hidden_states = torch.randn(6, 4) if with_hidden_states else None
+    draft = SimpleNamespace()
+    logits = torch.zeros(2, 3, 8)
+    inputs = {}
+    spec_metadata = SimpleNamespace()
     with pytest.raises(Refined):
-        _worker(RecordingWorker)._sample_block_draft_tokens(
-            SimpleNamespace(), torch.zeros(2, 3, 8), hidden_states, {}, SimpleNamespace(), 0, 2
+        _worker(FourArgWorker)._sample_block_draft_tokens(
+            draft, logits, torch.randn(6, 4), inputs, spec_metadata, 0, 2
         )
-    if with_hidden_states:
-        torch.testing.assert_close(seen["hidden_states"], hidden_states.reshape(2, 3, 4))
-    else:
-        assert seen["hidden_states"] is None
+    assert seen["args"] == (draft, logits, inputs, spec_metadata)

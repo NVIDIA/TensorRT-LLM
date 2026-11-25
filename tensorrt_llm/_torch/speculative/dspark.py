@@ -2182,7 +2182,6 @@ class DSparkWorker(DFlashWorker):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
-        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 

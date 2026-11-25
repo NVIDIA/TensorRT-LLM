@@ -2673,16 +2673,13 @@ class DFlashWorker(SpecWorkerBase):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
-        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Refine the block logits between the draft forward and sampling.
 
         Plain DFlash proposes the backbone's logits unchanged. Drafter
         families carrying extra heads override this — see
         :meth:`DSparkWorker._refine_block_logits` for the Markov
-        intra-block bias. ``draft_hidden_states`` is the ``[num_gens, K,
-        hidden]`` block output the logits were projected from, for heads that
-        condition on it.
+        intra-block bias.
         """
         return gen_logits
 
@@ -2705,13 +2702,7 @@ class DFlashWorker(SpecWorkerBase):
         draft overrides this (``DSparkWorker``).
         """
         num_gens, K = gen_logits.shape[:2]
-        gen_logits = self._refine_block_logits(
-            draft_model,
-            gen_logits,
-            inputs,
-            spec_metadata,
-            None if gen_hidden_states is None else gen_hidden_states.reshape(num_gens, K, -1),
-        )
+        gen_logits = self._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
 
         # DFlash 2: replace the independent per-position picks with one
         # coherent path through the block (absent for plain DFlash).

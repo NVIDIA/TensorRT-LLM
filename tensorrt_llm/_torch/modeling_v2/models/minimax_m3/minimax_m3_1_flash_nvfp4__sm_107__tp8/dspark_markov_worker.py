@@ -571,9 +571,7 @@ class S4WorkerMixin:
             self._s4_step_attn = None
             self._tailbk_rewound = False
 
-    def _refine_block_logits(
-        self, draft_model, gen_logits, inputs, spec_metadata, draft_hidden_states=None
-    ):
+    def _refine_block_logits(self, draft_model, gen_logits, inputs, spec_metadata):
         state = self._s4_step
         if state is not None and gen_logits.dim() == 3 and gen_logits.shape[-1] == state.shard:
             base = state.buffer(gen_logits.shape[0])

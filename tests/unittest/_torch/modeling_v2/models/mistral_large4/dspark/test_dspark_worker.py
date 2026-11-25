@@ -12,7 +12,6 @@ import torch
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.dspark.worker import (
     MistralLarge4DSparkWorker,
 )
-from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -55,43 +54,43 @@ def test_the_fused_paged_latent_preparation_is_not_used():
     assert _worker()._uses_fused_paged_latent_prepare(SimpleNamespace(), 1) is False
 
 
-def test_the_recurrent_markov_head_refines_over_the_draft_hidden_states():
-    draft_hidden = torch.randn(2, 3, 4)
+@pytest.mark.parametrize("with_hidden_states", [False, True])
+def test_the_recurrent_markov_head_refines_over_the_draft_hidden_states(
+    monkeypatch, with_hidden_states
+):
+    draft_hidden_flat = torch.randn(6, 4) if with_hidden_states else None
     logits = torch.randn(2, 3, 8)
     anchors = torch.tensor([0, 1])
+    seen = {}
 
     def head(base, first, *, hidden_states):
-        assert base is logits and first is anchors and hidden_states is draft_hidden
+        assert base is logits and first is anchors
+        seen["hidden_states"] = hidden_states
         return base + 1
 
-    draft = SimpleNamespace(apply_markov_chain_logits=head)
-    actual = _worker()._refine_block_logits(
-        draft, logits, {"first_prev_tokens": anchors}, object(), draft_hidden
+    def sample(refined, spec_metadata, batch_size, *, num_contexts):
+        seen["refined"] = refined
+        seen["sample_args"] = (spec_metadata, batch_size, num_contexts)
+        return torch.zeros(2, 3, dtype=torch.int32)
+
+    worker = _worker()
+    # The DSpark ancestral and fused chains compute the vanilla Markov head only.
+    worker.spec_config = SimpleNamespace(use_ancestral_draft_sampling=True)
+    monkeypatch.setattr(worker, "sample_draft_tokens", sample)
+    draft = SimpleNamespace(has_markov_head=True, apply_markov_chain_logits=head)
+    metadata = SimpleNamespace(advanced_sampling_mode=None, wants_advanced_draft_sampling=True)
+    tokens, vocab = worker._sample_block_draft_tokens(
+        draft, logits, draft_hidden_flat, {"first_prev_tokens": anchors}, metadata, 0, 2
     )
-    torch.testing.assert_close(actual, logits + 1)
+    assert tokens.shape == (2, 3) and vocab == 8
+    torch.testing.assert_close(seen["refined"], logits + 1)
+    assert seen["sample_args"] == (metadata, 2, 0)
+    if with_hidden_states:
+        torch.testing.assert_close(seen["hidden_states"], draft_hidden_flat.reshape(2, 3, 4))
+    else:
+        assert seen["hidden_states"] is None
 
 
 def test_vocab_shard_drafting_keeps_the_gathered_block_logits():
     # The shard chain computes the vanilla Markov head only.
     assert _worker()._vocab_parallel_draft_tokens(SimpleNamespace(has_markov_head=True)) is None
-
-
-def test_drafts_take_the_dflash_path_where_dspark_would_chain_ancestrally(monkeypatch):
-    # The DSpark ancestral and fused chains compute the vanilla Markov head only.
-    drafts = (torch.zeros(1, 3, dtype=torch.int32), 8)
-    calls = []
-
-    def dflash_path(self, draft_model, *args):
-        calls.append(draft_model)
-        return drafts
-
-    monkeypatch.setattr(DFlashWorker, "_sample_block_draft_tokens", dflash_path)
-    worker = _worker()
-    worker.spec_config = SimpleNamespace(use_ancestral_draft_sampling=True)
-    draft = SimpleNamespace(has_markov_head=True)
-    metadata = SimpleNamespace(advanced_sampling_mode=None, wants_advanced_draft_sampling=True)
-    actual = worker._sample_block_draft_tokens(
-        draft, torch.zeros(1, 3, 8), torch.zeros(1, 3, 4), {}, metadata, 0, 1
-    )
-    assert actual is drafts
-    assert calls == [draft]
