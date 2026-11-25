@@ -180,3 +180,18 @@ def test_pool_in_another_process_waits_for_the_reads_recorded_on_its_slot():
         if owner.is_alive():
             owner.kill()
             owner.join()
+
+
+def test_failed_host_registration_leaves_no_error_for_the_next_kernel():
+    """The runtime refuses to register a range twice. The refusal must not be
+    raised by whatever kernel is launched next."""
+    from tensorrt_llm._torch.visual_gen.slot_pool import _page_lock, _page_unlock
+
+    torch.zeros(1, device="cuda")
+    storage = torch.empty(1 << 20, dtype=torch.uint8).share_memory_()
+    assert _page_lock(storage)
+    try:
+        assert not _page_lock(storage)
+        assert int((torch.ones(4, device="cuda") + 1).sum()) == 8
+    finally:
+        _page_unlock(storage)

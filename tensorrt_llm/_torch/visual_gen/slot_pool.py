@@ -24,6 +24,7 @@ memory shared through CUDA IPC.
 
 from __future__ import annotations
 
+import ctypes
 import itertools
 import math
 import weakref
@@ -245,8 +246,22 @@ def _page_lock(storage: torch.Tensor) -> bool:
         logger.warning(
             f"slot pool: cudaHostRegister failed with {int(rc)}; copies stay synchronous"
         )
+        _clear_cuda_error()
         return False
     return True
+
+
+def _clear_cuda_error() -> None:
+    """Reset the CUDA runtime's last error on this thread. A runtime call that
+    fails leaves its error behind, and PyTorch raises it from the next kernel
+    launch, whatever that kernel is."""
+    try:
+        with open("/proc/self/maps") as maps:
+            runtimes = {line.split()[-1] for line in maps if "libcudart" in line}
+        for path in runtimes:
+            ctypes.CDLL(path).cudaGetLastError()  # returns the error and resets it
+    except (OSError, AttributeError) as exc:
+        logger.warning(f"slot pool: could not reset the CUDA runtime's last error: {exc}")
 
 
 def _page_unlock(storage: torch.Tensor) -> None:
@@ -260,6 +275,7 @@ def _page_unlock(storage: torch.Tensor) -> None:
         return
     if int(rc) != 0:
         logger.warning(f"slot pool: cudaHostUnregister failed with {int(rc)}")
+        _clear_cuda_error()
 
 
 def map_slots(handles: List[SlotHandles]) -> List[Dict[str, torch.Tensor]]:
