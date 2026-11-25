@@ -7773,7 +7773,7 @@
             }
           ],
           "default": null,
-          "description": "CUDA graph capture for multimodal encoders, keyed by modality name. This config is not applied automatically - each model must read `model_config.multimodal_config.encoder_cuda_graph` and implement capture + replay via `MultimodalEncoderCudaGraphRunner` (see `tensorrt_llm/_torch/models/multimodal_encoder_graph.py`).",
+          "description": "CUDA graph capture for supported encoder towers, keyed by modality name. Set a tower's value to {} to capture its block stack at startup using automatic budgets.",
           "status": "prototype",
           "title": "Encoder Cuda Graph"
         },
@@ -7820,7 +7820,7 @@
     },
     "MultimodalEncoderCudaGraphConfig": {
       "additionalProperties": false,
-      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nSet `max_batch_size` to generate capture shapes automatically. Advanced users can instead\nspecify `buckets`. Replay falls back to eager when no captured shape fits the live workload.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
+      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nAn empty config captures shapes automatically from the encoder token budget. Set\n`buckets` to choose explicit capacities. Workloads outside those capacities run eagerly.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
       "properties": {
         "buckets": {
           "anyOf": [
@@ -7848,13 +7848,13 @@
             }
           ],
           "default": null,
-          "description": "Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair captures one graph sized for up to `total_tokens` real encoder tokens across exactly `num_contexts` real contexts.",
+          "description": "Explicit encoder graph capacities as `(total_tokens, num_contexts)` pairs. These replace the automatic budgets. Packed encoders with padding accept up to both limits. Dense encoders must also fit the captured time dimension.",
           "status": "prototype",
           "title": "Buckets"
         },
         "enable_padding": {
           "default": true,
-          "description": "Capture a padded variant of each bucket so partial buckets can replay. Padding works only when the request has exactly the bucket's `num_contexts` real contexts and no more than the bucket's `total_tokens` real encoder tokens. The runner appends one dummy padding context and one reserved padding token internally, so bucket values should describe only the real workload.",
+          "description": "Allow workloads smaller than a capture to replay. Packed encoders isolate unused tokens in padding contexts. With padding disabled, capture per context count and require an exact fit.",
           "status": "prototype",
           "title": "Enable Padding",
           "type": "boolean"
@@ -7877,7 +7877,7 @@
             }
           ],
           "default": null,
-          "description": "Maximum number of encoder contexts per CUDA graph. Automatically captures every context count from 1 to this limit, with token capacities derived from the encoder token budget. Contexts are encoder sequences, such as image or video frame groups and audio chunks; they are not concurrent requests. Mutually exclusive with buckets.",
+          "description": "Maximum number of real encoder contexts (image segments, frames or audio clips) per call. Defaults to max(1, min(32, max_num_tokens // 256)) using the resolved encoder token budget. Mutually exclusive with buckets.",
           "status": "prototype",
           "title": "Max Batch Size"
         },

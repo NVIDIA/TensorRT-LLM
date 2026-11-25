@@ -16,7 +16,8 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
-from typing import TYPE_CHECKING, Optional, Type, cast
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Literal, Optional, Type, cast
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,8 @@ from transformers import AutoConfig, AutoModel
 
 from ..._utils import prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.vanilla import VanillaAttentionMetadata
+from ..utils import torch_compiling
 from .modeling_multimodal_utils import multiscale_forward
 
 if TYPE_CHECKING:
@@ -143,6 +146,7 @@ class MultimodalEncoderMixin:
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None
     encoder_cuda_graph_modality: str | None = None
+    encoder_cuda_graph_layout: Literal["packed", "batched"] = "packed"
     _encoder_cuda_graph_config: "MultimodalEncoderCudaGraphConfig | None" = None
     _blocks_graph_runner: "MultimodalEncoderGraphRunner | None" = None
 
@@ -175,16 +179,58 @@ class MultimodalEncoderMixin:
             if graph_configs is not None
             and self.encoder_cuda_graph_modality is not None else None)
 
-    def _build_blocks_graph_runner(
-        self, config: "MultimodalEncoderCudaGraphConfig"
-    ) -> "MultimodalEncoderGraphRunner":
-        """Describe the block function, tensor specs, and metadata provider.
+    def _encoder_graph_fn(
+            self, inputs: Mapping[str, torch.Tensor],
+            attn_metadata: AttentionMetadata | None) -> dict[str, torch.Tensor]:
+        """Run the graphable blocks without reading device values on the host.
 
-        Encoders opting into graphs override this factory. Model-specific
-        preprocessing and output assembly stay in the encoder forward.
+        Packed inputs use token axis zero. Each segment must be independent,
+        including quantization scales and normalization statistics.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support encoder CUDA graphs")
+
+    def _run_blocks(
+            self, inputs: dict[str, torch.Tensor],
+            attn_metadata: AttentionMetadata | None) -> dict[str, torch.Tensor]:
+        with torch_compiling(False):
+            if self._blocks_graph_runner is not None:
+                if attn_metadata is None:
+                    batch, time = next(iter(inputs.values())).shape[:2]
+                    seq_lengths = [time] * batch
+                else:
+                    seq_lengths = attn_metadata.seq_lens.tolist()
+                outputs = self._blocks_graph_runner.maybe_run(
+                    seq_lengths=seq_lengths, inputs=inputs)
+                if outputs is not None:
+                    return outputs
+            return self._encoder_graph_fn(inputs, attn_metadata)
+
+    def _build_blocks_graph_runner(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+        inputs: Mapping[str, torch.Tensor],
+        attn_metadata: AttentionMetadata | None,
+    ) -> "MultimodalEncoderGraphRunner":
+        """Use the shapes and dtypes produced by the tower's ordinary input preparation."""
+        from .multimodal_encoder_graph import (EncoderGraphTensorSpec,
+                                               MultimodalEncoderGraphRunner,
+                                               PackedEncoderGraphIOAdapter)
+        if isinstance(attn_metadata, VanillaAttentionMetadata):
+            raise ValueError(
+                "VANILLA attention does not support multimodal encoder CUDA graphs."
+            )
+        specs = {
+            name: EncoderGraphTensorSpec(tuple(tensor.shape[1:]),
+                                         tensor.dtype)
+            for name, tensor in inputs.items()
+        }
+        adapter = PackedEncoderGraphIOAdapter(specs,
+                                              attn_metadata=attn_metadata)
+        return MultimodalEncoderGraphRunner(encoder_fn=self._encoder_graph_fn,
+                                            metadata_provider=adapter,
+                                            io_adapter=adapter,
+                                            config=config)
 
     def enable_blocks_cuda_graph(
         self,
