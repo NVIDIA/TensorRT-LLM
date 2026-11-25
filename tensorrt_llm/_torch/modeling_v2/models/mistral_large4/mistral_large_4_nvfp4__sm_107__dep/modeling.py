@@ -756,6 +756,12 @@ class MistralLarge4DepModelingV2(DecoderModel):
         self.dp_pg = None
         self._prefill = self._decode = None
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Fill packed UE8M0 FP8 weight scales (`int32`) skipped by `initialize_dummy_weights`."""
+        for param in self.w.values():
+            if param.dtype == torch.int32:
+                param.data.fill_(0x7F7F7F7F)
+
     def post_load_weights(self) -> None:
         """Derive what the weights fix, build the kernels, the shared expert's stream and the
         communicator handle, then the targets.

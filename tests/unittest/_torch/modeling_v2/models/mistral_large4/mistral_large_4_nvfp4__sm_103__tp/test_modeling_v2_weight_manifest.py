@@ -1353,3 +1353,55 @@ def test_native_dspark_manifest_shards_and_off_coverage(world):
         rows, cols, axis = projections[role]
         expected = torch.arange((rows, cols)[axis])
         torch.testing.assert_close(torch.cat(parts), expected)
+
+
+def test_initialize_dummy_weights_populates_int32_fp8_scales():
+    """`load_format='dummy'` skips `int32` params; `initialize_dummy_state` fills UE8M0 scales."""
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep import (  # noqa: E501
+        modeling as sm103_dep,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep import (  # noqa: E501
+        modeling as sm103_tep,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp import (  # noqa: E501
+        modeling as sm103_tp,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep import (  # noqa: E501
+        modeling as sm107_dep,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tep import (  # noqa: E501
+        modeling as sm107_tep,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp import (  # noqa: E501
+        modeling as sm107_tp,
+    )
+    from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+
+    target_classes = (
+        sm103_tp.MistralLarge4TpModelingV2,
+        sm103_tep.MistralLarge4TepModelingV2,
+        sm103_dep.MistralLarge4DepModelingV2,
+        sm107_tp.MistralLarge4TpModelingV2,
+        sm107_tep.MistralLarge4TepModelingV2,
+        sm107_dep.MistralLarge4DepModelingV2,
+    )
+    for cls in target_classes:
+        stub = object.__new__(cls)
+        nn.Module.__init__(stub)
+        stub.w = nn.ParameterDict(
+            {
+                "l0_mlp_gu_s": nn.Parameter(
+                    torch.full((2, 4), -1, dtype=torch.int32), requires_grad=False
+                ),
+                "l0_wo_s": nn.Parameter(
+                    torch.zeros((2, 4), dtype=torch.int32), requires_grad=False
+                ),
+                "l0_attn_norm": nn.Parameter(
+                    torch.empty((4,), dtype=torch.bfloat16), requires_grad=False
+                ),
+            }
+        )
+        initialize_dummy_weights(stub)
+        assert bool((stub.w["l0_mlp_gu_s"].data == 0x7F7F7F7F).all()), cls.__name__
+        assert bool((stub.w["l0_wo_s"].data == 0x7F7F7F7F).all()), cls.__name__
+        assert torch.equal(_decode_sf(stub.w["l0_mlp_gu_s"].data, 4, 8), torch.ones((4, 8)))
