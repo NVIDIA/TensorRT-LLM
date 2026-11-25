@@ -60,6 +60,7 @@ from .backends import (
     TrtllmAttention,
     TrtllmAttentionMetadata,
 )
+from .backends.fmha.registry import FmhaCls
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_high_rows
@@ -436,6 +437,7 @@ class MLA(nn.Module):
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
         enable_locality_domain_bf16_linear: bool = False,
+        fmha_libs: list[str | FmhaCls] | None = None,
     ) -> None:
         """
         Initialize the MLA module.
@@ -467,6 +469,8 @@ class MLA(nn.Module):
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
+            fmha_libs: Ordered FMHA candidates for both TRTLLM backends.
+                None uses the default candidates.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -820,6 +824,7 @@ class MLA(nn.Module):
             rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
             kv_cache_dtype=self.kv_cache_dtype,
             skip_correction_threshold=config.skip_correction_threshold,
+            fmha_libs=fmha_libs,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")
@@ -853,6 +858,7 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 sparse_params=mha_sparse_params,
                 skip_correction_threshold=config.skip_correction_threshold,
+                fmha_libs=fmha_libs,
             )
         else:
             self.mha = None
