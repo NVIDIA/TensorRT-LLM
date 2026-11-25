@@ -31,8 +31,6 @@ DEFAULT_FMHA_LIBS = (
     "triton_custom_mask",
     "prims_ts",
     "cute_dsl_mla",
-    "msa_decode",
-    "msa_prefill",
     "flashinfer_sparse_mla",
     "prims_ts_block_sparse",
     "prims_ts_sparse_mla",

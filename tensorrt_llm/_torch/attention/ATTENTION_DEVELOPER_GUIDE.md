@@ -826,9 +826,12 @@ The FMHA package is split by role:
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.
-- `fmha/msa_prefill.py` integrates the packaged SM100/SM103 block-sparse GQA
-  implementation for the context phase, and `fmha/msa_decode.py` runs the
-  MiniMax-M3 decode kernels for the generation phase.
+- `fmha/msa_prefill.py` integrates the packaged block-sparse GQA kernel for
+  MiniMax-M3 context, and `fmha/msa_decode.py` runs the generation kernels.
+  The stock MiniMax-M3 adapter supplies `MINIMAX_M3_V1_FMHA_LIBS` at construction.
+  The Modeling V2 M3.1 family adapter supplies `MINIMAX_M3_V2_FMHA_LIBS`.
+  Both lists enumerate the full candidate order. MSA classes are anonymous,
+  and shared libraries use their registered names.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:

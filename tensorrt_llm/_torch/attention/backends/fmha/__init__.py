@@ -23,8 +23,6 @@ from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .gqa_decode import GqaDecodeFmha
 from .interface import Fmha, FmhaPhase
-from .msa_decode import MsaDecodeFmha
-from .msa_prefill import MsaPrefillFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
 from .prims_ts_block_sparse import PrimsTSBlockSparseFmha  # noqa: F401
@@ -48,8 +46,6 @@ __all__ = [
     "FmhaParams",
     "FmhaPhase",
     "GqaDecodeFmha",
-    "MsaDecodeFmha",
-    "MsaPrefillFmha",
     "PhasedFmha",
     "PrimsTSFmha",
     "PrimsTSSparseMlaFmha",
