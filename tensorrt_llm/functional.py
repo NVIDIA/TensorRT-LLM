@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .logger import logger
+
 
 class RotaryScalingType(IntEnum):
     none = 0
@@ -434,8 +436,19 @@ class RopeEmbeddingUtils:
         t_pos = np.arange(np.max([num_pos, original_max_pos]), dtype=np.float32)
 
         # Choose proper freqs based on max_seq_len.
-        factor = (long_factor if max_seq_len is None
-                  or max_seq_len > original_max_pos else short_factor)
+        use_long_factor = max_seq_len is None or max_seq_len > original_max_pos
+        if use_long_factor:
+            reason = ("max_seq_len is not set" if max_seq_len is None else
+                      f"max_seq_len={max_seq_len} is larger than "
+                      f"original_max_position_embeddings={original_max_pos}")
+            logger.warning_once(
+                f"LongRoPE: {reason}, so every request uses the long-context "
+                f"scaling factors, which lowers accuracy on requests shorter "
+                f"than {original_max_pos} tokens. If no request needs more "
+                f"than {original_max_pos} tokens, set max_seq_len to "
+                f"{original_max_pos} or less to use the short factors.",
+                key="long_rope_long_factor")
+        factor = long_factor if use_long_factor else short_factor
         inv_freq = inv_freq / factor
         freqs = np.einsum("i,j->ij", t_pos, inv_freq)
         sinusoid_inp = freqs.astype(np.float32)[..., np.newaxis]

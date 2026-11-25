@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
 import pytest
 import torch
 
@@ -20,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.interface import (RopeParams,
 from tensorrt_llm._torch.attention.rotary_embedding import (MRotaryEmbedding,
                                                             RotaryEmbedding)
 from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm.logger import logger
 
 
 class TestRotaryEmbedding:
@@ -227,6 +229,61 @@ class TestDuplicateData:
         _, cos_sin = rp.create_rope_const_params(interleave=True)
         floats_per_pos = cos_sin.numel() // rp.max_positions
         assert floats_per_pos == rp.dim
+
+
+@pytest.mark.cpu_only
+class TestLongRopeFactorChoice:
+    """LongRoPE builds one table for every request: the short factors only when
+    max_seq_len fits in original_max_position_embeddings, the long factors
+    otherwise, with a warning that short requests lose accuracy."""
+
+    DIM = 8
+    ORIGINAL_MAX_POS = 16
+    NUM_POS = 64
+    SHORT_FACTOR = [1.0, 1.5, 2.0, 2.5]
+    LONG_FACTOR = [4.0, 8.0, 16.0, 32.0]
+
+    def _expected_table(self, factor):
+        inv_freq = 1.0 / (10000.0**(np.arange(0, self.DIM, 2) / self.DIM))
+        angles = np.outer(np.arange(self.NUM_POS),
+                          inv_freq / np.asarray(factor))
+        mscale = np.sqrt(1.0 + np.log(self.NUM_POS / self.ORIGINAL_MAX_POS) /
+                         np.log(self.ORIGINAL_MAX_POS))
+        return np.stack((np.cos(angles), np.sin(angles)), axis=-1) * mscale
+
+    @pytest.mark.parametrize("max_seq_len,expect_long", [
+        (None, True),
+        (17, True),
+        (16, False),
+        (8, False),
+    ])
+    def test_factor_choice_and_warning(self, monkeypatch, max_seq_len,
+                                       expect_long):
+        warnings = []
+        monkeypatch.setattr(logger, "warning_once",
+                            lambda *msg, key: warnings.append(" ".join(msg)))
+
+        _, table = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
+            num_pos=self.NUM_POS,
+            dim=self.DIM,
+            theta=10000.0,
+            original_max_pos=self.ORIGINAL_MAX_POS,
+            short_factor=self.SHORT_FACTOR,
+            long_factor=self.LONG_FACTOR,
+            max_seq_len=max_seq_len,
+        )
+
+        expected = self._expected_table(
+            self.LONG_FACTOR if expect_long else self.SHORT_FACTOR)
+        np.testing.assert_allclose(table.reshape(expected.shape),
+                                   expected,
+                                   rtol=1e-5,
+                                   atol=1e-5)
+        if expect_long:
+            assert len(warnings) == 1
+            assert "set max_seq_len to 16 or less" in warnings[0]
+        else:
+            assert warnings == []
 
 
 class TestFromConfigDuplicateData:
