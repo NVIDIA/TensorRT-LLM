@@ -211,6 +211,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.draft_contin
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (
     qsa_canonical_selection,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_cold_index_codec import (
+    qsa_cold_index_mark,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
@@ -904,6 +907,16 @@ DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
 #: top-2048 block overlap with bf16 keys p50 0.976. Read once, when the core is built, at every
 #: layout.
 INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
+#: Off by default (opt-in: a cold-page codec over the KV cache manager's migration bridge, whose
+#: callbacks run on the manager's copy thread). Context servers only, with `INDEX_KEY_FP8_ENV`,
+#: block reuse, a host tier, MTP-3 and the `L - 2` in-forward snapshot: every anchor writer also
+#: marks the groups it pooled (`qsa_cold_index_mark`, bytes 128-143 of the anchor slot, dead under
+#: e4m3 anchors), and the KV cache manager stores the attention pages that leave the GPU without
+#: the index bytes no kernel reads again (`qsa_cold_pages`): a page 532,864 -> 462,848 B. Every
+#: byte a kernel reads comes back bitwise. Measured: +1.6% context requests/s on the dep4 x 2
+#: front's context servers (843758), more where restores from disk dominate. Read once, when the
+#: core is built (the marks) and when the shell is built (the codec).
+CTX_COLDIDX_ENV = "TRTLLM_QWEN4_EXP_CTX_COLDIDX"
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
 #: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
 #: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
@@ -2285,6 +2298,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 f"{INDEX_KEY_FP8_ENV}=1: the QSA index anchors are e4m3 (lossy against bf16 "
                 "keys); every context and generation worker of this deployment must set it"
             )
+        # The cold index codec's group marks (`CTX_COLDIDX_ENV`): only over e4m3 anchors.
+        self.cold_index_marks = self.index_key_fp8 and _switch(CTX_COLDIDX_ENV)
         # The most generation rows the cluster top-k serves (`DP_TOPK_CLUSTER_ROWS_ENV`).
         self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
 
@@ -5917,6 +5932,11 @@ def _index_anchors_fp8(core, index_cache, block_table, req_idx, logical, tpb) ->
     group ends, converted to e4m3 in place; on the writer's stream, right behind it."""
     if getattr(core, "index_key_fp8", False):
         index_anchors_to_fp8(index_cache, block_table, req_idx, logical, tpb, core.compress_ratio)
+        if getattr(core, "cold_index_marks", False):
+            # The groups this writer pooled, for the cold-page codec (`CTX_COLDIDX_ENV`).
+            qsa_cold_index_mark(
+                index_cache, block_table, req_idx, logical, tpb, core.compress_ratio
+            )
 
 
 def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
@@ -9792,13 +9812,29 @@ class SpeculativeRollback:
 # -------------------------------------------------------------------- shell ---
 
 
-def _runtime_hooks() -> RuntimeHooks:
+def _runtime_hooks(spec_config=None) -> RuntimeHooks:
     """The engine hooks of a speculative shell, as the FP8 target's: the spec loop on the
     execution stream, and the decode prologue -- a generation-only verify step's position and
     KV-length corrections and the QSA row mapping in one launch during input preparation
     (`qsa_spec_step_metadata`), bitwise what it replaces; the decode forward reads the corrected
-    positions it leaves (`take_step_positions`)."""
-    return RuntimeHooks(loop_on_execution_stream=True, decode_prologue=SpecStepMetadataPrologue())
+    positions it leaves (`take_step_positions`). Under `CTX_COLDIDX_ENV`, the cold index codec."""
+    cold_page_codec = None
+    if _switch(CTX_COLDIDX_ENV):
+        draft_len = getattr(spec_config, "max_draft_len", None)
+
+        def cold_page_codec(kv_cache_config):
+            # Imported here: the provider module reaches the executor's resource managers.
+            from ..qsa_cold_pages import qsa_cold_pages_provider
+
+            return qsa_cold_pages_provider(
+                kv_cache_config, index_key_fp8=_switch(INDEX_KEY_FP8_ENV), max_draft_len=draft_len
+            )
+
+    return RuntimeHooks(
+        loop_on_execution_stream=True,
+        decode_prologue=SpecStepMetadataPrologue(),
+        cold_page_codec=cold_page_codec,
+    )
 
 
 class _WidenedHead:
@@ -10216,7 +10252,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # default, the draft step would be handed a manager that maps no draft layer.
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
             self.spec_decode_fast_paths = True
-            self.runtime_hooks = _runtime_hooks()
+            self.runtime_hooks = _runtime_hooks(self.spec_config)
             # Under attention TP the TP group's key exchange, as the FP8 target builds it: the
             # worker then takes the target tokens of greedy and temperature-only batches, and
             # the greedy draft tokens, from this rank's vocabulary shard (argmax or Gumbel-max

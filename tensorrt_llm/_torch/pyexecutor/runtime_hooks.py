@@ -327,6 +327,11 @@ class RuntimeHooks:
     # separate draft model's KV cache manager is resolved from the draft model and does not use it.
     # None keeps the resolved class.
     kv_cache_manager_cls: Optional[type] = None
+    # The model's own cold-page codec for its KV cache when no kv_cache_compression_config is set:
+    # called once, with the KV cache config, before the KV cache manager is built; returns a
+    # KVCacheCompressionManager that provides a cold-page codec (`provides_cold_page_codec`), or
+    # None. None keeps the default (no codec: pages leave the GPU as they are).
+    cold_page_codec: Optional[Callable[[object], Optional[object]]] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:
