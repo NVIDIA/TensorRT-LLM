@@ -187,6 +187,8 @@ def test_decode_forms_line_names_what_engaged(monkeypatch):
         dp_gqa_min_requests=8,
         dp_topk_cluster_rows=256,
         dp_gqa_bitmap=2,
+        dp_draft_gqa_g1=True,
+        dp_mtp_attn_pack=True,
         hc_first_x2=True,
         index_key_fp8=True,
     )
@@ -202,6 +204,8 @@ def test_decode_forms_line_names_what_engaged(monkeypatch):
         "grouped gqa from requests 8",
         "cluster top-k up to rows 256",
         "bitmap gqa from requests 2",
+        "draft gqa grouped1 True",
+        "mtp attn pack True",
         "hc first x2 True",
         "route fast2 rows []",
         "draft moe tile False",

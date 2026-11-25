@@ -2573,6 +2573,8 @@ def _decode_forms(core) -> str:
             "grouped gqa from requests": core.dp_gqa_min_requests,
             "cluster top-k up to rows": core.dp_topk_cluster_rows,
             "bitmap gqa from requests": getattr(core, "dp_gqa_bitmap", 0),
+            "draft gqa grouped1": getattr(core, "dp_draft_gqa_g1", False),
+            "mtp attn pack": getattr(core, "dp_mtp_attn_pack", False),
             "hc first x2": getattr(core, "hc_first_x2", False),
             "route fast2 rows": rows(getattr(route, "fast2", None) if route else None),
             "draft moe tile": getattr(core, "_draft_moe_tactics", None) is not None,
