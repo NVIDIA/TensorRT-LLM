@@ -398,7 +398,7 @@ def test_draft_sparse_gate(monkeypatch, cute):
     core = SimpleNamespace(token_topk=8, compress_ratio=4, q_width=12)
     calls = []
     monkeypatch.setattr(M, "_decode_index_scores", lambda *a: calls.append("scores") or "s")
-    monkeypatch.setattr(M, "_selection", lambda *a: calls.append("select"))
+    monkeypatch.setattr(M, "_selection", lambda *a, **k: calls.append("select"))
     monkeypatch.setattr(
         M,
         "_sparse_gqa_decode",

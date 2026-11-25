@@ -608,6 +608,48 @@ def test_dp_gqa_bitmap_switch(monkeypatch, bitmap_env, min_env, dp_size, expecte
     assert M._dp_gqa_bitmap(core) == expected
 
 
+@pytest.mark.parametrize(
+    "rows, draft, expected",
+    [
+        (37, False, {}),  # clusters of 4: the op's own placement
+        (38, False, dict(solo_blocks=8192, pairs=0)),  # pairs of CTAs, short rows alone
+        (76, False, dict(solo_blocks=8192, pairs=0)),
+        (77, False, dict(solo_blocks=8192, pairs=74)),  # past one wave: the row map
+        (104, False, dict(solo_blocks=8192, pairs=74)),
+        (105, False, dict(solo_blocks=32768, pairs=0)),  # rows of up to 32768 blocks alone
+        (256, False, dict(solo_blocks=32768, pairs=0)),
+        (38, True, {}),  # draft: clusters of 2 as the op places them
+        (39, True, dict(solo_blocks=32768, pairs=0)),
+        (64, True, dict(solo_blocks=32768, pairs=0)),
+        (65, True, {}),
+    ],
+)
+def test_topk_placement_rows(monkeypatch, rows, draft, expected):
+    monkeypatch.setattr(M, "_sm_count", lambda index: 148)
+    assert M._topk_placement(torch.zeros(rows, 8), draft) == expected
+
+
+@pytest.mark.parametrize(
+    "rows_env, draft, rows, knobs",
+    [
+        (None, False, 20, {}),  # the switch unset: nothing past the op's own rows
+        (256, False, 20, {}),  # clusters of 4 or 8: no placement
+        (256, False, 96, dict(solo_blocks=8192, pairs=74)),
+        (256, True, 48, dict(solo_blocks=32768, pairs=0)),
+    ],
+)
+def test_selection_passes_the_placement(monkeypatch, rows_env, draft, rows, knobs):
+    seen = []
+    monkeypatch.setattr(M, "_sm_count", lambda index: 148)
+    monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: True)
+    monkeypatch.setattr(M, "qsa_topk_expand_cluster", lambda *a, **k: seen.append(k))
+    extra = {} if rows_env is None else {"dp_topk_cluster_rows": rows_env}
+    core = SimpleNamespace(**{**vars(CORE), **extra})
+    out = torch.zeros(rows, 1)
+    M._selection(core, torch.zeros(rows, 8), None, None, None, None, None, out, draft=draft)
+    assert seen == [dict(out=out, **knobs)]
+
+
 def _fp8_recorders(monkeypatch):
     calls = []
     monkeypatch.setattr(

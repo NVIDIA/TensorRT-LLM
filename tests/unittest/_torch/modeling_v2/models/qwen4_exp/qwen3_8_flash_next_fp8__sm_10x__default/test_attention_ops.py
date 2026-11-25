@@ -1326,7 +1326,10 @@ def _check_topk_expand_cluster(cell, monkeypatch) -> None:
     floor = {"max_rows": cell.spec["max_rows"]} if "max_rows" in cell.spec else {}
     assert supports(args[0], **floor), "a cell outside the callers' routing to this entry"
     want_topk, want_sel = _tkc_op.reference(*args)
-    sel = _tkc_op(*args)
+    # Clusters of 2 also take the cell's placement (one CTA alone, the row map).
+    knobs = {k: cell.spec[k] for k in ("solo_blocks", "pairs") if k in cell.spec}
+    _tkc_op.is_valid(*args, **knobs)
+    sel = _tkc_op(*args, **knobs)
     assert sel.dtype == torch.int32 and sel.shape == want_sel.shape
     assert torch.equal(args[4], want_topk), "block list"
     assert torch.equal(sel, want_sel), "token selection"

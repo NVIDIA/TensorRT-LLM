@@ -169,6 +169,7 @@ Integration facts this file depends on:
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import re
@@ -1028,6 +1029,19 @@ _BITMAP_MIN_REQUESTS = 8  # capacity: fixed: a dispatch threshold
 #: step at graphs 40-52, bitwise), not this one. Read once, when the core is built; set at a
 #: layout without attention DP it warns and does nothing.
 DP_TOPK_CLUSTER_ROWS_ENV = "TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"
+#: Where `DP_TOPK_CLUSTER_ROWS_ENV` takes a launch past 37 rows (clusters of 2 CTAs), how the
+#: rows sit on the clusters (`_topk_placement`; the selection is the same whatever the
+#: placement): `(first rows, last rows, solo blocks, row map)` per launch kind, as measured on
+#: the dep4 / dep8 AgentX front (GB300, our cluster kernel of the same placements). A row of at
+#: most `solo blocks` blocks takes one CTA alone, its pair returning at once; with the row map
+#: the shortest rows go two a cluster, one a CTA, so the launch fits one wave of `SMs / 2`
+#: clusters (77-104 rows: 19.8-21.9 -> 13.0-13.2 us a launch; -0.10 / -0.13 ms a step at 20 /
+#: 24 requests a rank). Trunk 153-256 and draft 39-64 rows (one CTA a row of up to 32768
+#: blocks): -0.19..-0.28 ms a step at 40-52 requests a rank.
+_TOPK_PLACEMENT = {
+    "trunk": ((38, 76, 8192, False), (77, 104, 8192, True), (105, 256, 32768, False)),
+    "draft": ((39, 64, 32768, False),),
+}  # capacity: fixed: a dispatch table
 _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 # The compressed index keys rotate at coordinate 0 alone (no mRoPE section), as the index
 # query does.
@@ -1443,6 +1457,22 @@ def _dp_topk_cluster_rows(core) -> int:
         )
         return _TOPK_CLUSTER_MAX_ROWS
     return value
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _topk_placement(scores, draft: bool) -> dict:
+    """`qsa_topk_expand_cluster`'s placement knobs for a generation launch of `scores`' rows
+    (`_TOPK_PLACEMENT`; empty where the table has no row). Host side, on shapes only."""
+    rows = scores.shape[0]
+    for lo, hi, solo, row_map in _TOPK_PLACEMENT["draft" if draft else "trunk"]:
+        if lo <= rows <= hi:
+            pairs = _sm_count(scores.device.index or 0) // 2 if row_map else 0
+            return dict(solo_blocks=solo, pairs=pairs)
+    return {}
 
 
 def _tep4_layout(core) -> bool:
@@ -6076,18 +6106,21 @@ def _selection(
     out,
     live_cols=None,
     context=False,
+    draft=False,
 ):
     """The selected token indices of `scores`' rows into `out` `[rows, token_topk +
     compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a cluster
     of CTAs a row up to `qsa_topk_expand_cluster`'s rows, an attention-DP rank's
-    `DP_TOPK_CLUSTER_ROWS_ENV` for generation rows, else one CTA a row; a context chunk's rows,
-    `context`, on the one-CTA op's context launch), or, for a score table neither serves, the
-    selection and the expansion apart (the rewrite bounded by `live_cols`, `_select`). They all
-    give the same selection."""
+    `DP_TOPK_CLUSTER_ROWS_ENV` for generation rows, placed by `_topk_placement` for the trunk or
+    the `draft` layer past 37 rows, else one CTA a row; a context chunk's rows, `context`, on the
+    one-CTA op's context launch), or, for a score table neither serves, the selection and the
+    expansion apart (the rewrite bounded by `live_cols`, `_select`). They all give the same
+    selection."""
     cluster_rows = _TOPK_CLUSTER_MAX_ROWS
     if not context:
         cluster_rows = getattr(core, "dp_topk_cluster_rows", _TOPK_CLUSTER_MAX_ROWS)
     if _topk_expand_cluster_supports(scores, max_rows=cluster_rows):
+        placement = _topk_placement(scores, draft) if cluster_rows > _TOPK_CLUSTER_MAX_ROWS else {}
         qsa_topk_expand_cluster(
             scores,
             visible_blocks,
@@ -6097,6 +6130,7 @@ def _selection(
             core.compress_ratio,
             core.token_topk,
             out=out,
+            **placement,
         )
         return
     if _topk_expand_supports(scores):
@@ -8150,6 +8184,7 @@ class PrefillTarget:
                 row_starts,
                 selected,
                 _live_score_columns(core, md, batch),
+                draft=True,
             )
             if share:
                 self._capture_selection(md, topk_indices, visible_blocks, compact=True)
@@ -9195,6 +9230,7 @@ class DecodeTarget:
                         topk_indices,
                         md.qsa_topk_row_starts[:rows],
                         selected,
+                        draft=True,
                     )
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
@@ -10203,6 +10239,7 @@ class DecodeTarget:
                 topk_indices,
                 md.qsa_topk_row_starts[:n],
                 selected,
+                draft=True,
             )
             if share:
                 self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
