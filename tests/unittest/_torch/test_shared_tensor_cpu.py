@@ -100,3 +100,24 @@ def test_release_cuda_export_does_not_reopen_producer_ipc(monkeypatch):
         }
     )
     assert calls == [((b"counter", 2), {"device": 0})]
+
+
+def test_malformed_cuda_view_retires_current_and_remaining_exports(monkeypatch):
+    released = []
+    monkeypatch.setattr(
+        torch.UntypedStorage,
+        "_release_ipc_counter",
+        lambda counter, offset, device: released.append((counter, offset, device)),
+    )
+    handles = [
+        {
+            "method_key": 1,
+            "ref_counter_handle": base64.b64encode(b"counter"),
+            "ref_counter_offset": offset,
+            "storage_device": 0,
+        }
+        for offset in (2, 3)
+    ]
+    with pytest.raises(KeyError, match="storage_handle"):
+        SharedTensorContainer.consume_many(handles)
+    assert released == [(b"counter", 2, 0), (b"counter", 3, 0)]

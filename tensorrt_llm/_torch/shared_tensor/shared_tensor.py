@@ -6,7 +6,7 @@ import itertools
 import logging
 import os
 import threading
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.multiprocessing import reductions
@@ -302,6 +302,16 @@ class SharedTensorContainer:
             raise ValueError(f"Failed to deserialize tensor information: {e}")
 
     @staticmethod
+    def _rebuild_cpu_storage(tensor_info: Dict[str, Any]):
+        return reductions.rebuild_storage_filename(
+            torch.storage.TypedStorage,
+            base64.b64decode(tensor_info["manager_handle"]),
+            base64.b64decode(tensor_info["storage_handle"]),
+            tensor_info["storage_size"],
+            str_to_torch_dtype(tensor_info["storage_dtype"]),
+        )
+
+    @staticmethod
     def dict_to_cpu_handle(tensor_info: Dict[str, Any]) -> Tuple:
         """Reconstruct CPU tensor handle from serialized dictionary
 
@@ -319,21 +329,15 @@ class SharedTensorContainer:
             A tuple representing the CPU tensor handle for PyTorch's rebuild_tensor
         """
         try:
-            manager_handle = base64.b64decode(tensor_info['manager_handle'])
-            storage_handle = base64.b64decode(tensor_info['storage_handle'])
-            storage_metadata = (torch.storage.TypedStorage, manager_handle,
-                                storage_handle, tensor_info['storage_size'],
-                                str_to_torch_dtype(
-                                    tensor_info['storage_dtype']))
-            storage = reductions.rebuild_storage_filename(*storage_metadata)
-            if not isinstance(storage, torch.storage.TypedStorage):
-                storage = reductions.rebuild_typed_storage(
-                    storage, str_to_torch_dtype(tensor_info['storage_dtype']))
-
             meta_data = (tensor_info['tensor_storage_offset'],
                          tuple(tensor_info['tensor_size']),
                          tuple(tensor_info['tensor_stride']), False
                          )  # requires_grad is always False for cpu tensor
+            storage = SharedTensorContainer._rebuild_cpu_storage(tensor_info)
+            if not isinstance(storage, torch.storage.TypedStorage):
+                storage = reductions.rebuild_typed_storage(
+                    storage, str_to_torch_dtype(tensor_info['storage_dtype']))
+
             tensor_handle = (torch.Tensor, storage, meta_data)
             return tensor_handle
         except KeyError as e:
@@ -475,8 +479,43 @@ class SharedTensorContainer:
                 base64.b64decode(tensor_info['ref_counter_handle']),
                 tensor_info['ref_counter_offset'],
                 device=tensor_info['storage_device'])
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
+            # Retiring a storage export does not require a valid tensor shape.
+            cls._rebuild_cpu_storage(tensor_info)
         else:
             cls.from_dict(tensor_info).get_local_view()
+
+    @classmethod
+    def consume_many(cls, handles: Iterable[Dict[str,
+                                                 Any]]) -> list[torch.Tensor]:
+        """Open each trusted export once, retiring unopened exports on failure."""
+        pending = iter(handles)
+        tensors = []
+        try:
+            for handle in pending:
+                # Parse the view metadata before opening CPU storage or CUDA IPC.
+                # A malformed view still owns a storage reference.
+                try:
+                    container = cls.from_dict(handle)
+                except (KeyError, TypeError, ValueError):
+                    cls.release_many((handle, ))
+                    raise
+                tensors.append(container.get_local_view())
+        finally:
+            cls.release_many(pending)
+        return tensors
+
+    @classmethod
+    def release_many(cls, handles: Iterable[Dict[str, Any] | None]) -> None:
+        """Release each undelivered export, even if another descriptor is invalid."""
+        for handle in handles:
+            if handle is None:
+                continue
+            try:
+                cls.release_dict(handle)
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError):
+                logger.exception(
+                    "Failed to release an undelivered tensor export")
 
     def dump_to_dict(self) -> Dict[str, Any]:
         """Convert this container to a dictionary for direct IPC (Producer side).

@@ -298,6 +298,9 @@ class PostprocWorker:
                 if is_final:
                     self._records.pop(client_id, None)
             except Exception as e:
+                from .._torch.pyexecutor.llm_request import \
+                    release_undelivered_response
+                release_undelivered_response(inp.rsp)
                 logger.error(
                     f"Postprocessing error for client {client_id}: {e}\n"
                     f"{traceback.format_exc()}")

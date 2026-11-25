@@ -37,6 +37,7 @@ from .._torch.pyexecutor.llm_request import (LlmResponse,
                                              release_undelivered_response)
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
+from .._torch.shared_tensor import SharedTensorContainer
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
@@ -410,6 +411,20 @@ class BaseWorker(GenerationExecutor):
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
         assert request.id is not None
+        handoff = getattr(request, "disaggregated_params", None)
+        if handoff is not None and handoff.multimodal_embedding_handles is not None:
+            # This worker owns the encoder exports upon receipt, even if later
+            # admission fails. A descriptor that has been opened cannot be retried.
+            pending = handoff.multimodal_embedding_handles
+            handoff.multimodal_embedding_handles = None
+            try:
+                embeddings = SharedTensorContainer.consume_many(pending)
+            except (KeyError, TypeError, ValueError, RuntimeError,
+                    OSError) as error:
+                raise RequestError(
+                    f"Invalid encoder embedding export: {error}") from error
+            request.multimodal_params.multimodal_data[
+                "multimodal_embedding"] = embeddings
         if request.prompt_adapter_request is not None:
             raise RequestError(
                 "Prompt adapters are not supported by the PyTorch executor.")

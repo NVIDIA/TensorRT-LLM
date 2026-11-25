@@ -13,16 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
-
-import numpy as np
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from tensorrt_llm.bindings import executor as tllme
 
 if TYPE_CHECKING:
     from tensorrt_llm.inputs.multimodal import MultimodalInputLayout
+
+
+@contextmanager
+def _release_encoder_handles_on_error(disagg: Optional["DisaggregatedParams"]) -> Iterator[None]:
+    """Retire encoder exports if processing fails before the next owner accepts them."""
+    try:
+        yield
+    except BaseException:
+        if disagg is not None and disagg.multimodal_embedding_handles:
+            from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+            SharedTensorContainer.release_many(disagg.multimodal_embedding_handles)
+        raise
+
+
+def _has_retained_token_counts(handles: Optional[List[Dict[str, Any]]]) -> bool:
+    """Whether a video export requires the producer's per-tubelet pruning layout."""
+    return any(
+        isinstance(handle, dict) and "retained_token_counts" in (handle.get("metadata") or {})
+        for handle in handles or ()
+    )
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -158,22 +178,15 @@ class DisaggregatedParams:
                     f"Unknown request type: {self.request_type}. Must be context_only, generation_only or "
                     "context_and_generation"
                 )
-        if self.multimodal_embedding_handles is not None:
-            if self.multimodal_hashes is not None:
-                # if mm hashes are provided, kvcache reuse can be enabled
-                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
+        if self.multimodal_embedding_handles is not None and self.multimodal_hashes is not None:
+            if len(self.multimodal_embedding_handles) != len(self.multimodal_hashes):
+                raise ValueError(
                     "multimodal_embedding_handles and multimodal_hashes must have the same length"
                 )
-                for mm_hash in self.multimodal_hashes:
-                    assert isinstance(mm_hash, list), "mm_hash must be a list"
-                    assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
-                    assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
-            else:
-                # if user did not provide mm embedding handles, kvcache reuse will be disabled
-                assert len(self.multimodal_embedding_handles) > 0, (
-                    "multimodal_embedding_handles must be provided"
-                )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+            if any(
+                not isinstance(digest, list)
+                or len(digest) != 8
+                or any(type(word) is not int or not -(2**31) <= word < 2**31 for word in digest)
+                for digest in self.multimodal_hashes
+            ):
+                raise ValueError("multimodal_hashes must hold eight int32 values per item")

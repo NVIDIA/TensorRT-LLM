@@ -268,6 +268,80 @@ def test_context_result_preserves_multimodal_spans() -> None:
     assert request.prompt_token_ids[0] == 129264
 
 
+@pytest.mark.parametrize("postproc", [False, True])
+def test_encoder_result_preserves_prepared_handoff(postproc):
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
+                                                            LlmResult, PyResult)
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+    from tensorrt_llm.executor.base_worker import _get_params_for_first_rsp
+
+    ids = [10, 11, 11, 42, 11]
+    record = {
+        "multimodal_hashes": [[1] * 8, [2] * 8],
+        "multimodal_positions": [1, 4],
+        "multimodal_lengths": [2, 1],
+        "multimodal_uuids": ["first", "second"],
+        "multimodal_item_run_cu_offsets": [0, 1, 2],
+        "multimodal_run_positions": [1, 4],
+        "multimodal_run_lengths": [2, 1],
+    }
+    handoff = DisaggregatedParams(request_type="context_and_generation",
+                                  multimodal_input=record,
+                                  multimodal_hashes=record["multimodal_hashes"])
+    sampling = SamplingParams(max_tokens=1)
+    request = GenerationRequest(prompt_token_ids=ids,
+                                sampling_params=sampling).set_id(42)
+    result = GenerationResult(request, disaggregated_params=handoff)
+    py_result = PyResult(prompt_len=len(ids), max_new_tokens=1)
+    source = torch.arange(12).reshape(3, 4)
+    py_result.append_mm_embeddings(source, [2, 1])
+    positions = torch.arange(len(ids)).expand(3, 1, len(ids))
+    py_result.set_mrope_position(positions, torch.zeros(1, dtype=torch.int32))
+    response = LlmResponse(request_id=42,
+                           client_id=42,
+                           result=LlmResult(create_rsp(17,
+                                                       finished=True).result,
+                                            py_result,
+                                            is_final=True))
+    if postproc:
+        _, _, params = _get_params_for_first_rsp(
+            SimpleNamespace(_results={42: result}), 42)
+        worker = SimpleNamespace(
+            _records={},
+            _record_creator=PostprocWorker.default_record_creator,
+            _tokenizer=None,
+            _post_processor_hook=None)
+        inp = PostprocWorker.Input(response,
+                                   sampling_params=sampling,
+                                   disaggregated_params=params)
+        with closing(asyncio.new_event_loop()) as loop:
+            output, _, _, params = loop.run_until_complete(
+                PostprocWorker._handle_input(worker, inp))
+        response = PostprocWorker.Output(42,
+                                         output,
+                                         is_final=True,
+                                         disaggregated_params=params)
+
+    result._handle_response(response)
+    params = result.disaggregated_params
+    assert params is result.outputs[0].disaggregated_params
+    assert result.prompt_token_ids == ids
+    assert params.multimodal_input == record
+    assert params.multimodal_hashes == record["multimodal_hashes"]
+    assert params.mrope_position_ids_handle["method_key"] == 4
+    restored = SharedTensorContainer.from_dict(
+        params.mrope_position_ids_handle).get_local_view()
+    assert torch.equal(restored, positions)
+    payload = [
+        SharedTensorContainer.from_dict(h).get_local_view()
+        for h in params.multimodal_embedding_handles
+    ]
+    assert [len(t) for t in payload] == [2, 1]
+    assert torch.equal(torch.cat(payload), source)
+
+
 def test_context_result_preserves_remote_tail_handoff() -> None:
     from types import SimpleNamespace
 

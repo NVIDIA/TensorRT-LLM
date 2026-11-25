@@ -618,14 +618,10 @@ class GenerationResultBase:
 
             self._outputs[
                 0].request_perf_metrics = response.request_perf_metrics
-            if not self._outputs[0].disaggregated_params:
-                disaggregated_params = response.disaggregated_params
-
-                # Generation only response has no disaggregated_params attached
-                if not disaggregated_params:
-                    disaggregated_params = self.disaggregated_params
-
-                self._outputs[0].disaggregated_params = disaggregated_params
+            self._disaggregated_params = (response.disaggregated_params or
+                                          self._outputs[0].disaggregated_params
+                                          or self.disaggregated_params)
+            self._outputs[0].disaggregated_params = self.disaggregated_params
 
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
@@ -721,6 +717,21 @@ class GenerationResultBase:
                     multimodal_input_layout=None,
                 )
 
+            if (handles := getattr(response_result, "mm_embedding_handles",
+                                   None)) is not None:
+                self._disaggregated_params = dataclasses.replace(
+                    self.disaggregated_params
+                    or DisaggregatedParams(multimodal_hashes=getattr(
+                        self, "_multimodal_hashes", None)),
+                    multimodal_embedding_handles=handles,
+                )
+            if (getattr(response_result, "mrope_position_ids_handle", None)
+                    is not None and self.disaggregated_params is not None):
+                self._disaggregated_params.mrope_position_ids_handle = (
+                    response_result.mrope_position_ids_handle)
+                self._disaggregated_params.mrope_position_deltas_handle = (
+                    response_result.mrope_position_deltas_handle)
+
             finish_reasons = response_result.finish_reasons
             # output_token_ids = (beams, tokens). Read the attribute once: on
             # the C++-backed result every access converts the whole
@@ -775,28 +786,6 @@ class GenerationResultBase:
                     context_logits :=
                     response_result.context_logits) is not None:
                 self._context_logits = context_logits
-
-            if (mm_embedding_handles :=
-                    getattr(response_result, "mm_embedding_handles",
-                            None)) is not None:
-                if self._disaggregated_params is not None:
-                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
-                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
-                else:
-                    self._disaggregated_params = DisaggregatedParams(
-                        multimodal_embedding_handles=mm_embedding_handles,
-                        multimodal_hashes=self._multimodal_hashes)
-
-            # Handle mrope handles for both:
-            # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
-            # 2. Prefill-only EPD requests (mm_embedding_handle is None because embeddings
-            #    were already computed in encode phase, but mrope still needs forwarding)
-            if (getattr(response_result, "mrope_position_ids_handle", None)
-                    is not None and self.disaggregated_params is not None):
-                self._disaggregated_params.mrope_position_ids_handle = (
-                    response_result.mrope_position_ids_handle)
-                self._disaggregated_params.mrope_position_deltas_handle = (
-                    response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -1186,7 +1175,14 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
-        self._disaggregated_params = disaggregated_params
+        # A prefill worker consumes its input exports. Only encoder completion
+        # can transfer fresh embedding handles to a caller.
+        self._disaggregated_params = (
+            dataclasses.replace(disaggregated_params,
+                                multimodal_embedding_handles=None)
+            if disaggregated_params is not None
+            and disaggregated_params.multimodal_embedding_handles is not None
+            else disaggregated_params)
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
@@ -1243,27 +1239,29 @@ class GenerationResult(GenerationResultBase):
         # indefinitely.
         # Raises `queue.Empty` on timeout; `result()` turns that into a `TimeoutError`.
         response = self.queue.get(timeout=timeout)
-        # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
-        # every pending result so this get() unblocks instead of hanging forever
-        # on a queue whose producer is gone. Record it as the sticky terminal
-        # error and mark the result done before raising, so subsequent
-        # result()/aresult()/_exception() calls keep surfacing the failure
-        # instead of re-blocking on an empty queue or looking successful.
-        if isinstance(response, EngineDeadError):
-            self._terminal_error = response
-            self._done = True
-            raise response
-        self._handle_response(response)
+        self._consume_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
+        self._consume_response(response)
+
+    def _consume_response(self, response):
+        # Keep worker death sticky across repeated result()/aresult() calls.
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
             raise response
-        self._handle_response(response)
+        try:
+            self._handle_response(response)
+        except Exception:
+            from .._torch.pyexecutor.llm_request import \
+                release_undelivered_response
+            release_undelivered_response(response)
+            if self._disaggregated_params is not None:
+                self._disaggregated_params.multimodal_embedding_handles = None
+            raise
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.

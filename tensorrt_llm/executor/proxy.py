@@ -40,6 +40,7 @@ from tensorrt_llm._startup_errors import (StartupErrorInfo,
 from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import release_undelivered_response
+from .._torch.shared_tensor import SharedTensorContainer
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -149,21 +150,24 @@ class _RequestSender:
         # interpreter teardown, when module globals may already be None.
         self._is_finalizing = sys.is_finalizing
 
-    def send(self, payload: bytes) -> None:
+    def send(self,
+             payload: bytes,
+             encoder_exports: Optional[list[dict]] = None) -> bool:
         """Queue a pickled request for the worker.
 
         Payloads sent after ``close`` are dropped: the proxy is shutting down.
         """
         with self._cond:
             if self._closed:
-                return
+                return False
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run,
                                                 daemon=True,
                                                 name="proxy_request_sender")
                 self._thread.start()
-            self._pending.append(payload)
+            self._pending.append((payload, encoder_exports))
             self._cond.notify()
+            return True
 
     def close(self,
               timeout: Optional[float] = None,
@@ -212,10 +216,13 @@ class _RequestSender:
                     for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
                 ]
             try:
-                self._request_queue.put(batch)
+                self._request_queue.put([payload for payload, _ in batch])
             except Exception as e:
                 # The payloads are already pickled, so this is a transport
                 # error, which the proxy treats as fatal.
+                for _, exports in batch:
+                    if exports:
+                        SharedTensorContainer.release_many(exports)
                 self._error_queue.put_nowait(e)
         if send_sentinel:
             # A bare None, not a batch: the worker stops at a top-level None.
@@ -1232,7 +1239,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._request_sender is None:
             self.request_queue.put(request)
         else:
-            self._request_sender.send(pickle.dumps(request))
+            payload = pickle.dumps(request)
+            params = getattr(request, "disaggregated_params", None)
+            if params is not None and params.multimodal_embedding_handles:
+                if not self._request_sender.send(
+                        payload, params.multimodal_embedding_handles):
+                    raise RuntimeError(
+                        "Request sender closed before accepting encoder embeddings"
+                    )
+            else:
+                self._request_sender.send(payload)
 
     def _close_request_sender(self, send_sentinel: bool = False) -> None:
         """Stop the request sender, if any, then send the shutdown sentinel if asked.
@@ -1413,8 +1429,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             if tail:
                 request._prompt_tail_tokens = tail
 
-        with nvtx_range_debug("request_queue.put"):
-            self._send_request(request)
+        try:
+            with nvtx_range_debug("request_queue.put"):
+                self._send_request(request)
+        except Exception:
+            self._results.pop(request.id, None)
+            raise
+        if request.disaggregated_params is not None:
+            request.disaggregated_params.multimodal_embedding_handles = None
 
         self._handle_background_error()
 

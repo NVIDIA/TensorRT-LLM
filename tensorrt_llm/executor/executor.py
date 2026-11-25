@@ -12,6 +12,7 @@ import traceback
 import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from copy import copy
 from pathlib import Path
 from queue import Empty, Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
@@ -27,7 +28,8 @@ from tensorrt_llm.logger import logger, set_level
 from .._errors import ConfigInputError
 from .._utils import mpi_world_size
 from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import (DisaggregatedParams,
+                                    _release_encoder_handles_on_error)
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
@@ -142,34 +144,39 @@ class GenerationExecutor(ABC):
         ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
         omit this argument or pass None.
         """
-        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
-            prompt_token_ids[0], int)
-        assert isinstance(sampling_params, SamplingParams)
+        # Keep ownership local to this submission. The direct worker and IPC
+        # proxy disarm this envelope as soon as they accept its one-shot exports.
+        if disaggregated_params is not None and disaggregated_params.multimodal_embedding_handles is not None:
+            disaggregated_params = copy(disaggregated_params)
+        with _release_encoder_handles_on_error(disaggregated_params):
+            assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+                prompt_token_ids[0], int)
+            assert isinstance(sampling_params, SamplingParams)
 
-        self._maybe_initialize_iteration_results()
+            self._maybe_initialize_iteration_results()
 
-        if postproc_params:
-            postproc_params.postproc_args.num_prompt_tokens = len(
-                prompt_token_ids)
-        request = GenerationRequest(
-            prompt_token_ids,
-            sampling_params=sampling_params,
-            postproc_params=postproc_params,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            streaming=streaming,
-            kv_cache_retention_config=kv_cache_retention_config,
-            disaggregated_params=disaggregated_params,
-            trace_headers=trace_headers,
-            multimodal_params=multimodal_params,
-            scheduling_params=scheduling_params,
-            conversation_params=conversation_params,
-            cache_salt=cache_salt,
-            arrival_time=arrival_time,
-            encoder_input_token_ids=encoder_input_token_ids,
-            priority=priority,
-            kv_hints=kv_hints)
-        result = self.submit(request)
+            if postproc_params:
+                postproc_params.postproc_args.num_prompt_tokens = len(
+                    prompt_token_ids)
+            request = GenerationRequest(
+                prompt_token_ids,
+                sampling_params=sampling_params,
+                postproc_params=postproc_params,
+                lora_request=lora_request,
+                prompt_adapter_request=prompt_adapter_request,
+                streaming=streaming,
+                kv_cache_retention_config=kv_cache_retention_config,
+                disaggregated_params=disaggregated_params,
+                trace_headers=trace_headers,
+                multimodal_params=multimodal_params,
+                scheduling_params=scheduling_params,
+                conversation_params=conversation_params,
+                cache_salt=cache_salt,
+                arrival_time=arrival_time,
+                encoder_input_token_ids=encoder_input_token_ids,
+                priority=priority,
+                kv_hints=kv_hints)
+            result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
             del request.multimodal_params

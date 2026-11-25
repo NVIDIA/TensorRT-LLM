@@ -614,10 +614,11 @@ class PyResult:
                                        mm_embedding_lengths,
                                        dim=0)
 
-        self._mm_embeddings = [
-            SharedTensorContainer.from_tensor(emb).dump_to_dict()
-            for emb in split_embeddings
-        ]
+        # The scheduler retires even a partially exported request on failure.
+        self._mm_embeddings = []
+        for emb in split_embeddings:
+            self._mm_embeddings.append(
+                SharedTensorContainer.from_tensor(emb).dump_to_dict())
         if mm_embedding_metadata is not None:
             for handle, metadata in zip(self._mm_embeddings,
                                         mm_embedding_metadata,
@@ -801,9 +802,7 @@ def release_exported_handles(result: "PyResult | LlmResult") -> None:
         result.mrope_position_ids_handle,
         result.mrope_position_deltas_handle,
     ]
-    for handle in handles:
-        if handle is not None:
-            SharedTensorContainer.release_dict(handle)
+    SharedTensorContainer.release_many(handles)
 
 
 def release_undelivered_response(response: Any) -> None:
@@ -812,9 +811,16 @@ def release_undelivered_response(response: Any) -> None:
     Takes the executor's responses, also when the worker has wrapped them; error
     responses and other records carry no ``LlmResult`` and export nothing.
     """
+    if hasattr(response, "has_error") and response.has_error():
+        return
     result = getattr(response, "result", None)
     if isinstance(result, LlmResult):
         release_exported_handles(result)
+    elif (params := getattr(response, "disaggregated_params",
+                            None)) is not None:
+        # A postprocessing worker has already moved these exports to its output.
+        SharedTensorContainer.release_many(params.multimodal_embedding_handles
+                                           or ())
 
 
 class LlmResult:
