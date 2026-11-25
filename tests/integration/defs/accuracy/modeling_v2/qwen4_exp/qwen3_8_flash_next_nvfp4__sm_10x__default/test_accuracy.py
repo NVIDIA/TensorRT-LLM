@@ -420,7 +420,9 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # The attention-TP cases run 6 query heads a KV head on each rank. FP8 at dep4 once more with the
 # MoE round trip on the Lamport transport (`TRTLLM_QWEN4_EXP_DP_MOE_COMM=lamport`, SM103 only),
 # and FP8 at tep4 once more with each decode MoE block's finalize and all-reduce in one Lamport
-# launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only).
+# launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only). FP8 at dep4 once more with both
+# output projections on the bf16 mid-rows GEMM (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in,
+# another K split; SM103 only).
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -431,6 +433,16 @@ _QUANTIZED_KV = [
         id="dep4_fp8_kv_lamport",
         marks=pytest.mark.skipif(
             get_sm_version() != 103, reason="the Lamport MoE round trip is certified on SM103"
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(out_proj_bf16="all"),
+        id="dep4_fp8_kv_out_proj_bf16",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the bf16 mid-rows output projections are measured on SM103",
         ),
     ),
     pytest.param(
@@ -858,6 +870,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             env["TRTLLM_QWEN4_EXP_DP_MOE_COMM"] = "lamport"
         if variant.get("finar"):
             env["TRTLLM_QWEN4_EXP_TEP_FINAR"] = variant["finar"]
+        if variant.get("out_proj_bf16"):
+            env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"] = variant["out_proj_bf16"]
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
             scoped_env_overrides(env) as rank_env,
