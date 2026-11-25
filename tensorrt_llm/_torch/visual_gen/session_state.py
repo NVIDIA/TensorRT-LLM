@@ -58,7 +58,7 @@ class SessionState:
         # Per stream: where its next result starts, in that stream's units (frames, samples).
         self.stream_positions: Dict[str, int] = {s.name: 0 for s in capabilities.streams}
         # True once the terminal result is published: no more input or advances;
-        # slot returns are still served until the client closes.
+        # slot returns are still served until every slot is back or the client closes.
         self.ended = False
 
     # ---- admission

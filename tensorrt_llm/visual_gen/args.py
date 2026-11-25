@@ -404,14 +404,15 @@ class SessionConfig(StrictBaseModel):
         ),
     )
     idle_timeout: Optional[float] = Field(
-        None,
+        10.0,
         gt=0,
         status="prototype",
         description=(
             "Seconds a session may wait for the client (no submit, no result request, "
             "no slot return) while only the client can make progress, before the "
             "executor closes it with a terminal error and frees the model instance. "
-            "None disables the timeout."
+            "An open session occupies its model instance, so a client that pauses "
+            "longer than this between calls loses the session. None disables the timeout."
         ),
     )
 

@@ -247,6 +247,12 @@ class VisualGenSession:
     for the next one expires the previous. ``close`` ends the session and is also
     the context manager's exit.
 
+    An open session occupies its model instance: ``generate()`` and
+    ``open_session()`` on that instance are refused until the session ends. A
+    session that reaches its terminal result ends by itself once the caller has
+    requested that result; any other session ends at ``close`` or at the idle
+    timeout, so close it, or use it as a context manager.
+
     A session is driven from one thread or one asyncio task. One submit and one
     result request can be in progress at a time; a second raises
     :class:`SessionError` instead of waiting.

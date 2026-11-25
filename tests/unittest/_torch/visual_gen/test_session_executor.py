@@ -526,6 +526,26 @@ def test_autonomous_session_runs_to_its_terminal(harness):
                 s.submit("camera", 1)
 
 
+def test_finished_session_releases_the_instance_without_a_close(harness):
+    """A session read to its terminal and never closed. The worker ends it once
+    the terminal is published and the last slot is back, so the pipeline state
+    is released and the next open is served; the terminal the caller took
+    stays what it was."""
+    pipe = CountingPipeline(queued=False, initial=False, length=2)
+    with harness(pipe) as h:
+        abandoned = h.open()
+        results = abandoned.results()
+        assert [next(results).advance_index for _ in range(2)] == [0, 1]
+        assert pipe.closed == 0  # the caller still holds the last result's slot
+        terminal = next(results)  # returns that slot
+        assert terminal.done and terminal.error is None
+        _wait_until(lambda: pipe.closed == 1, what="the worker to end the finished session")
+        with h.open() as following, following.results() as more:
+            assert next(more).advance_index == 0
+        assert pipe.opened == 2 and pipe.closed == 2
+        abandoned.close()  # after the fact: nothing to do, nothing raised
+
+
 def test_iterator_ends_after_the_terminal_result(harness):
     with harness(CountingPipeline(queued=False, initial=False, length=1)) as h:
         with h.open() as s:
@@ -1962,8 +1982,9 @@ def test_advance_takes_the_terminal_when_the_earlier_input_died_without_media(ha
             assert s.submit("controls", 1) == 0  # admitted, then the advance raises
             channel = h.client._sessions[s.request_id]
             _wait_until(lambda: _terminal_next(channel), what="the error terminal")
-            assert channel.lockstep_due() > 0  # index 0 is still recorded ...
-            terminal = s.advance(2)  # ... but the terminal supersedes it; nothing submitted
+            # No slot is out, so the worker ends the session behind the terminal;
+            # the terminal is delivered either side of that, and nothing is submitted.
+            terminal = s.advance(2)
             assert terminal.done and "kernel exploded" in terminal.error
             assert [a["controls"] for a in pipe.advances] == []
             with pytest.raises(SessionEnded):

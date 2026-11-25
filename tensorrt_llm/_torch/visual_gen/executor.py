@@ -110,7 +110,8 @@ class _SessionExit(Enum):
     """Why a session ended. After CLOSE and IDLE_TIMEOUT the worker serves the
     next request; after SHUTDOWN it stops, once the session is torn down."""
 
-    CLOSE = "close"  # the client closed the session
+    # The client closed the session, or it finished and every slot came back.
+    CLOSE = "close"
     SHUTDOWN = "shutdown"  # the executor's shutdown signal arrived during the session
     IDLE_TIMEOUT = "idle_timeout"  # the client went quiet past the configured limit
 
@@ -1172,8 +1173,9 @@ class DiffusionExecutor:
     ) -> _SessionExit:
         """The session loop on rank 0: advance whenever the advance condition
         holds, otherwise wait for the client. The advance that completes a finite
-        session publishes its terminal; the loop ends on the close command, on
-        the shutdown signal, or on the idle timeout, and says which."""
+        session publishes its terminal. The loop ends on the close command, on
+        the shutdown signal, on the idle timeout, or by itself once the terminal
+        is published and the client has returned every slot, and says which."""
         idle_timeout = self._session_idle_timeout()
         # The idle wait counts from the later of the last advance and the last
         # command of this session's own client. Traffic the worker refuses (a
@@ -1181,6 +1183,10 @@ class DiffusionExecutor:
         # not move it.
         active_at = time.monotonic()
         while True:
+            if session.ended and pool.free_count == len(pool):
+                # Nothing can happen in this session any more and the client has
+                # moved past every result: the model instance is released.
+                return _SessionExit.CLOSE
             # Commands already waiting go first, so a value submitted during the
             # last advance is seen by the next dispatch.
             commands = self._waiting_commands()
