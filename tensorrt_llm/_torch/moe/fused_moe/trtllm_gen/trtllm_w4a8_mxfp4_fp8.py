@@ -54,9 +54,9 @@ class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
         x = torch.nn.functional.pad(x, (0, pad_size))
-        # Two static per-tensor scales, one per side of the fused FC1: the
-        # post-communication path dequantizes with the gate-less scale.
-        scale = self.fc31_input_dequant[0] if post_quant_comm else self.fc31_input_gate_dequant[0]
+        # Input quantization always uses the raw FC1 scale. fc31_input_dequant
+        # is the FC1/FC2 scale ratio used inside the fused kernel.
+        scale = self.fc31_input_gate_dequant[0]
         x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, scale)
         return x, None
 

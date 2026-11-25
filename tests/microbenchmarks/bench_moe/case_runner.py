@@ -722,6 +722,18 @@ def _run_one_candidate(
                 device=device,
             )
         except Exception as exc:
+            # The framework checks the actual backend/comm capabilities after
+            # AUTO selection. Only its unfinalized-output refusals are skips.
+            if (
+                model.post_expert_norm_eps is not None
+                and isinstance(exc, ValueError)
+                and (
+                    str(exc).startswith("unfinalized_combine_fn is registered but ")
+                    or str(exc) == "unfinalized_combine_fn requires ConfigurableMoE."
+                )
+            ):
+                _maybe_print_rank0(f"[bench_moe] skipped: {exc}")
+                return _short_circuit(result, "skipped", str(exc))
             reason = f"build error: {type(exc).__name__}: {exc}"
             _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)

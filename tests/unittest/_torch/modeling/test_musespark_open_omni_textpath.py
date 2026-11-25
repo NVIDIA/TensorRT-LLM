@@ -1067,16 +1067,6 @@ def test_the_dummy_batch_fits_the_aggregate_encoder_budget():
             assert described == item["pixel_values"].shape[0]
 
 
-def test_the_model_asks_the_loaders_for_pil():
-    """The framework's default is `pt` -- a float32 CHW tensor in 0..1 -- and
-    this preprocessing is written against PIL. Declaring the format is the
-    framework's own mechanism rather than converting on every request."""
-    processor = _build_processor()
-    prefs = processor.get_preferred_media_io_kwargs()
-    assert prefs["image"]["format"] == "pil"
-    assert prefs["video"]["format"] == "pil"
-
-
 def test_the_model_declares_its_own_video_sampling():
     """The video loader defaults to `num_frames=10, fps=30` -- 10 frames per
     video regardless of length -- while this model's sampling policy is
@@ -1084,10 +1074,7 @@ def test_the_model_declares_its_own_video_sampling():
     here, a bare serve boot hands the model 10 frames per video with no error
     anywhere: a silent quality collapse on video inputs."""
     prefs = _build_processor().get_preferred_media_io_kwargs()
-    assert prefs["video"]["num_frames"] == 96
-    assert prefs["video"]["fps"] == 2.0
-    # Frame sampling is a video concept; the image loader takes neither key.
-    assert set(prefs["image"]) == {"format"}
+    assert prefs == {"video": {"num_frames": 96, "fps": 2.0}}
 
 
 def test_video_sampling_prefs_follow_the_processor_config(tmp_path):

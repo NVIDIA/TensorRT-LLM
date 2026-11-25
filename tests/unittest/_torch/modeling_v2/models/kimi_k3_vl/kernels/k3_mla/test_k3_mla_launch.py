@@ -9,7 +9,7 @@ import pytest
 
 source = (
     Path(__file__).resolve().parents[8]
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/_launch.py"
+    / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/_launch.py"
 )
 spec = importlib.util.spec_from_file_location("_k3_mla_launch_test", source)
 launch = importlib.util.module_from_spec(spec)

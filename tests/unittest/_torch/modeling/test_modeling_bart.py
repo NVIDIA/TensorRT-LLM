@@ -17,13 +17,17 @@
 
 import pytest
 import torch
-from transformers import BartConfig
+from transformers import BartConfig, MBartConfig
 from transformers import BartForConditionalGeneration as HFBartForConditionalGeneration
+from transformers import MBartForConditionalGeneration as HFMBartForConditionalGeneration
 
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_bart import BartForConditionalGeneration
+from tensorrt_llm._torch.models.modeling_bart import (
+    BartForConditionalGeneration,
+    MBartForConditionalGeneration,
+)
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 
 
@@ -110,4 +114,84 @@ def test_bart_for_conditional_generation_construction_and_forward() -> None:
     assert torch.isfinite(logits).all()
     # Both implementations use float32 and identical small weights. Allow
     # accumulation-order differences between SDPA and eager HF attention.
+    torch.testing.assert_close(logits, expected, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="The production mBART layers require CUDA"
+)
+def test_mbart_for_conditional_generation_construction_and_forward() -> None:
+    torch.manual_seed(0)
+    config = MBartConfig(
+        vocab_size=64,
+        d_model=32,
+        encoder_layers=1,
+        decoder_layers=1,
+        encoder_attention_heads=4,
+        decoder_attention_heads=4,
+        encoder_ffn_dim=64,
+        decoder_ffn_dim=64,
+        max_position_embeddings=32,
+        activation_function="relu",
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        scale_embedding=True,
+        tie_word_embeddings=True,
+        pad_token_id=1,
+        bos_token_id=0,
+        eos_token_id=2,
+        decoder_start_token_id=2,
+        forced_eos_token_id=2,
+        torch_dtype=torch.float32,
+    )
+    config._attn_implementation = "eager"
+    reference = HFMBartForConditionalGeneration(config).cuda().float().eval()
+    model_cls = get_registered_model_class("MBartForConditionalGeneration")
+    assert model_cls is MBartForConditionalGeneration
+    model = model_cls(ModelConfig(pretrained_config=config, attn_backend="VANILLA")).cuda().eval()
+    assert isinstance(model, MBartForConditionalGeneration)
+    assert model.model.encoder.layer_norm is not None
+    assert model.model.decoder.layer_norm is not None
+    assert model.model.encoder.layers[0].normalize_before
+    assert model.model.decoder.layers[0].normalize_before
+    model.load_weights(
+        {name: value.detach().clone() for name, value in reference.state_dict().items()}
+    )
+
+    encoder_input_ids = torch.tensor([3, 7, 11, 5, 9], dtype=torch.int32, device="cuda")
+    decoder_input_ids = torch.tensor([2, 4, 6], dtype=torch.int32, device="cuda")
+    encoder_metadata = _context_metadata(encoder_input_ids.numel())
+    decoder_metadata = _context_metadata(decoder_input_ids.numel())
+    cross_metadata = decoder_metadata.create_cross_metadata([encoder_input_ids.numel()])
+    cross_metadata.prepare()
+    assert cross_metadata.is_cross
+
+    # Learned position tables reserve their first two entries.
+    encoder_positions = (
+        torch.arange(encoder_input_ids.numel(), dtype=torch.int32, device="cuda") + 2
+    )
+    decoder_positions = (
+        torch.arange(decoder_input_ids.numel(), dtype=torch.int32, device="cuda") + 2
+    )
+    with torch.inference_mode():
+        logits = model.forward(
+            attn_metadata=decoder_metadata,
+            input_ids=decoder_input_ids,
+            position_ids=decoder_positions,
+            encoder_input_ids=encoder_input_ids,
+            encoder_position_ids=encoder_positions,
+            encoder_attn_metadata=encoder_metadata,
+            cross_attn_metadata=cross_metadata,
+            return_context_logits=True,
+        )
+        expected = reference(
+            input_ids=encoder_input_ids.long().unsqueeze(0),
+            decoder_input_ids=decoder_input_ids.long().unsqueeze(0),
+            use_cache=False,
+        ).logits.squeeze(0)
+
+    assert logits.shape == (decoder_input_ids.numel(), config.vocab_size)
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits).all()
     torch.testing.assert_close(logits, expected, rtol=2e-4, atol=2e-5)

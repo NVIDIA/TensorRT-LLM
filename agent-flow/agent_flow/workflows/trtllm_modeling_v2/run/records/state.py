@@ -20,16 +20,14 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 STATE_FILENAME = ".trtllm_modeling_v2_state.json"
 SCHEMA_VERSION = 2
 
 STAGE_PREFLIGHT = "preflight"
 STAGE_EXECUTION = "execution"
-STAGE_TUNE = "tune"
 
-_VALID_STAGES = (STAGE_PREFLIGHT, STAGE_EXECUTION, STAGE_TUNE)
+_VALID_STAGES = (STAGE_PREFLIGHT, STAGE_EXECUTION)
 
 
 #: Verdicts a re-run should re-enter rather than refuse: each names a repair the
@@ -64,9 +62,6 @@ class WorkflowState:
     branch: str = ""
     devices: list[int] = field(default_factory=list)
 
-    # The tune stage's checkpoint (see tune/stage.py). Empty until it runs.
-    tune: dict[str, Any] = field(default_factory=dict)
-
 
 def load_state(path: Path) -> WorkflowState:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -90,7 +85,6 @@ def load_state(path: Path) -> WorkflowState:
         slug=str(data.get("slug", "")),
         branch=str(data.get("branch", "")),
         devices=[int(d) for d in data.get("devices", [])],
-        tune=dict(data.get("tune") or {}),
     )
 
 
@@ -118,7 +112,6 @@ __all__ = [
     "SCHEMA_VERSION",
     "STAGE_EXECUTION",
     "STAGE_PREFLIGHT",
-    "STAGE_TUNE",
     "STATE_FILENAME",
     "WorkflowState",
     "is_remediable",

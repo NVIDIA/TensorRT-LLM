@@ -1,16 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_long catalog entry."""
+"""GPU test for the k3_ctm_gemv_long op."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-    op as ctm_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import op as ctm_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
 
@@ -18,7 +16,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "k3_ctm_gemv_long requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",

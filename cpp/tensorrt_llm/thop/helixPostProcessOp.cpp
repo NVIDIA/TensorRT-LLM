@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale)
+torch::Tensor helix_post_process(
+    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, bool is_lse)
 {
     CHECK_TH_CUDA(gathered_o);
     CHECK_CONTIGUOUS(gathered_o);
@@ -34,7 +35,8 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
     CHECK_CONTIGUOUS(gathered_stats);
 
     TORCH_CHECK(gathered_o.dim() == 3, "gathered_o must be 3D tensor [cp_size, num_tokens, num_heads * kv_lora_rank]");
-    TORCH_CHECK(gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [cp_size, num_tokens, num_heads, 2]");
+    TORCH_CHECK(
+        gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [cp_size, num_tokens, num_heads, stats_width]");
 
     auto const cp_size = gathered_stats.sizes()[0];
     auto const num_tokens = gathered_stats.sizes()[1];
@@ -49,7 +51,8 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
     TORCH_CHECK(gathered_o.sizes()[2] == num_heads * kv_lora_rank,
         "gathered_o third dimension must match num_heads * kv_lora_rank");
 
-    TORCH_CHECK(gathered_stats.sizes()[3] == 2, "gathered_stats fourth dimension must be 2");
+    TORCH_CHECK(
+        gathered_stats.sizes()[3] == (is_lse ? 1 : 2), "gathered_stats last dimension does not match its format");
 
     // Check data types
     TORCH_CHECK(
@@ -73,9 +76,9 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
 
 #define CALL_CPP_OP(T)                                                                                                 \
     tensorrt_llm::kernels::HelixPostProcParams<T> params{reinterpret_cast<T*>(output.mutable_data_ptr()),              \
-        reinterpret_cast<T const*>(gathered_o.data_ptr()), reinterpret_cast<float2 const*>(gathered_stats.data_ptr()), \
+        reinterpret_cast<T const*>(gathered_o.data_ptr()), gathered_stats.data_ptr<float>(),                           \
         static_cast<int>(cp_size), static_cast<int>(num_tokens), static_cast<int>(num_heads),                          \
-        static_cast<int>(kv_lora_rank)};                                                                               \
+        static_cast<int>(kv_lora_rank), is_lse};                                                                       \
     tensorrt_llm::kernels::helixPostProcess(params, stream);
 
     if (gathered_o.scalar_type() == at::ScalarType::Half)
@@ -101,7 +104,7 @@ torch::Tensor helix_post_process(torch::Tensor const& gathered_o, torch::Tensor 
 
 template <typename T, typename Fn>
 inline torch::Tensor helix_post_process_native_impl_v1(
-    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, Fn fn)
+    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, bool is_lse, Fn fn)
 {
     CHECK_TH_CUDA(gathered_o);
     CHECK_CONTIGUOUS(gathered_o);
@@ -113,7 +116,8 @@ inline torch::Tensor helix_post_process_native_impl_v1(
     auto heads_dim = 1;
 
     TORCH_CHECK(gathered_o.dim() == 4, "gathered_o must be 4D tensor [num_tokens, num_heads, cp_size, kv_lora_rank]");
-    TORCH_CHECK(gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [num_tokens, num_heads, cp_size, 2]");
+    TORCH_CHECK(
+        gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [num_tokens, num_heads, cp_size, stats_width]");
 
     auto const num_tokens = gathered_stats.sizes()[tokens_dim];
     auto const num_heads = gathered_stats.sizes()[heads_dim];
@@ -125,7 +129,8 @@ inline torch::Tensor helix_post_process_native_impl_v1(
     TORCH_CHECK(gathered_o.sizes()[tokens_dim] == num_tokens, "gathered_o tokens_dim must match num_tokens");
     TORCH_CHECK(gathered_o.sizes()[heads_dim] == num_heads, "gathered_o heads_dim must match num_heads");
 
-    TORCH_CHECK(gathered_stats.sizes()[3] == 2, "gathered_stats last dimension must be 2");
+    TORCH_CHECK(
+        gathered_stats.sizes()[3] == (is_lse ? 1 : 2), "gathered_stats last dimension does not match its format");
 
     // Check data types.
     TORCH_CHECK(
@@ -149,9 +154,8 @@ inline torch::Tensor helix_post_process_native_impl_v1(
     auto stream = at::cuda::getCurrentCUDAStream(gathered_o.get_device());
 
     tensorrt_llm::kernels::HelixPostProcParams<T> params{reinterpret_cast<T*>(output.mutable_data_ptr()),
-        reinterpret_cast<T const*>(gathered_o.data_ptr()), reinterpret_cast<float2 const*>(gathered_stats.data_ptr()),
-        static_cast<int>(cp_size), static_cast<int>(num_tokens), static_cast<int>(num_heads),
-        static_cast<int>(kv_lora_rank)};
+        reinterpret_cast<T const*>(gathered_o.data_ptr()), gathered_stats.data_ptr<float>(), static_cast<int>(cp_size),
+        static_cast<int>(num_tokens), static_cast<int>(num_heads), static_cast<int>(kv_lora_rank), is_lse};
     fn(params, stream);
 
     if (scale != 1.0)
@@ -164,7 +168,7 @@ inline torch::Tensor helix_post_process_native_impl_v1(
 
 template <typename T, typename Fn>
 inline torch::Tensor helix_post_process_native_impl_v2(
-    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, Fn fn)
+    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, bool is_lse, Fn fn)
 {
     CHECK_TH_CUDA(gathered_o);
     CHECK_CONTIGUOUS(gathered_o);
@@ -172,9 +176,10 @@ inline torch::Tensor helix_post_process_native_impl_v2(
     CHECK_CONTIGUOUS(gathered_stats);
 
     // For cp_dim=1: gathered_o: [num_tokens, cp_size, num_heads, kv_lora_rank]
-    //               gathered_stats: [num_tokens, cp_size, num_heads, 2]
+    //               gathered_stats: [num_tokens, cp_size, num_heads, is_lse ? 1 : 2]
     TORCH_CHECK(gathered_o.dim() == 4, "gathered_o must be 4D tensor [num_tokens, cp_size, num_heads, kv_lora_rank]");
-    TORCH_CHECK(gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [num_tokens, cp_size, num_heads, 2]");
+    TORCH_CHECK(
+        gathered_stats.dim() == 4, "gathered_stats must be 4D tensor [num_tokens, cp_size, num_heads, stats_width]");
 
     auto const num_tokens = gathered_o.sizes()[0];
     auto const cp_size = gathered_o.sizes()[1];
@@ -185,7 +190,8 @@ inline torch::Tensor helix_post_process_native_impl_v2(
     TORCH_CHECK(gathered_stats.sizes()[0] == num_tokens, "gathered_stats num_tokens dim must match");
     TORCH_CHECK(gathered_stats.sizes()[1] == cp_size, "gathered_stats cp_size dim must match");
     TORCH_CHECK(gathered_stats.sizes()[2] == num_heads, "gathered_stats num_heads dim must match");
-    TORCH_CHECK(gathered_stats.sizes()[3] == 2, "gathered_stats last dimension must be 2");
+    TORCH_CHECK(
+        gathered_stats.sizes()[3] == (is_lse ? 1 : 2), "gathered_stats last dimension does not match its format");
 
     // Check data types.
     TORCH_CHECK(
@@ -209,9 +215,8 @@ inline torch::Tensor helix_post_process_native_impl_v2(
     auto stream = at::cuda::getCurrentCUDAStream(gathered_o.get_device());
 
     tensorrt_llm::kernels::HelixPostProcParams<T> params{reinterpret_cast<T*>(output.mutable_data_ptr()),
-        reinterpret_cast<T const*>(gathered_o.data_ptr()), reinterpret_cast<float2 const*>(gathered_stats.data_ptr()),
-        static_cast<int>(cp_size), static_cast<int>(num_tokens), static_cast<int>(num_heads),
-        static_cast<int>(kv_lora_rank)};
+        reinterpret_cast<T const*>(gathered_o.data_ptr()), gathered_stats.data_ptr<float>(), static_cast<int>(cp_size),
+        static_cast<int>(num_tokens), static_cast<int>(num_heads), static_cast<int>(kv_lora_rank), is_lse};
     fn(params, stream);
 
     if (scale != 1.0)
@@ -223,7 +228,7 @@ inline torch::Tensor helix_post_process_native_impl_v2(
 }
 
 inline torch::Tensor helix_post_process_native(
-    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, int64_t cp_dim)
+    torch::Tensor const& gathered_o, torch::Tensor const& gathered_stats, double scale, int64_t cp_dim, bool is_lse)
 {
     TORCH_CHECK(cp_dim == 1 || cp_dim == 2,
         "cp_dim must be 1 or 2. \n"
@@ -236,13 +241,13 @@ inline torch::Tensor helix_post_process_native(
         if (gathered_o.scalar_type() == at::ScalarType::Half)
         {
             return helix_post_process_native_impl_v2<__half>(
-                gathered_o, gathered_stats, scale, tensorrt_llm::kernels::helixPostProcessNativeV2<__half>);
+                gathered_o, gathered_stats, scale, is_lse, tensorrt_llm::kernels::helixPostProcessNativeV2<__half>);
         }
         else if (gathered_o.scalar_type() == at::ScalarType::BFloat16)
         {
 #ifdef ENABLE_BF16
-            return helix_post_process_native_impl_v2<__nv_bfloat16>(
-                gathered_o, gathered_stats, scale, tensorrt_llm::kernels::helixPostProcessNativeV2<__nv_bfloat16>);
+            return helix_post_process_native_impl_v2<__nv_bfloat16>(gathered_o, gathered_stats, scale, is_lse,
+                tensorrt_llm::kernels::helixPostProcessNativeV2<__nv_bfloat16>);
 #else
             TLLM_THROW("BFloat16 must be enabled to use helix_post_process_native with bf16 tensors.");
 #endif
@@ -258,13 +263,13 @@ inline torch::Tensor helix_post_process_native(
         if (gathered_o.scalar_type() == at::ScalarType::Half)
         {
             return helix_post_process_native_impl_v1<__half>(
-                gathered_o, gathered_stats, scale, tensorrt_llm::kernels::helixPostProcessNativeV1<__half>);
+                gathered_o, gathered_stats, scale, is_lse, tensorrt_llm::kernels::helixPostProcessNativeV1<__half>);
         }
         else if (gathered_o.scalar_type() == at::ScalarType::BFloat16)
         {
 #ifdef ENABLE_BF16
-            return helix_post_process_native_impl_v1<__nv_bfloat16>(
-                gathered_o, gathered_stats, scale, tensorrt_llm::kernels::helixPostProcessNativeV1<__nv_bfloat16>);
+            return helix_post_process_native_impl_v1<__nv_bfloat16>(gathered_o, gathered_stats, scale, is_lse,
+                tensorrt_llm::kernels::helixPostProcessNativeV1<__nv_bfloat16>);
 #else
             TLLM_THROW("BFloat16 must be enabled to use helix_post_process_native with bf16 tensors.");
 #endif
@@ -278,10 +283,10 @@ inline torch::Tensor helix_post_process_native(
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("helix_post_process(Tensor gathered_o, Tensor gathered_stats, float scale) -> Tensor");
+    m.def("helix_post_process(Tensor gathered_o, Tensor gathered_stats, float scale, bool is_lse=False) -> Tensor");
     m.def(
         "helix_post_process_native(Tensor gathered_o, Tensor gathered_stats, float "
-        "scale, int cp_dim) -> Tensor");
+        "scale, int cp_dim, bool is_lse=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

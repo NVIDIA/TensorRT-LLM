@@ -28,6 +28,7 @@ from .chat import (
     render_chat,
     render_chat_for_length,
     render_conversation,
+    render_conversation_with_media,
     render_prepared_chat,
     tokenize_rendered,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "render_chat",
     "render_chat_for_length",
     "render_conversation",
+    "render_conversation_with_media",
     "render_endpoints_enabled",
     "render_prepared_chat",
     "tokenize_rendered",

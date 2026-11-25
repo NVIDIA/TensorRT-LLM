@@ -43,7 +43,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -53,7 +52,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, PrefillCudaGraphBackend, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
@@ -220,6 +219,7 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
         cuda_runner = Mock()
         breakable_runner = Mock()
         decoder_runner = object.__new__(DecoderRunner)
+        decoder_runner._host_uploader = None
         decoder_runner._graphs = object.__new__(DecoderCudaGraphs)
         decoder_runner._graphs.cuda_graph_runner = cuda_runner
         decoder_runner._graphs.breakable_cuda_graph_runner = breakable_runner
@@ -657,15 +657,12 @@ def test_model_engine_rejects_encode_only() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["piecewise", "breakable"])
-@pytest.mark.parametrize("mm_encoder_only", [False, True])
 def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
-    monkeypatch: pytest.MonkeyPatch, backend: str, mm_encoder_only: bool
+    monkeypatch: pytest.MonkeyPatch, backend: str
 ) -> None:
     model = DummyLegacyMultimodalIndexModel()
-    model.model_config = SimpleNamespace(is_generation=not mm_encoder_only)
-    llm_args = TorchLlmArgs(
-        model="dummy", mm_encoder_only=mm_encoder_only, prefill_cuda_graph_backend=backend
-    )
+    model.model_config = SimpleNamespace(is_generation=True)
+    llm_args = TorchLlmArgs(model="dummy", prefill_cuda_graph_backend=backend)
     monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     monkeypatch.setattr(
         model_engine_module,
@@ -679,7 +676,7 @@ def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
     )
     monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
     engine = ModelEngine.__new__(ModelEngine)
-    rejects_breakable = not mm_encoder_only and backend == "breakable"
+    rejects_breakable = backend == "breakable"
     expected_error = ValueError if rejects_breakable else RuntimeError
     message = "multimodal models" if rejects_breakable else "model configuration resolved"
     with pytest.raises(expected_error, match=message):
@@ -687,10 +684,7 @@ def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
             engine, model_path="dummy", llm_args=llm_args, mapping=Mapping(), model=model
         )
 
-    expected_backend = "disabled" if mm_encoder_only else backend
-    assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(expected_backend)
-    if mm_encoder_only:
-        assert engine.llm_args.torch_compile_config is None
+    assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(backend)
 
 
 class ModelEngineTestCase(unittest.TestCase):
@@ -766,43 +760,18 @@ class ModelEngineTestCase(unittest.TestCase):
             max_beam_width=2,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]),
         )
-        for is_generation in (True, False):
-            with self.subTest(is_generation=is_generation):
-                engine = DummyModelEngine(llm_args, torch.half, is_generation=is_generation)
+        engine = DummyModelEngine(llm_args, torch.half)
 
-                runner = engine._runner
-                if is_generation:
-                    self.assertIsInstance(runner, DecoderRunner)
-                    self.assertIsNotNone(engine.cuda_graph_runner)
-                    self.assertEqual(
-                        tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len)
-                    )
-                else:
-                    self.assertIsInstance(runner, EncoderRunner)
-                    self.assertIsNone(engine.cuda_graph_runner)
-                self.assertEqual(isinstance(runner._buffers, DecoderInputBuffers), is_generation)
+        runner = engine._runner
+        self.assertIsInstance(runner, DecoderRunner)
+        self.assertIsInstance(runner._buffers, DecoderInputBuffers)
+        self.assertIsNotNone(engine.cuda_graph_runner)
+        self.assertEqual(tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len))
 
-    def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
-        for mm_encoder_only, runner_name in (
-            (False, "EncoderRunner"),
-            (True, "MultimodalEncoderRunner"),
-        ):
-            with self.subTest(runner=runner_name):
-                llm_args = TorchLlmArgs(
-                    model="dummy",
-                    max_batch_size=4,
-                    max_num_tokens=64,
-                    mm_encoder_only=mm_encoder_only,
-                )
-                with self.assertRaisesRegex(
-                    ValueError, f"{runner_name} does not support speculative decoding"
-                ):
-                    DummyModelEngine(
-                        llm_args,
-                        torch.half,
-                        spec_config=SADecodingConfig(max_draft_len=1),
-                        is_generation=False,
-                    )
+    def test_model_engine_rejects_non_generation_models(self) -> None:
+        llm_args = TorchLlmArgs(model="dummy", max_batch_size=4, max_num_tokens=64)
+        with self.assertRaisesRegex(ValueError, "ScheduledEncoderExecutor"):
+            DummyModelEngine(llm_args, torch.half, is_generation=False)
 
     @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
@@ -821,6 +790,7 @@ class ModelEngineTestCase(unittest.TestCase):
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
         engine = object.__new__(ModelEngine)
         decoder = object.__new__(DecoderRunner)
+        decoder._host_uploader = None
         engine._runner = decoder
         engine._torch_compile_backend = None
         decoder._inputs = object.__new__(DecoderInputPreparer)
@@ -1228,33 +1198,6 @@ class TestWarmupCleanup(unittest.TestCase):
                                 exclude_nccl_symmetric,
                             )
                         unused.assert_not_called()
-
-    @pytest.mark.cpu_only
-    def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
-        """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
-        model_engine = object.__new__(ModelEngine)
-        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
-        model_engine._metrics = {}
-        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
-        model_engine.moe_load_balancer = None
-        model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=MultimodalEncoderRunner)
-        runner = model_engine._runner
-        runner._validate_resources = MultimodalEncoderRunner._validate_resources.__get__(runner)
-        runner.warmup.side_effect = MultimodalEncoderRunner.warmup.__get__(runner)
-        resource_manager = Mock()
-        resource_manager.get_resource_manager.return_value = object()
-
-        with self.assertRaisesRegex(
-            AssertionError,
-            "no-KV-cache runner was initialized, but a KV cache manager was allocated",
-        ):
-            model_engine.warmup(resource_manager)
-
-        model_engine._runner.warmup.assert_called_once_with(resource_manager)
-        resource_manager.get_resource_manager.assert_called_once_with(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
 
     @pytest.mark.cpu_only
     def test_warmup_total_timing_and_kv_cache_cleanup(self) -> None:

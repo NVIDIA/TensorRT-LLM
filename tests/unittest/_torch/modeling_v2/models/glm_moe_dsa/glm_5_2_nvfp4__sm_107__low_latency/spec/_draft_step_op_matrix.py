@@ -32,7 +32,7 @@ import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -455,10 +455,10 @@ def check_tp8_worker_feedback_eager_and_graph() -> None:
     """
     if WORLD != 8:
         return
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._mtp_worker import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._mtp_worker import (  # noqa: E501
         MTPDraftWorker,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._small_batch_draft import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._small_batch_draft import (  # noqa: E501
         SmallBatchDraftKernels,
     )
 
@@ -713,18 +713,23 @@ def _run_one_rank(entry: str, expected_cells: int) -> int:
     """Body of one rank: build the workspaces, run the entry's checks, exit hard on a failure."""
     global RANK, WORLD, HOST_GROUP, table_op, glue_op, validating, assert_within_ulp
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "comm"))
-    from _mnnvl_ranks import init_rank
+    if TYPE_CHECKING:
+        from _torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.comm._mnnvl_ranks import (
+            init_rank,
+        )
+    else:
+        from _mnnvl_ranks import init_rank
 
     RANK, WORLD, mapping = init_rank()
     HOST_GROUP = dist.new_group(backend="gloo")
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec import (  # noqa: E501
         _draft_exchange,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_ehproj_table import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_ehproj_table import (  # noqa: E501
         glm_draft_ehproj_table,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_sample_glue import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_sample_glue import (  # noqa: E501
         glm_draft_sample_glue,
     )
 

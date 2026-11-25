@@ -12,12 +12,16 @@ interpreter and turns its exit code into an assertion.
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 __extra_import_path__ = ["../../../../comm"]
-import _rank_job  # noqa: E402 — needs the path declared above
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _rank_job
+else:
+    import _rank_job  # noqa: E402 — needs the path declared above
 
 
 def _sm103_devices() -> int:

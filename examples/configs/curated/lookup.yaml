@@ -73,6 +73,42 @@
   scenario: Agentic Disaggregated Decode
   gpu_compatibility: "GB300"
   disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep8-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Remote KV Cache, TEP8 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep8-decode.yaml
+  scenario: AgentX Disaggregated Decode (Remote KV Cache, TEP8)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-dep8-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Remote KV Cache over NIXL, DEP8 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-dep8-decode.yaml
+  scenario: AgentX Disaggregated Decode (Remote KV Cache over NIXL, DEP8)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep16-prefill.yaml
+  scenario: AgentX Disaggregated Prefill (Host KV Cache, TEP16 Decode)
+  gpu_compatibility: "GB300"
+  disagg: true
+- model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.5-gb300-agentx-tep16-decode.yaml
+  scenario: AgentX Disaggregated Decode (Host KV Cache, TEP16)
+  gpu_compatibility: "GB300"
+  disagg: true
 - model: Qwen/Qwen3-30B-A3B
   arch: Qwen3MoeForCausalLM
   config_path: examples/configs/curated/qwen3.yaml
@@ -140,6 +176,16 @@
   config_path: examples/configs/curated/minimax-m3-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "GB200"
+- model: MiniMaxAI/MiniMax-M3.1-Flash
+  arch: MiniMaxM3SparseForConditionalGeneration
+  config_path: examples/configs/curated/minimax-m3.1-flash-latency.yaml
+  scenario: Min Latency
+  gpu_compatibility: "Vera Rubin"
+- model: MiniMaxAI/MiniMax-M3.1-Flash
+  arch: MiniMaxM3SparseForConditionalGeneration
+  config_path: examples/configs/curated/minimax-m3.1-flash-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Vera Rubin"
 - model: deepseek-ai/DeepSeek-V4-Pro
   arch: DeepseekV4ForCausalLM
   config_path: examples/configs/curated/deepseek-v4-pro-latency.yaml
@@ -150,3 +196,20 @@
   config_path: examples/configs/curated/deepseek-v4-pro-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "B200"
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open.yaml
+  scenario: General deployment
+  gpu_compatibility: "GB300"
+
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open-agentic-max-throughput.yaml
+  scenario: Agentic Max Throughput
+  gpu_compatibility: "GB300"
+
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open-agentic-balanced.yaml
+  scenario: Agentic Balanced
+  gpu_compatibility: "GB300"

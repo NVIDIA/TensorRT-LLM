@@ -16,7 +16,6 @@
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from collections.abc import Iterable
@@ -121,36 +120,26 @@ def load_timeout_evidence(path: str | None, unfinished_nodeids: Iterable[str]) -
 
 
 def retain_unfinished_timeout_evidence(path: str, unfinished_nodeids: Iterable[str]) -> None:
-    """Discard records from completed attempts before a rerun starts."""
+    """Discard records from completed attempts before a rerun starts.
+
+    The file is rewritten in place, not replaced: the Jenkins agent owns it and writes it
+    again later, so it must keep its owner and mode.
+    """
     candidates = _nodeid_set(unfinished_nodeids)
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        with open(path, "r+", encoding="utf-8", errors="replace") as f:
+            retained_lines = []
+            for line in f.readlines():
+                event = _timeout_event_from_line(line)
+                if event is not None and event[1] in candidates:
+                    retained_lines.append(line if line.endswith("\n") else line + "\n")
+            f.seek(0)
+            f.writelines(retained_lines)
+            f.truncate()
     except FileNotFoundError:
         return
     except OSError as exc:
-        print(f"WARNING: cannot read timeout evidence file {path}: {exc}", file=sys.stderr)
-        return
-
-    retained_lines = []
-    for line in lines:
-        event = _timeout_event_from_line(line)
-        if event is not None and event[1] in candidates:
-            retained_lines.append(line if line.endswith("\n") else line + "\n")
-
-    temporary_path = f"{path}.tmp"
-    try:
-        with open(temporary_path, "w", encoding="utf-8") as f:
-            f.writelines(retained_lines)
-        os.replace(temporary_path, path)
-    except OSError as exc:
         print(f"WARNING: cannot prune timeout evidence file {path}: {exc}", file=sys.stderr)
-        try:
-            os.remove(temporary_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
 
 
 def main() -> None:

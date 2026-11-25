@@ -26,10 +26,10 @@ import re
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
+from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa as op,
 )
-from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401

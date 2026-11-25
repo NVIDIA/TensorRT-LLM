@@ -195,7 +195,7 @@ def test_codeowners_is_exact_path_noop() -> None:
 
 def test_documentation_does_not_trigger_backend_rules() -> None:
     assert not _is_agent_flow_claim("agent-flow/guide.rst")
-    assert not _is_mv2_claim("tensorrt_llm/_torch/_experimental/modeling_v2/guide.rst")
+    assert not _is_mv2_claim("tensorrt_llm/_torch/modeling_v2/guide.rst")
     assert not _is_openengine_claim("tensorrt_llm/grpc/openengine/guide.rst")
     assert not _is_spec_claim("examples/eagle/guide.rst")
     assert not _is_vg_claim("examples/visual_gen/guide.rst")
@@ -274,6 +274,7 @@ def _docstring_pr(tmp_path: Path, before: str, source: str, path: str) -> PRInpu
         ".github/ISSUE_TEMPLATE/guide.md",
         ".codex/skills/new/README.rst",
         ".claude/skills/new/README.md",
+        "skills/new/SKILL.md",
     ),
 )
 def test_noop_metadata_documentation_adds_no_docs_contribution(path: str) -> None:
@@ -557,6 +558,18 @@ def test_out_of_scope_rule_removes_ruff_config_preflight_blockers(tmp_path: Path
             '[[tool.pyrefly.sub-config]]\nmatches = "old"\n',
             '[[tool.pyrefly.sub-config]]\nmatches = "new"\n',
         ),
+        (
+            '[tool.pyrefly-tests]\nsearch-path = ["old"]\n',
+            '[tool.pyrefly-tests]\nsearch-path = ["new"]\n',
+        ),
+        (
+            '[tool.pyrefly-tests.errors]\nmissing-argument = "error"\n',
+            '[tool.pyrefly-tests.errors]\nmissing-argument = "ignore"\n',
+        ),
+        (
+            '[tool.pyrefly-exclusions]\nsymbols = ["old"]\n',
+            '[tool.pyrefly-exclusions]\nsymbols = ["new"]\n',
+        ),
     ),
 )
 def test_out_of_scope_rule_claims_static_check_tables_as_noop(
@@ -585,6 +598,14 @@ def test_out_of_scope_rule_claims_static_check_tables_as_noop(
         (
             "[build-system]\nrequires = []\n[tool.ruff]\nfix = false\n",
             '[build-system]\nrequires = ["new"]\n[tool.ruff]\nfix = true\n',
+        ),
+        (
+            '[project]\ndependencies = ["old"]\n[tool.pyrefly-tests]\nsearch-path = ["old"]\n',
+            '[project]\ndependencies = ["new"]\n[tool.pyrefly-tests]\nsearch-path = ["new"]\n',
+        ),
+        (
+            '[tool.pyrefly-tests-extra]\nvalue = "old"\n',
+            '[tool.pyrefly-tests-extra]\nvalue = "new"\n',
         ),
         ('description = """old\n[tool.ruff]\n"""\n', 'description = """new\n[tool.ruff]\n"""\n'),
         ('["tool".ruff]\nfix = false\n', '["tool".ruff]\nfix = true\n'),
@@ -635,6 +656,11 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         ".claude/skills/trtllm-test-specialist/references/test_config_template.yaml",
         ".claude/new-config.yaml",
         ".claude/scripts/new-helper.py",
+        "skills/trtllm-serve-config-guide/SKILL.md",
+        "skills/trtllm-serve-config-guide/BENCHMARK.md",
+        "skills/trtllm-serve-config-guide/skill.oms.sig",
+        "skills/trtllm-serve-config-guide/evals/evals.json",
+        "skills/new/scripts/new-helper.py",
         "LICENSE",
         ".pre-commit-config.yaml",
         "agent-flow/.pre-commit-config.yaml",
@@ -851,6 +877,9 @@ def test_noop_directory_filename_policy_handles_clang_configs(path: str) -> None
         ".codex-extra/new-config.toml",
         "nested/.claude/new-config.yaml",
         "nested/.codex/new-config.toml",
+        "skills-extra/new/SKILL.md",
+        "nested/skills/new/SKILL.md",
+        "tensorrt_llm/skills/new-config.yaml",
         ".devcontainer/new-config.json",
         ".devcontainer/make_env.py",
         "jenkins/current_image_tags.properties",

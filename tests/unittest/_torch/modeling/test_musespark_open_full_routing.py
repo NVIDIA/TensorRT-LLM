@@ -173,7 +173,13 @@ def test_sorted_routing_matches_an_argmax_reference_on_mutable_inputs(tokens):
         graph.replay()
         expected = (torch.empty_like(actual[0]), torch.empty_like(actual[1]))
         _reference_argmax_routing_kernel[(tokens,)](
-            logits, bias, *expected, 1e-6, EXPERTS=256, num_warps=4
+            logits,
+            bias,
+            *expected,
+            1e-6,
+            EXPERTS=256,
+            # pyrefly: ignore [unexpected-keyword]
+            num_warps=4,
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)

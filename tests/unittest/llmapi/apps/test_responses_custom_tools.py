@@ -531,7 +531,7 @@ DEFERRED_TEMPLATE = (
 EAGER_TEMPLATE = "{{ messages }}{{ tools }}"
 
 
-def _function_tool(name="get_weather", defer_loading=None, parameters=None):
+def _deferred_function_tool(name="get_weather", defer_loading=None, parameters=None):
     return SimpleNamespace(
         type="function",
         name=name,
@@ -571,7 +571,7 @@ def test_template_support_is_keyed_on_deferred_render_mode():
 def test_plain_function_tools_stay_on_the_flattened_view():
     """No namespace and no defer flag: the rendering must not change."""
     flat = [{"type": "function", "function": {"name": "get_weather"}}]
-    tools = [_function_tool()]
+    tools = [_deferred_function_tool()]
     assert _tools_for_chat_template(tools, flat, DEFERRED_TEMPLATE) is flat
 
 
@@ -612,7 +612,7 @@ def test_custom_member_keeps_the_freeform_schema_in_native_form():
 
 
 def test_top_level_defer_flag_alone_switches_to_native():
-    tools = [_function_tool(defer_loading=True)]
+    tools = [_deferred_function_tool(defer_loading=True)]
     (entry,) = _tools_for_chat_template(tools, [], DEFERRED_TEMPLATE)
     assert entry["function"]["defer_loading"] is True
     # The schema-less tool still presents an object schema.

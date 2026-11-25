@@ -35,6 +35,7 @@ from openai.types.responses.tool import FunctionTool
 from starlette.requests import ClientDisconnect
 
 import tensorrt_llm.serve.responses_utils as responses_utils
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
@@ -303,8 +304,8 @@ def _event_data(frame):
     return json.loads(frame.split("data: ", 1)[1])
 
 
-def _processor():
-    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+def _processor(request=None):
+    request = request or ResponsesRequest(model="test-model", input="hi", stream=True)
     return ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
@@ -941,11 +942,15 @@ def test_stamping_leaves_a_frame_without_its_own_number_alone(frame):
     assert _stamp_sequence_number(frame, 7) == frame
 
 
-def _server_streaming(monkeypatch, steps):
-    """An OpenAIServer whose generator streams ``steps`` as (pause, text) pairs."""
+def _server_streaming(monkeypatch, steps, yielded_at=None):
+    """An OpenAIServer whose generator streams ``steps`` as (pause, text) pairs.
+
+    The server clock's time as the generator yields each result is appended to ``yielded_at``.
+    """
     import tensorrt_llm.serve.openai_server as server_module
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
+    yielded_at = [] if yielded_at is None else yielded_at
     server = object.__new__(OpenAIServer)
     server.model = "test-model"
     server.enable_store = False
@@ -961,19 +966,38 @@ def _server_streaming(monkeypatch, steps):
     server.conversation_store = None
     server._validate_internal_disagg_request = lambda request, raw_request: None
     server._extract_metrics = AsyncMock()
+    server._adjusted_steady_clock = AdjustedSteadyClock()
 
     class Generation:
-        prompt_token_ids = [1, 2, 3]
-        finished = False
+        """The promise as the route sees it, an async iterator like GenerationResult.
 
-        async def __aiter__(self):
-            text = ""
-            for i, (pause, diff) in enumerate(steps):
-                await asyncio.sleep(pause)
-                text += diff
-                result = _step(text, diff, done=i == len(steps) - 1)
-                self.finished = result._done
-                yield result
+        It yields itself after each step and is finished from the start when
+        there is no step.
+        """
+
+        prompt_token_ids = [1, 2, 3]
+        cached_tokens = 0
+
+        def __init__(self):
+            self._pending = list(enumerate(steps))
+            self._text = ""
+            self._take(_step("", "", done=not steps))
+
+        def _take(self, step):
+            self.outputs, self._done, self.finished = step.outputs, step._done, step.finished
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            i, (pause, diff) = self._pending.pop(0)
+            await asyncio.sleep(pause)
+            self._text += diff
+            self._take(_step(self._text, diff, done=i == len(steps) - 1))
+            yielded_at.append(server._adjusted_steady_clock.now())
+            return self
 
     server.generator = SimpleNamespace(
         args=SimpleNamespace(reasoning_parser=None, num_postprocess_workers=0),
@@ -1005,3 +1029,102 @@ async def test_the_responses_route_keeps_a_silent_stream_alive(monkeypatch):
     assert any(i > types.index("response.output_text.delta") for i in keepalives)
     assert types[-1] == "response.completed"
     assert [_event_data(f)["sequence_number"] for f in sent] == list(range(len(sent)))
+
+
+@pytest.mark.asyncio
+async def test_a_promise_finished_before_the_stream_reads_it_ends_normally(monkeypatch):
+    """A promise with no result left to yield is its own last result.
+
+    The stream ends with response.completed, not with an error.
+    """
+    server = _server_streaming(monkeypatch, steps=[])
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert types[-1] == "response.completed"
+    assert "error" not in types
+    assert _event_data(sent[-1])["response"]["output"] == []
+    server._extract_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_promise_finished_with_text_before_the_stream_reads_it_streams_the_text(
+    monkeypatch,
+):
+    """The text a promise already holds when the stream first reads it is streamed and kept."""
+    server = _server_streaming(monkeypatch, steps=[])
+    # With no step the promise is finished from the start; give it the engine's whole answer.
+    promise = server.generator.generate_async()
+    promise._take(_step("Hello", "Hello", done=True))
+    server.generator.generate_async = lambda **kwargs: promise
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    deltas = [
+        _event_data(f)["delta"] for f in sent if _event_type(f) == "response.output_text.delta"
+    ]
+    assert "".join(deltas) == "Hello"
+    assert types[-1] == "response.completed"
+    assert "error" not in types
+    output = _event_data(sent[-1])["response"]["output"]
+    assert [part["text"] for item in output for part in item["content"]] == ["Hello"]
+    server._extract_metrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_first_token_time_is_taken_at_the_first_result(monkeypatch):
+    """The TTFT the perf metrics record is the wait for the first result, not the whole stream."""
+    yielded_at = []
+    server = _server_streaming(monkeypatch, [(0.1, "Hello"), (0.3, " world")], yielded_at)
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    await _collect(response.body_iterator)
+
+    first = getattr(raw_request.state, "server_first_token_time", None)
+    assert first is not None, "the stream did not record its first-token time"
+    # Taken once the first result is in, and before the second one is.
+    assert yielded_at[0] <= first < yielded_at[1]
+
+
+@pytest.mark.asyncio
+async def test_a_single_result_from_a_postprocessing_worker_is_streamed(monkeypatch):
+    """With postprocessing workers the route streams the frames a worker made for the one result."""
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+    # The worker serves the route's own request.
+    worker = _processor(request)
+    result = _step("Hello", "Hello", done=True)
+    frames = worker.process_single_output(result) + [worker.get_final_response_non_store(result)]
+    first = SimpleNamespace(outputs=[SimpleNamespace(_postprocess_result=frames)])
+
+    async def generation():
+        # Only the frames the worker made: the server must not post-process the result itself.
+        yield first
+
+    server = _server_streaming(monkeypatch, steps=[])
+    server.generator.args.num_postprocess_workers = 1
+    server.generator.generate_async = lambda **kwargs: generation()
+    raw_request = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+    response = await server.openai_responses(request, raw_request)
+    sent = await _collect(response.body_iterator)
+
+    types = [_event_type(f) for f in sent]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert sent[2:] == frames
+    assert "response.output_text.delta" in types
+    assert types[-1] == "response.completed"
+    # The worker's terminal event completes the response the route opened.
+    ids = {_event_data(sent[i])["response"]["id"] for i in (0, -1)}
+    assert ids == {request.request_id}
+    server._extract_metrics.assert_awaited_once_with(first, raw_request)
