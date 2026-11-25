@@ -54,7 +54,6 @@ _gates_TASK = {
     "parallel": "tp1",
     "trtllm_repo_path": "/repo",
     "accuracy": {
-        "benchmark": "gsm8k",
         "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
     },
 }
@@ -155,7 +154,6 @@ def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
         "members": ["tp1", "tp2", "tep2", "dep2", "tp4", "tep4", "dep4"],
         "features": ["mtp", "multimodal"],
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "x.yaml",
             "llm_api_options": str(options),
             "max_seq_len": 9216,
@@ -257,10 +255,13 @@ def _cli_task(tmp_path):
         "features": ["mtp", "disagg"],
         "environment": {"kind": "local", "python": "/usr/bin/python3"},
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "r.yaml",
             "model_key": "M",
-            "disagg": {"test": DISAGG_TEST, "env": {"LLM_MODELS_ROOT": "/models"}},
+        },
+        "verification": {
+            "disagg": {
+                "e2e": {"pytest": DISAGG_TEST, "env": {"LLM_MODELS_ROOT": "/models"}},
+            },
         },
     }
     path = tmp_path / "task.yaml"
@@ -569,7 +570,7 @@ def _reuse_task(tmp_path: Path, **extra) -> dict:
         "trtllm_repo_path": str(tmp_path / "repo"),
         "features": [],
         "runtime": {"default": dict(_RUNTIME)},
-        "accuracy": {"benchmark": "gsm8k", "llm_api_options": {"core": str(options)}},
+        "accuracy": {"llm_api_options": {"core": str(options)}},
     }
     task.update(extra)
     return task

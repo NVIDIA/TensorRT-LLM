@@ -128,19 +128,27 @@ def load_reference_score(
     return float(matches[0]["accuracy"])
 
 
+#: Default in-tree directory holding one reference YAML per accuracy_core benchmark.
+REFERENCES_DIR = "tests/integration/defs/accuracy/references"
+
+
 def resolve_reference(
     task_data: Mapping[str, Any],
     *,
     model_key: str,
     discriminators: Mapping[str, Any] | None = None,
     unit: str | None = None,
+    benchmark: str = "gsm8k",
 ) -> float:
     """Look up this run's anchor, resolving the reference path against the repo.
 
     ``discriminators`` overrides ``accuracy.discriminators`` for ``unit``.
+    When ``accuracy.reference_yaml`` is omitted, uses
+    ``tests/integration/defs/accuracy/references/<benchmark>.yaml``.
     """
     accuracy = dict(task_data.get("accuracy") or {})
-    reference_yaml = Path(str(resolve_per_unit(accuracy, "reference_yaml", unit)))
+    declared = resolve_per_unit(accuracy, "reference_yaml", unit)
+    reference_yaml = Path(str(declared) if declared else f"{REFERENCES_DIR}/{benchmark}.yaml")
     if not reference_yaml.is_absolute():
         reference_yaml = Path(str(task_data["trtllm_repo_path"])) / reference_yaml
     if discriminators is None:

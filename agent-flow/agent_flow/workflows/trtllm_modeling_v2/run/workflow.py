@@ -143,7 +143,7 @@ class TrtllmModelingV2Workflow:
         event_window_s: float = DEFAULT_EVENT_WINDOW_S,
         primers: bool = True,
     ) -> None:
-        self.workspace = Path(workspace)
+        self.workspace = Path(workspace).resolve()
         self.event_window_s = event_window_s
         # The planner's, kernel writers' and assemblers' turns start as forks of one
         # briefing session per role (run/startup/primers.py); off, each starts afresh.
@@ -1097,6 +1097,12 @@ def gate_inputs(task_data: Mapping[str, Any], repo: str | Path) -> frozenset[str
             path = _in_checkout(str(node).partition("::")[0], root)
             if path is not None:
                 keep.add(path)
+        deployment = entry.get("deployment")
+        if isinstance(deployment, Mapping):
+            for word in deployment.values():
+                path = _in_checkout(str(word), root)
+                if path is not None:
+                    keep.add(path)
     for name in (e2e.TEST_FILENAME, e2e.CASES_FILENAME):
         keep |= {
             p.relative_to(root).as_posix() for p in root.glob(f"{e2e.ACCURACY_ROOT}/*/*/{name}")

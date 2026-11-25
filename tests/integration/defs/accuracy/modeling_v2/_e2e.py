@@ -11,7 +11,7 @@ every dataset of the case in order on it. A dataset is one of three kinds:
   engine must prefill in chunks, and a probe that sends one prompt twice and reads what
   the KV cache reused.
 * ``benchmark``: an ``accuracy_core`` task judged by its hypothesis test, against the
-  references row it matches or against the score ``MV2_E2E_REFERENCES`` names.
+  references row it matches or against the score ``MV2FLOW_E2E_REFERENCES`` names.
 * ``acceptance``: a drafter's acceptance length, the generated tokens of a workload over
   its streamed iterations, held above 1.0 and above an optional floor.
 
@@ -82,11 +82,11 @@ CASES_FILE = "e2e_cases.yaml"
 #: The only ``version`` of the cases file this runner reads.
 CASES_VERSION = 1
 #: Names a file every result line is appended to, when set.
-RESULTS_ENV = "MV2_E2E_RESULTS"
+RESULTS_ENV = "MV2FLOW_E2E_RESULTS"
 #: A JSON object ``{dataset name: score}`` that replaces a benchmark's reference score.
-REFERENCES_ENV = "MV2_E2E_REFERENCES"
+REFERENCES_ENV = "MV2FLOW_E2E_REFERENCES"
 #: Comma-separated dataset names: run only these of each case (a debugging run's subset).
-DATASETS_ENV = "MV2_E2E_DATASETS"
+DATASETS_ENV = "MV2FLOW_E2E_DATASETS"
 #: What each result line printed to stdout starts with.
 RESULT_PREFIX = "MV2_E2E_RESULT"
 #: A string starting with this has it replaced by ``llm_models_root()``.
@@ -576,14 +576,17 @@ def load_cases(test_file: str | os.PathLike[str]) -> list[Any]:
     """The cases of the ``e2e_cases.yaml`` beside ``test_file``, as pytest parameters.
 
     Each parameter is the case mapping, with the case id as its pytest id and a
-    ``skip_less_device`` mark for its ``devices``.
+    ``skip_less_mpi_world_size`` mark for its ``devices`` (checks local GPUs on a single-rank
+    run and MPI world size under ``trtllm-llmapi-launch``).
 
     Raises:
         CasesError: The cases file is missing or invalid, failing the collection.
     """
     path = Path(test_file).resolve().parent / CASES_FILE
     return [
-        pytest.param(case, id=case["id"], marks=[pytest.mark.skip_less_device(case["devices"])])
+        pytest.param(
+            case, id=case["id"], marks=[pytest.mark.skip_less_mpi_world_size(case["devices"])]
+        )
         for case in read_cases(path)
     ]
 
@@ -645,7 +648,7 @@ def result_line(
 
 
 def emit_result(line: Mapping[str, Any]) -> None:
-    """Print ``MV2_E2E_RESULT <json>`` and append the JSON line to ``$MV2_E2E_RESULTS`` when set."""
+    """Print ``MV2_E2E_RESULT <json>`` and append the JSON line to ``$MV2FLOW_E2E_RESULTS`` when set."""
     text = json.dumps(dict(line), ensure_ascii=True)
     print(f"{RESULT_PREFIX} {text}", flush=True)
     target = os.environ.get(RESULTS_ENV)
@@ -661,7 +664,7 @@ def select_datasets(case: Mapping[str, Any], raw: str | None) -> dict[str, Any]:
 
     Args:
         case: One case.
-        raw: The value of ``MV2_E2E_DATASETS``: comma-separated names of datasets and
+        raw: The value of ``MV2FLOW_E2E_DATASETS``: comma-separated names of datasets and
             extra checks.
 
     Raises:
@@ -1301,7 +1304,7 @@ def acceptance_prompts(
 
 
 def parse_references(raw: str | None) -> dict[str, float]:
-    """The reference scores ``MV2_E2E_REFERENCES`` holds, by dataset name.
+    """The reference scores ``MV2FLOW_E2E_REFERENCES`` holds, by dataset name.
 
     Args:
         raw: The variable's value; ``None`` or blank when it is not set.
@@ -1808,7 +1811,7 @@ def _run_dataset(
 def run_case(case: Mapping[str, Any]) -> None:
     """Run one case: build its ``LLM``, run every dataset on it and its extra checks, then judge.
 
-    ``${LLM_MODELS_ROOT}`` is expanded (:func:`expand_case`), ``MV2_E2E_DATASETS``
+    ``${LLM_MODELS_ROOT}`` is expanded (:func:`expand_case`), ``MV2FLOW_E2E_DATASETS``
     keeps a subset of the datasets and extra checks (:func:`select_datasets`), and the
     engine is ``LLM(model=model_dir, **llm)``, used as a context manager. The extra
     checks run after the datasets, on the same engine (:func:`run_extra_checks`). A

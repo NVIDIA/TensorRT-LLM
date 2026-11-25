@@ -23,7 +23,7 @@ import yaml
 
 pytestmark = [
     pytest.mark.cpu_only,
-    # ``skip_less_device`` is registered by the integration tests' pytest.ini only.
+    # ``skip_less_mpi_world_size`` is registered by the integration tests' pytest.ini only.
     pytest.mark.filterwarnings("ignore::pytest.PytestUnknownMarkWarning"),
 ]
 
@@ -100,7 +100,7 @@ def test_load_cases_ids_marks_and_defaults(tmp_path):
     assert [p.id for p in params] == ["core-e2e-tp1", "mtp-acceptance-tp4"]
     for param, devices in zip(params, (1, 4)):
         (mark,) = param.marks
-        assert mark.name == "skip_less_device"
+        assert mark.name == "skip_less_mpi_world_size"
         assert mark.args == (devices,)
     first, second = (p.values[0] for p in params)
     assert first["model_name"] == "Org/Model-1B"
@@ -525,7 +525,7 @@ def test_a_debugging_run_keeps_only_the_datasets_it_names():
     assert [d["name"] for d in case["datasets"]] == ["generate", "gsm8k"]  # left as it was
     both = e2e.select_datasets(case, "gsm8k, generate")
     assert [d["name"] for d in both["datasets"]] == ["generate", "gsm8k"]  # the case's order
-    with pytest.raises(e2e.CasesError, match=r"MV2_E2E_DATASETS names \['mmlu'\]"):
+    with pytest.raises(e2e.CasesError, match=r"MV2FLOW_E2E_DATASETS names \['mmlu'\]"):
         e2e.select_datasets(case, "generate,mmlu")
     # Extra checks are named like datasets; a subset keeps those it names.
     case["extra_checks"] = [{"check": "tests/x/c.py::f", "name": "f"}]
@@ -545,11 +545,13 @@ def test_references_override_parsing():
     assert references.get("gsm8k") == 71.5
     assert references.get("mmlu") == 80.0
     assert references.get("gpqa_diamond") is None
-    with pytest.raises(ValueError, match="MV2_E2E_REFERENCES is not valid JSON"):
+    with pytest.raises(ValueError, match="MV2FLOW_E2E_REFERENCES is not valid JSON"):
         e2e.parse_references('{"gsm8k": 71.5')
     with pytest.raises(ValueError, match="not an object"):
         e2e.parse_references("[71.5]")
-    with pytest.raises(ValueError, match=r"MV2_E2E_REFERENCES\['gsm8k'\] is '71.5', not a number"):
+    with pytest.raises(
+        ValueError, match=r"MV2FLOW_E2E_REFERENCES\['gsm8k'\] is '71.5', not a number"
+    ):
         e2e.parse_references('{"gsm8k": "71.5"}')
 
 
@@ -647,7 +649,7 @@ def test_benchmark_override_keeps_the_row_parameters_and_drops_its_threshold():
     outcome = e2e.evaluate_benchmark(task, "llm", _BENCHMARK, override=80.0, params_cls=_Params)
     assert not outcome.passed
     assert (outcome.reference, outcome.threshold) == (80.0, 75.0)
-    assert "from MV2_E2E_REFERENCES" in outcome.detail
+    assert "from MV2FLOW_E2E_REFERENCES" in outcome.detail
     row = _Task.get_hypothesis_testing_params(task, extra_acc_spec=None)
     params = e2e.overridden_params(_Params, row, _Task, 80.0)
     assert (params.ref_accuracy, params.sigma, params.num_samples) == (80.0, 30, 1319)

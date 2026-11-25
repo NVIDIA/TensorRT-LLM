@@ -36,7 +36,6 @@ from .schema_keys import reject_unknown_keys
 from .task_schema import (
     DISAGG_FEATURE,
     DISAGG_FILES,
-    DISAGG_KEYS,
     FEATURE_FAMILIES,
     PARALLEL_PATTERN,
     PROFILE_CERTIFIED,
@@ -44,6 +43,19 @@ from .task_schema import (
     PROFILE_STANDARD,
     PROFILES,
     SPECULATORS,
+)
+
+SITE_DISAGG_KEYS: tuple[str, ...] = (
+    *DISAGG_FILES,
+    "pytest",
+    "test",
+    "devices",
+    "nodes",
+    "timeout",
+    "env",
+    "datasets",
+    "evaluator_kwargs",
+    "stage",
 )
 
 #: The derived spec and its report, in the workspace.
@@ -372,7 +384,7 @@ def validate_site(site: Any) -> list[str]:
         ("workload", WORKLOAD_KEYS),
         ("accuracy", SITE_ACCURACY_KEYS),
         ("boot", None),
-        ("disagg", DISAGG_KEYS),
+        ("disagg", SITE_DISAGG_KEYS),
     ):
         block = defaults.get(key)
         if block is not None and not isinstance(block, Mapping):
@@ -537,9 +549,10 @@ def derive_spec(
         if key not in goal.accuracy:
             note(f"accuracy.{key}", value, "site")
     anchor = {**site_accuracy, **goal.accuracy}
-    benchmark = anchor.get("benchmark") or note("accuracy.benchmark", DEFAULT_BENCHMARK, "default")
+    benchmark = anchor.get("benchmark") or note(
+        "verification.core.e2e.datasets", DEFAULT_BENCHMARK, "default"
+    )
     accuracy: dict[str, Any] = {
-        "benchmark": benchmark,
         "reference_yaml": anchor.get("reference_yaml")
         or f"{_tree_path(site, 'accuracy_references')}/{benchmark}.yaml",
     }
@@ -567,8 +580,14 @@ def derive_spec(
         accuracy["boot"] = note("accuracy.boot", dict(defaults["boot"]), "site")
     else:
         accuracy["boot"] = note("accuracy.boot", json.loads(json.dumps(DEFAULT_BOOT)), "default")
+
+    verification: dict[str, Any] = {}
+    if benchmark != DEFAULT_BENCHMARK:
+        verification["core"] = {"e2e": {"datasets": ["generate", benchmark]}}
     if DISAGG_FEATURE in built:
-        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions, checkpoint)
+        verification[DISAGG_FEATURE] = {
+            "e2e": _disagg(defaults, facts, site, note, questions, checkpoint)
+        }
 
     spec: dict[str, Any] = {
         "checkpoint_path": str(checkpoint),
@@ -580,6 +599,7 @@ def derive_spec(
         "runtime": runtime,
         "environment": dict(site["environment"]),
         "accuracy": accuracy,
+        **({"verification": verification} if verification else {}),
     }
     kv_variants = {
         f"kv_{dtype}": {
@@ -760,21 +780,23 @@ def _disagg(
     questions: list[str],
     checkpoint: Path | None = None,
 ) -> dict[str, Any]:
-    """The disaggregated-serving test the run writes: the site's settings, its node id, its layout.
-
-    The node id defaults to a class named for the architecture, in the file whose
-    tests share the tree's disaggregated launcher (``launch_disaggregated_llm``).
-    The layout (:func:`disagg_layout`) is derived from the checkpoint's size:
-    one node when a context and a generation engine fit it, more only when they
-    do not.
-    """
-    block = dict(defaults.get("disagg") or {})
-    if block:
-        note("accuracy.disagg", dict(block), "site")
-    if block.get(DISAGG_FILES[0]):
-        # A stated deployment: no test to size.
-        return block
-    if "devices" not in block and "nodes" not in block and checkpoint is not None:
+    """The disaggregated-serving test entry for ``verification.disagg.e2e``."""
+    raw = dict(defaults.get("disagg") or {})
+    if raw:
+        note("verification.disagg.e2e", dict(raw), "site")
+    if raw.get(DISAGG_FILES[0]):
+        entry: dict[str, Any] = {
+            "deployment": {key: raw[key] for key in DISAGG_FILES if key in raw}
+        }
+        for key in ("env", "timeout", "datasets", "evaluator_kwargs", "stage"):
+            if key in raw:
+                entry[key] = raw[key]
+        return entry
+    entry = {}
+    for key in ("env", "timeout", "devices", "nodes", "stage"):
+        if key in raw:
+            entry[key] = raw[key]
+    if "devices" not in entry and "nodes" not in entry and checkpoint is not None:
         from .sizing import checkpoint_weight_bytes
 
         environment = site.get("environment") or {}
@@ -786,27 +808,29 @@ def _disagg(
         )
         if layout is not None:
             devices, nodes = layout
-            block["devices"] = note("accuracy.disagg.devices", devices, "checkpoint size")
+            entry["devices"] = note("verification.disagg.e2e.devices", devices, "checkpoint size")
             if nodes > 1:
-                block["nodes"] = note("accuracy.disagg.nodes", nodes, "checkpoint size")
-    if block.get("test"):
-        return block
+                entry["nodes"] = note("verification.disagg.e2e.nodes", nodes, "checkpoint size")
+    node_id = raw.get("pytest") or raw.get("test")
+    if node_id:
+        entry["pytest"] = node_id
+        return entry
     launcher = tree_anchors.resolve(site.get("trtllm_repo_path"), "disagg_launcher")
     if launcher.found:
         name = re.sub(r"\W|For(?:CausalLM|ConditionalGeneration)$", "", facts.architecture)
         name = name or "Model"
-        block["test"] = note(
-            "accuracy.disagg.test",
+        entry["pytest"] = note(
+            "verification.disagg.e2e.pytest",
             f"{launcher.paths[0]}::Test{name}::test_auto_dtype",
             "default",
         )
     else:
         questions.append(
-            "accuracy.disagg.test: name the node id of the disaggregated-serving accuracy test "
-            "the run will write, beside the tree's tests that serve through "
+            "verification.disagg.e2e.pytest: name the node id of the disaggregated-serving "
+            "accuracy test the run will write, beside the tree's tests that serve through "
             "`trtllm-serve disaggregated`"
         )
-    return block
+    return entry
 
 
 def render_report(derivation: Derivation, spec_path: Path) -> str:

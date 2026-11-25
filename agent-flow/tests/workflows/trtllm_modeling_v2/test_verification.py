@@ -57,7 +57,6 @@ def _spec(tmp_path, tests=None, **extra) -> dict:
             },
         },
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "x.yaml",
             "model_key": "Qwen/Qwen3-8B",
         },

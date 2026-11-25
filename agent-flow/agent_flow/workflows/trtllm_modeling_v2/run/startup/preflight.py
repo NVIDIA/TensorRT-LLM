@@ -402,7 +402,13 @@ def check_accuracy_anchors(
                 f"is no row to check"
             )
             continue
-        benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "").strip()
+        benchmark = contract_mod.DEFAULT_BENCHMARK
+        e2e_entry = verification_mod.entries(task_data).get((unit, verification_mod.E2E)) or {}
+        if isinstance(e2e_entry.get("datasets"), list):
+            benchmark = next(
+                (str(d) for d in e2e_entry["datasets"] if d in verification_mod.BENCHMARKS),
+                benchmark,
+            )
         model_key = accuracy_checks.resolve_model_key(task_data, unit)
         # Resolved once and passed in, so the message and the lookup cannot
         # disagree about which row was searched for. A speculator's row is the one
@@ -539,7 +545,6 @@ def check_tests(
     repo = str(task_data.get("trtllm_repo_path") or "")
     missing: list[str] = []
     tests = contract_mod.run_tests(task_data, world_size)
-    accuracy = task_data.get("accuracy") or {}
     if (
         any(t.runner == verification_mod.RUN_DATASETS for t in tests)
         and not (Path(repo) / e2e_checks.RUNNER_MODULE).is_file()
@@ -568,7 +573,15 @@ def check_tests(
             )
             missing += [f"{where}: extra check {said}" for said in problems]
             notes += [f"test {where}: extra check {node}" for node in found.values()]
-        own = str(resolve_per_unit(accuracy, "benchmark", test.feature) or "gsm8k")
+        own = contract_mod.DEFAULT_BENCHMARK
+        e2e_entry = (
+            verification_mod.entries(task_data).get((test.feature, verification_mod.E2E)) or {}
+        )
+        if isinstance(e2e_entry.get("datasets"), list):
+            own = next(
+                (str(d) for d in e2e_entry["datasets"] if d in verification_mod.BENCHMARKS),
+                own,
+            )
         for dataset in test.benchmarks:
             if dataset == own:
                 continue
@@ -598,13 +611,38 @@ def check_tests(
 
 def check_disagg_placement(task_data: Mapping[str, Any], world_size: int = 0) -> list[str]:
     """The nodes a gate's job spans (a wide member, a deployment, a test) are one gates session's."""
-    spec = disagg_checks.DisaggSpec.from_task(task_data)
     members = {m for u in assembly_units(task_data) for m in members_for(task_data, u, world_size)}
     members |= {str(m) for v in variants_of(task_data).values() for m in v.get("members") or ()}
     per_node = gpus_per_node(task_data)
+    world = world_size or 1
+    needed: list[int] = [1]
+    notes: list[str] = []
+    for test in contract_mod.run_tests(task_data, world):
+        if test.runner == verification_mod.RUN_DISAGG:
+            spec = disagg_checks.DisaggSpec.from_test(test, task_data)
+            if spec is not None:
+                try:
+                    needed.append(spec.job_nodes())
+                except ValueError as exc:
+                    raise PreflightError(str(exc)) from exc
+        elif test.whole_model:
+            members |= set(contract_mod.test_members(task_data, test, world))
+        else:
+            if per_node and test.devices > per_node:
+                raise PreflightError(
+                    f"verification.{test.feature}.{test.name}.devices is {test.devices}, more than "
+                    f"the {per_node} devices one node holds: a pytest test runs on at most "
+                    f"{per_node} devices per node"
+                )
+            if test.gang_nodes > 1:
+                needed.append(test.gang_nodes)
+                notes.append(
+                    f"{test.feature}.{test.name}: runs on {test.devices or 'all'} device(s) per "
+                    f"node across {test.gang_nodes} node(s)"
+                )
     try:  # a member is one world, laid out as a deployment's server is
         nodes = max(
-            spec.job_nodes() if spec else 1,
+            *needed,
             *(
                 disagg_checks.plan_layout([(m, parse_parallel_segment(m)[1])], per_node)[0]
                 for m in members
@@ -628,18 +666,7 @@ def check_disagg_placement(task_data: Mapping[str, Any], world_size: int = 0) ->
                 f"a gate's job (a member wider than one node, or disagg) needs {nodes} nodes in "
                 f"one session_spool allocation; the declared gate sessions provide {available}"
             )
-    if spec is None or not spec.devices or not spec.node_gpus:
-        return []
-    if spec.devices > spec.node_gpus:
-        raise PreflightError(
-            f"accuracy.disagg.devices is {spec.devices}, more than the {spec.node_gpus} devices "
-            f"one node holds: the tree's disaggregated launcher starts every worker on one "
-            f"host, so the test runs on one node. Write it for {spec.node_gpus} devices or fewer "
-            f"(its context and generation workers between them) and set `devices` to match."
-        )
-    return [
-        f"disagg: the test {spec.test} runs on {spec.devices} devices per node across {spec.nodes} node(s)"
-    ]
+    return notes
 
 
 def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
@@ -647,22 +674,24 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
 
     The spool admits a job only where it can finish before its allocation ends, so a
     gate whose limit is longer than a whole allocation is never admitted: it would wait
-    for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
-    disaggregated test's ``accuracy.disagg.timeout``, and a test the spec changes or
-    declares its ``timeout`` (per member, per pytest node).
+    for ever.
     """
     sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]
     if not sessions:
         return []
     budget = int(max(s.time_limit_s for s in sessions))
-    accuracy = task_data.get("accuracy") or {}
-    limits = {"accuracy.timeout": int(accuracy.get("timeout") or contract_mod.E2E_TIMEOUT_S)}
-    disagg = disagg_checks.DisaggSpec.from_task(task_data)
-    if disagg is not None:
-        limits["accuracy.disagg.timeout"] = int(disagg.timeout)
+    limits: dict[str, int] = {}
+    try:
+        tests = contract_mod.run_tests(task_data, 1)
+    except Exception:
+        tests = []
+    for test in tests:
+        limits[f"verification.{test.feature}.{test.name}.timeout"] = int(test.timeout)
     for (feature, name), entry in verification_mod.entries(task_data).items():
         if entry.get("timeout") is not None:
             limits[f"verification.{feature}.{name}.timeout"] = int(entry["timeout"])
+    if not limits:
+        limits["e2e.timeout"] = contract_mod.E2E_TIMEOUT_S
     over = {key: limit for key, limit in limits.items() if limit > budget}
     if over:
         raise PreflightError(

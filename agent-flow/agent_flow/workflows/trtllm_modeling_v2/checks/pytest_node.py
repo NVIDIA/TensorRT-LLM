@@ -4,12 +4,23 @@
 """A pytest node of the tree as a gate: run as the tree runs it, judged by its report.
 
 Some things are proven the way the engine's CI proves them, by a test in the
-tree: the disaggregated hop (``checks/disagg.py``) and the spec's own tests
-(``checks/user_tests.py``). The node runs under the tree's interpreter from its
-pytest root and writes a JUnit report. With ``nodes > 1`` the spool runs one
-pytest process per node of one allocation, publishing
-``MV2FLOW_JOB_NODE_RANK/HOSTS/NODES``; each node writes its own report, and all
-reports and process exit codes must pass. The flow deploys nothing of its own.
+tree: the target's generated e2e test (``checks/e2e.py``), the disaggregated
+hop (``checks/disagg.py``) and the spec's own tests (``checks/user_tests.py``).
+The node runs under the tree's interpreter from its pytest root and writes a
+JUnit report.
+
+Two multi-node launch modes are kept explicit:
+
+- ``launch_world=True`` (with ``nodes == 1``): a test that constructs a whole-model
+  ``LLM`` across ``environment.world_size`` ranks. At one rank it runs as a single
+  scrubbed process; above one rank it runs under ``trtllm-llmapi-launch``
+  (``mpirun`` on one node, a lead-launched ``srun --mpi=pmix`` step across
+  ``environment.nodes`` nodes), so rank 0 runs pytest and writes one JUnit report
+  while the other ranks serve as MPI workers.
+- ``nodes > 1`` (with ``launch_world=False``): per-node gang pytest, where the
+  spool runs one pytest process per node of one allocation, publishing
+  ``MV2FLOW_JOB_NODE_RANK/HOSTS/NODES``; each node writes its own report, and all
+  reports and process exit codes must pass. The flow deploys nothing of its own.
 
 The gate passes when every test the node id selects passed. A test that
 skipped (too few devices, a missing model root) proves nothing and fails it,
@@ -83,13 +94,22 @@ def node_command(
     env: Mapping[str, str] | None = None,
     nodes: int = 1,
     capture: bool = True,
+    launch_world: bool = False,
 ) -> str:
     """``node`` under the tree's interpreter, from its pytest root, with a JUnit report.
 
     ``capture=False`` (``-s``) lets what the test's processes print reach the
     command's output as they print it: the resolve hook's record of where each
     imported the package under test (``run/workspace/snapshots.py``) among it.
+    ``launch_world=True`` launches the engine's full MPI world via
+    ``trtllm-llmapi-launch`` whenever ``environment.ntasks > 1`` (mutually
+    exclusive with per-node gang ``nodes > 1``).
     """
+    if launch_world and nodes > 1:
+        raise ValueError(
+            "launch_world launches one pytest across a world and cannot be combined with "
+            "per-node gang pytest (nodes > 1)"
+        )
     file, _, rest = node.partition("::")
     root = pytest_root(repo, file)
     selected = (Path(repo) / file).relative_to(root).as_posix() + (f"::{rest}" if rest else "")
@@ -104,7 +124,8 @@ def node_command(
         argv.append("-s")
     if nodes == 1:
         argv.append(f"--junitxml={report}")
-        return f"cd {shlex.quote(str(root))} && {environment.python_command(argv, single_process=True)}"
+        single_process = not (launch_world and environment.ntasks > 1)
+        return f"cd {shlex.quote(str(root))} && {environment.python_command(argv, single_process=single_process)}"
     report_arg = (
         shlex.quote(str(report.with_suffix("")))
         + '.node"${MV2FLOW_JOB_NODE_RANK:?missing gang node rank}".xml'
@@ -157,6 +178,7 @@ def run_node(
     what: str = "the test command",
     capture: bool = True,
     token: str | None = None,
+    launch_world: bool = False,
 ) -> GateResult:
     """Run ``node`` as gate ``name`` and judge its report.
 
@@ -184,6 +206,7 @@ def run_node(
         env=env,
         nodes=nodes,
         capture=capture,
+        launch_world=launch_world,
     )
     started = time.monotonic()
     result = runner(command, None, timeout)

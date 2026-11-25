@@ -34,12 +34,7 @@ from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
 from ...spec import verification as verification_mod
-from ...spec.task_schema import (
-    assembly_units,
-    features_through,
-    parse_parallel_segment,
-    resolve_per_unit,
-)
+from ...spec.task_schema import assembly_units, features_through, parse_parallel_segment
 from ...spec.verification import DATASET_ACCEPTANCE
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
@@ -335,51 +330,39 @@ class CheckRunner:
             return lambda runner: self._datasets(check, test, env, spec, workdir, runner)
         if test.runner == verification_mod.RUN_DISAGG:
             return lambda runner: disagg.run_disagg_gate(
-                env, workdir=workdir, task_data=self._with_dataset(spec, unit),
-                runner=runner, unit=unit, member=member,
+                env, workdir=workdir, task_data=self._with_dataset(spec, unit, test),
+                runner=runner, unit=unit, member=member, test=test,
             )  # fmt: skip
         if test.runner == verification_mod.RUN_SERVE:
             return lambda runner: serve.run_serve_gate(
                 env, features=features, workdir=workdir,
                 boot=boot_checks.resolve_boot_spec(spec, unit, features),
                 task_data=spec, runner=runner, unit=unit, member=member,
+                spec=serve.ServeSpec.from_test(test),
             )  # fmt: skip
         return lambda runner: user_tests.run_user_test(
             env, task_data=spec, test=test, workdir=workdir, runner=runner,
             member=member, features=features,
         )  # fmt: skip
 
-    def _with_dataset(self, spec: Any, unit: str | None = None) -> Any:
-        """``spec`` with the staged dataset the disaggregated gate reads (``startup/datasets.py``), once ready.
+    def _with_dataset(
+        self, spec: Any, unit: str | None = None, test: verification_mod.Test | None = None
+    ) -> Any:
+        """``spec`` with the staged dataset a stated disaggregated deployment reads, once ready.
 
         A stated deployment's benchmark gets it as ``accuracy.dataset_path``
-        (``trtllm-eval --dataset_path``); the disaggregated test, which reads it under
-        ``$LLM_MODELS_ROOT``, a models root that holds it. A dataset still being staged is
-        waited for; one that could not be is left out, and the gate runs as it would
+        (``trtllm-eval --dataset_path``). A dataset still being staged is waited
+        for; one that could not be is left out, and the gate runs as it would
         without it.
         """
         accuracy = dict(spec.get("accuracy") or {})
-        block = dict(accuracy.get("disagg") or {})
-        benchmark = "gsm8k"
-        if not block.get("test"):
-            benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or benchmark)
+        benchmark = str(test.benchmarks[0] if test and test.benchmarks else "gsm8k")
         if benchmark not in datasets_mod.status(self.workspace):
             return spec
         path = datasets_mod.wait(self.workspace, benchmark)
-        if not path:
+        if not path or accuracy.get("dataset_path"):
             return spec
-        if block.get("test"):
-            env = dict(block.get("env") or {})
-            outer = (spec.get("environment") or {}).get("env") or {}
-            root = env.get("LLM_MODELS_ROOT") or outer.get("LLM_MODELS_ROOT") or ""
-            staged = datasets_mod.models_root(self.workspace, str(root), benchmark, path)
-            if not staged or staged == root:
-                return spec
-            accuracy["disagg"] = {**block, "env": {**env, "LLM_MODELS_ROOT": staged}}
-        elif not accuracy.get("dataset_path"):
-            accuracy["dataset_path"] = path
-        else:
-            return spec
+        accuracy["dataset_path"] = path
         return {**spec, "accuracy": accuracy}
 
     def _models_root_env(self, spec: Any, datasets: Sequence[str]) -> dict[str, str]:
@@ -551,20 +534,26 @@ class CheckRunner:
 
     def _gate_gpus(self, check: contract_mod.Check) -> str | None:
         """The devices ``check``'s job asks for when it is not one member's worth."""
-        if check.runner != verification_mod.RUN_DISAGG:
+        test = self._run_tests().get((check.unit, check.gate))
+        if test is None:
             return None
-        spec = disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
-        count = spec.device_count(check.member) if spec else None
-        return str(count) if count else None
+        if test.runner == verification_mod.RUN_DISAGG:
+            spec = disagg.DisaggSpec.from_test(test, self._spec_for(check.unit)[0])
+            count = spec.device_count(check.member) if spec else None
+            return str(count) if count else None
+        if test.runner == verification_mod.RUN_PYTEST and not test.whole_model:
+            return str(test.devices) if test.devices and test.gang_nodes == 1 else None
+        return None
 
     def _gate(self, check: contract_mod.Check, log) -> Any:
         """Run ``check``'s test on the target this workflow sees, journal it, and return its result."""
         call = self._gate_call(check)
-        nodes, lead = disagg.job_span(
-            self._spec_for(check.unit)[0],
-            disagg.GATE_NAME if check.runner == verification_mod.RUN_DISAGG else check.gate,
-            self._member_env(check.member).nodes,
-        )
+        test = self._run_tests().get((check.unit, check.gate))
+        engine_nodes = self._member_env(check.member).nodes
+        if test is not None:
+            nodes, lead = disagg.job_span(self._spec_for(check.unit)[0], test, engine_nodes)
+        else:
+            nodes, lead = engine_nodes, engine_nodes > 1
         runner = self._member_runner(check.member, self._gate_gpus(check), nodes=nodes, lead=lead)
         result = self._gate_until_verdict(lambda: call(runner), log)
         self.gate_log.record(result)

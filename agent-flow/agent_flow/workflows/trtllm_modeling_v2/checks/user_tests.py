@@ -25,6 +25,7 @@ module test (``devices``) is handed only ``MV2FLOW_FEATURE``.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -114,11 +115,12 @@ def run_user_test(
             )
     else:
         env[FEATURE_ENV] = test.feature
+    run_env = replace(environment, nodes=1) if test.gang_nodes > 1 else environment
     nodes = test.node_ids(member if test.whole_model else None)
     parts: list[GateResult] = []
     for index, node in enumerate(nodes):
         part = pytest_node.run_node(
-            environment,
+            run_env,
             name=test.gate,
             node=node,
             task_data=task_data,
@@ -126,9 +128,11 @@ def run_user_test(
             timeout=test.timeout,
             runner=runner,
             env=env,
+            nodes=test.gang_nodes,
             unit=test.feature if len(nodes) == 1 else f"{test.feature}.part{index}",
             member=member,
             what="the test's pytest",
+            launch_world=test.whole_model,
         )
         if part.infrastructure:
             # A run that lost its session says nothing of the target: the check is owed still.

@@ -119,16 +119,19 @@ def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_pa
         tmp_path,
         parallel="unified",
         members=["tp4", "dep4"],
-        accuracy={"benchmark": "gsm8k", "reference_yaml": "x.yaml", "benchmark_members": "tp4"},
+        accuracy={"reference_yaml": "x.yaml"},
+        verification={"core": {"e2e": {"members": ["tp4"]}}},
         variants={"kv_fp8": {**fp8, "gates": ["accuracy"]}},
     )
     with pytest.raises(PreflightError, match="`core`'s benchmark at none of dep4"):
         preflight.check_variant_anchors(task, 4)
-    del task["accuracy"]["benchmark_members"]
+    del task["verification"]
     assert "relative, core's own score at dep4" in preflight.check_variant_anchors(task, 4)[0]
     task["features"] = ["disagg"]
     task["environment"]["gpus_per_node"] = 4
-    task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
+    task["verification"] = {
+        "disagg": {"e2e": {"pytest": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}}
+    }
     with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
         preflight.check_disagg_placement(task)
 
@@ -144,13 +147,18 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
         },
         "accuracy": {},
     }
-    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
+    with pytest.raises(preflight.PreflightError, match="verification.core.e2e.timeout is 14400s"):
         preflight.check_gate_budgets(task)
-    task["accuracy"]["timeout"] = 5400
+    task["verification"] = {"core": {"e2e": {"timeout": 5400}}}
     (note,) = preflight.check_gate_budgets(task)
-    assert "accuracy.timeout 5400s" in note and "7200s" in note
+    assert "verification.core.e2e.timeout 5400s" in note and "7200s" in note
     # A test the spec gives a timeout of its own is held to the same bound.
-    task["verification"] = {"core": {"e2e": {"timeout": 3600}, "long": {"timeout": 9000}}}
+    task["verification"] = {
+        "core": {
+            "e2e": {"timeout": 3600},
+            "long": {"purpose": "long", "pytest": "tests/x.py::test_a", "timeout": 9000},
+        }
+    }
     with pytest.raises(preflight.PreflightError, match="verification.core.long.timeout is 9000s"):
         preflight.check_gate_budgets(task)
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []

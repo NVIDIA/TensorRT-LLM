@@ -660,7 +660,7 @@ def test_each_feature_owes_one_e2e_and_a_boot_only_where_it_scores_nothing():
         "parallel": "unified",
         "features": ["mtp"],
         "members": ["tp1", "tp4"],
-        "accuracy": {"benchmark": "gsm8k"},
+        "accuracy": {},
     }
 
     def tests(data):
@@ -678,11 +678,15 @@ def test_each_feature_owes_one_e2e_and_a_boot_only_where_it_scores_nothing():
         ("mtp", "e2e"): ("generate", "gsm8k", "acceptance"),
     }
     assert c.compile_contract(spec, world_size=4).confirm == "mtp:e2e@tp1"
-    # Where the benchmark runs at one member, the others boot (and accept the drafts there).
-    one = {**spec, "accuracy": {"benchmark": "gsm8k", "benchmark_members": "tp4"}}
-    assert list(tests(one)) == ["core:e2e@tp4", "core:boot@tp1", "mtp:e2e@tp4", "mtp:boot@tp1"]
-    assert datasets(one)[("mtp", "boot")] == ("generate", "acceptance")
-    assert not tests(one)["core:boot@tp1"].scores
+    # Narrowing e2e to one member via verification runs e2e there only.
+    one = {
+        **spec,
+        "verification": {
+            "core": {"e2e": {"members": ["tp4"]}},
+            "mtp": {"e2e": {"members": ["tp4"]}},
+        },
+    }
+    assert list(tests(one)) == ["core:e2e@tp4", "mtp:e2e@tp4"]
     # A variant scores at one member and boots at its others.
     fp8 = {"base": "core", "gates": ["boot", "accuracy"]}
     fp8["llm_api_options"] = {"kv_cache_config": {"dtype": "fp8"}}

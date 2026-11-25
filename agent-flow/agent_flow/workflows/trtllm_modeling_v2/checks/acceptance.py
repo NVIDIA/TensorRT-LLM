@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from ..spec.task_schema import SPECULATORS, TaskSchemaError, load_prompts_file, resolve_per_unit
+from ..spec.task_schema import SPECULATORS, TaskSchemaError, load_prompts_file
 from .harness import workload_io
 
 #: Tokens each acceptance prompt may generate when the task declares none.
@@ -113,22 +113,24 @@ class AcceptanceWorkload:
 
 
 def acceptance_dataset(
-    accuracy: Mapping[str, Any], unit: str | None, setting: Callable[[str], Any]
+    accuracy: Mapping[str, Any],
+    unit: str | None,
+    setting: Callable[[str], Any],
+    *,
+    benchmark: str = "gsm8k",
 ) -> tuple[dict[str, Any] | None, str]:
     """The dataset an undeclared acceptance workload is drawn from, and its name.
 
-    ``accuracy.acceptance.dataset`` when declared; otherwise the accuracy
-    benchmark's own dataset -- ``accuracy.dataset_path`` when the run keeps
-    it locally, else the benchmark's Hugging Face id, read from the local
-    cache only (:data:`.harness.workload_io.KNOWN_DATASETS`). A unit whose
-    benchmark has no text dataset uses the run-wide benchmark's.
+    ``accuracy.acceptance.dataset`` when declared; otherwise ``benchmark``'s own
+    dataset -- ``accuracy.dataset_path`` when the run keeps it locally, else the
+    benchmark's Hugging Face id, read from the local cache only
+    (:data:`.harness.workload_io.KNOWN_DATASETS`).
     """
     known: dict[str, Any] = {}
-    for scope in (unit, "default"):
-        benchmark = resolve_per_unit(accuracy, "benchmark", scope)
-        if isinstance(benchmark, str) and benchmark in workload_io.KNOWN_DATASETS:
-            known = dict(workload_io.KNOWN_DATASETS[benchmark])
-            break
+    if isinstance(benchmark, str) and benchmark in workload_io.KNOWN_DATASETS:
+        known = dict(workload_io.KNOWN_DATASETS[benchmark])
+    elif "gsm8k" in workload_io.KNOWN_DATASETS:
+        known = dict(workload_io.KNOWN_DATASETS["gsm8k"])
     declared = setting("dataset")
     if declared:
         source, where = str(declared), "accuracy.acceptance.dataset"
@@ -150,7 +152,7 @@ def acceptance_dataset(
 
 
 def resolve_acceptance_workload(
-    accuracy: Mapping[str, Any], unit: str | None
+    accuracy: Mapping[str, Any], unit: str | None, *, benchmark: str = "gsm8k"
 ) -> AcceptanceWorkload:
     """The acceptance workload ``unit`` declares, or the accuracy dataset's prompts.
 
@@ -193,7 +195,7 @@ def resolve_acceptance_workload(
             source = f"{where}.prompts_file ({entry['prompts_file']})"
             break
     if not prompts:
-        dataset, source = acceptance_dataset(accuracy, unit, setting)
+        dataset, source = acceptance_dataset(accuracy, unit, setting, benchmark=benchmark)
         if dataset is None:
             raise TaskSchemaError(
                 "no acceptance workload: declare `accuracy.acceptance.prompts`, "

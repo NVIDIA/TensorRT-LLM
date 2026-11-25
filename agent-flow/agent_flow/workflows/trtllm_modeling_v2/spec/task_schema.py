@@ -27,7 +27,8 @@ from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
-from .verification import BENCHMARKS, VERIFICATION_FIELD
+from .verification import DEPLOYMENT_FILES, VERIFICATION_FIELD
+from .verification import entries as verification_entries
 from .verification import validate as validate_verification
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
@@ -92,27 +93,11 @@ SPECULATORS: frozenset[str] = frozenset(
 # modules OR DSpark stages and never both.
 MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 
-# `accuracy.disagg`: the one check the `disagg` feature owes (checks/disagg.py). Either the
-# tree's three files of a deployment, which the flow serves:
-#
-#   config      the proxy's (`trtllm-serve disaggregated -c`)
-#   context     every context server's `trtllm-serve --config`; `generation` likewise
-#
-# or the tree's own kind of test, which the run writes beside the tree's tests that serve
-# through `trtllm-serve disaggregated`:
-#
-#   test     its repository-relative pytest node id, e.g.
-#            `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_y`
-#   tests    optional refinements of test, each run as a separate native job
-#   devices  the devices it starts its engines on (default two engines at the member's width)
-#   nodes    nodes that run one pytest process each
-#   timeout  seconds (default 7200)
-#   env      the environment the servers or the test run under (`LLM_MODELS_ROOT`, ...)
+# The `disagg` feature is proven by its tests under `verification.disagg`: either a
+# stated deployment (`deployment: {config, context, generation}`) or a pytest test.
 DISAGG_FEATURE = "disagg"
 DISAGG_SIDES: tuple[str, ...] = ("context", "generation")
 DISAGG_FILES: tuple[str, ...] = ("config", *DISAGG_SIDES)
-DISAGG_TEST_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes")
-DISAGG_KEYS: tuple[str, ...] = (*DISAGG_FILES, *DISAGG_TEST_KEYS, "timeout", "env")
 
 # Workload and field documentation lives in task.example.yaml. These key sets
 # close the accepted blocks; cross-field constraints are validated below.
@@ -216,23 +201,16 @@ TARGET_NAME_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 
 ACCURACY_KEYS: tuple[str, ...] = (
     # The `acceptance_length` floor a unit is held to, and the acceptance
-    # gate's declared workload; see `ACCEPTANCE_WORKLOAD_KEYS`.
+    # workload; see `ACCEPTANCE_WORKLOAD_KEYS`.
     "acceptance",
-    # The benchmark of the flow's e2e test: an accuracy_core dataset
-    # (`spec.verification.BENCHMARKS`), judged against its references row.
-    "benchmark",
     "reference_yaml",
     "model_key",
-    # Seconds one of the flow's tests may take at one member.
-    "timeout",
     "dataset_path",
     "llm_api_options",
     # Which ROW of reference_yaml this run anchors to. The references key a
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
     "discriminators",
-    # The disaggregated-serving test the `disagg` feature owes (checks/disagg.py).
-    "disagg",
     # The e2e test's engine limits, beside the options YAML.
     "max_seq_len",
     "max_batch_size",
@@ -241,15 +219,26 @@ ACCURACY_KEYS: tuple[str, ...] = (
     # protocol its references row was measured under. Run-wide; a variant states its own.
     "evaluator_kwargs",
     "boot",
-    "serve",
-    "benchmark_members",
     "anchor",
 )
-#: Keys a benchmark run by trtllm-eval read, and why none is read now.
+#: Keys no longer accepted under ``accuracy`` and where they moved.
 RETIRED_ACCURACY_KEYS: dict[str, str] = {
-    key: "the flow's e2e test judges a benchmark by accuracy_core's hypothesis test against "
-    "its references row (tests/integration/defs/accuracy/references/<dataset>.yaml)"
-    for key in ("tolerance", "floor", "samples", "score_pattern", "benchmark_args")
+    **{
+        key: "the flow's e2e test judges a benchmark by accuracy_core's hypothesis test against "
+        "its references row (tests/integration/defs/accuracy/references/<dataset>.yaml)"
+        for key in ("tolerance", "floor", "samples", "score_pattern", "benchmark_args")
+    },
+    "benchmark": "set the benchmark in `verification.<feature>.e2e.datasets` (default `[generate, gsm8k]`)",
+    "benchmark_members": "set the members in `verification.<feature>.e2e.members` (default `all`)",
+    "timeout": "set per-test timeouts under `verification.<feature>.<test>.timeout`",
+    "serve": (
+        "configure serving checks under `verification.<feature>.serve` "
+        "(`enabled`, `prompt`, `max_tokens`, `timeout`, `stage`)"
+    ),
+    "disagg": (
+        "declare disaggregated tests under `verification.disagg` "
+        "(`deployment: {config, context, generation}` or `pytest:` with `devices:` / `nodes:`)"
+    ),
 }
 RETIRED_ACCURACY_KEYS["benchmark_args"] += (
     "; the protocol is `evaluator_kwargs` (`{apply_chat_template: true}`, ...), which a stated "
@@ -265,21 +254,11 @@ RETIRED_ACCURACY_KEYS["benchmark_args"] += (
 #             for a variant that names no reference row of its own.
 ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 
-# `accuracy.benchmark_members`: where each unit's accuracy benchmark runs.
-#
-#   every    (default) at every member.
-#   <member> at that member (`dep4`, ...), for each unit that has it.
-BENCHMARK_MEMBERS_EVERY = "every"
-BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
-
 # Boot workloads allow run-wide keys and per-unit overlays. Absent multimodal images use
 # the repository asset.
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-
-# Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
-SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
 
 
 ENVIRONMENT_KEYS: tuple[str, ...] = (
@@ -666,74 +645,6 @@ def _validate_fields(
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _validate_disagg_files(block: Mapping[str, Any], where: str, errors: list[str]) -> None:
-    """A stated deployment: the tree's three files, and nothing of the test form."""
-    stated = [key for key in DISAGG_FILES if block.get(key) is not None]
-    if not stated:
-        return
-    for key in DISAGG_FILES:
-        path = block.get(key)
-        if not isinstance(path, str) or not Path(path).is_file():
-            errors.append(f"'{where}.{key}' must be an existing YAML file, got {path!r}")
-    used = [key for key in DISAGG_TEST_KEYS if block.get(key) is not None]
-    if used:
-        errors.append(f"'{where}' states a deployment and {', '.join(used)}: state one of the two")
-
-
-def _validate_disagg(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.disagg``: a stated deployment, or the test the run writes and names."""
-    where = f"{ACCURACY_FIELD}.disagg"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, DISAGG_KEYS, errors, where=where)
-    _validate_disagg_files(block, where, errors)
-    test = block.get("test")
-    if test is not None and (
-        not isinstance(test, str) or "::" not in test or Path(test).is_absolute()
-    ):
-        errors.append(
-            f"'{where}.test' must be a repository-relative pytest node id "
-            f"(`tests/.../test_x.py::TestY::test_z`), got {test!r}"
-        )
-    tests = block.get("tests")
-    if tests is not None:
-        if not isinstance(tests, list) or not tests:
-            errors.append(f"'{where}.tests' must be a nonempty list of native node ids")
-        else:
-            seen = set()
-            for selected in tests:
-                if (
-                    not isinstance(selected, str)
-                    or not isinstance(test, str)
-                    or not (
-                        selected == test
-                        or selected.startswith(test + "[")
-                        or selected.startswith(test + "::")
-                    )
-                ):
-                    errors.append(f"'{where}.tests' must refine '{where}.test', got {selected!r}")
-                elif selected in seen:
-                    errors.append(f"'{where}.tests' repeats {selected!r}")
-                else:
-                    seen.add(selected)
-    _validate_fields(
-        block, {"devices": _POS_INT, "nodes": _POS_INT, "timeout": _POS_INT}, errors, where
-    )
-    env = block.get("env")
-    if env is not None:
-        if not isinstance(env, dict):
-            errors.append(f"'{where}.env' must be a mapping from variable to value")
-        else:
-            for name, value in env.items():
-                if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
-                    errors.append(
-                        f"'{where}.env' names {name!r}, which is not a shell variable name"
-                    )
-                if not isinstance(value, (str, int, float, bool)):
-                    errors.append(f"'{where}.env.{name}' must be a scalar the shell can carry")
-
-
 def load_prompts_file(path: str | Path) -> tuple[str, ...]:
     """Read a prompt list for the acceptance gate's declared workload.
 
@@ -924,22 +835,7 @@ def resolve_per_unit(accuracy: Mapping[str, Any], key: str, unit: str | None) ->
     return value
 
 
-def _validate_serve(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.serve``."""
-    where = f"{ACCURACY_FIELD}.serve"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, SERVE_KEYS, errors, where=where)
-    _validate_fields(
-        block,
-        {"enabled": _FLAG, "max_tokens": _POS_INT, "timeout": _POS_INT, "prompt": _TEXT},
-        errors,
-        where,
-    )
-
-
-def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
+def bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
     """Whether the spec says what sequence length ``trtllm-serve`` sizes its cache for."""
     if accuracy.get("max_seq_len") is not None:
         return True
@@ -955,40 +851,6 @@ def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
     return isinstance(loaded, dict) and loaded.get("max_seq_len") is not None
 
 
-def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
-    """The switches the run's ``profile`` sets where ``accuracy`` leaves them unsaid, in place.
-
-    ``certified`` turns on the serve gate; ``bringup`` and ``smoke`` turn it off.
-    ``standard`` sets nothing.
-    """
-    if profile not in (PROFILE_SMOKE, PROFILE_BRINGUP, PROFILE_CERTIFIED):
-        return
-    on = profile == PROFILE_CERTIFIED
-    block = accuracy.get("serve")
-    if block is None:
-        accuracy["serve"] = {"enabled": on}
-    elif isinstance(block, dict):
-        block.setdefault("enabled", on)
-
-
-def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
-    """Turn on, in place, the gates the spec leaves unsaid and the run can derive.
-
-    ``accuracy.serve``: a block without ``enabled`` gets it, true wherever the
-    spec bounds the server's sequence length (:func:`_bounds_server_length`). A
-    spec that says ``enabled: false`` keeps it off. A ``profile`` sets its
-    switches first (:func:`_profile_defaults`). ``spec_dir`` is the spec's
-    directory.
-    """
-    accuracy = data.get(ACCURACY_FIELD)
-    if not isinstance(accuracy, dict):
-        return
-    _profile_defaults(profile_of(data), accuracy)
-    serve = accuracy.get("serve")
-    if serve is None or (isinstance(serve, dict) and "enabled" not in serve):
-        accuracy["serve"] = {**(serve or {}), "enabled": _bounds_server_length(accuracy)}
-
-
 def _validate_accuracy(block: Any, errors: list[str]) -> None:
     """Validate the ``accuracy`` block in place, appending to ``errors``."""
     if not isinstance(block, dict):
@@ -1002,9 +864,8 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         levels = [level, *level.values()] if isinstance(level, dict) else []
         if any(isinstance(entry, dict) and "timeout" in entry for entry in levels):
             errors.append(
-                f"'{ACCURACY_FIELD}.{name}.timeout' is no longer read: the flow's e2e test runs "
-                f"the boot prompts, the benchmark and the acceptance on one engine, within "
-                f"`{ACCURACY_FIELD}.timeout`"
+                f"'{ACCURACY_FIELD}.{name}.timeout' is no longer read: set per-test timeouts "
+                "under `verification.<feature>.<test>.timeout`"
             )
     reject_unknown_keys(
         {k: v for k, v in block.items() if k not in RETIRED_ACCURACY_KEYS},
@@ -1013,37 +874,28 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         where=ACCURACY_FIELD,
     )
 
-    for name in ("benchmark", "reference_yaml"):
-        value = block.get(name)
-        if isinstance(value, str):
-            if not value.strip():
-                errors.append(f"'{ACCURACY_FIELD}.{name}' must be a non-empty string")
-            continue
-        if isinstance(value, dict):
-            if "default" not in value:
+    ref_yaml = block.get("reference_yaml")
+    if ref_yaml is not None:
+        if isinstance(ref_yaml, str):
+            if not ref_yaml.strip():
+                errors.append(f"'{ACCURACY_FIELD}.reference_yaml' must be a non-empty string")
+        elif isinstance(ref_yaml, dict):
+            if "default" not in ref_yaml:
                 errors.append(
-                    f"'{ACCURACY_FIELD}.{name}' is a per-unit mapping, so it needs a "
-                    f"'default' key -- otherwise a unit nobody listed silently has no "
-                    f"{name} and the gate falls back to a hard-coded one"
+                    f"'{ACCURACY_FIELD}.reference_yaml' is a per-unit mapping, so it needs a "
+                    "'default' key"
                 )
-            for unit, entry in value.items():
+            for unit, entry in ref_yaml.items():
                 if not isinstance(entry, str) or not entry.strip():
-                    errors.append(f"'{ACCURACY_FIELD}.{name}[{unit}]' must be a non-empty string")
-            continue
-        errors.append(
-            f"'{ACCURACY_FIELD}.{name}' must be a non-empty string, or a mapping "
-            f"from assembly unit to one"
-        )
-
-    benchmark = block.get("benchmark")
-    named = benchmark.values() if isinstance(benchmark, dict) else [benchmark]
-    for value in named:
-        if isinstance(value, str) and value.strip() and value not in BENCHMARKS:
+                    errors.append(
+                        f"'{ACCURACY_FIELD}.reference_yaml[{unit}]' must be a non-empty string"
+                    )
+        else:
             errors.append(
-                f"'{ACCURACY_FIELD}.benchmark' names {value!r}, which is not an accuracy_core "
-                f"benchmark the e2e test runs ({sorted(BENCHMARKS)}); another evaluation is a "
-                f"test of the tree, named in `verification` with `pytest`"
+                f"'{ACCURACY_FIELD}.reference_yaml' must be a non-empty string, or a mapping "
+                "from assembly unit to one"
             )
+
     kwargs = block.get("evaluator_kwargs")
     if kwargs is not None and (
         not isinstance(kwargs, dict) or not all(isinstance(k, str) for k in kwargs)
@@ -1078,7 +930,7 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
 
     _validate_fields(
         block,
-        dict.fromkeys(("max_seq_len", "max_batch_size", "timeout"), _POS_INT),
+        dict.fromkeys(("max_seq_len", "max_batch_size"), _POS_INT),
         errors,
         ACCURACY_FIELD,
     )
@@ -1088,12 +940,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
 
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
-
-    if block.get("disagg") is not None:
-        _validate_disagg(block["disagg"], errors)
-
-    if block.get("serve") is not None:
-        _validate_serve(block["serve"], errors)
 
     anchor = block.get("anchor")
     for where, state in (
@@ -1105,14 +951,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
                 f"{list(ANCHOR_STATES)}; got {state!r}. Without a written anchor, record a "
                 f"low placeholder in reference_yaml and replace it when a measured one is known"
             )
-
-    members = block.get("benchmark_members")
-    named = isinstance(members, str) and PARALLEL_PATTERN.match(members)
-    if members is not None and members not in BENCHMARK_MEMBERS and not named:
-        errors.append(
-            f"'{ACCURACY_FIELD}.benchmark_members' must be one of {list(BENCHMARK_MEMBERS)} "
-            f"or a member (tp4, dep4, ...); got {members!r}"
-        )
 
     # A mapping of scalars (the whole run) or of unit -> mapping of scalars.
     discriminators = block.get("discriminators")
@@ -1218,18 +1056,20 @@ def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) ->
 
 
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
-    """The ``disagg`` feature states what proves it: nothing else crosses the hop."""
+    """The ``disagg`` feature states what proves it under ``verification.disagg``."""
     features = data.get(FEATURES_FIELD)
     if not isinstance(features, list) or DISAGG_FEATURE not in features:
         return
-    accuracy = data.get(ACCURACY_FIELD)
-    block = accuracy.get("disagg") if isinstance(accuracy, dict) else None
-    if not isinstance(block, dict) or not (block.get("test") or block.get(DISAGG_FILES[0])):
+    declared = [
+        entry
+        for (feature, _), entry in verification_entries(data).items()
+        if feature == DISAGG_FEATURE and entry.get("enabled", True) is not False
+    ]
+    if not any(entry.get("deployment") or entry.get("pytest") for entry in declared):
         errors.append(
-            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg': the deployment the flow "
-            f"serves (`config`, `context`, `generation`), or 'accuracy.disagg.test', the node id "
-            f"of the disaggregated-serving accuracy test the run writes beside the tree's own; "
-            f"boot and accuracy run one aggregated engine and never cross the hop."
+            f"feature {DISAGG_FEATURE!r} needs a test under '{VERIFICATION_FIELD}.{DISAGG_FEATURE}' "
+            "(either `deployment: {config, context, generation}` or `pytest:`): boot and aggregated "
+            "e2e tests run one engine and never cross the disaggregated hop."
         )
 
 
@@ -1253,50 +1093,51 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         return value if candidate.is_absolute() else str((spec_dir / candidate).resolve())
 
     accuracy = data.get(ACCURACY_FIELD)
-    if not isinstance(accuracy, dict):
-        return
+    if isinstance(accuracy, dict):
+        options = accuracy.get("llm_api_options")
+        if isinstance(options, dict):
+            accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
+        elif options is not None:
+            accuracy["llm_api_options"] = absolute(options)
 
-    options = accuracy.get("llm_api_options")
-    if isinstance(options, dict):
-        accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
-    elif options is not None:
-        accuracy["llm_api_options"] = absolute(options)
-    disagg = accuracy.get("disagg")
-    for key in DISAGG_FILES if isinstance(disagg, dict) else ():
-        if key in disagg:
-            disagg[key] = absolute(disagg[key])
+        # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
+        # a relative path, so it is resolved only when the spec's directory holds it.
+        acceptance = accuracy.get("acceptance")
+        if isinstance(acceptance, dict):
+            for level in (acceptance, *(v for v in acceptance.values() if isinstance(v, dict))):
+                if level.get("prompts_file") is not None:
+                    level["prompts_file"] = absolute(level["prompts_file"])
+                dataset = level.get("dataset")
+                if isinstance(dataset, str) and dataset.strip() and not Path(dataset).is_absolute():
+                    if (spec_dir / dataset).exists():
+                        level["dataset"] = absolute(dataset)
 
-    # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
-    # a relative path, so it is resolved only when the spec's directory holds it.
-    acceptance = accuracy.get("acceptance")
-    if isinstance(acceptance, dict):
-        for level in (acceptance, *(v for v in acceptance.values() if isinstance(v, dict))):
-            if level.get("prompts_file") is not None:
-                level["prompts_file"] = absolute(level["prompts_file"])
-            dataset = level.get("dataset")
-            if isinstance(dataset, str) and dataset.strip() and not Path(dataset).is_absolute():
-                if (spec_dir / dataset).exists():
-                    level["dataset"] = absolute(dataset)
+        # Boot prompt files, and boot images that sit beside the spec. An image
+        # that does not is left relative: the gate resolves it against the tree
+        # under test, where the repository's own test assets are.
+        boot = accuracy.get("boot")
+        if isinstance(boot, dict):
+            units = (v for k, v in boot.items() if k not in BOOT_KEYS and isinstance(v, dict))
+            for level in (boot, *units):
+                if level.get("prompts_file") is not None:
+                    level["prompts_file"] = absolute(level["prompts_file"])
+                for entry in level.get("prompts") or ():
+                    if isinstance(entry, dict) and isinstance(entry.get("images"), list):
+                        entry["images"] = [
+                            absolute(i)
+                            if isinstance(i, str)
+                            and not Path(i).is_absolute()
+                            and (spec_dir / i).exists()
+                            else i
+                            for i in entry["images"]
+                        ]
 
-    # Boot prompt files, and boot images that sit beside the spec. An image
-    # that does not is left relative: the gate resolves it against the tree
-    # under test, where the repository's own test assets are.
-    boot = accuracy.get("boot")
-    if isinstance(boot, dict):
-        units = (v for k, v in boot.items() if k not in BOOT_KEYS and isinstance(v, dict))
-        for level in (boot, *units):
-            if level.get("prompts_file") is not None:
-                level["prompts_file"] = absolute(level["prompts_file"])
-            for entry in level.get("prompts") or ():
-                if isinstance(entry, dict) and isinstance(entry.get("images"), list):
-                    entry["images"] = [
-                        absolute(i)
-                        if isinstance(i, str)
-                        and not Path(i).is_absolute()
-                        and (spec_dir / i).exists()
-                        else i
-                        for i in entry["images"]
-                    ]
+    for entry in verification_entries(data).values():
+        deployment = entry.get("deployment") if isinstance(entry, dict) else None
+        if isinstance(deployment, dict):
+            for key in DEPLOYMENT_FILES:
+                if key in deployment:
+                    deployment[key] = absolute(deployment[key])
 
 
 def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
@@ -1322,12 +1163,9 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             f"{task_path} must be a YAML mapping at the top level, got {type(data).__name__}"
         )
 
-    # BEFORE validation, deliberately. `accuracy.llm_api_options` has an
-    # existence check, and that check is a *consumer* of the resolved path.
+    # BEFORE validation, deliberately. `accuracy.llm_api_options` and
+    # `verification.*.*.deployment` have existence checks that consume resolved paths.
     _resolve_spec_relative_paths(data, task_path.resolve().parent)
-    # After the paths, before validation: what it derives is validated like
-    # what the spec says.
-    derive_gate_defaults(data, task_path.resolve().parent)
 
     errors: list[str] = []
 
@@ -1503,11 +1341,10 @@ __all__ = [
     "ANCHOR_STATES",
     "gpus_per_node",
     "resolve_per_unit",
-    "BENCHMARK_MEMBERS",
-    "BENCHMARK_MEMBERS_EVERY",
-    "derive_gate_defaults",
+    "bounds_server_length",
     "DISAGG_FEATURE",
-    "DISAGG_KEYS",
+    "DISAGG_FILES",
+    "DISAGG_SIDES",
     "ACCEPTANCE_UNIT_KEYS",
     "ACCEPTANCE_WORKLOAD_KEYS",
     "ACCURACY_FIELD",
@@ -1539,7 +1376,6 @@ __all__ = [
     "RUNTIME_SWITCHES",
     "SCOPES",
     "SCOPE_FIELD",
-    "SERVE_KEYS",
     "reject_unknown_keys",
     "TARGET_FIELD",
     "TARGET_KEYS",

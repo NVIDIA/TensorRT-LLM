@@ -26,7 +26,15 @@ import yaml
 from ..infra.compute import steps
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import LLMAPI_LAUNCH, RunEnvironment
-from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
+from ..spec.task_schema import (
+    PROFILE_BRINGUP,
+    PROFILE_CERTIFIED,
+    PROFILE_SMOKE,
+    TaskSchemaError,
+    bounds_server_length,
+    parse_parallel_segment,
+    profile_of,
+)
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, resolve_boot_spec
 from .check_config import check_configuration, order_members_by_cost
 from .check_runtime import (
@@ -71,13 +79,25 @@ class ServeSpec:
 
     @classmethod
     def from_task(cls, task_data: Mapping[str, Any]) -> "ServeSpec":
-        block = dict((task_data.get("accuracy") or {}).get("serve") or {})
+        """Default serve settings derived from ``profile`` and bounded sequence length."""
+        level = profile_of(task_data)
+        if level in (PROFILE_SMOKE, PROFILE_BRINGUP):
+            enabled = False
+        elif level == PROFILE_CERTIFIED:
+            enabled = True
+        else:
+            enabled = bounds_server_length(task_data.get("accuracy") or {})
+        return cls(enabled=enabled)
+
+    @classmethod
+    def from_test(cls, test: Any) -> "ServeSpec":
+        """Serve settings from a ``verification.Test``."""
         default = cls()
         return cls(
-            enabled=bool(block.get("enabled", default.enabled)),
-            prompt=str(block.get("prompt") or default.prompt),
-            max_tokens=int(block.get("max_tokens") or default.max_tokens),
-            timeout=int(block.get("timeout") or default.timeout),
+            enabled=True,
+            prompt=str(test.prompt or default.prompt),
+            max_tokens=int(test.max_tokens or default.max_tokens),
+            timeout=int(test.timeout or default.timeout),
         )
 
 

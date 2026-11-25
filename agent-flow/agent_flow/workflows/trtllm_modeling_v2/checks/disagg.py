@@ -35,8 +35,8 @@ from ..spec.task_schema import (
     DISAGG_SIDES,
     gpus_per_node,
     parse_parallel_segment,
-    resolve_per_unit,
 )
+from ..spec.verification import RUN_DISAGG, RUN_PYTEST, Test
 from . import check_config, pytest_node
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .eval_score import eval_arguments, judge_score
@@ -135,31 +135,44 @@ class DisaggSpec:
             raise ValueError("disagg nodes must be positive")
 
     @classmethod
-    def from_task(cls, task_data: Mapping[str, Any]) -> "DisaggSpec | None":
-        block = (task_data.get(ACCURACY_FIELD) or {}).get("disagg")
-        if not isinstance(block, Mapping):
+    def from_deployment(
+        cls,
+        deployment: Mapping[str, str],
+        *,
+        timeout: int = DEFAULT_TIMEOUT_S,
+        env: Mapping[str, str] | None = None,
+        node_gpus: int | None = None,
+    ) -> "DisaggSpec | None":
+        """Build a stated-deployment ``DisaggSpec`` from ``{config, context, generation}``."""
+        config, *files = (deployment.get(key) for key in DISAGG_FILES)
+        if not config or not all(files):
             return None
-        config, *files = (block.get(key) for key in DISAGG_FILES)
         fleets = check_config.load_llm_api_options(config)
         sides = []
-        for role, key, path in zip(ROLES, DISAGG_SIDES, files if config and all(files) else ()):
+        for role, key, path in zip(ROLES, DISAGG_SIDES, files):
             own = check_config.load_llm_api_options(path)
             ranks = int(own.get("tensor_parallel_size") or 1)
             ranks *= int(own.get("pipeline_parallel_size") or 1)
             instances = int((fleets.get(f"{key}_servers") or {}).get("num_instances") or 1)
             sides.append(Side(role, str(path), instances, ranks))
-        if not block.get("test") and not sides:
-            return None
         return cls(
-            test=str(block.get("test") or ""),
-            sides=tuple(sides) if not block.get("test") else (),
-            config=str(config or ""),
-            devices=int(block["devices"]) if block.get("devices") else None,
-            timeout=int(block.get("timeout") or DEFAULT_TIMEOUT_S),
-            env={str(k): str(v) for k, v in (block.get("env") or {}).items()},
+            sides=tuple(sides),
+            config=str(config),
+            timeout=int(timeout or DEFAULT_TIMEOUT_S),
+            env={str(k): str(v) for k, v in (env or {}).items()},
+            node_gpus=node_gpus,
+        )
+
+    @classmethod
+    def from_test(cls, test: Test, task_data: Mapping[str, Any]) -> "DisaggSpec | None":
+        """Build a ``DisaggSpec`` for a ``verification.Test`` carrying a ``deployment``."""
+        if test.runner != RUN_DISAGG or not test.deployment:
+            return None
+        return cls.from_deployment(
+            test.deployment,
+            timeout=test.timeout,
+            env=test.env,
             node_gpus=gpus_per_node(task_data),
-            nodes=int(block.get("nodes", 1)),
-            tests=tuple(block.get("tests") or ()),
         )
 
     @property
@@ -196,17 +209,20 @@ class DisaggSpec:
         return min(count, self.node_gpus) if self.node_gpus else count
 
 
-def job_span(task_data: Mapping[str, Any], gate: str, engine_nodes: int) -> tuple[int, bool]:
-    """``(nodes, lead)``: the nodes a check of ``gate`` holds, and whether the lead runs it.
+def job_span(task_data: Mapping[str, Any], test: Test, engine_nodes: int) -> tuple[int, bool]:
+    """``(nodes, lead)``: the nodes a check of ``test`` holds, and whether the lead runs it.
 
     The lead runs what starts a world across nodes: an engine wider than one
-    (``engine_nodes``) or a deployment's servers; a test is a process on each node.
+    (``engine_nodes``) or a deployment's servers; a per-node gang pytest
+    (``test.gang_nodes > 1``) runs one process on each node.
     """
-    if gate != GATE_NAME:
-        return engine_nodes, engine_nodes > 1
-    spec = DisaggSpec.from_task(task_data)
-    nodes = spec.job_nodes() if spec else 1
-    return nodes, bool(spec and spec.served and nodes > 1)
+    if test.runner == RUN_DISAGG:
+        spec = DisaggSpec.from_test(test, task_data)
+        nodes = spec.job_nodes() if spec else 1
+        return nodes, nodes > 1
+    if test.runner == RUN_PYTEST and test.gang_nodes > 1:
+        return test.gang_nodes, False
+    return engine_nodes, engine_nodes > 1
 
 
 def disagg_command(
@@ -235,30 +251,40 @@ def run_served_gate(
     runner: ShellRunner,
     unit: str | None,
     member: str | None,
+    test: Test | None = None,
 ) -> GateResult:
-    """Serve the stated deployment; hold the unit's benchmark through its proxy to its floor.
+    """Serve the stated deployment; hold the test's benchmark through its proxy to its floor.
 
     The job's script starts each server as one world (a step across nodes, an engine's own
     launch on one), then the client (``steps.servers_script``).
     """
-    from .accuracy import resolve_model_key, resolve_reference
+    from .accuracy import reference_discriminators, resolve_model_key, resolve_reference
 
     _verdict = verdict_factory(inspect_tree(task_data))
     accuracy = dict(task_data.get(ACCURACY_FIELD) or {})
-    benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "gsm8k")
-    protocol = dict(accuracy.get("evaluator_kwargs") or {})
+    benchmark = str(test.benchmarks[0] if test and test.benchmarks else "gsm8k")
+    protocol = {
+        **dict(accuracy.get("evaluator_kwargs") or {}),
+        **dict((test.evaluator_kwargs if test else None) or {}),
+    }
     arguments = eval_arguments(protocol)
-    common: dict[str, Any] = dict(name=GATE_NAME, member=member)
+    gate_name = test.gate if test is not None else GATE_NAME
+    common: dict[str, Any] = dict(name=gate_name, member=member)
     try:  # before any load
+        discriminators = reference_discriminators(task_data, unit) if unit else None
         reference = resolve_reference(
-            task_data, model_key=resolve_model_key(task_data, unit), unit=unit
+            task_data,
+            model_key=resolve_model_key(task_data, unit),
+            discriminators=discriminators,
+            unit=unit,
+            benchmark=benchmark,
         )
         nodes, layout = spec.placement()
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return _verdict(passed=False, detail=f"nothing was loaded: {exc}", **common)
     common["reference"] = reference
     model = str(task_data["checkpoint_path"])
-    directory = gate_workdir(Path(workdir) / f"disagg.{unit or 'unit'}.{member or 'member'}")
+    directory = gate_workdir(Path(workdir) / f"{gate_name}.{unit or 'unit'}.{member or 'member'}")
     env = with_mode(replace(environment, env={**environment.env, **(spec.env or {})}), MODE_REQUIRE)
     worlds = []
     for side in spec.sides:
@@ -328,20 +354,20 @@ def run_disagg_gate(
     unit: str | None = None,
     member: str | None = None,
     spec: DisaggSpec | None = None,
+    test: Test | None = None,
 ) -> GateResult:
     """Score a benchmark across the hop: the stated deployment, or the tree's own test."""
     _verdict = verdict_factory(inspect_tree(task_data))
-    spec = spec or DisaggSpec.from_task(task_data)
+    spec = spec or (DisaggSpec.from_test(test, task_data) if test is not None else None)
     environment = replace(environment, nodes=1)  # the gate places its own servers
+    gate_name = test.gate if test is not None else GATE_NAME
     if spec is None:
         return _verdict(
-            name=GATE_NAME,
+            name=gate_name,
             member=member,
             passed=False,
-            detail="`accuracy.disagg` states nothing to run: state the deployment (`context` "
-            "and `generation`), which the flow serves and scores itself, or write the target's "
-            "disaggregated accuracy test beside the tree's own (the tests that serve through "
-            "`trtllm-serve disaggregated`) and name its node id in `accuracy.disagg.test`",
+            detail="no disaggregated deployment stated: declare `deployment: {config, context, "
+            "generation}` or a `pytest:` test under `verification.disagg`",
         )
     if spec.served:
         return run_served_gate(
@@ -352,6 +378,7 @@ def run_disagg_gate(
             runner=runner,
             unit=unit,
             member=member,
+            test=test,
         )
     if spec.tests:
         parts = []

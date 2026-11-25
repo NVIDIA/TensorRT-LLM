@@ -50,7 +50,6 @@ VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy", "acceptance")
 DEFAULT_VARIANT_GATES: tuple[str, ...] = ("boot", "accuracy")
 #: Accuracy keys a variant may set for itself; every other key is the unit's.
 VARIANT_ACCURACY_KEYS: tuple[str, ...] = (
-    "benchmark",
     "reference_yaml",
     "model_key",
     "discriminators",
@@ -59,7 +58,7 @@ VARIANT_ACCURACY_KEYS: tuple[str, ...] = (
     "anchor",
 )
 #: The variant accuracy keys that name a reference row of the variant's own.
-VARIANT_ROW_KEYS: tuple[str, ...] = ("benchmark", "reference_yaml", "model_key", "discriminators")
+VARIANT_ROW_KEYS: tuple[str, ...] = ("reference_yaml", "model_key", "discriminators")
 RUNTIME_OVERLAY_KEYS: tuple[str, ...] = (
     "cuda_graph",
     "chunked_prefill",

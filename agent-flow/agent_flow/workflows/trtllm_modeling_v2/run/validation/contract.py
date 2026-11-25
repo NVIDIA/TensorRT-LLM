@@ -65,7 +65,6 @@ from ...spec.task_schema import (
 )
 from ...spec.verification import (
     BOOT,
-    DISAGG,
     E2E,
     ORIGIN_FLOW,
     RUN_DATASETS,
@@ -90,7 +89,7 @@ MILESTONE_BRINGUP = "bringup"
 MILESTONE_CORRECTNESS = "correctness"
 #: The benchmark of a unit whose spec names none.
 DEFAULT_BENCHMARK = "gsm8k"
-#: Seconds one of the flow's tests may take at one member, unless ``accuracy.timeout`` says.
+#: Seconds one of the flow's e2e tests may take at one member, unless ``verification`` says.
 E2E_TIMEOUT_S = 4 * 60 * 60
 
 #: What each of the flow's tests proves, as the contract and the report say it.
@@ -101,7 +100,7 @@ _PURPOSE: dict[str, str] = {
     "speculator)",
     SERVE: "trtllm-serve starts and answers the boot prompts",
     SERVE_ONE_RANK: "trtllm-serve on one rank starts and answers the boot prompts",
-    DISAGG: "the tree's disaggregated-serving test passes (accuracy.disagg)",
+    DISAGG_FEATURE: "the disaggregated-serving test passes",
 }
 
 
@@ -266,30 +265,6 @@ def landing_budget(
         spec = specs.get(check.unit, task_data)
         kwargs = _effective_evaluator_kwargs(spec, test)
 
-        if test.runner == RUN_DISAGG:
-            accuracy = spec.get("accuracy") or {}
-            disagg_block = accuracy.get("disagg") or {}
-            if isinstance(disagg_block, Mapping) and disagg_block.get("test"):
-                unestimated += 1
-                continue
-            benchmark = str(
-                resolve_per_unit(accuracy, "benchmark", check.unit) or DEFAULT_BENCHMARK
-            )
-            minutes = verification_mod.DATASET_REF_MINUTES.get(benchmark)
-            if minutes is None:
-                unestimated += 1
-                continue
-            if benchmark in verification_mod.HEAVY_DATASETS:
-                heavy_hits.append(f"{check.key} ({benchmark})")
-            if (
-                verification_mod.thinking_enabled(kwargs)
-                and benchmark not in verification_mod.LONG_OUTPUT_BENCHMARKS
-            ):
-                minutes *= verification_mod.THINKING_MULTIPLIER
-                thinking_hits.append(check.key)
-            estimated += minutes
-            continue
-
         minutes = verification_mod.estimate_run_minutes(test, evaluator_kwargs=kwargs)
         if minutes is None:
             unestimated += 1
@@ -356,7 +331,7 @@ def _options(accuracy: Mapping[str, Any], unit: str) -> Any:
 _ACCURACY_RESOLVERS: dict[str, Callable[[Mapping[str, Any], str], Any]] = {
     "llm_api_options": _options,
     "discriminators": resolve_discriminators,
-    **{key: _per_unit(key) for key in ("benchmark", "reference_yaml", "model_key")},
+    **{key: _per_unit(key) for key in ("reference_yaml", "model_key")},
 }
 
 
@@ -474,21 +449,17 @@ def _width(member: str) -> int:
 
 
 def benchmark_members(task_data: Mapping[str, Any], unit: str, members: Sequence[str]) -> list[str]:
-    """Where ``unit``'s accuracy benchmark runs: every member, or the one ``benchmark_members`` names."""
-    named = (task_data.get("accuracy") or {}).get("benchmark_members")
-    return [str(named)] if named in members else list(members)
+    """Where ``unit``'s default accuracy benchmark runs: every member."""
+    return list(members)
 
 
 def benchmark_member(task_data: Mapping[str, Any], members: Sequence[str]) -> tuple[str, str]:
-    """The one member of ``members`` a configuration variant's benchmark runs at, and why.
+    """The one member of ``members`` a single-member benchmark runs at, and why.
 
-    The member ``accuracy.benchmark_members`` names; else an attention-DP member,
-    whose served engine takes the most paths (the router, dummy requests, per-rank
-    caches); else the widest, the cheapest to start among equals.
+    An attention-DP member first, whose served engine takes the most paths (the
+    router, dummy requests, per-rank caches); else the widest, the cheapest to
+    start among equals.
     """
-    named = (task_data.get("accuracy") or {}).get("benchmark_members")
-    if named in members:
-        return str(named), "named in accuracy.benchmark_members"
     ranked = order_members_by_cost(list(members))
     for member in ranked:
         if parse_parallel_segment(member)[0] == "dep":
@@ -502,9 +473,15 @@ def test_members(
     """Where ``test`` runs, one check each.
 
     Its members; every member of its feature for ``all``; the feature's cheapest
-    for a test of datasets that names none. A module test (pytest with
-    ``devices``) runs once, recorded at ``tp<N>`` for its devices.
+    for a test of datasets that names none. A stated disaggregated deployment
+    runs once at its feature's benchmark member. A module or per-node gang pytest
+    test runs once, recorded at ``tp<N>`` for its devices.
     """
+    if test.runner == RUN_DISAGG:
+        if test.members and list(test.members) != [verification_mod.ALL_MEMBERS]:
+            return list(test.members)
+        everywhere = order_members_by_cost(members_for(task_data, test.feature, world_size))
+        return [benchmark_member(task_data, everywhere)[0]]
     if not test.whole_model:
         return [verification_mod.module_member(test.devices or 1)]
     if test.members and list(test.members) != [verification_mod.ALL_MEMBERS]:
@@ -567,18 +544,19 @@ def flow_tests(
     ``serve_one_rank`` at delivery: the last unit served on one rank.
     """
     notes = notes if notes is not None else []
-    accuracy = task_data.get("accuracy") or {}
     serving = serve.ServeSpec.from_task(task_data).enabled
+    declared = verification_mod.entries(task_data)
     units = assembly_units(task_data)
     lean = profile_of(task_data) in (PROFILE_SMOKE, PROFILE_BRINGUP)
-    timeout = int(accuracy.get("timeout") or E2E_TIMEOUT_S)
+    timeout = E2E_TIMEOUT_S
     out: list[verification_mod.Test] = []
 
     def add(
         name: str, feature: str, purpose: str, runner: str, members: Sequence[str], **kw
     ) -> None:
         if members:
-            out.append(_test(name, feature, purpose, runner, members, timeout=timeout, **kw))
+            kw.setdefault("timeout", timeout)
+            out.append(_test(name, feature, purpose, runner, members, **kw))
 
     for index, unit in enumerate(units):
         level = profile_of(task_data, unit)
@@ -591,18 +569,28 @@ def flow_tests(
             members = members[:1]
         implemented = set(units[1 : index + 1])
         if unit == DISAGG_FEATURE:
-            member, why = benchmark_member(task_data, members)
-            add(DISAGG, unit, _PURPOSE[DISAGG], RUN_DISAGG, [member])
-            notes.append(
-                f"{unit}: its disaggregated-serving test alone proves it, once at {member} "
-                f"({why}); its boot and accuracy would run one aggregated engine"
-            )
+            disagg_entries = [name for (feat, name) in declared if feat == DISAGG_FEATURE]
+            if not disagg_entries or E2E in disagg_entries:
+                member, why = benchmark_member(task_data, members)
+                add(
+                    E2E,
+                    unit,
+                    _PURPOSE[DISAGG_FEATURE],
+                    RUN_DISAGG,
+                    [member],
+                    datasets=[DEFAULT_BENCHMARK],
+                    timeout=verification_mod.DEFAULT_DISAGG_TIMEOUT_S,
+                )
+                notes.append(
+                    f"{unit}: its disaggregated-serving test proves it at {member} "
+                    f"({why}); its boot and accuracy would run one aggregated engine"
+                )
             continue
         if level == PROFILE_SMOKE:
             add(BOOT, unit, _PURPOSE[BOOT], RUN_DATASETS, members, datasets=[GENERATE])
             notes.append(f"{unit}: the smoke profile owes its boot alone")
             continue
-        benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or DEFAULT_BENCHMARK)
+        benchmark = DEFAULT_BENCHMARK
         # Speculative decoding preserves the output distribution by construction, so a
         # draft path that computes the wrong thing passes boot and accuracy and shows
         # only as speed: per-prompt acceptance is the detector.
@@ -611,9 +599,17 @@ def flow_tests(
         add(E2E, unit, _PURPOSE[E2E], RUN_DATASETS, scored, datasets=[GENERATE, benchmark, *drafts])
         rest = [m for m in members if m not in scored]
         add(BOOT, unit, _PURPOSE[BOOT], RUN_DATASETS, rest, datasets=[GENERATE, *drafts])
-        if serving:
-            add(SERVE, unit, _PURPOSE[SERVE], RUN_SERVE, [serve.serve_member(members)],
-                datasets=[GENERATE])  # fmt: skip
+        explicit_serve = declared.get((unit, SERVE))
+        if serving or (explicit_serve and explicit_serve.get("enabled") is True):
+            add(
+                SERVE,
+                unit,
+                _PURPOSE[SERVE],
+                RUN_SERVE,
+                [serve.serve_member(members)],
+                datasets=[GENERATE],
+                timeout=serve.BOOT_TIMEOUT_S,
+            )
     for name in () if lean else variants_mod.variants(task_data):
         level = profile_of(task_data, name)
         if level == PROFILE_BRINGUP:
@@ -626,9 +622,7 @@ def flow_tests(
         spec = check_config.variant_spec(task_data, name, world_size=world_size)
         members = order_members_by_cost(members_for(spec, name, world_size))
         everywhere = order_members_by_cost(members_for(task_data, base, world_size))
-        benchmark = str(
-            resolve_per_unit(spec.get("accuracy") or {}, "benchmark", name) or DEFAULT_BENCHMARK
-        )
+        benchmark = DEFAULT_BENCHMARK
         gates = ("boot",) if level == PROFILE_SMOKE else variants_mod.variant_gates(task_data, name)
         drafts = [ACCEPTANCE] if "acceptance" in gates else []
         if variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE and (
@@ -658,11 +652,22 @@ def flow_tests(
             f"the {profile_of(task_data)} profile gates no configuration variant: "
             + ", ".join(variants_mod.variants(task_data))
         )
-    if units and serving and not lean:
-        single = serve.delivery_member(members_for(task_data, units[-1], world_size))
-        if single is not None:
-            add(SERVE_ONE_RANK, units[-1], _PURPOSE[SERVE_ONE_RANK], RUN_SERVE, [single],
-                datasets=[GENERATE], stage=STAGE_DELIVERY)  # fmt: skip
+    if units and not lean:
+        last_unit = units[-1]
+        explicit_one_rank = declared.get((last_unit, SERVE_ONE_RANK))
+        if serving or (explicit_one_rank and explicit_one_rank.get("enabled") is True):
+            single = serve.delivery_member(members_for(task_data, last_unit, world_size))
+            if single is not None:
+                add(
+                    SERVE_ONE_RANK,
+                    last_unit,
+                    _PURPOSE[SERVE_ONE_RANK],
+                    RUN_SERVE,
+                    [single],
+                    datasets=[GENERATE],
+                    stage=STAGE_DELIVERY,
+                    timeout=serve.BOOT_TIMEOUT_S,
+                )
     return out
 
 

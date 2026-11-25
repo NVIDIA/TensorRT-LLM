@@ -240,14 +240,13 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
             options_dir=args.workdir.resolve() / variants_mod.OPTIONS_DIRNAME,
         )
     size = parse_parallel_segment(member)[1] or 1
-    # The disaggregated-serving test starts two engines, so it asks for both, as the
-    # orchestrator's run does.
-    spec = (
-        disagg.DisaggSpec.from_task(task_data)
-        if test.runner == verification_mod.RUN_DISAGG
-        else None
-    )
-    gpus = (spec.device_count(member) if spec else None) or size
+    spec = disagg.DisaggSpec.from_test(test, task_data)
+    if spec is not None:
+        gpus = spec.device_count(member) or size
+    elif test.runner == verification_mod.RUN_PYTEST and not test.whole_model:
+        gpus = test.devices or size
+    else:
+        gpus = size
     if args.devices:
         devices = tuple(int(d) for d in args.devices.split(","))
     elif scheduler_owns_devices(str((task_data.get("environment") or {}).get("kind", "local"))):
@@ -257,8 +256,7 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
     else:
         devices = tuple(range(gpus))
     environment = resolve_environment(task_data, devices=devices).at_width(size)
-    gate = disagg.GATE_NAME if test.runner == verification_mod.RUN_DISAGG else args.name
-    nodes, lead = disagg.job_span(task_data, gate, environment.nodes)
+    nodes, lead = disagg.job_span(task_data, test, environment.nodes)
     if args.python:
         environment = replace(environment, python=args.python)
     features = (
@@ -317,7 +315,7 @@ class Run:
         if test.runner == verification_mod.RUN_DATASETS:
             result = self._datasets(test, task_data, member, workdir)
         elif test.runner == verification_mod.RUN_SERVE:
-            spec = serve.ServeSpec.from_task(task_data)
+            spec = serve.ServeSpec.from_test(test)
             result = serve.run_serve_gate(
                 self.environment, task_data=task_data, runner=self.runner, unit=unit,
                 member=member, features=features, workdir=workdir,
@@ -325,11 +323,11 @@ class Run:
                 spec=replace(spec, timeout=self.args.timeout) if self.args.timeout else spec,
             )  # fmt: skip
         elif test.runner == verification_mod.RUN_DISAGG:
-            spec = disagg.DisaggSpec.from_task(task_data)
+            spec = disagg.DisaggSpec.from_test(test, task_data)
             if spec is not None and self.args.timeout:
                 spec = replace(spec, timeout=self.args.timeout)
             result = disagg.run_disagg_gate(
-                self.environment, workdir=workdir, spec=spec, task_data=task_data,
+                self.environment, workdir=workdir, spec=spec, test=test, task_data=task_data,
                 runner=self.runner, unit=unit, member=member,
             )  # fmt: skip
         else:

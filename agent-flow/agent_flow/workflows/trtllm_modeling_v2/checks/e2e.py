@@ -69,11 +69,11 @@ TARGET_EXTRA_CHECKS = "extra_checks.py"
 CASES_FILENAME = "e2e_cases.yaml"
 CASES_VERSION = 1
 #: The file the runner appends one JSON line per dataset to.
-RESULTS_ENV = "MV2_E2E_RESULTS"
+RESULTS_ENV = "MV2FLOW_E2E_RESULTS"
 #: A JSON object ``{dataset: score}``: the score a benchmark is judged against instead of its row.
-REFERENCES_ENV = "MV2_E2E_REFERENCES"
+REFERENCES_ENV = "MV2FLOW_E2E_REFERENCES"
 #: Comma-separated dataset names: a debugging run's subset of the case (``gate --datasets``).
-DATASETS_ENV = "MV2_E2E_DATASETS"
+DATASETS_ENV = "MV2FLOW_E2E_DATASETS"
 MODELS_ROOT_ENV = "LLM_MODELS_ROOT"
 #: How a case names a path under the models root.
 MODELS_ROOT_PREFIX = "${LLM_MODELS_ROOT}"
@@ -232,10 +232,16 @@ def _benchmark(spec: Mapping[str, Any], name: str, test: Test) -> dict:
 
 
 def _acceptance(
-    spec: Mapping[str, Any], config: Mapping[str, Any], feature: str, features, root: str
+    spec: Mapping[str, Any],
+    config: Mapping[str, Any],
+    feature: str,
+    features,
+    root: str,
+    *,
+    benchmark: str = "gsm8k",
 ) -> dict:
     accuracy = spec.get("accuracy") or {}
-    workload = acceptance_checks.resolve_acceptance_workload(accuracy, feature)
+    workload = acceptance_checks.resolve_acceptance_workload(accuracy, feature, benchmark=benchmark)
     floor = acceptance_checks.resolve_acceptance_floor_spec(accuracy, feature, features)
     load: dict[str, Any] = {
         "max_tokens": workload.max_tokens,
@@ -303,7 +309,8 @@ def build_case(
         if name == DATASET_GENERATE:
             datasets.append(_generate(spec, config, feature, features))
         elif name == DATASET_ACCEPTANCE:
-            datasets.append(_acceptance(spec, config, feature, features, root))
+            bench = test.benchmarks[0] if test.benchmarks else "gsm8k"
+            datasets.append(_acceptance(spec, config, feature, features, root, benchmark=bench))
         else:
             datasets.append(_benchmark(spec, name, test))
     _, size = parse_parallel_segment(member)
@@ -504,6 +511,7 @@ def run_e2e(
         # command's output, as the engine's own prints do.
         capture=False,
         token=token,
+        launch_world=True,
     )
     lines = read_results(results)
     if not lines:

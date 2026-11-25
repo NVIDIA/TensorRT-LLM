@@ -74,10 +74,20 @@ def _holds_files(path: Path) -> bool:
 
 
 def benchmarks(task_data: Mapping[str, Any]) -> list[str]:
-    """The known benchmarks the run's units score."""
-    value = (task_data.get("accuracy") or {}).get("benchmark") or "gsm8k"
-    names = value.values() if isinstance(value, Mapping) else [value]
-    return sorted({str(n).lower() for n in names if str(n).lower() in KNOWN})
+    """The known benchmarks the run's tests score."""
+    from ..validation import contract as contract_mod
+
+    try:
+        tests = contract_mod.run_tests(task_data, 1)
+    except Exception:
+        return ["gsm8k"]
+    found = {
+        str(name).lower()
+        for test in tests
+        for name in test.benchmarks
+        if str(name).lower() in KNOWN
+    }
+    return sorted(found)
 
 
 def stage(

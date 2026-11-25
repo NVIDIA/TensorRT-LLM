@@ -48,7 +48,6 @@ def task_file(tmp_path, repo, checkpoint):
             "env": {"TMPDIR": SCRATCH, "CLAUDE_CODE_TMPDIR": SCRATCH},
         },
         "accuracy": {
-            "benchmark": "gsm8k",
             "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
             "model_key": "openai/gpt-oss-120b",
         },

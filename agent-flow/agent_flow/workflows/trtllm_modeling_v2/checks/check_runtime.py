@@ -77,12 +77,13 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
 
 
 def gate_workdir(workdir: str | Path) -> Path:
-    """``workdir``, made: where a gate writes the files its job reads.
+    """``workdir``, resolved and made: where a gate writes the files its job reads.
 
-    On the shared filesystem when the job runs on another host; the workflow
-    passes ``<workspace>/gates/<unit>``.
+    Resolved so commands that ``cd`` into a pytest root still read and write
+    the same path. On the shared filesystem when the job runs on another host;
+    the workflow passes ``<workspace>/gates/<unit>``.
     """
-    directory = Path(workdir)
+    directory = Path(workdir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 

@@ -112,9 +112,13 @@ TEST_KEYS: tuple[str, ...] = (
     "purpose",
     "datasets",
     "pytest",
+    "deployment",
     "serve",
+    "prompt",
+    "max_tokens",
     "members",
     "devices",
+    "nodes",
     "stage",
     "timeout",
     "env",
@@ -123,6 +127,10 @@ TEST_KEYS: tuple[str, ...] = (
     "evaluator_kwargs",
     "extra_checks",
 )
+#: The three YAML files of a stated disaggregated deployment (``deployment``).
+DEPLOYMENT_FILES: tuple[str, ...] = ("config", "context", "generation")
+#: Default timeout (seconds) for a stated disaggregated deployment test.
+DEFAULT_DISAGG_TIMEOUT_S = 7200
 
 #: LLM-API options the member and the feature decide; a test's ``config`` leaves them.
 FLOW_CONFIG_KEYS: tuple[str, ...] = (
@@ -200,8 +208,7 @@ E2E = "e2e"
 BOOT = "boot"
 SERVE = "serve"
 SERVE_ONE_RANK = "serve_one_rank"
-DISAGG = "disagg"
-FLOW_TEST_NAMES: tuple[str, ...] = (E2E, BOOT, SERVE, SERVE_ONE_RANK, DISAGG)
+FLOW_TEST_NAMES: tuple[str, ...] = (E2E, BOOT, SERVE, SERVE_ONE_RANK)
 
 #: A test's name: it names the test's checks (``core:e2e@tep4``).
 TEST_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -242,8 +249,15 @@ class Test:
     #: module test (pytest with ``devices``), and for a spec's datasets test that
     #: names none (the feature's cheapest member).
     members: tuple[str, ...] = ()
-    #: The devices a module test runs on; ``0`` for a test that runs per member.
+    #: The devices a module or per-node gang pytest test runs on per node; ``0`` per member.
     devices: int = 0
+    #: Nodes running one pytest process each (per-node gang mode, ``pytest`` without ``members``).
+    gang_nodes: int = 1
+    #: Stated disaggregated deployment (``config``, ``context``, ``generation`` YAML paths).
+    deployment: Mapping[str, str] | None = None
+    #: Serving prompt and token limit for ``RUN_SERVE`` tests.
+    prompt: str | None = None
+    max_tokens: int | None = None
     timeout: int = DEFAULT_TIMEOUT_S
     env: Mapping[str, str] | None = None
     origin: str = ORIGIN_SPEC
@@ -262,12 +276,17 @@ class Test:
             dict(self.evaluator_kwargs or {}),
             tuple(self.extra_checks),
             dict(self.env or {}),
+            dict(self.deployment or {}),
+            self.prompt,
+            self.max_tokens,
         )
 
     @property
     def whole_model(self) -> bool:
-        """Whether it runs per member with that member's configuration (every test but a module test)."""
-        return self.runner != RUN_PYTEST or bool(self.members)
+        """Whether it runs per member with that member's configuration."""
+        return self.runner in (RUN_DATASETS, RUN_SERVE) or (
+            self.runner == RUN_PYTEST and bool(self.members)
+        )
 
     @property
     def of_the_flow(self) -> bool:
@@ -318,12 +337,12 @@ def estimate_run_minutes(
     """Estimated pure execution time (minutes, excluding model load) for one run of ``test``.
 
     Returns ``None`` for tests whose workload is not from :data:`DATASETS` (arbitrary
-    ``pytest`` nodes and ``disagg`` tests). When ``evaluator_kwargs`` enables thinking mode,
+    ``pytest`` nodes). When ``evaluator_kwargs`` enables thinking mode,
     short-output benchmarks are scaled by :data:`THINKING_MULTIPLIER`.
     """
     if test.runner == RUN_SERVE:
         return DATASET_REF_MINUTES[DATASET_GENERATE]
-    if test.runner != RUN_DATASETS or not test.datasets:
+    if test.runner not in (RUN_DATASETS, RUN_DISAGG) or not test.datasets:
         return None
     thinking = thinking_enabled(evaluator_kwargs)
     total = 0.0
@@ -374,8 +393,23 @@ def changes(entry: Mapping[str, Any], base: Test) -> Test | None:
 
 def declared(feature: str, name: str, entry: Mapping[str, Any]) -> Test:
     """The spec's own test ``name`` of ``feature``, from its validated entry."""
-    runner = RUN_PYTEST if entry.get("pytest") else RUN_DATASETS
-    base = Test(name=name, feature=feature, purpose="", runner=runner, origin=ORIGIN_SPEC)
+    if entry.get("deployment"):
+        runner = RUN_DISAGG
+    elif entry.get("pytest"):
+        runner = RUN_PYTEST
+    elif entry.get("serve"):
+        runner = RUN_SERVE
+    else:
+        runner = RUN_DATASETS
+    timeout = DEFAULT_DISAGG_TIMEOUT_S if runner == RUN_DISAGG else DEFAULT_TIMEOUT_S
+    base = Test(
+        name=name,
+        feature=feature,
+        purpose="",
+        runner=runner,
+        timeout=timeout,
+        origin=ORIGIN_SPEC,
+    )
     return _with_fields(base, entry)
 
 
@@ -383,22 +417,54 @@ def _with_fields(base: Test, entry: Mapping[str, Any]) -> Test:
     fields: dict[str, Any] = {}
     if entry.get("purpose"):
         fields["purpose"] = " ".join(str(entry["purpose"]).split())
-    if entry.get("pytest"):
-        fields.update(runner=RUN_PYTEST, nodes=_strings(entry["pytest"]), datasets=())
-    if entry.get("datasets"):
-        fields.update(datasets=_strings(entry["datasets"]), nodes=())
-        fields["runner"] = (
-            RUN_SERVE if entry.get("serve", base.runner == RUN_SERVE) else RUN_DATASETS
+    if entry.get("deployment"):
+        fields.update(
+            runner=RUN_DISAGG,
+            deployment={str(k): str(v) for k, v in entry["deployment"].items()},
+            nodes=(),
+            devices=0,
+            gang_nodes=1,
         )
-    elif "serve" in entry and base.runner in (RUN_DATASETS, RUN_SERVE):
+        if not entry.get("datasets") and not base.benchmarks:
+            fields["datasets"] = ("gsm8k",)
+        if not entry.get("timeout") and base.runner != RUN_DISAGG:
+            fields["timeout"] = DEFAULT_DISAGG_TIMEOUT_S
+    if entry.get("pytest"):
+        fields.update(
+            runner=RUN_PYTEST,
+            nodes=_strings(entry["pytest"]),
+            datasets=(),
+            deployment=None,
+        )
+    if entry.get("datasets"):
+        fields["datasets"] = _strings(entry["datasets"])
+        if fields.get("runner", base.runner) != RUN_DISAGG:
+            fields["nodes"] = ()
+            fields["runner"] = (
+                RUN_SERVE if entry.get("serve", base.runner == RUN_SERVE) else RUN_DATASETS
+            )
+    elif (
+        "serve" in entry
+        and base.runner in (RUN_DATASETS, RUN_SERVE)
+        and fields.get("runner", base.runner) in (RUN_DATASETS, RUN_SERVE)
+    ):
         fields["runner"] = RUN_SERVE if entry["serve"] else RUN_DATASETS
+        if entry["serve"] and not base.datasets:
+            fields["datasets"] = (DATASET_GENERATE,)
     if entry.get("members") is not None:
-        fields.update(members=_strings(entry["members"]), devices=0)
+        fields.update(members=_strings(entry["members"]), devices=0, gang_nodes=1)
     if entry.get("devices") is not None:
         fields.update(devices=int(entry["devices"]), members=())
+    if entry.get("nodes") is not None:
+        fields.update(gang_nodes=int(entry["nodes"]), members=())
     runner = fields.get("runner", base.runner)
     if runner == RUN_PYTEST and not fields.get("members", base.members):
-        fields["devices"] = fields.get("devices") or base.devices or 1
+        if fields.get("gang_nodes", base.gang_nodes) == 1:
+            fields["devices"] = fields.get("devices") or base.devices or 1
+    if entry.get("prompt") is not None:
+        fields["prompt"] = str(entry["prompt"])
+    if entry.get("max_tokens") is not None:
+        fields["max_tokens"] = int(entry["max_tokens"])
     if entry.get("stage"):
         fields["stage"] = str(entry["stage"])
     if entry.get("timeout"):
@@ -439,10 +505,13 @@ def apply(flow: list[Test], data: Mapping[str, Any]) -> list[Test]:
         where = f"{VERIFICATION_FIELD}.{feature}.{name}"
         if entry.get("enabled") is False:
             problems.append(f"'{where}' turns off a test the flow does not derive for {feature}")
-        elif not (entry.get("purpose") and (entry.get("pytest") or entry.get("datasets"))):
+        elif not (
+            entry.get("purpose")
+            and (entry.get("pytest") or entry.get("datasets") or entry.get("deployment"))
+        ):
             problems.append(
                 f"'{where}' changes a test the flow does not derive for {feature}; as a test of "
-                "the spec's own it needs 'purpose' and 'datasets' or 'pytest'"
+                "the spec's own it needs 'purpose' and 'datasets', 'pytest' or 'deployment'"
             )
         else:
             out.append(declared(feature, name, entry))
@@ -453,6 +522,23 @@ def apply(flow: list[Test], data: Mapping[str, Any]) -> list[Test]:
                 f"'{where}' serves through trtllm-serve, which sends the boot prompts only: its "
                 f"datasets are [{DATASET_GENERATE}], not {list(test.datasets)}"
             )
+        if test.runner == RUN_DISAGG:
+            if not test.deployment:
+                problems.append(
+                    f"'{where}' needs 'deployment' (`config`, `context`, `generation`) or 'pytest'"
+                )
+            elif len(test.datasets) != 1 or test.datasets[0] not in BENCHMARKS:
+                problems.append(
+                    f"'{where}' serves a disaggregated deployment and scores one benchmark "
+                    f"from {sorted(BENCHMARKS)}, not {list(test.datasets)}"
+                )
+        if (test.prompt is not None or test.max_tokens is not None) and test.runner != RUN_SERVE:
+            problems.append(f"'{where}' sets 'prompt'/'max_tokens', which only a serve test reads")
+        if test.gang_nodes > 1 and (test.runner != RUN_PYTEST or test.members):
+            problems.append(
+                f"'{where}.nodes' runs one pytest process per node and applies only to a pytest "
+                "test without 'members'"
+            )
         if test.config and not (
             test.runner == RUN_DATASETS or (test.runner == RUN_PYTEST and test.members)
         ):
@@ -460,7 +546,9 @@ def apply(flow: list[Test], data: Mapping[str, Any]) -> list[Test]:
                 f"'{where}.config' lays options over an engine of its feature: a test of "
                 "datasets, or a pytest test with 'members', has one; this test has none"
             )
-        if test.evaluator_kwargs and not (test.runner == RUN_DATASETS and test.benchmarks):
+        if test.evaluator_kwargs and not (
+            test.runner in (RUN_DATASETS, RUN_DISAGG) and test.benchmarks
+        ):
             problems.append(
                 f"'{where}.evaluator_kwargs' applies to the test's benchmarks, and it runs none "
                 f"({list(BENCHMARKS)})"
@@ -535,28 +623,65 @@ def _validate_entry(
         errors.append(f"'{where}.purpose' must say what the test proves and what passing means")
     elif purpose is None and not flows and enabled is not False:
         errors.append(f"'{where}.purpose' must say what the test proves and what passing means")
-    nodes, datasets = entry.get("pytest"), entry.get("datasets")
+    nodes, datasets, deployment = (
+        entry.get("pytest"),
+        entry.get("datasets"),
+        entry.get("deployment"),
+    )
     if nodes is not None and datasets is not None:
         errors.append(f"'{where}' sets both 'datasets' and 'pytest'; a test runs one way")
-    elif nodes is None and datasets is None and not flows and enabled is not False:
+    if deployment is not None and nodes is not None:
+        errors.append(f"'{where}' sets both 'deployment' and 'pytest'; a test runs one way")
+    elif (
+        nodes is None
+        and datasets is None
+        and deployment is None
+        and not flows
+        and enabled is not False
+    ):
         errors.append(
-            f"'{where}' must say how it runs: 'datasets' (from {list(DATASETS)}) or 'pytest'"
+            f"'{where}' must say how it runs: 'datasets' (from {list(DATASETS)}), 'pytest' or "
+            "'deployment'"
         )
     if nodes is not None:
-        _validate_nodes(where, nodes, entry, errors, per_member=flows)
+        _validate_nodes(
+            where,
+            nodes,
+            entry,
+            errors,
+            per_member=flows and entry.get("devices") is None and entry.get("nodes") is None,
+        )
     if datasets is not None:
         _validate_datasets(where, datasets, entry, errors)
+    if deployment is not None:
+        _validate_deployment(where, deployment, entry, errors)
     serve = entry.get("serve")
     if serve is not None and not isinstance(serve, bool):
         errors.append(f"'{where}.serve' must be true or false")
     elif serve and nodes is not None:
         errors.append(f"'{where}.serve' sends prompts through trtllm-serve; a pytest test has none")
-    members, devices = entry.get("members"), entry.get("devices")
+    elif serve and deployment is not None:
+        errors.append(f"'{where}.serve' cannot be combined with 'deployment'")
+    prompt = entry.get("prompt")
+    if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
+        errors.append(f"'{where}.prompt' must be a non-empty string")
+    max_tokens = entry.get("max_tokens")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1
+    ):
+        errors.append(f"'{where}.max_tokens' must be an integer >= 1")
+    if (prompt is not None or max_tokens is not None) and not (
+        name in (SERVE, SERVE_ONE_RANK) or serve is True
+    ):
+        errors.append(f"'{where}' sets 'prompt'/'max_tokens', which only a serve test reads")
+    members, devices, gang_nodes = entry.get("members"), entry.get("devices"), entry.get("nodes")
     if members is not None and devices is not None:
         errors.append(
             f"'{where}' sets both 'members' (once per member) and 'devices' (a module test, "
             "once); say one"
         )
+    if members is not None and gang_nodes is not None:
+        errors.append(f"'{where}' sets both 'members' and 'nodes' (per-node gang pytest); say one")
     if members is not None:
         listed = [members] if isinstance(members, str) else members
         if not isinstance(listed, list) or not listed:
@@ -574,6 +699,11 @@ def _validate_entry(
                 f"'{where}.devices' makes a pytest test a module test; a test of datasets runs "
                 "at members"
             )
+    if gang_nodes is not None:
+        if isinstance(gang_nodes, bool) or not isinstance(gang_nodes, int) or gang_nodes < 1:
+            errors.append(f"'{where}.nodes' must be an integer >= 1")
+        elif gang_nodes > 1 and nodes is None:
+            errors.append(f"'{where}.nodes' runs one pytest process per node and requires 'pytest'")
     stage = entry.get("stage")
     if stage is not None and stage not in STAGES:
         errors.append(f"'{where}.stage' must be one of {list(STAGES)}, got {stage!r}")
@@ -621,6 +751,40 @@ def _validate_entry(
             errors.append(
                 f"'{where}.extra_checks' judge what a test's datasets did; a pytest test "
                 "asserts in its own code"
+            )
+
+
+def _validate_deployment(
+    where: str, deployment: Any, entry: Mapping[str, Any], errors: list[str]
+) -> None:
+    if not isinstance(deployment, Mapping):
+        errors.append(f"'{where}.deployment' must be a mapping with keys {list(DEPLOYMENT_FILES)}")
+        return
+    unknown = [k for k in deployment if k not in DEPLOYMENT_FILES]
+    if unknown:
+        errors.append(
+            f"'{where}.deployment' has unknown key(s) {unknown}; expected {list(DEPLOYMENT_FILES)}"
+        )
+    for key in DEPLOYMENT_FILES:
+        value = deployment.get(key)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"'{where}.deployment.{key}' must be a non-empty file path")
+        elif not Path(value).is_file():
+            errors.append(f"'{where}.deployment.{key}' file not found: {value}")
+    if entry.get("members") is not None:
+        errors.append(f"'{where}.deployment' sizes its own servers; do not set 'members'")
+    if entry.get("config") is not None:
+        errors.append(
+            f"'{where}.deployment' reads options from its context/generation files; do not set 'config'"
+        )
+    if entry.get("extra_checks") is not None:
+        errors.append(f"'{where}.extra_checks' apply to the tree's e2e runner, not 'deployment'")
+    datasets = entry.get("datasets")
+    if datasets is not None and isinstance(datasets, list):
+        if len(datasets) != 1 or datasets[0] not in BENCHMARKS:
+            errors.append(
+                f"'{where}.datasets' with 'deployment' must name one benchmark from "
+                f"{sorted(BENCHMARKS)}"
             )
 
 
@@ -844,8 +1008,9 @@ __all__ = [
     "DATASET_ACCEPTANCE",
     "DATASET_GENERATE",
     "DATASET_REF_MINUTES",
+    "DEFAULT_DISAGG_TIMEOUT_S",
     "DEFAULT_TIMEOUT_S",
-    "DISAGG",
+    "DEPLOYMENT_FILES",
     "E2E",
     "FEATURE_ENV",
     "FEATURE_PLACEHOLDER",

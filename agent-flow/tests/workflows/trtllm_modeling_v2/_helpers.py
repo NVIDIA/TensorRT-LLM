@@ -268,7 +268,7 @@ def healthy_smi(count: int = 1):
 
 
 _JUNIT = re.compile(r"--junitxml=('[^']*'|\S+)")
-_RESULTS = re.compile(r"MV2_E2E_RESULTS=('[^']*'|\S+)")
+_RESULTS = re.compile(r"MV2FLOW_E2E_RESULTS=('[^']*'|\S+)")
 _CASE = re.compile(r"test_e2e\[([^\]]+)\]")
 
 
