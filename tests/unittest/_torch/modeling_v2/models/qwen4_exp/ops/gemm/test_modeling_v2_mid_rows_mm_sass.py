@@ -35,11 +35,11 @@ _CHILD = textwrap.dedent(
     from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
     from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import mid_rows_mm as op
 
-    n, k, rows, fp8, w_mode, ks, inj = (int(v) for v in sys.argv[1:8])
+    n, k, rows, fp8, w_mode, ks, inj, conv = (int(v) for v in sys.argv[1:9])
     plan = op.Plan(ks, 4, 4, 1)
     kern = op._MidMm(
         n=n, k=k, plan=plan, mpad=op.mma_rows(rows), fp8=bool(fp8), w_mode=w_mode, pdl=True,
-        inj=inj,
+        inj=inj, conv=(conv, 4, -1) if conv else None,
     )
     dt = cutlass.Float8E4M3FN if fp8 else cutlass.BFloat16
     gm, p = cute.AddressSpace.gmem, 0x7F0000000000
@@ -56,20 +56,24 @@ _CHILD = textwrap.dedent(
         make_ptr(cutlass.Float32, p, gm, assumed_align=16),
         *[make_ptr(cutlass.BFloat16, p, gm, assumed_align=16) for _ in range(4)],
         make_ptr(cutlass.Float32, p, gm, assumed_align=16),
+        *[cutlass.Int64(0)] * 7,
         make_fake_stream(),
         options="--opt-level 2 --enable-tvm-ffi",
     )
     """
 )
 
-#: `(why, N, K, rows, fp8, weight-scale mode, K split, inject streams)`: one compile a mode.
+#: `(why, N, K, rows, fp8, weight-scale mode, K split, inject streams, conv channels)`: one
+#: compile a mode.
 _VARIANTS = (
-    ("FP8, one weight scale, split-K (GDN out / o at tp1)", 2560, 6144, 48, 1, 1, 6, 0),
-    ("FP8, one scale a weight row, no split (vocab head)", 4096, 2560, 128, 1, 2, 1, 0),
-    ("bf16, split-K (attention-DP output projection)", 2560, 6144, 48, 0, 0, 6, 0),
-    ("bf16, no split (attention-DP input projection)", 16480, 2560, 64, 0, 0, 1, 0),
+    ("FP8, one weight scale, split-K (GDN out / o at tp1)", 2560, 6144, 48, 1, 1, 6, 0, 0),
+    ("FP8, one scale a weight row, no split (vocab head)", 4096, 2560, 128, 1, 2, 1, 0, 0),
+    ("bf16, split-K (attention-DP output projection)", 2560, 6144, 48, 0, 0, 6, 0, 0),
+    ("bf16, no split (attention-DP input projection)", 16480, 2560, 64, 0, 0, 1, 0, 0),
     # The inject mode reads `hc` / `inject` (previous launches' outputs) in its store loop.
-    ("bf16, split-K, inject mode (attention-DP site-B fold)", 2560, 6144, 48, 0, 0, 6, 4),
+    ("bf16, split-K, inject mode (attention-DP site-B fold)", 2560, 6144, 48, 0, 0, 6, 4, 0),
+    # The conv mode reads slots, windows and taps behind the epilogue warps' wait.
+    ("bf16, no split, conv mode (attention-DP lean verify)", 16480, 2560, 48, 0, 0, 1, 0, 10240),
 )
 
 
