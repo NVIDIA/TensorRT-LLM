@@ -1549,6 +1549,38 @@ def _tep_draft_layer(core) -> bool:
     return False
 
 
+#: Off by default (class S: another GEMM shape and another norm + rope kernel than the split
+#: form, draft tokens only). At a dep4 / dep8 rank with MTP, a draft step of the generic pass forms
+#: its attention input as one rank does (`DecodeTarget._mtp_attn_front`): one GEMM against the
+#: packed `[q | k | v | gate | index | pad]` operand, one norm + rope launch for both planes, the
+#: index key's store and compression on the side stream. It replaces four cuBLAS GEMMs on one
+#: input, three copies, two norm + rope launches and a serial index branch. The packed operand is
+#: a second copy of the draft layer's q, k, v and index weights (about 69 MiB a rank); the split
+#: ones stay for the draft step with context rows. Measured on GB300 dep4 inside a step bundle
+#: with the draft launch order (0.08-0.2 ms a step derived). Read once, when the target is built.
+DP_MTP_ATTN_PACK_ENV = "TRTLLM_QWEN4_EXP_DP_MTP_ATTN_PACK"
+
+
+def _dp_mtp_attn_pack(core) -> bool:
+    """`DP_MTP_ATTN_PACK_ENV` at this core's layout: an attention-DP rank of a measured group size
+    (dep4, dep8) with MTP. Set where it cannot apply: one warning, False."""
+    if not _switch(DP_MTP_ATTN_PACK_ENV):
+        return False
+    if (
+        not core.one_rank
+        and core.dp_size in _DP_DECODE_SIZES
+        and core.attn_tp_size == 1
+        and core.mtp_enabled
+    ):
+        return True
+    logger.warning(
+        f"{DP_MTP_ATTN_PACK_ENV} is set but ignored: it serves a dep4 / dep8 rank with MTP; this "
+        f"rank has attention DP {core.dp_size}, attention TP {core.attn_tp_size}, MTP "
+        f"{'on' if core.mtp_enabled else 'off'}"
+    )
+    return False
+
+
 #: Off by default (opt-in: the router logits come from another GEMM, a same-precision reorder). At a
 #: tep4 rank whose trunk MoE takes the route front (`TEP_FAST_DECODE_ENV`), a captured block of a
 #: row count the route front serves, up to `moe_decode_front.MAX_ROWS`, forms its router logits in
@@ -2825,6 +2857,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # draft layer's (`TEP_DRAFT_LAYER_ENV`).
         self.tep_fast = _tep_fast_decode(self)
         self.tep_draft_layer = _tep_draft_layer(self)
+        # An attention-DP rank's draft attention input in the one-rank form (`DP_MTP_ATTN_PACK_ENV`).
+        self.dp_mtp_attn_pack = _dp_mtp_attn_pack(self)
         # The attention-DP decode forms, built after load (`post_load_weights`) on a GPU:
         # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
         self.hc_tiles = False
@@ -3101,10 +3135,16 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         draft layer's operands for `DecodeTarget._mtp_layer`: the fused
         `[q | k | v | gate | index | pad]` attention input (`weights._attn_in_w`), and at one rank
         with `_MTP_DENSE_FP8_ENV` the packed FP8 copies of its dense projections; None / empty at
-        every other layout."""
+        every other layout. At an attention-DP rank under `DP_MTP_ATTN_PACK_ENV` the fused
+        attention input alone (`DecodeTarget._mtp_attn_front`)."""
         self._mtp_attn_in = None
         self._mtp_gemv8 = {}
-        if not (self.one_rank or self.tep_draft_layer):
+        if self.dp_mtp_attn_pack and not _dp_decode_rank(self, device):
+            logger.warning(
+                f"{DP_MTP_ATTN_PACK_ENV} is set but ignored: it was measured on SM103 GPUs only"
+            )
+            self.dp_mtp_attn_pack = False
+        if not (self.one_rank or self.tep_draft_layer or self.dp_mtp_attn_pack):
             return
         w = self.w
         p = f"l{self.mtp_layer_idx}_mtp_"
@@ -9256,87 +9296,15 @@ class DecodeTarget:
         core = self.core
         M = core._mtp
         dt, dev = x.dtype, x.device
-        proj = _draft_mm(x, core._mtp_attn_in, core._mtp_gemv8.get("attn_in"), gemm)
-        qkv_view, gate, index_view = torch.split(
+        proj, q_index = self._mtp_attn_front(x, md, draft, rows, reuse, pos3, coords, gemm)
+        qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
         q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
-        index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
-        q_index = _index_query(core, index_scratch)
         req_idx = md.qsa_req_idx_per_token[:rows]
         logical = md.qsa_logical_positions[:rows]
         block_table = md.qsa_block_table
         tokens_per_block = md.tokens_per_block
-        main = torch.cuda.current_stream()
-        side = core._side_stream
-        side.wait_stream(main)
-        qwen4_exp_qk_norm_rope(
-            proj,
-            q_index,
-            pos3,
-            core._mtp_cos_sin,
-            M.q_norm,
-            M.k_norm,
-            M.idx_qn,
-            num_heads_q=core.heads_q,
-            num_heads_k=core.heads_kv,
-            head_dim=core.head_dim,
-            index_heads=core.index_heads,
-            index_head_dim=core.index_head_dim,
-            index_q_col=core.qkv_width + core.q_width,
-            rotary_dim=core.rotary_dim,
-            eps=core.eps,
-            mrope_section1=core.mrope_section1,
-            mrope_section2=core.mrope_section2,
-            index_mrope_section1=0,
-            index_mrope_section2=0,
-        )
-        if not reuse:
-            with torch.cuda.stream(side):
-                token_k = torch.split(
-                    torch.reshape(
-                        index_view,
-                        [
-                            rows,
-                            core.index_scratch_width // core.index_head_dim,
-                            core.index_head_dim,
-                        ],
-                    ),
-                    [core.index_heads, core.index_kv_heads, 1],
-                    1,
-                )[1]
-                qsa_paged_index_store(
-                    token_k,
-                    coords,
-                    draft.index_cache,
-                    draft.position_cache,
-                    req_idx,
-                    logical,
-                    block_table,
-                    tokens_per_block,
-                )
-                qsa_prefill_compress(
-                    logical_positions=logical,
-                    request_indices=req_idx,
-                    block_table=block_table,
-                    index_cache=draft.index_cache,
-                    position_cache=draft.position_cache,
-                    k_norm_weight=M.idx_kn,
-                    cos_sin=core._mtp_cos_sin,
-                    eps=core.eps,
-                    tokens_per_block=tokens_per_block,
-                    compress_ratio=core.compress_ratio,
-                    mrope_section=_QSA_MROPE_SECTION,
-                )
-                _index_anchors_fp8(
-                    core,
-                    draft.index_cache,
-                    block_table,
-                    req_idx,
-                    logical,
-                    tokens_per_block,
-                )
-        main.wait_stream(side)
         if not core.one_rank:
             return _draft_mm(
                 self._mtp_attention_tp(
@@ -9477,14 +9445,104 @@ class DecodeTarget:
             fused_sigmoid_mul_inplace(out, gate)
         return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
+    def _mtp_attn_front(self, x, md, draft, rows, reuse, pos3, coords, gemm) -> tuple:
+        """The draft layer's attention input in the one-rank form: one GEMM against the fused
+        `[q | k | v | gate | index | pad]` operand (`core._mtp_attn_in`), the norm + rope of both
+        planes in one launch at the module's rope base, and (unless `reuse`) the raw index key's
+        store and the compression on the side stream, joined before this returns. Returns
+        `(proj, q_index)`: the projection row and the normalized, rotated index query."""
+        core = self.core
+        M = core._mtp
+        dt, dev = x.dtype, x.device
+        proj = _draft_mm(x, core._mtp_attn_in, core._mtp_gemv8.get("attn_in"), gemm)
+        index_view = proj[:, core.qkv_width + core.q_width :]
+        index_scratch = torch.empty([rows, core.index_scratch_width], dtype=dt, device=dev)
+        q_index = _index_query(core, index_scratch)
+        req_idx = md.qsa_req_idx_per_token[:rows]
+        logical = md.qsa_logical_positions[:rows]
+        block_table = md.qsa_block_table
+        tokens_per_block = md.tokens_per_block
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        side.wait_stream(main)
+        qwen4_exp_qk_norm_rope(
+            proj,
+            q_index,
+            pos3,
+            core._mtp_cos_sin,
+            M.q_norm,
+            M.k_norm,
+            M.idx_qn,
+            num_heads_q=core.heads_q,
+            num_heads_k=core.heads_kv,
+            head_dim=core.head_dim,
+            index_heads=core.index_heads,
+            index_head_dim=core.index_head_dim,
+            index_q_col=core.qkv_width + core.q_width,
+            rotary_dim=core.rotary_dim,
+            eps=core.eps,
+            mrope_section1=core.mrope_section1,
+            mrope_section2=core.mrope_section2,
+            index_mrope_section1=0,
+            index_mrope_section2=0,
+        )
+        if not reuse:
+            with torch.cuda.stream(side):
+                token_k = torch.split(
+                    torch.reshape(
+                        index_view,
+                        [
+                            rows,
+                            core.index_scratch_width // core.index_head_dim,
+                            core.index_head_dim,
+                        ],
+                    ),
+                    [core.index_heads, core.index_kv_heads, 1],
+                    1,
+                )[1]
+                qsa_paged_index_store(
+                    token_k,
+                    coords,
+                    draft.index_cache,
+                    draft.position_cache,
+                    req_idx,
+                    logical,
+                    block_table,
+                    tokens_per_block,
+                )
+                qsa_prefill_compress(
+                    logical_positions=logical,
+                    request_indices=req_idx,
+                    block_table=block_table,
+                    index_cache=draft.index_cache,
+                    position_cache=draft.position_cache,
+                    k_norm_weight=M.idx_kn,
+                    cos_sin=core._mtp_cos_sin,
+                    eps=core.eps,
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    mrope_section=_QSA_MROPE_SECTION,
+                )
+                _index_anchors_fp8(
+                    core,
+                    draft.index_cache,
+                    block_table,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                )
+        main.wait_stream(side)
+        return proj, q_index
+
     def _mtp_attention_tp(
         self, md, step, draft, layer_idx, proj, q_index, rows, gen_seqs, p, sparse, share, reuse,
         cont,
     ) -> torch.Tensor:  # fmt: skip
-        """`_mtp_attention` at a tep4 rank past its norm + rope and index branch: the K/V
-        append of every row, then the generic pass's sparse core (`_draft_sparse`) at the rows
-        that go on, or the dense op over every row. Returns the gated `[n, q_width]` attention
-        output of those rows."""
+        """`_mtp_attention` at a tep4 rank (and the generic pass at an attention-DP rank under
+        `DP_MTP_ATTN_PACK_ENV`) past its norm + rope and index branch: the K/V append of every
+        row, then the generic pass's sparse core (`_draft_sparse`) at the rows that go on, or the
+        dense op over every row. Returns the gated `[n, q_width]` attention output of those
+        rows."""
         core = self.core
         _, k_dst, v_dst = _attn_in_heads(core, proj)
         req_idx = md.qsa_req_idx_per_token[:rows]
@@ -10297,6 +10355,24 @@ class DecodeTarget:
             n = gen_seqs
             pad_rows = _draft_pad_rows(core, cont.counts, n)
         x, mixed, inject = _mtp_front(core, M, embed_tokens, input_ids, hidden_states)
+        if core.dp_mtp_attn_pack and core._mtp_attn_in is not None:
+            # `DP_MTP_ATTN_PACK_ENV`: the attention input in the one-rank form, then the
+            # multi-rank core past it (a rank's own row counts and collectives are unchanged).
+            gemm = core.decode_mm if md.is_cuda_graph else cublas_mm
+            proj, q_index = self._mtp_attn_front(mixed, md, draft, rows, reuse, pos3, coords, gemm)
+            attn = self._mtp_attention_tp(
+                md, step, draft, layer_idx, proj, q_index, rows, gen_seqs, p, sparse, share,
+                reuse, cont,
+            )  # fmt: skip
+            kept = {"x": x, "inject": inject}
+            if cont is not None:
+                kept = _draft_rows(cont.rows, kept)
+            out = _mtp_tail(core, M, kept["x"], attn, kept["inject"], pad_rows)
+            if cont is None:
+                return out
+            full = out.new_empty([rows, out.shape[1]])
+            full.index_copy_(0, cont.rows, out)
+            return full
         qkv, gate, k_dst, v_dst = _mtp_qkv(core, M, mixed, pos3)
         q_index = None
         if not reuse:
