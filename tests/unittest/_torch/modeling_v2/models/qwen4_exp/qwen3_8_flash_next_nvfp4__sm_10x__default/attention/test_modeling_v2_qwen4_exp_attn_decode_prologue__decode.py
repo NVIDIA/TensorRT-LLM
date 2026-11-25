@@ -259,3 +259,24 @@ def test_reads_after_the_wait_under_graph_replay(spec) -> None:
         want[0]["proj"].copy_(src)
         op.reference(**want[0])
         _check((work, work_copies), want, where=f"replay {trial}: ")
+
+
+def test_tep4_in_place_prologue_is_bitwise_the_packed_one() -> None:
+    """`TEP_ATTN_INPLACE_ENV`'s build check on a tep4 rank's geometry over an e4m3 pool: the
+    family's one-rank prologue, in place on the projection row, writes the same K/V, index-plane,
+    coordinate and index-query bytes as this entry, and its q / k heads equal this entry's packed
+    copy (a verify request ending a group in the launch, and four decode rows)."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
+        modeling as M,
+    )
+
+    hq, hk = GEOMS["tp4"]
+    _, _, qkv_width, iq_col, row_width = _geometry("tp4")
+    core = SimpleNamespace(
+        heads_q=hq, heads_kv=hk, head_dim=D, index_heads=IH, index_head_dim=ID,
+        attn_in_width=row_width, qkv_width=qkv_width, index_col=iq_col, rotary_dim=ROT,
+        eps=1e-6, mrope_section1=11, mrope_section2=10, compress_ratio=CR,
+    )  # fmt: skip
+    assert M._tep_attn_inplace_check(core, torch.device(DEV)) == []

@@ -1476,6 +1476,18 @@ _TEP_PLE_WIDE_MIN_ROWS = 9  # capacity: fixed: a dispatch threshold
 #: split-K kernel. Read once, when the target is built; set where it cannot apply it warns and
 #: does nothing.
 TEP_GQA_E4M3_ENV = "TRTLLM_QWEN4_EXP_TEP_GQA_E4M3"
+#: On by default (bitwise; a row table). At a tep4 rank with its fast forms on SM103, a sparse
+#: trunk decode or verify step of up to `_TEP_ATTN_INPLACE_MAX_ROWS` rows over the e4m3 pool runs
+#: the family's one-launch prologue in place on the projection row (`one_rank_attn_decode_prologue`,
+#: the one-rank form) instead of the target's packed one: no packed `[q | k | v]` copy, the
+#: sparse GQA reading the query heads as views of the projection. The same arithmetic in both
+#: launches (the shared norm + rope tile and launch plan, the same e4m3 conversion of the same
+#: bf16 values, the same compression); the build checks the bytes on this rank's geometry and
+#: keeps the packed form where they differ. Read once, when the target is built.
+TEP_ATTN_INPLACE_ENV = "TRTLLM_QWEN4_EXP_TEP_ATTN_INPLACE"
+#: Rows up to which `TEP_ATTN_INPLACE_ENV` engages: one request of an MTP-3 verify step, or up to
+#: four decode rows (the 4-rank micro: 1.06 us a layer saved at 4 rows, nothing at 8).
+_TEP_ATTN_INPLACE_MAX_ROWS = 4  # capacity: fixed: a dispatch threshold
 
 
 def _tep_gqa_e4m3(core, device) -> bool:
@@ -1494,6 +1506,110 @@ def _tep_gqa_e4m3(core, device) -> bool:
         f"{TEP_FAST_DECODE_ENV} on, on SM103"
     )
     return False
+
+
+def _tep_attn_inplace_build(core, device) -> bool:
+    """`TEP_ATTN_INPLACE_ENV`, read once at build: True at a tep4 rank with its fast forms on SM103
+    whose self-check passes (`_tep_attn_inplace_check`); False elsewhere, silently, and where the
+    check fails or does not run (one warning; the rank keeps the packed prologue, which needs no
+    other rank to agree: the two forms write the same bytes)."""
+    if not (
+        _switch(TEP_ATTN_INPLACE_ENV, default=True)
+        and core.tep_fast
+        and torch.cuda.get_device_capability(device) == archs.SM_103
+    ):
+        return False
+    try:
+        bad = _tep_attn_inplace_check(core, device)
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        bad = [f"{type(e).__name__}: {e}"]
+    if bad:
+        logger.warning(
+            f"{TEP_ATTN_INPLACE_ENV}: the in-place prologue is not bitwise the packed one at "
+            f"tp rank {core.mapping.tp_rank} ({'; '.join(bad[:4])}); the rank keeps the packed prologue"
+        )
+        return False
+    logger.info(
+        f"tep4 in-place attention prologue: tp rank {core.mapping.tp_rank}, sparse trunk steps up to "
+        f"{_TEP_ATTN_INPLACE_MAX_ROWS} rows over an e4m3 pool"
+    )
+    return True
+
+
+def _tep_attn_inplace_check(core, device) -> list[str]:
+    """Run both prologues on one synthetic input of this rank's geometry (an e4m3 K/V pool as the
+    engine lays it out, a bf16 index plane): an MTP-3 verify request whose rows end a group with
+    its three earlier members in the launch, and four decode rows, one a group end. Returns what
+    differs: the K/V pool, the index plane, the position cache or the index query bytes, or the
+    in-place q / k heads against the packed copy (v is not written in place)."""
+    tpb, width, pages = 32, 4, 40
+    hq, hk, dim = core.heads_q, core.heads_kv, core.head_dim
+    g = torch.Generator(device=device).manual_seed(2311)
+    bad = []
+    for rows_per_request, pos in ((4, (60, 61, 62, 63)), (1, (95, 33, 127, 70))):
+        rows = len(pos)
+        request = torch.tensor(
+            [r // rows_per_request for r in range(rows)], dtype=torch.int32, device=device
+        )
+        logical = torch.tensor(pos, dtype=torch.int64, device=device)
+        requests = rows // rows_per_request
+        block_table = torch.randperm(pages, generator=g, device=device).to(torch.int32)
+        block_table = block_table[: requests * width].reshape(requests, width).contiguous()
+        ids = torch.stack([logical, logical + 3, logical + 7]).to(torch.int32).contiguous()
+        coords = ids.t()
+        angles = torch.rand(max(pos) + 16, core.rotary_dim // 2, generator=g, device=device) * 6.28
+        cos_sin = torch.cat([torch.cos(angles), torch.sin(angles)], dim=1).contiguous()
+        weights = [
+            (0.3 * torch.randn(n, generator=g, device=device)).to(torch.bfloat16)
+            for n in (dim, dim, core.index_head_dim, core.index_head_dim)
+        ]
+        proj = (2.0 * torch.randn(rows, core.attn_in_width, generator=g, device=device)).to(
+            torch.bfloat16
+        )
+        pool = torch.randn(pages, 2, hk, tpb, dim, generator=g, device=device).to(
+            torch.float8_e4m3fn
+        )
+        index_cache = torch.randn(pages, tpb, 1, core.index_head_dim, generator=g, device=device)
+        index_cache = index_cache.to(torch.bfloat16)
+        position_cache = torch.randint(
+            0, max(pos), (pages, tpb, 3), generator=g, device=device, dtype=torch.int32
+        )
+        runs = []
+        for inplace in (False, True):
+            pool_r, index_r, position_r = pool.clone(), index_cache.clone(), position_cache.clone()
+            proj_r = proj.clone()
+            index_q = torch.empty(
+                rows, core.index_heads, core.index_head_dim, dtype=torch.bfloat16, device=device
+            )
+            shape = (block_table, tpb, core.compress_ratio)
+            common = (ids, coords, cos_sin, *weights, pool_r[:, 0], pool_r[:, 1], index_r)
+            if inplace:
+                one_rank_attn_decode_prologue(
+                    proj_r, index_q, *common, position_r, request, logical, *shape,
+                    num_heads_q=hq, num_heads_k=hk, head_dim=dim, index_heads=core.index_heads,
+                    index_head_dim=core.index_head_dim, index_q_col=core.index_col,
+                    rotary_dim=core.rotary_dim, eps=core.eps, mrope_section1=core.mrope_section1,
+                    mrope_section2=core.mrope_section2, index_mrope_section1=0,
+                    index_mrope_section2=0, compress_mrope_section=_QSA_MROPE_SECTION,
+                    rows_per_request=rows_per_request,
+                )  # fmt: skip
+                heads = proj_r[:, : core.qkv_width]
+            else:
+                qkv = torch.empty(rows, core.qkv_width, dtype=torch.bfloat16, device=device)
+                qwen4_exp_attn_decode_prologue(
+                    proj_r, qkv, index_q, *common, position_r, request, logical, *shape,
+                    hq, hk, dim, core.index_heads, core.index_head_dim, core.index_col,
+                    core.rotary_dim, core.eps, core.mrope_section1, core.mrope_section2,
+                    rows_per_request=rows_per_request,
+                )  # fmt: skip
+                heads = qkv
+            runs.append((pool_r, index_r, position_r, index_q, heads[:, : (hq + hk) * dim]))
+        torch.cuda.synchronize(device)
+        names = ("K/V pool", "index plane", "position cache", "index query", "q/k heads")
+        for name, a, b in zip(names, *runs):
+            if not torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)):
+                bad.append(f"{name} at {rows} rows, {rows_per_request} a request")
+    return bad
 
 
 def _tep_index_prefetch(core) -> bool:
@@ -2014,6 +2130,7 @@ def _decode_forms(core) -> str:
             "finar": core._tep_finar is not None,
             "draft layer": core.tep_draft_layer,
             "proj split-k": getattr(core, "tep_proj", False),
+            "attn inplace": getattr(core, "tep_attn_inplace", False),
         }
     return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
 
@@ -2616,6 +2733,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.tep_index_prefetch = _tep_index_prefetch(self)
         # A tep4 rank's decode GQA on the e4m3 entry (`TEP_GQA_E4M3_ENV`).
         self.tep_gqa_e4m3 = _tep_gqa_e4m3(self, device)
+        # A tep4 rank's in-place attention prologue (`TEP_ATTN_INPLACE_ENV`), built below.
+        self.tep_attn_inplace = False
         self.decode_mm = (
             _one_rank_projection
             if one_rank
@@ -2642,6 +2761,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.hc_tiles = _hc_tiles_build(self, device)
             self._inproj_release = _inproj_release_build(self, device)
             self._out_proj = _out_proj_build(self, device)
+            self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
             _route_front_build(self, self._decode._layers, device)
@@ -8263,11 +8383,57 @@ class DecodeTarget:
         )
         pools = core._bound.pools
         # Over a bf16 or e4m3 pool the sparse path's norm + rope, packed copy, K/V append,
-        # index store and compression are one launch; it writes the packed buffer itself.
+        # index store and compression are one launch; it writes the packed buffer itself, or
+        # (`TEP_ATTN_INPLACE_ENV`, a few rows over e4m3) normalizes q and k in place instead.
         prologue = sparse and pools.kv[i].k_scale is None
+        inplace = (
+            prologue
+            and core.tep_attn_inplace
+            and num_tokens <= _TEP_ATTN_INPLACE_MAX_ROWS
+            and pools.kv[i].k.dtype == torch.float8_e4m3fn
+        )
         if stage:
             core.spec_rollback.stage_index(pools.position_cache)
-        if prologue:
+        if inplace:
+            kv = pools.kv[i]
+            one_rank_attn_decode_prologue(
+                proj,
+                _index_query(core, index_scratch),
+                pos3,
+                coords,
+                core._cos_sin,
+                L.q_norm,
+                L.k_norm,
+                L.idx_qn,
+                L.idx_kn,
+                kv.k,
+                kv.v,
+                pools.index_cache[i],
+                pools.position_cache,
+                req_idx,
+                logical,
+                block_table,
+                tokens_per_block,
+                core.compress_ratio,
+                num_heads_q=core.heads_q,
+                num_heads_k=core.heads_kv,
+                head_dim=core.head_dim,
+                index_heads=core.index_heads,
+                index_head_dim=core.index_head_dim,
+                index_q_col=core.index_col,
+                rotary_dim=core.rotary_dim,
+                eps=core.eps,
+                mrope_section1=core.mrope_section1,
+                mrope_section2=core.mrope_section2,
+                index_mrope_section1=0,
+                index_mrope_section2=0,
+                compress_mrope_section=_QSA_MROPE_SECTION,
+                rows_per_request=step["predicted_tokens_per_seq"],
+            )
+            _index_anchors_fp8(
+                core, pools.index_cache[i], block_table, req_idx, logical, tokens_per_block
+            )
+        elif prologue:
             kv = pools.kv[i]
             qwen4_exp_attn_decode_prologue(
                 proj,
@@ -8314,12 +8480,16 @@ class DecodeTarget:
             # the sparse GQA reads its query heads from it.
             qkv.copy_(qkv_view)
         if self._kv_probe is not None:
-            # Both branches leave the normalized, rotated K/V in the packed copy.
-            k_rows, v_rows = torch.split(
-                torch.reshape(qkv, [qkv.shape[0], -1, core.head_dim])[:, core.heads_q :],
-                core.heads_kv,
-                1,
-            )
+            # Both branches leave the normalized, rotated K/V in the packed copy (in place in
+            # the projection under `inplace`).
+            if inplace:
+                _, k_rows, v_rows = _attn_in_heads(core, proj)
+            else:
+                k_rows, v_rows = torch.split(
+                    torch.reshape(qkv, [qkv.shape[0], -1, core.head_dim])[:, core.heads_q :],
+                    core.heads_kv,
+                    1,
+                )
             if not self._kv_probe.observe(i, k_rows, v_rows):
                 self._kv_probe = None
 
@@ -8355,7 +8525,7 @@ class DecodeTarget:
                 topk_row_starts,
                 selected,
             )
-            q = _packed_q(core, qkv)
+            q = _attn_in_heads(core, proj)[0] if inplace else _packed_q(core, qkv)
             attn = _sparse_gqa_decode(
                 core, kv, q, block_table, selected, req_idx, tokens_per_block, gate, p
             )

@@ -304,6 +304,50 @@ def test_tep_gqa_e4m3_switch(monkeypatch, env, tep_fast, sm, expected, warns):
 
 
 @pytest.mark.parametrize(
+    "env, tep_fast, sm, check, expected, warns",
+    [
+        (None, True, (10, 3), [], True, False),  # on by default
+        ("0", True, (10, 3), [], False, False),
+        (None, False, (10, 3), [], False, False),  # another layout: silently off
+        (None, True, (10, 0), [], False, False),  # another arch
+        (None, True, (10, 3), ["K/V pool at 4 rows"], False, True),  # the check declines
+        (None, True, (10, 3), RuntimeError("no compile"), False, True),
+    ],
+)
+def test_tep_attn_inplace_switch(monkeypatch, env, tep_fast, sm, check, expected, warns):
+    """`TEP_ATTN_INPLACE_ENV`: a tep4 rank with its fast forms on SM103 takes the in-place
+    prologue once its self-check finds the bytes equal; a failing or raising check declines on
+    this rank alone, with one warning."""
+    warned = []
+    if env is None:
+        monkeypatch.delenv(M.TEP_ATTN_INPLACE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.TEP_ATTN_INPLACE_ENV, env)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: sm)
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    monkeypatch.setattr(M.logger, "info", lambda *a: None)
+
+    def run_check(core, device):
+        if isinstance(check, Exception):
+            raise check
+        return check
+
+    monkeypatch.setattr(M, "_tep_attn_inplace_check", run_check)
+    core = SimpleNamespace(tep_fast=tep_fast, mapping=SimpleNamespace(tp_rank=1))
+    assert M._tep_attn_inplace_build(core, SimpleNamespace(type="cuda")) is expected
+    assert bool(warned) is warns
+
+
+def test_tep_attn_inplace_reads_the_query_heads_off_the_projection():
+    """The in-place form feeds the sparse GQA the projection's q heads (no packed copy) and
+    engages only on a few rows over an e4m3 pool, behind the same rows table."""
+    source = inspect.getsource(M.DecodeTarget._attention_block)
+    assert "_TEP_ATTN_INPLACE_MAX_ROWS" in source and "torch.float8_e4m3fn" in source
+    assert "_attn_in_heads(core, proj)[0] if inplace else _packed_q(core, qkv)" in source
+    assert M._TEP_ATTN_INPLACE_MAX_ROWS == 4
+
+
+@pytest.mark.parametrize(
     "cluster, cta, expected",
     [(True, True, "cluster"), (False, True, "cta"), (False, False, "apart")],
 )
@@ -548,12 +592,18 @@ def _calls_by_function():
     return found
 
 
+#: Build self-checks that run the anchor writers on a scratch bf16 plane no step reads.
+_SCRATCH_ANCHOR_WRITERS = frozenset({"_tep_attn_inplace_check"})
+
+
 def test_index_key_fp8_every_anchor_writer_converts():
     """Under `INDEX_KEY_FP8_ENV` a bf16 anchor left in the plane is read as e4m3 bytes: every
     function that launches an anchor writer converts behind each launch (`_index_anchors_fp8`),
     so a writer added without its conversion fails here."""
     writers = 0
     for name, calls in _calls_by_function():
+        if name in _SCRATCH_ANCHOR_WRITERS:
+            continue
         launched = sum(c in _ANCHOR_WRITERS for c in calls)
         writers += launched
         assert calls.count("_index_anchors_fp8") == launched, (
