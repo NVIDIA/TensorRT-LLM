@@ -70,7 +70,8 @@ l0_gb300_multi_gpus:
   # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
   # runs them. multi_gpu/test_gqa_kv_replica.py runs in l0_gb300's pre_merge block instead;
   # --ignore arguments do not change the CSV key (test_unittests.py _parallel_config_key).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (120)
+  # The entry takes about 7,300 s, so its budget is 150 minutes.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (150)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
