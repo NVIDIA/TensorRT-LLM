@@ -77,12 +77,14 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm._torch.modules.qwen4_exp import ple as ple_module
     from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
     from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
 
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "0")
     if not is_flashinfer_gdn_prefill_supported_arch():
         pytest.skip("FlashInfer GDN prefill is unavailable on this device")
     # The single-rank test communicator does not provide clock calibration.
@@ -99,13 +101,28 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
     source_tokens = [3 + (17 * position % 990) for position in range(448)]
     suffix = [3 + ((29 * position + 71) % 990) for position in range(128)]
     sampling = SamplingParams(
-        max_tokens=4, temperature=0, ignore_eos=True, end_id=2, pad_id=0, detokenize=False
+        max_tokens=4,
+        temperature=0,
+        ignore_eos=True,
+        end_id=2,
+        pad_id=0,
+        detokenize=False,
+        return_generation_logits=True,
     )
     replays = []
     snapshot_histories = []
     snapshot_conv_windows = []
+    snapshot_pools = []
+    prefix_pools = {}
+    restored_pools = {}
+    suffix_outputs = {}
+    cold_suffix_outputs = {}
+    corrupted_suffix_outputs = {}
+    phase = {"name": None, "point": None}
     replay = BreakableCUDAGraphRunner.replay
     store = ple_module.store_ple_snapshots
+    ple_forward = ple_module.Qwen4ExpPLE.forward
+    pad_tokens = DecoderInputPreparer.pad_tokens
 
     def count_replay(runner, num_tokens):
         replays.append(num_tokens)
@@ -120,10 +137,70 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
             actual = conv_states.index_select(0, slots.long()).cpu()
             expected = torch.stack([conv_input[p - width : p].T for p in points]).cpu()
             snapshot_conv_windows.append((actual, expected))
+            snapshot_pools.append((actual.clone(), histories.index_select(0, slots.long()).cpu()))
         return result
+
+    def eager_reference_pad(preparer, *args, **kwargs):
+        if phase["name"] in ("prefix", "cold", "warm"):
+            kwargs["allow_prefill_cuda_graph"] = False
+        return pad_tokens(preparer, *args, **kwargs)
+
+    def observe_ple(layer, hidden, metadata, conv_state, ngram_context):
+        if phase["name"] not in ("prefix", "cold", "warm") or metadata.num_contexts != 1:
+            return ple_forward(layer, hidden, metadata, conv_state, ngram_context)
+        point = phase["point"]
+        assert metadata.state_indices.numel() == 1
+        slot = int(metadata.state_indices[0])
+        if phase["name"] == "prefix":
+            assert metadata.processed_tokens == point
+            output = ple_forward(layer, hidden, metadata, conv_state, ngram_context)
+            prefix_pools[point] = (
+                conv_state[slot].detach().clone(),
+                ngram_context[slot].detach().clone(),
+            )
+            return output
+        if phase["name"] == "cold":
+            assert metadata.processed_tokens == point + len(suffix)
+            output = ple_forward(layer, hidden, metadata, conv_state, ngram_context)
+            cold_suffix_outputs[point] = output[point:].detach().cpu().clone()
+            return output
+
+        restored_pools[point] = (
+            conv_state[slot].detach().cpu().clone(),
+            ngram_context[slot].detach().cpu().clone(),
+        )
+        reference_conv, reference_ngram = (
+            tensor.unsqueeze(0).clone() for tensor in prefix_pools[point]
+        )
+        reference_meta = ple_module.PLEMetadata.build(
+            metadata.padded_tokens[0, : metadata.processed_tokens],
+            metadata.lengths[:1],
+            torch.tensor([0], device=metadata.state_indices.device),
+            is_decode=False,
+            eos_token_id=metadata.ngram_eos_token_id,
+            physical_tokens=metadata.physical_tokens,
+            num_contexts=1,
+        )
+        if point == points[0]:
+            no_conv = torch.zeros_like(reference_conv)
+            correct_ngram = reference_ngram.clone()
+            no_conv_output = ple_forward(layer, hidden, reference_meta, no_conv, correct_ngram)
+            correct_conv = reference_conv.clone()
+            no_ngram = torch.full_like(reference_ngram, metadata.ngram_eos_token_id)
+            no_ngram_output = ple_forward(layer, hidden, reference_meta, correct_conv, no_ngram)
+            corrupted_suffix_outputs[point] = (
+                no_conv_output.detach().cpu().clone(),
+                no_ngram_output.detach().cpu().clone(),
+            )
+        reference = ple_forward(layer, hidden, reference_meta, reference_conv, reference_ngram)
+        output = ple_forward(layer, hidden, metadata, conv_state, ngram_context)
+        suffix_outputs[point] = (output.detach().cpu().clone(), reference.detach().cpu().clone())
+        return output
 
     monkeypatch.setattr(BreakableCUDAGraphRunner, "replay", count_replay)
     monkeypatch.setattr(ple_module, "store_ple_snapshots", record_snapshots)
+    monkeypatch.setattr(ple_module.Qwen4ExpPLE, "forward", observe_ple)
+    monkeypatch.setattr(DecoderInputPreparer, "pad_tokens", eager_reference_pad)
     with LLM(
         model=str(tmp_path),
         backend="pytorch",
@@ -149,6 +226,24 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
             mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
         ),
     ) as llm:
+        model = llm._executor.engine.model_engine.model
+        ple_layers = [
+            layer for layer in model.modules() if isinstance(layer, ple_module.Qwen4ExpPLE)
+        ]
+        assert len(ple_layers) == 1
+        layer = ple_layers[0]
+        generator = torch.Generator(device="cuda").manual_seed(20261125)
+        # Dummy weights are too small for the existing BF16 tolerance to detect lost history.
+        with torch.no_grad():
+            for weight, scale in (
+                (layer.ple_embedding.ngram_embedding.weight, 0.05),
+                (layer.key_proj.weight, 0.03),
+                (layer.value_proj.weight, 0.03),
+                (layer.conv1d.weight, 0.5),
+            ):
+                values = torch.randn(weight.shape, generator=generator, device=weight.device)
+                weight.copy_(values.to(weight.dtype) * scale)
+        torch.cuda.synchronize()
         manager = llm._executor.engine.kv_cache_manager
         capacity = manager.periodic_snapshot_capacity
         assert capacity >= len(points), "multi-snapshot staging was not initialized"
@@ -175,10 +270,43 @@ def test_periodic_ple_snapshots_bypass_prefill_graph(tmp_path, monkeypatch) -> N
         assert snapshot_histories == [[source_tokens[p - 2 : p] for p in points]]
         assert len(snapshot_conv_windows) == 1
         torch.testing.assert_close(*snapshot_conv_windows[0], rtol=0, atol=0)
-        for point in points[:3]:
+        for index, point in enumerate(points[:3]):
+            phase.update(name="prefix", point=point)
+            prefix = generate(source_tokens[:point], f"ple-reference-{point}")
+            assert prefix.cached_tokens == 0
+            assert prefix.ctx_num_chunks == 1
+            assert point in prefix_pools
+            phase.update(name="cold", point=point)
+            cold = generate(source_tokens[:point] + suffix, f"ple-cold-{point}")
+            assert cold.cached_tokens == 0
+            assert cold.ctx_num_chunks == 1
+            assert point in cold_suffix_outputs
+            phase.update(name="warm", point=point)
             output = generate(source_tokens[:point] + suffix, "ple-graph-snapshot")
+            phase.update(name=None, point=None)
             assert output.cached_tokens == point
             assert len(output.outputs[0].token_ids) == 4
+            saved_conv, saved_ngram = (pool[index] for pool in snapshot_pools[0])
+            restored_conv, restored_ngram = restored_pools[point]
+            torch.testing.assert_close(restored_conv, saved_conv, rtol=0, atol=0)
+            assert torch.equal(restored_ngram, saved_ngram)
+            reference_conv, reference_ngram = prefix_pools[point]
+            # Match the existing BF16 PLE suffix parity test's absolute tolerance.
+            torch.testing.assert_close(saved_conv, reference_conv.cpu(), rtol=0, atol=6e-2)
+            assert torch.equal(saved_ngram, reference_ngram.cpu())
+            actual_suffix, reference_suffix = suffix_outputs[point]
+            torch.testing.assert_close(actual_suffix, reference_suffix, rtol=0, atol=6e-2)
+            torch.testing.assert_close(actual_suffix, cold_suffix_outputs[point], rtol=0, atol=6e-2)
+            if point == points[0]:
+                for corrupted in corrupted_suffix_outputs[point]:
+                    assert (reference_suffix.float() - corrupted.float()).abs().max().item() > 6e-2
+            # Compare the first-step logits before the generated histories can diverge.
+            torch.testing.assert_close(
+                cold.outputs[0].generation_logits[0].float(),
+                output.outputs[0].generation_logits[0].float(),
+                rtol=1.6e-2,
+                atol=1e-5,
+            )
 
 
 def test_config_types_are_registered_with_transformers() -> None:
