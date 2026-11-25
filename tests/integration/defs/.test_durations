@@ -1036,7 +1036,6 @@
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL]": 1253.667,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL]": 719.3897,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL]": 772.272,
-   "perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256]": 449.1974340277778,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp16ep1_nospec_1k1k]": 1089.9984285714286,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp4ep4_dspark7_1k1k]": 1022.2181428571429,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_8k1k]": 998.160375,

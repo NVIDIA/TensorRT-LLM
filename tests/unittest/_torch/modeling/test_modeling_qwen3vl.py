@@ -974,7 +974,7 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
     tokenizer = MagicMock()
     tokenizer.return_value.input_ids = [torch.tensor(prompt_ids)]
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor") as auto_processor:
-        auto_processor.from_pretrained.return_value = MagicMock()
+        auto_processor.from_pretrained.return_value = MagicMock(mm_special_token_ids=None)
         processor = processor_cls("unused", config, tokenizer, trust_remote_code=True)
     # A Qwen3-VL embedding row also holds one deepstack level.
     width = hidden_size * (2 if model == "qwen3" else 1)

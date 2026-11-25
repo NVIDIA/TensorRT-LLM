@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -244,6 +245,7 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+// Whole-core budget shared by pod CPU limits and CPU-only pytest thread limits.
 TESTER_CPU_ONLY_CORES = "2"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 
@@ -380,7 +382,7 @@ def getShortenedJenkinsInstanceName() {
 }
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // The pipeline-level kill switch is propagated by L0_MergeRequest.groovy.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -388,12 +390,15 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
+    if (stageName.contains("-Ray-")) {
+        return false
+    }
     // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
-    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+    // The context channel is limited to a single node.
+    if (stageName.contains("_Nodes")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
@@ -633,40 +638,58 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
         // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
+            boolean interruptionWasActualInsideTimeout = false
             try {
-                CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                    def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                    def cbtsLocalDir = "${stageName}/cbts${postTag}"
-                    def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                    sh "mkdir -p ${cbtsLocalDir}"
-                    timeout(time: 5, unit: 'MINUTES') {
-                        // Pack remote coverage and discard empty archives.
-                        Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "\"cd '${remoteWs}' && sleep 2 && " +
-                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
-                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
-                            ),
-                            returnStatus: true,
-                            numRetries: 3,
-                        )
-                        def gotArchive = Utils.exec(
-                            pipeline,
-                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
-                            returnStatus: true,
-                            numRetries: 3,
-                        ) == 0
-                        if (gotArchive) {
-                            // Aggregation flattens directories; tag retry filenames too.
-                            def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
-                        } else {
-                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
+                timeout(time: 5, unit: 'MINUTES') {
+                    try {
+                        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                            def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                            def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                            def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                            sh "mkdir -p ${cbtsLocalDir}"
+                            def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
+                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
+                            def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
+                            def archiveStatus = Utils.exec(
+                                pipeline,
+                                script: Utils.sshUserCmd(remote, "\"echo ${archiveScriptB64} | base64 -d | bash\""),
+                                returnStatus: true,
+                                numRetries: 3,
+                            )
+                            if (archiveStatus != 0) {
+                                echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
+                            } else {
+                                def gotArchive = Utils.exec(
+                                    pipeline,
+                                    script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                    returnStatus: true,
+                                    numRetries: 3,
+                                ) == 0
+                                if (gotArchive) {
+                                    // Aggregation flattens directories; tag retry filenames too.
+                                    def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                                    sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                                } else {
+                                    echo "CBTS: coverage archive transfer failed for ${stageName}."
+                                }
+                            }
                         }
+                    } catch (FlowInterruptedException e) {
+                        interruptionWasActualInsideTimeout = e.isActualInterruption()
+                        throw e
                     }
                 }
+            } catch (FlowInterruptedException e) {
+                // Jenkins marks this timeout non-actual only after leaving its own block.
+                if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+                    e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
+                    echo "CBTS: coverage pull for ${stageName} timed out; continuing."
+                } else {
+                    throw e
+                }
+            } catch (InterruptedException e) {
+                throw e
             } catch (Exception e) {
                 echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
             }
@@ -835,6 +858,29 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
+// Only a successful collection that removed a nonempty original shard is a no-op.
+def isIntentionalCbtsEmpty(result) {
+    return result.intentional_empty == true && result.original_count instanceof Number &&
+        result.original_count > 0 && result.selected_count == 0 &&
+        result.removed_count == result.original_count
+}
+
+def reportCbtsEmptyShard(String stageName) {
+    echo "CBTS: ${stageName} has an empty intersection with its original shard; successful no-op"
+    // A distinct skipped control record survives empty-results.xml cleanup and
+    // lets normal junit reporting accept the no-op without allowing missing results.
+    // Match the ordinary runner's container UID when creating result files.
+    sh(label: "Record successful empty CBTS shard", script: """
+mkdir -p '${stageName}'
+cat > '${stageName}/results-cbts-empty.xml' <<'CBTS_XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites><testsuite name="${stageName}" tests="1" failures="0" errors="0" skipped="1">
+<testcase classname="cbts" name="original-shard-empty-intersection"><skipped message="No CBTS-selected cases belong to this original shard"/></testcase>
+</testsuite></testsuites>
+CBTS_XML
+""")
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -909,6 +955,14 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
     if (stageName.contains("-CPP-") && !isInfraDryRun()) {
         testListCmd += ["${llmSrc}/tests/integration/defs/cpp"]
     }
+    def cbtsResultPath = "${testDBList}.cbts-result.json"
+    def cbtsIntersection = fileExists("${testDBList}.cbts")
+    sh "rm -f ${cbtsResultPath}"
+    if (cbtsIntersection) {
+        testListCmd += ["--cbts-test-list=${testDBList}.cbts",
+                        "--cbts-shard-result=${cbtsResultPath}"]
+    }
+    def intentionalCbtsEmpty = false
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
     try {
@@ -943,6 +997,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
             return shouldInclude
         }
         echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+        if (cbtsIntersection && fileExists(cbtsResultPath)) {
+            intentionalCbtsEmpty = isIntentionalCbtsEmpty(readJSON(file: cbtsResultPath))
+        }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
@@ -1032,7 +1089,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
             regular: regularTestList,
             isolate: isolateTestList,
             regularCount: 0,
-            isolateCount: 0
+            isolateCount: 0,
+            cbtsEmptyShard: intentionalCbtsEmpty
         ]
     }
 }
@@ -2094,6 +2152,10 @@ def getPytestBaseCommandLine(
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
+    if (stageName.startsWith("CPU-")) {
+        extraInternalEnv += " OMP_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+        extraInternalEnv += " MKL_NUM_THREADS=${TESTER_CPU_ONLY_CORES}"
+    }
     // CPP test execution is timing out easily, so we always override its internal timeout to the same value as pytest
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
@@ -2157,7 +2219,7 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         // Keep an existing report path out of pytest's initial collection-path discovery.
@@ -2714,6 +2776,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
 
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    Utils.copyFileToRemoteHost(pipeline, remote,
+                        "${testListPathLocal}.cbts", "${testListPathNode}.cbts.tmp")
+                    Utils.exec(pipeline, script: Utils.sshUserCmd(remote,
+                        "\"mv -f ${testListPathNode}.cbts.tmp ${testListPathNode}.cbts\""))
+                }
+
                 if (infraDryRun) {
                     sh "mkdir -p ${llmPath} && : > ${waivesListPathLocal}"
                 } else {
@@ -2846,6 +2915,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    extraArgs += ["--cbts-test-list=${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -3169,6 +3241,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     coverageConfigFile
                 ]
+                if (fileExists("${testListPathLocal}.cbts")) {
+                    filesToKeepWhenRetry += ["${testListPathNode}.cbts"]
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     filesToKeepWhenRetry += [
                         s3SecretKeyPathNode
@@ -3777,89 +3852,74 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 2.5: rename narrowed stages (reuse-safety) and resize their splits to k.
+// Explicit stage selection retains the original pytest-split assignment.
+def preserveCbtsShardScope() {
+    return testFilter[(TEST_STAGE_LIST)] != null || testFilter[(EXTRA_STAGE_LIST)] != null
+}
+
+// Keep config tuples shared with the stage closures so splits can be resized
+// after command-stage selection, without moving work outside the selected scope.
+@Field
+def cbtsStageConfigs = [:]
+
+// Rename narrowed stages for reuse safety; defer split sizing until scope is known.
 def cbtsResizeSplits(configs) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
         return configs
     }
-    def kByStage = cbts.affected_stage_split_counts
-    if (!kByStage) {
-        return configs
-    }
-    def resized = [:]
-    configs.each { key, values ->
-        def k = kByStage[key]
-        if (k == null) {
-            resized[key] = values
-            return
+    def kByStage = cbts.affected_stage_split_counts ?: [:]
+    return configs.collectEntries { key, values ->
+        if (!kByStage.containsKey(key)) {
+            return [(key): values]
         }
-        int kk = Math.max(1, k as int)
-        if ((values[2] as int) > kk) {
-            echo "CBTS [${cbts.scope}]: ${key} narrowed -> ${kk} shard(s); dropping group ${values[2]}"
-            return
-        }
-        def v = values.collect()
-        v[3] = kk
-        resized[key + CBTS_STAGE_SUFFIX] = v
+        def stageName = key + CBTS_STAGE_SUFFIX
+        def config = values.collect()
+        cbtsStageConfigs[stageName] = config
+        return [(stageName): config]
     }
-    return resized
 }
 
-// CBTS Layer 2: replace the normal stage set with the selector's affected
-// stages while retaining the baseline sanity and multi-GPU gates.
-def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+// CBTS can only narrow the stages selected by the command. A null decision
+// leaves that same scope intact, including on selector failure.
+def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null) {
         return parallelJobsFiltered
     }
 
-    // cbtsResizeSplits renames only narrowed stages (those in
-    // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
-    // stages keep their original name, so match each per its actual key.
     def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
     def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
     def affectedSet = (cbts.affected_stages ?: []).collect {
         (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
     } as Set
-    def needsSanity = cbts.sanity_required
-    def needsPerfSanity = cbts.perfsanity_required
-    def filtered = parallelJobs.findAll { key, _ ->
-        if (key.contains("-OnDemand-")) {
-            return false
-        }
-        if (key =~ /Post-Merge/) return affectedSet.contains(key)
-        return affectedSet.contains(key) ||
-               (needsSanity && key =~ /PackageSanityCheck/) ||
-               (needsPerfSanity && key =~ /PerfSanity/)
-    }
-    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
-    if (cbts.scope == "coverage") {
-        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
-        filtered += parallelJobsFiltered.findAll { key, _ ->
-            autoTriggerTags.any { key.contains(it) }
-        }
-    }
-    if (affectedSet.isEmpty()) {
-        if (filtered.isEmpty()) {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
-        } else {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                 "${filtered.size()} force-kept stage(s) only"
-        }
-    } else if (filtered) {
-        echo "CBTS [${cbts.scope}]: limiting to ${filtered.size()} stages " +
-             "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
-    } else {
-        echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+    def autoTriggerTags = cbts.scope == "coverage" ? (testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []) : []
+    def filtered = parallelJobsFiltered.findAll { key, _ ->
+        return autoTriggerTags.any { key.contains(it) } || affectedSet.contains(key) ||
+               (cbts.sanity_required && key =~ /PackageSanityCheck/) ||
+               (cbts.perfsanity_required && key =~ /PerfSanity/ && !key.contains("Post-Merge")) ||
+               (cbts.enable_multi_gpu && key =~ /\d+_GPUs/)
     }
 
-    // The coverage tier omits multi-GPU; re-add it under the baseline gate.
-    if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
-        filtered += multiGpuJobs
-        echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
-             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+    // Full-scope runs can rebalance. Explicit stage selections keep their
+    // original group IDs and split counts, then intersect after pytest-split.
+    def narrowedJobs = filtered.findAll { key, _ ->
+        !preserveCbtsShardScope() && cbtsStageConfigs.containsKey(key)
     }
+    narrowedJobs.keySet().groupBy { it.replaceFirst(/-\d+-cbts$/, "") }.each { _, names ->
+        def ordered = names.sort { cbtsStageConfigs[it][2] as int }
+        def original = ordered.first() - CBTS_STAGE_SUFFIX
+        int splits = Math.min(ordered.size(), Math.max(1, cbts.affected_stage_split_counts[original] as int))
+        ordered.eachWithIndex { name, index ->
+            if (index >= splits) {
+                filtered.remove(name)
+            } else {
+                cbtsStageConfigs[name][2] = index + 1
+                cbtsStageConfigs[name][3] = splits
+            }
+        }
+    }
+    echo "CBTS [${cbts.scope}]: limiting command-selected scope to ${filtered.size()} stages"
     return filtered
 }
 
@@ -4033,7 +4093,10 @@ def stageMatchesPattern(String key, String pattern) {
 
 // Check if a stage key matches any pattern in the list.
 def stageMatchesAnyPattern(String key, List patterns) {
-    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
+    def originalKey = key.endsWith(CBTS_STAGE_SUFFIX) ? key - CBTS_STAGE_SUFFIX : key
+    return patterns.any { pattern ->
+        stageMatchesPattern(key, pattern) || stageMatchesPattern(originalKey, pattern)
+    }
 }
 
 // Return the OpenSearch regexp for sibling shards and their CBTS variants.
@@ -5424,6 +5487,30 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
+// Inspect the packaged parser without importing its GPU/runtime dependencies.
+def packagedPytestSupportsCbts(String llmSrc) {
+    return sh(returnStatus: true, script: """
+        python3 - '${llmSrc}/tests/integration/defs/conftest.py' <<'CBTS_SUPPORT_PY'
+import ast
+from pathlib import Path
+import sys
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text())
+except (OSError, SyntaxError):
+    sys.exit(1)
+options = {
+    arg.value
+    for node in ast.walk(tree)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    and node.func.attr == 'addoption'
+    for arg in node.args
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+}
+sys.exit(0 if {'--cbts-test-list', '--cbts-shard-result'} <= options else 1)
+CBTS_SUPPORT_PY
+    """) == 0
+}
+
 def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null, Map prefetched=null) {
     def makoOpts = preDefinedMakoOpts
 
@@ -5526,6 +5613,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
             echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
         }
     }
+    def sourceTestDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (preserveCbtsShardScope() && testDBPath != sourceTestDBPath &&
+            !packagedPytestSupportsCbts(llmSrc)) {
+        echo "CBTS: packaged pytest lacks shard-intersection options; " +
+             "using the original test list and shard assignment for ${stageName}"
+        testDBPath = sourceTestDBPath
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",
@@ -5540,7 +5634,27 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         "'${makoOpts}'"
     ].join(" ")
 
+    sh "rm -f ${testList}.cbts"
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
+    if (preserveCbtsShardScope() && testDBPath != "${llmSrc}/tests/integration/test_lists/test-db") {
+        // The source tree can belong to the test container's UID. Jenkins
+        // writeFile runs as the agent UID, so create the companion in the same
+        // container as trt-test-db instead of changing workspace permissions.
+        sh(label: "Write CBTS companion in the test container", script: """
+            python3 - '${testList}' '${testList}.cbts' <<'CBTS_PY'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text().splitlines()
+cleaned = [line.replace('ISOLATION,', '').replace(',ISOLATION', '').replace(' ISOLATION', '').strip() for line in lines]
+Path(sys.argv[2]).write_text('\\n'.join(cleaned))
+CBTS_PY
+        """)
+        def sourceQuery = testDBQueryCmd.replace(
+            "-d ${testDBPath}", "-d ${llmSrc}/tests/integration/test_lists/test-db")
+        sh(label: "Render original test list for shard assignment", script: sourceQuery)
+        echo "CBTS: ${stageName} preserves its original shard; filtering cases after pytest-split"
+    }
+
     // Count non-empty lines, not newlines: trt-test-db writes the test names
     // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
     // for a single-test render, which would trip the empty-list guard below
@@ -5550,7 +5664,8 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // missing file, unreadable, etc.) still aborts the step instead of being
     // silently masked.
     def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
-    def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
+    def testDBLabel = fileExists("${testList}.cbts") ? "source (CBTS after sharding)" :
+        (testDBPath != sourceTestDBPath ? "CBTS-narrowed [${cbts.scope}]" : "source")
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
     if (testCount == "0") {
@@ -6583,6 +6698,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Process shard test list and create separate files for regular and isolate tests
         def collectionLogDir = "${WORKSPACE}/${stageName}/collection${postTag}"
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, clusterDurationsPath)
+        if (preprocessedLists.cbtsEmptyShard) {
+            reportCbtsEmptyShard(stageName)
+            return
+        }
         def cppTestTarArtifactPath = cppTestArtifactPath(config, stageName)
         if (cppTestTarArtifactPath) {
             def cppTestArchive = "${llmPath}/cpp-tests.tar.gz"
@@ -7683,6 +7802,7 @@ def infraDeferPredicate(def pipeline, Map stageScopes) {
 
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
+    cbtsStageConfigs.clear()
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
@@ -7760,6 +7880,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
+    fullSet = x86TestConfigs.keySet() as Set
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
@@ -7771,7 +7892,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
-    fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
         "DGX_H100-CPP-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1],
@@ -7845,8 +7965,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // Single-GPU Rubin PerfSanity post-merge test: a Rubin copy of the B200 Qwen3.8-Flash-Next case, on the same builds
         "GR100-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:gr100-x1", "l0_gr100_perf_sanity", 1, 1],
     ]
-    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
+    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
@@ -7884,8 +8004,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
-    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
+    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
 
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
@@ -7939,8 +8059,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         4,
         1, true
     )
-    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
+    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
 
     multiNodesSBSAConfigs = [
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
@@ -8046,8 +8166,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
-    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
+    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -8546,7 +8666,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }
 
     parallelJobsFiltered = filterCbtsStageJobs(
-        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
+        parallelJobsFiltered, testFilter)
 
     // Explicit selectors override both the post-merge perf-sanity skip and the -k_of_N build cadence.
     def postMergeBuildNumber = globalVars[POST_MERGE_BUILD_NUMBER]

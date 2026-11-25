@@ -1359,6 +1359,14 @@ class AttentionBackend(Generic[TMetadata]):
         """
         raise NotImplementedError
 
+    def supports_variable_window(self, metadata: AttentionMetadata) -> bool:
+        """Whether this backend can consume per-context-query inclusive KV bounds.
+
+        This request-time probe must reflect mutable quantization and metadata.
+        Backends with a separate native kernel probe may retain that richer probe.
+        """
+        return False
+
     @classmethod
     def support_fused_rope(cls) -> bool:
         return False

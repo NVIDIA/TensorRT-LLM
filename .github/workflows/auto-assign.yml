@@ -1,8 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 name: auto-assign
 on:
   issues:
     types:
       - labeled
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   assign_issue:
@@ -12,32 +31,36 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Get assignee
         uses: actions/github-script@v8
         id: get-assignee
         with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
             const fs = require('fs');
-
-            // Read configuration file
             const config = JSON.parse(fs.readFileSync('.github/workflows/module-owners.json', 'utf8'));
-
-            // Find matching label in config
-            for (const [configLabel, users] of Object.entries(config)) {
-              if (configLabel == "${{ github.event.label.name}}") {
-                // Select Randomly
-                const index = Math.floor(Math.random() * users.length)
-                const assignee = users[index % users.length];
-                return assignee
+            const labelName = context.payload.label?.name;
+            if (labelName && Object.hasOwn(config, labelName)) {
+              const users = config[labelName];
+              if (Array.isArray(users) && users.length > 0) {
+                const index = Math.floor(Math.random() * users.length);
+                return users[index];
               }
             }
-            // Returning empty string in case a valid assignee is not found.
-            return ""
+            return '';
           result-encoding: string
 
       - name: Assign
-        run: gh issue edit ${{ github.event.issue.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ASSIGNEE: ${{ steps.get-assignee.outputs.result }}
+        run: |
+          set -euo pipefail
+          args=(--add-label "triaged" --add-label "investigating")
+          if [ -n "${ASSIGNEE}" ]; then
+            args+=(--add-assignee "${ASSIGNEE}")
+          fi
+          gh issue edit "${ISSUE_NUMBER}" "${args[@]}"
