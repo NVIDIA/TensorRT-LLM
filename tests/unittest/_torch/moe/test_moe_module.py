@@ -2012,6 +2012,8 @@ class _PremergeCase(NamedTuple):
     model: str
     routing: str = "Renormalize"
     swiglu_alpha: float = 1
+    swiglu_beta: float = 0
+    swiglu_limit: float = float("inf")
 
 
 class _PremergeProblem(NamedTuple):
@@ -2067,7 +2069,17 @@ _MULTI_GPU_PREMERGE_CASES = {
         _PremergeCase("comm", "DEP", _ONE_SIDED, "CUTLASS", "NVFP4", _E60),
         _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "NVFP4", _E8),
         _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "W4A8_MXFP4_MXFP8", _E8),
-        _PremergeCase("comm", "DEP", _ONE_SIDED, "TRTLLM", "W4A16_MXFP4", _E60, swiglu_alpha=1.702),
+        _PremergeCase(
+            "comm",
+            "DEP",
+            _ONE_SIDED,
+            "TRTLLM",
+            "W4A16_MXFP4",
+            _E60,
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+            swiglu_limit=7.0,
+        ),
         _PremergeCase("comm", "DEP", _TWO_SIDED, "CUTLASS", "NVFP4", _E60),
         _PremergeCase("comm", "DEP", _TWO_SIDED, "TRTLLM", "W4A8_MXFP4_MXFP8", _E8),
         _PremergeCase("comm", "DEP", _DEEPEP, "CUTLASS", "NVFP4", _E60),
@@ -2141,6 +2153,8 @@ def _matches_premerge_case(case: _PremergeCase, values: Sequence[object]) -> boo
         and str(params["model_config"]) == case.model
         and params["routing_method_cls"] is _ROUTING_METHODS[case.routing]
         and params["swiglu_alpha"] == case.swiglu_alpha
+        and params["swiglu_beta"] == case.swiglu_beta
+        and params["swiglu_limit"] == case.swiglu_limit
     )
 
 
