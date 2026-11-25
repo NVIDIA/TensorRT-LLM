@@ -519,6 +519,15 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             phase = resolved_extra_key("vc_smooth_phase")
             if phase is not None:
                 self._vc_graph_shapes.add(shape)
+                if shape == self._vc_shape:
+                    # The runner's preprocessor groups this shape from now on, and eager calls
+                    # at it use that one: drop the eager copy.
+                    from ....attention.backends.prims_ts.vc_attention.quantization import (
+                        VCAttentionPreprocessor,
+                    )
+
+                    self._vc_eager_preprocessor = VCAttentionPreprocessor()
+                    self._vc_shape = None
                 mode = VC_PHASE_MODES[phase]
                 # The runner warms a new graph up with eager calls before the
                 # capture. A warm refresh in those calls would advance the
