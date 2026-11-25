@@ -25,7 +25,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from safetensors import safe_open
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
-from utils.llm_data import get_checkpoint
+from utils.llm_data import get_checkpoint, llm_models_root
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
@@ -167,6 +167,9 @@ def dit_inputs():
 
 @pytest.fixture(scope="module")
 def checkpoint():
+    root = llm_models_root()
+    if root is None or not (root / CHECKPOINT).is_dir():
+        pytest.skip(f"{CHECKPOINT} is not staged under LLM_MODELS_ROOT")
     return get_checkpoint(CHECKPOINT)
 
 
