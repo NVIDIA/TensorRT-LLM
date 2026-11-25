@@ -136,6 +136,8 @@ The two levels follow from one rule: **a ModelCore owns the model's weights in o
 
 ### Core abstractions: a thin contract
 
+The abstractions in Modeling V2 have to serve two goals that pull in opposite directions. First, we do not want to limit how modeling code is written. The optimizations that pay off most, such as fusing across layers or running speculative decoding inside the forward pass, are exactly the ones a rigid structure would rule out. Second, the code still needs clear boundaries between its parts. Without them, a growing body of model-specific code, much of it written quickly by agents, would soon become hard to read, review and maintain. Our answer is a thin contract layer. It defines what each part is responsible for and how the parts connect, and says nothing about how each part is implemented inside.
+
 Modeling V2 defines only a few abstractions, nested as family → ModelCore → Target:
 
 - **Family**: one model architecture, usually one Hugging Face `architectures` value. It owns the `route` function and the code its ModelCores share.
