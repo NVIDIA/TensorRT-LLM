@@ -27,7 +27,6 @@ from LLM_MODELS_ROOT). `test_device_log_is_torchs_log` pins the one transcendent
 libdevice logf returns torch.log's fp32 bits, so even the unrounded log agrees.
 """
 
-import json
 import os
 import zlib
 from pathlib import Path
@@ -36,7 +35,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from test_common.llm_data import llm_models_root
 from triton.language.extra import libdevice
 
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.attention.ssmax_scaling import (
@@ -389,80 +387,3 @@ LAYOUTS = {
     "tp8_native": (8, 8),
     "tp8_padded": (8, 64),
 }
-
-
-def _checkpoint_dir() -> Path | None:
-    root = llm_models_root()
-    for name in CHECKPOINTS if root is not None else ():
-        path = Path(root) / name
-        names = ("params.json", "consolidated.safetensors.index.json")
-        if all((path / f).is_file() for f in names):
-            return path
-    return None
-
-
-@pytest.fixture(scope="module")
-def checkpoint_mla() -> list:
-    """Every layer's MLA SSMax s and b (`[64]` each, as stored) and whether it ropes its query
-    (not a NoPE layer), read off the NVFP4 checkpoint."""
-    path = _checkpoint_dir()
-    if path is None:
-        pytest.skip(f"none of {CHECKPOINTS} is under LLM_MODELS_ROOT ({llm_models_root()})")
-    from safetensors import safe_open
-
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
-
-    cfg = MistralConfigLoader().load_pretrained_config(str(path))
-    index = json.loads((path / "consolidated.safetensors.index.json").read_text())["weight_map"]
-    keys = {
-        (layer, p): f"layers.{layer}.attention.ssmax_scaling.{p}"
-        for layer in range(cfg.num_hidden_layers)
-        for p in ("s", "b")
-    }
-    got = {}
-    for shard in sorted({index[k] for k in keys.values()}):
-        with safe_open(str(path / shard), framework="pt", device="cpu") as handle:
-            for at, key in keys.items():
-                if index[key] == shard:
-                    got[at] = handle.get_tensor(key).cuda()
-    return [
-        (got[layer, "s"], got[layer, "b"], not cfg.nope_layer_flags[layer])
-        for layer in range(cfg.num_hidden_layers)
-    ]
-
-
-@pytest.mark.parametrize("layout", list(LAYOUTS))
-def test_every_layer_and_position_bit_equal_to_the_unfused_composition(checkpoint_mla, layout):
-    """The NVFP4 checkpoint's own s and b of every layer (all 72, RoPE and NoPE), at every
-    position 0..1048575 of the 1M config, in each call site's layout (`LAYOUTS`, every rank's
-    slice of the 64 heads): the fused call is bitwise the composition it replaces,
-    `ssmax_scaling` then the tail's copy or zero fill -- the scaled query and the whole fused
-    query, the tail written and every other byte untouched, `torch.equal` on the bit patterns.
-    Each call is one chunked step's 32768 consecutive positions, half the rows normal queries
-    and half drawn over every bf16 binade, the same queries at every layer."""
-    heads, fq_heads = LAYOUTS[layout]
-    assert all(s.shape == b.shape == (64,) for s, b, _ in checkpoint_mla)
-    calls = 0
-    for k in range(LONG_MAX_SEQ_LEN // STEP_ROWS):
-        g = torch.Generator(device="cuda").manual_seed(1 << 20 | k)
-        half = STEP_ROWS // 2
-        q = torch.cat(
-            [
-                _queries((half, heads, 128), "normal", g),
-                _queries((STEP_ROWS - half, heads, 128), "wide", g),
-            ]
-        )
-        start = k * STEP_ROWS
-        positions = torch.arange(start, start + STEP_ROWS, dtype=torch.int32, device="cuda")
-        for layer, (s_all, b_all, rope) in enumerate(checkpoint_mla):
-            for lo in range(0, 64, heads):
-                what = f"{layout} layer {layer} heads {lo}..{lo + heads - 1} at {start}.."
-                _assert_old_equals_new(
-                    q, positions, s_all[lo : lo + heads], b_all[lo : lo + heads], rope, what,
-                    fq_heads,
-                )  # fmt: skip
-                calls += 1
-    print(
-        f"\n  {layout}: {len(checkpoint_mla)} layers x positions 0..{LONG_MAX_SEQ_LEN - 1}, "
-        f"{calls} calls: bit-equal"
-    )

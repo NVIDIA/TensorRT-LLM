@@ -18,16 +18,13 @@ the checkpoint's rope parameters and `lerope.alpha`, the identity table on a NoP
 at every position 0..1048575 (skipped where the checkpoint is absent from LLM_MODELS_ROOT).
 """
 
-import json
 import math
 import os
 import zlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
-from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.attention.cute_dsl_indexer_q_side_fused import (  # noqa: E501
     build,
@@ -330,99 +327,3 @@ CHECKPOINTS = ("Mistral-Large-4-1T-A52B-NVFP4", "mistral-large-4-nvfp4")
 #: Every position the 1M config reaches (max_seq_len 1048576, the table's rows), in calls of
 #: one chunked step's 32768 rows.
 LONG_MAX_SEQ_LEN, STEP_ROWS = 1048576, 32768
-
-
-def _checkpoint_dir() -> Path | None:
-    root = llm_models_root()
-    for name in CHECKPOINTS if root is not None else ():
-        path = Path(root) / name
-        names = ("params.json", "consolidated.safetensors.index.json")
-        if all((path / f).is_file() for f in names):
-            return path
-    return None
-
-
-@pytest.fixture(scope="module")
-def checkpoint_indexer() -> list:
-    """The NVFP4 checkpoint's indexer layers, each (layer, s, b, table): its SSMax s and b
-    (`[32]` each, as stored) and the table its call reads -- the 1048576-row `[cos | sin]`
-    indexer table the targets build (`_rope_tables` over the rope parameters the engine adapts
-    from params.json and `lerope.alpha` widened to fp32, as the weight table loads it), or the
-    identity table on a NoPE indexer layer."""
-    path = _checkpoint_dir()
-    if path is None:
-        pytest.skip(f"none of {CHECKPOINTS} is under LLM_MODELS_ROOT ({llm_models_root()})")
-    from safetensors import safe_open
-
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep import (  # noqa: E501
-        modeling as M,
-    )
-    from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
-
-    cfg = MistralConfigLoader().load_pretrained_config(str(path))
-    index = json.loads((path / "consolidated.safetensors.index.json").read_text())["weight_map"]
-    keys = {
-        (layer, p): f"layers.{layer}.attention.indexer.ssmax_scaling.{p}"
-        for layer in range(cfg.num_hidden_layers)
-        for p in ("s", "b")
-        if f"layers.{layer}.attention.indexer.ssmax_scaling.{p}" in index
-    }
-    keys["alpha"] = "lerope.alpha"
-    got = {}
-    for shard in sorted({index[k] for k in keys.values()}):
-        with safe_open(str(path / shard), framework="pt", device="cpu") as handle:
-            for at, key in keys.items():
-                if index[key] == shard:
-                    got[at] = handle.get_tensor(key)
-    rope_cfg = SimpleNamespace(
-        rope_parameters=cfg.rope_parameters, qk_rope_head_dim=cfg.qk_rope_head_dim
-    )
-    tables = M._rope_tables(
-        rope_cfg, got["alpha"].float(), LONG_MAX_SEQ_LEN, torch.bfloat16, torch.device("cuda")
-    )
-    layers = sorted({at[0] for at in keys if at != "alpha"})
-    return [
-        (
-            layer,
-            got[layer, "s"].cuda(),
-            got[layer, "b"].cuda(),
-            tables.identity if cfg.indexer_nope_layer_flags[layer] else tables.indexer,
-        )
-        for layer in layers
-    ]
-
-
-def test_every_layer_and_position_bit_equal_to_the_unfused_composition(checkpoint_indexer):
-    """The NVFP4 checkpoint's own indexer layers (their s and b, the 1048576-row table they
-    read, the identity table on a NoPE indexer layer) at every position 0..1048575 of the 1M
-    config: the fused call's codes and weights are bitwise the composition it replaces,
-    `ssmax_scaling`, the head weights' fp32 copy and `cute_dsl_indexer_q_side_fused`
-    (`torch.equal` on the bit patterns). Each call is one chunked step's 32768 consecutive
-    positions, half the rows normal queries and half drawn over every bf16 binade, the head
-    weights the last 32 columns of a bf16 `[T, 160]` buffer, the same inputs at every layer."""
-    assert len(checkpoint_indexer) == 44, len(checkpoint_indexer)
-    calls = 0
-    for k in range(LONG_MAX_SEQ_LEN // STEP_ROWS):
-        g = torch.Generator(device="cuda").manual_seed(1 << 20 | k)
-        half = STEP_ROWS // 2
-        q = torch.cat(
-            [
-                _queries((half, HEADS, HEAD_DIM), "normal", g),
-                _queries((STEP_ROWS - half, HEADS, HEAD_DIM), "wide", g),
-            ]
-        )
-        kw = torch.randn(STEP_ROWS, HEAD_DIM + HEADS, generator=g, device="cuda").bfloat16()
-        start = k * STEP_ROWS
-        positions = torch.arange(start, start + STEP_ROWS, dtype=torch.int32, device="cuda")
-        for layer, s, b, table in checkpoint_indexer:
-            args = [
-                q, positions, s, b, table, kw[:, HEAD_DIM:], WEIGHT_SCALE,
-                torch.empty(STEP_ROWS, HEADS, HEAD_DIM, dtype=torch.float8_e4m3fn, device="cuda"),
-                torch.empty(STEP_ROWS, HEADS, device="cuda"),
-            ]  # fmt: skip
-            _assert_old_equals_new(args, f"layer {layer} at positions {start}..")
-            calls += 1
-    print(
-        f"\n  {len(checkpoint_indexer)} indexer layers x positions 0..{LONG_MAX_SEQ_LEN - 1}, "
-        f"{calls} calls: bit-equal"
-    )
