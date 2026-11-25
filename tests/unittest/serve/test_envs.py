@@ -412,6 +412,22 @@ def test_introspection_does_not_read_environment(monkeypatch: pytest.MonkeyPatch
 
 KINDS_IN_ORDER = ("deploy", "internal", "external")
 SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+GATED_ALSO_READ_BY_PREFIXES = ("tensorrt_llm/serve/", "tensorrt_llm/commands/")
+
+
+def _check_also_read_by(name: str, reader: str, repo_root: Path = REPO_ROOT) -> str | None:
+    rel = Path(reader)
+    if not reader.strip() or rel.is_absolute() or ".." in rel.parts:
+        return f"{name}: also_read_by entry {reader!r} must be a non-empty repo-relative path"
+    normalized = rel.as_posix()
+    if not normalized.startswith(GATED_ALSO_READ_BY_PREFIXES):
+        return None
+    path = repo_root / rel
+    if not path.is_file():
+        return f"{name}: also_read_by names {reader}, which does not exist"
+    if name not in path.read_text(errors="replace"):
+        return f"{name}: also_read_by names {reader}, which does not mention the variable"
+    return None
 
 
 def test_declarations_are_complete() -> None:
@@ -427,13 +443,9 @@ def test_declarations_are_complete() -> None:
         if not var.description.strip():
             problems.append(f"{name}: description is empty")
         for reader in var.also_read_by:
-            path = REPO_ROOT / reader
-            if not path.is_file():
-                problems.append(f"{name}: also_read_by names {reader}, which does not exist")
-            elif name not in path.read_text(errors="replace"):
-                problems.append(
-                    f"{name}: also_read_by names {reader}, which does not mention the variable"
-                )
+            problem = _check_also_read_by(name, reader)
+            if problem is not None:
+                problems.append(problem)
         if not kinds_seen or kinds_seen[-1] != var.kind:
             kinds_seen.append(var.kind)
     if kinds_seen != list(KINDS_IN_ORDER):
@@ -442,6 +454,41 @@ def test_declarations_are_complete() -> None:
             "internal, external, in that order"
         )
     assert not problems, "\n".join(problems)
+
+
+def test_also_read_by_gates_only_serve_and_commands_paths(tmp_path: Path) -> None:
+    serve_file = tmp_path / "tensorrt_llm/serve/sample.py"
+    serve_file.parent.mkdir(parents=True)
+    serve_file.write_text("# does not mention var\n")
+    commands_file = tmp_path / "tensorrt_llm/commands/sample.py"
+    commands_file.parent.mkdir(parents=True)
+    commands_file.write_text("# does not mention var\n")
+
+    assert (
+        _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/grpc/openengine/missing.py", tmp_path)
+        is None
+    )
+    assert (
+        _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/_torch/visual_gen/missing.py", tmp_path)
+        is None
+    )
+    assert _check_also_read_by("TRTLLM_FOO", "/abs/path.py", tmp_path) is not None
+    assert _check_also_read_by("TRTLLM_FOO", "../escape.py", tmp_path) is not None
+    assert _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/serve/missing.py", tmp_path) is not None
+    assert _check_also_read_by("TRTLLM_FOO", "tensorrt_llm//serve/missing.py", tmp_path) is not None
+    assert (
+        _check_also_read_by("TRTLLM_FOO", "./tensorrt_llm/commands/missing.py", tmp_path)
+        is not None
+    )
+    assert _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/serve/sample.py", tmp_path) is not None
+    assert (
+        _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/commands/sample.py", tmp_path) is not None
+    )
+
+    serve_file.write_text('os.getenv("TRTLLM_FOO")\n')
+    commands_file.write_text('os.getenv("TRTLLM_FOO")\n')
+    assert _check_also_read_by("TRTLLM_FOO", "tensorrt_llm/serve/sample.py", tmp_path) is None
+    assert _check_also_read_by("TRTLLM_FOO", "./tensorrt_llm/commands/sample.py", tmp_path) is None
 
 
 def test_secrets_are_marked() -> None:
