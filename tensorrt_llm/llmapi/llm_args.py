@@ -2558,8 +2558,10 @@ class MoeConfig(StrictBaseModel):
     use_low_precision_moe_combine: bool = Field(
         default=False,
         description=
-        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
-    )
+        "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance. "
+        "On SM107 the MEGAMOE_CUTEDSL backend then combines in MXFP8 for capacity rungs of at least 4096 tokens per rank "
+        "and in BF16 below; on other architectures it keeps BF16. The MEGAMOE_COMBINE_FORMAT environment variable "
+        "overrides its combine format for every rung.")
 
     @field_validator("load_balancer", mode="before")
     @classmethod

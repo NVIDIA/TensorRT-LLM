@@ -509,6 +509,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # Legal combine wire formats; must stay in sync with
     # ``CombineFormat.parse`` in the kernel package's token_comm.py.
     _SUPPORTED_COMBINE_FORMATS = frozenset({"bf16", "32e4m3xe8m0", "16e2m1xbf16"})
+    # The format moe_config.use_low_precision_moe_combine selects on SM107: MXFP8 rows (E4M3
+    # values, one E8M0 scale per 32), the more accurate of the two quantized combines.
+    _LOW_PRECISION_COMBINE_FORMAT = "32e4m3xe8m0"
+    # The smallest capacity rung (max_tokens_per_rank) that use_low_precision_moe_combine moves to
+    # MXFP8 on SM107; smaller rungs keep BF16. DeepSeek-V4-Pro DEP4 on VR200, default tactics,
+    # MXFP8 / BF16 MoE time: 1.17 at 128 and 1.13-1.14 at 1024 tokens per rank (the
+    # generation-phase kernel takes only BF16, so a quantized rung runs the generic kernel),
+    # 1.06 at 2048, 0.96 at 4096.
+    _SM107_LOW_PRECISION_COMBINE_MIN_TOKENS = 4096
+    # Subclasses whose kernels take only the BF16 combine set this to False: they keep
+    # BF16 under use_low_precision_moe_combine.
+    _honors_low_precision_combine: bool = True
     # Opt-in uGPU localization (MEGAMOE_UGPU_LAYOUT): the packed bank that
     # moves into die-local VMM memory. The VMM owner lives until
     # release_ugpu_localized_weights(), which the engine calls once its CUDA graphs
@@ -637,6 +649,80 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Init
     # ------------------------------------------------------------------
+    @classmethod
+    def _resolve_combine_format(cls, model_config: ModelConfig) -> Tuple[str, int, str]:
+        """Return the combine wire format, the smallest capacity rung that uses it, and why.
+
+        Rungs below that capacity combine in BF16. ``MEGAMOE_COMBINE_FORMAT`` wins
+        when set and applies to every rung; otherwise ``use_low_precision_moe_combine``
+        selects MXFP8 for the SM107 rungs from ``_SM107_LOW_PRECISION_COMBINE_MIN_TOKENS``
+        up, and BF16 elsewhere. The inputs and the rung ladder are rank-identical, as
+        the workspace sizes require.
+        """
+        flag = bool(model_config.use_low_precision_moe_combine)
+        env_format = os.environ.get("MEGAMOE_COMBINE_FORMAT")
+        if env_format is not None:
+            if env_format not in cls._SUPPORTED_COMBINE_FORMATS:
+                raise ValueError(
+                    f"MEGAMOE_COMBINE_FORMAT must be one of "
+                    f"{sorted(cls._SUPPORTED_COMBINE_FORMATS)}; got {env_format!r}."
+                )
+            reason = "set by MEGAMOE_COMBINE_FORMAT"
+            if flag:
+                reason += ", which overrides moe_config.use_low_precision_moe_combine"
+            return env_format, 0, reason
+        if not flag:
+            return "bf16", 0, "the default"
+        if not cls._honors_low_precision_combine:
+            return (
+                "bf16",
+                0,
+                (
+                    f"{cls.__name__} combines in BF16 only and ignores "
+                    "moe_config.use_low_precision_moe_combine"
+                ),
+            )
+        sm_version = get_sm_version()
+        if sm_version != 107:
+            return (
+                "bf16",
+                0,
+                (
+                    "moe_config.use_low_precision_moe_combine selects a quantized MegaMoE "
+                    f"combine on SM107 only, not on SM{sm_version}"
+                ),
+            )
+        return (
+            cls._LOW_PRECISION_COMBINE_FORMAT,
+            cls._SM107_LOW_PRECISION_COMBINE_MIN_TOKENS,
+            "set by moe_config.use_low_precision_moe_combine",
+        )
+
+    def _combine_format_for(self, max_tokens_per_rank: int) -> str:
+        """Return the combine wire format of the capacity rung ``max_tokens_per_rank``."""
+        if int(max_tokens_per_rank) >= self._combine_format_min_tokens:
+            return self.combine_format
+        return "bf16"
+
+    def _quantized_combine_rungs(self) -> List[int]:
+        """Return the capacity rungs of the ladder whose combine is not BF16."""
+        return [b for b in self._maxt_buckets if self._combine_format_for(b) != "bf16"]
+
+    def _log_combine_formats(self) -> None:
+        """Log once which capacity rungs combine in which format, and why."""
+        quantized = self._quantized_combine_rungs()
+        if not quantized:
+            policy = "bf16 for every capacity rung"
+        elif len(quantized) == len(self._maxt_buckets):
+            policy = f"{self.combine_format} for every capacity rung"
+        else:
+            bf16 = self._maxt_buckets[: len(self._maxt_buckets) - len(quantized)]
+            policy = f"{self.combine_format} for capacity rungs {quantized}, bf16 for {bf16}"
+        if self.combine_format != "bf16" and self._combine_format_min_tokens > 0:
+            policy += f"; {self.combine_format} starts at {self._combine_format_min_tokens} tokens per rank"
+        message = f"[MegaMoECuteDsl] combine format {policy} ({self._combine_format_reason})"
+        logger.info_once(message, key=message)
+
     def __init__(
         self,
         *,
@@ -698,12 +784,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
 
         # The wire format must match on all EP ranks: it sizes the symmetric workspace.
-        combine_format = os.environ.get("MEGAMOE_COMBINE_FORMAT", "bf16")
-        if combine_format not in self._SUPPORTED_COMBINE_FORMATS:
-            raise ValueError(
-                f"MEGAMOE_COMBINE_FORMAT must be one of "
-                f"{sorted(self._SUPPORTED_COMBINE_FORMATS)}; got {combine_format!r}."
-            )
+        # ``combine_format`` is that of the capacity rungs from ``_combine_format_min_tokens``
+        # up; smaller rungs combine in BF16 (``_combine_format_for``).
+        (
+            combine_format,
+            self._combine_format_min_tokens,
+            self._combine_format_reason,
+        ) = self._resolve_combine_format(model_config)
         self.combine_format = combine_format
 
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
@@ -746,6 +833,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if _engine_max > 0:
             per_rank_cap = min(per_rank_cap, _engine_max)
         self._maxt_buckets = self._resolve_maxt_buckets(per_rank_cap)
+        self._log_combine_formats()
         # Per-bucket symmetric providers (bucket -> MegaMoeSymmMemProvider);
         # filled in ``create_weights`` on the multi-rank EP path.
         self._symm_providers = {}
@@ -1110,10 +1198,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         if get_sm_version() != 107 or (self.dtype or torch.bfloat16) != torch.bfloat16:
             raise ValueError(f"MEGAMOE_UGPU_LAYOUT={layout} requires SM107 and BF16 output")
-        if self.combine_format != "bf16" or self.tactic_autotune:
+        quantized = self._quantized_combine_rungs()
+        if quantized:
             raise ValueError(
-                f"MEGAMOE_UGPU_LAYOUT={layout} requires BF16 combine and fixed tactics"
+                f"MEGAMOE_UGPU_LAYOUT={layout} requires the BF16 combine, but the capacity rungs "
+                f"{quantized} combine in {self.combine_format} ({self._combine_format_reason})"
             )
+        if self.tactic_autotune:
+            raise ValueError(f"MEGAMOE_UGPU_LAYOUT={layout} requires fixed tactics")
         if self.layer_load_balancer is not None or self.ep_size == 1:
             raise ValueError(
                 f"MEGAMOE_UGPU_LAYOUT={layout} requires static experts and ep_size > 1"
@@ -1246,7 +1338,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         return self._symm_providers.get(self._maxt_buckets[-1])
 
     def _use_in_kernel_fc2_reduce(self, max_tokens_per_rank: int) -> bool:
-        if get_sm_version() != 107 or self.combine_format != "bf16":
+        if get_sm_version() != 107 or self._combine_format_for(max_tokens_per_rank) != "bf16":
             return False
         from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
             _sm107_use_in_kernel_fc2_reduce,
@@ -1280,6 +1372,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
+            # Each rung's provider is sized for that rung's own combine format.
+            combine_format = self._combine_format_for(max_T)
             (
                 shared_workspace_bytes,
                 supports_direct_inputs,
@@ -1306,7 +1400,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     self.act_beta if self.activation_type is ActivationType.SiTu else None
                 ),
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
-                combine_format=self.combine_format,
+                combine_format=combine_format,
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
             if supports_direct_inputs:
@@ -1319,7 +1413,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 max_tokens_per_rank=max_T,
                 num_topk=top_k,
                 output_dtype=self.dtype or torch.bfloat16,
-                combine_format=self.combine_format,
+                combine_format=combine_format,
                 shared_workspace_bytes=shared_workspace_bytes,
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
@@ -1338,7 +1432,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     max_tokens_per_rank=max_T,
                     num_topk=top_k,
                     output_dtype=self.dtype or torch.bfloat16,
-                    combine_format=self.combine_format,
+                    combine_format=combine_format,
                     shared_workspace_bytes=shared_workspace_bytes,
                 )
         if len(self._maxt_buckets) > 1 and self.ep_rank == 0:
@@ -1816,7 +1910,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     self.act_beta if self.activation_type is ActivationType.SiTu else None
                 ),
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
-                combine_format=self.combine_format,
+                combine_format=self._combine_format_for(max_T),
                 ugpu_weight_layout=self._ugpu_weight_layout,
             )
             if supports_direct_inputs:
@@ -2146,7 +2240,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 act_alpha=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
                 act_beta=(self.act_beta if self.activation_type is ActivationType.SiTu else None),
                 in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-                combine_format=self.combine_format,
+                combine_format=self._combine_format_for(launch_max_T),
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
                 **shared_kwargs,
@@ -2195,7 +2289,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             int(self.intermediate_size_per_partition),
             self.compute_slot_count,
             top_k,
-            self.combine_format,
+            tuple(self._combine_format_for(b) for b in self._maxt_buckets),
             self.act_clamp,
             self.act_alpha,
             self.act_beta,

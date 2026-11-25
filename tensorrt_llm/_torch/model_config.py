@@ -426,7 +426,8 @@ class ModelConfig(Generic[TConfig]):
     moe_row_space_rows_per_request: Optional[int] = None
     # If true, MEGAMOE_CUTEDSL kernels also run the FP8 shared expert (MXFP8 input)
     megamoe_fuse_shared_expert: bool = False
-    # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
+    # If true, use low precision combine in MoE operations (only for NVFP4 quantization);
+    # on SM107, MEGAMOE_CUTEDSL then combines rungs of at least 4096 tokens per rank in MXFP8
     use_low_precision_moe_combine: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection

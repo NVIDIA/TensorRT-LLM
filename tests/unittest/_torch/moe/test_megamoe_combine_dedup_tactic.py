@@ -340,6 +340,19 @@ def test_default_keeps_dedup_off_outside_the_measured_problem(
         assert op._sm107_default_combine_dedup(tuple(key)) is False
 
 
+def test_quantized_combine_defaults_to_the_fixed_non_dedup_tactic(op: types.ModuleType) -> None:
+    # An MXFP8 combine on DSv4-Pro (any rung under MEGAMOE_COMBINE_FORMAT, rungs from 4096 under
+    # use_low_precision_moe_combine): no tuned table and no dedup apply, so every SM107 rung
+    # takes the fixed non-bulk tactic.
+    fixed = op._unpack_tactic(op._MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    for world, experts in ((4, 96), (8, 48)):
+        for tokens in (32, 128, 1024, 2048, 8192, 16384, 32768):
+            key = list(op._sm107_dsv4_pro_problem_key(world, experts, tokens))
+            key[14] = "32e4m3xe8m0"
+            tactic = op._default_megamoe_tactic_for_key(tuple(key), num_tokens=tokens)
+            assert tactic == fixed and tactic[11] is False
+
+
 def test_query_sizes_the_provider_for_dedup_and_its_base(
     op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:

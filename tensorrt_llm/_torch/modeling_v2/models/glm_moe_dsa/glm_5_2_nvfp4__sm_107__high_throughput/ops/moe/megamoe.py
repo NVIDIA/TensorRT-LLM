@@ -56,6 +56,8 @@ class DirectStage:
 class RubinMegaMoE(MegaMoECuteDsl):
     # Launches and sizes its kernels itself, without the localized weight layout.
     _supports_ugpu_localization = False
+    # Its generation-phase kernel takes only the BF16 combine.
+    _honors_low_precision_combine = False
 
     def __init__(self, **kwargs):
         self._direct_stage_enabled = True
@@ -119,7 +121,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                     self.act_beta if self.activation_type is ActivationType.SiTu else None
                 ),
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
-                combine_format=self.combine_format,
+                combine_format=self._combine_format_for(max_T),
             )
             if supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
@@ -131,7 +133,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                 max_tokens_per_rank=max_T,
                 num_topk=top_k,
                 output_dtype=self.dtype or torch.bfloat16,
-                combine_format=self.combine_format,
+                combine_format=self._combine_format_for(max_T),
                 shared_workspace_bytes=shared_workspace_bytes,
             )
             self._symm_providers[max_T] = provider
@@ -149,7 +151,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
                     max_tokens_per_rank=max_T,
                     num_topk=top_k,
                     output_dtype=self.dtype or torch.bfloat16,
-                    combine_format=self.combine_format,
+                    combine_format=self._combine_format_for(max_T),
                     shared_workspace_bytes=shared_workspace_bytes,
                 )
         if len(self._maxt_buckets) > 1 and self.ep_rank == 0:
@@ -374,7 +376,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
             apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
             gate_up_clamp=self.act_clamp,
             in_kernel_fc2_reduce=in_kernel,
-            combine_format=self.combine_format,
+            combine_format=self._combine_format_for(bucket),
             defer_topk_reduce=deferred,
         )
         runner = get_rubin_runner(**runner_args)
