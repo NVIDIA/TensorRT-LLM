@@ -178,8 +178,10 @@ GPU result completes deployment acceptance.
 
 [test_transfer_lifecycle_gpu.py](test_transfer_lifecycle_gpu.py) exercises the
 bridge with real GPU allocations, the C++ NIXL agent, and separate MPI CTX/GEN
-worlds. Each world has an active attention-DP rank and an idle peer. The tests
-use generic `KVCacheManagerV2` NVFP4/`SELFKONLY` allocations with explicit key and
+worlds. The generation-first profile has an active attention-DP rank and an idle
+peer in each world; the context-first BF16 profile has two active TP ranks per
+world. The generation-first tests use generic `KVCacheManagerV2`
+NVFP4/`SELFKONLY` allocations with explicit key and
 block-scale coverage and real KV/AUX transfers, without loading a model or
 introducing production fault-injection hooks. This deliberately excludes the
 dense FP4 MLA manager's high-precision tail, local-only V-scale/packed-V roles,
@@ -195,8 +197,13 @@ Before publication, a real native filler cache pins the allocator's measured
 spare slots; the nominal token quota is not assumed to equal physical capacity.
 The protected slot must stay unavailable until retirement and then be reused
 with unchanged sentinels after duplicate reports. Readiness gates establish
-native DONE and allocation pressure before cancellation or timeout; the real
-120-second request/grace clocks are never reset by the fixture.
+native DONE and allocation pressure before cancellation or timeout. Cases that
+exercise request timeout or fatal grace expiry use real 30-second clocks;
+baseline and cancellation cases retain 120-second clocks. Fatal cases give the
+independent surviving endpoint three times the target's timeout. These clocks
+are never reset by the fixture. Clock-relative preparation and settlement margins
+remain separate from the 30-second observation waits, 600-second shared startup
+deadline, and 1080-second outer pytest timeout.
 
 The fault control masks completion evidence **after the real backend reports
 DONE**. This deterministically tests the software's behavior while completion is
@@ -206,19 +213,24 @@ the grace period expires. It does not simulate a still-active DMA, nor qualify
 abort/release semantics. A fatal test must establish its fault preconditions and
 retention assertions before process death; an arbitrary MPI failure is not a pass.
 The fatal-world exit check observes both recorded PID/create-time identities
-before cleanup, with a bounded wait and state diagnostics. Absent, exited/zombie,
-or reused identities mean the original process no longer executes; a live or
+before cleanup, with a bounded wait and state diagnostics. The independent peer
+job must still be running after that observation completes and before test cleanup.
+Absent, exited/zombie, or reused identities mean the original process no longer
+executes; a live or
 unobservable rank fails. This process observation is not GPU/RDMA fencing proof.
 The [exit-observer tests](test_transfer_lifecycle_process_exit.py) exercise all
 nine scenarios on each rank. The [startup tests](test_transfer_lifecycle_startup.py)
-check that both workers and the supervisor share one 600-second startup deadline,
-reject readiness observed at or after expiry, and leave relative transfer waits
-unchanged; startup failures print bounded worker logs and missing readiness
-markers before cleanup.
+check case-specific clocks, strict transition margins, independent protective
+wait limits, and peer survival through target-exit observation. Both workers and
+the supervisor share one 600-second startup deadline
+and reject readiness observed at or after expiry; startup failures print bounded
+worker logs and missing readiness markers before cleanup.
 
-The seven cases cover normal delivery, cancellation before publication,
+The seven generation-first cases cover normal delivery, cancellation before publication,
 cancellation with KV or AUX completing late, timeout with AUX completing late,
-and fatal expiry on the source or destination. Fatal cases deliberately give the
+and fatal expiry on the source or destination. Four context-first BF16 cases cover
+normal delivery, cancellation with KV completing late, and source/destination
+fatal expiry. Fatal cases deliberately give the
 other endpoint a longer timeout to observe the affected endpoint's containment
 without simultaneously losing its peer. This is fault isolation, not a claim to
 qualify arbitrary mixed configurations. The suite is included in the four-GPU
