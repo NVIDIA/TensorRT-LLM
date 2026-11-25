@@ -498,7 +498,8 @@ class LTX23Pipeline(BasePipeline):
             sample_rate=self.audio_sampling_rate,
             hop_length=self.audio_hop_length,
         )
-        self.transformer.configure_audio_ulysses(audio_shape.frames)
+        for _, model in self.transformer_quant_models("transformer"):
+            model.configure_audio_ulysses(audio_shape.frames)
 
         latents = torch.randn(
             (
@@ -546,7 +547,8 @@ class LTX23Pipeline(BasePipeline):
         else:
             v_ctx, a_ctx, v_mask = video_embeds, audio_embeds, connector_mask
 
-        text_cache = self.transformer.prepare_text_cache(
+        text_cache = self.prepare_transformer_inputs(
+            "prepare_text_cache",
             video_context=v_ctx,
             video_context_mask=v_mask,
             video_positions=video_positions,
@@ -581,7 +583,7 @@ class LTX23Pipeline(BasePipeline):
             vel_v, vel_a = self.transformer(
                 video=video_mod,
                 audio=audio_mod,
-                text_cache=text_cache,
+                text_cache=self.resolve_transformer_inputs(text_cache),
                 timestep=timestep_val.new_tensor(0.0),
             )
 

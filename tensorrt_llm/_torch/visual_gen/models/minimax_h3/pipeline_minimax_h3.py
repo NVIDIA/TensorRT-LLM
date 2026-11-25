@@ -1347,9 +1347,10 @@ class MiniMaxH3Pipeline(BasePipeline):
             )
         ]
         with self.offloader.context_if_requested("transformer"):
-            static_context = self.transformer.prepare_static_context(
-                prompt_embeds,
-                position_ids,
+            static_context = self.prepare_transformer_inputs(
+                "prepare_static_context",
+                encoder_hidden_states=prompt_embeds,
+                position_ids=position_ids,
             )
         condition_rows = layout.num_condition_video_rows
         condition_prefix = latents[:condition_rows][None]
@@ -1415,7 +1416,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 audio_indices=audio_indices,
                 text_indices=text_indices,
                 return_dict=False,
-                static_context=static_context,
+                static_context=self.resolve_transformer_inputs(static_context),
             )
             if _vsa_active:
                 with set_h3_vsa_context(vsa_metadata):

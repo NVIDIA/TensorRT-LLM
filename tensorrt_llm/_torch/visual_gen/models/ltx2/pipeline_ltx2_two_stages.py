@@ -1667,7 +1667,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             sample_rate=getattr(self, "audio_sampling_rate", 16000),
             hop_length=getattr(self, "audio_hop_length", 160),
         )
-        self.transformer.configure_audio_ulysses(audio_shape.frames)
+        for _, model in self.transformer_quant_models("transformer"):
+            model.configure_audio_ulysses(audio_shape.frames)
 
         # --- Video: patchify, positions ---
         v_latents = self.video_patchifier.patchify(video_latents)
