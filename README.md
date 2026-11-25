@@ -22,6 +22,9 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
+* [11/25] DeCo-Attention: Accurate and Fast 4-Bit Attention for Video Generation in TensorRT LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog37_DeCo_Attention_Accurate_and_Fast_4bit_Attention_for_Video_Generation_in_TensorRT-LLM.md)
+
 * [11/24] TensorRT LLM for Reinforcement Learning: Powering the Fastest MLPerf Training v6.1 Qwen3.5 397B GRPO Result on NVIDIA Vera Rubin
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog36_TensorRT-LLM_for_Reinforcement_Learning_Fastest_MLPerf_Qwen3_5_397B_GRPO_on_Vera_Rubin.md)
 
