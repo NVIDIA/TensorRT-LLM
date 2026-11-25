@@ -1706,6 +1706,120 @@ def test_cutlass_w4a8_undeclared_pre_quant_scale() -> None:
     )
 
 
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True])
+def test_cutlass_w4a8_sharded_vanilla_scales(has_pre_quant_scale: bool) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90")
+    with torch.cuda.device(0):
+        _check_cutlass_w4a8_sharded_vanilla_scales(has_pre_quant_scale)
+
+
+def _check_cutlass_w4a8_sharded_vanilla_scales(has_pre_quant_scale: bool) -> None:
+    if get_sm_version() != 90:
+        pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90")
+    if not collect_moe_environment().oss_cutlass_moe:
+        pytest.skip("CUTLASS W4A8 requires an OSS CUTLASS build")
+
+    num_experts, hidden_size, intermediate_size = 4, 256, 256
+    dtype = torch.bfloat16
+    mapping = Mapping(
+        world_size=4,
+        rank=3,
+        tp_size=4,
+        moe_tp_size=2,
+        moe_ep_size=2,
+        enable_attention_dp=True,
+    )
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.W4A8_AWQ,
+        torch.empty(1, hidden_size, dtype=dtype, device="cuda"),
+        MoeBackendType.CUTLASS,
+    )
+    quant_config.pre_quant_scale = has_pre_quant_scale
+    quantize_util = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        num_local_experts=num_experts // mapping.moe_ep_size,
+    )
+    weights = quantize_util.create_weights(
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA, **quant_kwargs
+    )
+    fc31_channels = torch.arange(hidden_size, dtype=torch.float32, device="cuda")
+    fc2_channels = torch.arange(intermediate_size, dtype=torch.float32, device="cuda")
+    for expert_id in range(num_experts):
+        weights[f"{expert_id}.w3.input_scale"] = torch.tensor([2.0**expert_id], device="cuda")
+        weights[f"{expert_id}.w1.input_scale"] = torch.tensor(
+            [2.0 ** (expert_id - 1)], device="cuda"
+        )
+        weights[f"{expert_id}.w2.input_scale"] = torch.tensor(
+            [2.0 ** (expert_id + 1)], device="cuda"
+        )
+        weights[f"{expert_id}.w3.pre_quant_scale"] = (1.0 + expert_id / 4 + fc31_channels / 128).to(
+            dtype
+        )
+        weights[f"{expert_id}.w1.pre_quant_scale"] = (2.0 + expert_id / 4 - fc31_channels / 256).to(
+            dtype
+        )
+        weights[f"{expert_id}.w2.pre_quant_scale"] = (0.75 + expert_id / 4 + fc2_channels / 64).to(
+            dtype
+        )
+    if not has_pre_quant_scale:
+        weights = {
+            key: value for key, value in weights.items() if not key.endswith(".pre_quant_scale")
+        }
+
+    model_config = _create_model_config(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        mapping=mapping,
+        quant_config=quant_config,
+        moe_backend=MoeBackendType.CUTLASS.value,
+    )
+    with (
+        torch.device("cuda:0"),
+        create_moe(
+            routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+            reduce_results=False,
+            model_config=model_config,
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        ) as fused_moe,
+    ):
+        fused_moe.create_weights()
+        fused_moe.load_weights([weights])
+        assert fused_moe.backend.initial_local_expert_ids == [2, 3]
+
+        expected_fc31 = torch.stack(
+            [
+                torch.maximum(
+                    weights[f"{expert_id}.w3.pre_quant_scale"],
+                    weights[f"{expert_id}.w1.pre_quant_scale"],
+                )
+                if has_pre_quant_scale
+                else torch.ones(hidden_size, dtype=dtype, device="cuda")
+                for expert_id in (2, 3)
+            ]
+        ).float() / torch.tensor([4.0, 8.0], device="cuda").unsqueeze(1)
+        expected_fc2 = torch.stack(
+            [
+                weights[f"{expert_id}.w2.pre_quant_scale"][intermediate_size // 2 :]
+                if has_pre_quant_scale
+                else torch.ones(intermediate_size // 2, dtype=dtype, device="cuda")
+                for expert_id in (2, 3)
+            ]
+        ).float().unsqueeze(-1) / torch.tensor([8.0, 16.0], device="cuda").view(2, 1, 1)
+        torch.testing.assert_close(
+            fused_moe.backend.fc31_act_scale, expected_fc31.to(dtype), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            fused_moe.backend.fc2_act_scale, expected_fc2.to(dtype), rtol=0, atol=0
+        )
+
+
 def test_cutlass_w4a8_sm89_without_pre_quant_scale() -> None:
     if not torch.cuda.is_available() or get_sm_version() != 90:
         pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90 for test setup")
