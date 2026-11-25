@@ -9,7 +9,7 @@ the agentic recipes:
 
 * no 1-CTA b-reuse tile (``mma_tiler_m, mma_inst_m == 256, 128``);
 * prefetch only on the unswapped 2-CTA b-reuse tile (``512, 256``);
-* split-K (atomic BF16 accumulation, so not run-to-run deterministic) only up to M = 256.
+* split-K only up to M = 256, using the shared runner's accumulation and reduction.
 
 ``get_valid_tactics`` keeps exactly those tactics of main's list, in main's order; the tactic tuples
 and the launch are main's. Inputs: FP8 E4M3 ``[M, K]`` activation and ``[N, K]`` weight, their

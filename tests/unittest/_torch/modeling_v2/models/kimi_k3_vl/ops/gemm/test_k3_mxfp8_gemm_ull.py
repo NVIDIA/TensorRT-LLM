@@ -73,11 +73,10 @@ def _split_k_tactics(m, n, k):
 def test_k3_mxfp8_gemm_ull_cells(cell):
     """Both operands are E4M3 with power-of-two scales, so every product is exact.
 
-    Without split-K the kernel sums them in FP32 and rounds once to BF16: at most 2 units of
-    ``ULP`` of the row maximum element-wise, 1 in RMS. A split-K tactic rounds each of its ``s``
-    FP32 partials to BF16 and adds them with BF16 atomics, one more rounding per add; a partial
-    and a running sum stay within twice the row maximum on these operands, so each split adds at
-    most 2 units: ``2 + 2 s`` element-wise and ``1 + s`` in RMS.
+    FP32 accumulation with one rounding to BF16 allows at most 2 units of ``ULP`` of the row
+    maximum element-wise, 1 in RMS. The earlier shared runner adds BF16 partials atomically.
+    Its partials and running sum stay within twice the row maximum on these operands, so each
+    split adds at most 2 units element-wise and 1 in RMS.
     """
     op = k3_mxfp8_gemm_ull
     n, k, m = cell.spec["n"], cell.spec["k"], cell.spec["m"]
@@ -90,6 +89,10 @@ def test_k3_mxfp8_gemm_ull_cells(cell):
     if m > mxfp8_gemm.K3_SPLIT_K_MAX_M:
         assert not by_split, f"{cell.why}: split-K tactic kept above {mxfp8_gemm.K3_SPLIT_K_MAX_M}"
         return
+    fp32_partials = getattr(mxfp8_gemm.K3MXFP8RubinRunner, "split_k_fp32_partials", False)
     for split_k, tactic in sorted(by_split.items()):
         got = mxfp8_gemm.run_with_tactic(act, weight, act_scale, weight_scale, tactic)
-        assert_within_ulp(got, want, 2 + 2 * split_k, 1 + split_k)
+        if fp32_partials:
+            assert_within_ulp(got, want, 2, 1)
+        else:
+            assert_within_ulp(got, want, 2 + 2 * split_k, 1 + split_k)
