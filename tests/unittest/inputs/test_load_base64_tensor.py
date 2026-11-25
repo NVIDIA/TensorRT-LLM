@@ -368,6 +368,8 @@ _PICKLE_REJECTED = {
     "protocol": (_pickle((4, 2), (2, 1), 8, head=b"\x80\xff"), "malformed"),
     "frame-past-end": (_pickle((4, 2), (2, 1), 8, head=_FRAMED), "malformed"),
     "frame-inside-frame": (_NESTED + _BODY, "malformed"),
+    # The frame ends two bytes into GLOBAL's "torch._utils" argument.
+    "opcode-across-frame": (b"\x80\x04\x95" + struct.pack("<Q", 2) + _BODY, "malformed"),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
     # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
     "reducer-wrapping-tensor": (_pickle((10**8, 2), (0, 0), 1, wrap=True), "exactly one"),

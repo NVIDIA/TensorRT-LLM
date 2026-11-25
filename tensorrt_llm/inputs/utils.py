@@ -153,19 +153,21 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
         raise ValueError("Tensor payload pickle is malformed.")
     stack: list[object] = []
     frame_end = 0
+    # Each opcode, arguments included, ends where the next one starts.
+    ends = [pos for _, _, pos in ops[1:]] + [ops[-1][2] + 1]
     try:
-        for opcode, arg, pos in ops:
+        for (opcode, arg, pos), end in zip(ops, ends):
             name = opcode.name
             if name not in _TENSOR_PICKLE_OPS:
                 raise ValueError(
                     f"Tensor payload uses unsupported pickle opcode {name}.")
             if name == "STOP":
                 break
-            # torch.save starts the pickle with one PROTO of 2 to 5, and a
-            # frame starts after the previous one and ends within the pickle
-            # (a FRAME opcode is 9 bytes).
+            # torch.save starts the pickle with one PROTO of 2 to 5; a frame
+            # starts after the previous one and ends within the pickle (a
+            # FRAME opcode is 9 bytes), and no opcode crosses a frame's end.
             if (name == "PROTO" and (pos or not 2 <= arg <= 5)
-                    or name == "FRAME" and
+                    or pos < frame_end < end or name == "FRAME" and
                 (pos < frame_end or pos + 9 + arg > len(pickled))):
                 raise ValueError("Tensor payload pickle is malformed.")
             if name == "FRAME":
