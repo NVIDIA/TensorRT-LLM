@@ -36,6 +36,7 @@ from test_common.interface_checks import mock_target
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
@@ -372,8 +373,9 @@ class DecoderDsaWarmupTestCase(unittest.TestCase):
             attention_runtime_features=None,
         )
         engine._metadata.setup_attention = Mock()
-        engine._ensure_dsa_attn_metadata_for_warmup(Mock())
-        engine._warmup_cute_dsl_radix_topk()
+        with patch.object(engine._config.attention_backend, "Metadata", TrtllmAttentionMetadata):
+            engine._ensure_dsa_attn_metadata_for_warmup(Mock())
+            engine._warmup_cute_dsl_radix_topk()
 
         engine._metadata.setup_attention.assert_not_called()
 
