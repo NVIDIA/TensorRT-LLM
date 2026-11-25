@@ -428,6 +428,20 @@ def test_index_key_fp8_decode_scores(monkeypatch, fp8, rows, p):
         assert calls and calls[0][0] in ("bf16", "cute")
 
 
+def test_index_key_fp8_keeps_the_tep4_prefetch_off(monkeypatch):
+    """`TEP_INDEX_PREFETCH_ENV` with `INDEX_KEY_FP8_ENV`: the prefetching kernel reads bf16
+    anchors, so a captured trunk call behind the prologue goes to the e4m3 kernel instead."""
+    calls = _fp8_recorders(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    core = SimpleNamespace(
+        **{**vars(CORE), "tep_fast": True, "tep_index_prefetch": True, "index_key_fp8": True}
+    )
+    t = torch.zeros(8, dtype=torch.int64)
+    q = torch.zeros(8, 4, 128)
+    M._decode_index_scores(core, q, None, None, t, t.int(), 32, 4, behind_prologue=True)
+    assert calls == [("fp8", True, False, 4)]
+
+
 @pytest.mark.parametrize("fp8", [False, True])
 def test_index_key_fp8_reader_and_writer_helpers(monkeypatch, fp8):
     calls = _fp8_recorders(monkeypatch)
