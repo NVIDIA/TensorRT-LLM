@@ -35,7 +35,7 @@ class TrtllmCutlassW8a16Impl(CutlassFusedMoEBase):
     )
     sm_support = SmSupport(minimum=80)
     supported_dtypes = HP_DTYPES
-    FUSED_MOE_OP_FLAGS = FusedMoeOpFlags(use_int8_woq_per_channel=True)
+    FUSED_MOE_OP_FLAGS = FusedMoeOpFlags(use_woq_per_channel=True)
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
