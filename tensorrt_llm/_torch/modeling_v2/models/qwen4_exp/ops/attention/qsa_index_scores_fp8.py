@@ -19,6 +19,14 @@ context step's twelve calls 14.9 ms on the bf16 query-tiled kernel, 9.5 ms on th
 here. GSM8K 95.91 / 95.98; the AgentX top-2048 block overlap with bf16 keys p50 0.976.
 Decode-sized generation calls run on a flat grid of a fixed number of programs, bitwise the
 request-group kernel's scores (`_qsa_index_scores_flat_kernel`).
+
+`early` (a decode call behind an anchor convert launched with `use_pdl`): the flat kernel is
+launched with PDL and, before its grid-dependency wait, builds its tile map from the positions
+and issues `prefetch.global.L2::evict_last` of its first `_EARLY_PF_TILES` tiles' key lines
+(page-table reads only; a prefetch can never return stale data), then waits, releases its
+dependents and runs the same body: bitwise the default launch. Before the wait it reads only
+the step's positions, request indices and block table, the operands the attention decode
+prologue also reads before its own wait; the caller answers for that.
 """
 
 from __future__ import annotations
@@ -504,11 +512,26 @@ _FLAT_MAX_GROUP_ROWS = 4
 _FLAT_MAX_ROWS = 256
 _FLAT_MAX_RUNS = 64
 _FLAT_WARPS = 4
+#: `early`: the tiles a program prefetches into L2 before its grid-dependency wait.
+_EARLY_PF_TILES = 2
 
 
 @functools.lru_cache(maxsize=None)
 def _sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@triton.jit
+def _l2_prefetch(ptrs):
+    """`prefetch.global.L2::evict_last` of each address (a hint, no value); returns zeros."""
+    return tl.inline_asm_elementwise(
+        "prefetch.global.L2::evict_last [$1];\n\tmov.u32 $0, 0;",
+        "=r,l",
+        [ptrs.to(tl.int64)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit(
@@ -531,6 +554,7 @@ def _qsa_index_scores_flat_kernel(
     query_positions,
     request_indices,
     output,
+    sink,
     score_scale,
     rows,
     max_blocks,
@@ -550,11 +574,15 @@ def _qsa_index_scores_flat_kernel(
     MAX_GROUPS: tl.constexpr,
     PROGRAMS: tl.constexpr,
     ROW_BY_ROW: tl.constexpr,
+    EARLY: tl.constexpr,
+    PF_TILES: tl.constexpr,
 ):
     """e4m3 keys (the first INDEX_HEAD_DIM bytes of each anchor slot) x the bf16 query rounded
     to e4m3 here. Program `pid` takes tiles [pid * chunk, (pid + 1) * chunk) of the runs' tiles
     laid end to end; a run is GROUP_ROWS consecutive rows. Scores are written at each row's
-    visible blocks only."""
+    visible blocks only. EARLY (a PDL launch): the tile map and the L2 prefetch of the first
+    PF_TILES tiles' key lines come before the grid-dependency wait (`sink` is never written: the
+    prefetch's dummy result is stored under a false mask)."""
     BLOCK_H: tl.constexpr = BLOCK_G * NUM_INDEX_HEADS
     pid = tl.program_id(0)
     # Every run's visible bound (the largest of its rows') and tile count, then this program's
@@ -575,6 +603,9 @@ def _qsa_index_scores_flat_kernel(
     chunk = tl.maximum((total + (PROGRAMS - 1)) // PROGRAMS, 1)
     start = pid * chunk
     if start >= total:
+        if EARLY:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
         return
     end = tl.minimum(start + chunk, total)
     # The runs holding tiles `start` and `end - 1`: the first whose prefix sum exceeds each.
@@ -586,6 +617,38 @@ def _qsa_index_scores_flat_kernel(
     columns = tl.arange(0, BLOCK_H)
     column_slot = columns // NUM_INDEX_HEADS
     block_offsets = tl.arange(0, BLOCK_N)
+    if EARLY:
+        # Before the wait: the program's first PF_TILES tiles (they may run into the next run),
+        # one L2 line a block; only step inputs are read.
+        acc = tl.zeros([BLOCK_N], dtype=tl.int32)
+        for k in tl.static_range(PF_TILES):
+            gt = start + k
+            if gt < end:
+                gk = tl.sum((cum <= gt).to(tl.int32), axis=0)
+                mine = g == gk
+                before = tl.sum(tl.where(mine, cum - g_tiles, 0), axis=0)
+                mv = tl.max(tl.where(mine[:, None], all_vis, 0))
+                req = tl.load(request_indices + gk * GROUP_ROWS).to(tl.int64)
+                bc = (gt - before) * BLOCK_N + block_offsets
+                vb = bc < mv
+                ap = bc * COMPRESS_RATIO + COMPRESS_RATIO - 1
+                pp = tl.load(
+                    block_table + req * block_table_stride_request + ap // TOKENS_PER_BLOCK,
+                    mask=vb,
+                    other=0,
+                ).to(tl.int64)
+                kp = (
+                    cache8
+                    + (
+                        pp * cache_stride_page16
+                        + (ap % TOKENS_PER_BLOCK).to(tl.int64) * cache_stride_token16
+                    )
+                    * 16
+                )
+                acc += tl.where(vb, _l2_prefetch(kp), 0)
+        tl.store(sink + pid, tl.sum(acc, axis=0), mask=pid < 0)
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     for grp in tl.range(g_first, g_last + 1):
         mine = g == grp
         before = tl.sum(tl.where(mine, cum - g_tiles, 0), axis=0)
@@ -749,18 +812,26 @@ def _flat_refusal(
     return None
 
 
+@functools.lru_cache(maxsize=None)
+def _early_sink(device_index: int, programs: int) -> torch.Tensor:
+    """`early`'s never-written operand: one int32 a program, once a device."""
+    return torch.zeros(programs, dtype=torch.int32, device=torch.device("cuda", device_index))
+
+
 def _qsa_index_scores_flat(
     q, index_cache, block_table, query_positions, request_indices, tokens_per_block,
-    compress_ratio, rows_per_request,
+    compress_ratio, rows_per_request, early=False,
 ) -> torch.Tensor:  # fmt: skip
     """The flat kernel's scores (visible blocks only), one launch; the caller has checked the
-    envelope (`_flat_refusal`)."""
+    envelope (`_flat_refusal`). `early`: the PDL launch with the pre-wait tile map and L2
+    prefetch (module docstring)."""
     rows, heads, dim = q.shape
     max_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
     output = torch.empty((rows, max_blocks), dtype=torch.float32, device=q.device)
     cache8 = _fp8_view(index_cache)
     runs = triton.cdiv(rows, rows_per_request)
     programs = _FLAT_PROGRAMS_PER_SM * _sm_count(q.device.index or 0)
+    sink = _early_sink(q.device.index or 0, programs) if early else output
     _qsa_index_scores_flat_kernel[(programs,)](
         q,
         cache8,
@@ -768,6 +839,7 @@ def _qsa_index_scores_flat(
         query_positions,
         request_indices,
         output,
+        sink,
         dim**-0.5,
         rows,
         max_blocks,
@@ -787,7 +859,10 @@ def _qsa_index_scores_flat(
         MAX_GROUPS=16 if runs <= 16 else 32 if runs <= 32 else 64,
         PROGRAMS=programs,
         ROW_BY_ROW=rows_per_request > 1,
+        EARLY=bool(early),
+        PF_TILES=_EARLY_PF_TILES if early else 0,
         num_warps=_FLAT_WARPS,
+        launch_pdl=bool(early),
     )
     return output
 
@@ -814,11 +889,13 @@ def qsa_index_scores_fp8_launch(
     only_visible_blocks: bool,
     context_rows: bool,
     rows_per_request: int = 1,
+    early: bool = False,
 ) -> torch.Tensor:
     """The scores `[rows, max_compressed_blocks]` fp32 of `q` against the e4m3 anchors: a
     decode-sized generation call on the flat grid and a prefill-sized context call on the
     ctx-tile kernel (both bitwise the request-group kernel's scores), every other call on the
-    request-group kernel."""
+    request-group kernel. `early`: a flat-grid call launches early (module docstring); the
+    other kernels ignore it."""
     if (
         only_visible_blocks
         and not context_rows
@@ -836,7 +913,7 @@ def qsa_index_scores_fp8_launch(
     ):
         return _qsa_index_scores_flat(
             q, index_cache, block_table, query_positions, request_indices, tokens_per_block,
-            compress_ratio, rows_per_request,
+            compress_ratio, rows_per_request, early,
         )  # fmt: skip
     if _takes_ctx_tile(q, only_visible_blocks, context_rows, rows_per_request):
         return _qsa_index_scores_fp8_ctx_tile(
@@ -900,6 +977,16 @@ class QsaIndexScoresFp8(OpWrapper):
             spec=_scores_spec(requests=((5000, 140), (100, 160)), context_rows=True),
         ),
         Cell(
+            why="dep MTP-3 verify launched early (PDL, pre-wait tile map and L2 prefetch): 12 "
+            "requests x 4 rows on the flat grid",
+            spec=_scores_spec(
+                requests=tuple((20000 + 9973 * r, 4) for r in range(12)),
+                rows_per_request=4,
+                table=8196,
+                early=True,
+            ),  # fmt: skip
+        ),
+        Cell(
             why="decode rows with -inf past the visible blocks (not only visible)",
             spec=_scores_spec(
                 requests=tuple((300 + 997 * r, 1) for r in range(8)), only_visible_blocks=False
@@ -912,7 +999,9 @@ class QsaIndexScoresFp8(OpWrapper):
     context and generation, trunk and draft); `index_anchors_to_fp8` after every anchor writer.
     Preconditions: `q` bf16 `[rows, 2 | 4 | 8 heads, dim]` (unit dim stride); the plane bf16-sized
     `[pages, tokens, 1, dim]` with e4m3 anchors; int32 row-contiguous block table; positions and
-    request indices `[rows]`; up to 8 rows a request group.
+    request indices `[rows]`; up to 8 rows a request group. `early` (the trunk verify call behind
+    the attention decode prologue under `TRTLLM_QWEN4_EXP_DP_SCORES_EARLY`): the flat grid's PDL
+    launch, bitwise the default one; ignored by the other kernels.
     """
 
     def __call__(
@@ -927,6 +1016,7 @@ class QsaIndexScoresFp8(OpWrapper):
         only_visible_blocks: bool,
         context_rows: bool,
         rows_per_request: int = 1,
+        early: bool = False,
     ) -> torch.Tensor:
         return qsa_index_scores_fp8_launch(
             q,
@@ -939,6 +1029,7 @@ class QsaIndexScoresFp8(OpWrapper):
             only_visible_blocks,
             context_rows,
             rows_per_request,
+            early,
         )
 
     def reference(
@@ -953,6 +1044,7 @@ class QsaIndexScoresFp8(OpWrapper):
         only_visible_blocks: bool,
         context_rows: bool,
         rows_per_request: int = 1,
+        early: bool = False,
     ) -> torch.Tensor:
         """float64 over the e4m3 operands, -inf past each row's visible blocks (the kernel
         leaves those columns unwritten with `only_visible_blocks`: compare visible columns)."""
@@ -984,6 +1076,7 @@ class QsaIndexScoresFp8(OpWrapper):
         only_visible_blocks: bool,
         context_rows: bool,
         rows_per_request: int = 1,
+        early: bool = False,
     ) -> None:
         assert q.dtype == torch.bfloat16 and q.dim() == 3 and q.shape[1] in (2, 4, 8)
         assert index_cache.dim() == 4 and index_cache.shape[2] == 1

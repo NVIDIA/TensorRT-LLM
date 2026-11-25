@@ -1040,6 +1040,17 @@ _DRAFT_GQA_G1_ROWS = (4, 96)  # capacity: fixed: the measured row range
 #: top-2048 block overlap with bf16 keys p50 0.976. Read once, when the core is built, at every
 #: layout.
 INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
+#: Off by default (race-risk: two launches read step inputs before their grid-dependency wait).
+#: At a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) with `INDEX_KEY_FP8_ENV` on and PDL: a
+#: trunk attention layer's anchor convert behind the attention decode prologue is launched with
+#: PDL (it releases its dependents, then waits, at its top), and the verify step's index scores
+#: behind it take the flat grid's early launch (`qsa_index_scores_fp8(..., early=True)`): the
+#: tile map and an L2 prefetch of the first tiles' key lines before the wait. Before the wait
+#: the scores read only the step's positions, request indices and block table, which the
+#: prologue also reads before its own wait. Bitwise. GB300 dep4: the scores' preamble off the
+#: critical path, 2.7-3.3 us a layer at 7..25 requests a rank, -0.021..-0.072 ms a step in the
+#: server A/B. Read once, when the target is built.
+DP_SCORES_EARLY_ENV = "TRTLLM_QWEN4_EXP_DP_SCORES_EARLY"
 #: Off by default (opt-in: a cold-page codec over the KV cache manager's migration bridge, whose
 #: callbacks run on the manager's copy thread). Context servers only, with `INDEX_KEY_FP8_ENV`,
 #: block reuse, a host tier, MTP-3 and the `L - 2` in-forward snapshot: every anchor writer also
@@ -1490,6 +1501,28 @@ def _dp_draft_gqa_g1(core) -> bool:
             f"rank has attention DP {core.dp_size}"
         )
         return False
+    return True
+
+
+def _dp_scores_early(core, device) -> bool:
+    """`DP_SCORES_EARLY_ENV`, read once at build: True at a dep4 / dep8 rank on SM103 with the e4m3
+    index anchors and PDL on; set where it cannot apply: one warning, False."""
+    if not _switch(DP_SCORES_EARLY_ENV):
+        return False
+    why = None
+    if not _dp_decode_rank(core, device):
+        why = "it serves a dep4 / dep8 rank on SM103"
+    elif not getattr(core, "index_key_fp8", False):
+        why = f"it serves the e4m3 index anchors ({INDEX_KEY_FP8_ENV}), which are off"
+    elif not _INDEX_SCORES_PDL:
+        why = "programmatic dependent launch is off (TRTLLM_ENABLE_PDL=0)"
+    if why is not None:
+        logger.warning(f"{DP_SCORES_EARLY_ENV} is set but ignored: {why}")
+        return False
+    logger.info(
+        f"trunk verify index scores launched early behind a PDL anchor convert "
+        f"({DP_SCORES_EARLY_ENV}=1): rank {core.dp_rank} of {core.dp_size}"
+    )
     return True
 
 
@@ -2891,6 +2924,7 @@ def _decode_forms(core) -> str:
             "draft moe tile": getattr(core, "_draft_moe_tactics", None) is not None,
             "launch order": getattr(core, "dp_launch_order", False),
             "index key fp8": getattr(core, "index_key_fp8", False),
+            "scores early": getattr(core, "dp_scores_early", False),
             "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
             "replay gap": getattr(core, "host_step_forms", {}).get("qsa_replay_gap", False),
@@ -3346,6 +3380,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.cold_index_marks = self.index_key_fp8 and _switch(CTX_COLDIDX_ENV)
         # The most generation rows the cluster top-k serves (`DP_TOPK_CLUSTER_ROWS_ENV`).
         self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
+        # The trunk verify's early index scores (`DP_SCORES_EARLY_ENV`, opt-in), settled after load.
+        self.dp_scores_early = False
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -3564,6 +3600,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._out_proj = _out_proj_build(self, device)
             self._draft_o = _draft_o_build(self, device)
             self._siteb = _siteb_build(self, device)
+            self.dp_scores_early = _dp_scores_early(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
             self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
@@ -7332,13 +7369,22 @@ def _index_scores(core, **kw):
     )
 
 
-def _index_anchors_fp8(core, index_cache, block_table, req_idx, logical, tpb) -> None:
+def _index_anchors_fp8(
+    core, index_cache, block_table, req_idx, logical, tpb, use_pdl: bool = False
+) -> None:
     """Under `INDEX_KEY_FP8_ENV`, the anchors a writer just compressed (as bf16) at `logical`'s
-    group ends, converted to e4m3 in place; on the writer's stream, right behind it."""
+    group ends, converted to e4m3 in place; on the writer's stream, right behind it. `use_pdl`
+    (`DP_SCORES_EARLY_ENV`, behind the attention decode prologue): a PDL launch that releases
+    its dependents before its wait."""
     if getattr(core, "index_key_fp8", False):
-        index_anchors_to_fp8(index_cache, block_table, req_idx, logical, tpb, core.compress_ratio)
+        kw = {"use_pdl": True} if use_pdl else {}
+        index_anchors_to_fp8(
+            index_cache, block_table, req_idx, logical, tpb, core.compress_ratio, **kw
+        )
         if getattr(core, "cold_index_marks", False):
-            # The groups this writer pooled, for the cold-page codec (`CTX_COLDIDX_ENV`).
+            # The groups this writer pooled, for the cold-page codec (`CTX_COLDIDX_ENV`). A plain
+            # launch: behind a PDL convert (`use_pdl`) it still waits for the convert to finish,
+            # and a PDL successor starts when it ends (ordered; only the early overlap is lost).
             qsa_cold_index_mark(
                 index_cache, block_table, req_idx, logical, tpb, core.compress_ratio
             )
@@ -7382,9 +7428,12 @@ def _decode_index_scores(
     grouped = rows >= _INDEX_GROUP_MIN_ROWS or (core.tep_fast and rows in _TEP_INDEX_GROUP_ROWS)
     rpr = p if p > 1 and grouped else 1
     if getattr(core, "index_key_fp8", False):
+        # `DP_SCORES_EARLY_ENV`: behind the prologue the anchor convert released its dependents
+        # at its top, and the flat grid launches early (ignored by the other kernels).
+        kw = {"early": True} if behind_prologue and getattr(core, "dp_scores_early", False) else {}
         return qsa_index_scores_fp8(
             q, index_cache, block_table, logical, req_idx, tpb, core.compress_ratio, True, False,
-            p if p > 1 else 1,
+            p if p > 1 else 1, **kw,
         )  # fmt: skip
     if (
         rpr > 1
@@ -9528,7 +9577,13 @@ class DecodeTarget:
                 rows_per_request=step["predicted_tokens_per_seq"],
             )
             _index_anchors_fp8(
-                core, pools.index_cache[i], block_table, req_idx, logical, tokens_per_block
+                core,
+                pools.index_cache[i],
+                block_table,
+                req_idx,
+                logical,
+                tokens_per_block,
+                use_pdl=getattr(core, "dp_scores_early", False),
             )
         else:
             _, k_dst, v_dst = _attn_in_heads(core, proj)

@@ -60,6 +60,8 @@ def build(spec, seed):
         context_rows=spec["context_rows"],
         rows_per_request=spec["rows_per_request"],
     )
+    if spec.get("early"):
+        args["early"] = True
     return args, bf16_keys, (every, owners)
 
 
@@ -164,3 +166,39 @@ def test_flat_is_bitwise_the_group_kernel(requests, rpr):
     for r in range(flat.shape[0]):
         v = (int(args["query_positions"][r]) + 1) // RATIO
         assert torch.equal(flat[r, :v], group[r, :v])
+
+
+@pytest.mark.parametrize(
+    "requests, rpr",
+    [
+        (tuple((900 + 7919 * r, 4) for r in range(12)), 4),  # dep verify, 12 runs of 4
+        (tuple((300 + 997 * r, 4) for r in range(64)), 4),  # 256 rows, the most it serves
+        (tuple((5, 4) for _ in range(3)), 4),  # fewer tiles than programs: early exits wait too
+    ],
+    ids=["verify12", "verify64", "short"],
+)
+def test_early_is_bitwise_the_default_flat_launch(requests, rpr):
+    """The early launch behind a PDL anchor convert (the trunk verify's chain): the convert
+    writes the anchors the scores then read, so a read before the wait would show as other
+    bits; eager and under graph replay with fresh anchors."""
+    spec = _module._scores_spec(requests=requests, rows_per_request=rpr, table=8196)
+    args, bf16_keys, (every, owners) = build(spec, seed=17)
+    want = qsa_index_scores_fp8(**args)
+    plane = args["index_cache"]
+
+    def chain():
+        plane.copy_(bf16_keys)
+        index_anchors_to_fp8(plane, args["block_table"], owners, every.long(), TPB, RATIO, True)
+        return qsa_index_scores_fp8(**args, early=True)
+
+    got = chain()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = chain()
+    graph.replay()
+    torch.cuda.synchronize()
+    for out in (got, captured):
+        for r in range(out.shape[0]):
+            v = (int(args["query_positions"][r]) + 1) // RATIO
+            assert torch.equal(out[r, :v], want[r, :v])

@@ -456,9 +456,9 @@ _DEP8 = dict(
 # heads' group over the NVLink domain, the low-row floors at 2 requests a rank, and the dep8
 # front's decode fusions:
 # the MoE-side site folded into the output projection at every row count with the 6-way plan at
-# MMA N 32; as
+# MMA N 32, and the trunk verify's index scores launched early behind a PDL anchor convert; as
 # the dep8 front ran them). FP8 at dep4 once more with those fusions alone on top of the bf16
-# output projections and the host-indexed Lamport slots (SM103 only).
+# output projections, the e4m3 index anchors and the host-indexed Lamport slots (SM103 only).
 _DP_FRONT_STACK = dict(
     lamport="lamport_step",
     router_front=True,
@@ -513,7 +513,7 @@ _QUANTIZED_KV = [
     pytest.param(
         _DEP4,
         "fp8",
-        dict(lamport="lamport_step", out_proj_bf16="all", dp_fuse=True),
+        dict(lamport="lamport_step", out_proj_bf16="all", index_key_fp8=True, dp_fuse=True),
         id="dep4_fp8_kv_dp_fuse",
         marks=pytest.mark.skipif(
             get_sm_version() != 103,
@@ -1035,6 +1035,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         if variant.get("dp_fuse"):
             env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_INJECT"] = "all"
             env["TRTLLM_QWEN4_EXP_DP_SITEB_PLAN32"] = "1"
+            env["TRTLLM_QWEN4_EXP_DP_SCORES_EARLY"] = "1"
         if variant.get("dp8_domain"):
             env["TRTLLM_QWEN4_EXP_DP_HEAD_SHARD_GROUP"] = "domain"
             env["TRTLLM_QWEN4_EXP_DP_LOWROWS"] = "2"
