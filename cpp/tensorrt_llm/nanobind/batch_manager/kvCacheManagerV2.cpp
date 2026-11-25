@@ -2314,6 +2314,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("reuse_status", &kv::KvCache::reuseStatus, nb::rv_policy::copy)
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
+        .def("_get_num_reusable_tokens_before_alignment", &kv::KvCache::numReusableTokensBeforeAlignment)
         // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist)

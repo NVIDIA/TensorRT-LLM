@@ -86,6 +86,34 @@ protected:
     cudaStream_t mStream{};
 };
 
+TEST_F(ReplayCacheTest, MatchReportsTheReuseAlignmentGivesUp)
+{
+    // makeConfig(): 4-token blocks. Two committed blocks, matched with a 1-token backoff,
+    // leave 7 reusable tokens; aligning to whole blocks rounds that down to 4.
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    std::vector<TokenIdExt> tokens;
+    for (int i = 0; i < 8; ++i)
+    {
+        tokens.emplace_back(TokenId{i});
+    }
+    TokenSpan const span{tokens.data(), static_cast<int>(tokens.size())};
+    {
+        auto source = manager->createKvCache({}, span, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(span);
+        source->close();
+    }
+    auto const& tree = manager->radixTree();
+    auto const aligned = tree.match({}, span, false, false, /*backoff=*/1, false, /*alignment=*/4);
+    EXPECT_EQ(aligned.numTokens, 4);
+    EXPECT_EQ(aligned.numReusableTokensBeforeAlignment, 7);
+    auto const unaligned = tree.match({}, span, false, false, /*backoff=*/1, false, /*alignment=*/1);
+    EXPECT_EQ(unaligned.numTokens, 7);
+    EXPECT_EQ(unaligned.numReusableTokensBeforeAlignment, 7);
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, GlobalReuseKeepsPrivateAttentionUnpublished)
 {
     for (int length : {23, 24})

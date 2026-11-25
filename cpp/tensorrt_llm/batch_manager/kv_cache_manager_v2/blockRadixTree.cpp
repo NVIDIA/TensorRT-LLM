@@ -1110,8 +1110,16 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, T
         numReusableTokensBeforeHybridPruning
             = numMatchedTokens(pruneMatch(rawMatched, std::nullopt, alignment), mTokensPerBlock);
     }
+    // Diagnostic only: the same pruning without alignment, to report the local reuse
+    // that alignment gives up. Only a whole-block connector's managers pay for it.
+    std::optional<int> numReusableTokensBeforeAlignment;
+    if (alignment > 1)
+    {
+        numReusableTokensBeforeAlignment = numMatchedTokens(pruneMatch(rawMatched, ssmLcId, 1), mTokensPerBlock);
+    }
     auto matched = pruneMatch(std::move(rawMatched), ssmLcId, alignment);
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
+    result.numReusableTokensBeforeAlignment = numReusableTokensBeforeAlignment.value_or(result.numTokens);
     result.numLookupTokens = static_cast<int>(tokens.size());
     result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
     result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
