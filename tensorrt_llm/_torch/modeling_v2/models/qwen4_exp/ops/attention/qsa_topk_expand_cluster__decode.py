@@ -359,7 +359,10 @@ class _TopkExpandClusterKernel:
 
         # 3. Block order within the CTA (slot j of every thread, then slot j + 1): each
         # (thread, slot)'s counts above and in the class, packed (above + class << 16), and their
-        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip).
+        # exclusive prefix. Slots past `q4` hold no keys in any thread (uniform skip). Each half
+        # is below 2^16 (a CTA's keys), but the class half can pass 2^15 in a cluster of 2 (up
+        # to 33280 keys a CTA): the Int32 sums then wrap into the sign bit, so the class half is
+        # read back with a mask, never with the arithmetic shift alone.
         pre = cute.make_rmem_tensor(cute.make_layout((G,), stride=(1,)), cutlass.Int32)
         pre.fill(0)
         for j in cutlass.range_constexpr(G):
@@ -407,7 +410,7 @@ class _TopkExpandClusterKernel:
         for rr in cutlass.range_constexpr(C):
             r = C - 1 - rr
             tot = ex[r]
-            e_r = tot >> 16
+            e_r = (tot >> 16) & 0xFFFF
             take = cutlass.max(cutlass.min(need - later, e_r), cutlass.Int32(0))
             later = later + e_r
             if r < rank:
@@ -419,7 +422,7 @@ class _TopkExpandClusterKernel:
         for j in cutlass.range_constexpr(G):
             gl = g_lo + j * nt + tidx
             ab = pre[j] & 0xFFFF
-            cb = pre[j] >> 16
+            cb = (pre[j] >> 16) & 0xFFFF
             for c in cutlass.range_constexpr(KPT):
                 kv = keys[c, j]
                 if kv >= 0:
@@ -662,6 +665,18 @@ class QsaTopkExpandClusterDecode(OpWrapper):
                 rows=208,
                 requests=tuple((5000 + 4800 * r, 4) for r in range(52)),
                 lognormal=True,
+                width=_TUNE_WIDTH,
+                max_rows=PAIR_MAX_ROWS,
+            ),
+        ),
+        Cell(
+            why="40 rows of equal scores at the table's deepest windows (65568..65529 blocks) in "
+            "clusters of 2: a CTA's tie class holds up to 32784 keys, past the packed counts' "
+            "2^15 (their sign bit)",
+            spec=dict(
+                rows=40,
+                pos=tuple(262271 - 4 * r for r in range(40)),
+                equal=True,
                 width=_TUNE_WIDTH,
                 max_rows=PAIR_MAX_ROWS,
             ),
