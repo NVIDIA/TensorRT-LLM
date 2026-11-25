@@ -279,3 +279,35 @@ def test_first_entry_below_its_rows(rows):
     ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 7)
     excess = ((got.double() - ref).abs() - 0.5 * ulp).clamp_min(0) / absref.clamp_min(1e-30)
     assert excess.max().item() < 1e-5
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env, built, warned",
+    [
+        ({"DP_OUT_PROJ_BF16_ROWSLO": "5"}, dict(out=None), ["DP_OUT_PROJ_BF16_ROWSLO"]),
+        ({"DP_OUT_PROJ_BF16_ROWSLO": "5"}, dict(out={}), []),
+        ({"DP_LOWROWS": "2"}, dict(tiles=False, inproj=None), ["DP_LOWROWS"]),
+        ({"DP_LOWROWS": "2"}, dict(tiles=True, inproj=None), []),
+        ({"DP_LOWROWS": "2"}, dict(tiles=False, inproj={0: {}}), []),
+        ({}, dict(out=None, tiles=False, inproj=None), []),
+    ],
+)
+def test_row_floors_ignored_warn(monkeypatch, env, built, warned):
+    """A row-floor switch set while the form it lowers is not engaged leaves one warning in the
+    engine log, as the other declines do."""
+    for name in ("DP_OUT_PROJ_BF16_ROWSLO", "DP_LOWROWS"):
+        monkeypatch.delenv(f"TRTLLM_QWEN4_EXP_{name}", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(f"TRTLLM_QWEN4_EXP_{name}", value)
+    core = SimpleNamespace(
+        _out_proj=built.get("out"),
+        hc_tiles=built.get("tiles", False),
+        _inproj_release=built.get("inproj"),
+    )
+    got = []
+    monkeypatch.setattr(M.logger, "warning", got.append)
+    M._warn_dp_row_floors_ignored(core)
+    assert len(got) == len(warned)
+    for line, name in zip(got, warned):
+        assert line.startswith(f"TRTLLM_QWEN4_EXP_{name} is set but ignored")

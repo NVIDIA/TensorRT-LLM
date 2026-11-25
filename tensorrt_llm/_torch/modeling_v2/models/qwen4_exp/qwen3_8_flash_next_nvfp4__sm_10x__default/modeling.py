@@ -1893,6 +1893,36 @@ _HC_FIRST_X2_ROWS = _HC_ROWSN_ROWS  # capacity: fixed: dispatch thresholds
 DP_INPROJ_RELEASE_ENV = "TRTLLM_QWEN4_EXP_DP_INPROJ_RELEASE"
 #: Rows a rank at which the switch above can engage (`mid_rows_mm`'s rows past the GEMV's).
 _INPROJ_RELEASE_ROWS = (17, 256)  # capacity: fixed: dispatch thresholds
+#: Off by default. `<r>` (2..4 requests a rank): two bitwise attention-DP decode forms also serve
+#: r..4 requests (4 r..16 rows; from 5 rows the hc first kernel's default plan has the K split
+#: the rows-on-N kernel keeps): the input projections behind a releasing site A
+#: (`DP_INPROJ_RELEASE_ENV`, its first plan; its build self-check still gates every row count)
+#: and the rows-on-N hc first kernel for a mixer with the injection (`DP_HC_TILES_ENV`, in place
+#: of the 64-row tile; the same K slices in the same order). Measured on dep8 at 3 requests a
+#: rank with r = 2, as part of a -0.33 ms step whose other row floors belong to forms not in
+#: this target. Read once, when the target is built.
+DP_LOWROWS_ENV = "TRTLLM_QWEN4_EXP_DP_LOWROWS"
+#: The most rows the lowered floors reach below their own ranges: 4 requests a rank.
+_DP_LOWROWS_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
+
+
+def _dp_lowrows() -> int | None:
+    """`DP_LOWROWS_ENV`: the lowest request count a rank, or None (unset, empty, off)."""
+    raw = os.environ.get(DP_LOWROWS_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return None
+    if value.isdigit() and 2 <= int(value) <= 4:
+        return int(value)
+    raise ValueError(f"{DP_LOWROWS_ENV}={raw!r}: expected 0 or 2..4 requests a rank")
+
+
+def _dp_lowrows_floor(base: int) -> int:
+    """`base` lowered to `DP_LOWROWS_ENV`'s rows (4 a request), or `base` where it is off."""
+    r = _dp_lowrows()
+    return base if r is None else min(base, 4 * r)
+
+
 #: Measured plans of the bf16 GEMM behind a releasing site A (GB300 dep4 trunk-loop micro at 28 /
 #: 48 / 96 / 120 / 224 rows, 13 plan sets): weight geometry `(N, K)` -> `((largest rows, MMA N
 #: rule, Plan(ks, kpb, stages, l2, epi)), ...)`. MMA N rule "op": `mid_rows_mm`'s (32 / 64 / 128 /
@@ -2165,6 +2195,23 @@ def _draft_o(core, attn, weight_t):
     return mid_mm_raw(attn, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
 
 
+def _warn_dp_row_floors_ignored(core) -> None:
+    """After the attention-DP decode forms are built: one warning for each row-floor switch that is
+    set but rides on a form that is not engaged (`DP_OUT_PROJ_BF16_ROWSLO_ENV` on
+    `DP_OUT_PROJ_BF16_ENV`; `DP_LOWROWS_ENV` on `DP_HC_TILES_ENV` or `DP_INPROJ_RELEASE_ENV`), so
+    the engine log shows it as the other declines do. Validates both values."""
+    if _out_proj_rowslo() is not None and core._out_proj is None:
+        logger.warning(
+            f"{DP_OUT_PROJ_BF16_ROWSLO_ENV} is set but ignored: it rides on "
+            f"{DP_OUT_PROJ_BF16_ENV}, which is not engaged"
+        )
+    if _dp_lowrows() is not None and not (core.hc_tiles or core._inproj_release):
+        logger.warning(
+            f"{DP_LOWROWS_ENV} is set but ignored: it lowers {DP_HC_TILES_ENV} and "
+            f"{DP_INPROJ_RELEASE_ENV}, neither of which is engaged"
+        )
+
+
 def _out_proj(core, x, weight_t, site: str, dense):
     """An output projection of a decode step: `DP_OUT_PROJ_BF16_ENV`'s GEMM at a row count its
     table serves for `site` (`weight_t` the `.t()` view of the checkpoint's `[N, K]` weight,
@@ -2281,7 +2328,10 @@ def _hc_tiles_build(core, device) -> bool:
         return False
     try:
         hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64=True)
-        bns = sorted({-(-r // 16) * 16 for r in range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1)})
+        core.hc_rowsn_lo = _dp_lowrows_floor(_HC_ROWSN_ROWS[0])
+        rowsn = set(range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1))
+        rowsn |= set(range(core.hc_rowsn_lo, _DP_LOWROWS_MAX_ROWS + 1))
+        bns = sorted({-(-r // 16) * 16 for r in rowsn})
         hc_tc_first_precompile_rowsn(core.stream, core.hc_lowrank, core.hc_count, device, bns)
         variants = [(False, 64), (True, 64), (True, 128)]
         hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, variants)
@@ -2294,7 +2344,13 @@ def _hc_tiles_build(core, device) -> bool:
     logger.info(
         f"hc mixer plans: rank {core.dp_rank} of {core.dp_size}, 64-row tiles at "
         f"{_HC_TILE64_ROWS[0]}..{_HC_TILE64_ROWS[1]} rows, rows on N at {_HC_ROWSN_ROWS[0]}.."
-        f"{_HC_ROWSN_ROWS[1]}, two up tiles at {_HC_UP2_ROWS[0]}..{_HC_UP2_ROWS[1]}"
+        f"{_HC_ROWSN_ROWS[1]}"
+        + (
+            f" and {core.hc_rowsn_lo}..{_DP_LOWROWS_MAX_ROWS}"
+            if core.hc_rowsn_lo <= _DP_LOWROWS_MAX_ROWS
+            else ""
+        )
+        + f", two up tiles at {_HC_UP2_ROWS[0]}..{_HC_UP2_ROWS[1]}"
     )
     return True
 
@@ -2358,16 +2414,19 @@ def _inproj_release_build(core, device) -> dict | None:
     trunk layer whose input projection is a bf16 `[N, K]` weight with a plan at the CUDA-graph
     row counts and no other decode copy (`_mid`, packed FP8 / NVFP4: tp1 only today). Every
     entry's GEMM is compiled here and compared with the stock entry on this rank's weight over
-    one random activation a row count; a difference anywhere, or a GEMM that does not compile or
-    run, leaves the switch off at this rank (one warning; the release is rank-local, so no other
-    rank needs to agree). None where it is off or cannot take effect."""
+    one random activation a row count; a difference at a row count only `DP_LOWROWS_ENV` adds
+    drops that row count (one warning); a difference anywhere else, or a GEMM that does not
+    compile or run, leaves the switch off at this rank (one warning; the release is rank-local,
+    so no other rank needs to agree). None where it is off or cannot take effect."""
     if not (
         _switch(DP_INPROJ_RELEASE_ENV, default=True)
         and _dp_decode_rank(core, device)
         and _DECODE_PROJ_PDL
     ):
         return None
-    rows_list = _graph_rows(core, *_INPROJ_RELEASE_ROWS)
+    rows_list = _graph_rows(
+        core, _dp_lowrows_floor(_INPROJ_RELEASE_ROWS[0]), _INPROJ_RELEASE_ROWS[1]
+    )
     table: dict = {}
     gen = torch.Generator(device=device).manual_seed(20261125)
     checked = {}
@@ -2399,22 +2458,38 @@ def _inproj_release_build(core, device) -> dict | None:
             try:
                 x = torch.randn(max(ents), geom[1], generator=gen, device=device)
                 x = x.to(torch.bfloat16)
-                bad = 0
+                low_bad, n_bad = [], 0
                 for rows, ent in ents.items():
                     got = _inproj_mm(x[:rows], ent)
                     ref = stock(x[:rows], w.t())
-                    bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
-                checked[geom] = f"differs from the stock entry in {bad} elements" if bad else ""
+                    n = int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+                    if n and rows < _INPROJ_RELEASE_ROWS[0]:
+                        # A row count only `DP_LOWROWS_ENV` adds: it alone keeps the stock forms,
+                        # so that opt-in never turns the default rows off.
+                        low_bad.append(rows)
+                    else:
+                        n_bad += n
+                bad = f"differs from the stock entry in {n_bad} elements" if n_bad else ""
             except Exception as e:  # noqa: BLE001 -- declined like a GEMM that differs
-                checked[geom] = f"raised {type(e).__name__}: {e}"
-        if checked[geom]:
+                bad, low_bad = f"raised {type(e).__name__}: {e}", []
+            checked[geom] = (bad, low_bad)
+            if low_bad:
+                logger.warning(
+                    f"{DP_LOWROWS_ENV}: the bf16 mid-rows GEMM of a {geom[0]} x {geom[1]} input "
+                    f"projection differs from the stock entry at rows {low_bad} on rank "
+                    f"{core.dp_rank}; those row counts keep the stock forms"
+                )
+        if checked[geom][0]:
             logger.warning(
                 f"{DP_INPROJ_RELEASE_ENV}: the bf16 mid-rows GEMM of a {geom[0]} x {geom[1]} "
-                f"input projection {checked[geom]} at rank {core.dp_rank}; every site and input "
+                f"input projection {checked[geom][0]} at rank {core.dp_rank}; every site and input "
                 "projection keeps the stock forms"
             )
             return None
-        table[i] = ents
+        for rows in checked[geom][1]:
+            ents.pop(rows)
+        if ents:
+            table[i] = ents
     if not table:
         return None
     try:
@@ -3136,6 +3211,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
                 _dp_decode_rank(self, device)
             )
+            _warn_dp_row_floors_ignored(self)
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
             _route_front_build(self, self._decode._layers, device)
@@ -4906,8 +4982,12 @@ def _hc_first(core, normed, first, with_inject):
     rows = normed.shape[0]
     if rows <= _HC_TC_FIRST_MAX_ROWS:
         if core.hc_tiles:
-            if with_inject and _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1]:
-                if getattr(core, "hc_first_x2", False):
+            rowsn_lo = getattr(core, "hc_rowsn_lo", _HC_ROWSN_ROWS[0])
+            rowsn = _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1] or (
+                rowsn_lo <= rows <= _DP_LOWROWS_MAX_ROWS
+            )
+            if with_inject and rowsn:
+                if getattr(core, "hc_first_x2", False) and rows >= _HC_ROWSN_ROWS[0]:
                     return qwen4_exp_hc_decode_tc_first(
                         normed, first, core.hc_lowrank, core.hc_count, True, tm64x2=True
                     )

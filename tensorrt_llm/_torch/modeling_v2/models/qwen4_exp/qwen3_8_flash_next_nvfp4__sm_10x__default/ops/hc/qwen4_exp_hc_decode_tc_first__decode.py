@@ -1007,7 +1007,9 @@ def hc_decode_tc_first(normed, first, rank, hc_count, with_inject, bn, ks, tm=12
 #: GB300 micro, us a site against the 128-row tile: -0.55 to -0.60 at 65..80 rows (MMA N
 #: 80), -0.14 to -0.23 at 81..96 (N 96), slower from 97 rows.
 ROWSN_PLAN = (16, 64)
-#: Rows the rows-on-N kernel serves (`Qwen4ExpHcDecodeTcFirst(..., rows_on_n=True)`).
+#: Rows the rows-on-N kernel serves in place of the 128-row tile (`Qwen4ExpHcDecodeTcFirst(...,
+#: rows_on_n=True)`). It takes any row count up to its last (MMA N from 16); the target also runs
+#: it at 8..16 rows in place of the 64-row tile under an opt-in.
 ROWSN_ROWS = (65, 96)
 
 _COMPILED_ROWSN: dict = {}
@@ -1206,6 +1208,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
             (65, True, dict(rows_on_n=True), "rows on N, 65 rows: MMA N 80"),
             (80, True, dict(rows_on_n=True), "rows on N, 80 rows: dep8 at 20 requests a rank"),
             (96, True, dict(rows_on_n=True), "rows on N, 96 rows: MMA N 96, the last it serves"),
+            (8, True, dict(rows_on_n=True), "rows on N, 8 rows: MMA N 16, dep8 at 2 requests"),
             (65, True, dict(tm64x2=True), "two 64-row tiles, 8-way K, 65 rows: the first"),
             (80, True, dict(tm64x2=True), "two 64-row tiles, 80 rows: dep8 at 20 requests a rank"),
             (96, True, dict(tm64x2=True), "two 64-row tiles, 96 rows: dep8 at 24 requests"),
@@ -1316,7 +1319,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     ) -> None:
         rows, k = normed.shape
         assert tm == 128 or (tm == 64 and rows <= TILE64_MAX_ROWS), "tm: 128, or 64 up to 64 rows"
-        assert not rows_on_n or ROWSN_ROWS[0] <= rows <= ROWSN_ROWS[1], "rows on N: 65..96 rows"
+        assert not rows_on_n or 1 <= rows <= ROWSN_ROWS[1], "rows on N: 1..96 rows"
         assert not tm64x2 or TILE64X2_ROWS[0] <= rows <= TILE64X2_ROWS[1], (
             "two 64-row tiles: 65..128 rows"
         )

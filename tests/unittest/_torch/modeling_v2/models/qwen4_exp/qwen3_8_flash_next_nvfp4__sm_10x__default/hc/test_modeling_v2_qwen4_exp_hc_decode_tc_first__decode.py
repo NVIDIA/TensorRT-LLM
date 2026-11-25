@@ -118,7 +118,7 @@ def test_tile64_is_bitwise_the_default_plan(rows, inject) -> None:
         assert (a is None) == (b is None) and (a is None or torch.equal(a, b))
 
 
-@pytest.mark.parametrize("rows", [65, 72, 80, 81, 88, 96])
+@pytest.mark.parametrize("rows", [5, 8, 12, 16, 65, 72, 80, 81, 88, 96])
 def test_rows_on_n_is_bitwise_the_default_plan(rows) -> None:
     """The rows-on-N kernel (65..96 rows, MMA N rounded up to 16) gives the 128-row tile's
     bits for a mixer with the injection, eagerly and replayed."""
@@ -140,7 +140,7 @@ def test_rows_on_n_is_bitwise_the_default_plan(rows) -> None:
 
 def test_guard_refuses_rows_on_n_outside_its_rows() -> None:
     normed, first, rank, c, wi = _build(dict(rows=97), seed=7)
-    with validating(op), pytest.raises(AssertionError, match="rows on N"):
+    with validating(op), pytest.raises(AssertionError, match="rows on N: 1..96"):
         op(normed, first, rank, c, wi, rows_on_n=True)
 
 

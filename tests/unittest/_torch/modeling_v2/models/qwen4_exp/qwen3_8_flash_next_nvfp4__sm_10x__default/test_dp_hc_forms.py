@@ -369,3 +369,94 @@ def test_inproj_release_gemm_is_bitwise_the_stock_entry(geom):
         torch.cuda.synchronize()
         bad = int((got.view(torch.int16) != ref.view(torch.int16)).sum())
         assert bad == 0, f"{geom} at {rows} rows (MMA N {mpad}): {bad} elements differ"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value, floor", [(None, None), ("0", None), ("2", 8), ("4", 16)])
+def test_lowrows_value(monkeypatch, value, floor):
+    if value is None:
+        monkeypatch.delenv(M.DP_LOWROWS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_LOWROWS_ENV, value)
+    assert M._dp_lowrows_floor(17) == (17 if floor is None else floor)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("value", ["1", "5", "on"])
+def test_lowrows_rejects_another_value(monkeypatch, value):
+    monkeypatch.setenv(M.DP_LOWROWS_ENV, value)
+    with pytest.raises(ValueError, match=M.DP_LOWROWS_ENV):
+        M._dp_lowrows()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rows, inject, first_kw",
+    [
+        (4, True, {}),  # below the floor: the 10-way split stays
+        (8, True, {"rows_on_n": True}),
+        (16, True, {"rows_on_n": True}),
+        (8, False, {"tm": 64}),  # rows on N serves a mixer with the injection only
+        (17, True, {"tm": 64}),  # past the lowered band: the 64-row tile again
+        (65, True, {"rows_on_n": True}),
+    ],
+)
+def test_lowrows_rows_on_n_band(monkeypatch, rows, inject, first_kw):
+    calls = _first_recorder(monkeypatch)
+    core = _core(True)
+    core.hc_rowsn_lo = 8
+    M._hc_first(core, torch.zeros(rows, 16), None, inject)
+    assert calls == [("first", inject, first_kw)]
+
+
+@pytest.mark.cpu_only
+def test_lowrows_rows_on_n_band_with_two_tiles(monkeypatch):
+    """`DP_HC_FIRST_X2_ENV` replaces rows on N at its own rows only, not in the lowered band."""
+    calls = _first_recorder(monkeypatch)
+    core = _core(True, x2=True)
+    core.hc_rowsn_lo = 8
+    M._hc_first(core, torch.zeros(12, 16), None, True)
+    M._hc_first(core, torch.zeros(72, 16), None, True)
+    assert [c[2] for c in calls] == [{"rows_on_n": True}, {"tm64x2": True}]
+
+
+@pytest.mark.cpu_only
+def test_lowrows_hc_tiles_build_compiles_the_band(monkeypatch):
+    bns = []
+    monkeypatch.setattr(M, "hc_tc_first_precompile", lambda *a, **k: None)
+    monkeypatch.setattr(M, "hc_tc_first_precompile_rowsn", lambda *a: bns.extend(a[4]))
+    monkeypatch.setattr(M, "hc_up_precompile", lambda *a, **k: None)
+    monkeypatch.setattr(M, "_dp_decode_rank", lambda core, device: True)
+    monkeypatch.setenv(M.DP_LOWROWS_ENV, "2")
+    core = SimpleNamespace(
+        stream=10240, hc_lowrank=320, hc_count=4, hidden=2560, dp_rank=0, dp_size=8
+    )
+    assert M._hc_tiles_build(core, torch.device("cpu"))
+    assert core.hc_rowsn_lo == 8 and bns == [16, 80, 96]
+
+
+@pytest.mark.cpu_only
+def test_lowrows_inproj_release_build(monkeypatch):
+    """`DP_LOWROWS_ENV=2`: graph rows 8 (4 x 2) take the first plan too; 4 rows stay out."""
+    monkeypatch.setenv(M.DP_LOWROWS_ENV, "2")
+    table = _release_build(monkeypatch, _release_core())
+    assert sorted(table[0]) == [8, 16, 28, 48, 256]
+    assert (table[0][8].mpad, table[0][8].plan) == (32, M.MidPlan(1, 8, 5, 2, 16))
+
+
+@pytest.mark.cpu_only
+def test_lowrows_self_check_drops_only_the_lowered_rows(monkeypatch):
+    """A row count only `DP_LOWROWS_ENV` adds that differs from the stock entry keeps the stock
+    forms alone: the default rows stay on (the opt-in never turns the default switch off)."""
+    monkeypatch.setenv(M.DP_LOWROWS_ENV, "2")
+    warned = []
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    table = _release_build(monkeypatch, _release_core(bad_rows=(8,)))
+    assert sorted(table[0]) == [16, 28, 48, 256] and sorted(table[1]) == [16, 28, 48, 256]
+    # One warning a weight geometry (the GDN and attention input projections).
+    assert len(warned) == 2
+    assert all(M.DP_LOWROWS_ENV in w and "[8]" in w for w in warned)
+    # A default row count that differs still leaves the whole switch off.
+    warned.clear()
+    assert _release_build(monkeypatch, _release_core(bad_rows=(8, 48))) is None
+    assert any(M.DP_INPROJ_RELEASE_ENV in w for w in warned)
