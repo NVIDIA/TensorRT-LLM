@@ -487,7 +487,6 @@ l0_b200:
   - unittest/_torch/visual_gen/test_quant_ignore_runtime.py::test_native_linear_instances_keep_fusions_and_survive_offload
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore_compile_cuda_graph TIMEOUT (30)
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore[attention_cutedsl_step] TIMEOUT (20)
-  - visual_gen/test_quant_ignore.py::test_ltx2_two_stage_linear_step_ignore_compile_cuda_graph TIMEOUT (40)
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_attention_deco.py
@@ -619,6 +618,7 @@ l0_b200:
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore[attention_flashinfer_step] TIMEOUT (20)
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore[attention_trtllm_sage_layer] TIMEOUT (20)
   - visual_gen/test_quant_ignore.py::test_flux2_quant_ignore[attention_cudnn_layer] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_ltx2_two_stage_linear_step_ignore_compile_cuda_graph TIMEOUT (40)
 - condition:
     ranges:
       system_gpu_count:
