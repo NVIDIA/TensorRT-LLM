@@ -10893,10 +10893,14 @@ class _DpShardDraftHead:
         return out
 
 
+@torch.no_grad()
 def _dp_head_shard_check(group, lm_head, counts) -> list:
     """The row counts in `counts` at which this rank's slice logits (the group's GEMM over
     `group_size * rows` test rows) differ in any bit from the full head called `rows` rows at a
-    time, as each rank calls it. On this rank alone; also the slice GEMM's warm-up."""
+    time, as each rank calls it. On this rank alone; also the slice GEMM's warm-up.
+
+    Without grad: it runs in `post_load_weights`, outside the executor's inference mode, where
+    the head's weight still requires grad and `torch.mm(..., out=)` refuses such an input."""
     bad = []
     g, lo, n = group.group_size, group.vocab_offset, group.local_vocab
     dev = group.weight.device

@@ -307,6 +307,27 @@ def test_build_agrees_when_a_group_is_missing(monkeypatch, where):
     assert shell.spec_worker.draft_head is None
 
 
+def test_check_runs_with_grad_on_and_a_weight_that_requires_grad():
+    """The build check runs in `post_load_weights`, with grad mode on, over the head's weight,
+    which still requires grad there: its `torch.mm(..., out=)` must not see autograd (dep8 GSM8K
+    on the full-stack3 image: `mm(): functions with out=... arguments don't support automatic
+    differentiation`, so the heads were declined on every rank)."""
+    vocab, hidden, g, lo, n = 16, 8, 2, 8, 8
+    full = torch.nn.Parameter(torch.randn(vocab, hidden).to(torch.bfloat16))
+    assert full.requires_grad and torch.is_grad_enabled()
+    group = SimpleNamespace(
+        group_size=g,
+        vocab_offset=lo,
+        local_vocab=n,
+        hidden=hidden,
+        rank=1,
+        weight=full[lo : lo + n],
+        slice_logits=torch.empty(g * 4, n, dtype=torch.bfloat16),
+    )
+    bad = M._dp_head_shard_check(group, lambda x: x @ full.t(), [1, 4])
+    assert set(bad) <= {1, 4}
+
+
 def test_build_off(monkeypatch):
     monkeypatch.delenv(M.DP_HEAD_SHARD_ENV, raising=False)
     assert M._dp_head_shard_build(_build_shell(), torch.device("cpu")) is None
