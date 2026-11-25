@@ -265,7 +265,8 @@ def _copy_transposed_smem8b_to_gmem(
     headdim = cfg.headdim
     tile_size_q = cfg.tile_size_q
     num_bytes_per_smem_row = Int32(headdim if headdim <= 128 else 128)
-    num_copy_segments = max((tile_size_q * headdim + 2047) // 2048, 1)
+    # STSM covers full physical bands, including a partial logical head tail.
+    num_copy_segments = max((tile_size_q * cfg.swaps_output_head_dim + 2047) // 2048, 1)
     for copy_segment_idx in cutlass.range_constexpr(num_copy_segments):
         base_offset = warp_grp_thread_idx * Int32(16) + Int32(copy_segment_idx * 2048)
         smem_row_idx = base_offset // num_bytes_per_smem_row
@@ -296,7 +297,8 @@ def _copy_transposed_smem8b_to_gmem(
             dst_row_idx,
             seq_len_q,
         )
-        if cutlass.const_expr(full_tile_rows):
+        valid_output_row = valid_output_row & (dst_col_offset < headdim)
+        if cutlass.const_expr(full_tile_rows and cfg.swaps_output_head_dim == headdim):
             smem_src_full = (
                 smem_base_i32.subview((load_smem_offset >> Int32(2)))
             ).data_ptr()

@@ -22,6 +22,7 @@ they run on the CPU CI stage.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,40 @@ def mod():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+def test_collect_multinode_yaml_entries(mod, tmp_path, quote):
+    path = tmp_path / "multinode.yml"
+    path.write_text(
+        "tests:\n"
+        f"  - case: {quote}accuracy/test_model.py::TestModel::test_accuracy[baseline]{quote}\n"
+        "    launch:\n"
+        "      mode: mpi\n"
+        "      world_size: 16\n"
+        f"  - case: {quote}test_e2e.py::test_disagg{quote}\n"
+        "    launch:\n"
+        "      mode: per_node\n"
+        "      nodes: 2\n"
+        "      tasks_per_node: 1\n"
+        "      gpus_per_node: 4\n",
+        encoding="utf-8",
+    )
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not malformed
+    assert dict(entries) == {
+        ("accuracy/test_model.py", "TestModel", "test_accuracy", "baseline"): [f"{path}:2"],
+        ("test_e2e.py", None, "test_disagg", None): [f"{path}:6"],
+    }
+
+
+@pytest.mark.parametrize("value", ["", "   ", "''", '""', "'   '", '"   "'])
+def test_collect_multinode_yaml_blank_case(mod, tmp_path, value):
+    path = tmp_path / "multinode.yml"
+    path.write_text(f"tests:\n  - case: {value}\n", encoding="utf-8")
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not entries
+    assert malformed == [f"{path}:2: case: {value}".rstrip()]
 
 
 def _index(mod, tmp_path, src: str, name: str = "mod_under_test.py"):
@@ -365,6 +400,321 @@ def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
     result = (llm_src / "qa_test.txt").read_text().splitlines()
     assert "accuracy/test_old.py::test_stale[b]" not in result
     assert result == ["accuracy/test_new.py::test_current[a]"]
+
+
+def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    case = "accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_fp8_tp16_mtp3_trtllm"
+    (qa_dir / "multinode.yml").write_text(
+        f"defaults:\n  launch:\n    mode: mpi\n    world_size: 16\ntests:\n  - case: '{case}'\n",
+        encoding="utf-8",
+    )
+    (qa_dir.parent / "waives.txt").write_text(f"{case} SKIP reason\n", encoding="utf-8")
+    collected = []
+
+    def collect(llm_src, path):
+        collected.extend(Path(path).read_text().splitlines())
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_run_collection_pytest", collect)
+    mod.verify_qa_test_lists(str(tmp_path))
+    assert collected == [case]
+    assert (tmp_path / "qa_test.txt").read_text().splitlines() == [case]
+    assert mod.load_collectable_entries(str(tmp_path)) == {mod.parse_test_entry(case)}
+    mod.verify_waive_list(str(tmp_path), mod.argparse.Namespace(l0=False, qa=True))
+    assert not (tmp_path / "nonexits_cases.json").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "[]\n", "test: []\n", "tests: null\n", "tests: {}\n", "tests: invalid\n"],
+    ids=["empty", "sequence", "misspelled-key", "null-tests", "mapping-tests", "scalar-tests"],
+)
+def test_verify_qa_yaml_rejects_invalid_structure(mod, tmp_path, monkeypatch, content):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    test_list = qa_dir / "invalid.yml"
+    test_list.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="expected a mapping with a 'tests' list") as exc:
+        mod.verify_qa_test_lists(str(tmp_path))
+
+    assert str(test_list) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "invalid:\n  - test: []\n",
+        "invalid:\n  - tests: null\n",
+        "invalid:\n  - tests: [123]\n",
+        "tests:\n  - test: test_sample.py::test_case\n",
+    ],
+)
+def test_verify_qa_yaml_rejects_invalid_entries(mod, tmp_path, monkeypatch, content):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / "invalid.yml").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="Invalid QA test list"):
+        mod.verify_qa_test_lists(str(tmp_path))
+
+
+@pytest.mark.parametrize("filename", ["llm_config_database.yml", "llm_spark_func.yml"])
+def test_verify_qa_grouped_yaml(mod, tmp_path, monkeypatch, filename):
+    import yaml
+
+    source = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / filename
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / filename).write_text(source.read_text(), encoding="utf-8")
+    data = yaml.safe_load(source.read_text())
+    expected = [
+        case
+        for group in data[Path(filename).stem]
+        for case in group["tests"]
+        if not case.startswith("perf/")
+    ]
+    collected = []
+
+    def collect(llm_src, path):
+        collected.extend(Path(path).read_text().splitlines())
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_run_collection_pytest", collect)
+    mod.verify_qa_test_lists(str(tmp_path))
+
+    assert collected == expected
+    result = tmp_path / "qa_test.txt"
+    assert (result.read_text().splitlines() if result.exists() else []) == expected
+
+
+def test_list_test_db_names(mod, tmp_path):
+    """Entries from every block are merged, deduplicated and sorted; dynamic perf lists are skipped."""
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\n"
+        "l0_a:\n"
+        "- condition: {terms: {stage: pre_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n"
+        "  - a.py::test_a[x] TIMEOUT (60)\n"
+        "- condition: {terms: {stage: post_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "l0_perf_sanity.yml").write_text(
+        "version: 0.0.1\nl0_ps:\n- condition: {}\n  tests:\n  - perf/test_s.py::test_s\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "llm_perf_core.yml").write_text(
+        "l0_p:\n- tests:\n  - perf/test_p.py::test_p\n", encoding="utf-8"
+    )
+
+    assert mod.list_test_db_names(str(tmp_path)) == [
+        "a.py::test_a[x] TIMEOUT (60)",
+        "b.py::test_b ISOLATION",
+        "perf/test_s.py::test_s",
+    ]
+
+
+VALID_BLOCK = "- condition: {}\n  tests: [a.py::test_a]\n"
+
+
+@pytest.mark.parametrize(
+    "files, error",
+    [
+        pytest.param(
+            {
+                "l0_a.yml": "version: 0.0.1\n"
+                "l0_a:\n"
+                "- condition: {}\n"
+                "  tests: [a.py::test_a]\n"
+                "  tests: [a.py::test_b]\n"
+            },
+            "duplicate key 'tests'",
+            id="duplicate-key",
+        ),
+        pytest.param(
+            {"l0_a.yml": "l0_a:\n" + VALID_BLOCK},
+            "version must be '0.0.1', got None",
+            id="missing-version",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.2\nl0_a:\n" + VALID_BLOCK},
+            "version must be '0.0.1', got '0.0.2'",
+            id="unsupported-version",
+        ),
+        pytest.param(
+            {
+                "l0_a.yml": "version: 0.0.1\nl0_a:\n" + VALID_BLOCK,
+                "l0_b.yml": "version: 0.0.1\nl0_a:\n" + VALID_BLOCK,
+            },
+            "context 'l0_a' is already defined in",
+            id="context-in-two-files",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n  tests: [a.py::test_a]\n"},
+            "context 'l0_a' must be a list of blocks",
+            id="context-not-a-list",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- a.py::test_a\n"},
+            "context 'l0_a' has a non-mapping block",
+            id="block-not-a-mapping",
+        ),
+        pytest.param(
+            {"l0_a.yml": "- a.py::test_a\n"},
+            "expected a mapping at the top level",
+            id="top-level-not-a-mapping",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- tests: [a.py::test_a]\n"},
+            "context 'l0_a' has a block without 'condition'",
+            id="block-without-condition",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- condition: {}\n"},
+            "context 'l0_a' has a block whose 'tests' is not a list",
+            id="block-without-tests",
+        ),
+        pytest.param(
+            {"l0_a.yml": "version: 0.0.1\nl0_a:\n- condition: {}\n  tests:\n"},
+            "context 'l0_a' has a block whose 'tests' is not a list",
+            id="block-with-null-tests",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_invalid_input(mod, tmp_path, files, error):
+    """Input the test-db scheduler rejects fails here instead of being read leniently."""
+    for name, content in files.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(error)):
+        mod.list_test_db_names(str(tmp_path))
+
+
+@pytest.mark.parametrize("condition", ["", "[]", "pre_merge"], ids=["null", "list", "scalar"])
+def test_list_test_db_names_rejects_non_mapping_condition(mod, tmp_path, condition):
+    path = tmp_path / "l0_a.yml"
+    path.write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    error = f"{path}: context 'l0_a' has a block whose 'condition' is not a mapping"
+    with pytest.raises(ValueError, match=re.escape(error)):
+        mod.list_test_db_names(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "condition, error",
+    [
+        ("{terms: [stage]}", "condition.terms must be a mapping"),
+        ("{wildcards: gpu}", "condition.wildcards must be a mapping"),
+        ("{ranges: [4]}", "condition.ranges must be a mapping"),
+        ("{ranges: {system_gpu_count: 4}}", "condition.ranges.system_gpu_count must be a mapping"),
+        ("{match_any: null}", "condition.match_any must be a list of mappings"),
+        (
+            "{match_any: {terms: {stage: pre_merge}}}",
+            "condition.match_any must be a list of mappings",
+        ),
+        ("{match_none: excluded}", "condition.match_none must be a list of mappings"),
+        ("{match_any: [null]}", "condition.match_any[0] must be a mapping"),
+        ("{match_none: [pre_merge]}", "condition.match_none[0] must be a mapping"),
+        (
+            "{match_any: [{ranges: {system_gpu_count: null}}]}",
+            "condition.match_any[0].ranges.system_gpu_count must be a mapping",
+        ),
+        (
+            "{match_none: [{match_any: null}]}",
+            "condition.match_none[0].match_any must be a list of mappings",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_malformed_nested_condition(mod, tmp_path, condition, error):
+    path = tmp_path / "l0_a.yml"
+    path.write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=re.escape(f"{path}: context 'l0_a' {error}")):
+        mod.list_test_db_names(str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "{terms: null, ranges: {}, wildcards: [], match_none: null}",
+        "{ranges: {system_gpu_count: {ge: 4, le: 8}}}",
+        "{match_any: [{terms: {stage: [pre_merge, post_merge]}}, {wildcards: {gpu: 'H*'}}]}",
+        "{match_none: [{terms: {stage: post_merge}}, {ranges: {system_gpu_count: {lt: 4}}}]}",
+    ],
+)
+def test_list_test_db_names_accepts_nested_conditions(mod, tmp_path, condition):
+    (tmp_path / "l0_a.yml").write_text(
+        f"version: 0.0.1\nl0_a:\n- condition: {condition}\n  tests:\n  - a.py::test_a\n",
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["a.py::test_a"]
+
+
+def test_list_test_db_names_accepts_merge_overrides(mod, tmp_path):
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\nl0_a:\n"
+        "- &base\n"
+        "  condition: &filters {terms: {stage: pre_merge}}\n"
+        "  tests:\n  - a.py::test_a\n"
+        "- &override\n"
+        "  <<: *base\n"
+        "  tests:\n  - b.py::test_b\n"
+        "- <<: [*override, *base]\n"
+        "- <<: *override\n"
+        "  condition:\n"
+        "    <<: *filters\n"
+        "    terms: {stage: post_merge}\n",
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["a.py::test_a", "b.py::test_b"]
+
+
+@pytest.mark.parametrize("override", ["", "  tests:\n  - c.py::test_c\n"])
+def test_list_test_db_names_merge_precedence(mod, tmp_path, override):
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\nl0_a:\n"
+        "- <<:\n"
+        "  - condition: {}\n    tests:\n    - a.py::test_a\n"
+        "  - tests:\n    - b.py::test_b\n" + override,
+        encoding="utf-8",
+    )
+    assert mod.list_test_db_names(str(tmp_path)) == ["c.py::test_c" if override else "a.py::test_a"]
+
+
+@pytest.mark.parametrize(
+    "block, duplicate",
+    [
+        (
+            "- <<: {condition: {}, tests: [], tests: []}\n",
+            "tests",
+        ),
+        (
+            "- <<: {condition: {}, tests: []}\n  tests: []\n  tests: []\n",
+            "tests",
+        ),
+        (
+            "- <<: {condition: {}}\n  <<: {tests: []}\n",
+            "<<",
+        ),
+    ],
+)
+def test_list_test_db_names_rejects_duplicate_explicit_keys_with_merge(
+    mod, tmp_path, block, duplicate
+):
+    (tmp_path / "l0_a.yml").write_text("version: 0.0.1\nl0_a:\n" + block, encoding="utf-8")
+    with pytest.raises(ValueError, match=re.escape(f"duplicate key {duplicate!r}")):
+        mod.list_test_db_names(str(tmp_path))
 
 
 # --------------------------------------------------------------------------

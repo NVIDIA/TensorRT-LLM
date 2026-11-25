@@ -22,18 +22,22 @@ import math
 import tempfile
 import unittest
 import unittest.mock
+from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
 from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_gemma4
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import build_gemma_attention_mask
 from tensorrt_llm._torch.models.modeling_gemma4 import (
@@ -533,6 +537,84 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             self.assertEqual(
                 attn.num_key_value_heads, expected_kv_heads, f"Layer {i} kv_heads mismatch"
             )
+
+    def test_variable_window_bounds_reach_attention_backend(self):
+        model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
+        model_config.attn_backend = "TRTLLM"
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+        hidden_states = torch.zeros(4, GEMMA4_SMALL_CONFIG["hidden_size"])
+        qkv = torch.zeros(4, 1)
+        q = torch.zeros(4, 1)
+        k = torch.zeros(4, 1)
+        v = torch.zeros(4, 1)
+        backend_output = torch.zeros_like(hidden_states)
+        starts = torch.tensor([0, 0, 0, 3], dtype=torch.int32)
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+        attn_metadata = SimpleNamespace(
+            num_tokens=4,
+            kv_cache_manager=None,
+            mixed_precision_kv_staging=lambda _: nullcontext(),
+        )
+
+        with (
+            unittest.mock.patch.object(attn.qkv_proj, "forward", return_value=qkv),
+            unittest.mock.patch.object(attn, "preprocess_qkv", return_value=(q, k, v, None, None)),
+            unittest.mock.patch.object(attn, "convert_qkv", return_value=(q, k, v)),
+            unittest.mock.patch.object(
+                attn.attn, "forward", return_value=backend_output
+            ) as backend_forward,
+            unittest.mock.patch.object(attn.o_proj, "forward", return_value=backend_output),
+        ):
+            attn(
+                position_ids=None,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                variable_window_token_starts=starts,
+                variable_window_token_ends=ends,
+            )
+
+        forward_args = backend_forward.call_args.kwargs["forward_args"]
+        self.assertIs(forward_args.variable_window_token_starts, starts)
+        self.assertIs(forward_args.variable_window_token_ends, ends)
+
+    def test_compiled_attention_propagates_variable_window_bounds(self):
+        model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
+        model_config.attn_backend = "TRTLLM"
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+        q = torch.zeros(4, 1)
+        output = torch.zeros_like(q)
+        starts = torch.tensor([0, 0, 0, 3], dtype=torch.int32)
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.is_torch_compiling",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.create_attn_outputs",
+                return_value=[output],
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.maybe_bcg_attn_custom_op_inplace"
+            ) as inplace_attention,
+        ):
+            actual = attn.forward_impl(
+                q,
+                None,
+                None,
+                SimpleNamespace(),
+                PredefinedAttentionMask.CAUSAL,
+                attn.attention_window_size,
+                None,
+                None,
+                variable_window_token_starts=starts,
+                variable_window_token_ends=ends,
+            )
+
+        self.assertIs(actual, output)
+        self.assertIs(inplace_attention.call_args.args[8], starts)
+        self.assertIs(inplace_attention.call_args.args[9], ends)
 
 
 class TestGemma4HfWeightMapper(unittest.TestCase):
@@ -1509,6 +1591,21 @@ class TestGemma4HFComparison(unittest.TestCase):
             config_dict,
             attn_backend="TRTLLM",
         )
+
+    @torch.no_grad()
+    def test_kv_sharing_real_headdim_config(self):
+        """FlashInfer backend: Q-only H256/H512 KV-shared layers (fused q_norm + RoPE) match HF."""
+        config_dict = deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG)
+        config_dict["num_hidden_layers"] = 12
+        config_dict["num_kv_shared_layers"] = 4
+        fused = modeling_gemma4.gemma4_fused_qkv_norm_rope_quant
+        with unittest.mock.patch.object(
+            modeling_gemma4, "gemma4_fused_qkv_norm_rope_quant", wraps=fused
+        ) as spy:
+            self._run_full_model_comparison(config_dict)
+        # The KV-shared layers take the fused Q-only path (num_kv_heads=0), for both head dims.
+        q_only_head_dims = {c.args[8] for c in spy.call_args_list if c.args[7] == 0}
+        self.assertEqual(q_only_head_dims, {256, 512})
 
     @torch.no_grad()
     def test_diff_kv_heads_config(self):
@@ -2610,6 +2707,344 @@ class TestGemma4HFComparison(unittest.TestCase):
         torch.testing.assert_close(mixed_mask.cpu(), expected, rtol=0, atol=0)
 
     @torch.no_grad()
+    def test_variable_window_matches_dense_bidirectional_mask(self) -> None:
+        """Per-token bounds encode the existing Gemma4 mask exactly."""
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        cases = (
+            (8, 5, [0, 1, 1, 1, 0, 2, 2, 3, 0, 1, 1]),
+            (4, 0, [0, 1, 1, 1, 1, 1, 1, 0, 3, 3]),
+            (5, 2, [0, 3, 3, 3, 0, 2, 2, 2, 2, 2, 0]),
+        )
+        for window, prefix_len, types in cases:
+            with self.subTest(window=window, prefix_len=prefix_len, types=types):
+                token_type_ids = torch.tensor(types, dtype=torch.long, device="cuda")
+                expected = model.get_context_mask(
+                    token_type_ids,
+                    effective_sliding_window=window,
+                    prefix_len=prefix_len,
+                )
+                starts, ends = model.get_context_variable_window(
+                    token_type_ids,
+                    effective_sliding_window=window,
+                    prefix_len=prefix_len,
+                )
+                kv_positions = torch.arange(expected.shape[1], device="cuda")
+                actual = (kv_positions.unsqueeze(0) >= starts.unsqueeze(1)) & (
+                    kv_positions.unsqueeze(0) <= ends.unsqueeze(1)
+                )
+
+                self.assertEqual(starts.dtype, torch.int32)
+                self.assertEqual(ends.dtype, torch.int32)
+                self.assertTrue(starts.is_contiguous())
+                self.assertTrue(ends.is_contiguous())
+                torch.testing.assert_close(actual, expected)
+
+    @torch.no_grad()
+    def test_variable_window_packed_requests_keep_local_bounds(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model = (
+            Gemma4ForCausalLM(ModelConfig(pretrained_config=config, attn_backend="TRTLLM"))
+            .to(config.torch_dtype)
+            .to("cuda")
+        )
+
+        request_types = ([0, 1, 1, 0, 3, 3], [0, 2, 2, 2, 0])
+        prefixes = (2, 1)
+        metadata = SimpleNamespace(
+            num_contexts=2,
+            context_lens=torch.tensor([len(types) for types in request_types]),
+            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=prefixes),
+        )
+        token_type_ids = torch.tensor(
+            request_types[0] + request_types[1], dtype=torch.long, device="cuda"
+        )
+        starts, ends = model.get_attention_variable_window(
+            token_type_ids, metadata, effective_sliding_window=5
+        )
+
+        token_offset = 0
+        for types, prefix_len in zip(request_types, prefixes, strict=True):
+            length = len(types)
+            dense_mask = model.get_context_mask(
+                token_type_ids[token_offset : token_offset + length],
+                effective_sliding_window=5,
+                prefix_len=prefix_len,
+            )
+            kv_positions = torch.arange(dense_mask.shape[1], device="cuda")
+            actual = (kv_positions >= starts[token_offset : token_offset + length, None]) & (
+                kv_positions <= ends[token_offset : token_offset + length, None]
+            )
+            torch.testing.assert_close(actual, dense_mask)
+            token_offset += length
+
+    @torch.no_grad()
+    def test_blackwell_routes_bidirectional_mask_to_variable_window(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        token_type_ids = torch.tensor([0, 1, 1, 0], dtype=torch.long, device="cuda")
+        starts = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
+        output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
+        attn_metadata = fake_metadata_type()
+        attn_metadata.num_contexts = 1
+        attn_metadata.padded_num_tokens = None
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                fake_metadata_type,
+            ),
+            unittest.mock.patch.object(
+                model,
+                "get_attention_variable_window",
+                return_value=(starts, ends),
+            ) as get_variable_window,
+            unittest.mock.patch.object(
+                model, "_supports_variable_window_attention", return_value=True
+            ),
+            unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
+            unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
+        ):
+            actual = model(
+                attn_metadata=attn_metadata,
+                inputs_embeds=output,
+                mm_token_type_ids=token_type_ids,
+            )
+
+        self.assertIs(actual, output)
+        get_variable_window.assert_called_once_with(
+            mm_token_type_ids=token_type_ids,
+            attn_metadata=attn_metadata,
+            effective_sliding_window=config.sliding_window,
+        )
+        self.assertIsNone(text_forward.call_args.kwargs["local_attention_mask_data"])
+        self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_starts"], starts)
+        self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_ends"], ends)
+
+    @torch.no_grad()
+    def test_variable_window_probe_uses_attention_output_dtype(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model = (
+            Gemma4ForCausalLM(ModelConfig(pretrained_config=config, attn_backend="TRTLLM"))
+            .to(config.torch_dtype)
+            .to("cuda")
+        )
+        attention = next(layer.self_attn for layer in model.model.layers if layer.is_sliding)
+        backend = attention.attn
+        metadata = SimpleNamespace()
+
+        with (
+            unittest.mock.patch.object(attention, "_use_quantize_output", return_value=True),
+            unittest.mock.patch.object(backend, "use_nvfp4_output", return_value=True),
+            unittest.mock.patch.object(
+                backend, "get_quantize_output_dtype", return_value=torch.uint8
+            ),
+            unittest.mock.patch.object(
+                backend, "_is_variable_window_kernel_available", return_value=True
+            ) as kernel_probe,
+        ):
+            self.assertTrue(model._supports_variable_window_attention(metadata))
+
+        kernel_probe.assert_called_once_with(
+            dtype=config.torch_dtype,
+            output_dtype=torch.uint8,
+            metadata=metadata,
+        )
+
+    @torch.no_grad()
+    def test_variable_window_probe_requires_backend_capability(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model = (
+            Gemma4ForCausalLM(ModelConfig(pretrained_config=config, attn_backend="TRTLLM"))
+            .to(config.torch_dtype)
+            .to("cuda")
+        )
+        attention = next(layer.self_attn for layer in model.model.layers if layer.is_sliding)
+
+        with unittest.mock.patch.object(
+            attention.attn,
+            "_is_variable_window_kernel_available",
+            None,
+        ):
+            self.assertFalse(model._supports_variable_window_attention(SimpleNamespace()))
+
+    @torch.no_grad()
+    def test_sm107_variable_window_uses_dense_bidirectional_mask(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        token_type_ids = torch.tensor([0, 1, 1, 0], dtype=torch.long, device="cuda")
+        dense_mask = torch.ones(4, 4, dtype=torch.bool, device="cuda")
+        output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
+        attn_metadata = fake_metadata_type()
+        attn_metadata.num_contexts = 1
+        attn_metadata.padded_num_tokens = None
+        attn_metadata.tokens_per_block = 32
+        attn_metadata.use_paged_context_fmha = True
+        attn_metadata.max_num_requests = 1
+        attn_metadata.max_context_length = 4
+        attn_metadata.max_seq_len = 4
+        attn_metadata.kv_cache_manager = None
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                fake_metadata_type,
+            ),
+            unittest.mock.patch.object(
+                torch.ops.trtllm, "attention_supports_variable_window", return_value=False
+            ) as support_op,
+            unittest.mock.patch.object(
+                model, "get_attention_variable_window"
+            ) as get_variable_window,
+            unittest.mock.patch.object(
+                model, "get_attention_mask", return_value=dense_mask
+            ) as get_attention_mask,
+            unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
+            unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
+        ):
+            actual = model(
+                attn_metadata=attn_metadata,
+                inputs_embeds=output,
+                mm_token_type_ids=token_type_ids,
+            )
+
+        self.assertIs(actual, output)
+        support_op.assert_called_once()
+        get_variable_window.assert_not_called()
+        get_attention_mask.assert_called_once_with(
+            mm_token_type_ids=token_type_ids,
+            attn_metadata=attn_metadata,
+            effective_sliding_window=config.sliding_window,
+        )
+        self.assertIs(text_forward.call_args.kwargs["local_attention_mask_data"], dense_mask)
+        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_starts"])
+        self.assertIsNone(text_forward.call_args.kwargs["local_variable_window_token_ends"])
+
+    @torch.no_grad()
+    def test_vision_window_wider_than_sliding_window_uses_variable_window(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config_dict["sliding_window"] = 3
+        config = Gemma4TextConfig(**config_dict)
+        model = (
+            Gemma4ForCausalLM(ModelConfig(pretrained_config=config, attn_backend="TRTLLM"))
+            .to(config.torch_dtype)
+            .to("cuda")
+        )
+
+        token_type_ids = torch.tensor([1, 1, 1, 1], device="cuda")
+        output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
+        metadata = fake_metadata_type()
+        metadata.num_contexts = 1
+        metadata.padded_num_tokens = None
+        metadata.context_lens = torch.tensor([4])
+        metadata.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[4])
+        expected_starts = torch.tensor([2, 3, 4, 4], dtype=torch.int32, device="cuda")
+        expected_ends = torch.full((4,), 7, dtype=torch.int32, device="cuda")
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                fake_metadata_type,
+            ),
+            unittest.mock.patch.object(
+                model, "_supports_variable_window_attention", return_value=True
+            ),
+            unittest.mock.patch.object(model, "get_attention_mask") as get_attention_mask,
+            unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
+            unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
+        ):
+            model(
+                attn_metadata=metadata,
+                inputs_embeds=output,
+                mm_token_type_ids=token_type_ids,
+            )
+
+        get_attention_mask.assert_not_called()
+        self.assertIsNone(text_forward.call_args.kwargs["local_attention_mask_data"])
+        torch.testing.assert_close(
+            text_forward.call_args.kwargs["local_variable_window_token_starts"], expected_starts
+        )
+        torch.testing.assert_close(
+            text_forward.call_args.kwargs["local_variable_window_token_ends"], expected_ends
+        )
+
+    @torch.no_grad()
+    def test_generation_only_skips_bidirectional_mask_building(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+        output = torch.zeros(1, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {"is_cuda_graph": False})
+
+        for sm_version in (100, 103):
+            with self.subTest(sm_version=sm_version):
+                attn_metadata = fake_metadata_type()
+                attn_metadata.num_contexts = 0
+                attn_metadata.padded_num_tokens = None
+                with (
+                    unittest.mock.patch(
+                        "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                        side_effect=lambda: 100 <= sm_version < 110,
+                    ),
+                    unittest.mock.patch(
+                        "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                        fake_metadata_type,
+                    ),
+                    unittest.mock.patch.object(
+                        model, "get_attention_variable_window"
+                    ) as get_window,
+                    unittest.mock.patch.object(model, "get_attention_mask") as get_mask,
+                    unittest.mock.patch.object(model.model, "forward", return_value=output),
+                    unittest.mock.patch.object(
+                        model.logits_processor, "forward", return_value=output
+                    ),
+                ):
+                    actual = model(
+                        attn_metadata=attn_metadata,
+                        inputs_embeds=output,
+                        mm_token_type_ids=torch.zeros(1, dtype=torch.long, device="cuda"),
+                    )
+
+                self.assertIs(actual, output)
+                get_window.assert_not_called()
+                get_mask.assert_not_called()
+
+    @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2642,6 +3077,29 @@ class TestGemma4HFComparison(unittest.TestCase):
             else:
                 self.assertIsNone(actual_mask)
 
+        for layer_forward in layer_forwards:
+            layer_forward.reset_mock()
+        starts = torch.arange(4, dtype=torch.int32, device="cuda")
+        ends = starts.clone()
+        model.model(
+            attn_metadata=unittest.mock.MagicMock(),
+            inputs_embeds=torch.zeros(
+                4, config.hidden_size, dtype=config.torch_dtype, device="cuda"
+            ),
+            local_variable_window_token_starts=starts,
+            local_variable_window_token_ends=ends,
+        )
+
+        for layer, layer_forward in zip(model.model.layers, layer_forwards, strict=True):
+            actual_starts = layer_forward.call_args.kwargs["variable_window_token_starts"]
+            actual_ends = layer_forward.call_args.kwargs["variable_window_token_ends"]
+            if layer.is_sliding:
+                self.assertIs(actual_starts, starts)
+                self.assertIs(actual_ends, ends)
+            else:
+                self.assertIsNone(actual_starts)
+                self.assertIsNone(actual_ends)
+
     @torch.no_grad()
     def test_gemma4_routing_matches_hf_reference(self):
         """Routing preserves Hugging Face's FP32 softmax operation order."""
@@ -2661,6 +3119,41 @@ class TestGemma4HFComparison(unittest.TestCase):
         expected_weights *= per_expert_scale[expected_indices]
         torch.testing.assert_close(actual_indices, expected_indices.to(torch.int32))
         torch.testing.assert_close(actual_weights, expected_weights.float())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source, window, scratch", [(0, 32, True), (2, 32, True), (0, None, True), (0, 32, False)]
+)
+def test_shared_kv_scratch_requires_last_writer(
+    monkeypatch: pytest.MonkeyPatch, source: int, window: int | None, scratch: bool
+) -> None:
+    from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = scratch
+    manager.layer_offsets = {layer: layer for layer in range(5)}
+    manager.pp_layers = list(range(5))
+    manager.max_attention_window_vec = [window] * 5
+    manager.impl = SimpleNamespace(get_layer_group_id=lambda _: 0, layer_grouping=[[0, 2, 4]])
+    attn = object.__new__(Gemma4Attention)
+    torch.nn.Module.__init__(attn)
+    attn.is_kv_shared = True
+    attn._num_kv_writing_layers = 4
+    attn._validated_scratch_source = None
+    attn.attn = SimpleNamespace(layer_idx=source)
+    attn.attention_window_size = window
+    monkeypatch.setattr(
+        QKNormRoPEAttention, "forward", lambda *_, **kwargs: kwargs["hidden_states"]
+    )
+    hidden = torch.empty(0)
+    metadata = SimpleNamespace(kv_cache_manager=manager)
+    if scratch and window is not None and source != 2:
+        with pytest.raises(AssertionError, match="last KV-writing layer"):
+            attn.forward(None, hidden, metadata)
+    else:
+        assert attn.forward(None, hidden, metadata) is hidden
 
 
 class TestGemma4ModelDefaults(unittest.TestCase):
@@ -2786,6 +3279,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_model_defaults_follow_architecture(self):
         """Preserve TRTLLM on SM100f and FlashInfer FA2 elsewhere."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         for is_sm100f, expected in ((True, "TRTLLM"), (False, "FLASHINFER")):
             with (
@@ -2796,31 +3292,38 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(
-                    Gemma4ForCausalLM.get_model_defaults(None)["attn_backend"], expected
+                    Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"], expected
                 )
                 self.assertEqual(
-                    Gemma4ForConditionalGeneration.get_model_defaults(None)["attn_backend"],
+                    Gemma4ForConditionalGeneration.get_model_defaults(llm_args)["attn_backend"],
                     expected,
                 )
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
         """Gemma4ForCausalLM must not disable CUDA graphs."""
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        defaults = Gemma4ForCausalLM.get_model_defaults(TorchLlmArgs(model="/tmp/dummy_model"))
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_conditional_gen_does_not_disable_cuda_graphs(self):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        defaults = Gemma4ForConditionalGeneration.get_model_defaults(
+            TorchLlmArgs(model="/tmp/dummy_model")
+        )
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_external_shared_kv_mtp_defaults_to_flashinfer(self):
         """External shared-KV MTP requires FlashInfer attention metadata."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, TorchLlmArgs
 
-        spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
-        llm_args = SimpleNamespace(speculative_config=SimpleNamespace(spec_dec_mode=spec_dec_mode))
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model", speculative_config=MTPDecodingConfig(max_draft_len=1)
+        )
 
         for is_sm100f in (True, False):
             with (
@@ -2842,6 +3345,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_attn_backend_dispatches_by_architecture(self):
         """Verify architecture defaults dispatch to their intended classes."""
         from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         expected_classes = ((True, "TrtllmAttention"), (False, "FlashInferAttention"))
         for is_sm100f, expected_class in expected_classes:
@@ -2856,7 +3362,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                     return_value=is_sm100f,
                 ),
             ):
-                defaults = Gemma4ForCausalLM.get_model_defaults(None)
+                defaults = Gemma4ForCausalLM.get_model_defaults(llm_args)
                 backend_cls = get_attention_backend(defaults["attn_backend"])
                 self.assertEqual(backend_cls.__name__, expected_class)
 

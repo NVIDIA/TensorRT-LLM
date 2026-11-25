@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,6 +17,7 @@ from tensorrt_llm.bench.tuning.dataclasses import (
     Qwen3HybridConfig,
 )
 from tensorrt_llm.bench.tuning.heuristics import calc_engine_setting
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
@@ -89,16 +93,45 @@ def get_benchmark_engine_settings(
     return max_batch_size, max_num_tokens
 
 
-def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
+def load_runtime_model_config(checkpoint: str | Path, checkpoint_format: str | None = None):
+    """Read a checkpoint's runtime model configuration with the LLM API's config loader.
+
+    The loader is the one the LLM API registers for `checkpoint_format`: a Mistral-native
+    format reads params.json, the Hugging Face format config.json.
+
+    Args:
+        checkpoint (str | Path): Checkpoint directory or Hugging Face model name.
+        checkpoint_format (str | None): Checkpoint format the LLM API loads; None is the
+            Hugging Face format, the LLM API's default.
+
+    Returns:
+        tensorrt_llm._torch.model_config.ModelConfig: The runtime model configuration.
+    """
+    # Importing the checkpoints package registers the built-in config loaders.
+    import tensorrt_llm._torch.models.checkpoints  # noqa: F401
+    from tensorrt_llm._torch.models.modeling_utils import get_config_loader
+
+    config_loader = get_config_loader(checkpoint_format or CheckpointFormat.HF)()
+    return config_loader.load(str(checkpoint), trust_remote_code=True)
+
+
+def get_model_config(
+    model_name: str, model_path: Path = None, checkpoint_format: str | None = None
+) -> ModelConfig:
     """Obtain the model-related parameters from Hugging Face.
 
     Args:
         model_name (str): Huggingface model name.
         model_path (Path): Path to a local Huggingface checkpoint.
+        checkpoint_format (str | None): Checkpoint format the LLM API loads. A
+            Mistral-native format reads params.json and the consolidated
+            safetensors files instead of the Hugging Face files.
 
     Raises:
         ValueError: When model is not supported.
     """
+    if checkpoint_format in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3):
+        return ModelConfig.from_mistral(model_name, model_path, checkpoint_format)
     pretrained_config = load_pretrained_config(model_path or model_name, trust_remote_code=True)
     if is_nemotron_hybrid(pretrained_config):
         return NemotronHybridConfig.from_hf(model_name, model_path)

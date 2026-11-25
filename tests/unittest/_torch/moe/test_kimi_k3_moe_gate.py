@@ -103,3 +103,48 @@ def test_fused_route_quant_matches_unfused_chain(num_tokens):
     assert torch.equal(scales.view(torch.int16), ref_scales.to(torch.bfloat16).view(torch.int16))
     assert torch.equal(quantized.view(torch.uint8), ref_quantized.view(torch.uint8))
     assert torch.equal(quant_scales, ref_quant_scales.view(num_tokens, -1))
+
+
+def _router_logits_kernel_available() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        return False
+    from tensorrt_llm._torch.cute_dsl_utils import (
+        IS_CUTLASS_DSL_AVAILABLE,
+        IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    )
+
+    # The kernel runs on SM107 only with a Rubin-capable CuTe DSL.
+    return IS_CUTLASS_DSL_AVAILABLE and (
+        torch.cuda.get_device_capability() != (10, 7) or IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    )
+
+
+@pytest.mark.skipif(
+    not _router_logits_kernel_available(),
+    reason="the router-logits kernel needs SM100/SM103/SM107 and CuTe DSL",
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 16, 17, 64])
+def test_router_logits_kernel_matches_router_gemm(num_tokens):
+    """``logits_kernel=True`` gives the logits of ``dsv3_router_gemm_op`` bit for bit; above
+    the kernel's 16 tokens the gate keeps ``dsv3_router_gemm_op``."""
+    import tensorrt_llm._torch.custom_ops  # noqa: F401  (registers the trtllm ops)
+
+    torch.manual_seed(num_tokens)
+    cfg = _GateConfig(hidden_size=7168, num_experts=896, num_experts_per_token=16)
+    gates = []
+    for logits_kernel in (False, True):
+        gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16, logits_kernel=logits_kernel)
+        gates.append(gate.cuda())
+    with torch.no_grad():
+        gates[0].weight.normal_(0.0, 0.05)
+        gates[1].weight.copy_(gates[0].weight)
+    hidden = torch.randn(num_tokens, cfg.hidden_size, device="cuda").to(torch.bfloat16)
+
+    expected = gates[0].compute_logits(hidden)
+    actual = gates[1].compute_logits(hidden)
+    assert actual.dtype == torch.float32 and actual.shape == (num_tokens, cfg.num_experts)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))

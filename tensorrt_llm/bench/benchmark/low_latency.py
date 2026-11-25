@@ -220,7 +220,8 @@ def latency_command(
 
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer,
+                                     options.checkpoint_format)
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
@@ -269,6 +270,7 @@ def latency_command(
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+    exec_settings["iteration_log"] = options.iteration_log
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.
@@ -301,6 +303,8 @@ def latency_command(
 
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
+        engine_config = (llm._executor.get_engine_config()
+                         if llm._executor else {})
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
@@ -363,7 +367,8 @@ def latency_command(
                                        logger,
                                        kwargs,
                                        True,
-                                       startup_metrics=startup_metrics)
+                                       startup_metrics=startup_metrics,
+                                       engine_config=engine_config)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

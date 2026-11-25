@@ -670,6 +670,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     assert metadata.needs_gvr_prior == (not use_self_sampling)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "requested,cute_dsl_available,sm_100f,expected",
     [
@@ -766,6 +767,25 @@ def test_cute_dsl_paged_mqa_logits_default_is_aligned():
     [
         (dict(), True),
         (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
+        (dict(sm_version=107), False),
+        (dict(sm_version=107, is_prefill=False), False),
+        (dict(sm_version=107, sm107_decode=True), True),
+        (dict(sm_version=107, sm107_decode=True, index_topk=256), False),
+        (dict(sm_version=107, sm107_decode=True, compress_ratio=2), False),
+        (dict(sm_version=107, sm107_decode=True, is_cute_dsl_available=False), False),
+        (dict(sm_version=107, sm107_decode=True, use_self_sampling_topk=False), False),
+        (dict(sm_version=107, sm107_decode=True, enable_heuristic_topk=False), False),
+        (dict(sm_version=107, is_prefill=True), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=1024), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=2048), True),
+        (dict(sm_version=107, is_prefill=True, index_topk=256), False),
+        (dict(sm_version=107, is_prefill=True, compress_ratio=2), False),
+        (dict(sm_version=107, is_prefill=True, is_cute_dsl_available=False), False),
+        (dict(sm_version=107, is_prefill=True, use_self_sampling_topk=False), False),
+        (dict(sm_version=107, is_prefill=True, enable_heuristic_topk=False), False),
+        (dict(sm_version=100, is_prefill=True), True),
+        (dict(sm_version=103, is_prefill=True), True),
+        (dict(sm_version=120, is_prefill=True), False),
         (dict(enable_heuristic_topk=False), False),
         (dict(use_self_sampling_topk=False), False),
         (dict(is_cute_dsl_available=False), False),
@@ -1043,6 +1063,7 @@ def test_shared_topk_lifecycle(monkeypatch):
 
     metadata = object.__new__(DSAtrtllmAttentionMetadata)
     metadata.sparse_metadata_params = sparse_metadata_params
+    metadata._skipped_topk_groups = {}
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 4
     metadata.num_sparse_topk = 3
@@ -1073,15 +1094,20 @@ def test_shared_topk_lifecycle(monkeypatch):
 
     context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
     generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
+    # Offload off: sparse_attn_predict routes decode batches to the arena when it is on,
+    # which is a different path from the topk sharing under test.
+    sparse_params = SimpleNamespace(enable_kv_cache_offload=False)
     full_backend = SimpleNamespace(
         indexer=SimpleNamespace(
             forward_from_projected=Mock(side_effect=[context_topk, generation_topk])
         ),
         get_local_layer_idx=Mock(return_value=0),
+        sparse_params=sparse_params,
     )
     shared_backend = SimpleNamespace(
         indexer=None,
         get_local_layer_idx=Mock(return_value=1),
+        sparse_params=sparse_params,
     )
     # sparse_attn_predict dispatches the local->global remap through the
     # backend's own _remap_topk_to_global; bind the real method onto the stubs.
@@ -1274,6 +1300,52 @@ def test_indexer_two_level_gvr_dispatch(
         TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
     )
     assert indexer.top_k.prefill_implementation == expected_prefill
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("hidden_size", [6144, 7168])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "deterministic_flag", ["FORCE_DETERMINISTIC", "FORCE_ATTENTION_KERNEL_DETERMINISTIC"]
+)
+def test_indexer_projection_is_batch_invariant(
+    monkeypatch, hidden_size, weight_dtype, deterministic_flag
+):
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    monkeypatch.setenv(deterministic_flag, "1")
+    if weight_dtype == torch.bfloat16:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", "1")
+    torch.manual_seed(32)
+    indexer = create_indexer(
+        DeepSeekSparseAttentionConfig(index_head_dim=128, index_n_heads=32, index_topk=128)
+    )
+    weight = (torch.randn(160, hidden_size, device="cuda") / hidden_size**0.5).bfloat16()
+    weight = weight.to(weight_dtype)
+    indexer._fused_wk_wp_weight = weight
+    # A strided row view also covers hidden states sharing a larger activation buffer.
+    hidden = torch.randn(34, hidden_size, dtype=torch.bfloat16, device="cuda")[::2]
+    expected = (hidden.double() @ weight.double().T).to(weight_dtype)
+    actual = indexer._project_k_and_weights(hidden)
+    for batch_size in (1, 2, 3, 8):
+        chunks = [
+            indexer._project_k_and_weights(hidden[start : start + batch_size])
+            for start in range(0, hidden.shape[0], batch_size)
+        ]
+        torch.testing.assert_close(torch.cat(chunks), actual, atol=0, rtol=0)
+    permutation = torch.randperm(hidden.shape[0], device="cuda")
+    reordered = indexer._project_k_and_weights(hidden[permutation])
+    torch.testing.assert_close(reordered, actual[permutation], atol=0, rtol=0)
+    tolerance = (1e-6, 1e-5) if weight_dtype == torch.float32 else (1e-3, 1e-2)
+    torch.testing.assert_close(actual, expected, atol=tolerance[0], rtol=tolerance[1])
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = indexer._project_k_and_weights(hidden)
+    hidden.neg_()
+    graph.replay()
+    torch.testing.assert_close(replayed, indexer._project_k_and_weights(hidden), atol=0, rtol=0)
 
 
 @skip_pre_hopper
@@ -1517,6 +1589,7 @@ def _make_group_remap_metadata(
         _group_remap_struct=None,
         _group_remap_struct_kv_id=0,
         _group_remap_batched={},
+        _skipped_topk_groups={},
         _ensure_pool_view_cached=Mock(),
         _cached_block_table_gen=block_table,
         _cached_req_idx_gen=req_idx,
@@ -1527,6 +1600,12 @@ def _make_group_remap_metadata(
     )
     metadata._ensure_group_remap_struct = MethodType(
         DSAtrtllmAttentionMetadata._ensure_group_remap_struct, metadata
+    )
+    metadata.skip_shared_topk_copy = MethodType(
+        DSAtrtllmAttentionMetadata.skip_shared_topk_copy, metadata
+    )
+    metadata.check_shared_topk_fallback = MethodType(
+        DSAtrtllmAttentionMetadata.check_shared_topk_fallback, metadata
     )
     # Bind the real per-step cache invalidation so tests exercise the actual
     # clear of _group_remap_batched at forward boundaries.
@@ -1548,9 +1627,9 @@ def _make_group_remap_topk(num_tokens, num_topk, block_size, device, seed=11):
     return topk
 
 
-def _make_group_remap_backend(indexer, local_idx):
-    """Minimal DSATrtllmAttention exposing just what the remap helpers touch."""
-    att = DSATrtllmAttention.__new__(DSATrtllmAttention)
+def _make_group_remap_backend(indexer, local_idx, backend_cls=DSATrtllmAttention):
+    """Minimal backend exposing just what the remap helpers touch."""
+    att = backend_cls.__new__(backend_cls)
     att.indexer = indexer
     att.get_local_layer_idx = lambda metadata: local_idx
     return att
@@ -1640,9 +1719,18 @@ def test_group_remap_matches_per_layer(mask, params, num_topk):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_group_remap_dispatch_and_fallback(monkeypatch):
-    """Leader computes+caches, followers read the slice, and every fallback
-    condition returns the per-layer result."""
+@pytest.mark.parametrize("rubin", [False, True], ids=["shared", "rubin"])
+def test_group_remap_dispatch_and_fallback(monkeypatch, rubin):
+    """Followers use the grouped result or fall back only when local TopK was published."""
+    module, backend_cls = dsa_backend, DSATrtllmAttention
+    if rubin:
+        from importlib import import_module
+
+        module = import_module(
+            "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
+            "glm_5_2_nvfp4__sm_107__high_throughput.ops.attention.backend"
+        )
+        backend_cls = module.RubinDSATrtllmAttention
     device = torch.device("cuda")
     num_tokens, num_requests, num_topk, block_size = 8, 4, 128, 64
     mask = [True, False, False, True, False]  # leaders at 0 and 3
@@ -1658,8 +1746,8 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
         )
         return out
 
-    leader = _make_group_remap_backend(indexer=object(), local_idx=0)
-    follower = _make_group_remap_backend(indexer=None, local_idx=1)
+    leader = _make_group_remap_backend(indexer=object(), local_idx=0, backend_cls=backend_cls)
+    follower = _make_group_remap_backend(indexer=None, local_idx=1, backend_cls=backend_cls)
 
     # Follower before the leader has run -> no cached batch -> fall back (None).
     assert follower._grouped_remap_topk_to_global(topk, md, 1, True) is None
@@ -1677,13 +1765,13 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
     md_solo, _, _ = _make_group_remap_metadata(
         [True], {0: (2, 0)}, num_tokens, num_requests, num_topk, block_size, device
     )
-    solo = _make_group_remap_backend(indexer=object(), local_idx=0)
+    solo = _make_group_remap_backend(indexer=object(), local_idx=0, backend_cls=backend_cls)
     assert solo._grouped_remap_topk_to_global(topk, md_solo, 0, True) is None
 
     # Full dispatch via _remap_topk_to_global with the flag forced on: the
     # generation forward uses the grouped path, while context and MTP-draft keep
     # the per-layer path. All three must be bit-exact vs the per-layer op.
-    monkeypatch.setattr(dsa_backend, "_GROUP_REMAP", True)
+    monkeypatch.setattr(module, "_GROUP_REMAP", True)
 
     md._group_remap_batched.clear()
     assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
@@ -1697,6 +1785,53 @@ def test_group_remap_dispatch_and_fallback(monkeypatch):
     md._group_remap_batched.clear()
     assert torch.equal(leader._remap_topk_to_global(topk, md, is_generation=True), per_layer(0))
     md.in_mtp_draft_loop = False
+
+    # Exercise publication through the same entry point as a generation forward.
+    md._invalidate_pool_view_cache()
+    md.shared_topk_indices = torch.full_like(topk, -1)
+    md.num_tokens, md.num_ctx_tokens = num_tokens, 0
+    md.sparse_metadata_params = SimpleNamespace(enable_kv_cache_offload=False)
+    md.has_mixed_precision_high_rows = False
+    leader.sparse_params = follower.sparse_params = md.sparse_metadata_params
+    leader.indexer = SimpleNamespace(forward_from_projected=Mock(return_value=topk))
+    args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+    )
+    q = torch.empty((num_tokens, 1), device=device)
+
+    def predict(layer):
+        return layer.sparse_attn_predict(q, None, md, args)[0]
+
+    predict(leader)
+    assert (md.shared_topk_indices == -1).all()
+    torch.testing.assert_close(predict(follower), per_layer(1))
+
+    md._group_remap_batched.clear()
+    with pytest.raises(RuntimeError, match="leader 0 skipped the copy"):
+        predict(follower)
+
+    # Stub the shared backend's downstream readers; the publication decision stays real.
+    if not rubin:
+        monkeypatch.setattr(leader, "_sparse_offload_arena_indices", Mock(return_value=topk))
+        md.kv_cache_manager.mixed_precision_low_dtype = DataType.FP8
+        md.kv_cache_manager.mixed_precision_high_dtype = DataType.FP8
+        md.req_idx_per_token = md._cached_req_idx_gen
+        monkeypatch.setattr(module, "mixed_precision_high_row_indices", Mock(return_value=topk))
+    for offload, mixed_precision in [(True, False), (False, True)]:
+        md.sparse_metadata_params.enable_kv_cache_offload = offload
+        md.has_mixed_precision_high_rows = mixed_precision
+        md.shared_topk_indices.fill_(-1)
+        predict(leader)
+        torch.testing.assert_close(md.shared_topk_indices, topk)
+
+    md.has_mixed_precision_high_rows = False
+    md._group_remap_batched.clear()
+    torch.testing.assert_close(predict(follower), per_layer(1))
+
+    predict(leader)
+    md._invalidate_pool_view_cache()
+    torch.testing.assert_close(predict(follower), per_layer(1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2243,6 +2378,12 @@ def _create_mock_metadata(
             self._num_seqs = num_contexts + num_generations
             self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
+            self.sparse_metadata_params = SimpleNamespace(
+                use_cute_dsl_paged_mqa_logits=use_cute_dsl_paged_mqa_logits,
+                q_split_threshold=DeepSeekSparseAttentionConfig.model_fields[
+                    "q_split_threshold"
+                ].default,
+            )
             self.num_sparse_topk = index_topk
             self._radix_rows_per_sequence = 1 + self.max_draft_tokens
             self._create_radix_aux_buffers(capture_graph=False)
@@ -4508,6 +4649,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -4570,6 +4712,10 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager
     step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
     "context" (the first gen round after prefill, which runs the context path).
     Step-0 Top-K correctness is covered by test_indexer_decode_custom_vs_fallback.
+
+    The reuse steps run with the MQA-logits schedule marked stale and poisoned,
+    as the draft loop leaves it before an index-shared step; reuse must not read
+    it, and a step that computes Top-K on it must raise instead.
     """
     torch.manual_seed(7)
     heads, head_dim, block_size = 32, 128, 64
@@ -4709,12 +4855,19 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager
         meta.in_mtp_draft_loop = True
         meta.shared_topk_indices = stash
         meta.indexer_skip_topk = True
+        meta.indexer_schedule_stale = True
+        meta.scheduler_metadata_buffer.fill_(-1)
+        meta.scheduler_metadata_buffer_full_next_n.fill_(-1)
+        meta.kv_lens_cuda_2d.fill_(-1)
         hs, qs, ks_fp8, ks_scale, ws = make_inputs(batch_size)
         indexer._update_k_cache(ks_fp8, ks_scale, meta)
         topk = indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
         assert torch.equal(topk, stash[:batch_size, :]), (
             f"{step0_mode} draft reuse step {step} should copy the stash 1:1 (next_n=1)"
         )
+        meta.indexer_skip_topk = False
+        with pytest.raises(RuntimeError, match="stale"):
+            indexer.sparse_attn_indexer(meta, hs, qs, ks_fp8, ks_scale, ws)
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -5099,6 +5252,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,

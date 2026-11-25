@@ -36,9 +36,9 @@ from .kernel_inputs import prepare_kernel_inputs
 class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
     """``trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8``.
 
-    Single-provider, so there is no per-quant parent, and it calls its runner
-    op directly instead of going through ``self.op_backend``: the FlashInfer
-    wheel has no equivalent.
+    No other format shares its runner op, so there is no per-quant parent,
+    and it calls that op directly instead of going through
+    ``self.op_backend``.
     """
 
     descriptor = trtllm_gen_descriptor(

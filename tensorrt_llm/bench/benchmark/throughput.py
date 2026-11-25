@@ -339,7 +339,8 @@ def throughput_command(
             "is submitted to the engine at once, so there is no point at which "
             "the deadline can be applied and the full dataset would run. Pass "
             "--concurrency N.")
-    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer,
+                                     options.checkpoint_format)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
@@ -454,6 +455,8 @@ def throughput_command(
 
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
+        engine_config = (llm._executor.get_engine_config()
+                         if llm._executor else {})
 
         sampler_args = {
             "end_id": options.eos_id,
@@ -518,7 +521,8 @@ def throughput_command(
                                        logger,
                                        kwargs,
                                        options.streaming,
-                                       startup_metrics=startup_metrics)
+                                       startup_metrics=startup_metrics,
+                                       engine_config=engine_config)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

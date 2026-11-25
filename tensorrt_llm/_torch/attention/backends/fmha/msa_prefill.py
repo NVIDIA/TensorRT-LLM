@@ -21,6 +21,8 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
+import functools
+from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -155,6 +157,28 @@ def _aligned_nvfp4_dequant_scales(
     return k_global_scale, v_global_scale
 
 
+@functools.lru_cache(maxsize=1)
+def _msa_sparse_api() -> ModuleType:
+    """Resolve fmha_sm100's sparse API once; the package cannot change under a run."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+        require_msa_module,
+    )
+
+    fmha_sm100 = require_msa_module()
+    sparse = getattr(fmha_sm100, "sparse", None)
+    if sparse is None:
+        try:
+            from fmha_sm100 import sparse
+        except ImportError as exc:
+            raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires the Fan MSA sparse API") from exc
+    if not hasattr(sparse, "build_k2q_csr") or not hasattr(sparse, "sparse_atten_nvfp4_kv_func"):
+        raise RuntimeError(
+            "The loaded MSA build lacks build_k2q_csr or "
+            "sparse_atten_nvfp4_kv_func; use the NVFP4-capable Fan revision"
+        )
+    return sparse
+
+
 def run_msa_nvfp4_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -178,22 +202,9 @@ def run_msa_nvfp4_sparse_gqa(
     """
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         MSA_REQUIRED_TOPK,
-        require_msa_module,
     )
 
-    fmha_sm100 = require_msa_module()
-    sparse = getattr(fmha_sm100, "sparse", None)
-    if sparse is None:
-        try:
-            from fmha_sm100 import sparse
-        except ImportError as exc:
-            raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires the Fan MSA sparse API") from exc
-    if not hasattr(sparse, "build_k2q_csr") or not hasattr(sparse, "sparse_atten_nvfp4_kv_func"):
-        raise RuntimeError(
-            "The loaded MSA build lacks build_k2q_csr or "
-            "sparse_atten_nvfp4_kv_func; use the NVFP4-capable Fan revision"
-        )
-
+    sparse = _msa_sparse_api()
     for name, scale in (("K", k_global_scale), ("V", v_global_scale)):
         if scale.dtype != torch.float32 or scale.numel() != 1:
             raise ValueError(f"MiniMax-M3 NVFP4 {name} dequantization scale must be one FP32 value")

@@ -13,6 +13,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 try:
     from tensorrt_llm._torch.speculative import accept_stats
 except ImportError:  # pragma: no cover - torch-less host fallback
@@ -255,12 +257,6 @@ def test_mocked_calibration_end_to_end(tmp_path):
     assert p1["num_samples"] == [0, 1, 1, 2]
     # pos-1 ECE: (1*|.375-0| + 1*|.625-1| + 2*|.875-1|) / 4
     assert p1["ece"] == pytest.approx((0.375 + 0.375 + 2 * 0.125) / 4)
-
-
-def test_default_provider_absent_in_core_tree():
-    # The optional dspark_confidence module ships in a separate MR; on this
-    # tree the default provider must resolve to None (not raise).
-    assert accept_stats._resolve_default_confidence_provider() is None
 
 
 def test_conf_bin_edges():

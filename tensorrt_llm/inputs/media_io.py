@@ -14,9 +14,9 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
-from concurrent.futures import Executor
+from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -48,6 +48,11 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.perf_utils import (
+    _record_input_processing,
+    _start_input_processing,
+    _time_input_processing,
+)
 
 
 class MediaFetchError(RuntimeError):
@@ -175,6 +180,17 @@ _RESPONSE_CHUNK_BYTES = 1024 * 1024
 
 # Maximum number of redirects allowed for remote fetches.
 _MAX_REDIRECTS = 5
+
+# Maximum number of decoded audio samples (frames x channels) per audio input.
+# Compressed formats such as FLAC can expand a few hundred kilobytes into
+# gigabytes of samples, so decoded audio needs its own limit. The value is the
+# sample count of _MAX_RESPONSE_BYTES of 16-bit PCM, about 100 Mi samples, or
+# 800 MiB as float64.
+_MAX_AUDIO_SAMPLES = _MAX_RESPONSE_BYTES // 2
+
+# Frame count that libsndfile reports when a file does not state its length,
+# such as a FLAC stream whose STREAMINFO total is 0.
+_SF_UNKNOWN_FRAMES = 2**63 - 1
 
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
@@ -348,11 +364,14 @@ async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
         content.write(chunk)
 
 
-async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
+async def _safe_aiohttp_get(
+    url: str, timeout_sec: int = 30, *, session: Optional[aiohttp.ClientSession] = None
+) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    session = await _get_aiohttp_session()
+    if session is None:
+        session = await _get_aiohttp_session()
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
         try:
@@ -1076,12 +1095,15 @@ def _normalize_file_uri(uri: str) -> str:
 
 
 # Directory from which request-supplied local media paths may be read.
-# Media parts of a server request may name a `file://` URI or a bare path; such
-# a reference is read from the server's own filesystem, so it is accepted only
-# when TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path
-# lies inside it. Unset (the default) refuses every local reference. The
-# offline Python API does not go through this check.
-_ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+# A server request may name a `file://` URI or a bare path (a chat media part,
+# or a VisualGen reference with format='path'); such a reference is read from
+# the server's own filesystem, so it is accepted only when
+# TRTLLM_MEDIA_ALLOWED_INPUT_DIR names a directory and the resolved path lies
+# inside it. Unset (the default) refuses every local reference. The offline
+# Python API does not go through this check.
+_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
+# The variable's former name, no longer read; see `log_allowed_local_media_path`.
+_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
 
 # Flags for the single open of a request-supplied local file. Each is left
 # out on a platform that lacks it; the fstat checks on the open descriptor
@@ -1103,11 +1125,16 @@ def is_local_media_url(url: str) -> bool:
 # memory and decoded from bytes.
 _DESCRIPTOR_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
 
+# A directory where ``readlink`` on a descriptor's entry gives the location of
+# the open file. ``None`` where the platform has none; `open_allowed_local_media`
+# then skips its post-open location check.
+_FD_LINK_DIR = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else None
+
 
 def open_allowed_local_media(url: str) -> int:
     """Open a request-supplied local media reference; return its read-only descriptor.
 
-    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
+    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` names a
     directory, the reference resolves (symlinks and ``..`` included) to a path
     inside it, and that path is a regular file within the media size limit. A
     reference refused for its location gets the same message whether or not it
@@ -1117,16 +1144,19 @@ def open_allowed_local_media(url: str) -> int:
     The file is opened once, without following a symlink in its final
     component, and the regular-file and size checks run on the open descriptor.
     An entry swapped for a symlink, FIFO or device after the path was resolved
-    is therefore refused instead of opened. The caller owns the descriptor and
-    closes it. Blocking; call it on an executor.
+    is therefore refused instead of opened. Where ``/proc/self/fd`` reports the
+    location of an open file, that location is checked against the directory
+    as well, so a directory on the path swapped for a symlink after resolution
+    is refused too. The caller owns the descriptor and closes it. Blocking;
+    call it on an executor.
     """
     refused = ValueError(
         "Local media paths are not accepted by this server. Send the media as "
         "an http(s) or base64 data URL, or start the server with "
-        f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV}=<directory> to allow files under "
+        f"{_MEDIA_ALLOWED_INPUT_DIR_ENV}=<directory> to allow files under "
         "that directory."
     )
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         raise refused
     parsed = urlparse(url)
@@ -1137,7 +1167,7 @@ def open_allowed_local_media(url: str) -> int:
         # Operator configuration: report it in the server log, not to the client.
         logger.warning(
             "%s=%r is not a directory; refusing the local media reference.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
         raise refused
@@ -1154,6 +1184,16 @@ def open_allowed_local_media(url: str) -> int:
         raise ValueError(f"Local media file could not be read: {url!r}") from exc
     try:
         stat = os.fstat(fd)
+        # The containment check above looked at the path; this one looks at
+        # the file that was opened. O_NOFOLLOW guards only the last component,
+        # so a directory on the path that became a symlink in between was
+        # followed, and the open file then lies outside the root. It runs
+        # before the type and size checks, so a file outside the root gets the
+        # same refusal whatever it is.
+        if _FD_LINK_DIR is not None:
+            opened = os.readlink(f"{_FD_LINK_DIR}/{fd}")
+            if not os.path.isabs(opened) or os.path.commonpath([root, opened]) != root:
+                raise refused
         if not S_ISREG(stat.st_mode):
             raise ValueError(f"Local media path is not a regular file: {url!r}")
         _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
@@ -1188,27 +1228,48 @@ def _read_open_media(fd: int, url: str) -> bytes:
     return data
 
 
+def read_allowed_local_media(url: str) -> bytes:
+    """Read a request-supplied local media file under the allowed-directory policy.
+
+    `open_allowed_local_media` followed by a bounded read of the open file, for
+    a caller that wants the bytes rather than a decoded object. Blocking; call
+    it on an executor.
+    """
+    fd = open_allowed_local_media(url)
+    try:
+        return _read_open_media(fd, url)
+    finally:
+        os.close(fd)
+
+
 def log_allowed_local_media_path() -> None:
     """Log the local media policy once, at server start.
 
-    Unset ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is the default and is not
+    Unset ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is the default and is not
     logged. A value that is not a directory is reported here, since every
     request naming a local file would otherwise fail with a generic error
-    while the operator sees nothing at startup.
+    while the operator sees nothing at startup. So is a set
+    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH``, which is not read.
     """
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if os.environ.get(_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV):
+        logger.warning(
+            "%s is no longer read; set %s instead.",
+            _FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
+        )
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         return
     if os.path.isdir(os.path.realpath(allowed_root)):
         logger.info(
             "Request media may name local files under %r (%s).",
             allowed_root,
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
         )
     else:
         logger.warning(
             "%s=%r is not a directory; every request naming a local media file will be refused.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
 
@@ -1228,6 +1289,38 @@ def _decode_base64_with_limit(data: str) -> bytes:
     decoded = base64.b64decode(data)
     _check_media_size(len(decoded), _MAX_RESPONSE_BYTES)
     return decoded
+
+
+class _BoundedAudioSoundFile(soundfile.SoundFile):
+    def seekable(self) -> bool:
+        # libsndfile reports unknown-length FLAC as a huge sentinel. soundfile
+        # seeks after each read on seekable files, including a short final read;
+        # that seek fails when the header has no frame count. Read sequentially.
+        return self.frames != _SF_UNKNOWN_FRAMES and super().seekable()
+
+
+def _read_audio_with_limit(source: Any) -> Tuple[np.ndarray, int]:
+    """Decode audio like ``soundfile.read`` with a cap on decoded samples.
+
+    A file whose header reports more than ``_MAX_AUDIO_SAMPLES`` samples is
+    rejected before any samples are read. For a file of unknown length, the
+    read stops at one frame beyond the limit, so an oversized payload is
+    rejected before it is fully decoded.
+    """
+    too_many_samples = (
+        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+        f"(frames x channels), the maximum allowed."
+    )
+    with _BoundedAudioSoundFile(source) as audio_file:
+        # libsndfile refuses to open a file with fewer than one channel.
+        max_frames = _MAX_AUDIO_SAMPLES // audio_file.channels
+        if audio_file.frames != _SF_UNKNOWN_FRAMES and audio_file.frames > max_frames:
+            raise ValueError(too_many_samples)
+        data = audio_file.read(frames=max_frames + 1)
+        samplerate = audio_file.samplerate
+    if len(data) > max_frames:
+        raise ValueError(too_many_samples)
+    return data, samplerate
 
 
 def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
@@ -1294,6 +1387,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     _work_tracker: ClassVar[ContextVar[Optional[Callable[[asyncio.Future], None]]]] = ContextVar(
         "media_io_work_tracker", default=None
     )
+    _modality: ClassVar[str] = "other"
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1309,6 +1403,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    def clear_executor(cls, executor: Executor) -> None:
+        """Stop publishing ``executor``; later decode work uses the loop's default.
+
+        Does nothing when another executor has been published since, as
+        another server in the same process may have done.
+        """
+        if BaseMediaIO._executor is executor:
+            BaseMediaIO._executor = None
 
     @classmethod
     @contextmanager
@@ -1381,7 +1485,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
-            data = await _safe_aiohttp_get(url)
+            session = await _get_aiohttp_session()
+            with _time_input_processing("download", self._modality):
+                data = await _safe_aiohttp_get(url, session=session)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
@@ -1401,7 +1507,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             # No path policy here: this branch serves the offline API, which
             # reads the caller's own files. A URL taken from a server request
             # must go through `async_load_allowed_local_file` instead, which
-            # confines it to TRTLLM_MEDIA_ALLOWED_LOCAL_PATH and never looks
+            # confines it to TRTLLM_MEDIA_ALLOWED_INPUT_DIR and never looks
             # the request's path up again.
             return await self._run_in_executor(self.load_file, url)
         else:
@@ -1432,14 +1538,28 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         finally:
             os.close(fd)
 
-    @staticmethod
-    async def _run_in_executor(fn, *args, **kwargs):
+    @classmethod
+    async def _run_in_executor(
+        cls, fn: Callable[..., _MediaT], *args: Any, **kwargs: Any
+    ) -> _MediaT:
         """Run a blocking decode callable on the configured executor."""
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
         executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
-        future = loop.run_in_executor(executor, fn, *args)
+        queued = _start_input_processing()
+        if queued is None or isinstance(executor, ProcessPoolExecutor):
+            future = loop.run_in_executor(executor, fn, *args)
+        else:
+            modality = cls._modality
+
+            def decode() -> _MediaT:
+                _record_input_processing("decode_queue", queued, modality)
+                with _time_input_processing("decode", modality):
+                    return fn(*args)
+
+            # run_in_executor does not propagate request ContextVars to workers.
+            future = loop.run_in_executor(executor, copy_context().run, decode)
         tracker = BaseMediaIO._work_tracker.get()
         if tracker is not None:
             tracker(future)
@@ -1452,6 +1572,7 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
+    _modality = "image"
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
@@ -1504,6 +1625,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
+    _modality = "audio"
 
     def __init__(
         self, decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None, **kwargs
@@ -1519,7 +1641,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
@@ -1530,16 +1652,23 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
         if self._decoded_memory_reserver is None:
-            return soundfile.read(source)
+            return _read_audio_with_limit(source)
 
         reservation = None
         try:
             # Read metadata and samples from the same handle. Reserve the float64
             # output before allocation; libsndfile's internal buffers are excluded.
-            with soundfile.SoundFile(source) as audio:
+            with _BoundedAudioSoundFile(source) as audio:
                 frames, channels = audio.frames, audio.channels
                 if frames < 0 or channels < 1:
                     raise ValueError("invalid audio frame or channel count")
+                if frames == _SF_UNKNOWN_FRAMES:
+                    return self._read_unknown_length(audio, channels)
+                if frames * channels > _MAX_AUDIO_SAMPLES:
+                    raise ValueError(
+                        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+                        f"(frames x channels), the maximum allowed."
+                    )
                 decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
                 reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
                 shape = (frames,) if channels == 1 else (frames, channels)
@@ -1559,11 +1688,70 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
             if reservation is not None:
                 reservation.release()
 
+    def _read_unknown_length(
+        self, audio: soundfile.SoundFile, channels: int
+    ) -> Tuple[np.ndarray, int]:
+        """Read an unknown-length stream in bounded, budgeted chunks."""
+        reserver = self._decoded_memory_reserver
+        assert reserver is not None
+        max_frames = _MAX_AUDIO_SAMPLES // channels
+        too_many_samples = (
+            f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+            f"(frames x channels), the maximum allowed."
+        )
+        chunks: List[np.ndarray] = []
+        reservations: List[Tuple[_DecodedMemoryReservation, int]] = []
+        concatenation_reservation: Optional[_DecodedMemoryReservation] = None
+        total_frames = 0
+        try:
+            while True:
+                chunk_frames = min(16384, max_frames + 1 - total_frames)
+                chunk_bytes = chunk_frames * channels * np.dtype(np.float64).itemsize
+                reservation = reserver(chunk_bytes, chunk_bytes)
+                reservations.append((reservation, 0))
+                shape = (chunk_frames,) if channels == 1 else (chunk_frames, channels)
+                samples = np.empty(shape, dtype=np.float64)
+                decoded = audio.read(frames=chunk_frames, out=samples)
+                read_frames = len(decoded)
+                if total_frames + read_frames > max_frames:
+                    raise ValueError(too_many_samples)
+                if read_frames != chunk_frames:
+                    decoded = None
+                    samples.resize((read_frames,) if channels == 1 else (read_frames, channels))
+                    reservation.shrink(samples.nbytes)
+                if read_frames:
+                    chunks.append(samples)
+                    reservations[-1] = (reservation, samples.nbytes)
+                total_frames += read_frames
+                if read_frames < chunk_frames:
+                    break
+
+            if chunks:
+                total_bytes = sum(size for _, size in reservations)
+                concatenation_reservation = reserver(total_bytes, 0)
+                result = np.concatenate(chunks)
+                chunks.clear()
+                concatenation_reservation.release()
+                concatenation_reservation = None
+            else:
+                shape = (0,) if channels == 1 else (0, channels)
+                result = np.empty(shape, dtype=np.float64)
+            for reservation, size in reservations:
+                reservation.commit(size)
+            return result, audio.samplerate
+        finally:
+            chunks.clear()
+            if concatenation_reservation is not None:
+                concatenation_reservation.release()
+            for reservation, _ in reservations:
+                reservation.release()
+
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
     """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
+    _modality = "video"
 
     def __init__(
         self,
