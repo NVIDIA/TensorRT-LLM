@@ -227,6 +227,7 @@ are not supported. See the
   `parallel_config.ulysses_size: 1`.
 - The checkpoints ship only `modular_model_index.json`, so `trtllm-serve` needs
   `--visual_gen_args` or `--enable_visual_gen`.
+- 16-bit grayscale PNG references without alpha are clipped to 8 bits; rescale them first.
 
 ## Optimizations
 
