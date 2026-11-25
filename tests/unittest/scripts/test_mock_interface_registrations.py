@@ -275,6 +275,33 @@ def test_replacements_preserve_descriptor_binding(
     [
         pytest.param("def clear():\n    del fixture.x\nclear()", id="closure"),
         pytest.param('clear = lambda: delattr(fixture, "x")\nclear()', id="lambda"),
+        pytest.param(
+            'def invoke(callback):\n    callback()\ninvoke(lambda: delattr(fixture, "x"))',
+            id="inline-callback",
+        ),
+        pytest.param(
+            "alias = fixture\ndef clear(value=alias):\n    del value.x\nalias = None\nclear()",
+            id="function-default",
+        ),
+        pytest.param(
+            'alias = fixture\nclear = lambda value=alias: delattr(value, "x")\n'
+            "alias = None\nclear()",
+            id="lambda-default",
+        ),
+        pytest.param(
+            "alias = fixture\ndef clear():\n    nonlocal alias\n    del alias.x\n"
+            "    alias = None\nclear()",
+            id="nonlocal-alias",
+        ),
+        pytest.param(
+            "def clear():\n    def inner():\n        del fixture.x\n    inner()\nclear()",
+            id="nested-closure",
+        ),
+        pytest.param(
+            "alias = None\ndef clear():\n    del alias.x\n"
+            "callbacks = [clear]\nalias = fixture\ncallbacks[0]()",
+            id="container-callback",
+        ),
         pytest.param("holder = [fixture]\ndel holder[0].x", id="container"),
         pytest.param(
             "alias = fixture if flag else other\ndel alias.x", id="conditional-expression"
@@ -347,6 +374,25 @@ def test_indirect_mutation_invalidates_instance_evidence(tmp_path: Path, mutatio
     before, after = results
     assert before["status"] == "matched"
     assert after["status"] == "unverified"
+
+
+def test_callback_default_preserves_the_original_binding(tmp_path: Path) -> None:
+    results = _check(
+        tmp_path,
+        "class Real:\n    x = 1\n",
+        """
+        from types import SimpleNamespace
+        from test_common.interface_checks import verify_instance
+
+        fixture = SimpleNamespace(x=1)
+        callbacks = [lambda value=fixture: delattr(value, "x")]
+        verify_instance(fixture, "production:Real", members=("x",))
+        fixture = SimpleNamespace(x=1)
+        callbacks[0]()
+        verify_instance(fixture, "production:Real", members=("x",))
+        """,
+    )
+    assert [result["status"] for result in results] == ["matched", "matched"]
 
 
 def test_descriptor_preserves_captured_instance_evidence(tmp_path: Path) -> None:
@@ -450,6 +496,12 @@ def test_class_allocator_must_be_resolved(tmp_path: Path) -> None:
             def __init__(self):
                 initialize(self)
 
+        class Custom:
+            x = 1
+
+            def __new__(cls):
+                return object()
+
         class Conditional:
             x = 1
 
@@ -469,10 +521,11 @@ def test_class_allocator_must_be_resolved(tmp_path: Path) -> None:
             x = 1
         """,
         """
-        from production import Conditional, Decorated, Inherited, Plain
+        from production import Conditional, Custom, Decorated, Inherited, Plain
         from test_common.interface_checks import verify_instance
 
         verify_instance(Plain.__new__(Plain), "production:Plain", members=("x",))
+        verify_instance(Custom.__new__(Custom), "production:Custom", members=("x",))
         verify_instance(Conditional.__new__(Conditional), "production:Conditional", members=("x",))
         verify_instance(Inherited.__new__(Inherited), "production:Inherited", members=("x",))
         verify_instance(Decorated.__new__(Decorated), "production:Decorated", members=("x",))
@@ -484,8 +537,38 @@ def test_class_allocator_must_be_resolved(tmp_path: Path) -> None:
         "unverified",
         "unverified",
         "unverified",
+        "unverified",
         "matched",
     ]
+
+
+@pytest.mark.parametrize("in_test", [False, True], ids=["production", "test"])
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        pytest.param("Base.__new__ = staticmethod(lambda cls: object())", id="attribute"),
+        pytest.param('setattr(Base, "__new__", staticmethod(lambda cls: object()))', id="setattr"),
+        pytest.param(
+            "alias = Base\nalias.__new__ = staticmethod(lambda cls: object())",
+            id="alias",
+        ),
+    ],
+)
+def test_allocator_rebound_after_class_definition(
+    tmp_path: Path, in_test: bool, assignment: str
+) -> None:
+    production = "class Base:\n    x = 1\n\nclass Real(Base):\n    pass\n"
+    test = "from production import Base, Real\nfrom test_common.interface_checks import verify_instance\n"
+    if in_test:
+        test += assignment + "\n"
+    else:
+        production += assignment + "\n"
+    test += (
+        'verify_instance(Real.__new__(Real), "production:Real", members=("x",))\n'
+        'verify_instance(object.__new__(Real), "production:Real", members=("x",))\n'
+    )
+    results = _check(tmp_path, production, test)
+    assert [result["status"] for result in results] == ["unverified", "matched"]
 
 
 def test_inline_checkpoint_follows_call_argument_order(tmp_path: Path) -> None:
@@ -514,17 +597,19 @@ def test_inline_checkpoint_follows_call_argument_order(tmp_path: Path) -> None:
     assert [result["status"] for result in results] == ["unverified", "matched"]
 
 
-def test_class_tuple_assignment_respects_binding_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize("assignment", ["send = None", "send, other = None, None"])
+def test_class_assignment_respects_binding_order(tmp_path: Path, assignment: str) -> None:
     results = _check(
         tmp_path,
-        """
+        f"""
         class Real:
             other = None
+            {assignment}
 
             def send(self, key):
                 pass
         """,
-        """
+        f"""
         from test_common.interface_checks import mock_target
 
         @mock_target("production:Real")
@@ -534,18 +619,25 @@ def test_class_tuple_assignment_respects_binding_order(tmp_path: Path) -> None:
             def send(self, key):
                 pass
 
-            send, other = None, None
+            {assignment}
 
         @mock_target("production:Real")
         class Working:
-            send, other = None, None
+            other = None
+            {assignment}
 
             def send(self, key):
                 pass
+
+        @mock_target("production:Real")
+        class MissingMethod:
+            other = None
+            send = None
         """,
     )
-    assert [result["status"] for result in results] == ["mismatched", "matched"]
+    assert [result["status"] for result in results] == ["mismatched", "matched", "mismatched"]
     assert [issue["code"] for issue in results[0]["diagnostics"]] == ["member-kind"]
+    assert [issue["code"] for issue in results[2]["diagnostics"]] == ["member-kind"]
 
 
 @pytest.mark.parametrize(

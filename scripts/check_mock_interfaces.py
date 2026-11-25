@@ -32,6 +32,7 @@ import sys
 import sysconfig
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 BINDINGS_MODULE = "tensorrt_llm.bindings"
@@ -132,6 +133,47 @@ class Source:
         if module:
             parts.append(module)
         return ".".join(parts)
+
+    @cached_property
+    def allocator_writes(self) -> set[ast.expr]:
+        """Find receivers whose allocator is changed outside a class declaration."""
+        pending = []
+        for node in ast.walk(self.tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "__new__"
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+            ):
+                pending.append(node.value)
+            elif (
+                isinstance(node, ast.Call)
+                and self.qualified(node.func).removeprefix("builtins.") in {"setattr", "delattr"}
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "__new__"
+            ):
+                pending.append(node.args[0])
+        if not pending:
+            return set()
+        aliases: dict[str, list[ast.expr]] = {}
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    for leaf, value in assignment_leaves(target, node.value):
+                        if isinstance(leaf, ast.Name) and isinstance(
+                            value, (ast.Name, ast.Attribute)
+                        ):
+                            aliases.setdefault(leaf.id, []).append(value)
+        owners: set[ast.expr] = set()
+        while pending:
+            owner = pending.pop()
+            if owner in owners:
+                continue
+            owners.add(owner)
+            if isinstance(owner, ast.Name):
+                pending.extend(aliases.get(owner.id, ()))
+        return owners
 
     def bindings(self, scope: ast.AST) -> dict[str, set[ast.AST]]:
         """Collect lexical bindings that can shadow module imports and builtins."""
@@ -1306,19 +1348,54 @@ class Analyzer:
             raise Incomplete("bound must be a literal boolean")
         return value.value
 
-    def deferred_function(self, node: ast.AST) -> Value:
-        captures = loaded_names(node).difference(self.source.bindings(node))
-        return Value(captures=frozenset(captures))
+    def deferred_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        env: dict[str, Value],
+    ) -> Value:
+        # A nested callable can use a cell from outside this function. Global
+        # and nonlocal declarations can also refer to an object despite a store.
+        body = [node.body] if isinstance(node, ast.Lambda) else node.body
+        captures = {
+            child.id
+            for statement in body
+            for child in ast.walk(statement)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }.difference(self.source.bindings(node))
+        for child in statements(node):
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                captures.update(child.names)
+        # Defaults hold definition-time values even if a captured name is rebound.
+        defaults = [
+            self.referenced_value(default, env)
+            for default in [*node.args.defaults, *node.args.kw_defaults]
+            if default is not None
+        ]
+        return Value(
+            origins=frozenset(origin for value in defaults for origin in value.origins),
+            captures=frozenset(captures).union(*(value.captures for value in defaults)),
+        )
 
-    def referenced_origins(
+    def referenced_value(
         self, node: ast.AST, env: dict[str, Value], *, argument: Value | None = None
-    ) -> frozenset[int]:
-        """Find tracked objects reachable from references and an implicit argument."""
-        roots = [env[name] for name in loaded_names(node) if name in env]
+    ) -> Value:
+        """Collect possible aliases and callbacks reachable from an expression."""
+        if isinstance(node, ast.Lambda):
+            roots = [self.deferred_function(node, env)]
+        else:
+            roots = [env[name] for name in loaded_names(node) if name in env]
+            roots.extend(
+                self.deferred_function(child, env)
+                for item in statements(node)
+                for child in ast.iter_child_nodes(item)
+                if isinstance(child, ast.Lambda)
+            )
         if argument is not None:
             roots.append(argument)
-        return frozenset(
-            origin for value in reachable_values(roots, env) for origin in value.origins
+        values = list(reachable_values(roots, env))
+        return Value(
+            origins=frozenset(origin for value in values for origin in value.origins),
+            captures=frozenset(name for value in values for name in value.captures),
         )
 
     @staticmethod
@@ -1375,6 +1452,19 @@ class Analyzer:
             and key.value in owner.state.fields
         )
 
+    def has_rebound_allocator(self, definition: Definition) -> bool:
+        ancestry = self.sources.class_mro(definition)
+        modules = {item.source.path: item.source for item in ancestry}
+        modules[self.source.path] = self.source
+        for source in modules.values():
+            for owner in source.allocator_writes:
+                try:
+                    if self.sources.reference(source, owner) in ancestry:
+                        return True
+                except Incomplete:
+                    continue
+        return False
+
     def expression(self, node: ast.AST | None, env: dict[str, Value]) -> Value:
         if isinstance(node, ast.Name):
             return env.get(node.id, Value())
@@ -1382,15 +1472,15 @@ class Analyzer:
             owner = self.expression(node.value, env)
             if owner.state is not None and node.attr in owner.state.fields:
                 return owner.state.fields[node.attr]
-            return Value(origins=owner.origins)
+            return Value(origins=owner.origins, captures=owner.captures)
         if isinstance(node, ast.Lambda):
-            return self.deferred_function(node)
+            return self.deferred_function(node, env)
         if isinstance(
             node,
             (ast.IfExp, ast.BoolOp, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Subscript),
         ):
             # These expressions can carry an instance without defining its exact identity.
-            return Value(origins=self.referenced_origins(node, env))
+            return self.referenced_value(node, env)
         if isinstance(node, ast.Call):
             name = self.source.qualified(node.func)
             origin = frozenset({id(node)})
@@ -1432,6 +1522,7 @@ class Analyzer:
                         if (
                             shape.allocator_unknown
                             or shape.skipped_bases
+                            or self.has_rebound_allocator(definition)
                             or (
                                 allocator is not None
                                 and (
@@ -1454,7 +1545,7 @@ class Analyzer:
                     origin,
                 )
             # An unresolved result may alias a value reachable from the call.
-            return Value(origins=self.referenced_origins(node, env))
+            return self.referenced_value(node, env)
         return Value()
 
     def instance_registration(self, call: ast.Call, env: dict[str, Value]) -> None:
@@ -1827,10 +1918,8 @@ class Analyzer:
             or (isinstance(node, ast.Compare) and len(node.comparators) > 1)
             for node in nodes
         )
-        possible_origins = (
-            self.referenced_origins(expression, env)
-            if assignments and not track_alias
-            else frozenset()
+        possible_alias = (
+            self.referenced_value(expression, env) if assignments and not track_alias else Value()
         )
         for node in nodes:
             if isinstance(node, ast.NamedExpr):
@@ -1841,7 +1930,8 @@ class Analyzer:
                     # binding in place or take an alias from an enclosing iterable.
                     previous = env.get(node.target.id, Value())
                     value = Value(
-                        origins=possible_origins | previous.origins, captures=previous.captures
+                        origins=possible_alias.origins | previous.origins,
+                        captures=possible_alias.captures | previous.captures,
                     )
                 self.assignment(node.target, value, env)
             if not isinstance(node, ast.Call):
@@ -1873,7 +1963,7 @@ class Analyzer:
                     owner.fields[node.args[1].value] = self.expression(node.args[2], env)
             else:
                 self.invalidate_origins(
-                    self.referenced_origins(node, env),
+                    self.referenced_value(node, env).origins,
                     env,
                     f"Unresolved call effects at line {node.lineno}",
                 )
@@ -1937,7 +2027,7 @@ class Analyzer:
                     # Class bodies execute eagerly in their own namespace and
                     # can mutate objects from the enclosing scope.
                     self.invalidate_origins(
-                        self.referenced_origins(statement, env),
+                        self.referenced_value(statement, env).origins,
                         env,
                         f"Unresolved class-body effects at line {statement.lineno}",
                     )
@@ -1946,7 +2036,7 @@ class Analyzer:
                 else:
                     # A deferred body cannot use instance state from definition time.
                     self.block(statement.body, {})
-                    value = self.deferred_function(statement)
+                    value = self.deferred_function(statement, env)
                 for decorator in reversed(statement.decorator_list):
                     if isinstance(decorator, ast.Call):
                         reference = decorator.func
@@ -1961,7 +2051,7 @@ class Analyzer:
                     if only_wraps and not self.uses_rebound_names(statement, [reference]):
                         continue
                     self.invalidate_origins(
-                        self.referenced_origins(decorator, env, argument=value),
+                        self.referenced_value(decorator, env, argument=value).origins,
                         env,
                         f"Unresolved decorator effects at line {decorator.lineno}",
                     )
