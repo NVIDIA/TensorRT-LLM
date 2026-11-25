@@ -53,9 +53,9 @@ from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer, load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_device_count, get_sm_version, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper, skip_no_rubin,
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
                             GSM8KInferenceX, LlmapiAccuracyTestHarness,
@@ -470,13 +470,12 @@ def launch_disaggregated_llm(
 
         gen_servers.append((env, gen_server_args))
 
-    phase_limit = configure_weight_loading([(worker_env, ctx_total_gpus)
-                                            for worker_env, _ in ctx_servers] +
-                                           [(worker_env, gen_total_gpus)
-                                            for worker_env, _ in gen_servers])
-    if phase_limit is not None:
-        # The phase watchdog enforces the tighter, dynamically switched budget.
-        server_waiting_timeout = int(phase_limit)
+    readiness = configure_weight_loading([(worker_env, ctx_total_gpus)
+                                          for worker_env, _ in ctx_servers] +
+                                         [(worker_env, gen_total_gpus)
+                                          for worker_env, _ in gen_servers])
+    safety_timeout = (readiness.safety_timeout
+                      if readiness is not None else server_waiting_timeout)
 
     worker_log_paths = []
     capture_worker_logs = bool(assert_worker_log_contains
@@ -535,8 +534,7 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout), "-r", "360000", "--report_addr",
-        disagg_addr_path
+        str(safety_timeout), "-r", "360000", "--report_addr", disagg_addr_path
     ]
     # The disagg server must come up first: it owns the cluster storage the
     # workers register with, and only it knows the port the kernel handed it.
@@ -565,8 +563,12 @@ def launch_disaggregated_llm(
                         enable_redirect_log=capture_worker_logs))
 
         def wait_ready() -> None:
-            deadline = time.monotonic() + server_waiting_timeout
+            start = time.monotonic()
+            deadline = start + safety_timeout
             while time.monotonic() < deadline:
+                if readiness is not None:
+                    readiness.remaining(start, server_waiting_timeout,
+                                        time.monotonic())
                 for process in itertools.chain(ctx_processes, gen_processes,
                                                server_processes):
                     if process.poll() is not None:
@@ -580,13 +582,16 @@ def launch_disaggregated_llm(
                     response.raise_for_status()
                     cluster_info = response.json()
                     if cluster_info.get("is_ready"):
+                        if readiness is not None:
+                            readiness.require_complete()
+                            readiness.remaining(start, server_waiting_timeout,
+                                                time.monotonic())
                         print(f"Cluster ready: {cluster_info}")
                         return
                 except requests.exceptions.ConnectionError:
                     pass
                 time.sleep(5)
-            pytest.fail(
-                f"Server is not ready after {server_waiting_timeout} seconds")
+            pytest.fail(f"Server is not ready after {safety_timeout} seconds")
 
         wait_ready()
 
@@ -2377,9 +2382,14 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        readiness_timeout = (3000 if get_sm_version() == 107 else
+                             DEFAULT_SERVER_WAITING_TIMEOUT)
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                server_waiting_timeout=readiness_timeout) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
@@ -3253,12 +3263,13 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        # Same long-init reason as TestDeepSeekV4Flash above.
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      server_waiting_timeout=3600) as llm:
+        readiness_timeout = 5400 if get_sm_version() == 107 else 3600
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                server_waiting_timeout=readiness_timeout) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 

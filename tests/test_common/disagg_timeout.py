@@ -7,12 +7,15 @@ second starts when the last expected worker rank finishes loading its main
 model and includes all remaining initialization, test execution and teardown.
 """
 
+from __future__ import annotations
+
 import json
 import math
 import os
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Generator
 from pathlib import Path
 
 import pytest
@@ -20,16 +23,31 @@ from pytest_timeout import Settings
 
 _ATTEMPT_ENV = "TRTLLM_TEST_DISAGG_TIMEOUT_DIR"
 _WORKER_ENV = "TRTLLM_TEST_WEIGHT_LOADING_DIR"
+_LOADING_OVERRIDE = "TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT"
+_MARKER = "disagg_weight_loading"
+PLUGIN_NAME = "disagg-weight-loading-timeout"
+_LOADING_BUDGET = pytest.StashKey[float]()
 _WATCHDOG = pytest.StashKey["_Watchdog"]()
-_BUDGETS = pytest.StashKey[tuple[Settings, float]]()
+_SETTINGS = pytest.StashKey[Settings]()
+_ReportTimeout = Callable[[pytest.Item, float], None]
 
 
-def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> float | None:
-    """Configure every worker before launching any process; return a safety limit.
+def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> ReadinessBudget | None:
+    """Wire up every worker before launching any process.
 
     Worker environments may be snapshots made before pytest setup, so the
     attempt directory is read from the parent, rather than from those snapshots.
     The directory must be visible to every rank on the same host.
+
+    Args:
+        workers: A pair of environment and world size per worker. Each
+            environment is updated in place with its rank-event directory.
+
+    Returns:
+        The readiness budget for this launch, or None without supervision.
+
+    Raises:
+        RuntimeError: A cluster launch has already been configured in this attempt.
     """
     attempt = os.environ.get(_ATTEMPT_ENV)
     if not attempt:
@@ -51,7 +69,74 @@ def configure_weight_loading(workers: list[tuple[dict[str, str], int]]) -> float
     temporary.write_text(json.dumps(expected), encoding="utf-8")
     temporary.replace(root / "expected.json")
     budgets = json.loads((root / "budgets.json").read_text(encoding="utf-8"))
-    return budgets["loading"] + budgets["execution"]
+    return ReadinessBudget(root, budgets["loading"] + budgets["execution"])
+
+
+class _RankCompletions:
+    def __init__(self, root: Path, not_before: float = 0) -> None:
+        self._root = root
+        self._not_before = not_before
+        self._paths: list[Path] | None = None
+        self._completed_at: float | None = None
+
+    def _expected_paths(self) -> list[Path]:
+        if self._paths is None:
+            try:
+                expected = json.loads((self._root / "expected.json").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return []  # Worker launch has not been configured yet.
+            self._paths = [self._root / name for name in expected]
+        return self._paths
+
+    def completed_at(self) -> float | None:
+        if self._completed_at is None:
+            paths = self._expected_paths()
+            if not paths:
+                return None
+            try:
+                timestamps = [float(path.read_text(encoding="utf-8")) for path in paths]
+            except FileNotFoundError:
+                return None
+            if not all(math.isfinite(stamp) and stamp >= self._not_before for stamp in timestamps):
+                raise ValueError(
+                    "Weight-loading events must have valid timestamps from this attempt"
+                )
+            self._completed_at = max(timestamps)
+        return self._completed_at
+
+    def missing(self) -> str:
+        paths = self._expected_paths()
+        if not paths:
+            return "worker launch has not been configured"
+        return ", ".join(str(path.relative_to(self._root)) for path in paths if not path.exists())
+
+
+class ReadinessBudget:
+    """Apply the caller's readiness limit once the last worker rank has loaded."""
+
+    def __init__(self, root: Path, safety_timeout: float) -> None:
+        self._completions = _RankCompletions(root)
+        self.safety_timeout = math.ceil(safety_timeout)
+
+    def remaining(self, wait_start: float, timeout: float, now: float) -> float | None:
+        """Check the deadline and return seconds remaining, or None while loading."""
+        completed_at = self._completions.completed_at()
+        if completed_at is None:
+            return None
+        remaining = max(wait_start, completed_at) + timeout - now
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Cluster did not become ready within {timeout}s after weight loading"
+            )
+        return remaining
+
+    def require_complete(self) -> None:
+        """Fail a ready cluster that did not publish all loading events."""
+        if self._completions.completed_at() is None:
+            raise RuntimeError(
+                f"Cluster became ready without weight-loading events: {self._completions.missing()}. "
+                "Check worker ranks and use a TensorRT-LLM wheel built from this checkout."
+            )
 
 
 class PhaseBudget:
@@ -65,33 +150,27 @@ class PhaseBudget:
         self.execution = execution
         self.start = start
         self.loaded_at: float | None = None
+        self.completions = _RankCompletions(root, start)
 
     def remaining(self, now: float) -> tuple[str, float]:
         """Return the phase and remaining seconds, using the last rank's event."""
         if self.loaded_at is None:
-            manifest = self.root / "expected.json"
-            if manifest.exists():
-                expected = json.loads(manifest.read_text(encoding="utf-8"))
-                paths = [self.root / name for name in expected]
-                if paths and all(path.exists() for path in paths):
-                    timestamps = [float(path.read_text(encoding="utf-8")) for path in paths]
-                    if not all(
-                        math.isfinite(stamp) and self.start <= stamp for stamp in timestamps
-                    ):
-                        raise ValueError("Weight-loading events must belong to this attempt")
-                    completed = max(timestamps)
-                    # Late events must not rescue an already expired loading phase.
-                    if completed <= self.start + self.loading:
-                        self.loaded_at = completed
+            completed = self.completions.completed_at()
+            # Late events must not rescue an already expired loading phase.
+            if completed is not None and self.start <= completed <= self.start + self.loading:
+                self.loaded_at = completed
         if self.loaded_at is None:
             return "weight_loading", self.start + self.loading - now
         return "post_loading", self.loaded_at + self.execution - now
 
 
 class _Watchdog:
-    def __init__(self, item: pytest.Item, settings: Settings, loading: float) -> None:
+    def __init__(
+        self, item: pytest.Item, settings: Settings, loading: float, report: _ReportTimeout | None
+    ) -> None:
         self.item = item
         self.settings = settings
+        self.report = report
         output = item.config.getoption("output_dir", default=None)
         if output:
             output = str(Path(output).resolve())
@@ -105,46 +184,51 @@ class _Watchdog:
         self.previous_env = os.environ.get(_ATTEMPT_ENV)
         os.environ[_ATTEMPT_ENV] = str(root)
         self.stop = threading.Event()
-        self.setup_seen = False
         self.thread = threading.Thread(target=self._run, name="disagg-timeout", daemon=True)
 
     def _expire(self, phase: str) -> None:
         import pytest_timeout
 
-        timeout = self.budget.loading if phase == "weight_loading" else self.budget.execution
-        reporter = self.item.config.pluginmanager.getplugin("periodic_junit")
-        if reporter is not None:
-            reporter._dump_hang(self.item.nodeid)
-        evidence = self.item.config.pluginmanager.getplugin("trtllm_pytest_timeout_evidence")
-        if evidence is not None:
-            evidence.emit_timeout(self.item, timeout)
-        print(f"[disagg-timeout] {phase} timeout: {self.item.nodeid}", flush=True)
-        pytest_timeout.timeout_timer(self.item, self.settings._replace(timeout=timeout))
+        if not self.settings.disable_debugger_detection and pytest_timeout.is_debugging():
+            return
+        loading = phase == "weight_loading"
+        timeout = self.budget.loading if loading else self.budget.execution
+        try:
+            print(f"[disagg-timeout] {phase} timeout: {self.item.nodeid}", flush=True)
+            if self.report is not None:
+                self.report(self.item, timeout)
+            if loading and (missing := self.budget.completions.missing()):
+                print(f"[disagg-timeout] Missing weight-loading events: {missing}", flush=True)
+        finally:
+            pytest_timeout.timeout_timer(self.item, self.settings._replace(timeout=timeout))
+
+    def _log_phase(self, phase: str, remaining: float, now: float) -> None:
+        loading_elapsed = (self.budget.loaded_at or now) - self.budget.start
+        print(
+            f"[disagg-timeout] phase={phase}, remaining={remaining:.1f}s, "
+            f"loading_elapsed={loading_elapsed:.1f}s, "
+            f"loading_budget={self.budget.loading}s, execution_budget={self.budget.execution}s",
+            flush=True,
+        )
 
     def _run(self) -> None:
-        import pytest_timeout
-
         previous_phase = None
         next_log = 0.0
-        while not self.stop.is_set():
+        while True:
             now = time.monotonic()
             try:
                 phase, remaining = self.budget.remaining(now)
             except (OSError, ValueError, TypeError) as error:
                 print(f"[disagg-timeout] Invalid loading state: {error}", flush=True)
-                pytest_timeout.timeout_timer(self.item, self.settings)
+                if not self.stop.is_set():
+                    self._expire("weight_loading")
                 return
-            if phase != previous_phase or now >= next_log:
-                loading_elapsed = (self.budget.loaded_at or now) - self.budget.start
-                print(
-                    f"[disagg-timeout] phase={phase}, remaining={remaining:.1f}s, "
-                    f"loading_elapsed={loading_elapsed:.1f}s, "
-                    f"loading_budget={self.budget.loading}s, "
-                    f"execution_budget={self.budget.execution}s",
-                    flush=True,
-                )
+            if phase != previous_phase or (not self.stop.is_set() and now >= next_log):
+                self._log_phase(phase, remaining, now)
                 previous_phase = phase
                 next_log = now + 30
+            if self.stop.is_set():
+                return
             if remaining <= 0:
                 self._expire(phase)
                 return
@@ -160,59 +244,102 @@ class _Watchdog:
         self.directory.cleanup()
 
 
+def can_supervise(item: pytest.Item, settings: Settings) -> bool:
+    """Whether the marked item uses pytest-timeout's whole-item thread mode."""
+    uses_thread = settings.method == "thread" or (
+        settings.method == "signal" and threading.current_thread() is not threading.main_thread()
+    )
+    return (
+        item.get_closest_marker(_MARKER) is not None
+        and item.config.pluginmanager.hasplugin(PLUGIN_NAME)
+        and uses_thread
+        and not settings.func_only
+    )
+
+
+def is_supervised(item: pytest.Item) -> bool:
+    """Whether the disagg watchdog owns this item's timeout."""
+    return item.get_closest_marker(_MARKER) is not None and _SETTINGS in item.stash
+
+
 class DisaggTimeoutPlugin:
     """Replace pytest-timeout's timer only on explicitly marked tests."""
 
+    def __init__(self, report: _ReportTimeout | None) -> None:
+        self._report = report
+
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_setup(self, item: pytest.Item) -> None:
-        if _BUDGETS not in item.stash:
+        if _SETTINGS not in item.stash:
             return
-        watchdog = item.stash.get(_WATCHDOG, None)
-        if watchdog is None or watchdog.setup_seen:
-            # pytest-rerunfailures repeats setup inside one runtest protocol.
-            # pytest-timeout also cancels on exception_interact before a rerun.
-            settings, loading = item.stash[_BUDGETS]
-            if watchdog is not None:
-                watchdog.cancel()
-            watchdog = _Watchdog(item, settings, loading)
-            item.stash[_WATCHDOG] = watchdog
-            watchdog.thread.start()
-        watchdog.setup_seen = True
+        # pytest-rerunfailures invokes setup once per attempt.
+        self._cancel(item)
+        watchdog = _Watchdog(item, item.stash[_SETTINGS], item.stash[_LOADING_BUDGET], self._report)
+        item.stash[_WATCHDOG] = watchdog
+        watchdog.thread.start()
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_teardown(self, item: pytest.Item) -> Generator[None, None, None]:
+        try:
+            return (yield)
+        finally:
+            self._cancel(item)
+
+    def _cancel(self, item: pytest.Item) -> None:
+        if _WATCHDOG in item.stash:
+            item.stash[_WATCHDOG].cancel()
+            del item.stash[_WATCHDOG]
 
     @pytest.hookimpl(tryfirst=True, optionalhook=True)
     def pytest_timeout_set_timer(self, item: pytest.Item, settings: Settings) -> bool | None:
-        marker = item.get_closest_marker("disagg_weight_loading")
-        if marker is None:
+        if not can_supervise(item, settings):
             return None
-        if settings.func_only:
-            raise pytest.UsageError("disagg_weight_loading requires timeout func_only=False")
-        loading = float(os.environ.get("TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT", marker.args[0]))
-        item.stash[_BUDGETS] = settings, loading
-        watchdog = _Watchdog(item, settings, loading)
-        item.stash[_WATCHDOG] = watchdog
-        watchdog.thread.start()
+        item.stash[_SETTINGS] = settings
         return True
 
     @pytest.hookimpl(tryfirst=True, optionalhook=True)
     def pytest_timeout_cancel_timer(self, item: pytest.Item) -> bool | None:
-        if _WATCHDOG not in item.stash:
+        if _SETTINGS not in item.stash:
             return None
-        item.stash[_WATCHDOG].cancel()
-        del item.stash[_WATCHDOG]
+        self._cancel(item)
         return True
 
     def pytest_collection_modifyitems(
         self, config: pytest.Config, items: list[pytest.Item]
     ) -> None:
-        marked = [item for item in items if item.get_closest_marker("disagg_weight_loading")]
-        if marked and not config.pluginmanager.hasplugin("timeout"):
-            raise pytest.UsageError("disagg_weight_loading requires pytest-timeout")
+        override = os.environ.get(_LOADING_OVERRIDE)
+        for item in items:
+            marker = item.get_closest_marker(_MARKER)
+            if marker is None:
+                continue
+            if not config.pluginmanager.hasplugin("timeout"):
+                raise pytest.UsageError(f"{item.nodeid}: {_MARKER} requires pytest-timeout")
+            if len(marker.args) != 1 or marker.kwargs:
+                raise pytest.UsageError(f"{item.nodeid}: use {_MARKER}(seconds)")
+            seconds = _positive_seconds(item, _MARKER, marker.args[0])
+            if override is not None:
+                seconds = _positive_seconds(item, _LOADING_OVERRIDE, override)
+            item.stash[_LOADING_BUDGET] = seconds
 
 
-def register(config: pytest.Config) -> None:
+def _positive_seconds(item: pytest.Item, setting: str, value: object) -> float:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+    except (OverflowError, ValueError) as error:
+        raise pytest.UsageError(
+            f"{item.nodeid}: {setting} expects positive seconds, got {value!r}"
+        ) from error
+    return seconds
+
+
+def register(config: pytest.Config, report_timeout: _ReportTimeout | None = None) -> None:
     """Register once from the integration conftest."""
     config.addinivalue_line(
         "markers", "disagg_weight_loading(seconds): separate loading and post-loading budgets"
     )
-    if not config.pluginmanager.hasplugin("disagg-weight-loading-timeout"):
-        config.pluginmanager.register(DisaggTimeoutPlugin(), "disagg-weight-loading-timeout")
+    if not config.pluginmanager.hasplugin(PLUGIN_NAME):
+        config.pluginmanager.register(DisaggTimeoutPlugin(report_timeout), PLUGIN_NAME)

@@ -264,14 +264,7 @@ def run_gen_worker(
 
 
 def run_disagg_server(
-    disagg_cluster_config,
-    work_dir,
-    port=0,
-    save_log=False,
-    env=None,
-    cwd=None,
-    report_addr=None,
-    server_start_timeout=None,
+    disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None, report_addr=None
 ):
     """Launch the disaggregated server.
 
@@ -283,7 +276,6 @@ def run_disagg_server(
         env: Environment variables for the subprocess
         report_addr: If set, passed as --report_addr: the server writes the
             host:port it bound to this file (read it with wait_for_reported_addr)
-        server_start_timeout: Optional CLI startup safety limit in seconds.
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -295,8 +287,6 @@ def run_disagg_server(
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
     if report_addr:
         cmds += ["--report_addr", report_addr]
-    if server_start_timeout is not None:
-        cmds += ["--server_start_timeout", str(server_start_timeout)]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).

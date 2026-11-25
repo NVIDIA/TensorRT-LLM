@@ -12,13 +12,16 @@ def notify_weight_loading_complete(rank: int) -> None:
 
     No environment variable means no filesystem access. No extra distributed
     barrier is introduced: the test supervisor waits for each rank's event.
+
+    Args:
+        rank: Rank within the worker's model-parallel world.
     """
     directory = os.environ.get("TRTLLM_TEST_WEIGHT_LOADING_DIR")
     if not directory:
         return
     destination = Path(directory) / f"rank-{rank}.done"
-    # A profiling pass may construct another model engine in the same rank.
-    # Preserve the first completion instead of moving the phase boundary.
+    # A worker relaunched within this attempt republishes its ranks. Keep
+    # the first completion at the phase boundary.
     if destination.exists():
         return
     temporary = destination.with_suffix(f".{os.getpid()}.tmp")

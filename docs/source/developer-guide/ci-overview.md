@@ -28,6 +28,7 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 6. [Waiving tests](#waiving-tests)
 7. [Multi-GPU Tests](#multi-gpu-tests)
 8. [Triggering CI Best Practices](#triggering-ci-best-practices)
+9. [Experimental disaggregated QA timeout budgets](#experimental-disaggregated-qa-timeout-budgets)
 
 ## CI pipelines
 
@@ -224,7 +225,7 @@ Avoid habitually using `--disable-fail-fast` as it wastes scarce hardware resour
 
 ## Experimental disaggregated QA timeout budgets
 
-Selected large-model disaggregated QA cases use
+Selected disaggregated cases in L0 pre-merge and post-merge use
 `@pytest.mark.disagg_weight_loading(seconds)` to separate two wall-clock budgets:
 
 1. From pytest setup until every context and generation rank has returned from
@@ -234,29 +235,16 @@ Selected large-model disaggregated QA cases use
    inference or accuracy evaluation, and teardown. This budget is the existing
    `pytest.mark.timeout` value (or `--timeout` for cases without that marker).
 
-The experiment enables a 7200-second loading budget for Kimi K2.5 NVFP4,
-GLM-5.2 NVFP4's NIXL test, DeepSeek V4 Flash Base, and the two DeepSeek V4.1
-Flash GSM8K cases. Nemotron Super 120B's concurrency test uses 1800 seconds for
-loading and retains a 3600-second execution budget. The remaining reported
-cases use these budgets:
+The opt-in markers on individual tests define the loading budgets. Set
+`TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT` to a positive number of seconds to override
+them. Selected standalone tests specify their execution budgets explicitly so
+Jenkins can provide a larger group timeout.
 
-| Case | Loading budget | Execution budget |
-| --- | --- | --- |
-| DeepSeek V3 Lite FP8 NIXL | 1800 seconds | 3600 seconds |
-| DeepSeek V3 Lite BF16 Helix, short prompt | 1800 seconds | 2400 seconds |
-| DeepSeek V3 Lite BF16 empty batch | 1800 seconds | 3600 seconds |
-| Qwen3-0.6B context TP2 / generation PP2 | 600 seconds | 3600 seconds |
-| Qwen3.8 Flash Next FP8, `prefix_cache_offsets` | 7200 seconds | 3600 seconds |
-
-Only the indicated Qwen parameter instance opts in; its other snapshot-policy
-variants retain their existing timeout behavior. Explicit execution markers
-preserve the previous 3600-second default for the selected standalone cases
-when Jenkins supplies a larger outer-group safety timeout.
-
-Unmarked tests retain their configuration-derived readiness budgets: 900 seconds
-for PP configurations on the SM100 family, 300 seconds otherwise, with an
-explicit caller-provided limit taking precedence. `TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT`
-can override the loading budget with a positive number of seconds.
+After all ranks have loaded, the harness applies the test's service readiness
+limit within the execution budget. This lets the harness report a readiness
+failure and clean up the workers while execution time remains. The separate
+wait for the coordinator to report its initial address starts when the
+coordinator launches.
 
 This version supports one cluster launch per test attempt and single-host
 PyTorch workers with the main/one-model checkpoint. It does not separate the
@@ -267,13 +255,12 @@ added. Some initialization precedes or overlaps loading and is consequently
 within the first budget. A fresh runtime wheel built from the same checkout is
 required; changing test sources alone does not install the completion signal.
 
-The supervisor uses the thread timeout mechanism so a blocked CUDA call remains
-bounded, emits `[disagg-timeout] phase=weight_loading` and `phase=post_loading`
-messages, and preserves exact-nodeid timeout evidence and hang tracebacks.
-`timeout func_only=True` is unsupported. Internal server-ready limits become
-safety limits covering both budgets; the supervisor enforces the actual phase
-deadlines. Jenkins/process/group limits must cover both budgets, cleanup, and
-any configured retries, and can still terminate a run earlier if set too low.
+Use `--timeout-method=thread` with a whole-test pytest timeout to enable the
+supervisor. It emits `[disagg-timeout] phase=weight_loading` and
+`phase=post_loading` messages and preserves exact-nodeid timeout evidence and
+hang tracebacks. Local signal timeouts and `func_only=True` use pytest-timeout's
+single timer. Set Jenkins process and group limits to cover both budgets,
+cleanup, and any configured retries.
 
 CPU regression checks are in `tests/unittest/tools/test_disagg_timeout.py`,
 already covered by the `unittest/tools` parent entry in the CPU test list.

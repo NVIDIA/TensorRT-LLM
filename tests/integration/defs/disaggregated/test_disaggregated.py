@@ -798,8 +798,9 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
-        server_start_timeout: Timeout in seconds for server to become ready;
-            None picks one from the config (see resolve_server_start_timeout)
+        server_start_timeout: Timeout in seconds for server to become ready.
+            With separate loading supervision, this starts after loading.
+            None picks one from the config (see resolve_server_start_timeout).
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
@@ -909,11 +910,11 @@ def setup_disagg_cluster(
                             for _ in range(num_ctx_instances)]
     generation_environments = [(gen_worker_env or os.environ).copy()
                                for _ in range(num_gen_instances)]
-    phase_limit = configure_weight_loading(
+    readiness = configure_weight_loading(
         [(worker_env, gpus_per_ctx) for worker_env in context_environments] +
         [(worker_env, gpus_per_gen) for worker_env in generation_environments])
-    if phase_limit is not None:
-        server_start_timeout = int(phase_limit)
+    safety_timeout = (readiness.safety_timeout
+                      if readiness is not None else server_start_timeout)
 
     internal_request_auth_key = config.get(
         "internal_request_auth_key") or secrets.token_hex(32)
@@ -966,8 +967,6 @@ def setup_disagg_cluster(
         if schedule_style:
             server_config["schedule_style"] = schedule_style
         server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
-        if phase_limit is not None:
-            server_launch_kwargs["server_start_timeout"] = server_start_timeout
         if report_addr is not None:
             # The workers register with the server, so a server on a
             # kernel-assigned port starts first and they get the port it
@@ -1059,13 +1058,20 @@ def setup_disagg_cluster(
                         startup_callback(now - start)
                         last_tick = now
 
+                    elapsed = int(now - start)
+                    remaining = server_start_timeout - elapsed
+                    if readiness is not None:
+                        remaining = readiness.remaining(start,
+                                                        server_start_timeout,
+                                                        now)
                     if now - last_status_log >= 10:
-                        elapsed = int(now - start)
-                        remaining = int(server_start_timeout - elapsed)
+                        status = (
+                            "waiting for weight loading"
+                            if remaining is None else
+                            f"{int(max(remaining, 0))}s left until timeout")
                         print(
                             f"[startup] {elapsed}s elapsed, "
-                            f"{max(remaining, 0)}s left until timeout "
-                            f"(timeout={server_start_timeout}s, "
+                            f"{status} (timeout={server_start_timeout}s, "
                             f"workers registered: {last_worker_count}/"
                             f"{num_ctx_instances + num_gen_instances})",
                             flush=True,
@@ -1109,10 +1115,10 @@ def setup_disagg_cluster(
             # asyncio.wait(FIRST_COMPLETED) means whichever finishes first
             # (success or exception) immediately cancels the other, so a dead
             # worker detected by _tick() doesn't leave wait_for_disagg_server_ready
-            # polling silently for up to server_start_timeout seconds.
+            # polling silently until its timeout.
             ready_task = asyncio.create_task(
                 wait_for_disagg_server_ready(server_port,
-                                             timeout=server_start_timeout))
+                                             timeout=safety_timeout))
             tick_task = asyncio.create_task(_tick())
 
             done, pending = await asyncio.wait(
@@ -1133,6 +1139,10 @@ def setup_disagg_cluster(
                 if t in done and not t.cancelled() and t.exception(
                 ) is not None:
                     raise t.exception()
+            if readiness is not None:
+                readiness.require_complete()
+                readiness.remaining(start, server_start_timeout,
+                                    time.monotonic())
 
         asyncio.run(_wait_with_ticker())
         print(
@@ -2143,13 +2153,17 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # dominated by a separate UCX/NIXL issue, not slow warmup, so keep 300s
     # there rather than delaying those failures.
     server_start_timeout = 300
-    if get_sm_version() in (100, 103):
+    sm_version = get_sm_version()
+    if sm_version in (100, 103):
         gen_env = {
             "TLLM_LOG_LEVEL": "INFO",
             "TLLM_FMHA_LIBS": "cute_dsl_mla,fallback"
         }
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
         server_start_timeout = 1200
+    elif sm_version == 107:
+        # Allow time for post-load initialization on Rubin.
+        server_start_timeout = 1800
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -2455,13 +2469,15 @@ def run_disaggregated_benchmark(example_dir,
                                 max_concurrency=32,
                                 skip_warmup=False,
                                 model_path=None,
-                                cwd=None):
+                                cwd=None,
+                                server_start_timeout=None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
 
@@ -4695,6 +4711,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
         random_output_len=1024,
         skip_warmup=True,
         model_path=model_dir,
+        server_start_timeout=900 if get_sm_version() == 107 else None,
         cwd=llm_venv.get_working_directory())
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
