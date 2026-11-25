@@ -152,16 +152,113 @@ llm_perf_core:
       compute_capability:
         gte: 10.0
         lte: 10.7
+  model_configs:
+    glm53_flash_fp8:
+      source: tests/scripts/perf-sanity/aggregated/gb300_glm53_flash_fp8_grace_blackwell.yaml
+      section:
+      - server_configs
+      - glm53_flash_fp8_dep4_mtp3_fp8kv_maxseq16k_8k1k
+      fields:
+      - disable_mm_encoder
+      - enable_chunked_prefill
+      - cuda_graph_config.max_batch_size
+      - kv_cache_config.enable_block_reuse
+      - kv_cache_config.free_gpu_memory_fraction
+      - max_seq_len
+      - moe_config.backend
+    minimax_m3:
+      source: examples/configs/curated/minimax-m3-throughput.yaml
+      fields: [sparse_attention_config, kv_cache_config.enable_block_reuse]
+    minimax_m3_fp4:
+      source: examples/configs/curated/minimax-m3-throughput.yaml
+      fields:
+      - enable_attention_dp
+      - kv_cache_config.enable_block_reuse
+      - sparse_attention_config
+      settings:
+        kv_cache_config:
+          dtype: fp8
+          free_gpu_memory_fraction: 0.6
+        max_seq_len: 4096
+        moe_config:
+          backend: CUTLASS
+        sparse_attention_config:
+          implementation: msa
+    v41_flash_dep4:
+      source: tests/scripts/perf-sanity/aggregated/gb300_deepseek_v41_flash_nvfp4_grace_blackwell.yaml
+      section: [server_configs, v41_flash_nvfp4_dep4_dspark5_8k1k]
+      fields:
+      - allreduce_strategy
+      - custom_tokenizer
+      - enable_attention_dp
+      - enable_chunked_prefill
+      - max_seq_len
+      - kv_cache_config.dtype
+      - kv_cache_config.enable_block_reuse
+      - moe_config
+      - sparse_attention_config
+      settings:
+        cuda_graph_config:
+          batch_sizes: [1, 2, 4, 8, 16, 32]
+        enable_iter_perf_stats: true
+        gpus_per_node: 4
+        kv_cache_config:
+          enable_swa_scratch_reuse: false
+          max_tokens: 262144
+    minimax_m3_throughput:
+      source: examples/configs/curated/minimax-m3-throughput.yaml
+      settings:
+        kv_cache_config:
+          dtype: fp8
+        moe_config:
+          backend: CUTLASS
+        sparse_attention_config:
+          implementation: msa
+    gemma4_nvfp4:
+      settings:
+        enable_chunked_prefill: true
+        kv_cache_config:
+          dtype: fp8
+          enable_partial_reuse: false
+      on_sm:
+        versions: [107, 121]
+        settings:
+          attn_backend: FLASHINFER
+    super_throughput:
+      source: examples/configs/curated/nemotron-3-super-throughput.yaml
+      settings:
+        enable_chunked_prefill: true
+        kv_cache_config:
+          mamba_ssm_cache_dtype: float16
+          mamba_ssm_philox_rounds: 5
+          mamba_ssm_stochastic_rounding: true
+        max_seq_len: 1048576
+        moe_config:
+          backend: CUTLASS
+        num_postprocess_workers: 0
+    musespark_text:
+      source: examples/configs/curated/musespark-open.yaml
+      settings:
+        disable_mm_encoder: true
+        trust_remote_code: false
+        guided_decoding_backend: null
+    v41_dspark5:
+      source: tests/scripts/perf-sanity/aggregated/gb300_deepseek_v41_flash_nvfp4_grace_blackwell.yaml
+      section: [server_configs, v41_flash_nvfp4_dep4_dspark5_8k1k]
+      fields:
+      - speculative_config.decoding_type
+      - speculative_config.max_draft_len
+      - speculative_config.block_size
   tests:
   # Upper bound is 10.7 so Rubin shares this set: a VR200 NVL72 node exposes 4 GPUs,
   # the same shape these cases are sized for, so it runs them rather than a copy.
   # Muse Spark Open NVFP4, TP4/EP4, FP8 KV cache; text-only serving.
-  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:musespark-open.yaml,disable_mm_encoder=true,trust_remote_code=false,guided_decoding_backend=null] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:musespark-open.yaml,disable_mm_encoder=true,trust_remote_code=false,guided_decoding_backend=null] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:1280-con:256-ep:4-tp:4-gpus:4-cfg:musespark-open.yaml,disable_mm_encoder=true,trust_remote_code=false,guided_decoding_backend=null] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@musespark_text] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@musespark_text] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4-serve-pytorch-streaming-float4-maxbs:256-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:1280-con:256-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@musespark_text] TIMEOUT(120)
   # GLM-5.3-Flash FP8, TP4/EP4, BF16 KV cache, TRTLLM MoE, MTP3; honor EOS.
-  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_fp8+mtp3] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_fp8+mtp3] TIMEOUT(120)
   #qwen3.5_27b (dense BF16 52G, 1-GPU): maxbs 512 mamba states need >95G
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000]
@@ -170,45 +267,45 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:1000,2000]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:8000,1000-con:250] #max_throughput
   #minimax_m3 (MXFP8 block-sparse MoE, 4-GPU)
-  - perf/test_perf.py::test_perf[minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:4-gpus:4-cfg:max_seq_len=9216,enable_attention_dp=true] #min_latency
+  - perf/test_perf.py::test_perf[minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3,max_seq_len=9216,enable_attention_dp=true] #min_latency
   #minimax_m3_fp4 serve: MSA, CUTLASS, TP4/EP4, FP8 KV cache.
   #Limit batch/graph to 128; 8K inputs use chunked prefill and max_seq_len 9216.
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:128,128-ep:4-gpus:4]
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:500,2000-ep:4-gpus:4]
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:2000,500-ep:4-gpus:4]
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000-ep:4-gpus:4-cfg:max_seq_len=9216,enable_chunked_prefill=true]
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000-con:256-ep:4-gpus:4-cfg:max_seq_len=9216,enable_chunked_prefill=true] #max_throughput
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:128,128-ep:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_fp4]
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:500,2000-ep:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_fp4]
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:2000,500-ep:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_fp4]
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000-ep:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_fp4,max_seq_len=9216,enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000-con:256-ep:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_fp4,max_seq_len=9216,enable_chunked_prefill=true] #max_throughput
   #deepseek_v4_flash_base_fp8 (sparse-MLA MoE, FP8 block-scale, 4-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:8192,1024-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:8192,1024-ep:4-tp:4-gpus:4-cfg:enable_attention_dp=true,max_seq_len=10240] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:4-tp:4-gpus:4-cfg:enable_attention_dp=true,max_seq_len=10240] TIMEOUT(120)
   #deepseek_v4_flash (post-trained, FP4+FP8 mixed, 4-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:4-tp:4-gpus:4-cfg:enable_attention_dp=true,enable_chunked_prefill=true,max_seq_len=10240,moe_config.backend=TRTLLM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:4-tp:4-gpus:4-cfg:enable_attention_dp=true,enable_chunked_prefill=true,max_seq_len=10240,moe_config.backend=TRTLLM] TIMEOUT(120)
   # DeepSeek V4.1 Flash NVFP4, 4-GPU, with attention DP enabled.
   # Both variants use the same text prompts and honor EOS;
   # 8192/1024 denotes the prompt target and output cap, not a fixed output length.
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4-cfg:decoding_type=DSpark,max_draft_len=5,block_size=5] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4-cfg:decoding_type=DSpark,max_draft_len=5,block_size=5] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@v41_flash_dep4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@v41_flash_dep4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@v41_flash_dep4+llm_perf_core.yml@v41_dspark5] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v41_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:128-con:8-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@v41_flash_dep4+llm_perf_core.yml@v41_dspark5] TIMEOUT(120)
   #minimax_m3_fp4 (block-sparse MoE, MXFP8 base + NVFP4 experts 233G, 4-GPU ep=4)
   #mirrors accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] (tp=ep=4).
   #ISL+OSL is kept <= 2048 because the M3 sparse path caps max_seq_len for CUDA-graph capture.
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.9-input_output_len:1024,1024-ep:4-tp:4-gpus:4-cfg:minimax-m3-throughput.yaml,max_seq_len=2560,cuda_graph_config.max_batch_size=128] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:1-maxnt:2048-kv_frac:0.9-input_output_len:1024,1024-reqs:10-con:1-ep:4-tp:4-gpus:4-cfg:minimax-m3-throughput.yaml,max_seq_len=2560,cuda_graph_config.max_batch_size=1] #min_latency
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.9-input_output_len:1024,1024-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560,cuda_graph_config.max_batch_size=128] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:1-maxnt:2048-kv_frac:0.9-input_output_len:1024,1024-reqs:10-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560,cuda_graph_config.max_batch_size=1] #min_latency
   #gemma_4_26b_a4b_nvfp4 (Gemma4 MoE 26B-A4B NVFP4 18G, 1-GPU; VSWA sliding_window=1024)
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:500,2000]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:2000,500]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:8000,1000]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1] #min_latency
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:8000,1000-con:250] #max_throughput
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:128,128-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:500,2000-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:2000,500-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:8000,1000-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-cfg:llm_perf_core.yml@gemma4_nvfp4] #min_latency
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-float4-input_output_len:8000,1000-con:250-cfg:llm_perf_core.yml@gemma4_nvfp4] #max_throughput
   #gemma_4_31b_it_nvfp4 (Gemma4 dense 31B NVFP4 31G, 1-GPU)
-  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:500,2000]
-  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:2000,500]
-  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1] #min_latency
-  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:8000,1000-con:250] #max_throughput
+  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:128,128-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:500,2000-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:2000,500-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-cfg:llm_perf_core.yml@gemma4_nvfp4] #min_latency
+  - perf/test_perf.py::test_perf[gemma_4_31b_it_nvfp4-bench-pytorch-float4-input_output_len:8000,1000-con:250-cfg:llm_perf_core.yml@gemma4_nvfp4] #max_throughput
   #qwen3.5_397b_a17b_fp4 (MoE FP4 234G, 4-GPU)
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-input_output_len:128,128-ep:4-tp:4-gpus:4]
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-input_output_len:500,2000-ep:4-tp:4-gpus:4]
@@ -218,18 +315,18 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:4-tp:4-gpus:4] #min_latency
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:8000,1000-con:512-ep:4-tp:4-gpus:4] #max_throughput
   #qwen3.6_35b_a3b_fp4 (GDN-attn MoE NVFP4, 1-GPU, SM100/103 only)
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:128,128]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:500,2000]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:2000,500]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:8000,1000]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:1000,2000]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1] #min_latency
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:8000,1000-con:256] #max_throughput
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:128,128-cfg:moe_config.backend=TRTLLM]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:500,2000-cfg:moe_config.backend=TRTLLM]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:2000,500-cfg:moe_config.backend=TRTLLM]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:8000,1000-cfg:moe_config.backend=TRTLLM]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-input_output_len:1000,2000-cfg:moe_config.backend=TRTLLM]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-cfg:moe_config.backend=TRTLLM] #min_latency
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-float4-maxbs:512-input_output_len:8000,1000-con:256-cfg:moe_config.backend=TRTLLM] #max_throughput
   #nemotron_3_super_120b_nvfp4 (Hybrid MoE+SSM+Attn FP4 76G, 4-GPU ep=4 tp=4, throughput config)
   #these test config come from docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:nemotron-3-super-throughput.yaml,num_postprocess_workers=0] #min_latency
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:nemotron-3-super-throughput.yaml,num_postprocess_workers=0,print_iter_log=false]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4-cfg:nemotron-3-super-throughput.yaml,num_postprocess_workers=0] #max_throughput
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@super_throughput] #min_latency
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@super_throughput,print_iter_log=false]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@super_throughput] #max_throughput
   #nemotron_3_ultra_550b_nvfp4 (Hybrid MoE FP4 ~275G, 4-GPU ep=4 tp=4, throughput config, HF download)
   #these test config come from docs/source/deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.md
   - perf/test_perf.py::test_perf[nemotron_3_ultra_550b_nvfp4-serve-pytorch-float4-maxbs:256-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:nemotron-3-ultra-throughput.yaml] #min_latency
@@ -242,9 +339,9 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1-cfg:qwen3.8-flash-next.yaml,moe_config.backend=CUTEDSL] TIMEOUT(180)
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1-cfg:qwen3.8-flash-next.yaml,moe_config.backend=CUTEDSL] TIMEOUT(180)
   #glm_5.3_flash_fp8 (4-GPU TP4/EP4)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency
-  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] TIMEOUT(120) #max_throughput
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_fp8] TIMEOUT(120) #min_latency
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_fp8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_fp8] TIMEOUT(120) #max_throughput
 
 
 # 7: B200, B300 test cases
@@ -255,6 +352,40 @@ llm_perf_core:
       compute_capability:
         gte: 10.0
         lte: 10.3
+  model_configs:
+    v4_pro_dspark:
+      settings:
+        custom_tokenizer: deepseek_v4
+        disable_overlap_scheduler: true
+        enable_attention_dp: true
+        enable_chunked_prefill: false
+        kv_cache_config:
+          enable_block_reuse: false
+        max_seq_len: 10240
+        speculative_config:
+          speculative_model: ${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-DSpark
+          decoding_type: DSpark
+          max_draft_len: 5
+    glm53_fp8:
+      settings:
+        enable_chunked_prefill: true
+        kv_cache_config:
+          enable_block_reuse: false
+          dtype: fp8
+        max_seq_len: 16384
+        stream_interval: 10
+        moe_config:
+          backend: DEEPGEMM
+    glm52_fp4:
+      settings:
+        cuda_graph_config:
+          enable_padding: true
+          max_batch_size: 128
+        enable_attention_dp: true
+        enable_chunked_prefill: true
+        max_seq_len: 10240
+        moe_config:
+          backend: CUTEDSL
   tests:
   # gpt_oss_120b_fp4
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:1280-con:256-ep:8-tp:8-gpus:8-cfg:stream_interval=10,num_postprocess_workers=4,enable_attention_dp=true]
@@ -264,11 +395,11 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-reqs:100-con:32-ep:8-tp:8-gpus:8-cfg:stream_interval=10,num_postprocess_workers=4]
 
   #deepseek_v4_flash_base_fp8 (sparse-MLA MoE, FP8 block-scale, 8-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:8192,1024-ep:8-tp:8-gpus:8-cfg:enable_attention_dp=true,max_seq_len=10240] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash_base_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:enable_attention_dp=true,max_seq_len=10240] TIMEOUT(120)
   #deepseek_v4_flash (post-trained, FP4+FP8 mixed, 8-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8-cfg:enable_attention_dp=true,enable_chunked_prefill=true,max_seq_len=10240,moe_config.backend=TRTLLM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:enable_attention_dp=true,enable_chunked_prefill=true,max_seq_len=10240,moe_config.backend=TRTLLM] TIMEOUT(120)
   #deepseek_v4_pro_fp4 (1.6T MoE, sparse MLA + mHC, FP4+FP8 mixed, 8-GPU)
   #knobs from examples/configs/curated/deepseek-v4-pro-{throughput,latency}.yaml;
   #8K/1K is the fixed-shape workload used in tech_blog26 for DeepSeek-V4 Pro.
@@ -276,10 +407,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:deepseek-v4-pro-throughput.yaml] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8-cfg:deepseek-v4-pro-latency.yaml] TIMEOUT(120) #min_latency
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:decoding_type=DSpark,max_draft_len=5,moe_config.backend=MEGAMOE_DEEPGEMM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@v4_pro_dspark,moe_config.backend=MEGAMOE_DEEPGEMM] TIMEOUT(120)
   # GLM-5.3 FP8, TP8/EP8, FP8 KV cache, DEEPGEMM; no MTP.
-  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8-cfg:stream_interval=10,moe_config.backend=DEEPGEMM,kv_cache_config.dtype=fp8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:320-con:64-ep:8-tp:8-gpus:8-cfg:stream_interval=10,moe_config.backend=DEEPGEMM,kv_cache_config.dtype=fp8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm53_fp8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:320-con:64-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm53_fp8] TIMEOUT(120)
   #glm_5.3_fp8 (8-GPU TP8/EP8)
   - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
@@ -289,23 +420,23 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
   - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120) #max_throughput
   #glm_5.2_fp4 (MoE NVFP4 433G, MLA + DSA on the DeepSeek-V3.2 path, 8-GPU ep=8)
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:128,128-ep:8-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:8000,1000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
-  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120) #max_throughput
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:128,128-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4]
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:500,2000-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:2000,500-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:8000,1000-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:1000,2000-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] #min_latency
+  - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@glm52_fp4] TIMEOUT(120) #max_throughput
   #minimax_m3_fp4 (block-sparse MoE, 8-GPU ep=8 + attention DP, matching
   #docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md).
   #The MXFP8 checkpoint is already covered at 4-GPU in condition 6.
   #ISL+OSL stays <= 2048: the M3 sparse path needs max_seq_len capped just above it
   #or CUDA-graph capture fails on gigabyte-scale warmup temporaries.
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:1024,1024-ep:8-tp:8-gpus:8-cfg:minimax-m3-throughput.yaml,max_seq_len=2560] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:2000,500-ep:8-tp:8-gpus:8-cfg:minimax-m3-throughput.yaml,max_seq_len=2560] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:500,2000-ep:8-tp:8-gpus:8-cfg:minimax-m3-throughput.yaml,max_seq_len=2560] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:1-maxnt:2048-kv_frac:0.9-input_output_len:1024,1024-reqs:10-con:1-ep:8-tp:8-gpus:8-cfg:minimax-m3-throughput.yaml,max_seq_len=2560,cuda_graph_config.max_batch_size=1] #min_latency
-  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:1024,1024-con:256-ep:8-tp:8-gpus:8-cfg:minimax-m3-throughput.yaml,max_seq_len=2560] TIMEOUT(120) #max_throughput
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:1024,1024-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:2000,500-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:500,2000-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:1-maxnt:2048-kv_frac:0.9-input_output_len:1024,1024-reqs:10-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560,cuda_graph_config.max_batch_size=1] #min_latency
+  - perf/test_perf.py::test_perf[minimax_m3_fp4-bench-pytorch-float4-maxbs:256-maxnt:8192-kv_frac:0.9-input_output_len:1024,1024-con:256-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@minimax_m3_throughput,max_seq_len=2560] TIMEOUT(120) #max_throughput
 
 
 # 8: B300 test cases
@@ -316,35 +447,89 @@ llm_perf_core:
       compute_capability:
         gte: 10.3
         lte: 10.3
+  model_configs:
+    v4_pro_dspark3:
+      source: tests/scripts/perf-sanity/disaggregated/gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL.yaml
+      section: [worker_config, gen]
+      fields:
+      - custom_tokenizer
+      - enable_attention_dp
+      - enable_lm_head_tp_in_adp
+      - kv_cache_config.dtype
+      - kv_cache_config.enable_block_reuse
+      - moe_config.use_low_precision_moe_combine
+      - speculative_config
+      settings:
+        disable_overlap_scheduler: true
+        enable_chunked_prefill: false
+        max_seq_len: 10240
+        speculative_config:
+          speculative_model: ${LLM_MODELS_ROOT}/DeepSeek-V4-Pro-nvfp4-DSpark
+    kimi_k3_streaming:
+      settings:
+        cuda_graph_config:
+          enable_padding: false
+          max_batch_size: 16
+        enable_chunked_prefill: true
+        kv_cache_config:
+          enable_block_reuse: false
+          tokens_per_block: 64
+        max_seq_len: 9344
+        stream_interval: 10
+    qwen38_max_mtp:
+      source: examples/configs/curated/qwen3.8-low-latency-mtp3.yaml
+      fields:
+      - kv_cache_config.mamba_ssm_cache_dtype
+      - moe_config.backend
+      - speculative_config
+      settings:
+        cuda_graph_config:
+          max_batch_size: 32
+        max_seq_len: 8192
+    kimi_k3_dep8:
+      settings:
+        cuda_graph_config:
+          max_batch_size: 8
+        enable_attention_dp: true
+        enable_chunked_prefill: true
+        kv_cache_config:
+          dtype: nvfp4
+          enable_block_reuse: false
+          tokens_per_block: 64
+        max_seq_len: 8192
+        moe_config:
+          backend: CUTLASS
+          max_num_tokens: 131072
+          use_low_precision_moe_combine: true
   tests:
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8-cfg:decoding_type=DSpark,max_draft_len=5,moe_config.backend=MEGAMOE_DEEPGEMM] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@v4_pro_dspark,moe_config.backend=MEGAMOE_DEEPGEMM] TIMEOUT(120)
   # NVFP4 DSpark: experimental single-node adaptation of the GB300 disagg recipe.
   # Hold workload/parallelism fixed; only override MoE (including the draft).
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:AUTO] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:TRTLLM] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:CUTEDSL] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:AUTO-cfg:llm_perf_core.yml@v4_pro_dspark3] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:TRTLLM-cfg:llm_perf_core.yml@v4_pro_dspark3] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_nvfp4_dspark-bench-pytorch-float4-maxbs:64-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-reqs:32-con:8-ep:8-gpus:8-moe:CUTEDSL-cfg:llm_perf_core.yml@v4_pro_dspark3] TIMEOUT(120)
   #deepseek_v4_pro_base_fp8 (1.6T MoE, FP8 block-scale, B300 DEP8 throughput and TEP8 latency)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:8192,1024-reqs:1024-con:512-ep:8-tp:8-gpus:8-cfg:deepseek-v4-pro-throughput.yaml] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:1000,2000-reqs:512-con:256-ep:8-tp:8-gpus:8-cfg:deepseek-v4-pro-throughput.yaml] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448-kv_frac:0.9-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8-cfg:deepseek-v4-pro-latency.yaml] TIMEOUT(120) #min_latency
   #kimi_k3 (TEP8 interactive serving, 8-GPU)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #max_throughput
   # kimi_k3 short-context (1k/2k) scenario, same TEP8 8-GPU deployment
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #max_throughput
   # Qwen3.8 MAX NVFP4 TP8 with MTP3 on 8-GPU B300 systems.
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:1-tp:8-gpus:8-cfg:llm_perf_core.yml@qwen38_max_mtp] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:1-tp:8-gpus:8-cfg:llm_perf_core.yml@qwen38_max_mtp] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_max_fp4_mtp-serve-pytorch-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:1-tp:8-gpus:8-cfg:llm_perf_core.yml@qwen38_max_mtp] TIMEOUT(180)
   # Kimi K3 NVFP4 DEP8 on one B300 node.
   # PR #22078; NVFP4 weights and NVFP4 KV, attention DP + EP8.
   # Startup OOM is tracked by NVBug 7139159; keep the default autotuner path.
-  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:8-tp:8-gpus:8] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:8-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_dep8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_dep8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:8-tp:8-gpus:8-cfg:llm_perf_core.yml@kimi_k3_dep8] TIMEOUT(180)
 
 
 # 9: H100, B200, B300, RTX6000-Server test cases
@@ -413,6 +598,22 @@ llm_perf_core:
       compute_capability:
         gte: 10.7
         lte: 10.7
+  model_configs:
+    minimax_m31_flash:
+      source: examples/configs/curated/minimax-m3.1-flash-throughput.yaml
+      fields: [sparse_attention_config, modeling_v2, kv_cache_config.dtype]
+      settings:
+        cuda_graph_config:
+          max_batch_size: 64
+        kv_cache_config:
+          enable_block_reuse: false
+        max_seq_len: 16384
+    m31_dspark7:
+      source: examples/configs/curated/minimax-m3.1-flash-throughput.yaml
+      fields: [speculative_config]
+      settings:
+        speculative_config:
+          speculative_model: ${LLM_MODELS_ROOT}/MiniMax-M3.1-Flash/dspark
   tests:
   # These 4-GPU configurations require the VR200 memory tier. Keep them out
   # of the shared SM100/SM103 condition to avoid model-loading OOMs.
@@ -423,12 +624,12 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448-kv_frac:0.9-input_output_len:8192,1024-reqs:10-con:1-ep:4-tp:4-gpus:4-cfg:deepseek-v4-pro-latency.yaml] TIMEOUT(120) #min_latency
   #kimi_k3 (TEP4 interactive serving, 4-GPU on VR200's larger per-GPU HBM;
   #B300 needs TEP8 minimum per the deployment guide, VR200 fits the same shapes at ep=tp=4)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:4-tp:4-gpus:4] TIMEOUT (120)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT (120) #min_latency
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:4-tp:4-gpus:4] TIMEOUT (120) #max_throughput
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #max_throughput
   # kimi_k3 short-context (1k/2k) scenario, same TEP4 4-GPU deployment
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT (120) #min_latency
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:4-tp:4-gpus:4] TIMEOUT (120) #max_throughput
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:1000,2000-reqs:80-con:16-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@kimi_k3_streaming] TIMEOUT (120) #max_throughput
   #deepseek_v4_pro_fp4 (1.6T MoE, sparse MLA + mHC, FP4+FP8 mixed). The
   #rough 0.8-0.9TB weight footprint fits in 4x288GB Rubin HBM, but not 4xB200.
   - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-maxbs:32-maxnt:8448-kv_frac:0.6-input_output_len:8192,1024-reqs:1024-con:512-ep:4-tp:4-gpus:4-cfg:deepseek-v4-pro-throughput.yaml] TIMEOUT(120)
@@ -437,12 +638,12 @@ llm_perf_core:
 
   # MiniMax M3.1 Flash MXFP8/NVFP4 TP2/EP1 uses two GPUs on the four-GPU node.
   # PR #22261; one mixed-precision checkpoint, without and with DSpark7; NVFP4 KV.
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2-cfg:decoding_type=DSpark,max_draft_len=7] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2-cfg:decoding_type=DSpark,max_draft_len=7] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2-cfg:decoding_type=DSpark,max_draft_len=7] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash+llm_perf_core.yml@m31_dspark7] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash+llm_perf_core.yml@m31_dspark7] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2-cfg:llm_perf_core.yml@minimax_m31_flash+llm_perf_core.yml@m31_dspark7] TIMEOUT(180)
 
 
 # 13: B300, GB300 (SM103), single-node tests with >260 GiB per GPU.
@@ -455,6 +656,38 @@ llm_perf_core:
         lte: 10.3
       gpu_memory:
         gt: 266240
+  model_configs:
+    glm53_flash_bf16_kv:
+      settings:
+        cuda_graph_config:
+          max_batch_size: 32
+        disable_mm_encoder: true
+        enable_chunked_prefill: true
+        kv_cache_config:
+          dtype: auto
+          enable_block_reuse: true
+          mamba_state_config:
+            additional_snapshot_offsets_from_end: [0]
+          tokens_per_block: 128
+        max_seq_len: 16384
+        modeling_v2: require
+        speculative_config:
+          decoding_type: MTP
+          max_draft_len: 3
+    qwen38_flash_next_tep4:
+      source: examples/configs/curated/qwen3.8-flash-next.yaml
+      settings:
+        kv_cache_config:
+          dtype: fp8
+          enable_block_reuse: true
+          mamba_state_config:
+            periodic_snapshot_interval: 256
+        max_seq_len: 9216
+        modeling_v2: require
+        prefill_capture_num_tokens: [512, 1024, 2048, 4096, 8192]
+        prefill_cuda_graph_backend: breakable
+        cuda_graph_config:
+          max_batch_size: 128
   tests:
   # Single-GPU Flash-Next FP8 MTP3 at concurrency 16 can OOM in PLE short
   # convolution on B200. The memory threshold selects the larger tier.
@@ -463,12 +696,12 @@ llm_perf_core:
   # Four-GPU GLM/Qwen MTP3 and Muse AgentX recipes validated on GB300.
   # The test harness skips these cases when fewer than four GPUs are visible.
   # PR #21019: GLM BF16 KV / 128-token pages; #21621: Qwen FP8 KV / breakable prefill.
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:qwen3.8-flash-next.yaml,cuda_graph_config.max_batch_size=128] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4-cfg:qwen3.8-flash-next.yaml,cuda_graph_config.max_batch_size=128] TIMEOUT(180)
-  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:qwen3.8-flash-next.yaml,cuda_graph_config.max_batch_size=128] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_bf16_kv] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_bf16_kv] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_bf16_kv] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@qwen38_flash_next_tep4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@qwen38_flash_next_tep4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@qwen38_flash_next_tep4] TIMEOUT(180)
 
   # Muse Spark Open NVFP4 AgentX balanced recipe on GB300.
   # PR #22498; 24 multi-turn sessions, 1M context window, 640 GiB host KV per node.
@@ -487,10 +720,22 @@ llm_perf_core:
       compute_capability:
         gte: 10.0
         lte: 10.0
+  model_configs:
+    glm53_flash_nvfp4:
+      settings:
+        cuda_graph_config:
+          max_batch_size: 64
+        disable_mm_encoder: true
+        enable_chunked_prefill: true
+        kv_cache_config:
+          dtype: fp8
+          enable_block_reuse: false
+        max_seq_len: 8192
+        modeling_v2: require
   tests:
   # TP4/EP4, FP8 KV. Both variants use real text and honor EOS;
   # 1024/1024 denotes the input target and output cap, not fixed output length.
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_nvfp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_nvfp4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_nvfp4+mtp3] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4-cfg:llm_perf_core.yml@glm53_flash_nvfp4+mtp3] TIMEOUT(120)

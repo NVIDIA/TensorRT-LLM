@@ -46,7 +46,7 @@ data_cmd += [
 ```
 
 ### 2.2 PyTorch Configuration Generation
-In `pytorch_model_config.py`, we override PyTorch configurations for certain specific cases and generate YAML configuration files.
+The runner merges the configuration selected by the test name and writes the resulting YAML for `trtllm-bench` or `trtllm-serve`.
 
 ### 2.3 Calling trtllm-bench for Throughput Testing
 
@@ -113,41 +113,36 @@ if self._config.backend == "pytorch":
 
 ### 4.1 PyTorch Model Configuration
 
-In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches the model and runtime in the label from `PerfTestConfig.to_string()`. Put shared settings in the family rule and add only the differences in each variant. Matching rules run in order and merge nested fields.
+Put model settings in the final `-cfg:` suffix. Explicit test-name options such as
+`maxbs`, `maxnt`, `tp`, `pp`, `ep`, `kv_frac` and `moe` override the selected
+YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
 
-For example, both Kimi K3 serve variants disable KV block reuse and use 64 tokens per block. The DEP8 variant adds `kv_cache_config.dtype='nvfp4'` and inherits those two settings. The test list supplies the KV memory fraction through `kv_frac`.
+- Select a file in [examples/configs/curated](../../../../examples/configs/curated)
+  by filename, for example `-cfg:deepseek-v4-pro-latency.yaml`.
+- Select a shared configuration from a test list with `filename@profile`. For example,
+  `-cfg:llm_spark_perf.yml@lightning_mtp` reads the Lightning settings from
+  [the Spark list](../../test_lists/qa/llm_spark_perf.yml). The two variants specify
+  their MoE backends with `-moe:CUTEDSL` or `-moe:CUTLASS`.
+- Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
+  Append comma-separated overrides to a selection, or combine selections from left
+  to right with `+`, as in `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
+  Later selections override earlier ones and merge nested mappings.
 
-The Core and Spark test lists select existing recipes by filename, for example
-`-cfg:deepseek-v4-pro-latency.yaml`. The DeepSeek V4 Pro throughput and latency cases
-use their corresponding files in [examples/configs/curated](../../../../examples/configs/curated).
-Muse Spark serve cases use `musespark-open.yaml` with remote-code trust and guided decoding
-disabled. The 24-session AgentX case uses `musespark-open-agentic-balanced.yaml`.
-Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
-Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases select
-`cuda_graph_config.max_batch_size=128` for their larger CUDA graphs. The Spark streaming
-benchmarks use `speculative_config=null` to disable MTP and select their MoE backend with `moe:`.
-Explicit test-name options override the selected YAML. An omitted option inherits its
-YAML value and falls back to the code default when the YAML also omits it. This includes
-`maxbs`, `maxnt`, `tp`, `pp`, `ep` and `kv_frac` for both bench and serve.
-The MiniMax M3 FP4 cases explicitly set `kv_frac:0.9`. Their two low-latency cases
-set `maxnt:2048` to keep the original token budget with the 8192-token recipe.
-Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
+Define shared profiles under `model_configs` beside the `tests` that first use them.
+Profile names are unique within each manifest and can be selected from either list.
+The runner reads profiles from the repository manifests. A `trt-test-db` export of
+the schedule contains only the conditions and test IDs.
+A profile can read an existing repository-relative YAML `source`. Use `section`
+to select a nested mapping or a named entry in a sequence, and `fields` to import
+only the required settings (dotted paths select nested fields). Omitting `fields`
+imports the whole selected mapping. Put shared overrides in `settings` and any
+GPU-specific overrides under `on_sm`, as in the Gemma 4 NVFP4 profile in
+[the Core list](../../test_lists/qa/llm_perf_core.yml). Use `${LLM_MODELS_ROOT}/` for draft
+checkpoints stored in the test model cache. The runner resolves this prefix at launch.
 
-Use `cfg:field=value` for a case-specific setting, for example the two Qwen3 235B
-throughput cases use `cfg:enable_attention_dp=true`. Separate fields with commas, or
-append them to a curated filename as in `cfg:minimax-m3-throughput.yaml,max_seq_len=2560`.
-The loader keeps the recipe's model settings unless the case supplies a different value.
-The GPT-OSS 120B cases use inline streaming and worker settings so the runtime selects
-the historical MoE backend. The three high-concurrency cases also set `enable_attention_dp=true`.
-
-For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
-`speculative_config`. The two Nemotron Lightning cases share their MTP, streaming and KV cache
-settings in the Python model rule so their original test and metric names stay stable.
-Put recipe selections and inline overrides in the final `-cfg:` suffix, for example
-`-cfg:stream_interval=10,moe_config.backend=DEEPGEMM,kv_cache_config.dtype=fp8`.
-The Nemotron Super MTP cases select `decoding_type=MTP,num_nextn_predict_layers=3`
-to retain the layer count used by this variant.
-Draft checkpoint paths are resolved from the model root at run time.
+The test parameter also names the engine directory. Keep both the full parameter and
+the exported benchmark name within 255 bytes. Reuse a shared profile when inlining
+its fields would exceed that limit.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files

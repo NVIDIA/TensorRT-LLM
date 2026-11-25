@@ -8,44 +8,103 @@ llm_spark_perf:
       system_gpu_count:
         gte: 1
         lte: 1
+  model_configs:
+    gpt_oss_eagle3:
+      settings:
+        enable_autotuner: false
+        speculative_config:
+          decoding_type: Eagle
+          max_draft_len: 3
+          speculative_model_dir: ${LLM_MODELS_ROOT}/gpt_oss/gpt-oss-120b-Eagle3
+    gpt_oss_eagle3_throughput:
+      settings:
+        enable_autotuner: false
+        speculative_config:
+          decoding_type: Eagle
+          max_draft_len: 3
+          speculative_model_dir: ${LLM_MODELS_ROOT}/gpt_oss/gpt-oss-120b-Eagle3-throughput
+    nano_omni:
+      source: tests/integration/defs/examples/serve/test_configs/Nemotron3_Nano_Omni_30B_NVFP4.yml
+      fields:
+      - cuda_graph_config.max_batch_size
+      - enable_chunked_prefill
+      - kv_cache_config.free_gpu_memory_fraction
+      - kv_cache_config.mamba_ssm_cache_dtype
+      settings:
+        moe_config:
+          backend: CUTLASS
+    lightning_mtp:
+      source: tests/integration/defs/examples/serve/test_configs/Nemotron35_Lightning_30B.yml
+      fields:
+      - enable_chunked_prefill
+      - num_postprocess_workers
+      - stream_interval
+      - kv_cache_config.mamba_state_config
+      - kv_cache_config.free_gpu_memory_fraction
+      - kv_cache_config.mamba_ssm_cache_dtype
+      - kv_cache_config.mamba_ssm_philox_rounds
+      - kv_cache_config.mamba_ssm_stochastic_rounding
+      - speculative_config.decoding_type
+      - speculative_config.max_draft_len
+    qwen36_fp4_streaming:
+      settings:
+        enable_chunked_prefill: true
+        moe_config:
+          backend: CUTEDSL
+        num_postprocess_workers: 4
+        nvfp4_gemm_config:
+          allowed_backends: [marlin, cutlass, cublaslt, cuda_core]
+        stream_interval: 10
+    super_streaming:
+      source: tests/integration/defs/examples/serve/test_configs/Nemotron3_Super_120B_NVFP4.yml
+      fields:
+      - enable_chunked_prefill
+      - cuda_graph_config.max_batch_size
+      - kv_cache_config.mamba_ssm_cache_dtype
+      - kv_cache_config.mamba_ssm_philox_rounds
+      - kv_cache_config.mamba_ssm_stochastic_rounding
+      settings:
+        max_seq_len: 1048576
+        moe_config:
+          backend: CUTLASS
   tests:
   - perf/test_perf.py::test_perf[gpt_oss_20b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1-cfg:noreuse+enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1-cfg:llm_spark_perf.yml@gpt_oss_eagle3+noreuse+enable_chunked_prefill=true]
   # GPT-OSS 120B spec dec case (Eagle3-throughput) - https://nvbugspro.nvidia.com/bug/5832481
-  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3_throughput-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1-cfg:disable_overlap_scheduler=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3_throughput-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:1-con:1-cfg:llm_spark_perf.yml@gpt_oss_eagle3_throughput,disable_overlap_scheduler=true]
   - perf/test_perf.py::test_perf[nvidia_nemotron_nano_9b_v2_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   # Nemotron-3-Nano-Omni-30B NVFP4: text benchmarks (ISL 2048 and 32768)
-  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,1024-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4-serve-pytorch-streaming-float4-maxbs:1-input_output_len:32768,1024-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,1024-reqs:1-con:1-cfg:llm_spark_perf.yml@nano_omni]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4-serve-pytorch-streaming-float4-maxbs:1-input_output_len:32768,1024-reqs:1-con:1-cfg:llm_spark_perf.yml@nano_omni]
   # Nemotron-3-Nano-Omni-30B NVFP4: image benchmark (1526x1024 image + ISL 2048)
-  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4_image-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,1024-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_omni_nvfp4_image-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,1024-reqs:1-con:1-cfg:llm_spark_perf.yml@nano_omni]
   # Nemotron-3-Nano 30B/4B and Qwen3.8-27B NVFP4: BS=1 baseline, one agentic and one stress case each
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:16-input_output_len:2048,128-reqs:64-con:16]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-serve-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-bench-pytorch-streaming-float8-maxbs:16-maxnt:8192-input_output_len:1024,2-reqs:512-con:16]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:16-input_output_len:2048,128-reqs:64-con:16]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:16-maxnt:8192-input_output_len:1024,2-reqs:512-con:16]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp4-bench-pytorch-streaming-float4-maxbs:16-input_output_len:2048,128-reqs:64-con:16-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-serve-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-moe:CUTLASS-prefix:28672-cfg:reuse+enable_chunked_prefill=true,kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b_fp8-bench-pytorch-streaming-float8-maxbs:16-maxnt:8192-input_output_len:1024,2-reqs:512-con:16-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32,moe_config.backend=CUTLASS]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-moe:CUTLASS-cfg:enable_chunked_prefill=true,kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_30b-bench-pytorch-streaming-bfloat16-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8-moe:CUTLASS-cfg:enable_chunked_prefill=true,kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b_fp8-bench-pytorch-streaming-float8-maxbs:16-input_output_len:2048,128-reqs:64-con:16-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:enable_chunked_prefill=true,kv_cache_config.mamba_ssm_cache_dtype=float32]
+  - perf/test_perf.py::test_perf[nemotron_3_nano_4b-bench-pytorch-streaming-bfloat16-maxbs:16-maxnt:8192-input_output_len:1024,2-reqs:512-con:16-cfg:kv_cache_config.mamba_ssm_cache_dtype=float32]
   - perf/test_perf.py::test_perf[qwen3.8_27b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[qwen3.8_27b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
+  - perf/test_perf.py::test_perf[qwen3.8_27b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse+enable_chunked_prefill=true]
   - perf/test_perf.py::test_perf[qwen3.8_27b_fp4-bench-pytorch-streaming-float4-maxbs:16-input_output_len:2048,128-reqs:64-con:16]
-  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1-cfg:decoding_type=MTP,num_nextn_predict_layers=3]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:8192,512-kv_cache_dtype:fp8-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:8192,512-kv_cache_dtype:fp8-reqs:1-con:1-cfg:decoding_type=MTP,num_nextn_predict_layers=3]
+  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1-moe:CUTEDSL-cfg:llm_spark_perf.yml@lightning_mtp]
+  - perf/test_perf.py::test_perf[nemotron_3.5_lightning_30b_bf16_mtp-serve-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1-moe:CUTLASS-cfg:llm_spark_perf.yml@lightning_mtp]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1-cfg:llm_spark_perf.yml@super_streaming]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:2048,256-kv_cache_dtype:fp8-reqs:1-con:1-cfg:llm_spark_perf.yml@super_streaming,decoding_type=MTP,num_nextn_predict_layers=3]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:8192,512-kv_cache_dtype:fp8-reqs:1-con:1-cfg:llm_spark_perf.yml@super_streaming]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:8192,512-kv_cache_dtype:fp8-reqs:1-con:1-cfg:llm_spark_perf.yml@super_streaming,decoding_type=MTP,num_nextn_predict_layers=3]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
@@ -59,49 +118,49 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[qwen3_30b_a3b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[qwen3_32b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
   - perf/test_perf.py::test_perf[qwen3_32b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-reqs:1-con:1-cfg:llm_perf_core.yml@gemma4_nvfp4]
   # Qwen3.6-35B-A3B NVFP4: baseline and the same checkpoint with MTP drafting
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,decoding_type=MTP,max_draft_len=1]
   # Agentic context: 8K input, 512 output, one agent and four agents.
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:8192,512-reqs:4-con:1]
   - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:8192,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:8192,512-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-cfg:llm_perf_core.yml@gemma4_nvfp4]
   # Agentic context, decode at large cached input: one agent, one model per attention type
   # (gpt-oss sliding window + sinks, Qwen3.6 linear attention, Gemma 4 VSWA, Nemotron-H Mamba).
   # Prompts longer than 8192 tokens are prefilled in 8192-token chunks (pytorch_model_config.py).
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[nvidia_nemotron_nano_9b_v2_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:llm_perf_core.yml@gemma4_nvfp4]
+  - perf/test_perf.py::test_perf[nvidia_nemotron_nano_9b_v2_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1-cfg:enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
   # Multi-agent long context: four 32K-input agents at once.
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4-cfg:enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
   # Speculative decoding at long context (small batch).
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:32768,512-kv_cache_dtype:fp8-reqs:4-con:1-cfg:decoding_type=MTP,num_nextn_predict_layers=3]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,decoding_type=MTP,max_draft_len=1]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:32768,512-kv_cache_dtype:fp8-reqs:4-con:1-cfg:llm_spark_perf.yml@super_streaming,decoding_type=MTP,num_nextn_predict_layers=3]
   # Tool-call style: 16K input, 128 output, eight agents.
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,kv_cache_config.enable_block_reuse=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8-cfg:enable_chunked_prefill=true]
   # Agents sharing context: 28K shared prefix + 4K own input per request, KV block reuse on and off
   # (sliding window + sinks, linear attention, Mamba).
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:llm_spark_perf.yml@qwen36_fp4_streaming+reuse]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:llm_spark_perf.yml@qwen36_fp4_streaming+noreuse]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse+enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse+enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:llm_spark_perf.yml@super_streaming+reuse]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:llm_spark_perf.yml@super_streaming+noreuse]
   # Speculative decoding on real text (cnn_dailymail), so draft tokens can be accepted. Compare TPOT with the
   # bench cases of the base checkpoint at the same input/output length.
-  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:4-con:1-cfg:noreuse+enable_chunked_prefill=true]
-  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:4-input_output_len:128,2048-reqs:16-con:4-cfg:noreuse+enable_chunked_prefill=true]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:4-input_output_len:2048,256-reqs:16-con:4]
-  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1-cfg:mtp3]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:4-con:1-cfg:llm_spark_perf.yml@gpt_oss_eagle3+noreuse+enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:4-input_output_len:128,2048-reqs:16-con:4-cfg:llm_spark_perf.yml@gpt_oss_eagle3+noreuse+enable_chunked_prefill=true]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,decoding_type=MTP,max_draft_len=1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:4-input_output_len:2048,256-reqs:16-con:4-cfg:llm_spark_perf.yml@qwen36_fp4_streaming,decoding_type=MTP,max_draft_len=1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1-cfg:llm_spark_perf.yml@qwen36_fp4_streaming+mtp3]
 # ===============================================================================
 # 2: Multi-GPU (2 GPUs) Spark perf cases with multinode support
 # ===============================================================================
@@ -110,13 +169,31 @@ llm_spark_perf:
       system_gpu_count:
         gte: 2
         lte: 2
+  model_configs:
+    super_mamba:
+      source: tests/integration/defs/examples/serve/test_configs/Nemotron3_Super_120B_NVFP4.yml
+      fields:
+      - enable_chunked_prefill
+      - kv_cache_config.mamba_ssm_cache_dtype
+      - kv_cache_config.mamba_ssm_philox_rounds
+      - kv_cache_config.mamba_ssm_stochastic_rounding
+      settings:
+        moe_config:
+          backend: CUTLASS
+    qwen3_235b_eagle3:
+      settings:
+        enable_autotuner: false
+        speculative_config:
+          decoding_type: Eagle
+          max_draft_len: 3
+          speculative_model_dir: ${LLM_MODELS_ROOT}/Qwen3/qwen3-235B-eagle3
   tests:
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2-cfg:enable_chunked_prefill=false]
-  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2-cfg:enable_chunked_prefill=false]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,128-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2-cfg:llm_spark_perf.yml@qwen3_235b_eagle3,enable_chunked_prefill=false]
+  - perf/test_perf.py::test_perf[qwen3_235b_a22b_fp4_eagle3-bench-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-kv_cache_dtype:fp8-reqs:1-con:1-tp:2-gpus:2-cfg:llm_spark_perf.yml@qwen3_235b_eagle3,enable_chunked_prefill=false]
   - perf/test_perf.py::test_perf[qwen3.8_27b-bench-pytorch-streaming-bfloat16-maxbs:1-input_output_len:2048,128-reqs:1-con:1-tp:2-gpus:2]
-  - perf/test_perf.py::test_perf[qwen3.8_27b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-tp:2-gpus:2]
+  - perf/test_perf.py::test_perf[qwen3.8_27b-bench-pytorch-streaming-bfloat16-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1-tp:2-gpus:2-cfg:enable_chunked_prefill=true]
   - perf/test_perf.py::test_perf[qwen3.8_27b-bench-pytorch-streaming-bfloat16-maxbs:16-input_output_len:2048,128-reqs:64-con:16-tp:2-gpus:2]
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4-bench-pytorch-streaming-float4-maxbs:1-kv_frac:0.9-input_output_len:2048,128-reqs:1-con:1-ep:2-tp:2-gpus:2-moe:CUTEDSL-cfg:qwen3.8-flash-next.yaml,speculative_config=null]
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-kv_frac:0.9-input_output_len:8192,512-reqs:16-con:4-ep:2-tp:2-gpus:2-moe:CUTEDSL-cfg:qwen3.8-flash-next.yaml,speculative_config=null]
@@ -124,6 +201,6 @@ llm_spark_perf:
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8-bench-pytorch-streaming-float8-maxbs:1-kv_frac:0.9-input_output_len:2048,128-reqs:1-con:1-ep:2-tp:2-gpus:2-moe:CUTLASS-cfg:qwen3.8-flash-next.yaml,speculative_config=null]
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8-bench-pytorch-streaming-float8-maxbs:1-maxnt:8192-kv_frac:0.9-input_output_len:32768,512-reqs:4-con:1-ep:2-tp:2-gpus:2-moe:CUTLASS-cfg:qwen3.8-flash-next.yaml,speculative_config=null]
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8-bench-pytorch-streaming-float8-maxbs:16-maxnt:8192-kv_frac:0.9-input_output_len:1024,2-reqs:512-con:16-ep:2-tp:2-gpus:2-moe:CUTLASS-cfg:qwen3.8-flash-next.yaml,speculative_config=null]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1-ep:2-tp:2-gpus:2-cfg:disable_overlap_scheduler=true]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-ep:2-tp:2-gpus:2-cfg:disable_overlap_scheduler=true]
-  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:16-input_output_len:2048,128-reqs:64-con:16-ep:2-tp:2-gpus:2-cfg:disable_overlap_scheduler=true]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:1-input_output_len:2048,128-reqs:1-con:1-ep:2-tp:2-gpus:2-cfg:llm_spark_perf.yml@super_mamba,disable_overlap_scheduler=true]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4-ep:2-tp:2-gpus:2-cfg:llm_spark_perf.yml@super_mamba,disable_overlap_scheduler=true]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_fp8-bench-pytorch-streaming-float8-maxbs:16-input_output_len:2048,128-reqs:64-con:16-ep:2-tp:2-gpus:2-cfg:llm_spark_perf.yml@super_mamba,disable_overlap_scheduler=true]
