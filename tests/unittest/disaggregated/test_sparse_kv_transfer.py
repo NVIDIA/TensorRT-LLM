@@ -42,7 +42,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle, CacheTier
 
 pytestmark = pytest.mark.cpu_only
 
@@ -68,9 +68,11 @@ def _manager(offload: bool) -> Mock:
         )
         for role, size in zip(roles, sizes)
     ]
+    group_life_cycles = {0: AttnLifeCycle(window_size=None, num_sink_blocks=0)}
     impl = SimpleNamespace(
         init_config=SimpleNamespace(tokens_per_block=128, layers=layers),
         layer_grouping=((0, 1),),
+        get_group_life_cycle=group_life_cycles.__getitem__,
         buffer_grouping=(
             tuple(
                 SimpleNamespace(layer_id=layer, role=role) for layer in range(2) for role in roles
