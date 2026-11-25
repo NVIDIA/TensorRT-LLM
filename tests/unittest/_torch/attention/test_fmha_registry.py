@@ -43,15 +43,13 @@ def test_prims_ts_precedes_trtllm_gen_in_default_order() -> None:
     assert names.index("triton_custom_mask") < names.index(PRIMS_TS)
     assert names.index(PRIMS_TS) < names.index("cute_dsl_mla")
     assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
-    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("flashinfer_trtllm_gen")
-    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("fallback")
 
 
 def test_default_fmha_libs_include_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
     assert PRIMS_TS in registry.DEFAULT_FMHA_LIBS
-    assert PRIMS_TS_SPARSE_MLA in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS_SPARSE_MLA not in registry.DEFAULT_FMHA_LIBS
     assert PRIMS_TS_BLOCK_SPARSE in registry.DEFAULT_FMHA_LIBS
     assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS

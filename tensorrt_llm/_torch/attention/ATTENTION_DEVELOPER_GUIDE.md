@@ -617,11 +617,11 @@ cold cache. Use `TLLM_FMHA_LIBS=+prims_ts` to prioritize it and consider other
 supported requests, or `TLLM_FMHA_LIBS=-prims_ts` to remove it.
 Generic block-sparse PrimTS remains enabled
 by default because a dense fallback cannot preserve its routing semantics.
-The PrimTS sparse MLA library (`prims_ts_sparse_mla`) is also enabled by default.
-It serves DeepSeek-V4 generation on SM100, ahead of the TRTLLM-Gen libraries,
-unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it. With sparse KV cache
-offload, it reads the compress-ratio-4 layers' compressed rows from the sparse
-cache arena (§3.2.5).
+DeepSeek-V4 includes the PrimTS sparse MLA library (`prims_ts_sparse_mla`) in
+its own FMHA candidate list. It serves generation on SM100, ahead of the
+TRTLLM-Gen libraries, unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it.
+With sparse KV cache offload, it reads the compress-ratio-4 layers' compressed
+rows from the sparse cache arena (§3.2.5).
 
 ##### 3.2.2.2 Library contract
 
@@ -788,9 +788,10 @@ The FMHA package is split by role:
   reaches CuTe DSL MLA. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
-  it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
-  removes it. For compress-ratio-4 layers under KV-cache offload, its extra
-  source is the layer's sparse cache arena (§3.2.5).
+  DeepSeek-V4 includes it in its FMHA candidates and
+  `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it. For compress-ratio-4 layers
+  under KV-cache offload, its extra source is the layer's sparse cache arena
+  (§3.2.5).
 - `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
   D576 sparse MLA kernel (SM100/SM103, and SM107 with the Rubin helpers of the
   CuTe DSL), which reads the NVFP4 KV records of the

@@ -33,7 +33,6 @@ DEFAULT_FMHA_LIBS = (
     "cute_dsl_mla",
     "flashinfer_sparse_mla",
     "prims_ts_block_sparse",
-    "prims_ts_sparse_mla",
     "prims_ts_dsa_sparse_mla",
     # GQA generation kernels in precedence order, then general GQA decode.
     "gqa_kv_replica_fused",

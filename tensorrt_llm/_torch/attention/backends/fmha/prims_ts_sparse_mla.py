@@ -38,9 +38,9 @@ with FP32 scales ``[G, (H/G)*4, pad4(T)]``) maps one-to-one onto the kernel's
 ``o_a_proj`` BMM consumes the attention output without a separate quant
 kernel.
 
-The library is enabled by default on SM100 and precedes the TRTLLM-Gen
-fallback for the DeepSeek-V4 generation phase; ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla``
-restores the previous library. The context phase stays on the fallback library.
+DeepSeek-V4 lists this library ahead of the TRTLLM-Gen fallback for generation
+on SM100. ``TLLM_FMHA_LIBS=-prims_ts_sparse_mla`` restores the TRTLLM-Gen path.
+The context phase stays on the fallback library.
 SM103 (B300/GB300) is admitted by the kernels' architecture guard but not yet
 signoff-qualified upstream, so it keeps the fallback for now.
 """
