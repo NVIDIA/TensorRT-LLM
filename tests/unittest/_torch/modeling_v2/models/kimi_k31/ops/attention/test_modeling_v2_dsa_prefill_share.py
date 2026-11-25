@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention import dsa_prefill_share as share
 
-__extra_import_path__ = ["../../../..", "."]
+__extra_import_path__ = ["../../../..", ".", "../.."]
 import _k31_dsa_inputs as inputs  # noqa: E402
 from _k31_utils import on_sm
 
