@@ -75,7 +75,7 @@ def _load_curated_config(name: str) -> dict:
 
 @cache
 def get_perf_config_preset(selection: str) -> dict:
-    """Resolve a preset or a comma-separated list of case-specific fields."""
+    """Load the selected recipe and apply explicit field overrides to its values."""
     if selection == 'mtp3':
         return {'speculative_config': _speculative('MTP', 3)}
     if selection in ('reuse', 'noreuse'):
@@ -105,9 +105,6 @@ def get_perf_config_preset(selection: str) -> dict:
                       'num_nextn_predict_layers')
     for override in overrides:
         field, _, value = override.partition('=')
-        if value == 'default' and field in config:
-            del config[field]
-            continue
         if field in boolean_fields and value in ('true', 'false'):
             parsed = value == 'true'
         elif (field in integer_fields and value.isascii() and value.isdecimal()

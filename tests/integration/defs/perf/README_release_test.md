@@ -126,15 +126,19 @@ Muse Spark serve cases use `musespark-open.yaml`, and the 24-session AgentX case
 `musespark-open-agentic-balanced.yaml`. Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
 Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases select
 `cuda_graph_config.max_batch_size=128` for their larger CUDA graphs. The Spark streaming
-benchmarks select their MoE backend with `moe_config.backend` in the `cfg:` suffix and omit MTP with `speculative_config=default`.
+benchmarks inherit MTP from the same recipe and select their MoE backend with
+`moe_config.backend` in the `cfg:` suffix.
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
+For example, with `minimax-m3-throughput.yaml`, a case using `maxnt:4096` passes
+`--max_num_tokens=4096` to bench. Omitting `maxnt` uses the harness default of 2048.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
 Use `cfg:field=value` for a case-specific setting, for example the two Qwen3 235B
 throughput cases use `cfg:enable_attention_dp=true`. Separate fields with commas, or
 append them to a curated filename as in `cfg:minimax-m3-throughput.yaml,max_seq_len=2560`.
-Use `field=default` to omit a top-level recipe field. For example, `cuda_graph_config=default`
-lets bench derive capture sizes from the case's batch size.
+The loader keeps the recipe's model settings unless the case supplies a different value.
+For example, GPT-OSS inherits `moe_config.backend=TRTLLM` from its throughput recipe,
+and `cfg:gpt-oss-120b-throughput.yaml,stream_interval=10` changes just the stream interval.
 
 For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
 `speculative_config`. The two Nemotron Lightning cases share their MTP, streaming and KV cache
