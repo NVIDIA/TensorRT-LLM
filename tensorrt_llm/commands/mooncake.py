@@ -156,9 +156,7 @@ def _signal_handoff():
     type=str,
     default="mooncake_master",
     show_default=True,
-    help="The master executable to run, looked up on PATH. It "
-    "ships with the Mooncake runtime that "
-    "docker/common/install_mooncake.sh installs.",
+    help="The master executable to run, looked up on PATH.",
 )
 @click.option(
     "--timeout",
