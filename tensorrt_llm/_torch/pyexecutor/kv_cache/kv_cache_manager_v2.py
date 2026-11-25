@@ -1727,18 +1727,19 @@ def _augment_tokens_with_prompt_embeds(
     result: list[TokenIdExt],
     prompt_embeds: "PromptEmbeds",
     chunk_start: int,
-    chunk_end: int,
+    rows: tuple[int, int],
     memo: Optional[tuple[list[int], list[Optional[bytes]]]] = None,
 ) -> list[TokenIdExt]:
-    """Key the embedding positions of ``result`` (prompt ``[chunk_start, chunk_end)``).
+    """Key the embedding positions of ``result`` (the prompt slice from ``chunk_start``).
 
+    ``rows``: the ``[lo, hi)`` supplied rows inside that slice (``PromptEmbeds.chunk_rows``).
     The placeholder id stays in the key because some models still read it.
     ``memo``: the request's row positions and the keys computed so far, filled in place.
     """
     if memo is None:
         memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
     positions, keys = memo
-    lo, hi = prompt_embeds.chunk_rows(chunk_start, chunk_end)
+    lo, hi = rows
     for row in range(lo, hi):
         offset = positions[row] - chunk_start
         key = keys[row]
@@ -8623,7 +8624,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if memo is None:
             memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
             req.py_prompt_embeds_key_memo = memo
-        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, end, memo)
+        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, (lo, hi), memo)
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
         return self.max_seq_len if window_size is None else int(window_size)

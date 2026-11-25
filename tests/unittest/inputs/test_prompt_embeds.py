@@ -183,7 +183,9 @@ def test_block_reuse_keys(start: int, end: int) -> None:
     ids = [10, 11, 12, 13, 14, 15]
     mask = [False, True, False, True, True, False]
     _, pe = build_prompt_embeds(ids, _rows(3), mask)
-    keys = _augment_tokens_with_prompt_embeds(list(ids[start:end]), pe, start, end)
+    keys = _augment_tokens_with_prompt_embeds(
+        list(ids[start:end]), pe, start, pe.chunk_rows(start, end)
+    )
     expected = []
     for p in range(start, end):
         row = sum(mask[:p])

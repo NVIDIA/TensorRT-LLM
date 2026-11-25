@@ -584,13 +584,27 @@ def test_prefill_cuda_graph(
     ) as graphs:
         ids = _token_ids(graphs, PROMPTS)
         mixed_requests = [ids[0], {"prompt_embeds": table[torch.tensor(ids[1])]}, ids[2]]
-        per_run = []
+        per_run, first_logprobs = [], []
         for requests in (ids, mixed_requests, ids):
             passes.clear()
-            _run(graphs, requests)
+            outputs = graphs.generate(
+                requests,
+                SamplingParams(max_tokens=1, temperature=0.0, logprobs=5),
+                cache_salt=uuid.uuid4().hex,
+            )
             per_run.append(list(passes))
-    # Outputs are not compared: with the worker in this process, plain piecewise
-    # replays flip near-tie greedy tokens from run to run without any embedding pass.
+            first_logprobs.append(
+                [{t: lp.logprob for t, lp in o.outputs[0].logprobs[0].items()} for o in outputs]
+            )
+    # Greedy tokens are not compared: with the worker in this process, plain piecewise
+    # replays flip near-tie choices from run to run. First-token logprobs come from the
+    # context pass; plain prompts alone already move them by up to 0.1 between the first
+    # breakable run and later ones, while a wrong row moves them by whole units.
+    for before, mixed_lp, after in zip(*first_logprobs):
+        for other in (mixed_lp, after):
+            shared = before.keys() & other.keys()
+            assert len(shared) >= 3
+            assert max(abs(before[t] - other[t]) for t in shared) < 0.25
     plain_before, mixed, plain_after = per_run
     assert any(count for _, count in plain_before)
     assert any(has_rows for has_rows, _ in mixed)
