@@ -446,6 +446,55 @@ def _claim_paths(tmp_path: Path, who: str) -> Claim:
     return Claim(*(str(tmp_path / f"{who}.{end}") for end in ("claim", "done", "failed")))
 
 
+def test_builds_another_process_claimed_or_made_take_no_worker(
+    pool: BuildPool, tmp_path: Path
+) -> None:
+    """A build whose claim another process holds ends claimed, and one it made ends present,
+    at once: no worker starts for them, and neither runs here."""
+    claimed, made = _claim_paths(tmp_path, "claimed"), _claim_paths(tmp_path, "made")
+    for path in (claimed.claim, made.claim, made.done):
+        open(path, "w").close()
+    with pool.pass_scope():
+        results = pool.build(
+            [
+                Build(_RECORD, (str(tmp_path / "a"), 1), None, claimed),
+                Build(_RECORD, (str(tmp_path / "b"), 2), None, made),
+            ]
+        )
+    assert [result.status for result in results] == ["claimed", "present"]
+    assert pool._workers_started == 0
+    assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
+
+
+def test_a_build_claimed_elsewhere_while_it_waits_takes_no_worker(
+    pool: BuildPool, tmp_path: Path
+) -> None:
+    """A build queued behind busy workers, whose claim another process takes meanwhile, ends
+    claimed when a worker frees, without running."""
+    started = [str(tmp_path / f"started{i}") for i in range(pool.max_workers)]
+    release = str(tmp_path / "release")
+    theirs = _claim_paths(tmp_path, "theirs")
+    queued = tmp_path / "queued"
+    builds = [Build(_HOLD, (path, release, 60.0)) for path in started]
+    builds.append(Build(_RECORD, (str(queued), 3), None, theirs))
+    results = []
+    with pool.pass_scope():
+        caller = threading.Thread(target=lambda: results.extend(pool.build(builds)))
+        caller.start()
+        try:
+            deadline = time.monotonic() + 60.0
+            while not all(os.path.exists(path) for path in started):
+                assert time.monotonic() < deadline, "the workers did not start their builds"
+                time.sleep(0.05)
+            open(theirs.claim, "w").close()
+        finally:
+            open(release, "w").close()
+            caller.join(120.0)
+    assert not caller.is_alive()
+    assert [result.status for result in results] == ["built"] * len(started) + ["claimed"]
+    assert not queued.exists()
+
+
 def _running(pid: int) -> bool:
     """Whether process ``pid`` runs: neither gone nor a zombie no one has reaped yet."""
     try:

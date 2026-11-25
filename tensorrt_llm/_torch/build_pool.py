@@ -93,6 +93,8 @@ _MIN_FREE_GPU_BYTES = 8 << 30
 # What a worker's CUDA context takes: a worker's first build makes it, and reserves this much
 # beside its own need, so that workers starting together do not overcommit the GPU.
 _WORKER_CONTEXT_BYTES = 1 << 30
+# How often a build waiting for GPU room looks again whether another process claimed it.
+_CLAIM_POLL_S = 0.5
 
 # How a build ended (BuildResult.status): a worker built it; it was built before; another rank's
 # worker claimed it, and makes it; it failed; no worker took it.
@@ -132,7 +134,8 @@ class Build(NamedTuple):
     function), called with ``args``, which must pickle; a function that returns ``False`` found
     what it builds made already, and the build ends ``"present"``. ``family`` names the kind of
     build: the pool admits it by the most GPU memory a build of its kind allocated so far. With
-    a ``claim``, the ranks split the build: the worker that starts it first makes it."""
+    a ``claim``, the ranks split the build: the worker that starts it first makes it, and a
+    build another process has claimed or made takes no worker here."""
 
     function: str
     args: tuple = ()
@@ -459,16 +462,21 @@ class BuildPool:
         every one has ended. ``on_done(index, result)`` is called as each ends, on a thread of
         the pool. A build no worker takes is ``"refused"``, and its caller builds it: outside a
         pass, with workers off, with arguments that do not pickle or are too large to send, when
-        the store cannot be made, and when no worker can start."""
+        the store cannot be made, and when no worker can start. A build whose claim another
+        process holds is ``"claimed"`` and one it made is ``"present"``, without a worker: now,
+        or when the claim appears while the build waits for a worker or for GPU room."""
         batch = _Batch(len(builds), on_done)
         pool = None
         if self.accepting() and builds:
             with self._lock:
                 pool = self._ensure_pool()
         for index, build in enumerate(builds):
-            message = self._message(build) if pool is not None else None
+            elsewhere = _built_or_claimed(build.claim) if pool is not None else None
+            message = self._message(build) if pool is not None and elsewhere is None else None
             task = _Task(message, build.family, batch, index, claim=build.claim)
-            if message is None:
+            if elsewhere is not None:
+                self._settle(task, BuildResult(elsewhere))
+            elif message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
                 pool.put(task)
@@ -850,10 +858,10 @@ class _Pool:
                     pass
                 break
             try:
-                if not self._admit(task, cold):
-                    self._owner._settle(
-                        task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
-                    )
+                outcome = self._admit(task, cold)
+                if outcome is not None:
+                    error = "the GPU has no room for the build" if outcome == REFUSED else ""
+                    self._owner._settle(task, BuildResult(outcome, 0.0, error))
                     with self._lock:
                         self._free += 1
                     continue
@@ -915,15 +923,20 @@ class _Pool:
                     self._ended()
                 break
 
-    def _admit(self, task: _Task, cold: bool = False) -> bool:
+    def _admit(self, task: _Task, cold: bool = False) -> Optional[str]:
         """Wait until the GPU has room for ``task`` beside the builds running, and count it
-        running; False when it has none with no other build running. The first build of a worker
-        (``cold``) also makes the worker's CUDA context, which it reserves room for."""
+        running (None). Instead, ``"refused"`` when it has none with no other build running, and
+        ``"claimed"`` or ``"present"`` once another process claims or makes the build. The first
+        build of a worker (``cold``) also makes the worker's CUDA context, which it reserves room
+        for."""
         with self._memory:
             while not self._stopping:
+                elsewhere = _built_or_claimed(task.claim)
+                if elsewhere is not None:
+                    return elsewhere
                 free = _free_gpu_bytes(self._device)
                 if free is None:
-                    return True  # No GPU memory to keep.
+                    return None  # No GPU memory to keep.
                 need = self._owner.peak_bytes(task.family)
                 if (
                     need is None
@@ -937,11 +950,12 @@ class _Pool:
                     fits = free - taken - need >= _MIN_FREE_GPU_BYTES
                 if fits:
                     self._running[id(task)] = (task.family, need)
-                    return True
+                    return None
                 if not self._running:
-                    return False
-                self._memory.wait()
-            return False
+                    return REFUSED
+                # Woken when a build ends, or to see whether another process claimed this one.
+                self._memory.wait(_CLAIM_POLL_S)
+            return REFUSED
 
     def _release(self, task: _Task) -> None:
         with self._memory:
@@ -1144,6 +1158,19 @@ def _touch(path: str) -> None:
         os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o644))
     except OSError:
         pass  # The other ranks then wait for the build until their wait runs out.
+
+
+def _built_or_claimed(claim: Optional[Claim]) -> Optional[str]:
+    """For a build queued in the rank: ``"present"`` when another process has made it,
+    ``"claimed"`` when another process's worker holds its claim, None otherwise. A worker still
+    takes the claim itself when it starts the build (:func:`_run`)."""
+    if claim is None:
+        return None
+    if os.path.exists(claim.done):
+        return PRESENT
+    if os.path.exists(claim.claim):
+        return CLAIMED
+    return None
 
 
 def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
