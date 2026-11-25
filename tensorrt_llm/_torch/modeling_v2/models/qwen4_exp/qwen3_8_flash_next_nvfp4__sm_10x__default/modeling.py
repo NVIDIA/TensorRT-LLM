@@ -862,6 +862,11 @@ _INDEX_SCORES_PDL = get_env_enable_pdl()
 #:   (`qsa_paged_index_scores`' `rows_per_request`: one key gather serves a request's rows,
 #:   bitwise its row-wise kernel); smaller steps keep the entry's own choice.
 _INDEX_GROUP_MIN_ROWS = 17  # capacity: fixed: a dispatch threshold, not a buffer size
+#: - At a tep4 rank under `TEP_FAST_DECODE_ENV`, further row counts that score over request
+#:   groups: 2 requests of four verify rows, where the grouped kernel (2 tiles a program at 2
+#:   groups) beat the visible-split one (gen_d38 tepidxgrp, 848913; 0 of 209M scores differ
+#:   between them, 849000). 4 rows keep one request's own kernel; 12 and 16 the visible split.
+_TEP_INDEX_GROUP_ROWS = frozenset({8})  # capacity: fixed: a dispatch table
 #: - Request groups from which grouped scoring takes the CuTe kernel
 #:   (`qsa_index_scores_groups_cute__decode`, 2 or 3 rows a request). It sums in another order
 #:   (~7e-8 relative), so a row's top-k can differ only at a near-tie.
@@ -2382,6 +2387,16 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             hc_tc_first_precompile(self.stream, self.hc_lowrank, self.hc_count, device)
             self._report_ple_residency()
             self._side_stream = torch.cuda.Stream(device=device)
+            # A tep4 rank's PLE front (`DecodeTarget._ple_fork`); its cuBLAS workspace is made
+            # here, outside any capture.
+            self._ple_stream = None
+            if self.tep_fast:
+                self._ple_stream = torch.cuda.Stream(device=device)
+                self._ple_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._ple_stream):
+                    probe = torch.zeros([1, 64], dtype=torch.bfloat16, device=device)
+                    cublas_mm(probe, probe.new_zeros([64, 64]).t())
+                torch.cuda.current_stream().wait_stream(self._ple_stream)
             # The prefill CuteDSL MoE's output memset, beside its FC1 (`fp4_moe_renorm_cute_dsl`):
             # its own stream, so the join before FC2 does not also wait for the shared expert.
             self._moe_memset_stream = torch.cuda.Stream(device=device)
@@ -5767,10 +5782,12 @@ def _sparse_gqa(
 
 def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
     """`qsa_paged_index_scores` (visible blocks only) of a sparse generation step's rows, `p`
-    consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows one key gather a request, and
-    from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups on the CuTe kernel where it serves them."""
+    consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows (and at a tep4 rank's
+    `_TEP_INDEX_GROUP_ROWS`) one key gather a request, and from `_INDEX_SCORES_CUTE_MIN_GROUPS`
+    groups on the CuTe kernel where it serves them."""
     rows = q.shape[0]
-    rpr = p if p > 1 and rows >= _INDEX_GROUP_MIN_ROWS else 1
+    grouped = rows >= _INDEX_GROUP_MIN_ROWS or (core.tep_fast and rows in _TEP_INDEX_GROUP_ROWS)
+    rpr = p if p > 1 and grouped else 1
     if (
         rpr > 1
         and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
@@ -8652,14 +8669,10 @@ class DecodeTarget:
             )
         )
 
-    def _ple_block(self, hc, input_ids, ple_state, next_norm, stage) -> tuple:
-        """The n-gram side path on its decoder layer, added into the stream and normalized
-        for the layer's attention-side site. Returns `(hc, normed)`. The same steps as the
-        prefill target's `_ple_block`, over up to `rows` rows a sequence; every generation
-        sequence carries its history by construction, so no carry flags are passed. A verify
-        step (`stage`) stages what `SpeculativeRollback` rewrites the two pools from: both
-        pools' pre-step rows before either launch publishes, and the conv input the second
-        launch writes out."""
+    def _ple_front(self, input_ids, ple_state, stage) -> tuple:
+        """The PLE block's front, which reads only the step's ids, the PLE pools and weights:
+        the rollback's PLE staging (a verify step), the n-gram rows (summed over attention TP
+        where the table is split), the key and value projections. Returns `(key, value)`."""
         core = self.core
         S = self._stack
         conv_states, ngram_pool, si_all, qsl, rows = ple_state
@@ -8682,7 +8695,6 @@ class DecodeTarget:
         )
         if _ple_needs_sum(core):
             ngram = core.tp_sum(ngram)
-        conv_input = torch.empty_like(hc) if stage else None
         # A tep4 rank under `TEP_PROJ_ENV`: 9-16 rows on the split-K low-M kernel.
         ple_mm = (
             _tep_wide_mm
@@ -8690,10 +8702,58 @@ class DecodeTarget:
             and _TEP_PLE_WIDE_MIN_ROWS <= ngram.shape[0] <= _LOW_M_WIDE_MAX_ROWS
             else cublas_mm
         )
+        return ple_mm(ngram, S.ple_key), ple_mm(ngram, S.ple_val)
+
+    def _ple_fork(self, input_ids, ple_state, stage) -> tuple:
+        """`_ple_front` on the PLE stream (`core._ple_stream`), forked from this stream at the
+        start of the forward, so that it runs beside the layers before the PLE layer; the PLE
+        layer joins it (`_ple_block`). The same kernels on the same operands: no collective runs
+        there (`_ple_forks`). An eager step's key and value are marked for this stream, which
+        reads them after the join, before the allocator may reuse them."""
+        main = torch.cuda.current_stream()
+        fork = self.core._ple_stream
+        fork.wait_stream(main)
+        with torch.cuda.stream(fork):
+            key, value = self._ple_front(input_ids, ple_state, stage)
+        if not torch.cuda.is_current_stream_capturing():
+            key.record_stream(main)
+            value.record_stream(main)
+        return key, value
+
+    def _ple_forks(self) -> bool:
+        """Whether a decode forward forks its PLE front (`_ple_fork`): at a tep4 rank under
+        `TEP_FAST_DECODE_ENV` with layers before the PLE layer, and no TP sum in the front (two
+        streams must not issue collectives of one group)."""
+        core = self.core
+        return (
+            core.tep_fast
+            and core.ple_layer > 0
+            and getattr(core, "_ple_stream", None) is not None
+            and not _ple_needs_sum(core)
+        )
+
+    def _ple_block(self, hc, input_ids, ple_state, next_norm, stage, front=None) -> tuple:
+        """The n-gram side path on its decoder layer, added into the stream and normalized
+        for the layer's attention-side site. Returns `(hc, normed)`. The same steps as the
+        prefill target's `_ple_block`, over up to `rows` rows a sequence; every generation
+        sequence carries its history by construction, so no carry flags are passed. A verify
+        step (`stage`) stages what `SpeculativeRollback` rewrites the two pools from: both
+        pools' pre-step rows before either launch publishes, and the conv input the second
+        launch writes out. `front` is `_ple_fork`'s `(key, value)` when the front was forked,
+        joined here; else the front runs here (`_ple_front`)."""
+        core = self.core
+        S = self._stack
+        conv_states, ngram_pool, si_all, qsl, rows = ple_state
+        if front is None:
+            key, value = self._ple_front(input_ids, ple_state, stage)
+        else:
+            torch.cuda.current_stream().wait_stream(core._ple_stream)
+            key, value = front
+        conv_input = torch.empty_like(hc) if stage else None
         out = ple_gate_conv_inject_norm(
             hc,
-            ple_mm(ngram, S.ple_key),
-            ple_mm(ngram, S.ple_val),
+            key,
+            value,
             S.ple_nk_w,
             S.ple_nq_w,
             S.ple_nc_w,
@@ -8856,6 +8916,8 @@ class DecodeTarget:
         # after an MoE block with its combine (and at one rank its finalize, `fold`); before
         # the PLE layer the pending block is added here, the PLE tail taking the site's norm.
         block_out = inject = moe = None
+        # A tep4 rank's PLE front runs beside the layers before the PLE layer.
+        ple_front = self._ple_fork(input_ids, ple_state, is_verify) if self._ple_forks() else None
         for i, L in enumerate(layers):
             normed = None
             if i == core.ple_layer:
@@ -8864,7 +8926,9 @@ class DecodeTarget:
                         block_out = fused_sigmoid_gate_mul_add(block_out, moe[0], moe[1])
                     hc = qwen4_exp_post_inject(hc, block_out, inject)
                     block_out = inject = moe = None
-                hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm, is_verify)
+                hc, normed = self._ple_block(
+                    hc, input_ids, ple_state, L.ahc_norm, is_verify, ple_front
+                )
             # `DP_INPROJ_RELEASE_ENV`: where the block's input projection runs on the PDL bf16
             # GEMM (`q_in`, None with the switch off), site A releases its dependents early.
             q_in = _inproj_release_at(core, i, num_tokens)

@@ -70,6 +70,28 @@ def test_index_scores_dispatch(monkeypatch, rows, p, serves, expected):
     assert calls == [expected]
 
 
+@pytest.mark.parametrize(
+    "tep_fast, rows, p, expected",
+    [
+        (True, 8, 4, ("triton", 4)),  # tep4, 2 requests: grouped (`_TEP_INDEX_GROUP_ROWS`)
+        (True, 4, 4, ("triton", 1)),
+        (True, 12, 4, ("triton", 1)),  # the visible split
+        (True, 16, 4, ("triton", 1)),
+        (True, 8, 1, ("triton", 1)),  # one row a request: never grouped
+        (False, 8, 4, ("triton", 1)),  # another layout
+    ],
+)
+def test_index_scores_tep4_rows(monkeypatch, tep_fast, rows, p, expected):
+    calls = _scores_calls(monkeypatch, True)
+    core = SimpleNamespace(**{**vars(CORE), "tep_fast": tep_fast})
+    q = torch.zeros(rows, 4, 128, dtype=torch.bfloat16)
+    logical = torch.zeros(rows, dtype=torch.int64)
+    M._decode_index_scores(
+        core, q, None, None, logical, torch.zeros(rows, dtype=torch.int32), 32, p
+    )
+    assert calls == [expected]
+
+
 def test_index_scores_cute_needs_its_index_dtypes(monkeypatch):
     """The CuTe kernel reads int64 positions and int32 request indices; other dtypes keep the
     Triton kernel."""
