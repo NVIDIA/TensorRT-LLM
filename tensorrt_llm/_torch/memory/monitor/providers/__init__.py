@@ -85,11 +85,6 @@ class MonitorProvider(Protocol):
 
 
 @runtime_checkable
-class _ComponentProvider(Protocol):
-    def describes(self, component: object) -> bool: ...
-
-
-@runtime_checkable
 class _PoolRowsProvider(Protocol):
     def collect_with_pool_rows(self) -> tuple[list[Entry], list[dict] | None]: ...
 
@@ -235,7 +230,7 @@ def unregister_providers_of(component: object) -> None:
     _registered[:] = [
         (o, p)
         for o, p in _registered
-        if not (isinstance(p, _ComponentProvider) and p.describes(component))
+        if not (callable(getattr(p, "describes", None)) and p.describes(component))
     ]
 
 

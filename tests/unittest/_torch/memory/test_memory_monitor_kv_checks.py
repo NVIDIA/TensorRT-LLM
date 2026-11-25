@@ -211,31 +211,35 @@ def test_main_draft_and_cross_pools_are_registered_once_each(monkeypatch):
         def get_storage_statistics(self, level):
             pytest.fail("the V1 provider must use allocated_bytes")
 
-    a, b = FakeKvManager(kv_stats(10, 0, 0)), FakeKvManager(kv_stats(20, 0, 0))
-    assert KvCacheProviderV2(a, "main").name != KvCacheProviderV2(b, "draft").name
-
-    def physical():
-        return sorted(
-            e.size_bytes
-            for e in reg.collect_all()
-            if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
-        )
+    def registered_capacities():
+        return {
+            p.name: [e.size_bytes for e in p.collect() if e.basis is Basis.PHYSICAL_BACKING]
+            for p in reg.default_providers()
+            if isinstance(p, KvCacheProvider)
+        }
 
     reg.clear_registered_providers()
     try:
         main, draft = (FakeKvManager(kv_stats(n, 0, 0)) for n in (100, 20))
         cross = V1Manager()
         _util._register_kv_cache_monitor_providers(main, draft, cross)
-        # A shared fixed name would have let the registry keep only one.
-        assert physical() == [5 * MB, 20 * MB, 100 * MB]
+        assert registered_capacities() == {
+            "kv_cache.main": [100 * MB],
+            "kv_cache.draft": [20 * MB],
+            "kv_cache.cross": [5 * MB],
+        }
 
         reg.clear_registered_providers()
         _util._register_kv_cache_monitor_providers(main, main, None)
-        assert physical() == [100 * MB], "a draft sharing the main manager is counted once"
+        assert registered_capacities() == {"kv_cache.main": [100 * MB]}, (
+            "a draft sharing the main manager is counted once"
+        )
 
         rebuilt = FakeKvManager(kv_stats(200, 0, 0))
         _util._register_kv_cache_monitor_providers(rebuilt, None, None)
-        assert physical() == [200 * MB], "a rebuilt manager supersedes the one it replaced"
+        assert registered_capacities() == {"kv_cache.main": [200 * MB]}, (
+            "a rebuilt manager supersedes the one it replaced"
+        )
     finally:
         reg.clear_registered_providers()
 
