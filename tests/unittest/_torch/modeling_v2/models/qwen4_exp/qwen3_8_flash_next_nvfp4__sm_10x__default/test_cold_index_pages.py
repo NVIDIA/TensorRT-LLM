@@ -75,3 +75,49 @@ def test_the_shell_offers_its_codec_under_the_switch(monkeypatch, switch):
         monkeypatch.delenv(M.CTX_COLDIDX_ENV, raising=False)
     hooks = M._runtime_hooks(SimpleNamespace(max_draft_len=3))
     assert (hooks.cold_page_codec is not None) is switch
+
+
+def test_the_codec_state_names_every_attention_layer(monkeypatch):
+    """The native adapter reads `codec_state.layer_ids` (the layers whose lifecycles it routes to
+    the provider) when the codec is created: every attention layer, the one holding the side planes
+    and the others. Without it the context servers died at KV cache creation
+    (`'_CodecState' object has no attribute 'layer_ids'`, full-stack3 F1 GSM8K gate)."""
+    import tensorrt_llm.runtime.kv_cache_manager_v2 as kvm
+    from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
+    class Attention(SimpleNamespace):
+        pass
+
+    class Host(SimpleNamespace):
+        pass
+
+    created = []
+    monkeypatch.setattr(kvm, "AttentionLayerConfig", Attention)
+    monkeypatch.setattr(kvm, "HostCacheTierConfig", Host)
+    monkeypatch.setattr(
+        native,
+        "create_python_cold_page_codec",
+        lambda provider, state: created.append(state) or "codec",
+    )
+    monkeypatch.setattr(P.torch.cuda, "current_device", lambda: 0)
+
+    def buffers(*roles):
+        sizes = {"key": 4096, "value": 4096, "qsa_side_planes": 13 * 8192 + 384}
+        return [SimpleNamespace(role=r, size=sizes[r]) for r in roles]
+
+    config = SimpleNamespace(
+        cache_tiers=[Host()],
+        tokens_per_block=P.TOKENS_PER_BLOCK,
+        layers=[
+            SimpleNamespace(layer_id=0, buffers=[]),
+            Attention(layer_id=7, buffers=buffers("key", "value")),
+            Attention(layer_id=3, buffers=buffers("key", "value", "qsa_side_planes")),
+            SimpleNamespace(layer_id=4, buffers=[]),
+        ],
+    )
+    codec = P.QsaColdIndexPages().create_cold_page_codec(
+        config, runtime_dtype=None, pp_layers=[], num_kv_heads_per_layer=[], head_dim_per_layer=[]
+    )
+    assert codec == "codec"
+    (state,) = created
+    assert state.layer_ids == (3, 7) and state.num_planes == 13

@@ -63,11 +63,14 @@ class QsaColdIndexConfig:
 
 
 class _CodecState:
-    """State owned by one native codec (one KV cache manager build)."""
+    """State owned by one native codec (one KV cache manager build). `layer_ids`: the layers whose
+    lifecycles the native adapter hands this provider (it reads them when the codec is created;
+    every other lifecycle keeps the default concatenation)."""
 
-    def __init__(self, device: int, num_planes: int) -> None:
+    def __init__(self, device: int, num_planes: int, layer_ids: Sequence[int]) -> None:
         self.device = device
         self.num_planes = num_planes
+        self.layer_ids = tuple(int(i) for i in layer_ids)
         self.tables: list[ColdIndexTables] = []
 
 
@@ -112,10 +115,11 @@ class QsaColdIndexPages(KVCacheCompressionManager):
             problems.append("no host tier")
         if int(cache_config.tokens_per_block) != TOKENS_PER_BLOCK:
             problems.append(f"tokens_per_block {cache_config.tokens_per_block}")
-        side_sizes = []
+        side_sizes, attention_ids = [], []
         for layer in cache_config.layers:
             if not isinstance(layer, AttentionLayerConfig):
                 continue
+            attention_ids.append(int(layer.layer_id))
             roles = {str(b.role): int(b.size) for b in layer.buffers}
             if getattr(layer, "sparse_cache", None) is not None:
                 problems.append(f"layer {layer.layer_id} has a sparse cache")
@@ -133,7 +137,7 @@ class QsaColdIndexPages(KVCacheCompressionManager):
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
         return native.create_python_cold_page_codec(
-            self, _CodecState(torch.cuda.current_device(), planes)
+            self, _CodecState(torch.cuda.current_device(), planes, sorted(attention_ids))
         )
 
     def configure(self, codec_state: _CodecState, lifecycles: Sequence[object]) -> Sequence[object]:
