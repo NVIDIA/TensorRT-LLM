@@ -770,7 +770,7 @@ def _move_model_engine_metrics(py_executor: PyExecutor,
 def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
     _startup_timer: _StartupTimer,
-    _model_engines: list[ModelEngine],
+    _model_engine_slot: list[Optional[ModelEngine]],
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
@@ -784,7 +784,8 @@ def _create_py_executor_impl(
 
     Args:
         llm_args: Configuration arguments for the PyTorch-based LLM executor.
-        _model_engines: Receives the model engine once it is built.
+        _model_engine_slot: Its one entry is set to the model engine once it
+            is built.
         checkpoint_dir: Path to the model checkpoint directory. If None, uses
             the path specified in llm_args.
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
@@ -802,7 +803,7 @@ def _create_py_executor_impl(
         py_executor = _create_py_executor(
             llm_args=llm_args,
             _startup_timer=_startup_timer,
-            model_engines=_model_engines,
+            model_engine_slot=_model_engine_slot,
             creation_metrics=creation_metrics,
             checkpoint_dir=checkpoint_dir,
             tokenizer=tokenizer,
@@ -816,7 +817,7 @@ def _create_py_executor_impl(
 def _create_py_executor(
     llm_args: TorchLlmArgs,
     _startup_timer: _StartupTimer,
-    model_engines: list[ModelEngine],
+    model_engine_slot: list[Optional[ModelEngine]],
     creation_metrics: dict[str, float],
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
@@ -1118,7 +1119,7 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-        model_engines.append(model_engine)
+        model_engine_slot[0] = model_engine
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
@@ -1740,14 +1741,14 @@ def create_py_executor(
     # The memory monitor follows one executor per process, the first one
     # alive; the others are built and served without it.
     monitor_token = _begin_monitor(llm_args)
-    model_engines: list[ModelEngine] = []
+    model_engine_slot: list[Optional[ModelEngine]] = [None]
     try:
         with _monitor_startup_scope(
                 monitor_token.monitored), monitor_executor_initialization(
                 ), _StartupTimer("executor_creation") as startup_timer:
             py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
-                _model_engines=model_engines,
+                _model_engine_slot=model_engine_slot,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
                 tokenizer=tokenizer,
@@ -1776,7 +1777,7 @@ def create_py_executor(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
         try:
-            _release_host_resident_weights(model_engines)
+            _release_host_resident_weights(model_engine_slot[0])
         except BaseException:
             logger.error(
                 "Failed to release host-resident weights after PyExecutor "
@@ -1800,12 +1801,14 @@ def create_py_executor(
     return py_executor
 
 
-def _release_host_resident_weights(model_engines: list[ModelEngine]) -> None:
-    """Release now what the built models keep in host memory outside PyTorch's
-    allocator: the construction error's traceback keeps the models alive."""
+def _release_host_resident_weights(model_engine: Optional[ModelEngine]) -> None:
+    """Release now what the built model keeps in host memory outside PyTorch's
+    allocator: the construction error's traceback keeps the model alive."""
+    if model_engine is None:
+        return
     releases = [
-        module.release_host_resident_weights for engine in model_engines
-        for module in engine.model.modules()
+        module.release_host_resident_weights
+        for module in model_engine.model.modules()
         if hasattr(module, "release_host_resident_weights")
     ]
     if releases and torch.cuda.is_available():
