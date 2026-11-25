@@ -443,8 +443,11 @@ _DEP8 = dict(
 # those row ranges on the trunk's bitmap-union verify kernel (`TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1`,
 # class S, SM103 only). FP8 at dep4 once more with the e4m3 QSA index anchors
 # (`TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1`, opt-in and lossy against the bf16 keys: every anchor and
-# the index query rounded to e4m3), which only the pass keys reach (gsm8k stays dense).
-# Then the whole attention-DP stack the AgentX
+# the index query rounded to e4m3), which only the pass keys reach (gsm8k stays dense). FP8 at
+# dep4 once more with every opt-in attention-DP decode form of the dep follow-ups on (the heads
+# over vocabulary slices, the draft attention input in the one-rank form, the two-tile hc first
+# kernel, both output projections and the draft one on the bf16 mid-rows GEMM from 5 rows; over
+# the host-indexed Lamport round trip; SM103 only). Then the whole attention-DP stack the AgentX
 # front points run, every opt-in form together on top of the default ones (host-indexed Lamport
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
 # widest; SM103 only), at dep4 and at dep8 (two nodes of one rack).
@@ -478,6 +481,16 @@ _QUANTIZED_KV = [
         marks=pytest.mark.skipif(
             get_sm_version() != 103,
             reason="the bf16 mid-rows output projections are measured on SM103",
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport="lamport_step", dp_opt_in=True),
+        id="dep4_fp8_kv_dp_opt_in",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the opt-in attention-DP decode forms are measured on SM103",
         ),
     ),
     pytest.param(
@@ -982,6 +995,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             env["TRTLLM_QWEN4_EXP_TEP_FINAR"] = variant["finar"]
         if variant.get("out_proj_bf16"):
             env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"] = variant["out_proj_bf16"]
+        if variant.get("dp_opt_in"):
+            for name, value in (
+                ("HEAD_SHARD", "1"),
+                ("MTP_ATTN_PACK", "1"),
+                ("HC_FIRST_X2", "1"),
+                ("OUT_PROJ_BF16", "all"),
+                ("OUT_PROJ_BF16_ROWSLO", "5"),
+                ("DRAFT_O_MID", "1"),
+            ):
+                env[f"TRTLLM_QWEN4_EXP_DP_{name}"] = value
         if variant.get("dp_rows"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
