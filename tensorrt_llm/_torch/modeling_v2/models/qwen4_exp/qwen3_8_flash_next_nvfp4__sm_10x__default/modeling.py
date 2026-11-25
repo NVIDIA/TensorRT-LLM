@@ -1244,14 +1244,22 @@ def _graph_rows(core, lo: int, hi: int) -> list[int]:
 def _hc_tiles_build(core, device) -> bool:
     """`DP_HC_TILES_ENV`, read once at build (`post_load_weights`): True at an attention-DP rank
     on SM103 with the switch on (default), after compiling every plan `_hc_first` and `_hc_mixer`
-    can then launch; False elsewhere."""
+    can then launch; False elsewhere, and where a plan does not compile (one warning: the rank
+    keeps the 128-row plans, which it compiled before; no other rank needs to agree)."""
     if not (_switch(DP_HC_TILES_ENV, default=True) and _dp_decode_rank(core, device)):
         return False
-    hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64=True)
-    bns = sorted({-(-r // 16) * 16 for r in range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1)})
-    hc_tc_first_precompile_rowsn(core.stream, core.hc_lowrank, core.hc_count, device, bns)
-    variants = [(False, 64), (True, 64), (True, 128)]
-    hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, variants)
+    try:
+        hc_tc_first_precompile(core.stream, core.hc_lowrank, core.hc_count, device, tile64=True)
+        bns = sorted({-(-r // 16) * 16 for r in range(_HC_ROWSN_ROWS[0], _HC_ROWSN_ROWS[1] + 1)})
+        hc_tc_first_precompile_rowsn(core.stream, core.hc_lowrank, core.hc_count, device, bns)
+        variants = [(False, 64), (True, 64), (True, 128)]
+        hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, variants)
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        logger.warning(
+            f"{DP_HC_TILES_ENV}: a plan did not compile at rank {core.dp_rank} "
+            f"({type(e).__name__}: {e}); the hc mixers keep the 128-row plans"
+        )
+        return False
     logger.info(
         f"hc mixer plans: rank {core.dp_rank} of {core.dp_size}, 64-row tiles at "
         f"{_HC_TILE64_ROWS[0]}..{_HC_TILE64_ROWS[1]} rows, rows on N at {_HC_ROWSN_ROWS[0]}.."
@@ -1298,8 +1306,9 @@ def _inproj_release_build(core, device) -> dict | None:
     trunk layer whose input projection is a bf16 `[N, K]` weight with a plan at the CUDA-graph
     row counts and no other decode copy (`_mid`, packed FP8 / NVFP4: tp1 only today). Every
     entry's GEMM is compiled here and compared with the stock entry on this rank's weight over
-    one random activation a row count; a difference anywhere leaves the switch off (one
-    warning). None where it is off or cannot take effect."""
+    one random activation a row count; a difference anywhere, or a GEMM that does not compile or
+    run, leaves the switch off at this rank (one warning; the release is rank-local, so no other
+    rank needs to agree). None where it is off or cannot take effect."""
     if not (
         _switch(DP_INPROJ_RELEASE_ENV, default=True)
         and _dp_decode_rank(core, device)
@@ -1335,25 +1344,37 @@ def _inproj_release_build(core, device) -> dict | None:
         if geom not in checked:
             # The stock entry the block runs without the switch (`_dense_mm`'s bf16 branch).
             stock = core.decode_mm if core.is_attn[i] else core.decode_in_mm
-            x = torch.randn(max(ents), geom[1], generator=gen, device=device).to(torch.bfloat16)
-            bad = 0
-            for rows, ent in ents.items():
-                got = _inproj_mm(x[:rows], ent)
-                ref = stock(x[:rows], w.t())
-                bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
-            checked[geom] = bad
+            try:
+                x = torch.randn(max(ents), geom[1], generator=gen, device=device)
+                x = x.to(torch.bfloat16)
+                bad = 0
+                for rows, ent in ents.items():
+                    got = _inproj_mm(x[:rows], ent)
+                    ref = stock(x[:rows], w.t())
+                    bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+                checked[geom] = f"differs from the stock entry in {bad} elements" if bad else ""
+            except Exception as e:  # noqa: BLE001 -- declined like a GEMM that differs
+                checked[geom] = f"raised {type(e).__name__}: {e}"
         if checked[geom]:
             logger.warning(
                 f"{DP_INPROJ_RELEASE_ENV}: the bf16 mid-rows GEMM of a {geom[0]} x {geom[1]} "
-                f"input projection differs from the stock entry in {checked[geom]} elements at "
-                f"rank {core.dp_rank}; every site and input projection keeps the stock forms"
+                f"input projection {checked[geom]} at rank {core.dp_rank}; every site and input "
+                "projection keeps the stock forms"
             )
             return None
         table[i] = ents
     if not table:
         return None
-    torch.cuda.synchronize(device)
-    hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, [(True, 128)])
+    try:
+        torch.cuda.synchronize(device)
+        hc_up_precompile(core.hc_count, core.hidden, core.hc_lowrank, device, [(True, 128)])
+    except Exception as e:  # noqa: BLE001 -- a default-on form declines rather than stop the load
+        logger.warning(
+            f"{DP_INPROJ_RELEASE_ENV}: the releasing up kernel did not compile at rank "
+            f"{core.dp_rank} ({type(e).__name__}: {e}); every site and input projection keeps "
+            "the stock forms"
+        )
+        return None
     logger.info(
         f"input projections behind a releasing hc site: rank {core.dp_rank} of {core.dp_size}, "
         f"{len(table)} layers, rows {sorted({r for t in table.values() for r in t})}"

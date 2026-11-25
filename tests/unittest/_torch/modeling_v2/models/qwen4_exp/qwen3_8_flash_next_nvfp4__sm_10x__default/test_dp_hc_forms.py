@@ -7,7 +7,8 @@
   64-row tiles at 65..128 rows unless it releases; nothing changes without `core.hc_tiles`.
 * **Input projection behind a releasing site A** (`DP_INPROJ_RELEASE_ENV`): the plan table,
   the build (layers with another decode copy are skipped; one differing element in the
-  self-check leaves the switch off), the site's release and the block's GEMM.
+  self-check, or a kernel that raises, leaves the switch off), the site's release and the
+  block's GEMM. A 64-row plan that does not compile leaves `DP_HC_TILES_ENV` off.
 
 The kernels' bits are covered by the GPU tests of `qwen4_exp_hc_decode_tc_first__decode` and
 `qwen4_exp_hc_up_gate_mean` (`tm=64`, `rows_on_n`, `release_early`).
@@ -102,6 +103,27 @@ def test_hc_tiles_build_gating(monkeypatch):
     monkeypatch.delenv(M.DP_HC_TILES_ENV)
     assert M._hc_tiles_build(core, torch.device("cpu"))
     assert compiled == ["first", "rowsn", "up"]
+
+
+@pytest.mark.cpu_only
+def test_hc_tiles_build_declines_a_plan_that_does_not_compile(monkeypatch):
+    """A default-on form: a compile that raises turns it off at this rank (one warning) instead
+    of stopping the load, which would leave the group's later collective builds waiting."""
+    warned = []
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    monkeypatch.setattr(M, "_dp_decode_rank", lambda core, device: True)
+    monkeypatch.setattr(M, "hc_tc_first_precompile", lambda *a, **k: None)
+
+    def rowsn(*a, **k):
+        raise RuntimeError("smem")
+
+    monkeypatch.setattr(M, "hc_tc_first_precompile_rowsn", rowsn)
+    monkeypatch.setattr(M, "hc_up_precompile", lambda *a, **k: None)
+    core = SimpleNamespace(
+        stream=10240, hc_lowrank=320, hc_count=4, hidden=2560, dp_rank=0, dp_size=8
+    )
+    assert M._hc_tiles_build(core, torch.device("cpu")) is False
+    assert len(warned) == 1 and M.DP_HC_TILES_ENV in warned[0] and "smem" in warned[0]
 
 
 @pytest.mark.cpu_only
@@ -206,6 +228,34 @@ def test_inproj_release_off_when_the_self_check_differs(monkeypatch):
     monkeypatch.setattr(M.logger, "warning", warned.append)
     assert _release_build(monkeypatch, _release_core(bad_rows=(48,))) is None
     assert len(warned) == 1 and M.DP_INPROJ_RELEASE_ENV in warned[0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("where", ["gemm", "up"])
+def test_inproj_release_off_when_a_kernel_raises(monkeypatch, where):
+    """A GEMM (or the releasing up kernel) that does not compile or run is declined like one
+    that differs: the switch is off at this rank, with one warning, and the load goes on."""
+    warned = []
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    core = _release_core()
+
+    def boom(*a, **k):
+        raise RuntimeError("no such plan")
+
+    if where == "gemm":
+        core.decode_in_mm = boom
+        assert _release_build(monkeypatch, core) is None
+    else:
+        monkeypatch.setattr(M, "_dp_decode_rank", lambda core, device: True)
+        monkeypatch.setattr(M, "_DECODE_PROJ_PDL", True)
+        monkeypatch.setattr(
+            M, "_inproj_mm", lambda x, ent: torch.zeros(x.shape[0], ent.w.shape[0], dtype=x.dtype)
+        )
+        monkeypatch.setattr(M.torch.cuda, "synchronize", lambda *a, **k: None)
+        monkeypatch.setattr(M, "hc_up_precompile", boom)
+        assert M._inproj_release_build(core, torch.device("cpu")) is None
+    assert len(warned) == 1 and M.DP_INPROJ_RELEASE_ENV in warned[0]
+    assert "no such plan" in warned[0]
 
 
 @pytest.mark.cpu_only
