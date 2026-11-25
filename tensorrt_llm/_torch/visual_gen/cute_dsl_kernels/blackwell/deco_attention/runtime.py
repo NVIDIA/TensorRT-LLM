@@ -17,12 +17,15 @@
 import functools
 import math
 import os
+import time
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_ptr
+
+from tensorrt_llm.logger import logger
 
 from .constants import ALIGN
 
@@ -107,8 +110,20 @@ def compiled(
     cache: dict, key: tuple, make: Callable[[], object], *args: object, **kwargs: object
 ) -> Callable:
     """Return cache[key], compiled for args from make() on first use (make builds the kernel object, or returns the jit
-    function, only on a miss)."""
+    function, only on a miss). A miss logs the key and the compile time; a miss under CUDA graph capture raises."""
     fn = cache.get(key)
     if fn is None:
+        not_under_capture(torch.device("cuda"), f"kernel {key}")
+        start = time.perf_counter()
         fn = cache[key] = cute.compile(make(), *args, **kwargs)
+        logger.info(f"Compiled DeCo-Attention kernel {key} in {time.perf_counter() - start:.1f} s")
     return fn
+
+
+def not_under_capture(device: torch.device, what: str) -> None:
+    """Raise when `what` is first needed while the current CUDA stream is capturing a graph."""
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"DeCo-Attention {what} first needed during CUDA graph capture; "
+            "run the call eagerly once before capturing"
+        )

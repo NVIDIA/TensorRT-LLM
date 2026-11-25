@@ -72,7 +72,7 @@ sequence shorter than `min_seq_len(pv)`.
 - **CUDA graphs.** A call enqueues its launches on the current stream, reads nothing back from the device and
   allocates nothing, so both calls can be captured into one graph after one eager call of the shape. The eager call
   compiles the kernels and builds the sampled rows of the sequence length and the rotation matrix of the device; a
-  first use of either under capture raises a `RuntimeError`.
+  first use of any of them under capture raises a `RuntimeError`. Every compilation is logged with its key and time.
 
 ```python
 graph = torch.cuda.CUDAGraph()

@@ -656,7 +656,7 @@ def test_deco_delegates_unsupported_calls(
     require_deco_kernels, deco_recipe, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cross-attention, a causal mask and other dtypes run on VANILLA, unquantized; the layer
-    notes its first delegated self-attention call with what keeps it from the kernels."""
+    notes its first delegated call with what keeps it from the kernels."""
     device = require_deco_kernels()
     num_heads = 2
     q, k, v = _random_qkv(1, 256, num_heads, device)
@@ -674,6 +674,9 @@ def test_deco_delegates_unsupported_calls(
     out = attn.forward(q, k[:, :128], v[:, :128])
     assert out.shape == q.shape
     assert _relative_error(out, _sdpa(q, k[:, :128], v[:, :128])) < 2e-2
+    # A layer whose first delegated call is cross-attention notes that.
+    _backend(num_heads, deco_recipe()).forward(q, k[:, :128], v[:, :128])
+    assert len(notes) == 2 and "cross-attention" in notes[1]
 
     out = attn.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
     assert _relative_error(out, _sdpa(q, k, v, is_causal=True)) < 2e-2
@@ -682,17 +685,19 @@ def test_deco_delegates_unsupported_calls(
     assert out.dtype == torch.float16
     assert _relative_error(out, _sdpa(q, k, v)) < 2e-2
 
-    # A delegated call with a key padding mask attends the tokens; its masked rows are zero.
+    # A delegated call reads a key padding mask as a prefix of its count of tokens, as the kernels
+    # do; the rows after the prefix are zero.
     key_padding_mask = torch.ones(1, 256, dtype=torch.bool, device=device)
     key_padding_mask[:, 100:156] = False
     out = attn.forward(q.half(), k.half(), v.half(), key_padding_mask=key_padding_mask)
-    ref = _sdpa(q, k, v, attn_mask=key_padding_mask[:, None, None, :])
-    assert not out[~key_padding_mask].any()
-    assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
+    prefix = torch.arange(256, device=device)[None] < 200
+    ref = _sdpa(q, k, v, attn_mask=prefix[:, None, None, :])
+    assert not out[~prefix].any()
+    assert _relative_error(out[prefix], ref[prefix]) < 2e-2
 
     assert not kernel_calls
     # The layer notes once, whatever its later calls are delegated for.
-    assert len(notes) == 1 and "torch.float32" in notes[0]
+    assert len(notes) == 2 and "torch.float32" in notes[0]
 
 
 def test_deco_delegates_short_calls(

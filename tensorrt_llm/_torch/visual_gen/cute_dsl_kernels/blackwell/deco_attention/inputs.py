@@ -23,6 +23,7 @@ import functools
 import torch
 
 from .constants import DEFAULT_RANK, HEAD_DIM, SAMPLE_FRAC
+from .runtime import not_under_capture
 
 # Key of a position that the tagged draw does not take, above every priority.
 _NOT_DRAWN = 1 << 30
@@ -44,15 +45,6 @@ def _indexed(device: torch.device | str) -> torch.device:
     if device.type == "cuda" and device.index is None:
         return torch.device("cuda", torch.cuda.current_device())
     return device
-
-
-def _not_under_capture(device: torch.device, what: str) -> None:
-    """Raise when `what` is first needed while the current CUDA stream is capturing a graph."""
-    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"DeCo-Attention {what} first needed during CUDA graph capture; "
-            "run the call eagerly once before capturing"
-        )
 
 
 def _version(tensor: torch.Tensor | None) -> int | None:
@@ -140,7 +132,7 @@ def sample_rows(
 def _priorities(device: torch.device, capacity: int) -> torch.Tensor:
     """Return the priorities of the positions below `capacity` in the tagged draw: int32, distinct, below _NOT_DRAWN.
     Position i has the 30-bit mix of i whatever the capacity, so a sequence draws the same rows in every process."""
-    _not_under_capture(device, "priorities of a tagged sequence")
+    not_under_capture(device, "priorities of a tagged sequence")
     # Every step is a bijection of the 30-bit integers.
     mask = _NOT_DRAWN - 1
     x = (torch.arange(capacity, dtype=torch.int64, device=device) + 0x9E3779B9) & mask
@@ -153,7 +145,7 @@ def _priorities(device: torch.device, capacity: int) -> torch.Tensor:
 def _sample_rows(s: int, device: torch.device, rank: int) -> tuple[torch.Tensor, torch.cuda.Event]:
     """Return the cached default draw and the event of its completion on the stream that drew it, which the streams
     of later callers wait on."""
-    _not_under_capture(device, f"sampled rows of sequence length {s}")
+    not_under_capture(device, f"sampled rows of sequence length {s}")
     perm = torch.randperm(s, device=device, generator=torch.Generator(device=device).manual_seed(0))
     rows = perm[: sample_count(s, rank)].to(torch.int32).contiguous()
     return rows, torch.cuda.current_stream(device).record_event()
@@ -167,7 +159,7 @@ def hadamard(device: torch.device | str) -> torch.Tensor:
     indexed = _indexed(device)
     if indexed != device:
         return hadamard(indexed)
-    _not_under_capture(device, "rotation matrix")
+    not_under_capture(device, "rotation matrix")
     h = torch.ones(1, 1, device="cpu")
     while h.shape[0] < HEAD_DIM:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)

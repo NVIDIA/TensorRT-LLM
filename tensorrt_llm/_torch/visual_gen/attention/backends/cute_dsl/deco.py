@@ -26,8 +26,9 @@ like any other backend.
   ``attention_mask``, other dtypes or devices, shorter sequences, and every call of a layer whose
   head dimension or K/V head count the kernels do not take.
 * Padding: ``key_padding_mask`` (``[B, S]``, True for a token) is read as one valid prefix per
-  sample (``requires_trailing_padding``): the model puts the tokens of every sample first.
-  Padded rows get no attention weight and come back zero.
+  sample, its count of tokens, on the kernels and on VANILLA alike
+  (``requires_trailing_padding``): the model puts the tokens of every sample first. Padded rows
+  get no attention weight and come back zero.
 * One sequence: a call whose q, k and v have one shape, on the kernels and on VANILLA alike. Its
   padded rows are excluded as keys and come back zero as queries. The Attention module builds
   its cross-attention layers on VANILLA, so such a call is self-attention; a direct caller
@@ -38,7 +39,7 @@ like any other backend.
 * Device only: the token counts and the sampled tokens of a call are computed on the device and
   nothing is read back to the host. The layers of a forward share one draw: the kernel package
   keeps the last one while the model passes the same mask and tags tensors.
-* CUDA graphs: first use (kernel compilation, the inputs of a sequence length) runs eagerly, as
+* CUDA graphs: first use (a kernel variant, the inputs of a sequence length) runs eagerly, as
   in the warm-up of a graph runner, and raises ``RuntimeError`` under capture. A captured call
   computes its token counts and sampled tokens inside the graph: a replay follows the content
   of the captured mask and tags tensors.
@@ -166,13 +167,17 @@ class DeCoAttention(AttentionBackend):
     def _delegate(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, one_sequence: bool, **kwargs: Any
     ) -> torch.Tensor:
-        """Run a call on VANILLA. For one sequence, the rows that ``key_padding_mask`` excludes
-        come back zero, as from the kernels, and what they hold has no influence: a padded V row
-        enters SDPA with weight zero, which spreads a NaN in it over the valid rows, so the
-        padded K and V rows are zeroed first."""
+        """Run a call on VANILLA. For one sequence, ``key_padding_mask`` is read as a prefix, as
+        the kernels read it, and the rows it excludes come back zero, as from the kernels; what
+        they hold has no influence: a padded V row enters SDPA with weight zero, which spreads a
+        NaN in it over the valid rows, so the padded K and V rows are zeroed first."""
         key_padding_mask = kwargs.get("key_padding_mask")
         padded = None
         if key_padding_mask is not None and one_sequence:
+            # the mask as a prefix of its count of tokens, as _launch reads it
+            token_counts = key_padding_mask.sum(dim=1, dtype=torch.int32)
+            positions = torch.arange(q.shape[1], dtype=torch.int32, device=q.device)
+            key_padding_mask = kwargs["key_padding_mask"] = positions[None] < token_counts[:, None]
             padded = ~key_padding_mask[:, :, None, None]
             k = k.masked_fill(padded, 0)
             v = v.masked_fill(padded, 0)
@@ -254,13 +259,13 @@ class DeCoAttention(AttentionBackend):
 
     @torch.compiler.disable
     def _note_unquantized(self, reason: str) -> None:
-        """Note that the layer delegates a self-attention call: a layer notes it once, and the
-        process logs each reason once."""
+        """Note that the layer delegates a call: a layer notes it once, and the process logs each
+        reason once."""
         self._noted_unquantized = True
         logger.warning_once(
-            f"DeCo-Attention runs self-attention unquantized on VANILLA because of {reason} "
-            f"(first seen in layer {self.layer_idx}); its kernels take bfloat16 CUDA inputs of "
-            f"at least {MIN_SEQ_LEN} rows and padding, no other mask.",
+            f"DeCo-Attention runs attention unquantized on VANILLA because of {reason} (first "
+            f"seen in layer {self.layer_idx}); its kernels take bfloat16 CUDA inputs of at least "
+            f"{MIN_SEQ_LEN} rows of self-attention and padding, no other mask.",
             key=f"deco_attention_unquantized_{reason}",
         )
 
@@ -280,9 +285,11 @@ class DeCoAttention(AttentionBackend):
         if key_padding_mask is not None and key_padding_mask.dtype != torch.bool:
             key_padding_mask = kwargs["key_padding_mask"] = key_padding_mask.bool()
         # The kernels attend one sequence to itself at their head geometry; another geometry
-        # and cross-attention are delegated on every call and log nothing.
+        # (noted when the layer is built) and cross-attention are delegated on every call.
         one_sequence = q.shape == k.shape == v.shape
         if not (self._has_kernel_geometry and one_sequence):
+            if self._has_kernel_geometry and not self._noted_unquantized:
+                self._note_unquantized("cross-attention (q and k of different shapes)")
             return self._delegate(q, k, v, one_sequence, **kwargs)
         reason = self._delegation_reason(q, k, v, **kwargs)
         if reason is not None:
