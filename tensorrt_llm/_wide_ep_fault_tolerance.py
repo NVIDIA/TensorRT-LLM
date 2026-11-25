@@ -186,9 +186,9 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
             (
                 not llm_args.kv_cache_config.enable_kv_pool_rebalance,
                 "no KV pool rebalance (kv_cache_config.enable_kv_pool_rebalance=False, not True), "
-                "because fault tolerance resizes the KV cache pool with fixed shares between its "
-                "pool groups, and a rebalance changes those shares without zeroing the slots it "
-                "adds",
+                "because its auto-tuner moves the split between the KV cache pool groups, so a "
+                "pool resize could grow a pool group past its size at construction, which the "
+                "views that fault tolerance records cover",
             ),
             (
                 transceiver_backend is None,
