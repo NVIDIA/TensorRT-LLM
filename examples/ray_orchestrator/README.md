@@ -6,9 +6,9 @@
 
 <div align="left">
 
-This folder contains examples for a prototype **Ray orchestrator** that supports on-demand LLM instance spin-up and flexible GPU placement across single- and multi-node inference. It’s a first step toward making TensorRT-LLM a better fit for Reinforcement learning from human feedback (RLHF) workflows. For RLHF, [Ray](https://docs.ray.io/en/latest/index.html) — unlike MPI’s fixed world size and placement — can dynamically spawn and reconnect distributed inference actors, each with its own parallelism strategy.
+This folder contains examples for the **Ray orchestrator** that supports on-demand LLM instance spin-up and flexible GPU placement across single- and multi-node inference. It’s a first step toward making TensorRT-LLM a better fit for Reinforcement learning from human feedback (RLHF) workflows. For RLHF, [Ray](https://docs.ray.io/en/latest/index.html) — unlike MPI’s fixed world size and placement — can dynamically spawn and reconnect distributed inference actors, each with its own parallelism strategy.
 
-This feature is a prototype and under active development. MPI remains the default.
+MPI remains the default.
 
 
 ## Quick Start
@@ -44,8 +44,5 @@ This feature introduces new classes such as [RayExecutor](/tensorrt_llm/executor
 
 ![Ray orchestrator architecture](/docs/source/media/ray_orchestrator_architecture.jpg)
 
-
-## Disclaimer
-The code a prototype and subject to change. Currently, there are no guarantees regarding functionality, performance, or stability.
 
 </div>
