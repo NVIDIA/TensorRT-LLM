@@ -85,7 +85,9 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
     token_in_end_warp_idx: ClassVar[int] = 12
     scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
     epilogue_register_count: ClassVar[int] = 256
-    scheduler_register_count: ClassVar[int] = 72
+    # TensorRT-LLM local patch: match other_warp_register_count (80) so every warp of a warpgroup
+    # issues the same setmaxnreg.dec; `.aligned` leaves mixed counts within a warpgroup undefined.
+    scheduler_register_count: ClassVar[int] = 80
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
