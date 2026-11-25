@@ -16,36 +16,14 @@
 """PyTorch model configuration for the performance benchmarks."""
 
 import copy
+from pathlib import Path
+
+import yaml
 
 from ..conftest import llm_models_root
 
-# Named LLM API overrides, selected by the "cfg:<name>[+<name>...]" test-name
-# label and applied after every other rule in get_model_yaml_config().
-PERF_CONFIG_PRESETS = {
-    # KV cache block reuse (prefix caching) on or off. Hybrid linear-attention
-    # and Mamba models reuse a prefix only up to a recurrent-state snapshot,
-    # taken here every 8192 tokens (the long-context prefill chunk size).
-    'reuse': {
-        'kv_cache_config': {
-            'enable_block_reuse': True,
-            'mamba_state_config': {
-                'periodic_snapshot_interval': 8192
-            }
-        }
-    },
-    'noreuse': {
-        'kv_cache_config': {
-            'enable_block_reuse': False
-        }
-    },
-    # MTP drafting three tokens per step.
-    'mtp3': {
-        'speculative_config': {
-            'decoding_type': 'MTP',
-            'max_draft_len': 3
-        }
-    },
-}
+with Path(__file__).with_name('pytorch_config_presets.yml').open() as presets:
+    PERF_CONFIG_PRESETS = yaml.safe_load(presets)
 
 
 def _get_sm_version_safe() -> int:
@@ -119,30 +97,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config={'dtype': 'fp8'})
     if muse:
         update(max_seq_len=49152, cuda_graph_config={'max_batch_size': 256})
-    if muse_agentx:
-        update(
-            max_seq_len=1048576,
-            scheduler_config={'capacity_scheduler_policy': 'MAX_UTILIZATION'},
-            cuda_graph_config={'batch_sizes': list(range(1, 25))},
-            prefill_cuda_graph_backend='breakable',
-            prefill_capture_num_tokens=[
-                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536,
-                1792, 2048, 2304, 2560, 2816, 3072, 3584, 4096, 4608, 5120,
-                5632, 6144, 6656, 7168, 7680, 8192
-            ],
-            kv_cache_config={
-                'block_reuse_config': {
-                    'swa_endpoint_rewind_tokens': 1024
-                },
-                'pool_ratio': [0.25, 0.75],
-                'host_cache_size': 171798691840
-            },
-            num_postprocess_workers=8,
-            stream_interval=20,
-            enable_tokenization_cache=True,
-            enable_iter_perf_stats=True,
-            iter_perf_stats_interval=40,
-        )
 
     if 'deepseek_v41_flash_nvfp4' in label:
         update(
@@ -180,39 +134,17 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if dspark:
         update(moe_config={'backend': 'MEGAMOE_DEEPGEMM'},
                speculative_config=_dspark(5, 'DeepSeek-V4-Pro-DSpark'))
-    # Match the curated DeepSeek V4 Pro throughput and latency recipes.
-    fp4_bench = 'deepseek_v4_pro_fp4-bench-pytorch-float4-'
-    fp8_serve = 'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-'
-    throughput = any(
-        prefix + 'maxbs:32-maxnt:8448' in label
-        for prefix in (fp4_bench, fp8_serve,
-                       'deepseek_v4_pro_fp4-serve-pytorch-streaming-float4-'))
-    latency = any(prefix + 'maxbs:128-maxnt:8448' in label
-                  for prefix in (fp4_bench, fp8_serve,
-                                 'deepseek_v4_pro_fp4-serve-pytorch-float4-'))
-    if nvfp4_dspark or throughput or latency:
-        update(moe_config={'use_low_precision_moe_combine': True},
-               kv_cache_config={'dtype': 'fp8'})
-    if nvfp4_dspark or throughput:
-        update(enable_lm_head_tp_in_adp=True)
     if nvfp4_dspark:
         # Single-node adaptation of the disaggregated NVFP4 recipe for 8K prefill.
-        update(moe_config={'backend': 'CUTEDSL'},
+        update(enable_lm_head_tp_in_adp=True,
+               moe_config={
+                   'backend': 'CUTEDSL',
+                   'use_low_precision_moe_combine': True
+               },
+               kv_cache_config={'dtype': 'fp8'},
                speculative_config=_dspark(3,
                                           'DeepSeek-V4-Pro-nvfp4-DSpark',
                                           block_size=3))
-    if throughput or latency:
-        update(moe_config={'backend': 'TRTLLM'},
-               max_seq_len=9256,
-               speculative_config=_mtp(3 if latency else 1),
-               stream_interval=100,
-               num_postprocess_workers=4)
-    if throughput:
-        update(enable_attention_dp=True,
-               attention_dp_config={'enable_balance': True})
-    if (throughput or latency) and '-serve-' in label:
-        update(cuda_graph_config={'max_batch_size': 128 if latency else 32},
-               kv_cache_config=_kv_without_reuse())
 
     qwen_max = 'qwen3.8_max_fp4_mtp-serve-pytorch' in label
     flash_next = 'qwen3.8_flash_next_' in label

@@ -119,6 +119,12 @@ In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` 
 
 For example, both Kimi K3 serve variants disable KV block reuse and use 64 tokens per block. The DEP8 variant adds `kv_cache_config.dtype='nvfp4'` and inherits those two settings. The test list supplies the KV memory fraction through `kv_frac`.
 
+The Core test list selects workload settings with `-cfg:<name>`. DeepSeek V4 Pro uses
+`deepseek_v4_pro_throughput` or `deepseek_v4_pro_latency`, and Muse Spark AgentX uses
+`muse_spark_agentx`. These presets are defined in [pytorch_config_presets.yml](pytorch_config_presets.yml).
+Presets merge into the model configuration from left to right. For example,
+`-cfg:deepseek_v4_pro_throughput+mtp3` changes the draft length to three.
+
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files
 - Support for different models, precisions, batch sizes, etc.
