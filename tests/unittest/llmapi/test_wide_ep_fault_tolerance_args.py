@@ -312,6 +312,15 @@ def test_check_leaves_args_unchanged():
     assert args.modeling_v2 == "auto"
 
 
+def test_kv_pool_rebalance_accepted_without_fault_tolerance():
+    """Accept a KV pool rebalance with fault tolerance off."""
+    args = _args(
+        enable_wide_ep_fault_tolerance=False,
+        kv_cache_config=KvCacheConfig(enable_kv_pool_rebalance=True),
+    )
+    assert args.kv_cache_config.enable_kv_pool_rebalance
+
+
 @pytest.mark.parametrize("mode, rejected", [("standard", False), ("per_layer_dynamic", True)])
 def test_load_balancer_from_yaml_checked(tmp_path, mode, rejected):
     """Check that a load balancer given as a YAML path is checked once loaded."""

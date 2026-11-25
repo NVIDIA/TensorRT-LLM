@@ -860,15 +860,16 @@ def test_failed_replacement_warmup_resumes_the_record():
     assert _record().active
 
 
-def test_replacement_warmup_reports_startup_progress():
-    """Check that each step of the warmup a replacement runs alone counts as startup progress.
+def test_warmup_reports_startup_progress():
+    """Check that each step of an autotuner warmup counts as startup progress, on every rank.
 
-    The steps go through the progress report of its replayed collectives, so a long warmup that
-    keeps making progress is not taken for a hung startup. An original rank reports none.
+    The steps go through the progress report of the startup collectives, so a long warmup that
+    keeps making progress between two collectives is not taken for a hung startup.
     """
     rank_0_progress = _record().report_progress = Mock()
-    _, published, tuned_tactics = _original_rank_0(16, 16)
-    rank_0_progress.assert_not_called()
+    rank_0, published, tuned_tactics = _original_rank_0(16, 16)
+    assert rank_0.tuned_forwards == [16, 1]
+    assert rank_0_progress.call_count == len(rank_0.tuned_forwards)
     replacement = _replacement_engine(published, tuned_tactics)
     in_tuning_pass = []
     _record().report_progress = lambda: in_tuning_pass.append(replacement.tuning)

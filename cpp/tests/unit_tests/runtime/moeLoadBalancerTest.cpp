@@ -29,7 +29,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <cuda.h>
 #include <dlfcn.h>
 #include <exception>
@@ -1103,7 +1102,7 @@ TEST(MoeLoadBalancerAbandonTest, AbandonIterationsWaitsForTheLaunchedWork)
     using tensorrt_llm::kernels::MoeLoadBalanceSingleLayerSignal;
     MoeLoadBalanceSingleLayerSignal* held = nullptr;
     TLLM_CUDA_CHECK(cudaMallocHost(&held, sizeof(*held)));
-    std::memset(static_cast<void*>(held), 0, sizeof(*held));
+    *held = MoeLoadBalanceSingleLayerSignal{};
     held->stepAndOwner = MoeLoadBalanceSingleLayerSignal::kCPU;
     int* enabled = nullptr;
     TLLM_CUDA_CHECK(cudaMalloc(&enabled, sizeof(int)));

@@ -918,7 +918,7 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
         with Distributed.rank_varying("host cache tier quota"):
             host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
         record = Distributed.startup_record
-        if record is not None and record.replaying:
+        if record is not None and record.replacement:
             _check_replacement_host_tier(host_quota, mapping)
     return host_quota
 
@@ -3544,6 +3544,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 ],
             )
         self.kv_cache_manager_py_config = config
+        # The slot count of each GPU pool group, which the views of the pool cover;
+        # resize_gpu_quota never grows a group past it.
+        self._max_gpu_num_slots = [
+            pool_group.num_slots for pool_group in candidate.pool_group_descs
+        ]
         self.impl = candidate
         # Cached at construction so the per-locality-domain metadata invariants
         # stay stable for the manager's lifetime.
@@ -5199,7 +5204,14 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_rebalance=PoolRebalanceConfig(
                 min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
                 cooldown_secs=rebalance_cfg.cooldown_secs,
-                target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
+                # The backend splits every quota change by the auto-tuner's target split. Without
+                # the auto-tuner that target never moves (the largest int32 interval), so
+                # resize_gpu_quota keeps the split the pools were sized by and their views cover.
+                target_ratio_update_interval=(
+                    rebalance_cfg.target_ratio_update_interval
+                    if kv_cache_config.enable_kv_pool_rebalance
+                    else 2**31 - 1
+                ),
                 ratio_tolerance=rebalance_cfg.ratio_tolerance,
                 moving_average_decay=rebalance_cfg.moving_average_decay,
             ),
@@ -9362,6 +9374,12 @@ class KVCacheManagerV2(BaseResourceManager):
         num_slots = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
         if not self.impl.resize(GPU_LEVEL, quota):
             raise OutOfPagesError(f"The GPU KV cache pool cannot be resized to {quota} bytes")
+        resized = [pool_group.num_slots for pool_group in self.impl.pool_group_descs]
+        if any(count > max_count for count, max_count in zip(resized, self._max_gpu_num_slots)):
+            raise RuntimeError(
+                f"Resizing the GPU KV cache pool to {quota} bytes gave its pool groups {resized} "
+                f"slots, past the {self._max_gpu_num_slots} at construction that its views cover"
+            )
         grown = [
             (pool_group, range(old_num_slots, pool_group.num_slots))
             for pool_group, old_num_slots in zip(self.impl.pool_group_descs, num_slots)

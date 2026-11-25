@@ -1525,7 +1525,9 @@ class DecoderWarmup:
                 autotune(
                     cache_path=cache_path,
                     prime_all_runners=replacement,
-                    report_progress=startup_record.report_progress if replacement else None,
+                    report_progress=(
+                        None if startup_record is None else startup_record.report_progress
+                    ),
                 ),
                 synchronize_trtllm_cache=True,
             )
