@@ -168,6 +168,10 @@ l0_gb300:
   # protocols and the dep8 target's pointer entry (`buffers_from_pointers` + `build_on`); the
   # 8-rank cells need eight GPUs in one node and skip here.
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_round_trip.py
+  # qwen4_exp family, pre-merge: the fused reduce-scatter + inject + norm (and its finalize form)
+  # bitwise the plain reduce-scatter + qwen4_exp_hc_inject_norm, 4 ranks, both slot protocols,
+  # eager and replayed; the finalize form's PDL wait first in its SASS. The 8-rank cells skip here.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_rs_inject.py
   # qwen4_exp family, pre-merge: the tep4 fused MoE finalize all-reduce against its reference,
   # 4 ranks, one rank held back before each graph replay.
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_tep_finalize_allreduce.py
