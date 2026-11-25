@@ -161,6 +161,7 @@ class TestAttentionConfigQuantValidation:
             (100, "fp8", 0, 0, 0),
             (103, "bf16", 0, 0, 0),
             (103, "fp8", 0, 0, 0),
+            (107, "fp8", 0, 0, 0),
         ],
     )
     def test_supported_quant_config_trtllm(
@@ -436,6 +437,30 @@ class TestAttentionConfigQuantValidation:
                 AttentionConfig(
                     backend="TRTLLM",
                     quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
+                )
+
+    @pytest.mark.parametrize(
+        ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
+        [
+            ("bf16", 0, 0, 0),
+            ("fp8", 1, 4, 1),
+            ("int8", 1, 4, 1),
+        ],
+    )
+    def test_unsupported_quant_config_trtllm_sm107(
+        self, qk_dtype, q_block_size, k_block_size, v_block_size
+    ):
+        """On SM107 TRTLLM accepts only the per-tensor FP8 recipe."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=107):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype=qk_dtype,
+                        q_block_size=q_block_size,
+                        k_block_size=k_block_size,
+                        v_block_size=v_block_size,
+                    ),
                 )
 
     def test_supported_quant_config_cudnn_fp8(self):

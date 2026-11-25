@@ -4290,8 +4290,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                             or getattr(part_args, "v_fp8_per_tensor", False)):
                         raise RuntimeError(
                             "The per-tensor FP8 attention recipe needs the PrimTS "
-                            "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
-                            "enabled or does not support this request.")
+                            "FMHA library (TLLM_FMHA_LIBS=+prims_ts) or, on SM107, "
+                            "trtllm_gen_dense_fp8, and none that is enabled supports "
+                            "this request.")
                     raise RuntimeError(
                         "No TRT-LLM attention FMHA library supports this request."
                     )

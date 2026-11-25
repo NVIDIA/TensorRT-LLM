@@ -570,7 +570,12 @@ preserve its routing semantics. The PrimTS sparse MLA library
 generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
 decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
 removes it. With sparse KV cache offload, it reads the compress-ratio-4
-layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
+layers' compressed rows from the sparse cache arena (§3.2.5). The trtllm-gen
+dense FP8 library (`trtllm_gen_dense_fp8`) is enabled by default and sits after
+PrimTS: it serves only cache-free, uniform-length context attention of layers
+that carry the per-tensor FP8 `quant_attention_config` (VisualGen) on SM107, and
+reports itself unavailable for sparse layers, so LLM layers never select it.
+Remove it with `TLLM_FMHA_LIBS=-trtllm_gen_dense_fp8`. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
@@ -611,7 +616,16 @@ For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
-`Fmha` owns both entry points. Libraries declare shared capabilities through
+`Fmha` owns both entry points, plus an optional pre-quantized one for
+VisualGen: `supports_prequantized_fp8(fp8_output)` / `run_prequantized()` take
+e4m3 Q/K/V [T, H, D] with the softmax scale already folded into Q and K, one
+dequantization scale for V, uniform sequence lengths, and no KV cache, and
+return BF16 or (with `out_scale`) e4m3 output. The VisualGen TRTLLM backend
+picks, once at construction, the first available library of the layer that
+reports this capability; only `trtllm_gen_dense_fp8` does today. The base
+class returns `False`, so other libraries need not change.
+
+Libraries declare shared capabilities through
 class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
 `supports_fp4_mla` and `supports_deferred_prologue`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
@@ -780,6 +794,11 @@ The FMHA package is split by role:
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
   does not stage page tables through CSR metadata.
+- `fmha/trtllm_gen_dense_fp8.py` runs per-tensor FP8 dense context attention
+  without a KV cache on trtllm-gen kernels (`trtllm::fmha_dense_fp8`) for
+  VisualGen layers on SM107. It quantizes BF16 Q/K/V per tensor and folds the Q/K
+  scales into the softmax scale; through the pre-quantized entry point it takes
+  e4m3 Q/K/V from the fused QK-norm / RoPE / FP8 producer directly.
 - `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
   vendored PrimTS kernels. Before changing the managed source under
   `backends/prims_ts`, read the

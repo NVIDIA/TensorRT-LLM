@@ -80,7 +80,7 @@ def _reference(q, k, v, is_causal):
         seq_q, seq_kv = q.shape[2], k.shape[2]
         causal_mask = torch.ones(seq_q, seq_kv, device=q.device, dtype=torch.bool)
         logits = logits.masked_fill(causal_mask.triu(seq_kv - seq_q + 1), float("-inf"))
-    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1).transpose(1, 2)
+    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1)
 
 
 @pytest.mark.parametrize("quant_dtype", list(QUANT_CONFIGS), ids=["unquantized", "fp8", "mxfp8"])
@@ -109,7 +109,7 @@ def test_cudnn_attention(quant_dtype, shape, is_causal):
     ref_out, ref_lse = _reference(q, k, v, is_causal)
     assert output.shape == (batch, seq_q, num_heads, head_dim)
     assert output.dtype == torch.bfloat16
-    assert lse.shape == (batch, seq_q, num_heads)
+    assert lse.shape == (batch, num_heads, seq_q)
 
     cosine = F.cosine_similarity(output.float().flatten(), ref_out.flatten(), dim=0).item()
     assert cosine > MIN_COSINE[quant_dtype], (
@@ -252,3 +252,43 @@ def test_cudnn_fp8_attention_with_fused_qkv(num_kv_heads):
     ):
         cosine = F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
         assert cosine > MIN_COSINE["fp8"], f"{what}: cosine similarity {cosine} too low"
+
+
+def test_cudnn_fp8_attention_static_fp8_io():
+    """A pre-quantized e4m3 Q with a static descale, and an e4m3 output for a static-FP8 consumer."""
+    _require_cudnn("fp8")
+    device = torch.device("cuda")
+    batch, num_heads, seq_q, seq_kv, head_dim = 2, 8, 1024, 512, 128
+    q, k, v = _make_qkv(batch, num_heads, num_heads, seq_q, seq_kv, head_dim, device)
+    attention = CuDNNAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        quant_attention_config=QUANT_CONFIGS["fp8"],
+    )
+    assert attention.accepts_static_fp8_io()
+    ref, _ = _reference(q, k, v, is_causal=False)
+    out_bf16 = attention.forward(q, k, v)
+
+    # Static Q scale: twice the |Q| maximum, as a calibrated or bounded scale would leave headroom.
+    q_descale = (2.0 * q.float().abs().amax() / 448.0).reshape(1)
+    q8 = (q.float() / q_descale).to(torch.float8_e4m3fn)
+    out_static_q = attention.forward(q8, k, v, q_descale=q_descale)
+    assert out_static_q.dtype == torch.bfloat16
+    assert F.cosine_similarity(out_static_q.float().flatten(), ref.float().flatten(), dim=0) > 0.995
+
+    out_scale = torch.full((1,), 0.01, device=device)
+    out_fp8 = attention.forward(q, k, v, out_scale=out_scale)
+    assert out_fp8.dtype == torch.float8_e4m3fn and out_fp8.shape == out_bf16.shape
+    expected = (out_bf16.float() / out_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    # One rounding instead of BF16 then FP8: rare one-step differences only.
+    same = (out_fp8.view(torch.uint8) == expected.view(torch.uint8)).float().mean().item()
+    assert same > 0.95, f"only {same:.4f} of FP8 bytes match"
+    cosine = F.cosine_similarity(out_fp8.float().flatten(), expected.float().flatten(), dim=0)
+    assert cosine > 0.9999
+
+
+def test_static_fp8_io_needs_fp8_attention():
+    _require_cudnn(None)
+    attention = CuDNNAttention(num_heads=8, head_dim=128, dtype=torch.bfloat16)
+    assert not attention.accepts_static_fp8_io()
