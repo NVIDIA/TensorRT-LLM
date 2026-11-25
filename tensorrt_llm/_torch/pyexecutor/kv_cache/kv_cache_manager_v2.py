@@ -915,7 +915,7 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
         with Distributed.rank_varying("host cache tier quota"):
             host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
         record = Distributed.startup_record
-        if record is not None and record.replaying:
+        if record is not None and record.replacement:
             _check_replacement_host_tier(host_quota, mapping)
     return host_quota
 
