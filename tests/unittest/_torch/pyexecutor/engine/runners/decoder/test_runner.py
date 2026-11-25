@@ -210,6 +210,7 @@ def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: 
         project_context_logits,
     )
     from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+    from tensorrt_llm._torch.pyexecutor.context_logits_plan import FULL_CONTEXT_LOGITS_KEY
     from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 
     engine, _, resources, _, _ = _make_decoder_runner(None)
@@ -244,7 +245,7 @@ def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: 
         logits.zero_()
 
     if has_processor:
-        scoring.py_orig_prompt_len = scoring.py_prompt_len
+        scoring.is_last_context_chunk = True
         scoring.get_tokens = lambda beam: [1, 2]
         scoring.py_logits_post_processors = [process_logits]
         decode.get_beam_width_by_iter = lambda **kwargs: 1
@@ -277,6 +278,9 @@ def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: 
         expected[1].zero_()
     torch.testing.assert_close(outputs["logits"], expected)
     assert outputs["context_logits_handled"]
+    # The plan stored this step's context logits; nothing is left for
+    # HandleLogits to store again.
+    assert FULL_CONTEXT_LOGITS_KEY not in outputs
     stored = scoring.py_result.context_logits
     assert stored is not None
     torch.testing.assert_close(stored, hidden[3:5])
@@ -1166,7 +1170,9 @@ def test_full_context_rows_reach_their_own_requests() -> None:
     def request(
         request_id: int, chunk: int, *, returns: bool, guided: object | None = None
     ) -> SimpleNamespace:
-        def append_context_logits(logits: torch.Tensor, reusable: bool = False) -> None:
+        def append_context_logits(
+            logits: torch.Tensor, reusable: bool = False, retain_owned: bool = False
+        ) -> None:
             stored[request_id] = logits.clone()
 
         return SimpleNamespace(

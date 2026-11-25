@@ -1009,8 +1009,13 @@ class DecoderRunner(ScheduledModelRunner):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            # A step with encoder replay rows holds extra rows ahead of some
+            # requests' prompt rows. The plan recorded how many, so it stores
+            # and shortens that step's logits below.
+            has_replay_rows = output_plan is not None and bool(output_plan.replay_rows)
             if (
                 gather_context_logits
+                and not has_replay_rows
                 # Earlier pipeline stages hold placeholder logits; the last
                 # stage's context logits reach them as a result diff.
                 and self._mapping.is_last_pp_rank()

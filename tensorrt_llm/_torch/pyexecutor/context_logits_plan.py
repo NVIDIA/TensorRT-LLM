@@ -104,6 +104,10 @@ def sampling_rows_from_full_rows(
     leave the context logits in ``logits`` as the model's own scores.
     ``HandleLogits`` stores them when the step is sampled.
 
+    The rows are counted from ``context_chunk_size`` alone, so the step must
+    hold no encoder replay rows; ``ContextLogitsPlan.store_full_logits`` handles
+    a step that does.
+
     Args:
         context_requests: The step's context requests, in row order.
         logits: ``[context_tokens + other_rows, vocab]`` with all context rows
