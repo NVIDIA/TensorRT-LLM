@@ -235,9 +235,14 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = [context]
 
-                _, promoted_ids = _make_single_token_context_graph_batch(batch)
+                graph_batch, promoted_ids = _make_single_token_context_graph_batch(batch)
 
-                self.assertEqual(bool(promoted_ids), not row_on_final_token)
+                if row_on_final_token:
+                    self.assertIs(graph_batch, batch)
+                    self.assertFalse(promoted_ids)
+                else:
+                    self.assertEqual(graph_batch.generation_requests, [context])
+                    self.assertEqual(promoted_ids, frozenset({context.py_request_id}))
 
     def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)

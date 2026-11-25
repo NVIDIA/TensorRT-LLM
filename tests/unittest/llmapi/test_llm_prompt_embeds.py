@@ -398,6 +398,10 @@ def _check_preemption(
         assert got == expected
 
 
+# A handoff that stalls before its KV transfer starts fails here, not at the CI timeout.
+HANDOFF_TIMEOUT = 300
+
+
 def test_disaggregated_handoff() -> None:
     # Context and generation engines share one GPU; both key the transferred
     # blocks by the embedding identity.
@@ -432,14 +436,17 @@ def test_disaggregated_handoff() -> None:
                 sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
                 disaggregated_params=DisaggregatedParams(request_type="context_only"),
                 cache_salt=salt,
-            ).result()
+            ).result(timeout=HANDOFF_TIMEOUT)
             params = first.disaggregated_params
+            # The context result hands off the rows' identity, not the rows.
+            identity = params.prompt_embeds
+            assert identity is not None and identity.embeds is None and not identity.prefillable
             params.request_type = "generation_only"
             # The generation request takes the rows' identity from the context result.
             gen_request = {"prompt_token_ids": req["prompt_token_ids"]}
             out = gen.generate_async(
                 gen_request, sampling_params=_greedy(), disaggregated_params=params, cache_salt=salt
-            ).result()
+            ).result(timeout=HANDOFF_TIMEOUT)
             return list(out.outputs[0].token_ids), out.cached_tokens
 
         assert handoff(request) == (_run(ctx, [ids])[0], 0)
@@ -455,7 +462,7 @@ def test_disaggregated_handoff() -> None:
                     sampling_params=SamplingParams(max_tokens=1),
                     disaggregated_params=DisaggregatedParams(request_type="context_only"),
                 )
-                .result()
+                .result(timeout=HANDOFF_TIMEOUT)
                 .disaggregated_params
             )
             params.request_type = "generation_only"

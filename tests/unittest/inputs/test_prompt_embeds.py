@@ -65,13 +65,6 @@ def test_build_positions(
     [
         ([1, 2, 3], _rows(2), None, ValueError, "rows for"),
         ([1, 2, 3], _rows(2), [True, False], ValueError, "length"),
-        (
-            [1, 2, 3],
-            _rows(1),
-            torch.sparse_coo_tensor([[1]], [True], (1 << 40,)),
-            ValueError,
-            "length",
-        ),
         ([1, 2, 3], _rows(1), [True, True, False], ValueError, "selects"),
         ([1, 2, 3], _rows(2), [1, 1, 0], TypeError, "only bools"),
         ([1, 2, 3], _rows(2), torch.tensor([1, 1, 0]), TypeError, "torch.bool"),
@@ -98,6 +91,16 @@ def test_rejects_malformed(
 ) -> None:
     with pytest.raises(error, match=match):
         build_prompt_embeds(ids, embeds, mask)
+
+
+def test_sparse_mask_length_checked_before_densifying(monkeypatch: pytest.MonkeyPatch) -> None:
+    def densify(self: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("a wrong-length sparse mask was densified")
+
+    monkeypatch.setattr(torch.Tensor, "to_dense", densify)
+    mask = torch.sparse_coo_tensor([[1]], [True], (5,))
+    with pytest.raises(ValueError, match="length"):
+        build_prompt_embeds([1, 2, 3], _rows(1), mask)
 
 
 def test_snapshot_is_owned() -> None:

@@ -649,6 +649,19 @@ def test_remote_tail_short_prompt_rejects_unsupported_requests(
         PyExecutor._configure_csa2_remote_tail(executor, request)
 
 
+def test_remote_tail_destination_rejects_prompt_embeds_identity() -> None:
+    # A generation-only request carries the rows' identity but no rows to replay.
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    executor, request = _make_remote_tail_executor_and_request(64, context_only=False)
+    request.py_llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    request.py_disaggregated_params.remote_tail_start = 0
+    request.py_prompt_embeds = build_prompt_embeds([0] * 64, torch.ones(64, 4))[1].identity_only()
+
+    with pytest.raises(ValueError, match="does not support prompt_embeds"):
+        PyExecutor._configure_csa2_remote_tail(executor, request)
+
+
 @pytest.mark.parametrize("context_only", [False, True])
 def test_remote_tail_rejects_pipelined_transfer(context_only: bool) -> None:
     executor, request = _make_remote_tail_executor_and_request(64, context_only)

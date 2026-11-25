@@ -2423,6 +2423,7 @@ def test_request_broadcast_leaves_prompt_embeds_rows_on_rank0(broadcast_kind: st
     _, prompt_embeds = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     request = ExecutorRequest.adapt(trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=4))
     request.inputs.prompt_embeds = prompt_embeds
+    rows = prompt_embeds.embeds.clone()
     generation_only = ExecutorRequest.adapt(trtllm.Request(input_token_ids=[1, 2], max_tokens=4))
     generation_only.inputs.prompt_embeds = prompt_embeds.identity_only()
     # A cancellation carries no request.
@@ -2447,6 +2448,7 @@ def test_request_broadcast_leaves_prompt_embeds_rows_on_rank0(broadcast_kind: st
         "pipeline_parallel": transport.tp_cp_broadcast,
     }[broadcast_kind].call_args_list
     if broadcast_kind == "pipeline_parallel":
+        assert transport.send_object.call_args_list
         sent_calls += transport.send_object.call_args_list
     assert sent_calls
     for call in sent_calls:
@@ -2457,3 +2459,4 @@ def test_request_broadcast_leaves_prompt_embeds_rows_on_rank0(broadcast_kind: st
         assert not sent_generation_only.request.inputs.prompt_embeds.prefillable
         assert cancel.request is None and cancel.is_canceled_request
     assert request.inputs.prompt_embeds is prompt_embeds
+    assert torch.equal(prompt_embeds.embeds, rows)

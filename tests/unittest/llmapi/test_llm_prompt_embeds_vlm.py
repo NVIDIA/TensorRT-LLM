@@ -179,6 +179,12 @@ def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
         out = llm.generate([request], _greedy(), cache_salt=salt)[0]
         assert [list(out.outputs[0].token_ids)] == expected
         assert (out.cached_tokens > 0) == repeat
+    if reuse:
+        # The repeat reuses as far as a plain repeat does, past the image and both rows.
+        plain_salt = uuid.uuid4().hex
+        llm.generate([plain], _greedy(), cache_salt=plain_salt)
+        plain_hit = llm.generate([plain], _greedy(), cache_salt=plain_salt)[0].cached_tokens
+        assert out.cached_tokens == plain_hit
 
 
 def _video_request(llm: LLM, text_first: bool = False) -> dict:
