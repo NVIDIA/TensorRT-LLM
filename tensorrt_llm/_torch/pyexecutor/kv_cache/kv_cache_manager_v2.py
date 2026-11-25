@@ -9369,7 +9369,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Raises:
             OutOfPagesError: The pages in use do not fit in ``quota`` bytes.
-            RuntimeError: A KV cache is not suspended.
+            RuntimeError: A KV cache is not suspended, or the resize would grow a pool group past
+                its slot count at construction.
             ValueError: ``quota`` exceeds the pool's size at construction.
         """
         unit = _gpu_alloc_granularity(self.impl.init_config.cache_tiers[GPU_LEVEL].quota)
