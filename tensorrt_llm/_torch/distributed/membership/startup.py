@@ -326,18 +326,19 @@ def _start_alone(worker_main_args: dict) -> None:
 
     It takes the KV cache capacity from the startup record and the tuned tactics from its
     predecessor instead. So it neither loads nor saves the autotuner cache file of the original
-    ranks, whether the environment or ``env_overrides`` sets it: loading the file would replace the
-    tactics it took.
+    ranks: loading the file would replace the tactics it took. ``env_overrides`` set neither
+    variable again, because ``worker_main`` applies them over the environment.
     """
     os.environ["TRTLLM_SKIP_KV_CACHE_ESTIMATION"] = "1"
     os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
     llm_args = worker_main_args["llm_args"]
     update = {"checkpoint_io_policy": CheckpointIOPolicy.NATIVE}
-    if llm_args.env_overrides and "TLLM_AUTOTUNER_CACHE_PATH" in llm_args.env_overrides:
+    startup_variables = {"TRTLLM_SKIP_KV_CACHE_ESTIMATION", "TLLM_AUTOTUNER_CACHE_PATH"}
+    if llm_args.env_overrides and startup_variables & llm_args.env_overrides.keys():
         update["env_overrides"] = {
             name: value
             for name, value in llm_args.env_overrides.items()
-            if name != "TLLM_AUTOTUNER_CACHE_PATH"
+            if name not in startup_variables
         }
     requested = llm_args.checkpoint_io_policy
     if requested != CheckpointIOPolicy.NATIVE:

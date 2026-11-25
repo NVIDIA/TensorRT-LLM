@@ -709,6 +709,44 @@ class TestDefaultADPRouter:
         assert 5 in [item.id for item in result[2]]
         assert expected == 5  # (2 + 2 + 6) / 2 serving ranks
 
+    def test_absent_rank_holds_its_strict_requests(self):
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=3))
+        queue = FCFSWaitingQueue()
+        queue.add_requests(
+            [
+                RequestQueueItem(
+                    0,
+                    create_mock_request_with_py_schedule_params(
+                        attention_dp_rank=1, attention_dp_relax=False
+                    ),
+                ),
+                RequestQueueItem(
+                    1,
+                    create_mock_request_with_py_schedule_params(
+                        attention_dp_rank=1, attention_dp_relax=True
+                    ),
+                ),
+                RequestQueueItem(2, create_mock_request_with_py_schedule_params()),
+            ]
+        )
+        states = [  # rank 1 left the group
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=2, num_active_requests=0, num_active_tokens=0),
+        ]
+        admitted, placement = router.pop_requests(queue, states, 8, max_num_active_requests=4)
+        assert [item.id for item in admitted] == [1, 2]
+        assert [item.id for item in queue] == [0]
+        result, _ = router.route_requests(states, admitted, 4, placement=placement)
+        assert set(result) == {0, 2}
+        assert sorted(item.id for items in result.values() for item in items) == [1, 2]
+
+        # Rank 1 is back: the held request is admitted on it.
+        states.insert(1, RankState(rank=1, num_active_requests=0, num_active_tokens=0))
+        admitted, placement = router.pop_requests(queue, states, 8, max_num_active_requests=4)
+        assert [item.id for item in admitted] == [0]
+        result, _ = router.route_requests(states, admitted, 4, placement=placement)
+        assert [item.id for item in result[1]] == [0]
+
     def test_create_rank_state_default(self):
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist)

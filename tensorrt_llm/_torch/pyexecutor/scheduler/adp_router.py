@@ -573,8 +573,10 @@ class ADPRouter(ABC):
         """
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         if len(all_rank_states) < self.dist.tp_size:
+            # A rank left out of the gather has no free slot, so a request only it may take
+            # stays queued.
             all_ranks_num_active_requests = self._values_by_rank(
-                all_rank_states, all_ranks_num_active_requests
+                all_rank_states, all_ranks_num_active_requests, absent=max_num_active_requests
             )
         requests = get_from_waiting_queue(
             waiting_queue,
@@ -586,10 +588,12 @@ class ADPRouter(ABC):
         )
         return requests, {}
 
-    def _values_by_rank(self, all_rank_states: list[RankState], values: list[int]) -> list[int]:
-        """Return the values of the ranks in an active-only gather indexed by rank, with 0 for
-        the ranks it left out."""
-        by_rank = [0] * self.dist.tp_size
+    def _values_by_rank(
+        self, all_rank_states: list[RankState], values: list[int], absent: int = 0
+    ) -> list[int]:
+        """Return the values of the ranks in an active-only gather indexed by rank, with
+        ``absent`` for the ranks it left out."""
+        by_rank = [absent] * self.dist.tp_size
         for state, value in zip(all_rank_states, values):
             by_rank[state.rank] = value
         return by_rank
