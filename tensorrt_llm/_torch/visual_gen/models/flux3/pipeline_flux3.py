@@ -538,8 +538,12 @@ class Flux3Pipeline(BasePipeline):
         self._check_num_images(params.num_images_per_prompt)
         if not params.image_reference:
             return
+        # Only sizes the caller set count; default_params' filled-in 1024 leaves edits to the reference.
+        given = params.model_fields_set
         references, params.height, params.width = self._prepare_references(
-            [ref.content for ref in params.image_reference], params.height, params.width
+            [ref.content for ref in params.image_reference],
+            params.height if "height" in given else None,
+            params.width if "width" in given else None,
         )
         req.prepared_inputs["references"] = references
 

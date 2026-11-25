@@ -190,6 +190,7 @@ def make_request(*references: bytes, height=None, width=None, num_images_per_pro
         num_inference_steps=2,
         guidance_scale=None,
         seed=0,
+        model_fields_set={name for name, size in (("height", height), ("width", width)) if size},
     )
     return SimpleNamespace(prompt=["edit this image"], params=params, prepared_inputs={})
 
@@ -572,6 +573,23 @@ def test_prepare_request_resolves_size_and_infer_reuses_references():
     assert pipeline.forward.call_args.args == ("edit this image",)
     assert pipeline.forward.call_args.kwargs["image"] is references
     assert pipeline.forward.call_args.kwargs["height"] == 64
+
+
+@pytest.mark.cpu_only
+def test_default_params_edit_keeps_the_reference_size():
+    pipeline = bare_pipeline()
+    with patch.object(VisualGen, "__init__", lambda self, *args, **kwargs: None):
+        vg = VisualGen.__new__(VisualGen)
+    vg.executor = MagicMock(
+        default_generation_params=pipeline.default_generation_params, extra_param_specs={}
+    )
+    params = vg.default_params
+    params.image_reference = [MediaRef(content=png_bytes(56, 40), format="bytes")]
+    req = SimpleNamespace(params=params, prepared_inputs={})
+    pipeline.prepare_request(req)
+    # default_params fills in 1024 without marking it as set, so the edit keeps the reference's size.
+    assert (params.height, params.width) == (64, 64)
+    assert req.prepared_inputs["references"].crop == (4, 12, 60, 52)
 
 
 @pytest.mark.cpu_only
