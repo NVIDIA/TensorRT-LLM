@@ -1338,10 +1338,11 @@ class DiffusionExecutor:
                 return None
             reply = SessionAdmitted(session.session_id)
             try:
+                value = message.value()
                 # The pipeline's schema check first; ``admit`` mutates nothing
                 # until its own checks have passed.
-                self.pipeline.validate_input(pipeline_state, message.name, message.value)
-                reply.advance_index = session.admit(message.name, message.value)
+                self.pipeline.validate_input(pipeline_state, message.name, value)
+                reply.advance_index = session.admit(message.name, value)
             except SessionQueueFull as e:
                 reply.error, reply.failure = str(e), AdmissionFailure.QUEUE_FULL
             except SessionEnded as e:
@@ -1349,9 +1350,9 @@ class DiffusionExecutor:
             except (ValueError, TypeError) as e:
                 reply.error, reply.failure = str(e), AdmissionFailure.INVALID
             except Exception as e:
-                # Validation is pipeline code that runs on rank 0 before anything
-                # is broadcast: whatever it raises refuses this one input.
-                logger.error(f"session input {message.name!r} failed validation: {e}")
+                # Loading the value and validating it run on rank 0 before
+                # anything is broadcast: whatever they raise refuses this one input.
+                logger.error(f"session input {message.name!r} was refused: {e}")
                 logger.error(traceback.format_exc())
                 reply.error = f"{type(e).__name__}: {e}"
                 reply.failure = AdmissionFailure.INVALID
@@ -2616,7 +2617,8 @@ class DiffusionRemoteClient:
     ) -> Future:
         """Send one value; the future resolves to the advance index or raises
         ``ValueError`` / ``SessionQueueFull`` / ``SessionEnded``. The caller must
-        hand the future to ``channel.release_submit`` when done with it."""
+        hand the future to ``channel.release_submit`` when done with it. A value
+        that cannot be pickled raises ``ValueError`` here and reserves nothing."""
         if self._worker_failure is not None:
             raise RuntimeError(self._worker_failure)
         inputs = (channel.capabilities or {}).get("inputs", [])
@@ -2637,12 +2639,16 @@ class DiffusionRemoteClient:
             # happens under the lock that retirement (close, abort) takes, so a
             # command is either seen by the retirement that follows or never
             # queued behind a close that came first.
+            try:
+                command = SessionSubmit.pack(channel.session_id, name, value)
+            except Exception as exc:
+                raise ValueError(f"input {name!r} cannot be serialized: {exc}") from exc
             with self._sessions_lock:
                 if self._worker_failure is not None:
                     raise RuntimeError(self._worker_failure)
                 if channel.closing() is not None:
                     raise SessionEnded(f"session {channel.session_id} is closed")
-                self.pending_requests.put(SessionSubmit(channel.session_id, name, value))
+                self.pending_requests.put(command)
         except BaseException:
             channel.withdraw_submit(fut)
             raise

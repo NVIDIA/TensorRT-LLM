@@ -24,6 +24,7 @@ never sees any of this.
 
 from __future__ import annotations
 
+import pickle  # nosec B403
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -86,11 +87,23 @@ class SessionOpen(SessionCommand):
 
 @dataclass
 class SessionSubmit(SessionCommand):
-    """One value for the named input. A session has at most one unanswered submit."""
+    """One value for the named input. A session has at most one unanswered submit.
+
+    The value travels serialized on its own: the command always decodes on the
+    worker, and a value the worker cannot load refuses that one input."""
 
     session_id: int
     name: str
-    value: object  # whatever the pipeline's validator accepts; opaque to the protocol
+    payload: bytes  # the pickled value: whatever the pipeline's validator accepts
+
+    @classmethod
+    def pack(cls, session_id: int, name: str, value: object) -> SessionSubmit:
+        """Raises what pickling ``value`` raises."""
+        return cls(session_id, name, pickle.dumps(value))  # nosec B301
+
+    def value(self) -> object:
+        """Raises what unpickling the value raises."""
+        return pickle.loads(self.payload)  # nosec B301
 
 
 class ControlType(Enum):

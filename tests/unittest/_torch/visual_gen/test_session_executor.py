@@ -213,6 +213,9 @@ def _make_client():
     client._controls_lock = threading.Lock()
     client._request_to_send = None
     client._worker_failure = None
+    # Read by the liveness check, which a send that would block runs.
+    client._monitor_worker_liveness = False
+    client._shutdown_started = False
     return client
 
 
@@ -471,6 +474,41 @@ def test_input_check_that_crashes_refuses_that_input_only(harness):
     assert len(pipe.advances) == 1 and pipe.closed == 1
 
 
+def _refuse_to_load():
+    raise AttributeError("Can't get attribute 'Controls' on <module '__main__'>")
+
+
+class _LoadsNowhere:
+    """Pickles, and fails to unpickle: what a class defined in the caller's
+    ``__main__`` is to a spawned worker."""
+
+    def __reduce__(self):
+        return _refuse_to_load, ()
+
+
+def test_value_the_worker_cannot_load_refuses_that_input_only(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        with h.open() as s:
+            with pytest.raises(ValueError, match="AttributeError.*Can't get attribute"):
+                s.submit("controls", _LoadsNowhere())
+            s.submit("controls", 1)
+            with s.results() as results:
+                assert not next(results).done
+    assert len(pipe.advances) == 1 and pipe.closed == 1
+
+
+def test_value_that_cannot_be_pickled_is_refused_before_anything_is_reserved(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        with h.open() as s:
+            with pytest.raises(ValueError, match="cannot be serialized"):
+                s.submit("controls", threading.Lock())
+            assert h.client._sessions[s.request_id]._submit is None
+            assert s.submit("controls", 1) == 0  # the refused value consumed no index
+    assert pipe.closed == 1
+
+
 def test_backpressure_pauses_the_worker_until_a_slot_returns(harness):
     pipe = CountingPipeline(initial=False)
     with harness(pipe, SimpleNamespace(delivery_slots=1, idle_timeout=None)) as h:
@@ -539,6 +577,7 @@ def test_finished_session_releases_the_instance_without_a_close(harness):
         terminal = next(results)  # returns that slot
         assert terminal.done and terminal.error is None
         _wait_until(lambda: pipe.closed == 1, what="the worker to end the finished session")
+        _wait_until(lambda: not h.client._sessions, what="the client to learn of it")
         with h.open() as following, following.results() as more:
             assert next(more).advance_index == 0
         assert pipe.opened == 2 and pipe.closed == 2
@@ -628,7 +667,7 @@ def test_client_send_loop_forwards_session_commands():
     client.requests_ipc = FakeRequestSocket()
     req = DiffusionRequest(request_id=7, prompt=["p"], params=SimpleNamespace())
     client.pending_requests.put(SessionOpen(req))
-    client.pending_requests.put(SessionSubmit(7, "controls", 1))
+    client.pending_requests.put(SessionSubmit.pack(7, "controls", 1))
     client._process_requests()
     client._process_requests()
     sent = client.requests_ipc.drain()
@@ -1167,12 +1206,12 @@ def _run_rank(
             pipe.after_advance = lambda: ex.controls_ipc.put_nowait(
                 SessionControl(2, ControlType.CLOSE)
             )
-            ex.requests_ipc.put_nowait(SessionSubmit(2, "controls", 1))
+            ex.requests_ipc.put_nowait(SessionSubmit.pack(2, "controls", 1))
         ex._serve_session(req)
         return
     req = _session_request()
     if rank == 0:
-        ex.requests_ipc.put_nowait(SessionSubmit(1, "controls", 1))
+        ex.requests_ipc.put_nowait(SessionSubmit.pack(1, "controls", 1))
     ex._serve_session(req)
 
 
@@ -1981,8 +2020,8 @@ def test_advance_takes_the_terminal_when_the_earlier_input_died_without_media(ha
     pipe = CountingPipeline(initial=False, fail_at=0)
     with harness(pipe) as h:
         with h.open() as s:
-            assert s.submit("controls", 1) == 0  # admitted, then the advance raises
             channel = h.client._sessions[s.request_id]
+            assert s.submit("controls", 1) == 0  # admitted, then the advance raises
             _wait_until(lambda: _terminal_next(channel), what="the error terminal")
             # No slot is out, so the worker ends the session behind the terminal;
             # the terminal is delivered either side of that, and nothing is submitted.
@@ -2984,7 +3023,11 @@ def test_control_socket_real_zmq_carries_close_while_the_request_path_is_blocked
             reader.start()
             submitter.start()
             _wait_until(lambda: h.held_payloads, what="the stuck submit")
-            s.close()  # the close travels on the real control socket
+            # The close travels on the real control socket.
+            closer = threading.Thread(target=s.close, daemon=True)
+            closer.start()
+            closer.join(timeout=30)
+            assert not closer.is_alive(), "the worker never confirmed the close"
             reader.join(timeout=10)
             submitter.join(timeout=10)
             assert isinstance(outcome.get("read"), SessionEnded)
@@ -3349,10 +3392,12 @@ def test_interrupted_advance_validation_releases_both_reservations(harness):
 
             original = executor_module.SessionSubmit
 
-            def interrupt(*args):  # between the reservation and the publication
-                raise KeyboardInterrupt
+            class Interrupted:
+                @staticmethod
+                def pack(*args):  # between the reservation and the publication
+                    raise KeyboardInterrupt
 
-            executor_module.SessionSubmit = interrupt
+            executor_module.SessionSubmit = Interrupted
             try:
                 with pytest.raises(KeyboardInterrupt):
                     s.advance(1)

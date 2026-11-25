@@ -322,7 +322,7 @@ def test_supported_input_forms_survive_the_wire_serialization():
         np.arange(6, dtype=np.float32).reshape(2, 3)[:, 1:],
     ]
     for value in forms:
-        back = pickle.loads(pickle.dumps(SessionSubmit(1, "x", value))).value
+        back = pickle.loads(pickle.dumps(SessionSubmit.pack(1, "x", value))).value()
         if isinstance(value, torch.Tensor):
             assert torch.equal(back, value)
         elif isinstance(value, np.ndarray):
