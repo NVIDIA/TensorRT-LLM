@@ -16,9 +16,8 @@
 
 Entry points registered with ``dispatch``:
 
-* ``fmha_lib``: ``SparseMlaDecodeFmha``, an FMHA library class that the
-  attention FMHA registry places ahead of the native libraries when ``sparse_mla_decode`` is
-  selected.
+* ``fmha_lib``: ``SparseMlaDecodeFmha``, the first FMHA candidate in the
+  target's list when ``sparse_mla_decode`` is enabled.
 * ``sparse_mla_decode``: the functional kernel wrapper.
 """
 
