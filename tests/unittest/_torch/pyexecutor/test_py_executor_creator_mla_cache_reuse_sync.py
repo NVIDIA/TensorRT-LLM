@@ -160,16 +160,6 @@ class _DummyKvCacheCreator:
         """No remote donation is started (no-op)."""
 
 
-class _HostTable:
-    """A module of the model holding a host-resident weight table; counts its releases."""
-
-    def __init__(self):
-        self.releases = 0
-
-    def release_host_resident_weights(self):
-        self.releases += 1
-
-
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""
 
@@ -194,7 +184,6 @@ class _DummyModelEngine:
             max_seq_len: Effective sequence length reported by the model engine.
         """
         self.warmup_purpose = None
-        self.host_table = _HostTable()
         self.attn_runtime_features = attn_runtime_features
         self.metrics = {}
         self.max_seq_len = max_seq_len
@@ -218,7 +207,6 @@ class _DummyModelEngine:
                 ),
             ),
             vocab_size_padded=32000,
-            modules=lambda: (self.host_table,),
         )
 
     def set_warmup_purpose(self, purpose):
@@ -296,8 +284,6 @@ def _run_create_py_executor(
     ctx_chunk_configs: list | None = None,
     kv_cache_creator_cls: type[_DummyKvCacheCreator] = _DummyKvCacheCreator,
     is_mla_model: bool = True,
-    executor_error: BaseException | None = None,
-    model_engines: list | None = None,
 ) -> tuple[bool, bool, bool]:
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
@@ -319,8 +305,6 @@ def _run_create_py_executor(
         ctx_chunk_configs: Optional list that receives the executor chunk config.
         kv_cache_creator_cls: Mock cache creator, including optional capacity estimation.
         is_mla_model: Whether the model uses MLA.
-        executor_error: Raised by the executor's construction (as a failed warmup raises).
-        model_engines: Optional list that receives the model engine.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
@@ -382,7 +366,7 @@ def _run_create_py_executor(
     )
 
     def _create_model_engine(**kwargs):
-        engine = _DummyModelEngine(
+        return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
             attn_backend=attn_backend,
@@ -390,9 +374,6 @@ def _run_create_py_executor(
             enable_flash_mla=enable_flash_mla,
             max_seq_len=model_max_seq_len,
         )
-        if model_engines is not None:
-            model_engines.append(engine)
-        return engine
 
     monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
 
@@ -401,8 +382,6 @@ def _run_create_py_executor(
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:
             ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
-        if executor_error is not None:
-            raise executor_error
         executor = _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
@@ -438,33 +417,6 @@ def _run_create_py_executor(
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
-
-
-@pytest.mark.parametrize("fails", [True, False], ids=["failed", "built"])
-def test_only_a_failed_construction_releases_host_resident_weights(monkeypatch, fails: bool):
-    """An error after the model engine is built (here the executor's warmup) releases the model's
-    host-resident weight tables before the error reaches the caller, whose traceback would
-    otherwise keep them, and the threads serving them, until the caller drops the error. A
-    construction that succeeds releases nothing."""
-    engines = []
-    error = RuntimeError("warmup failed") if fails else None
-    if fails:
-        with pytest.raises(RuntimeError, match="warmup failed"):
-            _run_create_py_executor(
-                monkeypatch,
-                sm_version=100,
-                kv_cache_quant_algo=QuantAlgo.NO_QUANT,
-                executor_error=error,
-                model_engines=engines,
-            )
-    else:
-        _run_create_py_executor(
-            monkeypatch,
-            sm_version=100,
-            kv_cache_quant_algo=QuantAlgo.NO_QUANT,
-            model_engines=engines,
-        )
-    assert [engine.host_table.releases for engine in engines] == [1 if fails else 0]
 
 
 @pytest.mark.parametrize("requires_encoder_features", [False, True])
@@ -575,6 +527,31 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         "model_engine_creation_seconds": 1.0,
         "total_py_executor_creation_seconds": 1.5,
     }
+
+
+def test_a_failed_construction_releases_host_resident_weights(monkeypatch) -> None:
+    """A construction that fails after building the model engine releases the model's
+    host-resident tables before the error, whose traceback keeps the model, reaches the caller."""
+    released = []
+
+    class _Table:
+        def release_host_resident_weights(self):
+            released.append(self)
+
+    table = _Table()
+
+    def _fail_after_building(**kwargs):
+        engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: [table]))
+        kwargs.get("model_engines", []).append(engine)
+        raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _fail_after_building)
+    llm_args = SimpleNamespace(
+        memory_monitor_config=None, parallel_config=SimpleNamespace(world_size=1)
+    )
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        py_executor_creator.create_py_executor(llm_args)
+    assert released == [table]
 
 
 def _dense_fp4_mla_model_config() -> SimpleNamespace:

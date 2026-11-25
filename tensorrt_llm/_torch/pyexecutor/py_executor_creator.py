@@ -770,7 +770,6 @@ def _move_model_engine_metrics(py_executor: PyExecutor,
 def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
     _startup_timer: _StartupTimer,
-    _model_engines: list[ModelEngine],
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
@@ -784,9 +783,6 @@ def _create_py_executor_impl(
 
     Args:
         llm_args: Configuration arguments for the PyTorch-based LLM executor.
-        _model_engines: Receives the model engine once it is built, so that
-            the caller can release what its model holds if the construction
-            fails afterwards.
         checkpoint_dir: Path to the model checkpoint directory. If None, uses
             the path specified in llm_args.
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
@@ -800,19 +796,47 @@ def _create_py_executor_impl(
         A fully initialized PyExecutor instance.
     """
     creation_metrics: dict[str, float] = {}
-    with timing_metric("total_py_executor_creation_seconds", creation_metrics):
-        py_executor = _create_py_executor(
-            llm_args=llm_args,
-            _startup_timer=_startup_timer,
-            model_engines=_model_engines,
-            creation_metrics=creation_metrics,
-            checkpoint_dir=checkpoint_dir,
-            tokenizer=tokenizer,
-            profiling_stage_data=profiling_stage_data,
-            resource_governor_queue=resource_governor_queue,
-        )
+    model_engines: list[ModelEngine] = []
+    try:
+        with timing_metric("total_py_executor_creation_seconds",
+                           creation_metrics):
+            py_executor = _create_py_executor(
+                llm_args=llm_args,
+                _startup_timer=_startup_timer,
+                model_engines=model_engines,
+                creation_metrics=creation_metrics,
+                checkpoint_dir=checkpoint_dir,
+                tokenizer=tokenizer,
+                profiling_stage_data=profiling_stage_data,
+                resource_governor_queue=resource_governor_queue,
+            )
+    except BaseException:
+        _release_host_resident_weights(model_engines)
+        raise
     py_executor.metrics.update(creation_metrics)
     return py_executor
+
+
+def _release_host_resident_weights(model_engines: list[ModelEngine]) -> None:
+    """Call ``release_host_resident_weights()`` on the modules of the models a
+    failed construction built: the error's traceback keeps those models alive
+    while the caller holds it, so their host-resident tables, and the threads
+    serving them to the host's other processes, would wait for that. A failure
+    here is logged; the construction error stays the one raised."""
+    try:
+        releases = [
+            module.release_host_resident_weights for engine in model_engines
+            for module in engine.model.modules()
+            if hasattr(module, "release_host_resident_weights")
+        ]
+        if releases and torch.cuda.is_available():
+            # Work the failed step queued may still read the tables.
+            torch.cuda.synchronize()
+        for release in releases:
+            release()
+    except Exception as error:  # noqa: BLE001 - logged
+        logger.error("Releasing host-resident weights after a failed executor "
+                     f"construction failed: {error!r}")
 
 
 def _create_py_executor(
@@ -1735,23 +1759,19 @@ def create_py_executor(
     On an error, a DWDP manager and a dense DWDP manager registered during the
     construction are exited, in that order; managers registered before it are
     left alone. Exiting the DWDP manager also exits the dense manager it
-    registered, so the second rollback finds a standalone one only. The
-    host-resident weight tables of the model the construction built are then
-    released (``_release_host_resident_weights``).
+    registered, so the second rollback finds a standalone one only.
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
     # The memory monitor follows one executor per process, the first one
     # alive; the others are built and served without it.
     monitor_token = _begin_monitor(llm_args)
-    model_engines: list[ModelEngine] = []
     try:
         with _monitor_startup_scope(
                 monitor_token.monitored), monitor_executor_initialization(
                 ), _StartupTimer("executor_creation") as startup_timer:
             py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
-                _model_engines=model_engines,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
                 tokenizer=tokenizer,
@@ -1779,7 +1799,6 @@ def create_py_executor(
                 logger.error(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
-        _release_host_resident_weights(model_engines)
         raise
     py_executor._memory_monitor_token = monitor_token
     if monitor_token.monitored:
@@ -1797,42 +1816,6 @@ def create_py_executor(
     # thread, or a report request answered next to the serving loop.
     monitor_pools.prime()
     return py_executor
-
-
-def _release_host_resident_weights(model_engines: list[ModelEngine]) -> None:
-    """Release the host-resident weight tables of the models a failed executor
-    construction built: ``release_host_resident_weights()`` of every module that
-    has one.
-
-    The construction error's traceback keeps the model reachable for as long as
-    the caller holds the error, so such a table, in host memory outside
-    PyTorch's allocator and possibly served to the host's other processes by
-    threads of its own, would otherwise wait for the caller to drop the error.
-    Failures here are logged: the construction error stays the one raised.
-    """
-    releases = []
-    for engine in model_engines:
-        if engine.model is None:
-            continue
-        for module in engine.model.modules():
-            release = getattr(module, "release_host_resident_weights", None)
-            if release is not None:
-                releases.append(release)
-    if not releases:
-        return
-    if torch.cuda.is_available():
-        try:
-            # Work the failed step queued may still read the tables.
-            torch.cuda.synchronize()
-        except RuntimeError as error:
-            logger.error("Synchronizing before releasing host-resident weights "
-                         f"of a failed executor construction failed: {error!r}")
-    for release in releases:
-        try:
-            release()
-        except Exception as error:  # noqa: BLE001 - logged
-            logger.error("Releasing host-resident weights of a failed executor "
-                         f"construction also failed: {error!r}")
 
 
 def _begin_monitor(llm_args: TorchLlmArgs) -> "monitor_providers.ExecutorToken":
