@@ -35,7 +35,8 @@ from . import _tp4_allreduce_fused_rms_kernel as _ar
 
 _PING_PONG = 3
 _SIGNAL_STATE = 6
-_BF16_VEC = 8
+_TWOSHOT_FLAG_REGIONS = _ar._TWOSHOT_FLAG_REGIONS
+_TWOSHOT_ROWS_PER_CTA = _ar._TWOSHOT_ROWS_PER_CTA
 # In-band readiness: bitwise bf16 -0.0 marks a slot not yet arrived, as TRT-LLM's own
 # Lamport backend does. Separate ready flags double the peer traffic.
 _NEG_ZERO_BF16 = -32768
@@ -128,7 +129,7 @@ class LamportWorkspace:
     rank: int
     world: int
     #: This rank's `[3, world, max_rows * hidden]` bf16 symmetric buffer and its
-    #: `[3, world, max_rows * hidden / 8]` int32 flags.
+    #: `[3, 2, ceil(max_rows / 4)]` int32 two-shot block-ready flags.
     buffer: torch.Tensor
     flags: torch.Tensor
     #: Every rank's buffer and flags, mapped into this rank, in rank order.
@@ -150,9 +151,10 @@ def build_workspace(
     """Bring up the group, pin the peer buffers, agree multicast, compile the kernels.
 
     Collective: every rank of the group calls it, with the same `hidden`, `eps` and
-    `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter of that
-    in int32 flags of symmetric memory per rank, and compiles four CuTe DSL kernels
-    (pure, fused, fused+quant, fused two-shot) for this rank on the current device.
+    `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus
+    `3 * 2 * ceil(max_rows / 4)` int32 two-shot ready flags of symmetric memory per
+    rank, and compiles four CuTe DSL kernels (pure, fused, fused+quant, fused two-shot)
+    for this rank on the current device.
     Launches nothing beyond the buffer fills and the one-element multicast agreement.
 
     The multicast decision is agreed across the group: a rank compiling the multicast
@@ -167,8 +169,9 @@ def build_workspace(
     buffer = symm_mem.empty((_PING_PONG, world, numel), dtype=torch.bfloat16, device=dev)
     # Every slot starts not-ready, or the first exchange reads uninitialized memory as data.
     buffer.view(torch.int16).fill_(_NEG_ZERO_BF16)
+    flag_blocks = max(1, (max_rows + _TWOSHOT_ROWS_PER_CTA - 1) // _TWOSHOT_ROWS_PER_CTA)
     flags = symm_mem.empty(
-        (_PING_PONG, world, numel // _BF16_VEC), dtype=torch.int32, device=dev
+        (_PING_PONG, _TWOSHOT_FLAG_REGIONS, flag_blocks), dtype=torch.int32, device=dev
     ).zero_()
     group = dist.group.WORLD
     name = getattr(group, "group_name", group)

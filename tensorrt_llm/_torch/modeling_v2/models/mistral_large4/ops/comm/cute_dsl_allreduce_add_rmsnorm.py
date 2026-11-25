@@ -227,12 +227,10 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
     - `build_workspace` is collective (every rank, the same arguments), runs
       outside any graph capture and compiles four CuTe DSL kernels (0.5, 0.7,
       0.6 and 1.7 s with the DSL's caches off). The peer buffers are
-      3 x world x max_rows x hidden bf16 plus a quarter of that in int32
-      flags, in symmetric memory: 1.58 GiB per rank at 9216 rows, 5.63 GiB at
-      32768, 11.25 GiB at 32768 and world 8. A first build in a process
-      measured 2.14 GiB of device memory taken at 9216 rows; a first build
-      at 32768 rows 6.18 GiB, in 4.7 s; at world 8, with the group already
-      up, 11.80 GiB in 6.6 s.
+      3 x world x max_rows x hidden bf16 plus 3 x 2 x ceil(max_rows / 4) int32
+      two-shot ready flags, in symmetric memory: 1.27 GiB per rank at 9216 rows
+      (world 4), 4.50 GiB at 32768 (world 4), 9.00 GiB at 32768 (world 8), with
+      the flags taking under 200 KiB.
     - Under MPI, every rank must bring the group up the same way:
       `ensure_process_group` takes the rendezvous address from the
       environment when `MASTER_ADDR`, `MASTER_PORT`, `RANK` and `WORLD_SIZE`

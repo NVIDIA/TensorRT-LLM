@@ -109,3 +109,57 @@ def test_mpi_nonroot_uses_broadcast_address(monkeypatch, process_group):
     process_group.assert_called_once_with(
         backend="nccl", rank=5, world_size=8, device_id=torch.device("cuda", 2)
     )
+
+
+def test_build_workspace_sizes_ready_flags_by_four_row_blocks(monkeypatch):
+    import torch.distributed._symmetric_memory as symm_mem
+
+    allocations = []
+
+    def fake_empty(shape, *, dtype, device):
+        allocations.append((tuple(shape), dtype))
+        return torch.empty(shape, dtype=dtype, device="cpu")
+
+    class _FakeHandle:
+        multicast_ptr = 0
+
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        def get_buffer(self, peer, shape, dtype):
+            assert tuple(shape) == tuple(self._tensor.shape)
+            assert dtype == self._tensor.dtype
+            return self._tensor
+
+    monkeypatch.setattr(_lamport, "ensure_process_group", lambda rank, world: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(symm_mem, "empty", fake_empty)
+    monkeypatch.setattr(symm_mem, "rendezvous", lambda tensor, group: _FakeHandle(tensor))
+    monkeypatch.setattr(
+        torch, "zeros", lambda size, dtype, device: torch.empty(size, dtype=dtype, device="cpu")
+    )
+    monkeypatch.setattr(
+        torch, "tensor", lambda data, dtype, device: torch.as_tensor(data, dtype=dtype)
+    )
+    monkeypatch.setattr(dist, "all_reduce", lambda tensor, op, group: None)
+    monkeypatch.setattr(_lamport._ar, "compile_pure_for_rank", lambda *a, **kw: "pure")
+    monkeypatch.setattr(_lamport._ar, "compile_fused_for_rank", lambda *a, **kw: "fused")
+    monkeypatch.setattr(_lamport._ar, "compile_fused_out_quant_for_rank", lambda *a, **kw: "quant")
+    monkeypatch.setattr(_lamport._ar, "compile_fused_twoshot_for_rank", lambda *a, **kw: "twoshot")
+
+    ws = _lamport.build_workspace(hidden=8, eps=1e-5, max_rows=32768, rank=0, world=8)
+    assert allocations == [
+        ((3, 8, 32768 * 8), torch.bfloat16),
+        ((3, 2, 8192), torch.int32),
+    ]
+    assert tuple(ws.flags.shape) == (3, 2, 8192)
+    assert ws.flags.numel() * ws.flags.element_size() == 192 * 1024
+    assert all(tuple(pf.shape) == (3, 2, 8192) for pf in ws.peer_flags)
+
+    allocations.clear()
+    ws_odd = _lamport.build_workspace(hidden=8, eps=1e-5, max_rows=10, rank=0, world=4)
+    assert allocations == [
+        ((3, 4, 10 * 8), torch.bfloat16),
+        ((3, 2, 3), torch.int32),
+    ]
+    assert tuple(ws_odd.flags.shape) == (3, 2, 3)

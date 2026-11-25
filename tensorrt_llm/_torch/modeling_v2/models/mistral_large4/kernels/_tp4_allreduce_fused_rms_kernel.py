@@ -2905,6 +2905,7 @@ _TWOSHOT_INPUT_REGION = 0
 _TWOSHOT_SUM_REGION = 1
 _TWOSHOT_FLAG_INPUT_READY = 0
 _TWOSHOT_FLAG_SUM_READY = 1
+_TWOSHOT_FLAG_REGIONS = 2
 _TWOSHOT_THREADS_PER_BLOCK = 256
 _TWOSHOT_THREADS_PER_BLOCK_CHOICES = (128, 192, 256, 384, 768)
 _TWOSHOT_ROWS_PER_CTA = 4
@@ -3218,8 +3219,8 @@ def _tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
 
     numel = cute.size(buffers[0], mode=[2])
     numel_i64 = cutlass.Int64(numel)
-    num_vectors = cute.size(ready_flags[0], mode=[2])
-    num_vectors_i64 = cutlass.Int64(num_vectors)
+    num_flag_blocks = cute.size(ready_flags[0], mode=[2])
+    num_flag_blocks_i64 = cutlass.Int64(num_flag_blocks)
     state_counter_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_COUNTER_INDEX)).llvm_ptr
     state_signal_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_VALUE_INDEX)).llvm_ptr
 
@@ -3245,7 +3246,9 @@ def _tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
     clear_base = cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * numel_i64
     input_region_base = ping_base + cutlass.Int64(_TWOSHOT_INPUT_REGION) * numel_i64
     sum_region_base = ping_base + cutlass.Int64(_TWOSHOT_SUM_REGION) * numel_i64
-    flag_base = cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * num_vectors_i64
+    flag_base = (
+        cutlass.Int64(ping_slot) * cutlass.Int64(_TWOSHOT_FLAG_REGIONS) * num_flag_blocks_i64
+    )
     active_vectors_i32 = (m_rows * cutlass.Int32(N)) // cutlass.Int32(_BF16_VEC_SIZE)
     if USE_DEVICE_SIGNAL_STATE:
         if tidx == 0:
@@ -3314,8 +3317,8 @@ def _tp_allreduce_residual_rms_norm_twoshot_nvls_kernel(
     group_rows = cutlass.Int32(ROWS_PER_CTA * WORLD_SIZE)
     num_groups = (m_rows + group_rows - cutlass.Int32(1)) // group_rows
     row_block_rows = cutlass.Int32(ROWS_PER_CTA)
-    flag_in_base = flag_base + cutlass.Int64(_TWOSHOT_FLAG_INPUT_READY) * num_vectors_i64
-    flag_sum_base = flag_base + cutlass.Int64(_TWOSHOT_FLAG_SUM_READY) * num_vectors_i64
+    flag_in_base = flag_base + cutlass.Int64(_TWOSHOT_FLAG_INPUT_READY) * num_flag_blocks_i64
+    flag_sum_base = flag_base + cutlass.Int64(_TWOSHOT_FLAG_SUM_READY) * num_flag_blocks_i64
 
     stage_values = cutlass.Array(
         cutlass.BFloat16,
@@ -4124,6 +4127,8 @@ def compile_pure_for_rank(
 
     workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
+    flag_regions = world_size if use_ready_flags else cute.sym_int32()
+    flag_extent = workspace_num_vectors if use_ready_flags else cute.sym_int32()
     fake_buffers = []
     fake_ready_flags = []
     for _ in range(world_size):
@@ -4136,7 +4141,7 @@ def compile_pure_for_rank(
         fake_buffers.append(buffer_tensor)
         ready_flag_tensor = make_fake_compact_tensor(
             cutlass.Int32,
-            (_PING_PONG_SIZE, world_size, workspace_num_vectors),
+            (_PING_PONG_SIZE, flag_regions, flag_extent),
             stride_order=(2, 1, 0),
             assumed_align=_READY_FLAG_ALIGNMENT_BYTES,
         )
@@ -4285,6 +4290,8 @@ def compile_fused_for_rank(
 
     workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
+    flag_regions = world_size if use_ready_flags else cute.sym_int32()
+    flag_extent = workspace_num_vectors if use_ready_flags else cute.sym_int32()
     fake_buffers = []
     fake_ready_flags = []
     for _ in range(world_size):
@@ -4297,7 +4304,7 @@ def compile_fused_for_rank(
         fake_buffers.append(buffer_tensor)
         ready_flag_tensor = make_fake_compact_tensor(
             cutlass.Int32,
-            (_PING_PONG_SIZE, world_size, workspace_num_vectors),
+            (_PING_PONG_SIZE, flag_regions, flag_extent),
             stride_order=(2, 1, 0),
             assumed_align=_READY_FLAG_ALIGNMENT_BYTES,
         )
@@ -4478,6 +4485,8 @@ def compile_fused_out_quant_for_rank(
 
     workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
     workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
+    flag_regions = world_size if use_ready_flags else cute.sym_int32()
+    flag_extent = workspace_num_vectors if use_ready_flags else cute.sym_int32()
     fake_buffers = []
     fake_ready_flags = []
     for _ in range(world_size):
@@ -4490,7 +4499,7 @@ def compile_fused_out_quant_for_rank(
         fake_buffers.append(buffer_tensor)
         ready_flag_tensor = make_fake_compact_tensor(
             cutlass.Int32,
-            (_PING_PONG_SIZE, world_size, workspace_num_vectors),
+            (_PING_PONG_SIZE, flag_regions, flag_extent),
             stride_order=(2, 1, 0),
             assumed_align=_READY_FLAG_ALIGNMENT_BYTES,
         )
@@ -4631,7 +4640,7 @@ def _compile_twoshot_common(
         assumed_align=_ALIGNMENT_BYTES,
     )
     workspace_numel = cute.sym_int32(divisibility=_BF16_VEC_SIZE)
-    workspace_num_vectors = workspace_numel // _BF16_VEC_SIZE
+    workspace_num_blocks = cute.sym_int32()
     fake_buffers = []
     fake_ready_flags = []
     for _ in range(world_size):
@@ -4646,7 +4655,7 @@ def _compile_twoshot_common(
         fake_ready_flags.append(
             make_fake_compact_tensor(
                 cutlass.Int32,
-                (_PING_PONG_SIZE, world_size, workspace_num_vectors),
+                (_PING_PONG_SIZE, _TWOSHOT_FLAG_REGIONS, workspace_num_blocks),
                 stride_order=(2, 1, 0),
                 assumed_align=_READY_FLAG_ALIGNMENT_BYTES,
             )
