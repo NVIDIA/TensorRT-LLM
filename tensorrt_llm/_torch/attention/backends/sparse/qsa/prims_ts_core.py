@@ -27,9 +27,13 @@ _PREFILL_ROUTE_BUCKET = 256
 _PREFILL_ROW_BUCKET = 64
 # Query rows (requests x query tokens per request, so MTP counts draft tokens)
 # below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
-# context, TP2): the core ties at one row, the indexer until ~32 rows.
+# context, TP2): the core ties at one row, the indexer until ~32 rows. On
+# Rubin the Triton decode scorer runs at the K-bar streaming rate and the
+# PrimTS scorer ties it at 32-64 rows and trails by 5-11% from 256 rows, so
+# decode batches stay on Triton there.
 _MIN_DECODE_ROWS = 2
 _MIN_INDEXER_DECODE_ROWS = 32
+_INDEXER_DECODE_PRIMTS_CAPABILITIES = ((10, 0), (10, 3))
 _KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
@@ -124,15 +128,23 @@ def use_prims_ts_indexer(
 
     Follows ``sparse_core_backend`` unless ``indexer_backend`` is set:
     ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
-    when the device and inputs qualify and decode batches are large enough.
+    when the device and inputs qualify and decode batches are large enough on
+    a part where the PrimTS scorer wins them.
     """
     backend = params.indexer_backend
     if backend == "follow":
         backend = params.sparse_core_backend
     if backend == "triton":
         return False
-    if backend == "auto" and is_decode and q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
-        return False
+    if backend == "auto" and is_decode:
+        if q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
+            return False
+        if (
+            q.is_cuda
+            and torch.cuda.get_device_capability(q.device)
+            not in _INDEXER_DECODE_PRIMTS_CAPABILITIES
+        ):
+            return False
     reason = None
     if not q.is_cuda:
         reason = "requires CUDA tensors"
@@ -209,13 +221,24 @@ def slice_request_boundaries(cu_seq_lens: list[int], start: int, end: int) -> tu
 
 
 def _run_abi(run_args) -> tuple:
-    return tuple((name, tuple(t.shape), tuple(t.stride()), t.dtype) for name, t in run_args)
+    return tuple(
+        (name, tuple(t.shape), tuple(t.stride()), t.dtype, t.device, t.data_ptr() % 16)
+        for name, t in run_args
+    )
+
+
+class _Plan:
+    __slots__ = ("wrapper", "abi")
+
+    def __init__(self, wrapper) -> None:
+        self.wrapper = wrapper
+        # Run ABI of the last validated launch; None until one succeeds.
+        self.abi: tuple | None = None
 
 
 class _PrimsTSSparseCore:
     def __init__(self) -> None:
-        self._plans: dict[tuple, object] = {}
-        self._last_abi: dict[tuple, tuple] = {}
+        self._plans: dict[tuple, _Plan] = {}
         self._workspace: torch.Tensor | None = None
         # Graphs captured before a growth keep the old buffer's address.
         self._retired_workspaces: list[torch.Tensor] = []
@@ -306,6 +329,8 @@ class _PrimsTSSparseCore:
         if is_decode:
             if seq_lens is None:
                 raise ValueError("QSA PrimTS decode needs per-request seq_lens")
+            if request_indices is not None or query_positions is not None:
+                raise ValueError("QSA PrimTS decode derives request metadata from seq_lens")
             num_requests = seq_lens.numel()
             if rows % num_requests:
                 raise ValueError(
@@ -322,6 +347,8 @@ class _PrimsTSSparseCore:
         else:
             if request_indices is None or query_positions is None:
                 raise ValueError("QSA PrimTS prefill needs request_indices and query_positions")
+            if seq_lens is not None:
+                raise ValueError("QSA PrimTS prefill takes per-row metadata, not seq_lens")
             request_indices = request_indices.to(torch.int32).contiguous()
             padded_rows = -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
             if padded_rows != rows:
@@ -374,8 +401,8 @@ class _PrimsTSSparseCore:
                 (padded_rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device
             )
         with self._lock:
-            wrapper = self._plans.get(key)
-            if wrapper is None:
+            plan = self._plans.get(key)
+            if plan is None:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("QSA PrimTS plan must be prepared before CUDA-graph capture")
                 nbytes = workspace_size(
@@ -410,16 +437,24 @@ class _PrimsTSSparseCore:
                     kv_dtype=k_cache.dtype,
                     out_dtype=out_dtype,
                 )
-                self._plans[key] = wrapper
+                plan = self._plans[key] = _Plan(wrapper)
+            wrapper = plan.wrapper
             run_out = out.view_as(route_q) if is_decode else out
             run_args = (
                 ("q", route_q),
-                ("block_ids", block_ids),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
                 ("block_table", block_table),
+                ("block_ids", block_ids),
                 *metadata_args,
+                *((("qo_indptr", qo_indptr),) if qo_indptr is not None else ()),
                 ("out", run_out),
             )
+            abi = _run_abi(run_args)
             try:
+                # The wrapper's per-call validation costs host time. It covers
+                # the same tensors as abi, so a repeat of the ABI this wrapper
+                # last validated can skip it.
                 wrapper.run(
                     route_q,
                     (k_cache, v_cache),
@@ -431,17 +466,19 @@ class _PrimsTSSparseCore:
                     qo_indptr=qo_indptr,
                     sm_scale=softmax_scale,
                     out=run_out,
+                    validate=plan.abi != abi,
                 )
             except RuntimeError as error:
-                previous = self._last_abi.get(key)
-                changed = (
-                    [(a, b) for a, b in zip(previous, _run_abi(run_args)) if a != b]
-                    if previous
-                    else [("no eager run for this plan key", None)]
-                )
-                raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
-            if key not in self._last_abi:
-                self._last_abi[key] = _run_abi(run_args)
+                previous, plan.abi = plan.abi, None
+                if previous is None:
+                    detail = "no validated run for this plan"
+                elif previous == abi:
+                    detail = "validation skipped for an unchanged ABI"
+                else:
+                    changed = [(a, b) for a, b in zip(previous, abi) if a != b]
+                    detail = f"ABI changes vs the last validated run: {changed}"
+                raise RuntimeError(f"{error}; {detail}") from error
+            plan.abi = abi
         if result is None:
             return out[:rows]
         if result is not out:

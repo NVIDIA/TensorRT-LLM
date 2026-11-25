@@ -164,6 +164,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 layout.index_topk,
                 num_sms,
                 num_owners=len(owners),
+                attention_dp=mapping is not None and mapping.enable_attention_dp,
             )
 
         # Eager arenas grow to a power-of-two page capacity. The graph arena

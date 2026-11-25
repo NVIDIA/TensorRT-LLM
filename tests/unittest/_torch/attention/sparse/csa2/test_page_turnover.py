@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """KV cache v2 page turnover on the DeepSeek-V4.1 CSA2 layout.
 
-Admits and retires generation requests in shuffled order, with and without prefix reuse, and
-checks that every live request keeps exactly the pages it was given and that the pool and host
-memory return to their baseline.
+Admits and retires generation requests in shuffled order, with and without a live CTX
+publisher for prefix reuse, and checks that every live request keeps exactly the pages it was
+given and that the pool and host memory return to their baseline.
 """
 
 import ctypes
@@ -15,7 +15,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
@@ -86,21 +86,34 @@ def _manager(block_reuse: bool) -> CSA2CacheManager:
     )
 
 
-def _gen_init(manager: CSA2CacheManager, request_id: int, tokens: list[int]) -> LlmRequest:
+def _admit(
+    manager: CSA2CacheManager, request_id: int, tokens: list[int], *, context: bool = False
+) -> LlmRequest:
     request = LlmRequest(
         request_id=request_id,
         max_new_tokens=64,
         input_tokens=tokens,
         sampling_config=SamplingConfig(),
         is_streaming=False,
+        llm_request_type=(
+            LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+            if context
+            else LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+        ),
     )
-    request.state = LlmRequestState.DISAGG_GENERATION_INIT
-    assert manager.prepare_disagg_gen_init(request)
+    if context:
+        assert manager.prepare_context(request)
+        # This allocation-only test models completed prefill before publishing its pages.
+        assert manager.kv_cache_map[request_id].resize(len(tokens), len(tokens))
+    else:
+        request.state = LlmRequestState.DISAGG_GENERATION_INIT
+        assert manager.prepare_disagg_gen_init(request)
     return request
 
 
 def _publish_prompt(manager: CSA2CacheManager, request: LlmRequest) -> None:
-    """Commit the received prompt for reuse, as the GEN worker does after its transfer."""
+    """Publish a locally computed prompt; received Encoder pages must not be republished."""
+    assert request.is_context_only_request
     request.context_current_position = request.prompt_len
     manager.try_commit_blocks(request)
     assert manager.kv_cache_map[request.py_request_id].num_committed_tokens > 0
@@ -139,9 +152,14 @@ def _free(manager: CSA2CacheManager) -> list[int]:
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("block_reuse", [False, True], ids=["gen", "prefix_reuse"])
-def test_shuffled_turnover_keeps_pages_and_returns_to_baseline(block_reuse: bool) -> None:
+def test_shuffled_turnover_keeps_pages_and_returns_to_baseline(
+    monkeypatch, block_reuse: bool
+) -> None:
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
     rng = random.Random(7)
     manager = _manager(block_reuse)
+    assert manager._encoder_replay_enabled
     shared_prefix = list(range(1000, 1000 + PREFIX_BLOCKS * TOKENS_PER_BLOCK))
     shared_blocks = PREFIX_BLOCKS if block_reuse else 0
     live: dict[int, list[list[int]]] = {}
@@ -156,15 +174,25 @@ def test_shuffled_turnover_keeps_pages_and_returns_to_baseline(block_reuse: bool
                 length = rng.randint(64, 400) * TOKENS_PER_BLOCK + rng.randint(0, TOKENS_PER_BLOCK)
                 tail = [rng.randint(2, 120000) for _ in range(length)]
                 tokens = shared_prefix + tail if block_reuse else tail
-                requests[next_id] = _gen_init(manager, next_id, tokens)
+                requests[next_id] = _admit(
+                    manager, next_id, tokens, context=block_reuse and not live
+                )
                 live[next_id] = _tables(manager, next_id)
                 next_id += 1
             if block_reuse:
+                receiver = requests[max(live)]
+                cache = manager.kv_cache_map[receiver.py_request_id]
+                committed = cache.num_committed_tokens
+                receiver.context_current_position = receiver.prompt_len
+                manager.try_commit_blocks(receiver)
+                manager.try_commit_generation_blocks(receiver)
+                assert cache.num_committed_tokens == committed
+                del receiver, cache
                 # A later request reuses the prefix a live one published; the shuffled release
                 # below frees the publisher before or after it.
                 _publish_prompt(manager, requests[min(live)])
                 tail = [rng.randint(2, 120000) for _ in range(300)]
-                requests[next_id] = _gen_init(manager, next_id, shared_prefix + tail)
+                requests[next_id] = _admit(manager, next_id, shared_prefix + tail)
                 assert manager.kv_cache_map[next_id].num_committed_tokens > 0
                 live[next_id] = _tables(manager, next_id)
                 next_id += 1

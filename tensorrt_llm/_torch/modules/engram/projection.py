@@ -87,8 +87,8 @@ class EngramFp8Projection(Linear):
             isinstance(method, MXFP8LinearMethod)
             and method.use_cutlass
             and method.backend == "trtllm"
-            # The packed GEMM is validated on SM103 only.
-            and torch.cuda.get_device_capability() == (10, 3)
+            # The packed GEMM is validated on SM103 and SM107.
+            and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
         )
 
     def forward_packed(self, packed: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

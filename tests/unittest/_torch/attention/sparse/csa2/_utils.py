@@ -19,10 +19,13 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     INDEX_PAGE_ROWS,
     gather_rows,
     pack_index_queries_split,
+    pack_rows,
     row_bytes,
     store_index_rows,
     store_rows,
+    write_packed_index_rows,
 )
+from tensorrt_llm.mapping import Mapping
 
 
 def _index_pages(rows: int, device="cpu") -> torch.Tensor:
@@ -427,3 +430,120 @@ class _FakeMetadata:
         self.csa2_positions = torch.cat(
             [torch.arange(s, s + n) for s, n in zip(starts.tolist(), lengths)]
         )
+
+
+# Paged decode batches of a candidate source and its consumer: requests, 128-position pages each.
+_DECODE_REQUESTS = 20
+_DECODE_PAGES = 192
+
+
+class _PagedIndexOwner:
+    """The source's GLOBAL index rows in native 64-row pages, one 128-position page per entry."""
+
+    tokens_per_block = 128
+
+    def __init__(self, layout, rows, draft):
+        self.layout = layout
+        self.max_total_draft_tokens = draft
+        pages = -(-rows.shape[0] // 64)
+        storage = torch.zeros(pages * 64 * 68, dtype=torch.uint8, device=rows.device)
+        write_packed_index_rows(storage, torch.arange(rows.shape[0], device=rows.device), rows)
+        self.pages = storage.view(pages, 64, 1, 68)
+
+    def get_index_pages(self, layer):
+        return self.pages
+
+    def batch_page_table_key(self, spec):
+        return spec
+
+    def index_pages_per_global_page(self, layer):
+        return self.tokens_per_block // 64
+
+
+def _paged_decode_batch(next_n, starts, width=_DECODE_PAGES * _PagedIndexOwner.tokens_per_block):
+    """Decode rows of ``next_n`` queries per request over a candidate source's paged index rows, at most
+    ``width`` positions: the first request reaches ``width``, the next ones start at ``starts``, the rest
+    at random."""
+    page = _PagedIndexOwner.tokens_per_block
+    rows = _DECODE_REQUESTS * next_n
+    layout = CSA2Layout(
+        (1, 1), (0,), (0, 1), 0, candidate_topk_blocks=2048, candidate_block_size=8, index_topk=512
+    )
+    keys = pack_rows(
+        torch.randn(
+            _DECODE_REQUESTS * _DECODE_PAGES * page, 128, device="cuda", dtype=torch.bfloat16
+        ),
+        "index",
+    )
+    owner = _PagedIndexOwner(layout, keys, next_n - 1)
+    lengths = torch.randint(700, width - next_n, (_DECODE_REQUESTS,)).tolist()
+    lengths[: 1 + len(starts)] = [width - next_n, *starts]
+    table = (
+        torch.randperm(_DECODE_REQUESTS * _DECODE_PAGES, device="cuda")
+        .view(_DECODE_REQUESTS, _DECODE_PAGES)
+        .int()
+    )
+    visible = torch.tensor(
+        [start + t + 1 for start in lengths for t in range(next_n)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    metadata = CSA2TrtllmMetadata(max_num_requests=_DECODE_REQUESTS, max_num_tokens=rows)
+    metadata.kv_cache_manager = owner
+    metadata.mapping = Mapping()
+    metadata.is_cuda_graph = True
+    metadata.csa2_kv_sources = {0: 0, 1: 0}
+    metadata.csa2_num_context_requests = 0
+    metadata.csa2_request_query_ranges = [
+        (r * next_n, (r + 1) * next_n) for r in range(_DECODE_REQUESTS)
+    ]
+    metadata.csa2_request_start_positions = lengths
+    metadata.csa2_request_lengths = [next_n] * _DECODE_REQUESTS
+    metadata.csa2_global_max_positions = {0: width}
+    metadata.csa2_global_page_sizes = {0: page}
+    metadata.csa2_global_page_tables = {0: table}
+    metadata.csa2_visible_lengths = {0: visible, 1: visible}
+    requests = torch.arange(_DECODE_REQUESTS, device="cuda").repeat_interleave(next_n)
+    metadata.csa2_token_requests = requests
+    metadata.csa2_decode_row_requests = requests.int()
+    metadata.csa2_indices = {}
+    metadata.csa2_candidates = {}
+    metadata.csa2_candidate_blocks = {}
+    metadata.csa2_candidate_counts = {}
+    metadata.indexer_max_chunk_size = 16
+    metadata.indexer_q_split_threshold = -1
+    _plan_indexer(metadata)
+    q = torch.randn(rows, 32, 128, device="cuda", dtype=torch.bfloat16)
+    state = CSA2ForwardState(
+        metadata=metadata,
+        swa_kv=torch.zeros(rows, 512, device="cuda", dtype=torch.bfloat16),
+        index_q=q,
+        index_weights=torch.rand(rows, 32, device="cuda") / 32,
+    )
+    return SimpleNamespace(
+        next_n=next_n,
+        rows=rows,
+        width=width,
+        layout=layout,
+        metadata=metadata,
+        state=state,
+        q=q,
+        visible=visible,
+        table=table,
+    )
+
+
+def _replay_paged_decode(batch, graph, check):
+    """Replay ``graph`` three times over shrinking visibilities, new page holes and negated
+    queries of ``batch``, calling ``check()`` after each replay."""
+    for step in range(3):
+        # A request's rows keep consecutive visibilities.
+        shrink = torch.randint(0, 600, (_DECODE_REQUESTS,), device="cuda", dtype=torch.int32)
+        batch.visible.sub_(shrink.repeat_interleave(batch.next_n)).clamp_(min=1)
+        holes = torch.rand(batch.table.shape, device="cuda") < 0.05 * step
+        holes[:, -1] = False
+        batch.table.masked_fill_(holes, -1)
+        batch.q.neg_()
+        graph.replay()
+        torch.cuda.synchronize()
+        check()

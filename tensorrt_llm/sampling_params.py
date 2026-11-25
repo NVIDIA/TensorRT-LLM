@@ -19,7 +19,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields, make_dataclass
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import torch
 from pydantic import BaseModel
@@ -107,6 +107,10 @@ class LogprobMode(StrEnum):
     RAW = "raw"
     """
     Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    For single-beam requests, they exclude the embedding bias, the repetition, presence and frequency penalties, the
+    token bans (bad words, no-repeat n-grams and min_length), temperature, and top-k/top-p. Guided decoding and
+    logits processors still apply. Requests with a beam width above 1 return the log probabilities recorded in
+    their beam search history, so these exclusions do not apply to them.
     """
     PROCESSED = "processed"
     """
@@ -182,6 +186,9 @@ class BatchedLogitsProcessor(ABC):
         pass  # noqa
 
 
+EmbeddingBias: TypeAlias = tuple[tuple[int, float], ...]
+
+
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
@@ -204,7 +211,10 @@ class SamplingParams:
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
-        embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
+        embedding_bias (EmbeddingBias, torch.Tensor, List[float], optional): The embedding bias tensor in dense or sparse representation.
+            Dense representations can be torch.Tensor (float32 dtype, shape (vocab_size,)) or list of length vocab_size.
+            Sparse representation is a tuple of (vocabulary index, bias value) pairs. The behavior for repeated indices is undefined.
+            Defaults to None.
         logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
             If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
@@ -292,7 +302,7 @@ class SamplingParams:
     include_stop_str_in_output: bool = False
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
-    embedding_bias: Optional[torch.Tensor] = None
+    embedding_bias: Optional[Union[EmbeddingBias, torch.Tensor, List[float]]] = None
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
@@ -372,12 +382,6 @@ class SamplingParams:
 
         self.best_of = self.best_of or self.n
 
-        if self.embedding_bias is not None:
-            if isinstance(self.embedding_bias, torch.Tensor):
-                self.embedding_bias = self.embedding_bias.detach().clone()
-            else:
-                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
-
         self._validate()
 
     def __reduce_ex__(self, protocol):
@@ -438,6 +442,14 @@ class SamplingParams:
                 f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
                 f"under the greedy decoding."
             )
+
+        # An empty stop string tokenizes to no tokens, and the sampler rejects a
+        # stop word without tokens while setting up the request, which fails
+        # every request in flight with it instead of just this one.
+        if self.stop is not None:
+            stop_strings = [self.stop] if isinstance(self.stop, str) else self.stop
+            if any(stop_string == "" for stop_string in stop_strings):
+                raise ValueError("stop must not contain an empty string")
 
         self.logprobs_mode = LogprobMode(self.logprobs_mode)
 

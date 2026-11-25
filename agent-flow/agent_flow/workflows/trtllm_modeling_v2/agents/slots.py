@@ -4,10 +4,10 @@
 """A shared agent-turn cap, acquired by ``Workflow._run_turn``.
 
 Priority is explicit (:func:`turn_priority`): planner, critical-path tasks,
-required tasks, side work, then background tune turns. The planner alone may
-use the reserved slot; its occupancy there does not reduce task capacity.
-Side and background turns use capacity left idle by foreground work, but a
-side turn waiting ``side_max_wait_s`` may take the next unreserved slot.
+required tasks, then side work. The planner alone may use the reserved slot;
+its occupancy there does not reduce task capacity. Side turns use capacity
+left idle by required work, but a side turn waiting ``side_max_wait_s`` may
+take the next unreserved slot.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ class Priority(enum.IntEnum):
     CRITICAL = 1
     REQUIRED = 2
     SIDE = 3
-    BACKGROUND = 4
 
 
 _local = threading.local()
@@ -55,9 +54,9 @@ def run_at(priority: Priority, fn: Callable[..., object], *args: object) -> obje
         return fn(*args)
 
 
-#: How often a background turn waiting for idle capacity looks again; the
-#: foreground's demand changes without anyone telling the gate.
-_BACKGROUND_POLL_S = 5.0
+#: How often a side turn waiting for idle capacity looks again; the required
+#: work's demand changes without anyone telling the gate.
+_SIDE_POLL_S = 5.0
 #: How long a side turn waits for idle slots before it takes the next one free.
 SIDE_MAX_WAIT_S = 20 * 60.0
 
@@ -65,22 +64,19 @@ SIDE_MAX_WAIT_S = 20 * 60.0
 class AgentGate:
     """At most ``capacity`` turns at once, granted by :class:`Priority`.
 
-    ``background_limit`` says how many background turns may run now: the
-    slots the open foreground work leaves idle (no limit when not given).
-    ``side_limit`` says the same of side turns, which take a slot anyway once
-    they have waited ``side_max_wait_s``.
+    ``side_limit`` says how many side turns may run now: the slots the open
+    required work leaves idle (no limit when not given). A side turn takes a
+    slot anyway once it has waited ``side_max_wait_s``.
     """
 
     def __init__(
         self,
         capacity: int,
-        background_limit: Callable[[], int] | None = None,
         side_limit: Callable[[], int] | None = None,
         side_max_wait_s: float = SIDE_MAX_WAIT_S,
     ) -> None:
         self.capacity = max(1, capacity)
         self.reserve = min(1, self.capacity - 1)
-        self.background_limit = background_limit
         self.side_limit = side_limit
         self.side_max_wait_s = side_max_wait_s
         self._active: dict[Priority, int] = {p: 0 for p in Priority}
@@ -102,8 +98,6 @@ class AgentGate:
             return False
         if any(self._waiting[p] for p in Priority if p < priority):
             return False
-        if priority == Priority.BACKGROUND and self.background_limit is not None:
-            return self._active[Priority.BACKGROUND] < max(0, self.background_limit())
         if (
             priority == Priority.SIDE
             and self.side_limit is not None
@@ -116,8 +110,7 @@ class AgentGate:
     def slot(self, priority: Priority | None = None) -> Iterator[None]:
         """Hold a slot for one turn, at ``priority`` or the thread's (:func:`turn_priority`)."""
         priority = current_priority() if priority is None else priority
-        polled = priority in (Priority.BACKGROUND, Priority.SIDE)
-        poll = _BACKGROUND_POLL_S if polled else None
+        poll = _SIDE_POLL_S if priority == Priority.SIDE else None
         since = time.monotonic()
         with self._cond:
             self._waiting[priority] += 1

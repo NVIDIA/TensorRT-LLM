@@ -11,8 +11,8 @@ collected entry point is ``test_modeling_v2_kimi_k3_decode_comm_tp16_moetp16ep1_
 
 The checks are ``_kimi_k3_decode_comm_checks.py`` of the family test directory, at the steps this target serves: it
 decodes without speculation, so no step has more than one token per generation request (no DSpark verify, no wide
-step), and no layer is tapped (the MoE tail tap check is left out). Its MoE decode path (route B, ``decode_moe.py``
-with the k3_moe_m1 / k3_moe_m2 engines) has its own matrix, ``_kimi_k3_route_b_decode_moe_op_matrix.py``.
+step), and no layer is tapped (the MoE tail tap check is left out). Its MoE decode path (``decode_moe.py``
+with the k3_moe_m1 / k3_moe_m2 engines) has its own matrix, ``_kimi_k3_decode_moe_tp16_moetp16ep1_op_matrix.py``.
 """
 
 import sys

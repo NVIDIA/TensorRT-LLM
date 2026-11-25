@@ -31,7 +31,7 @@ def get_sparse_attn_kv_cache_manager(
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from .rocket import RocketKVCacheManager
+    from .rocket import RocketKVCacheManager, RocketKVCacheManagerV2
 
     if getattr(sparse_attention_config, "uses_dense_kv_cache", False):
         # The algorithm keeps the dense KV cache. get_kv_cache_manager_cls
@@ -43,7 +43,7 @@ def get_sparse_attn_kv_cache_manager(
 
         return CSA2CacheManager
     if sparse_attention_config.algorithm == "rocket":
-        return RocketKVCacheManager
+        return RocketKVCacheManagerV2 if use_kv_cache_manager_v2 else RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":

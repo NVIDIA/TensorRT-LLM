@@ -12,7 +12,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..infra.compute.commands import CommandResult
 from ..infra.git import git_output
-from .runtime_evidence import describe_engine
 
 #: What a gate records when it could not ask git anything — no repository, no
 #: ``git`` on the host, no commits yet. Never an exception: a gate adjudicates
@@ -98,11 +97,6 @@ class GateResult:
     #: verdict about the target: the workflow re-runs the gate once a session
     #: is back instead of recording it or handing it to the assembler.
     infrastructure: str = ""
-    #: One record per engine the gate built (:meth:`EngineAttestation.record`):
-    #: the configuration it ran against the declared one, the pools it sized
-    #: and the device memory it left free. Empty for a gate that built none.
-    #: Not hashed: the records are mappings.
-    engine: tuple[Mapping[str, Any], ...] = field(default=(), hash=False)
 
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
@@ -110,7 +104,6 @@ class GateResult:
         label = f"{self.name}@{self.member}" if self.member else self.name
         tree = f" [tree {self.tree_state}]"
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
-        breakdown += describe_engine(self.engine)
         if self.warnings:
             breakdown += "".join(f" [WARNING: {w}]" for w in self.warnings)
         why = f" -- {self.detail}" if self.detail and (self.explained or not self.passed) else ""
