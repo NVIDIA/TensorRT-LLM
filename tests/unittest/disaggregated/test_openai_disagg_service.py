@@ -1226,6 +1226,73 @@ async def test_a_reply_the_context_phase_finishes_after_a_retry_carries_the_new_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ctx_retries_first", [False, True], ids=["gen_first", "ctx_retry_first"])
+async def test_gen_first_surviving_reply_and_metrics_keep_initial_id_across_ctx_retry(
+    monkeypatch, ctx_retries_first
+):
+    """A retried CTX leg that fails in gen-first mode cannot shift the reply's metrics id."""
+    from tensorrt_llm.serve.openai_disagg_server import RawRequestResponseHooks
+
+    gen_done = asyncio.Event()
+    ctx_retried = asyncio.Event()
+
+    async def ctx_worker(request, *_args, hooks=None, **_kwargs):
+        if not ctx_retries_first:
+            await gen_done.wait()
+        # Simulate OpenAIHttpClient re-issuing disagg_request_id on CTX retry
+        # and delivering perf metrics headers from that failed retry attempt.
+        request.disaggregated_params.disagg_request_id = 202
+        if hooks:
+            hooks.on_disagg_request_id(202)
+            hooks.on_perf_metrics(
+                "ctx:9000",
+                "ctx",
+                {"request_id": "202", "phases": {"ctx": {"timing_metrics": {"e2e": 1.0}}}},
+            )
+        ctx_retried.set()
+        raise RuntimeError("retried CTX failure")
+
+    async def gen_worker(request, *_args, hooks=None, **_kwargs):
+        if ctx_retries_first:
+            await ctx_retried.wait()
+        response = await _generation_worker_answer(request)
+        if hooks:
+            hooks.on_perf_metrics(
+                "gen:9001",
+                "gen",
+                {"request_id": "101", "phases": {"gen": {"timing_metrics": {"e2e": 0.5}}}},
+            )
+            hooks.on_first_token("gen:9001", request, response)
+            hooks.on_resp_done("gen:9001", request, response)
+        gen_done.set()
+        return response
+
+    service = _service_with_disagg_request_id_101(
+        monkeypatch, "generation_first", gen_worker, ctx_worker
+    )
+    raw_req = SimpleNamespace(
+        state=SimpleNamespace(server_arrival_time=0.0, perf_metrics_records=[])
+    )
+    hooks = RawRequestResponseHooks(raw_req, mock.Mock(), collect_perf_metrics=True)
+
+    with mock.patch("tensorrt_llm.serve.openai_disagg_service.logger.warning"):
+        reply = await service.openai_responses(
+            ResponsesRequest(model="test-model", input="hello"), hooks=hooks
+        )
+
+    assert re.fullmatch(r"resp_101_[0-9a-f]{16}", reply.id)
+    assert hooks.disagg_request_id == 101
+    assert hooks.request_id == "101"
+    assert raw_req.state.disagg_request_id == 101
+    assert len(raw_req.state.perf_metrics_records) == 1
+    record = raw_req.state.perf_metrics_records[0]
+    assert record["disagg_request_id"] == 101
+    assert record["request_id"] == "101"
+    assert "ctx" not in record["phases"]
+    assert record["phases"]["gen"]["request_id"] == "101"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
 async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
     """Only a context-first GEN request carries orig_elapsed_s."""

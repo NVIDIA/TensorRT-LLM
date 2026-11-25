@@ -133,6 +133,64 @@ def _name_responses_reply(request: UCompletionRequest, disagg_request_id: int) -
     )
 
 
+class _PinnedDisaggIdHooks(ResponseHooks):
+    """Forward hooks to ``inner`` while keeping the request's correlation id pinned.
+
+    In generation-first mode, GEN runs under the initial disaggregated request
+    id (and names any Responses reply after it). If the concurrent CTX leg
+    retries with a new id, both the new id notification and any perf metrics
+    from that retried attempt are ignored so the surviving GEN reply and its
+    recorded metrics stay correlated under the initial id.
+    """
+
+    def __init__(self, inner: ResponseHooks, disagg_request_id: int) -> None:
+        self._inner = inner
+        self._disagg_request_id = disagg_request_id
+        self._id_shifted = False
+
+    def on_req_begin(self, request: UCompletionRequest):
+        return self._inner.on_req_begin(request)
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        if disagg_request_id != self._disagg_request_id:
+            self._id_shifted = True
+        return None
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        return self._inner.on_ctx_dispatch(request)
+
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        if self._id_shifted or metrics.get("request_id") not in (
+            None,
+            "",
+            str(self._disagg_request_id),
+        ):
+            return None
+        return self._inner.on_perf_metrics(server, role, metrics)
+
+    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
+        return self._inner.on_ctx_resp(ctx_server, response)
+
+    def on_first_token(
+        self,
+        gen_server: str,
+        request: UCompletionRequest,
+        response: UCompletionResponse = None,
+    ):
+        return self._inner.on_first_token(gen_server, request, response)
+
+    def on_resp_done(
+        self,
+        gen_server: str,
+        request: UCompletionRequest,
+        response: UCompletionResponse = None,
+    ):
+        return self._inner.on_resp_done(gen_server, request, response)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
 class _SseErrorObserver:
     """Observe worker error events without changing the forwarded SSE bytes."""
 
@@ -728,6 +786,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
             )
 
+        ctx_hooks = _PinnedDisaggIdHooks(hooks, disagg_request_id) if hooks is not None else None
         if request.stream:
             # For streaming gen_first requests, the gen client returns a lazy
             # async generator whose HTTP POST only fires when iterated. The ctx
@@ -768,7 +827,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 self._ctx_client.send_request(
                     ctx_req,
                     server=ctx_server,
-                    hooks=hooks,
+                    hooks=ctx_hooks,
                     req_id=disagg_request_id,
                 )
             )
@@ -829,7 +888,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         else:
             ctx_task = asyncio.create_task(
                 self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                    ctx_req, server=ctx_server, hooks=ctx_hooks, req_id=disagg_request_id
                 )
             )
             gen_task = asyncio.create_task(
