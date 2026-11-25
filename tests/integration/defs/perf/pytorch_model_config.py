@@ -96,35 +96,52 @@ def get_perf_config_preset(selection: str) -> dict:
         config = _load_curated_config(name)
 
     boolean_fields = ('print_iter_log', 'enable_attention_dp',
-                      'enable_chunked_prefill', 'disable_overlap_scheduler')
+                      'enable_chunked_prefill', 'disable_overlap_scheduler',
+                      'disable_mm_encoder')
     integer_fields = ('max_seq_len', 'stream_interval',
                       'num_postprocess_workers', 'max_draft_len', 'block_size',
-                      'periodic_snapshot_interval')
+                      'periodic_snapshot_interval',
+                      'cuda_graph_config.max_batch_size',
+                      'num_nextn_predict_layers')
     for override in overrides:
         field, _, value = override.partition('=')
         if value == 'default' and field in config:
             del config[field]
-        elif field in boolean_fields and value in ('true', 'false'):
-            config[field] = value == 'true'
-        elif field == 'decoding_type' and value == 'DSpark':
-            config.setdefault('speculative_config', {})[field] = value
+            continue
+        if field in boolean_fields and value in ('true', 'false'):
+            parsed = value == 'true'
         elif (field in integer_fields and value.isascii() and value.isdecimal()
               and (int(value) > 0 or field == 'num_postprocess_workers')):
-            target = config
-            if field in ('max_draft_len', 'block_size'):
-                target = config.setdefault('speculative_config', {})
-            elif field == 'periodic_snapshot_interval':
-                target = config.setdefault('kv_cache_config', {}).setdefault(
-                    'mamba_state_config', {})
-            target[field] = int(value)
+            parsed = int(value)
+        elif field == 'decoding_type' and value in ('MTP', 'DSpark'):
+            parsed = value
+        elif field == 'kv_cache_config.mamba_ssm_cache_dtype' and value in (
+                'auto', 'float16', 'bfloat16', 'float32'):
+            parsed = value
         else:
             raise ValueError(f"Invalid override {override!r} in {selection!r}")
+
+        if field in ('decoding_type', 'max_draft_len', 'block_size',
+                     'num_nextn_predict_layers'):
+            field = f'speculative_config.{field}'
+        elif field == 'periodic_snapshot_interval':
+            field = 'kv_cache_config.mamba_state_config.periodic_snapshot_interval'
+        *parents, key = field.split('.')
+        target = config
+        for parent in parents:
+            target = target.setdefault(parent, {})
+        target[key] = parsed
     return config
 
 
 _DEEPSEEK_PRO_DSPARK = {
     'deepseek_v4_pro_dspark', 'deepseek_v4_pro_nvfp4_dspark'
 }
+_DSPARK_DRAFTS = {
+    model: MODEL_PATH_DICT[model]
+    for model in _DEEPSEEK_PRO_DSPARK
+}
+_DSPARK_DRAFTS['minimax_m3.1_flash_nvfp4_dspark'] = 'MiniMax-M3.1-Flash/dspark'
 _EAGLE3_DRAFTS = {
     'qwen3_235b_a22b_fp4_eagle3': 'Qwen3/qwen3-235B-eagle3',
     'gpt_oss_120b_eagle3': 'gpt_oss/gpt-oss-120b-Eagle3',
@@ -139,9 +156,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         recursive_update(config, overrides)
 
     model, _, case = label.partition('-')
-
-    if model == 'muse_spark_open_nvfp4' and case.startswith('serve-pytorch'):
-        update(disable_mm_encoder=True)
 
     if 'deepseek_v41_flash_nvfp4' in label:
         update(
@@ -182,19 +196,12 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config={'dtype': 'fp8'},
                speculative_config=_speculative('DSpark', 3, block_size=3))
 
-    if 'qwen3.8_max_fp4_mtp-serve-pytorch' in label:
-        update(max_seq_len=8192,
-               cuda_graph_config={'max_batch_size': 32},
-               kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
-               moe_config={'backend': 'TRTLLM'},
-               speculative_config=_speculative('MTP', 3))
     if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
         update(
             modeling_v2='require',
             max_seq_len=9216,
             prefill_cuda_graph_backend='breakable',
             prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
-            cuda_graph_config={'max_batch_size': 128},
             kv_cache_config={
                 'dtype': 'fp8',
                 'enable_block_reuse': True,
@@ -298,11 +305,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                    'indexer_kv_dtype': 'fp8',
                    'fuse_qkv_index_projection': True
                })
-    if 'minimax_m3.1_flash_nvfp4_dspark' in label:
-        draft = f'{llm_models_root()}/MiniMax-M3.1-Flash/dspark'
-        update(speculative_config=_speculative(
-            'DSpark', 7, speculative_model=draft))
-
     if 'gemma_4_' in label:
         update(enable_chunked_prefill=True,
                kv_cache_config={
@@ -348,9 +350,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                speculative_config=_speculative('Eagle',
                                                3,
                                                speculative_model_dir=draft))
-        if model == 'gpt_oss_120b_eagle3':
-            update(kv_cache_config=_kv_without_reuse(),
-                   enable_chunked_prefill=True)
 
     nano_30b = 'nemotron_3_nano_30b' in label
     nano_omni = 'nemotron_3_nano_omni_nvfp4' in label
@@ -358,16 +357,12 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(kv_cache_config={'mamba_ssm_cache_dtype': 'float32'})
     if nano_30b or nano_omni:
         update(moe_config={'backend': 'CUTLASS'})
-    if nano_omni:
-        update(enable_chunked_prefill=True,
-               cuda_graph_config={'max_batch_size': 1},
-               kv_cache_config={'free_gpu_memory_fraction': 0.8})
-
     lightning = (model in ('nemotron_3.5_lightning_30b_nvfp4_mtp',
                            'nemotron_3.5_lightning_30b_bf16_mtp')
                  and case.startswith('serve-pytorch-streaming-'))
-    super_mtp = 'nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-' in label
-    super_streaming = super_mtp or 'nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-' in label
+    super_streaming = model in (
+        'nemotron_3_super_120b_nvfp4', 'nemotron_3_super_120b_nvfp4_mtp'
+    ) and case.startswith('serve-pytorch-streaming-')
     super_serve = super_streaming or 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
     if lightning or super_serve or super_fp8:
@@ -378,17 +373,10 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                    'mamba_ssm_stochastic_rounding': True,
                    'mamba_ssm_philox_rounds': 5
                })
-    if super_fp8:
-        update(disable_overlap_scheduler=True)
     if super_serve:
         update(max_seq_len=1048576)
     if super_streaming:
         update(cuda_graph_config={'max_batch_size': 8})
-    if super_mtp:
-        update(speculative_config={
-            'decoding_type': 'MTP',
-            'num_nextn_predict_layers': 3
-        })
 
 
 def get_model_yaml_config(model_label: str,
@@ -410,9 +398,9 @@ def get_model_yaml_config(model_label: str,
 
     model = label.partition('-')[0]
     spec = config.get('speculative_config') or {}
-    if (model in _DEEPSEEK_PRO_DSPARK and spec.get('decoding_type') == 'DSpark'
+    if (model in _DSPARK_DRAFTS and spec.get('decoding_type') == 'DSpark'
             and 'speculative_model' not in spec):
-        draft = MODEL_PATH_DICT[model]
+        draft = _DSPARK_DRAFTS[model]
         spec['speculative_model'] = f'{llm_models_root()}/{draft}'
 
     if 'pytorch' in model_label and 'loras' in model_label:
