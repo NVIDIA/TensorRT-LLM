@@ -165,7 +165,12 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
             if (name == "PROTO" and (pos or not 2 <= arg <= 5)
                     or name == "FRAME" and pos + 9 + arg > len(pickled)):
                 raise ValueError("Tensor payload pickle is malformed.")
-            if name in ("PROTO", "FRAME", "BINPUT", "LONG_BINPUT", "MEMOIZE"):
+            if name in ("BINPUT", "LONG_BINPUT", "MEMOIZE"):
+                # The unpickler memoizes the value on top, above any mark.
+                if not stack or stack[-1] is _PICKLE_MARK:
+                    raise ValueError("Tensor payload pickle is malformed.")
+                continue
+            if name in ("PROTO", "FRAME"):
                 continue
             if name == "MARK":
                 stack.append(_PICKLE_MARK)

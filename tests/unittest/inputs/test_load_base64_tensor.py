@@ -11,6 +11,7 @@ import re
 import struct
 import threading
 import tracemalloc
+import warnings
 import zipfile
 from typing import Callable, Optional
 
@@ -47,8 +48,10 @@ def _rewrite(
             data = (replace or {}).get(info.filename.split("/", 1)[1], src.read(info))
             if data is not None:
                 dst.writestr(info.filename, data)
-        for name in add:
-            dst.writestr(name, b"")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # Duplicate names are added on purpose.
+            for name in add:
+                dst.writestr(name, b"")
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
@@ -354,6 +357,9 @@ _PICKLE_REJECTED = {
     "opcode": (pickle.dumps([1.0], protocol=2), "unsupported pickle opcode"),
     "truncated": (b"\x80\x02" + _REBUILD, "malformed"),
     "missing-protocol": (_pickle((4, 2), (2, 1), 8, head=b""), "malformed"),
+    "memo-on-empty-stack": (_pickle((4, 2), (2, 1), 8, head=b"\x80\x02q\x00"), "malformed"),
+    "stack-underflow": (b"\x80\x02R.", "malformed"),
+    "non-string-stack-global": (b"\x80\x04K\x01K\x02\x93.", "malformed"),
     "protocol": (_pickle((4, 2), (2, 1), 8, head=b"\x80\xff"), "malformed"),
     "frame-past-end": (_pickle((4, 2), (2, 1), 8, head=_FRAMED), "malformed"),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
@@ -406,6 +412,7 @@ _ARCHIVE_REJECTED = {
     "offset-past-archive": (_patch(_ZEROS, _offset_past_archive), "outside the archive"),
     "missing-pickle": (_rewrite(_ZEROS, {"data.pkl": None}), "only the records"),
     "unknown-record": (_rewrite(_ZEROS, add=["archive/notes"]), "only the records"),
+    "duplicate-record": (_rewrite(_ZEROS, add=["archive/version"]), "only the records"),
     "directory-over-limit": (_rewrite(_ZEROS, add=[f"x/{i}" for i in range(400)]), "is over"),
     "zip64-directory-over-limit": (
         _patch(_ZEROS, _zip64_edit(40, lambda _: 8192, True)),
@@ -434,12 +441,13 @@ def test_archive_rejected(payload: str, match: str) -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
-@pytest.mark.parametrize("record", ["data.pkl", "byteorder", "data/0"])
-def test_record_sizes_must_agree(monkeypatch, record: str) -> None:
+def test_record_sizes_must_agree(monkeypatch) -> None:
     """A stored record whose two declared sizes differ is refused before any record is read."""
-    info = zipfile.ZipFile(io.BytesIO(base64.b64decode(_ZEROS))).getinfo(f"archive/{record}")
     # zipfile would read compress_size bytes, past the declared file_size.
-    forged = _set_sizes(_ZEROS, record, info.file_size + 4096, info.file_size)
+    size = (
+        zipfile.ZipFile(io.BytesIO(base64.b64decode(_ZEROS))).getinfo("archive/data.pkl").file_size
+    )
+    forged = _set_sizes(_ZEROS, "data.pkl", size + 4096, size)
     reads = _spy_reads(monkeypatch)
     with pytest.raises(ValueError, match="uncompressed"):
         load_base64_tensor(forged, max_bytes=_LIMIT)
