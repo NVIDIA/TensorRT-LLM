@@ -1307,7 +1307,8 @@ def test_rank_failure_error_after_final_response_is_dropped(monkeypatch, route):
 
     Rank 0 fails the requests that no active rank holds after a rank failure,
     including request 7, whose final response the worker thread has not handled
-    yet. That response comes first and ends request 7; request 8 had none.
+    yet. That response comes first and ends request 7; request 8 had none, and
+    its error is not resubmittable, so its client gets it on every route.
     """
     worker, helper = _ipc_worker(monkeypatch)
     _submit(worker, 7)
@@ -1321,7 +1322,9 @@ def test_rank_failure_error_after_final_response_is_dropped(monkeypatch, route):
     responses = [
         final,
         LlmResponse(request_id=100, error_msg=RankFailureError(), client_id=7),
-        LlmResponse(request_id=101, error_msg=RankFailureError(), client_id=8),
+        LlmResponse(request_id=101,
+                    error_msg=RankFailureError(resubmit=False),
+                    client_id=8),
     ]
     if route == "in_process":
         worker.result_queue = None
