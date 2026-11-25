@@ -237,9 +237,26 @@ Selected large-model disaggregated QA cases use
 The experiment enables a 7200-second loading budget for Kimi K2.5 NVFP4,
 GLM-5.2 NVFP4's NIXL test, DeepSeek V4 Flash Base, and the two DeepSeek V4.1
 Flash GSM8K cases. Nemotron Super 120B's concurrency test uses 1800 seconds for
-loading and retains a 3600-second execution budget. Unmarked tests keep their
-existing timeout behavior. `TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT` can override the
-loading budget with a positive number of seconds.
+loading and retains a 3600-second execution budget. The remaining reported
+cases use these budgets:
+
+| Case | Loading budget | Execution budget |
+| --- | --- | --- |
+| DeepSeek V3 Lite FP8 NIXL | 1800 seconds | 3600 seconds |
+| DeepSeek V3 Lite BF16 Helix, short prompt | 1800 seconds | 2400 seconds |
+| DeepSeek V3 Lite BF16 empty batch | 1800 seconds | 3600 seconds |
+| Qwen3-0.6B context TP2 / generation PP2 | 600 seconds | 3600 seconds |
+| Qwen3.8 Flash Next FP8, `prefix_cache_offsets` | 7200 seconds | 3600 seconds |
+
+Only the indicated Qwen parameter instance opts in; its other snapshot-policy
+variants retain their existing timeout behavior. Explicit execution markers
+preserve the previous 3600-second default for the selected standalone cases
+when Jenkins supplies a larger outer-group safety timeout.
+
+Unmarked tests retain their configuration-derived readiness budgets: 900 seconds
+for PP configurations on the SM100 family, 300 seconds otherwise, with an
+explicit caller-provided limit taking precedence. `TRTLLM_TEST_WEIGHT_LOADING_TIMEOUT`
+can override the loading budget with a positive number of seconds.
 
 This version supports one cluster launch per test attempt and single-host
 PyTorch workers with the main/one-model checkpoint. It does not separate the

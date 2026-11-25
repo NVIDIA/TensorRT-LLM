@@ -1935,6 +1935,8 @@ def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
 
 
 @pytest.mark.skip_less_device(4)
+@pytest.mark.disagg_weight_loading(600)
+@pytest.mark.timeout(3600)
 def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
@@ -2104,6 +2106,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+@pytest.mark.disagg_weight_loading(1800)
+@pytest.mark.timeout(3600)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                                                  disaggregated_example_root,
                                                  llm_venv,
@@ -3025,6 +3029,8 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
 @skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
+@pytest.mark.disagg_weight_loading(1800)
+@pytest.mark.timeout(3600)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
         disaggregated_example_root, llm_venv, benchmark_model_root,
         benchmark_root, shared_gpt_path):
@@ -3092,6 +3098,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
 @pytest.mark.parametrize("prompt_file", ["prompts.json"], ids=["short_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
+@pytest.mark.disagg_weight_loading(1800)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root, prompt_file):

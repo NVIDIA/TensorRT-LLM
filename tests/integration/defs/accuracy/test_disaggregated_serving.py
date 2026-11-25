@@ -2602,9 +2602,15 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                   reasoning_effort="xhigh"),
     )
 
-    @pytest.mark.parametrize(
-        "snapshot_policy", [None, "interval", "offsets"],
-        ids=["no_reuse", "prefix_cache", "prefix_cache_offsets"])
+    @pytest.mark.parametrize("snapshot_policy", [
+        None,
+        "interval",
+        pytest.param("offsets", marks=pytest.mark.disagg_weight_loading(7200)),
+    ],
+                             ids=[
+                                 "no_reuse", "prefix_cache",
+                                 "prefix_cache_offsets"
+                             ])
     def test_fp8_nixl_python(self, mocker, snapshot_policy):
         """Tensor/expert-parallel-2 context to attention-DP2 generation.
 
