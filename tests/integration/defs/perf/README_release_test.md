@@ -115,7 +115,7 @@ if self._config.backend == "pytorch":
 
 ### 4.1 PyTorch Model Configuration
 
-In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches substrings of the label from `PerfTestConfig.to_string()`. Each matching rule updates the config in order. Nested fields are merged, so a model variant only needs to specify its differences.
+In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches substrings of the label from `PerfTestConfig.to_string()`. Each matching rule updates the config in order. Nested fields are merged, so a model variant only needs to specify its differences. The Kimi K3 serve cases set `kv_frac:0.25` in the test list, so the harness supplies `kv_cache_config.free_gpu_memory_fraction` from the case label.
 
 ```python
 if 'qwen3.6_35b_a3b_fp4' in label:

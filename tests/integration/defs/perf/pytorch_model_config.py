@@ -70,10 +70,6 @@ def recursive_update(d: dict, u: dict) -> dict:
     return d
 
 
-def _cuda_graph(max_batch_size: int, *, enable_padding: bool = True) -> dict:
-    return {'enable_padding': enable_padding, 'max_batch_size': max_batch_size}
-
-
 def _kv_without_reuse(**options: object) -> dict:
     return {'enable_block_reuse': False, **options}
 
@@ -105,24 +101,16 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(
             disable_mm_encoder=True,
             enable_chunked_prefill=True,
-            attn_backend='TRTLLM',
             allreduce_strategy='NCCL',
             max_seq_len=49152,
-            cuda_graph_config=_cuda_graph(256),
-            kv_cache_config={
-                'dtype': 'fp8',
-                'enable_block_reuse': True,
-                'enable_partial_reuse': True,
-                'free_gpu_memory_fraction': 0.8,
-                'use_kv_cache_manager_v2': True
-            },
+            cuda_graph_config={'max_batch_size': 256},
+            kv_cache_config={'dtype': 'fp8'},
             moe_config={'backend': 'TRTLLM'},
         )
 
     if 'deepseek_v41_flash_nvfp4' in label:
         update(
             gpus_per_node=4,
-            attn_backend='TRTLLM',
             enable_attention_dp=True,
             allreduce_strategy='NCCL',
             moe_config={'backend': 'TRTLLM'},
@@ -130,16 +118,11 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             max_seq_len=9344,
             enable_chunked_prefill=True,
             enable_iter_perf_stats=True,
-            cuda_graph_config={
-                'enable_padding': True,
-                'batch_sizes': [1, 2, 4, 8, 16, 32]
-            },
+            cuda_graph_config={'batch_sizes': [1, 2, 4, 8, 16, 32]},
             kv_cache_config=_kv_without_reuse(dtype='fp8',
-                                              tokens_per_block=128,
                                               max_tokens=262144,
                                               enable_swa_scratch_reuse=False),
             sparse_attention_config={'algorithm': 'csa2'},
-            speculative_config=None,
         )
 
     if 'deepseek_v41_flash_nvfp4_dspark' in label:
@@ -154,7 +137,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if qwen_max or flash_next:
         # MAX TP8/MTP3 (#18071) and Flash-Next with PLE host offload (#18585).
         update(
-            cuda_graph_config=_cuda_graph(16 if flash_next else 32),
+            cuda_graph_config={'max_batch_size': 16 if flash_next else 32},
             kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
             speculative_config=_mtp(3),
         )
@@ -173,16 +156,15 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'qwen3.8_flash_next_fp8-bench-pytorch-streaming-' in label:
         update(speculative_config=None, moe_config={'backend': 'CUTLASS'})
 
-    if 'qwen3.8_27b' in label:
-        update(kv_cache_config=_kv_without_reuse())
-
     if 'kimi_k3-serve-pytorch' in label:
         update(
             max_seq_len=9344,
             enable_chunked_prefill=True,
-            cuda_graph_config=_cuda_graph(16, enable_padding=False),
-            kv_cache_config=_kv_without_reuse(free_gpu_memory_fraction=0.25,
-                                              tokens_per_block=64),
+            cuda_graph_config={
+                'max_batch_size': 16,
+                'enable_padding': False
+            },
+            kv_cache_config=_kv_without_reuse(tokens_per_block=64),
             stream_interval=10,
         )
 
@@ -213,11 +195,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             },
         )
     if dspark:
-        update(
-            moe_config={'backend': 'MEGAMOE_DEEPGEMM'},
-            max_num_tokens=9216,
-            kv_cache_config={'free_gpu_memory_fraction': 0.5},
-        )
+        update(moe_config={'backend': 'MEGAMOE_DEEPGEMM'})
     if nvfp4_dspark:
         # Single-node adaptation of the disaggregated NVFP4 recipe for 8K prefill.
         update(
@@ -258,19 +236,15 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                attention_dp_config={'enable_balance': True})
 
     if (throughput or latency) and '-serve-' in label:
-        fraction = 0.9 if latency else (0.5 if fp8_serve in label else 0.6)
-        update(cuda_graph_config=_cuda_graph(128 if latency else 32),
-               kv_cache_config=_kv_without_reuse(
-                   free_gpu_memory_fraction=fraction))
+        update(cuda_graph_config={'max_batch_size': 128 if latency else 32},
+               kv_cache_config=_kv_without_reuse())
 
     # GLM-5.3 B200 TP8/EP8 deployment recipe, without MTP.
     if 'glm_5.3_fp8-serve-pytorch' in label:
         update(
             enable_chunked_prefill=True,
             max_seq_len=16384,
-            cuda_graph_config=_cuda_graph(128),
-            kv_cache_config=_kv_without_reuse(dtype='fp8',
-                                              free_gpu_memory_fraction=0.75),
+            kv_cache_config=_kv_without_reuse(dtype='fp8'),
             moe_config={'backend': 'DEEPGEMM'},
             stream_interval=10,
         )
@@ -282,12 +256,12 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if (glm_flash_fp8 or glm_flash_nvfp4) and case.startswith('serve-pytorch'):
         update(disable_mm_encoder=True,
                enable_chunked_prefill=True,
-               cuda_graph_config=_cuda_graph(64),
-               kv_cache_config=_kv_without_reuse(free_gpu_memory_fraction=0.5))
+               cuda_graph_config={'max_batch_size': 64},
+               kv_cache_config=_kv_without_reuse())
         if glm_flash_fp8:
             update(max_seq_len=16384,
                    moe_config={'backend': 'TRTLLM'},
-                   kv_cache_config={'dtype': 'auto'})
+                   kv_cache_config={'free_gpu_memory_fraction': 0.5})
         else:
             # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
             update(modeling_v2='require',
@@ -297,12 +271,11 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             update(speculative_config=_mtp(3))
         if model.endswith('_bf16_kv'):
             update(max_seq_len=16384,
-                   cuda_graph_config=_cuda_graph(32),
+                   cuda_graph_config={'max_batch_size': 32},
                    kv_cache_config={
                        'dtype': 'auto',
                        'tokens_per_block': 128,
                        'enable_block_reuse': True,
-                       'free_gpu_memory_fraction': 0.8,
                        'mamba_state_config': {
                            'additional_snapshot_offsets_from_end': [0]
                        }
@@ -315,8 +288,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             enable_chunked_prefill=True,
             moe_config={'backend': 'CUTEDSL'},
             max_seq_len=10240,
-            kv_cache_config={'free_gpu_memory_fraction': 0.7},
-            cuda_graph_config=_cuda_graph(128),
+            cuda_graph_config={'max_batch_size': 128},
         )
 
     # Block-sparse attention requires reuse off. Cap the checkpoint's 1M
@@ -342,9 +314,9 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'minimax_m3_fp4-bench-pytorch' in label:
         update(stream_interval=10, num_postprocess_workers=4)
 
-    # Bound the serve warmup/capture batch and sequence length on TP4/EP4.
+    # Bound the serve sequence length on TP4/EP4.
     if 'minimax_m3_fp4-serve-pytorch' in label:
-        update(max_seq_len=4096, cuda_graph_config=_cuda_graph(128))
+        update(max_seq_len=4096)
 
     # The 8K input exceeds the 2048-token budget, so serve needs chunking.
     # Match the normalized PerfTestConfig label, including maxbs/maxnt.
@@ -358,9 +330,10 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'gemma_4_' in label:
         update(
             enable_chunked_prefill=True,
-            kv_cache_config=_kv_without_reuse(dtype='fp8',
-                                              enable_partial_reuse=False,
-                                              free_gpu_memory_fraction=0.6),
+            kv_cache_config={
+                'dtype': 'fp8',
+                'enable_partial_reuse': False
+            },
         )
 
     if any(pattern in label for pattern in (
@@ -424,8 +397,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
 
     if any(pattern in label
            for pattern in ('nemotron_3_nano_30b', 'nemotron_3_nano_4b')):
-        update(kv_cache_config=_kv_without_reuse(
-            mamba_ssm_cache_dtype='float32'))
+        update(kv_cache_config={'mamba_ssm_cache_dtype': 'float32'})
 
     if 'nemotron_3_nano_30b' in label:
         update(moe_config={'backend': 'CUTLASS'})
@@ -434,9 +406,11 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(
             enable_chunked_prefill=True,
             moe_config={'backend': 'CUTLASS'},
-            cuda_graph_config=_cuda_graph(1),
-            kv_cache_config=_kv_without_reuse(free_gpu_memory_fraction=0.8,
-                                              mamba_ssm_cache_dtype='float32'),
+            cuda_graph_config={'max_batch_size': 1},
+            kv_cache_config={
+                'free_gpu_memory_fraction': 0.8,
+                'mamba_ssm_cache_dtype': 'float32'
+            },
         )
 
     lightning = (model in ('nemotron_3.5_lightning_30b_nvfp4_mtp',
@@ -464,20 +438,23 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                    'backend': 'CUTLASS' if 'bf16_mtp' in model else 'CUTEDSL'
                },
                speculative_config=_mtp(3),
-               kv_cache_config=_kv_without_reuse(
-                   free_gpu_memory_fraction=0.8,
-                   mamba_state_config={'periodic_snapshot_interval': 8192}))
+               kv_cache_config={
+                   'free_gpu_memory_fraction': 0.8,
+                   'mamba_state_config': {
+                       'periodic_snapshot_interval': 8192
+                   }
+               })
     if super_streaming or super_throughput or super_fp8:
         update(enable_chunked_prefill=True, moe_config={'backend': 'CUTLASS'})
     if super_fp8:
-        update(disable_overlap_scheduler=True,
-               kv_cache_config=_kv_without_reuse())
+        update(disable_overlap_scheduler=True)
     if super_streaming or super_throughput:
         update(max_seq_len=1048576)
     if super_streaming:
-        update(cuda_graph_config=_cuda_graph(8))
+        update(cuda_graph_config={'max_batch_size': 8})
     if super_throughput or ultra:
-        update(enable_attention_dp=True, cuda_graph_config=_cuda_graph(256))
+        update(enable_attention_dp=True,
+               cuda_graph_config={'max_batch_size': 256})
     if super_mtp:
         update(speculative_config={
             'decoding_type': 'MTP',
@@ -495,14 +472,13 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             enable_attention_dp=True,
             max_seq_len=8192,
             enable_chunked_prefill=True,
-            cuda_graph_config=_cuda_graph(8),
+            cuda_graph_config={'max_batch_size': 8},
             moe_config={
                 'backend': 'CUTLASS',
                 'max_num_tokens': 131072,
                 'use_low_precision_moe_combine': True
             },
             kv_cache_config=_kv_without_reuse(dtype='nvfp4',
-                                              free_gpu_memory_fraction=0.8,
                                               tokens_per_block=64),
         )
 
@@ -512,11 +488,10 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             max_seq_len=9216,
             prefill_cuda_graph_backend='breakable',
             prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
-            cuda_graph_config=_cuda_graph(128),
+            cuda_graph_config={'max_batch_size': 128},
             kv_cache_config={
                 'dtype': 'fp8',
                 'enable_block_reuse': True,
-                'free_gpu_memory_fraction': 0.6,
                 'mamba_state_config': {
                     'periodic_snapshot_interval': 256
                 }
@@ -527,15 +502,13 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(
             modeling_v2='require',
             max_seq_len=16384,
-            cuda_graph_config=_cuda_graph(64),
-            kv_cache_config=_kv_without_reuse(dtype='nvfp4',
-                                              free_gpu_memory_fraction=0.6),
+            cuda_graph_config={'max_batch_size': 64},
+            kv_cache_config=_kv_without_reuse(dtype='nvfp4'),
             sparse_attention_config={
                 'algorithm': 'minimax_m3',
                 'implementation': 'msa',
                 'indexer_kv_dtype': 'fp8',
-                'fuse_qkv_index_projection': True,
-                'sparse_disable_index_value': True
+                'fuse_qkv_index_projection': True
             },
         )
 
@@ -557,11 +530,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             allreduce_strategy='NCCL',
             moe_config={'backend': 'TRTLLM'},
             scheduler_config={'capacity_scheduler_policy': 'MAX_UTILIZATION'},
-            cuda_graph_config={
-                'enable_padding': True,
-                'max_batch_size': 24,
-                'batch_sizes': list(range(1, 25))
-            },
+            cuda_graph_config={'batch_sizes': list(range(1, 25))},
             prefill_cuda_graph_backend='breakable',
             prefill_capture_num_tokens=[
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536,
@@ -570,12 +539,10 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             ],
             kv_cache_config={
                 'dtype': 'fp8',
-                'enable_block_reuse': True,
                 'block_reuse_config': {
                     'swa_endpoint_rewind_tokens': 1024
                 },
                 'pool_ratio': [0.25, 0.75],
-                'free_gpu_memory_fraction': 0.8,
                 'host_cache_size': 171798691840
             },
             disable_mm_encoder=True,
@@ -591,12 +558,12 @@ def get_model_yaml_config(model_label: str,
                           lora_dirs: list[str] | None = None) -> dict:
     """Build the benchmark YAML config for a PerfTestConfig.to_string() label."""
     config = {'print_iter_log': True}
-    # Throughput already enables padding and uses the case's max batch size.
-    if '-bench-pytorch' not in model_label:
-        config['cuda_graph_config'] = {'enable_padding': True}
-
     label = model_label.lower()
     _apply_model_overrides(config, label)
+    # Throughput supplies its own padded graph config unless YAML overrides it.
+    if '-bench-pytorch' not in model_label or 'cuda_graph_config' in config:
+        graph = config.setdefault('cuda_graph_config', {})
+        graph.setdefault('enable_padding', True)
 
     # Gemma4 NVFP4 needs FlashInfer for its 512-wide attention heads on SM107.
     if (label.startswith(('gemma_4_26b_a4b_nvfp4-', 'gemma_4_31b_it_nvfp4-'))
