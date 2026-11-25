@@ -4,11 +4,10 @@
 
 import pytest
 import torch
-from utils.util import skip_pre_blackwell
-
-pytestmark = skip_pre_blackwell
+from utils.util import getSMVersion, skip_pre_blackwell
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("reserved_sms", [0, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("rows,bucket,hidden", [(37, 64, 7168), (64, 64, 7168), (1, 8, 1024)])
@@ -31,6 +30,7 @@ def test_fp4_quantize_into_writes_what_fp4_quantize_returns(
         torch.ops.trtllm.fp4_quantize.into(x, scale, act[: rows - 1], act_sf[:rows], False)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("rows,hidden", [(37, 1056), (130, 7168)])
 def test_fp4_quantize_into_swizzled_writes_what_fp4_quantize_returns(rows, hidden):
     """The swizzled layout fills the padded 128 x 4 block as ``fp4_quantize`` does, and no more."""
@@ -49,6 +49,7 @@ def test_fp4_quantize_into_swizzled_writes_what_fp4_quantize_returns(rows, hidde
         torch.ops.trtllm.fp4_quantize.into(x, scale, act, act_sf[: want_sf.numel() - 1], True)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("swizzled", [False, True])
 def test_fp4_quantize_into_schema_and_fake(swizzled):
     rows, hidden = 5, 1024
@@ -64,3 +65,20 @@ def test_fp4_quantize_into_schema_and_fake(swizzled):
         (x, scale, act, act_sf, swizzled),
         test_utils=("test_schema", "test_faketensor"),
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or getSMVersion() >= 100,
+    reason="the refusal is for CUDA GPUs below SM100",
+)
+def test_fp4_quantize_into_refuses_gpus_below_sm100():
+    """Regression: below SM100 the quantization kernel compiles to nothing, so ``.into`` returned
+    with the caller's buffers unwritten."""
+    rows, hidden = 4, 1024
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    scale = torch.tensor([1.7], device="cuda")
+    act = torch.full((rows, hidden // 2), 9, dtype=torch.uint8, device="cuda")
+    act_sf = torch.full((rows, hidden // 16), 9, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="needs SM100 or newer"):
+        torch.ops.trtllm.fp4_quantize.into(x, scale, act, act_sf, False)
+    assert (act == 9).all() and (act_sf == 9).all()

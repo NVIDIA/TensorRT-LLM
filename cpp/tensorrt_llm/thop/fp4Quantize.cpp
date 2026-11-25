@@ -205,6 +205,8 @@ void fp4_quantize_into(at::Tensor const& self, std::optional<at::Tensor> const& 
     at::Tensor& outSf, bool isSfSwizzledLayout, int64_t reservedSms)
 {
     c10::cuda::CUDAGuard const deviceGuard(self.device());
+    // The quantization kernel compiles to nothing below SM100: the launch would leave the caller's buffers unwritten.
+    TORCH_CHECK(tensorrt_llm::common::getSMVersion() >= 100, "fp4_quantize.into needs SM100 or newer");
     fp4QuantizeImpl(
         self, globalScale, /*sfVecSize=*/16, /*sfUseUE8M0=*/false, isSfSwizzledLayout, reservedSms, out, outSf);
 }
