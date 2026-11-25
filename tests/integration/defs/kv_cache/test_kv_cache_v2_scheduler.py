@@ -22,11 +22,18 @@ import gc
 
 import pytest
 import torch
+from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor import request as executor_request
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams, SchedulerConfig
+from tensorrt_llm.llmapi import (
+    KvCacheConfig,
+    MambaStateConfig,
+    MTPDecodingConfig,
+    SamplingParams,
+    SchedulerConfig,
+)
 
 from ..conftest import llm_models_root, skip_pre_hopper
 
@@ -616,6 +623,95 @@ class TestKVCacheV2LoRA:
             max_batch_size=8,
             label_suffix="-evict",
         )
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(2)
+@pytest.mark.private_mpi_session
+def test_tp2_periodic_snapshots_reuse_an_interior_checkpoint():
+    """Compare warm reuse of the same interior snapshot under both prefill strategies."""
+    model_path = f"{llm_models_root()}/Qwen3.5-4B"
+    interval = 64
+    reuse_depth = 6 * interval
+    source_length = 7 * interval
+    generation_length = 8
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    source = tokenizer.encode(_LONG_BLOCK * 16, add_special_tokens=False)[:source_length]
+    suffix = tokenizer.encode(
+        "\nQuestion: Name one application of machine learning from this text.\nAnswer:",
+        add_special_tokens=False,
+    )
+    # The source must cross the reused boundary and then diverge from the probe.
+    assert len(source) == source_length
+    assert suffix and source[reuse_depth] != suffix[0]
+    probe = source[:reuse_depth] + suffix
+    assert len(probe) <= source_length
+
+    sampling = SamplingParams(
+        max_tokens=generation_length, temperature=0, ignore_eos=True, detokenize=False
+    )
+    seed_sampling = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True, detokenize=False)
+    results = {}
+    for multi_snapshot in (False, True):
+        with LLM(
+            model_path,
+            tensor_parallel_size=2,
+            modeling_v2="off",
+            disable_mm_encoder=True,
+            enable_chunked_prefill=True,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            max_seq_len=768,
+            max_num_tokens=512,
+            max_batch_size=1,
+            scheduler_config=_V2_SCHEDULER_CONFIG,
+            kv_cache_config=KvCacheConfig(
+                use_kv_cache_manager_v2=True,
+                enable_block_reuse=True,
+                tokens_per_block=interval,
+                max_tokens=4096,
+                mamba_ssm_cache_dtype="bfloat16",
+                mamba_state_config=MambaStateConfig(
+                    periodic_snapshot_interval=interval,
+                    enable_multi_snapshot_prefill=multi_snapshot,
+                ),
+            ),
+        ) as llm:
+            cold = llm.generate(
+                [{"prompt_token_ids": probe}], sampling, cache_salt="cold", use_tqdm=False
+            )[0]
+            seed = llm.generate(
+                [{"prompt_token_ids": source}], seed_sampling, cache_salt="warm", use_tqdm=False
+            )[0]
+            warm = llm.generate(
+                [{"prompt_token_ids": probe}], sampling, cache_salt="warm", use_tqdm=False
+            )[0]
+
+        assert cold.cached_tokens == seed.cached_tokens == 0
+        expected_chunks = 1 if multi_snapshot else source_length // interval
+        assert seed.ctx_num_chunks == cold.ctx_num_chunks == expected_chunks, (
+            f"multi_snapshot={multi_snapshot}: expected {expected_chunks} context chunks, "
+            f"got {seed.ctx_num_chunks} for the seed and {cold.ctx_num_chunks} for the cold probe"
+        )
+        assert warm.cached_tokens == reuse_depth, (
+            f"multi_snapshot={multi_snapshot}: expected to resume at {reuse_depth}, "
+            f"got {warm.cached_tokens}"
+        )
+        assert warm.ctx_num_chunks == 1
+        assert warm.ctx_first_begin == reuse_depth
+        assert warm.ctx_computed_tokens == len(suffix)
+        assert len(cold.outputs[0].token_ids) == len(warm.outputs[0].token_ids) == generation_length
+        results[multi_snapshot] = (cold.outputs[0].token_ids, warm.outputs[0].token_ids)
+
+    baseline_cold, baseline_warm = results[False]
+    expanded_cold, expanded_warm = results[True]
+    assert baseline_warm == baseline_cold, "One-boundary warm reuse changed the generated tokens"
+    assert expanded_warm == baseline_warm, (
+        "Restoring the multi-snapshot checkpoint changed the tokens"
+    )
+    assert expanded_warm == expanded_cold, (
+        "Multi-snapshot cold and warm runs generated different tokens"
+    )
 
 
 # ===========================================================================
