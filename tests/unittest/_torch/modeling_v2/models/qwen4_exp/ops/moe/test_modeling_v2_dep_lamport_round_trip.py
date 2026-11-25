@@ -14,9 +14,11 @@ CUDA graph (the three slots rotating across replays):
 
 The host-index cells run each round inside a region with a varying number of launches (one to
 four round trips), so the slot base moves by every residue mod 3, and also one launch outside any
-region (its own advance). The 8-rank cells run on one node of eight SM103 GPUs; the workspace
-there is built with `build_on` over the symmetric buffers, the path the NVFP4 target's dep8 takes
-over `PeerBuffers`.
+region (its own advance). The 8-rank cells run on one node of eight SM103 GPUs. Their workspace,
+and once more the 4-rank host-index one (so a 4-GPU tray runs it too), is built the way the NVFP4
+target's dep8 builds it over `PeerBuffers`: every rank's mapped buffer as a raw device pointer,
+wrapped by `buffers_from_pointers`, then `build_on` (here the pointers are torch symmetric
+memory's; the target's are MNNVL memory's).
 
 The inputs carry -0.0 lanes on purpose. Past `MAX_ROWS` rows a rank `takes` refuses the call
 (the caller keeps NCCL). `QWEN4_EXP_LAMPORT_REPLAYS` raises the graph replays (default 500 a cell)
@@ -71,26 +73,33 @@ def _nccl(x, y, world: int):
     return gathered, reduced
 
 
-def _build(rank: int, world: int, step: bool):
-    """`build` at 4 ranks; at 8, `build_on` over symmetric buffers mapped here."""
+def _build(rank: int, world: int, step: bool, via_pointers: bool):
+    """`build` (torch symmetric memory), or with `via_pointers` the dep8 target's entry: every
+    rank's mapped buffer as a device pointer through `buffers_from_pointers`, then `build_on`."""
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
 
     steps = op.LamportSteps() if step else None
-    if world == 4:
+    if not via_pointers:
         return op.build(HIDDEN, op.MAX_ROWS, rank, world, steps=steps), steps
     device = torch.device("cuda", rank)
     shape = op.workspace_shape(HIDDEN, op.MAX_ROWS, world)
     buffer = symm_mem.empty(shape, dtype=torch.bfloat16, device=device)
     handle = symm_mem.rendezvous(buffer, group=dist.group.WORLD.group_name)
-    buffers = [handle.get_buffer(p, buffer.shape, buffer.dtype) for p in range(world)]
-    trip = op.build_on(HIDDEN, op.MAX_ROWS, rank, world, buffers, steps=steps, keepalive=handle)
+    mapped = [handle.get_buffer(p, buffer.shape, buffer.dtype) for p in range(world)]
+    buffers = op.buffers_from_pointers(
+        [b.data_ptr() for b in mapped], HIDDEN, op.MAX_ROWS, world, rank
+    )
+    assert [b.data_ptr() for b in buffers] == [b.data_ptr() for b in mapped]
+    trip = op.build_on(
+        HIDDEN, op.MAX_ROWS, rank, world, buffers, steps=steps, keepalive=(handle, buffer, mapped)
+    )
     torch.cuda.synchronize(device)
     dist.barrier()
     return trip, steps
 
 
-def _rank_main(rank: int, port: int, world: int, step: bool) -> None:
+def _rank_main(rank: int, port: int, world: int, step: bool, via_pointers: bool) -> None:
     import torch.distributed as dist
 
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), NCCL_ALGO="Ring")
@@ -98,7 +107,7 @@ def _rank_main(rank: int, port: int, world: int, step: bool) -> None:
     dist.init_process_group("nccl", rank=rank, world_size=world)
     try:
         device = torch.device("cuda", rank)
-        trip, steps = _build(rank, world, step)
+        trip, steps = _build(rank, world, step, via_pointers)
         assert (trip.steps is not None) == step
         probe = torch.empty([1, HIDDEN], dtype=torch.bfloat16, device=device)
         assert trip.takes(op.MAX_ROWS, probe) and not trip.takes(op.MAX_ROWS + 1, probe)
@@ -176,14 +185,25 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+#: `(world, step, via_pointers)`: every cell group; the 8-rank ones and one more 4-rank host-index
+#: run over `buffers_from_pointers` + `build_on` (the dep8 target's entry).
+_BUILDS = [(w, s, w == 8) for w, s in GROUPS] + [(4, True, True)]
+
+
 @pytest.mark.parametrize(
-    "world, step",
+    "world, step, via_pointers",
     [
-        pytest.param(w, s, marks=_skip(w), id=f"w{w}-{'step' if s else 'counter'}")
-        for w, s in GROUPS
+        pytest.param(
+            w,
+            s,
+            p,
+            marks=_skip(w),
+            id=f"w{w}-{'step' if s else 'counter'}{'-pointers' if p and w == 4 else ''}",
+        )
+        for w, s, p in _BUILDS
     ],
 )
-def test_round_trip_matches_nccl_ring(world, step):
+def test_round_trip_matches_nccl_ring(world, step, via_pointers):
     import torch.multiprocessing as mp
 
-    mp.spawn(_rank_main, args=(_free_port(), world, step), nprocs=world, join=True)
+    mp.spawn(_rank_main, args=(_free_port(), world, step, via_pointers), nprocs=world, join=True)

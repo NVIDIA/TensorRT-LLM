@@ -165,7 +165,8 @@ l0_gb300:
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
   # qwen4_exp family, pre-merge: the Lamport MoE round trip against NCCL's ring, 4 ranks, both slot
-  # protocols (the 8-rank cells need eight GPUs in one node and skip here).
+  # protocols and the dep8 target's pointer entry (`buffers_from_pointers` + `build_on`); the
+  # 8-rank cells need eight GPUs in one node and skip here.
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops/moe/test_modeling_v2_dep_lamport_round_trip.py
   # qwen4_exp family, pre-merge: the tep4 fused MoE finalize all-reduce against its reference,
   # 4 ranks, one rank held back before each graph replay.
