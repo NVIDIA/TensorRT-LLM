@@ -1255,7 +1255,9 @@ def _check_sparse_gqa_grouped(cell, monkeypatch) -> None:
     _assert_straddles(args)
     q, k = args["q"], args["k_cache"]
     rows = q.shape[0]
-    assert _sgg_op.serves(q, k, args["selected_tokens"], args["rows_per_request"])
+    # A cell below `MIN_GROUPS` groups is served for a caller that asks (`min_groups`).
+    floor = {"min_groups": spec["min_groups"]} if "min_groups" in spec else {}
+    assert _sgg_op.serves(q, k, args["selected_tokens"], args["rows_per_request"], **floor)
     out = _sgg_op(**args)
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == torch.bfloat16 and out.is_contiguous()

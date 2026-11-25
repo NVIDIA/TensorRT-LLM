@@ -266,6 +266,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback
     qsa_rollback_restore,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
+    SMALL_MIN_GROUPS as _GROUPED_SMALL_MIN_GROUPS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_grouped_cute__decode import (  # noqa: E501
     qsa_sparse_gqa_grouped_cute,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_rowtile import (
@@ -802,6 +805,17 @@ _INDEX_SCORES_CUTE_MIN_GROUPS = 8  # capacity: fixed: a dispatch threshold
 #:   instead of the per-row `qsa_sparse_gqa_splitk_cute`. Both run within the decode op's band of
 #:   the fp32 reference, not bitwise `qsa_paged_sparse_gqa`, which keeps every call they decline.
 _GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=<n>` (n in
+#: `_GROUPED_SMALL_MIN_GROUPS`..`_GROUPED_DECODE_MIN_REQUESTS`; unset is the row above) takes the
+#: request-grouped kernel from n requests of `p` rows a rank instead of 32, the split-K kernel
+#: below n. Class S against split-K (another summation order; both within the decode op's band).
+#: Below the op's own `MIN_GROUPS` (8) the op plans those launches on its first such call. What
+#: was measured is a grouped verify kernel of the same lineage against the per-row kernel with a
+#: separate merge and gate launch (not split-K): grouped from 8 requests a rank, and from 2 with
+#: -0.12..-0.24 ms a step at 2-7 requests a rank (dep4, GB300); every dep8 point of the AgentX
+#: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
+#: set at a layout without attention DP it warns and does nothing.
+DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
 _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 # The compressed index keys rotate at coordinate 0 alone (no mRoPE section), as the index
 # query does.
@@ -1106,6 +1120,31 @@ _TEP_SPLITK_MAX_ROWS = {(6, 1, torch.float8_e4m3fn): 16}
 #: window call is not pinned (`fp4_block_scale_moe_renorm_routed` pins the whole layer only) and
 #: runs the AutoTuner's tactic; the build check compares at the pinned tactic.
 _TEP_ROUTE_FRONT_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold
+
+
+def _dp_gqa_min_requests(core) -> int:
+    """`DP_GQA_MIN_REQUESTS_ENV` at this core's layout: the requests from which a generation
+    step's rows take `qsa_sparse_gqa_grouped_cute` (`_GROUPED_DECODE_MIN_REQUESTS` unset or at a
+    layout without attention DP). A value outside the op's range raises."""
+    raw = os.environ.get(DP_GQA_MIN_REQUESTS_ENV, "").strip()
+    if not raw:
+        return _GROUPED_DECODE_MIN_REQUESTS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not _GROUPED_SMALL_MIN_GROUPS <= value <= _GROUPED_DECODE_MIN_REQUESTS:
+        raise ValueError(
+            f"{DP_GQA_MIN_REQUESTS_ENV}={raw!r}: expected an integer in "
+            f"{_GROUPED_SMALL_MIN_GROUPS}..{_GROUPED_DECODE_MIN_REQUESTS}"
+        )
+    if core.dp_size == 1:
+        logger.warning(
+            f"{DP_GQA_MIN_REQUESTS_ENV} is set but ignored: it serves attention-DP ranks; this "
+            f"rank has attention DP {core.dp_size}"
+        )
+        return _GROUPED_DECODE_MIN_REQUESTS
+    return value
 
 
 def _tep_fast_decode(core) -> bool:
@@ -1964,6 +2003,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.gdn_replay_map = False
         # `DP_OUT_PROJ_BF16_ENV` (opt-in), built after load.
         self._out_proj = None
+        # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
+        self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -5124,16 +5165,18 @@ def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tp
 def _sparse_gqa_decode(core, kv, q, block_table, selected, req_idx, tpb, gate, p: int):
     """The gated sparse GQA `bf16(attn) * sigmoid(gate)` (`[rows, heads_q, head_dim]`) of a
     generation step's rows over a bf16 or e4m3 pool on the family's CuTe decode kernels: the
-    request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows, else the
-    per-row split-K one up to its rows (`_splitk_serves`). None where neither serves the call (an
-    NVFP4 pool, a head geometry or row count they were not measured at): the caller then runs
-    `_sparse_gqa` and the gate apart."""
+    request-grouped one from `_GROUPED_DECODE_MIN_REQUESTS` requests of `p` rows (an
+    attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`), else the per-row split-K one up to its rows
+    (`_splitk_serves`). None where neither serves the call (an NVFP4 pool, a head geometry or
+    row count they were not measured at): the caller then runs `_sparse_gqa` and the gate
+    apart."""
     if kv.k_scale is not None:
         return None
+    min_requests = getattr(core, "dp_gqa_min_requests", _GROUPED_DECODE_MIN_REQUESTS)
     if (
         p > 1
-        and q.shape[0] >= _GROUPED_DECODE_MIN_REQUESTS * p
-        and qsa_sparse_gqa_grouped_cute.serves(q, kv.k, selected, p)
+        and q.shape[0] >= min_requests * p
+        and qsa_sparse_gqa_grouped_cute.serves(q, kv.k, selected, p, min_groups=min_requests)
     ):
         return qsa_sparse_gqa_grouped_cute(
             q, kv.k, kv.v, block_table, selected, req_idx, tpb, core.softmax_scale, p, gate

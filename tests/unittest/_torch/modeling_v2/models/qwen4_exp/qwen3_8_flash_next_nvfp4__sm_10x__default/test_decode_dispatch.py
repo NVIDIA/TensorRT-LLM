@@ -6,7 +6,8 @@
   `_INDEX_GROUP_MIN_ROWS - 1` rows, request groups of `p` rows from there, the CuTe group kernel
   from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups where it serves them.
 * **Sparse GQA** (`_sparse_gqa_decode`): the request-grouped CuTe kernel from
-  `_GROUPED_DECODE_MIN_REQUESTS` requests, the per-row split-K one where it serves the call
+  `_GROUPED_DECODE_MIN_REQUESTS` requests (an attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`),
+  the per-row split-K one where it serves the call
   (and at a tep4 rank under `TEP_FAST_DECODE_ENV` its e4m3 shard up to 16 rows), None (the
   caller's `_sparse_gqa`) otherwise and over an NVFP4 pool.
 * **Selection** (`_selection`): the cluster launch, then the one-CTA launch, then the two
@@ -81,13 +82,15 @@ def test_index_scores_cute_needs_its_index_dtypes(monkeypatch):
 
 
 class _GqaOp:
-    """A recorder in place of a CuTe GQA op: `serves` answers `taken`, a call records
-    `(name, gated, rows_per_request or None)`."""
+    """A recorder in place of a CuTe GQA op: `serves` answers `taken` (and keeps the
+    `min_groups` it was asked with), a call records `(name, gated, rows_per_request or None)`."""
 
     def __init__(self, name: str, taken: bool, calls: list):
         self.name, self.taken, self.calls = name, taken, calls
+        self.asked = []
 
-    def serves(self, *args) -> bool:
+    def serves(self, *args, **kwargs) -> bool:
+        self.asked.append(kwargs.get("min_groups"))
         return self.taken
 
     def __call__(self, *args):
@@ -205,3 +208,54 @@ def test_score_and_select_marks_context_parts(monkeypatch):
         CORE, None, torch.zeros(rows, 4), block_table, t, t, 32, parts, t, t, t, t, t, None
     )
     assert seen == [(300, True), (10, False)]
+
+
+@pytest.mark.parametrize(
+    "rows, floor, expected",
+    [
+        (8, 2, ("grouped", True, 4)),  # 2 requests of 4 at a floor of 2
+        (4, 2, ("splitk", True, None)),  # one request: below any floor
+        (28, 8, ("splitk", True, None)),  # 7 requests below a floor of 8
+        (32, 8, ("grouped", True, 4)),
+        (32, 32, ("splitk", True, None)),  # the row table's 32 (the switch unset)
+    ],
+)
+def test_sparse_gqa_dp_min_requests(monkeypatch, rows, floor, expected):
+    """`DP_GQA_MIN_REQUESTS_ENV` moves the grouped kernel's first request count; the op is asked
+    for that many groups."""
+    calls = []
+    grouped = _GqaOp("grouped", True, calls)
+    monkeypatch.setattr(M, "qsa_sparse_gqa_grouped_cute", grouped)
+    monkeypatch.setattr(M, "qsa_sparse_gqa_splitk_cute", _GqaOp("splitk", True, calls))
+    core = SimpleNamespace(**{**vars(CORE), "dp_gqa_min_requests": floor})
+    kv = SimpleNamespace(k=None, v=None, k_scale=None)
+    gate = torch.zeros(rows, 1)
+    out = M._sparse_gqa_decode(core, kv, torch.zeros(rows, 24, 256), None, None, None, 32, gate, 4)
+    assert out == expected[0] and calls == [expected]
+    assert grouped.asked in ([floor], [])
+
+
+@pytest.mark.parametrize(
+    "env, dp_size, expected",
+    [
+        (None, 4, 32),
+        ("2", 4, 2),
+        ("8", 8, 8),
+        ("32", 8, 32),
+        ("2", 1, 32),  # no attention DP: warns, keeps the row table
+        ("1", 4, ValueError),
+        ("33", 4, ValueError),
+        ("eight", 4, ValueError),
+    ],
+)
+def test_dp_gqa_min_requests_switch(monkeypatch, env, dp_size, expected):
+    if env is None:
+        monkeypatch.delenv(M.DP_GQA_MIN_REQUESTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_GQA_MIN_REQUESTS_ENV, env)
+    core = SimpleNamespace(dp_size=dp_size)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            M._dp_gqa_min_requests(core)
+    else:
+        assert M._dp_gqa_min_requests(core) == expected
