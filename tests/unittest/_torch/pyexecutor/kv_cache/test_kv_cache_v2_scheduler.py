@@ -6888,3 +6888,321 @@ class TestContextClaimsReclaimedBeforePreemption:
         mgr, victim, _ = _context_out_of_pages(closes_deferred=False, claims_parked=True)
         mgr.release_claims_ahead.assert_not_called()
         mgr.preempt_request.assert_called_once_with(victim)
+
+
+class TestContextClaimHold:
+    """scheduler_config.context_claim_hold: a first context chunk goes behind the demoted long
+    prefills of the pass that first sees it, once, and the scheduler picks what the host helper
+    claims ahead."""
+
+    def _make(self, hold=True, room=8, claimed=(), given_up=(), **demote):
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        mgr.context_claim_limit = 8
+        self.room = [room]
+        mgr.context_claim_room.side_effect = lambda: self.room[0]
+        mgr.has_context_claim.side_effect = lambda rid: rid in claimed
+        mgr.context_claim_given_up.side_effect = lambda rid: rid in given_up
+        demote.setdefault("context_demote_uncached_tokens", 1024)
+        demote.setdefault("context_demote_max_iters", 0)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1024,
+            ctx_chunk_config=(None, 64),
+            context_claim_hold=hold,
+            **demote,
+        )
+        return sched, mgr
+
+    def _req(self, request_id, remaining, estimate=None):
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.py_uncached_prefill_tokens = remaining if estimate is None else estimate
+        req.is_dummy_request = False
+        req.multimodal_hashes = None
+        return req
+
+    def _arm(self, sched, long_req):
+        """The first pass with claims on only records what it sees."""
+        assert ids(sched.schedule_request([long_req], set()).context_requests) == [
+            long_req.request_id
+        ]
+        assert sched._claim_hold_counters["held"] == 0
+
+    def test_off_by_default_and_without_demotion(self):
+        sched, _ = self._make(hold=False)
+        assert not sched._claim_hold and sched.context_claim_candidates is None
+        sched, _ = self._make(context_demote_uncached_tokens=0)
+        assert not sched._claim_hold
+
+    def test_ignored_under_shortest_uncached_first(self):
+        sched, _ = self._make(
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST
+        )
+        assert not sched._claim_hold
+
+    def test_a_new_request_waits_one_pass_behind_a_demoted_prefill(self):
+        sched, _ = self._make()
+        long_req, new = self._req(0, 10_000), self._req(1, 200)
+        self._arm(sched, long_req)
+        out = sched.schedule_request([long_req, new], set())
+        # The demoted prefill takes the whole budget; the new request is picked for a claim.
+        assert ids(out.context_requests) == [0]
+        assert ids(sched.context_claim_candidates) == [1]
+        assert sched._claim_hold_counters["held"] == 1
+        # Seen once: from the next pass on it keeps its arrival order.
+        out = sched.schedule_request([long_req, new], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched._claim_hold_counters["held"] == 1
+
+    def test_without_the_hold_the_new_request_goes_first(self):
+        sched, _ = self._make(hold=False)
+        long_req, new = self._req(0, 10_000), self._req(1, 200)
+        sched.schedule_request([long_req], set())
+        out = sched.schedule_request([long_req, new], set())
+        assert ids(out.context_requests) == [1, 0]
+
+    def test_budget_left_admits_the_held_request_in_the_same_pass(self):
+        sched, _ = self._make(context_demote_uncached_tokens=512)
+        long_req, new = self._req(0, 640), self._req(1, 200)
+        self._arm(sched, long_req)
+        out = sched.schedule_request([long_req, new], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched.context_claim_candidates == []
+
+    def test_a_pass_without_a_demoted_request_is_unchanged(self):
+        sched, _ = self._make()
+        short, new = self._req(0, 200), self._req(1, 200)
+        self._arm(sched, short)
+        out = sched.schedule_request([short, new], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched._claim_hold_counters["held"] == 0
+
+    def test_at_most_the_helper_room_is_held_newest_first(self):
+        sched, _ = self._make(room=1)
+        long_req = self._req(0, 10_000)
+        self._arm(sched, long_req)
+        older, newer = self._req(1, 200), self._req(2, 200)
+        out = sched.schedule_request([long_req, older, newer], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched._claim_hold_counters["not_held_room"] == 1
+        assert ids(sched.context_claim_candidates) == [2]
+
+    def test_no_hold_without_room(self):
+        sched, _ = self._make()
+        long_req, new = self._req(0, 10_000), self._req(1, 200)
+        self._arm(sched, long_req)
+        self.room[0] = 0
+        out = sched.schedule_request([long_req, new], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched._claim_hold_counters["off_room"] == 1
+        assert sched.context_claim_candidates == []
+
+    def test_no_hold_while_claims_were_released_for_pages(self):
+        sched, _ = self._make()
+        long_req = self._req(0, 10_000)
+        self._arm(sched, long_req)
+        sched._claim_hold_off_until = sched._sched_iter + 2
+        out = sched.schedule_request([long_req, self._req(1, 200)], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched._claim_hold_counters["off_pages"] == 1
+
+    def test_releasing_claims_for_pages_turns_the_hold_off(self):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0), has_cache_tier_below_gpu=False
+        )
+        mgr.release_claims_ahead.return_value = True
+        mgr.context_claim_limit = 8
+        mgr.context_claim_room.return_value = 8
+        mgr.context_claim_given_up.return_value = False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 64),
+            reclaim_context_claims=True,
+            context_claim_hold=True,
+            context_demote_uncached_tokens=1024,
+        )
+        victim = self._req(99, 100)
+        victim.is_first_context_chunk = False
+        sched.schedule_request([self._req(0, 100), victim], set())
+        mgr.release_claims_ahead.assert_called_once_with()
+        mgr.preempt_request.assert_not_called()
+        assert sched._claim_hold_off_until == sched._sched_iter + 9
+
+    def test_no_hold_in_a_demoted_request_s_last_demoted_pass(self):
+        sched, _ = self._make(context_demote_max_iters=3)
+        long_req = self._req(0, 10_000)
+        self._arm(sched, long_req)
+        sched._ctx_demote_skips = {0: 2}
+        out = sched.schedule_request([long_req, self._req(1, 200)], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched._claim_hold_counters["off_aging"] == 1
+
+    def test_candidates_are_what_the_next_pass_admits(self):
+        """Demoted, given-up and prefix-waiting requests are not picked; one already claimed
+        takes budget but no room; picking stops once the next pass's budget is spent."""
+        sched, _ = self._make(claimed={2}, given_up={3})
+        long_req, a, claimed, gone, waiter, b, c = (
+            self._req(i, 10_000 if i == 0 else 600) for i in range(7)
+        )
+        sched._ctx_demote_probes = {1: 600, 2: 300, 5: 600, 6: 600}
+        sched._pick_claim_candidates(
+            [long_req, a, claimed, gone, waiter, b, c], [], [], {0}, {4: None}
+        )
+        assert ids(sched.context_claim_candidates) == [1, 5]
+        # A started request ahead takes its remainder first.
+        started = self._req(7, 900)
+        started.is_first_context_chunk = False
+        sched._pick_claim_candidates([started, a, b], [], [], set(), {})
+        assert ids(sched.context_claim_candidates) == [1]
+
+    def test_without_claims_ahead_on_the_manager_the_executor_order_stays(self):
+        sched, mgr = self._make()
+        mgr.context_claim_limit = 0
+        long_req, new = self._req(0, 10_000), self._req(1, 200)
+        sched.schedule_request([long_req], set())
+        out = sched.schedule_request([long_req, new], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert sched.context_claim_candidates is None
+
+
+class TestDemoteNoWalk:
+    """scheduler_config.context_demote_no_walk: the demotion probe takes a waiting request's reuse
+    from its conversation's earlier prompt where that proves it short."""
+
+    def _make(self, no_walk=True, probe=True, reused=None):
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        mgr.committed_prompt_depth.side_effect = lambda prompt_len: prompt_len - 2
+        reused = reused or {}
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1024,
+            ctx_chunk_config=(None, 64),
+            context_demote_uncached_tokens=1024,
+            context_demote_max_iters=0,
+            context_demote_probe=probe,
+            context_demote_no_walk=no_walk,
+        )
+        return sched, mgr
+
+    def _req(self, request_id, tokens, conversation="c0"):
+        req = make_ctx_request(request_id, context_remaining_length=len(tokens))
+        req.py_uncached_prefill_tokens = None
+        req.is_dummy_request = False
+        req.multimodal_hashes = None
+        req.cache_salt = None
+        req.get_tokens_view.return_value = list(tokens)
+        req.py_conversation_params = (
+            None if conversation is None else SimpleNamespace(conversation_id=conversation)
+        )
+        return req
+
+    def _walks(self, mgr, request_id):
+        return [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list].count(
+            request_id
+        )
+
+    def test_ignored_without_the_probe(self):
+        sched, _ = self._make(probe=False)
+        assert sched._ctx_prompt_records is None
+
+    def test_a_continuing_turn_is_short_without_a_walk(self):
+        sched, mgr = self._make()
+        turn1 = list(range(3000))
+        sched.schedule_request([self._req(0, turn1)], set())
+        turn2 = turn1 + list(range(5000, 5500))
+        sched.schedule_request([self._req(1, turn2)], set())
+        assert self._walks(mgr, 1) == 0
+        # 3500 tokens, 2998 proved reusable: 502 left, short.
+        assert sched._ctx_demote_probes[1] == 502
+        assert sched._ctx_prompt_records.stats["no_walk"] == 1
+
+    def test_a_record_that_leaves_the_request_long_is_walked(self):
+        sched, mgr = self._make(reused={1: 0})
+        turn1 = list(range(3000))
+        sched.schedule_request([self._req(0, turn1)], set())
+        sched.schedule_request([self._req(1, turn1 + list(range(5000, 7000)))], set())
+        assert self._walks(mgr, 1) == 1
+        assert sched._ctx_prompt_records.stats["record_long"] == 1
+
+    def test_another_prefix_or_conversation_is_walked(self):
+        sched, mgr = self._make()
+        sched.schedule_request([self._req(0, list(range(3000)))], set())
+        sched.schedule_request([self._req(1, [7] + list(range(1, 3200)))], set())
+        sched.schedule_request([self._req(2, list(range(3200)), conversation="c1")], set())
+        sched.schedule_request([self._req(3, list(range(3200)), conversation=None)], set())
+        assert [self._walks(mgr, i) for i in (1, 2, 3)] == [1, 1, 1]
+
+    def test_a_record_whose_request_still_holds_its_cache_is_not_trusted(self):
+        sched, mgr = self._make()
+        sched.schedule_request([self._req(0, list(range(3000)))], set())
+        mgr.kv_cache_map[0] = Mock()
+        sched.schedule_request([self._req(1, list(range(3200)))], set())
+        assert self._walks(mgr, 1) == 1
+        assert sched._ctx_prompt_records.stats["inflight"] == 1
+
+    def test_off_by_default(self):
+        sched, mgr = self._make(no_walk=False)
+        sched.schedule_request([self._req(0, list(range(3000)))], set())
+        sched.schedule_request([self._req(1, list(range(3200)))], set())
+        assert self._walks(mgr, 1) == 1
+
+
+class TestConversationPromptRecords:
+    """The records behind context_demote_no_walk."""
+
+    def _req(self, request_id, conversation="c0", salt=None):
+        return SimpleNamespace(
+            py_request_id=request_id,
+            is_dummy_request=False,
+            py_conversation_params=SimpleNamespace(conversation_id=conversation),
+            lora_task_id=None,
+            cache_salt=salt,
+        )
+
+    def _records(self, now):
+        from tensorrt_llm._torch.pyexecutor.scheduler.context_demote_records import (
+            ConversationPromptRecords,
+        )
+
+        return ConversationPromptRecords(clock=lambda: now[0])
+
+    def test_proves_the_deepest_matching_record(self):
+        now = [0.0]
+        records = self._records(now)
+        records.record(self._req(0), list(range(100)), 98)
+        records.record(self._req(1), list(range(50)) + [7] * 60, 108)
+        never_cached = lambda rid: False  # noqa: E731
+        assert records.proven_depth(self._req(2), list(range(120)), never_cached) == 98
+        assert records.proven_depth(self._req(3), list(range(50)) + [7] * 70, never_cached) == 108
+        # Another reuse scope, or a prompt that does not extend past a record, proves nothing.
+        assert records.proven_depth(self._req(4, salt="s"), list(range(120)), never_cached) is None
+        assert records.proven_depth(self._req(5), list(range(98)), never_cached) is None
+
+    def test_a_proved_continuation_extends_its_record(self):
+        now = [0.0]
+        records = self._records(now)
+        records.record(self._req(0), list(range(100)), 98)
+        turn2 = list(range(200))
+        assert records.proven_depth(self._req(1), turn2, lambda rid: False) == 98
+        records.record(self._req(1), turn2, 198)
+        (slot,) = records._records[("c0", None, None)]
+        assert (slot.request_id, slot.depth) == (1, 198)
+        assert list(slot.tokens[:198]) == turn2[:198]
+
+    def test_sessions_take_their_own_slots_up_to_the_limit(self):
+        now = [0.0]
+        records = self._records(now)
+        for rid in range(4):
+            now[0] += 1.0
+            records.record(self._req(rid), [rid] * 50, 48)
+        slots = records._records[("c0", None, None)]
+        assert sorted(s.request_id for s in slots) == [1, 2, 3]
+
+    def test_old_records_are_not_trusted(self):
+        now = [0.0]
+        records = self._records(now)
+        records.record(self._req(0), list(range(100)), 98)
+        now[0] = records.MAX_AGE_S + 1
+        assert records.proven_depth(self._req(1), list(range(120)), lambda rid: False) is None
+        assert records.stats["stale"] == 1

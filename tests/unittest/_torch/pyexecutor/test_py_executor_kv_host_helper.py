@@ -41,6 +41,7 @@ def _executor(active_requests=()):
     ex._kv_host_helper = Mock()
     ex.kv_cache_manager = Mock()
     ex.active_requests = list(active_requests)
+    ex.scheduler = SimpleNamespace(context_claim_candidates=None)
     ex._is_warmup = False
     ex._forward_step_impl = Mock(return_value={"logits": None})
     return ex
@@ -64,6 +65,20 @@ def test_a_context_only_forward_opens_the_window_and_claims_ahead() -> None:
     (candidates,), _ = ex.kv_cache_manager.claim_context_ahead.call_args
     assert [req.py_request_id for req in candidates] == [2, 5]
     ex._forward_step_impl.assert_called_once_with(batch, None)
+
+
+def test_the_scheduler_s_picks_replace_the_arrival_order() -> None:
+    """scheduler_config.context_claim_hold: the scheduler's candidates, in its order, minus what
+    the batch runs or no longer waits for its first chunk."""
+    scheduled, held, older, started = _request(1), _request(2), _request(3), _request(4)
+    started.is_first_context_chunk = False
+    ex = _executor([scheduled, older, held, started])
+    ex.scheduler.context_claim_candidates = [held, scheduled, started]
+
+    ex._forward_step(_batch(context=[scheduled]))
+
+    (candidates,), _ = ex.kv_cache_manager.claim_context_ahead.call_args
+    assert [req.py_request_id for req in candidates] == [2]
 
 
 @pytest.mark.parametrize("reason", ["generation", "warmup", "torch_compile"])

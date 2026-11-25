@@ -5763,6 +5763,35 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "one pass at most; outputs are unchanged."),
         status="prototype")
 
+    context_claim_hold: bool = Field(
+        default=False,
+        description=
+        ("With kv_cache_config.context_claim_ahead > 0, long-prefill "
+         "demotion (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0, chunked prefill) "
+         "and the FCFS context order (KV cache manager V2): a first context "
+         "chunk goes behind the demoted long prefills of the scheduling pass "
+         "that first sees it, once, so that when the token budget is taken "
+         "it waits one pass and the host helper claims its cache under the "
+         "next forward instead of the executor thread claiming it inline. "
+         "The scheduler also picks what the helper claims: the waiting first "
+         "chunks the next pass is expected to admit, not every waiting one "
+         "in arrival order. Set it on context servers. Changes the context "
+         "order by at most one pass; outputs are unchanged."),
+        status="prototype")
+
+    context_demote_no_walk: bool = Field(
+        default=False,
+        description=(
+            "With context_demote_probe on: a waiting request whose "
+            "conversation's earlier prompt (kept by the scheduler for requests "
+            "it scheduled, up to the depth their prefill left reusable) proves "
+            "it short is classified without the probe's radix walk over its "
+            "whole prompt. A record that leaves the request long, or no record, "
+            "falls back to the probe; when the recorded blocks are no longer "
+            "cached the request is not demoted. Needs the FCFS context order. "
+            "Changes the context order only."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
         if (self.waiting_queue_max_wait_s is not None

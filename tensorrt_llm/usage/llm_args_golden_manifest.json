@@ -1737,6 +1737,16 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "scheduler_config.context_claim_hold"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.context_demote_no_walk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "scheduler_config.context_demote_probe"
     },
     {

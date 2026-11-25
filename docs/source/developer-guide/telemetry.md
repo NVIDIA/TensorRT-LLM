@@ -303,6 +303,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sampler_force_async_worker` | `bool` | `value` |  |
 | `scheduler_config.capacity_scheduler_policy` | `enum[CapacitySchedulerPolicy]` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `enum[ContextChunkingPolicy]\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
+| `scheduler_config.context_claim_hold` | `bool` | `value` |  |
+| `scheduler_config.context_demote_no_walk` | `bool` | `value` |  |
 | `scheduler_config.context_demote_probe` | `bool` | `value` |  |
 | `scheduler_config.context_scheduling_policy` | `enum[ContextSchedulingPolicy]` | `categorical` | `fcfs`, `shortest_uncached_first` |
 | `scheduler_config.context_starvation_iterations` | `int\|none` | `value` |  |

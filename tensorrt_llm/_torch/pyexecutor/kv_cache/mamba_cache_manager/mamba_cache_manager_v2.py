@@ -780,6 +780,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for buffer in self._get_recurrent_buffer_configs(layer_id)
         )
 
+    def committed_prompt_depth(self, prompt_len: int) -> int:
+        """A later prompt reuses a finished prefill up to a recurrent-state snapshot: the
+        deepest one its from-end offsets place (``mamba_state_config``); 0 without one (a
+        snapshot grid alone is not taken as committed)."""
+        if not self.kv_cache_config.enable_block_reuse:
+            return 0
+        offsets = self.kv_cache_config.mamba_state_config.additional_snapshot_offsets_from_end
+        return max(
+            (prompt_len - offset for offset in offsets if 0 < offset < prompt_len), default=0
+        )
+
     def _num_ssm_snapshots_for_capacity(
         self,
         capacity: int,

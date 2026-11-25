@@ -475,6 +475,28 @@ def test_claims_released_for_pages_are_not_made_again_at_once() -> None:
     assert sorted(manager._claims) == [6]
 
 
+def test_the_scheduler_reads_the_claim_room_and_state() -> None:
+    """What scheduler_config.context_claim_hold reads: the room left, a parked claim, a
+    given-up request, and no room while claims are paused after a release for pages."""
+    manager, _ = _manager()
+    assert manager.context_claim_limit == 0 and manager.context_claim_room() == 0
+    manager, _ = _claim_manager(limit=3)
+    assert manager.context_claim_limit == 3 and manager.context_claim_room() == 3
+    manager.claim_context_ahead([_context_request(5)])
+    assert manager.context_claim_room() == 2
+    assert manager.has_context_claim(5) and not manager.has_context_claim(6)
+    manager.release_claims_ahead()
+    assert manager.context_claim_given_up(5) and not manager.has_context_claim(5)
+    assert manager.context_claim_room() == 0  # paused
+
+
+def test_committed_prompt_depth() -> None:
+    manager, _ = _manager()  # tokens_per_block 4
+    assert manager.committed_prompt_depth(10) == 8
+    manager.enable_block_reuse = False
+    assert manager.committed_prompt_depth(10) == 0
+
+
 def test_a_running_claim_does_not_age_out_under_a_forward() -> None:
     manager, _ = _claim_manager()
     manager.claim_context_ahead([_context_request(5)])
@@ -599,6 +621,22 @@ def test_the_hybrid_mamba_manager_keeps_claims() -> None:
     manager = object.__new__(mamba.MambaHybridCacheManagerV2)
 
     assert manager._context_claim_path_overrides() == []
+
+
+def test_the_hybrid_mamba_manager_commits_at_its_from_end_snapshot() -> None:
+    """A later prompt reuses a hybrid model's prefill up to the snapshot its from-end offset places
+    (context_demote_no_walk's record depth); without one, nothing is taken as committed."""
+    mamba = pytest.importorskip(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2"
+    )
+    from types import SimpleNamespace
+
+    manager = object.__new__(mamba.MambaHybridCacheManagerV2)
+    state = SimpleNamespace(additional_snapshot_offsets_from_end=[2, 5])
+    manager.kv_cache_config = SimpleNamespace(enable_block_reuse=True, mamba_state_config=state)
+    assert manager.committed_prompt_depth(3000) == 2998
+    state.additional_snapshot_offsets_from_end = []
+    assert manager.committed_prompt_depth(3000) == 0
 
 
 # ---------------------------------------------------------------------------

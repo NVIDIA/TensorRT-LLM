@@ -12496,13 +12496,16 @@ class PyExecutor:
             helper.end_forward()
 
     def _context_claim_candidates(self, scheduled_requests: ScheduledRequests):
-        """Waiting first context chunks outside this batch, in arrival order."""
+        """Waiting first context chunks outside this batch: the ones the scheduler picked
+        (scheduler_config.context_claim_hold), else all of them in arrival order."""
         scheduled = {
             req.py_request_id
             for req in scheduled_requests.context_requests
         }
         context_init = LlmRequestState.CONTEXT_INIT
-        return (req for req in self.active_requests
+        picked = getattr(self.scheduler, "context_claim_candidates", None)
+        requests = picked if isinstance(picked, list) else self.active_requests
+        return (req for req in requests
                 if req.state == context_init and req.is_first_context_chunk and
                 not req.is_dummy_request and req.py_request_id not in scheduled)
 

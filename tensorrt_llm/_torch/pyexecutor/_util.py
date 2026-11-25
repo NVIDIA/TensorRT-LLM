@@ -5835,6 +5835,23 @@ def create_py_executor_resources(
             "needs a disaggregated server and the KV cache manager V2 scheduler"
         )
         gen_init_pause_after_release = False
+    context_claim_hold = (scheduler_config is not None
+                          and scheduler_config.context_claim_hold)
+    if context_claim_hold and not (
+            isinstance(kv_cache_manager, KVCacheManagerV2)
+            and llm_args.kv_cache_config.context_claim_ahead > 0):
+        logger.warning(
+            "scheduler_config.context_claim_hold is ignored: it needs "
+            "kv_cache_config.context_claim_ahead > 0 and the KV cache manager V2 "
+            "scheduler")
+        context_claim_hold = False
+    context_demote_no_walk = (scheduler_config is not None
+                              and scheduler_config.context_demote_no_walk)
+    if context_demote_no_walk and not isinstance(kv_cache_manager,
+                                                 KVCacheManagerV2):
+        logger.warning("scheduler_config.context_demote_no_walk is ignored: it "
+                       "needs the KV cache manager V2 scheduler")
+        context_demote_no_walk = False
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -5881,6 +5898,8 @@ def create_py_executor_resources(
             gen_init_pause_after_release=gen_init_pause_after_release,
             reclaim_context_claims=llm_args.kv_cache_config.context_claim_ahead
             > 0,
+            context_claim_hold=context_claim_hold,
+            context_demote_no_walk=context_demote_no_walk,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

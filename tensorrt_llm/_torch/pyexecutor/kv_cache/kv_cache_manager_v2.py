@@ -10344,6 +10344,34 @@ class KVCacheManagerV2(BaseResourceManager):
         self._close_claimed(request_id, kv_cache)
         return True
 
+    @property
+    def context_claim_limit(self) -> int:
+        """Claims ahead the host helper may park (kv_cache_config.context_claim_ahead); 0: off."""
+        return self._claim_ahead_limit
+
+    def context_claim_room(self) -> int:
+        """Claims the next `claim_context_ahead` call may queue: the limit less the parked
+        claims; 0 while claims are off or paused after `release_claims_ahead`."""
+        if not self._claim_ahead_limit or self._claims_paused:
+            return 0
+        return max(self._claim_ahead_limit - len(self._claims), 0)
+
+    def has_context_claim(self, request_id: int) -> bool:
+        """Whether a claim ahead is parked (queued, running or done) for this request."""
+        return request_id in self._claims
+
+    def context_claim_given_up(self, request_id: int) -> bool:
+        """Whether this request's claim aged out or was released: it is not claimed again."""
+        return request_id in self._claims_expired
+
+    def committed_prompt_depth(self, prompt_len: int) -> int:
+        """Prompt tokens a finished prefill of ``prompt_len`` tokens leaves reusable for a
+        later prompt that extends it, as a lower bound: its full blocks. Managers whose reuse
+        ends at recurrent-state snapshots override it."""
+        if not self.enable_block_reuse:
+            return 0
+        return prompt_len // self.tokens_per_block * self.tokens_per_block
+
     def release_claims_ahead(self) -> bool:
         """Close every parked claim, so that its pages go back to the pool. Their requests are
         not claimed again, and no claim is made in the next four forwards: claims made meanwhile
