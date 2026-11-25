@@ -82,20 +82,14 @@ def _kernels_serve_short_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
 
 
-def _quant_config(v_dtype: str = "fp8") -> QuantAttentionConfig:
-    return QuantAttentionConfig(qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True)
-
-
-def _backend(num_heads: int, v_dtype: str = "fp8") -> DeCoAttention:
+def _backend(num_heads: int, recipe: QuantAttentionConfig) -> DeCoAttention:
     """A DeCo layer from the factory."""
     attn = create_attention(
         backend="CUTEDSL",
         layer_idx=0,
         num_heads=num_heads,
         head_dim=HEAD_DIM,
-        attention_config=AttentionConfig(
-            backend="CUTEDSL", quant_attention_config=_quant_config(v_dtype)
-        ),
+        attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe),
     )
     assert isinstance(attn, DeCoAttention)
     return attn
@@ -196,7 +190,7 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
     return 1, seq_len, num_heads, seq_len // 2 - 156
 
 
-def test_deco_selection() -> None:
+def test_deco_selection(deco_recipe) -> None:
     """CUTEDSL keeps its dense backend unless the quantization recipe asks for DeCo-Attention,
     which takes the padding of a call as a key padding mask with the padding of every sample
     behind its tokens."""
@@ -208,7 +202,7 @@ def test_deco_selection() -> None:
         is CuTeDSLAttention
     )
     assert (
-        get_visual_gen_attention_backend("CUTEDSL", quant_attention_config=_quant_config())
+        get_visual_gen_attention_backend("CUTEDSL", quant_attention_config=deco_recipe())
         is DeCoAttention
     )
     assert DeCoAttention.support_key_padding_mask()
@@ -228,10 +222,10 @@ def test_deco_selection() -> None:
     assert get_padding_support(config("FLASHINFER", quantized)) == (False, False, False)
     assert get_padding_support(config("TRTLLM")) == (False, True, True)
     assert get_padding_support(config("TRTLLM", quantized)) == (False, False, False)
-    assert get_padding_support(config("CUTEDSL", _quant_config())) == (True, False, True)
+    assert get_padding_support(config("CUTEDSL", deco_recipe())) == (True, False, True)
 
 
-def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> None:
+def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels, deco_recipe) -> None:
     """The Attention module builds a cross-attention layer on VANILLA under a DeCo-Attention
     recipe, with separate or fused K and V projections, and a self-attention layer on the DeCo
     backend: the backend reads q, k and v of one shape as one sequence, which a cross-attention
@@ -248,7 +242,7 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
         pretrained_config=SimpleNamespace(
             hidden_size=hidden_size, num_attention_heads=num_heads, attention_head_dim=HEAD_DIM
         ),
-        attention=AttentionConfig(backend="CUTEDSL", quant_attention_config=_quant_config()),
+        attention=AttentionConfig(backend="CUTEDSL", quant_attention_config=deco_recipe()),
         skip_create_weights_in_init=True,
     )
 
@@ -277,15 +271,15 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
         assert type(self_attention.attn) is DeCoAttention
 
 
-def test_deco_layer_construction(require_deco_kernels, kernel_calls: list) -> None:
+def test_deco_layer_construction(require_deco_kernels, deco_recipe, kernel_calls: list) -> None:
     """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only). A layer whose
     head dimension or K/V head count the kernels do not take is built and runs all its calls on
     VANILLA."""
     device = require_deco_kernels()
-    args = dict(num_heads=4, head_dim=HEAD_DIM, quant_attention_config=_quant_config())
+    args = dict(num_heads=4, head_dim=HEAD_DIM, quant_attention_config=deco_recipe())
     if "nvfp4" not in deco_backend.supported_v_dtypes():
         with pytest.raises(ValueError, match="no kernel for qk_dtype='nvfp4', v_dtype='nvfp4'"):
-            DeCoAttention(**{**args, "quant_attention_config": _quant_config("nvfp4")})
+            DeCoAttention(**{**args, "quant_attention_config": deco_recipe("nvfp4")})
 
     for geometry in ({"head_dim": 64}, {"num_kv_heads": 2}):
         attn = DeCoAttention(**{**args, **geometry})
@@ -310,6 +304,7 @@ def test_deco_layer_construction(require_deco_kernels, kernel_calls: list) -> No
 )
 def test_deco_forward_matches_sdpa(
     require_deco_kernels,
+    deco_recipe,
     kernel_calls: list,
     v_dtype: str,
     batch_size: int,
@@ -320,7 +315,7 @@ def test_deco_forward_matches_sdpa(
     an attention that ignores Q and K (uniform weights) on rows that a few keys dominate."""
     device = require_deco_kernels(v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
 
     out = attn.forward(q, k, v)
 
@@ -475,7 +470,9 @@ def test_deco_preparations_on_two_streams_finish(require_deco_kernels) -> None:
     assert child.exitcode == 0
 
 
-def test_deco_kernel_api_host_checks(require_deco_kernels, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deco_kernel_api_host_checks(
+    require_deco_kernels, deco_recipe, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The kernels move q, k, v and out through TMA descriptors and vector stores that assume
     256-byte aligned base addresses: a view into an allocation at an offset of 128 elements is
     served, one at an offset of one or of eight elements is rejected.
@@ -496,7 +493,7 @@ def test_deco_kernel_api_host_checks(require_deco_kernels, monkeypatch: pytest.M
         deco_attention.attention(deco_attention.prepare(q, k, v, workspace, "fp8"), out), expected
     )
 
-    attn = _backend(shape[2])
+    attn = _backend(shape[2], deco_recipe())
     for offset in (1, 8):
         misaligned = backing[offset : offset + q.numel()].view(shape)
         assert misaligned.is_contiguous()
@@ -539,7 +536,9 @@ def test_deco_kernel_api_host_checks(require_deco_kernels, monkeypatch: pytest.M
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_reads_the_slices_of_a_fused_projection(require_deco_kernels, v_dtype: str) -> None:
+def test_deco_reads_the_slices_of_a_fused_projection(
+    require_deco_kernels, deco_recipe, v_dtype: str
+) -> None:
     """The preparation reads q, k and v in place from a fused QKV projection, whose slices are
     strided over the heads: the bits of contiguous copies, with and without valid lengths, and
     the backend hands such slices to the kernels without a copy. A slice of another layout is
@@ -558,7 +557,7 @@ def test_deco_reads_the_slices_of_a_fused_projection(require_deco_kernels, v_dty
             q.contiguous(), k.contiguous(), v.contiguous(), v_dtype, valid_seq_lens=valid_seq_lens
         )
         assert torch.equal(_kernels(q, k, v, v_dtype, valid_seq_lens=valid_seq_lens), expected)
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
     contiguous_out = attn.forward(q.contiguous(), k.contiguous(), v.contiguous())
     assert torch.equal(attn.forward(q, k, v), contiguous_out)
     num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
@@ -583,14 +582,14 @@ def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtyp
         torch.testing.assert_close(out, v, rtol=2e-2, atol=0)
 
 
-def test_deco_call_leaves_no_workspace_behind(require_deco_kernels) -> None:
+def test_deco_call_leaves_no_workspace_behind(require_deco_kernels, deco_recipe) -> None:
     """The workspace of a call comes from the caching allocator and lives for the call: the
     layers of a component hold no buffer between forwards, and calls of other sizes in between
     leave nothing a later call depends on."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 512, 4
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
-    first, second = _backend(num_heads), _backend(num_heads)
+    first, second = _backend(num_heads, deco_recipe()), _backend(num_heads, deco_recipe())
     out = first.forward(q, k, v)
     others = [_random_qkv(batch_size, n, num_heads, device, seed=1) for n in (200, 1024)]
     # The first call of a sequence length draws its basis rows, which the kernel package keeps.
@@ -606,7 +605,7 @@ def test_deco_call_leaves_no_workspace_behind(require_deco_kernels) -> None:
     assert torch.cuda.memory_allocated(device) == allocated
 
 
-def test_deco_forward_keeps_its_caller_compiled(require_deco_kernels) -> None:
+def test_deco_forward_keeps_its_caller_compiled(require_deco_kernels, deco_recipe) -> None:
     """A torch.compile'd caller keeps its own operations compiled around the backend. The one
     graph break is the call that launches the kernels: a tensor address read in traced code
     would make the compiler give up the whole frame of the caller."""
@@ -614,7 +613,7 @@ def test_deco_forward_keeps_its_caller_compiled(require_deco_kernels) -> None:
 
     device = require_deco_kernels()
     seq_len, num_heads = 512, 2
-    attn = _backend(num_heads)
+    attn = _backend(num_heads, deco_recipe())
 
     class Caller(torch.nn.Module):
         def forward(self, x, key_padding_mask, token_tags):
@@ -642,14 +641,14 @@ def test_deco_forward_keeps_its_caller_compiled(require_deco_kernels) -> None:
 
 
 def test_deco_delegates_unsupported_calls(
-    require_deco_kernels, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
+    require_deco_kernels, deco_recipe, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cross-attention, a causal mask and other dtypes run on VANILLA, unquantized; the layer
     notes its first delegated self-attention call with what keeps it from the kernels."""
     device = require_deco_kernels()
     num_heads = 2
     q, k, v = _random_qkv(1, 256, num_heads, device)
-    attn = _backend(num_heads)
+    attn = _backend(num_heads, deco_recipe())
 
     # The note names the dtype of K or V when Q is bfloat16. VANILLA takes one dtype for all.
     notes = []
@@ -685,7 +684,7 @@ def test_deco_delegates_unsupported_calls(
 
 
 def test_deco_delegates_short_calls(
-    require_deco_kernels, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
+    require_deco_kernels, deco_recipe, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A self-attention call over fewer than ``MIN_SEQ_LEN`` rows, such as the text sequence
     of a token refiner, runs on VANILLA, with the note; a call of that many rows runs on the
@@ -694,7 +693,7 @@ def test_deco_delegates_short_calls(
     monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", MIN_SEQ_LEN)
     assert MIN_SEQ_LEN > 256
     num_heads = 2
-    attn = _backend(num_heads)
+    attn = _backend(num_heads, deco_recipe())
 
     q, k, v = _random_qkv(2, 160, num_heads, device)
     key_padding_mask = torch.ones(2, 160, dtype=torch.bool, device=device)
@@ -719,7 +718,7 @@ def test_deco_delegates_short_calls(
 
 
 def test_deco_token_tags_draw_the_basis_rows_by_modality(
-    require_deco_kernels, kernel_inputs: list
+    require_deco_kernels, deco_recipe, kernel_inputs: list
 ) -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
     text and audio tokens and none from the padding. The rows are drawn on the device, the same
@@ -733,7 +732,7 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(
     token_tags[100:160] = 2  # audio
     token_tags[-8:] = -1  # padding
     num_rows = deco_attention.inputs.sample_count(seq_len)
-    attn = _backend(num_heads)
+    attn = _backend(num_heads, deco_recipe())
 
     out = attn.forward(q, k, v, token_tags=token_tags)
 
@@ -808,7 +807,7 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_prefix_mask_attends_the_prefix(
-    require_deco_kernels, kernel_inputs: list, v_dtype: str
+    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str
 ) -> None:
     """The tokens of a sample are its first rows and the rows after them padding: the tokens
     attend their own keys only, whatever the padding holds, and the padded rows come back zero.
@@ -816,7 +815,7 @@ def test_deco_prefix_mask_attends_the_prefix(
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_tokens, num_heads = 2, 1024, 700, 3
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
 
     positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
     prefix_mask = positions < num_tokens
@@ -973,7 +972,7 @@ def test_deco_sm120_nvfp4_split_units_merge_a_padded_half(require_deco_kernels) 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_key_padding_mask_attends_the_tokens(
-    require_deco_kernels, kernel_inputs: list, v_dtype: str
+    require_deco_kernels, deco_recipe, kernel_inputs: list, v_dtype: str
 ) -> None:
     """With a ``key_padding_mask`` every sample attends its own tokens only and the masked rows
     come back zero. A sample whose mask excludes every row comes back zero, on the kernels and
@@ -981,7 +980,7 @@ def test_deco_key_padding_mask_attends_the_tokens(
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 1024, 3
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
 
     # The samples hold different numbers of tokens, each followed by its padding.
     lengths = torch.tensor([717, 600], device=device)
@@ -1037,13 +1036,15 @@ def test_deco_key_padding_mask_attends_the_tokens(
     assert torch.equal(out, attn.forward(q, k, v, key_padding_mask=inference_mask.clone()))
 
 
-def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels, kernel_inputs: list) -> None:
+def test_deco_token_tags_with_a_key_padding_mask(
+    require_deco_kernels, deco_recipe, kernel_inputs: list
+) -> None:
     """With token tags and a mask every sample gets the draw of its own tokens, half of it from
     its text: the samples of a batch may hold text of different lengths."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 2, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    attn = _backend(num_heads)
+    attn = _backend(num_heads, deco_recipe())
 
     # Video, then text with the padding of every sample last: the tags mark no padding.
     num_video = 3600
@@ -1070,13 +1071,15 @@ def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels, kernel_in
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: str) -> None:
+def test_deco_cuda_graph_with_a_key_padding_mask(
+    require_deco_kernels, deco_recipe, v_dtype: str
+) -> None:
     """A captured forward with a mask and token tags computes its token counts and basis rows
     inside the graph: a replay follows the content of the mask and tags tensors of the capture,
     which the eager forward before it has not seen."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 2048, 2
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
     token_tags[1800:] = 1
@@ -1112,13 +1115,13 @@ def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: 
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_cuda_graph(require_deco_kernels, v_dtype: str) -> None:
+def test_deco_cuda_graph(require_deco_kernels, deco_recipe, v_dtype: str) -> None:
     """A forward is captured after an eager forward of its shape and replays onto new inputs,
     also after eager forwards of other shapes and other token tags. A sequence length first met
     under capture is rejected with a clear error."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 1, 384, 2
-    attn = _backend(num_heads, v_dtype)
+    attn = _backend(num_heads, deco_recipe(v_dtype))
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
     token_tags[:64] = 1

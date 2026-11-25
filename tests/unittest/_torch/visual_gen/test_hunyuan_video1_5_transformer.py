@@ -190,21 +190,17 @@ class TestHunyuanVideo15Transformer(unittest.TestCase):
         self.assertEqual(output.shape, hidden_states.shape)
 
 
-def test_deco_recipe_builds_deco_layers(require_deco_kernels):
+def test_deco_recipe_builds_deco_layers(require_deco_kernels, deco_recipe):
     """Every attention layer of a model under a DeCo-Attention recipe is a DeCo layer."""
     from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
     from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5 import (
         transformer_hunyuan_video1_5 as hunyuan,
     )
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     require_deco_kernels()
     model_config = _create_model_config(CONFIG | {"num_layers": 1}, backend="CUTEDSL")
     model_config.attention = AttentionConfig(
-        backend="CUTEDSL",
-        quant_attention_config=QuantAttentionConfig(
-            qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
-        ),
+        backend="CUTEDSL", quant_attention_config=deco_recipe()
     )
     model = hunyuan.HunyuanVideo15Transformer3DModel(model_config)
 

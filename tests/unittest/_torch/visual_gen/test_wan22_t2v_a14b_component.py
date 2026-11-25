@@ -68,8 +68,6 @@ DECO_LOSS_BUDGET = 0.02
 SAGE_RECIPE = QuantAttentionConfig(
     qk_dtype="int8", v_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1
 )
-# The DeCo-Attention recipe: compensated NVFP4 Q/K, FP8 V.
-DECO_RECIPE = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -378,9 +376,12 @@ def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     _assert_within(scores, SAGE_LOSS_BUDGET, f"{EXPERT} SageAttention vs BF16")
 
 
-def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels, monkeypatch):
+def test_deco_attention_loss_budget(
+    checkpoint, dit_inputs, require_deco_kernels, deco_recipe, monkeypatch
+):
     """DeCo-Attention against dense BF16 attention on the same block and inputs."""
-    require_deco_kernels(DECO_RECIPE.v_dtype)
+    recipe = deco_recipe()
+    require_deco_kernels(recipe.v_dtype)
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 
     weights = _block_weights(checkpoint, EXPERT)
@@ -391,9 +392,9 @@ def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels
         checkpoint,
         EXPERT,
         weights,
-        attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=DECO_RECIPE),
+        attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe),
     )
-    _assert_attention_backend(model, "CUTEDSL", DECO_RECIPE)
+    _assert_attention_backend(model, "CUTEDSL", recipe)
     prepare, calls = deco_attention.prepare, []
 
     def recording(q, *args, **kwargs):

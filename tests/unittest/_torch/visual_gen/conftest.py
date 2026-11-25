@@ -3,9 +3,13 @@
 """Shared pytest configuration for the VisualGen unit tests."""
 
 from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +45,18 @@ def isolated_cudnn_plans(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[
     reset()
     yield
     reset()
+
+
+@pytest.fixture
+def deco_recipe() -> Callable[..., "QuantAttentionConfig"]:
+    """Return a function that builds the DeCo-Attention recipe: compensated NVFP4 Q/K with V
+    in ``v_dtype`` (``fp8`` by default)."""
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    def recipe(v_dtype: str = "fp8") -> QuantAttentionConfig:
+        return QuantAttentionConfig(qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True)
+
+    return recipe
 
 
 @pytest.fixture

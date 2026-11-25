@@ -38,7 +38,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 try:
     from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import _flash_attn_fwd
@@ -486,16 +486,7 @@ def test_attention_dispatches_fused_qk_norm_rope_per_instance(monkeypatch):
     )
 
 
-def _deco_attention_config() -> AttentionConfig:
-    return AttentionConfig(
-        backend="CUTEDSL",
-        quant_attention_config=QuantAttentionConfig(
-            qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
-        ),
-    )
-
-
-def test_deco_recipe_builds_deco_layers(require_deco_kernels) -> None:
+def test_deco_recipe_builds_deco_layers(require_deco_kernels, deco_recipe) -> None:
     """Every attention layer of a model under a DeCo-Attention recipe is a DeCo layer."""
     from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 
@@ -503,7 +494,7 @@ def test_deco_recipe_builds_deco_layers(require_deco_kernels) -> None:
     config = _make_model_config(
         num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
     )
-    config.attention = _deco_attention_config()
+    config.attention = AttentionConfig(backend="CUTEDSL", quant_attention_config=deco_recipe())
     model = h3.MiniMaxH3Transformer3DModel(config)
 
     layers = [m.attn for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
@@ -1017,7 +1008,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
     ],
 )
 def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
-    backend: str, mask: bool, length: bool, trailing: bool, require_deco_kernels
+    backend: str, mask: bool, length: bool, trailing: bool, require_deco_kernels, deco_recipe
 ) -> None:
     """The model reads from the backend class what it takes for padding: a key padding mask,
     the length of the valid prefix, both or neither, and whether the padding must follow the
@@ -1025,7 +1016,7 @@ def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
     config = _make_model_config()
     if backend == "DECO":
         require_deco_kernels()
-        config.attention = _deco_attention_config()
+        config.attention = AttentionConfig(backend="CUTEDSL", quant_attention_config=deco_recipe())
     else:
         config.attention = AttentionConfig(backend=backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
