@@ -1200,6 +1200,17 @@ def _run_test_for_backend(backend_name,
                         cuda_capability == (9, 0))
                 attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
                 attn_metadata.prepare()
+                if (backend_name == "TRTLLM" and generation_seq_len_q > 1
+                        and cuda_capability == (12, 0)):
+                    # SM120 verifies MTP drafts with the XQA MLA kernel.
+                    attn_metadata.update_spec_dec_param(
+                        batch_size=len(context_sequence_lengths),
+                        is_spec_decoding_enabled=True,
+                        is_spec_dec_tree=False,
+                        is_spec_dec_dynamic_tree=False,
+                        max_draft_len=generation_seq_len_q - 1,
+                        max_total_draft_tokens=generation_seq_len_q - 1,
+                    )
             for layer_idx in range(num_layers):
                 print(
                     f"--------------------------------step {step} layer {layer_idx} start--------------------------------"

@@ -1879,6 +1879,16 @@ bool XqaFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) con
             usable = fillParams<T>(op, p, params, /*forConfigurePlugin=*/false)
                 && mRunner->supportConfig(params, /*forConfigurePlugin=*/false);
         });
+    if constexpr (std::is_same_v<AttentionVariant, MLA>)
+    {
+        // The MLA kernel takes uniform, linear draft tokens under a causal mask.
+        auto const& specDec = op.template feature<torch_ext::SpecDecodingFeature>();
+        if (usable && specDec.active() && specDec.isGenerationLengthVariable())
+        {
+            TLLM_LOG_DEBUG("XQA MLA declines tree or variable-length speculative decoding.");
+            return false;
+        }
+    }
     return usable;
 }
 

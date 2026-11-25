@@ -824,6 +824,7 @@ public:
         mBlTreeMaskCapacity = 0;
         mFirstSparseMaskOffsetKv = nullptr;
         mMaxGenLen = 1;
+        mGenerationLengthVariable = false;
         if (!mActive)
         {
             return;
@@ -858,6 +859,11 @@ public:
         // Blackwell uses the padded packed-mask row dim as the mask stride.
         mMaxGenLen = static_cast<int>(
             mSm100Family ? p.spec_decoding_packed_mask->size(1) : p.spec_decoding_position_offsets->size(1));
+        // Each sequence has at most one position offset row per token, so the lengths are uniform
+        // only when every sequence fills the full row.
+        int64_t const maxDraftRow = p.spec_decoding_position_offsets->size(1);
+        mGenerationLengthVariable
+            = mIsSpecDecTree || p.input_seq_length != maxDraftRow || p.num_tokens != p.batch_size * maxDraftRow;
     }
 
     [[nodiscard]] std::size_t getRequiredWorkspaceSize(bool /*isGen*/) const
@@ -877,6 +883,12 @@ public:
         return mActive;
     }
 
+    /// The call is a tree, or its sequences verify different numbers of tokens.
+    [[nodiscard]] bool isGenerationLengthVariable() const
+    {
+        return mGenerationLengthVariable;
+    }
+
     void apply(kernels::XQAParams& xp) const
     {
         xp.multi_query_tokens = mActive;
@@ -885,7 +897,7 @@ public:
         xp.spec_decoding_packed_mask = mPackedMask;
         xp.spec_decoding_position_offsets = mPositionOffsets;
         xp.spec_decoding_generation_lengths = mGenerationLengths;
-        xp.spec_decoding_is_generation_length_variable = mActive;
+        xp.spec_decoding_is_generation_length_variable = mGenerationLengthVariable;
         xp.spec_decoding_max_generation_length = mMaxGenLen;
         xp.spec_decoding_bl_tree_mask_offset = mBlTreeMaskOffset;
         xp.spec_decoding_bl_tree_mask = mBlTreeMask;
@@ -900,6 +912,7 @@ private:
     bool mActive{false};
     bool mIsSpecDecTree{true};
     bool mForcePrepareTreeMask{false};
+    bool mGenerationLengthVariable{false};
     int mMaxGenLen{1};
     int32_t const* mPackedMask{nullptr};
     int32_t const* mPositionOffsets{nullptr};
