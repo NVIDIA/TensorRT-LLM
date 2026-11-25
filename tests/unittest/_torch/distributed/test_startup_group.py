@@ -320,8 +320,11 @@ def test_replacement_starts_alone(monkeypatch, requested, logged):
             log.assert_not_called()
 
 
-def test_replacement_drops_autotuner_cache_override(monkeypatch):
-    """Check that a replacement's environment overrides do not set the autotuner cache file again."""
+def test_replacement_drops_startup_variable_overrides(monkeypatch):
+    """Check that a replacement's environment overrides do not undo how its startup differs.
+
+    They set neither the autotuner cache file nor the KV cache estimation again.
+    """
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "0")
     monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_PATH", "/cache/autotuner.json")
     monkeypatch.setenv("TLLM_LOG_LEVEL", "info")
@@ -329,6 +332,7 @@ def test_replacement_drops_autotuner_cache_override(monkeypatch):
         checkpoint_io_policy=CheckpointIOPolicy.NATIVE,
         env_overrides={
             "TLLM_AUTOTUNER_CACHE_PATH": "/cache/autotuner.json",
+            "TRTLLM_SKIP_KV_CACHE_ESTIMATION": "0",
             "TLLM_LOG_LEVEL": "debug",
         },
     )
@@ -337,6 +341,7 @@ def test_replacement_drops_autotuner_cache_override(monkeypatch):
     # As worker_main applies them.
     os.environ.update(env_overrides)
     assert "TLLM_AUTOTUNER_CACHE_PATH" not in os.environ
+    assert os.environ["TRTLLM_SKIP_KV_CACHE_ESTIMATION"] == "1"
     assert os.environ["TLLM_LOG_LEVEL"] == "debug"
 
 
