@@ -217,17 +217,20 @@ __host__ __device__ __forceinline__ int broadcast_capacity(int ep, int experts, 
     return receive_bound < experts ? receive_bound : experts;
 }
 
-/* Placement runs once per target, one warp each, and the plan with the lowest
- * maximum rank load wins (the lower target on a tie).  Warp w aims at
- * max(M0, ceil(A * (400 + margin) / (400 * ep))), margin = 0, 2, 4, 8: up to 2%
- * above the mean load A / ep.  M0 is the lowest maximum load any plan reaches
- * when a rank sends at most its candidates. */
+/* Each warp aims at max(M0, ceil(A * (400 + margin) / (400 * ep))).
+ * M0 bounds the load that an owner cannot export with its candidate budget. */
 constexpr int kPlannerWarps = 4;
+constexpr int kMaxPlannerWarps = kPlannerWarps + 1;
 constexpr int kPlannerScratchInts = 10752; // three dense EP32 S3 plans (3 x 3552) behind a direct warp 0
 
 __host__ __device__ __forceinline__ int target_margin_400(int warp)
 {
-    return warp == 0 ? 0 : warp == 1 ? 2 : warp == 2 ? 4 : 8;
+    return warp == 0 ? 0 : warp == 1 ? 2 : warp == 2 ? 4 : warp == 3 ? 8 : 12;
+}
+
+__host__ __device__ constexpr int dense_target_count(int denseInts)
+{
+    return kMaxPlannerWarps * denseInts <= kPlannerScratchInts ? kMaxPlannerWarps : kPlannerWarps;
 }
 
 /* Ints of one target's dense plan: five plan fields and an ep-wide quota row
@@ -257,6 +260,8 @@ __host__ __device__ __forceinline__ int planner_warp_ints(int ep, int experts, i
 /* As many targets as kPlannerScratchInts holds, at least one. */
 __host__ __device__ __forceinline__ int planner_targets(int ep, int experts, int helpers)
 {
+    if (dense_target_count(planner_dense_ints(ep, experts, helpers)) == kMaxPlannerWarps)
+        return kMaxPlannerWarps;
     // min(kPlannerWarps, max(1, kPlannerScratchInts / ints)) without a division.
     int const ints = planner_warp_ints(ep, experts, helpers);
     int fit = 1;
@@ -1522,6 +1527,12 @@ __device__ int plan_halo_q(int const* histogram, int const* load, int const* can
         by_depth(std::false_type{});
     if (lane == 0)
     {
+        // Keep a plan within 5% of the mean. The wider target only competes when the original targets miss that bound.
+        if (warp == kPlannerWarps)
+        {
+            int const limit = static_cast<int>(21LL * total / (20 * ep));
+            max_load = imax(max_load, limit);
+        }
         results[2 * warp] = max_load;
         results[2 * warp + 1] = broadcasts | (direct ? kDirectPlan : 0);
     }
@@ -1542,7 +1553,7 @@ __device__ int adopt_best_plan(int const* histogram, int const* scratch, int con
     int best = 0;
     int best_max = results[0];
 #pragma unroll
-    for (int warp = 1; warp < kPlannerWarps; ++warp)
+    for (int warp = 1; warp < kMaxPlannerWarps; ++warp)
     {
         int const value = warp < targets ? results[2 * warp] : best_max;
         best = value < best_max ? warp : best;
@@ -1618,10 +1629,10 @@ __device__ int place_halo_q_shape(int const* histogram, int const* load, int* qu
     int const ep = kEp > 0 ? kEp : ep_arg;
     int const helpers = kS > 0 ? kS : helpers_arg;
     int* const results = running + 2;
-    int* const scratch = results + 2 * kPlannerWarps;
+    int* const scratch = results + 2 * kMaxPlannerWarps;
     /* Prepare ends at a block barrier, or at the owner warps' named barrier,
      * which every planner warp joins when EP >= the target count. */
-    int const targets = kEp > 0 ? kPlannerWarps : planner_targets(ep, experts, helpers);
+    int const targets = kEp > 0 ? dense_target_count((5 + kEp) * kEp * kS) : planner_targets(ep, experts, helpers);
     if (uses_register_prepare(ep, experts) && ep < targets)
         __syncthreads();
     /* Dense plans: the planner warps adopt the best one among themselves while
@@ -2694,7 +2705,7 @@ __host__ __device__ __forceinline__ int halo_q_shared_ints(int ep, int experts, 
     int const capacity = broadcast_capacity(ep, experts, helpers);
     int const workerInts = threads / 32 * (experts + 1) + experts;
     int const plannerInts = ep * experts + experts + ep + capacity * ep + experts + (kHelperMaskWords + 1) * ep
-        + 2 * capacity + kScheduleInts + 2 + 2 * kPlannerWarps
+        + 2 * capacity + kScheduleInts + 2 + 2 * kMaxPlannerWarps
         + (planner_dense_spare(ep, experts, helpers)
                 ? (planner_targets(ep, experts, helpers) - 1) * planner_dense_ints(ep, experts, helpers)
                 : planner_targets(ep, experts, helpers) * planner_warp_ints(ep, experts, helpers));

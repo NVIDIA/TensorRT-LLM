@@ -24,9 +24,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -126,6 +128,8 @@ struct Case
     bool hotHalf;    // the first half of the ranks is three times as loaded, else hot experts are spread at random
     int broadcasts;  // of the placement
     uint64_t golden; // placementHash() of the placement
+    std::vector<int> (*makeInput)() = nullptr;
+    std::optional<int> expectedPeak = std::nullopt;
 };
 
 /* 8192 tokens x top-8 per source rank, with +-25% noise per source rank.  An expert's share follows 1 / (1 + j) for a
@@ -155,6 +159,40 @@ std::vector<int> makeCounts(Case const& c)
         for (int e = 0; e < c.experts; ++e)
             counts[rank * c.experts + e]
                 = static_cast<int>(int64_t{8192 * 8} * weight[e] / total * (75 + next() % 51) / 100);
+    return counts;
+}
+
+std::vector<int> makeStandardL7Counts()
+{
+    constexpr int kEp = 16;
+    constexpr int kExperts = 384;
+    // Global counts from an EP16 layer with 8,192 input tokens per rank and top-k = 6.
+    constexpr std::array<int, kExperts> kHistogram{129, 176, 12, 0, 38'840, 3, 0, 5, 1, 0, 0, 0, 0, 0, 173, 0, 2, 0, 2,
+        0, 134, 12, 126'511, 1, 0, 0, 2, 938, 101, 0, 63, 0, 0, 2, 0, 33, 22'321, 10, 0, 1191, 0, 686, 0, 0, 0, 0, 14,
+        187, 2, 0, 6, 0, 12, 0, 0, 20, 0, 1, 0, 0, 2, 6, 0, 0, 0, 7, 320, 0, 6, 0, 2, 0, 35, 0, 74, 10'655, 0, 0, 0, 70,
+        0, 1, 0, 15, 0, 13'620, 0, 0, 1, 0, 0, 6, 0, 0, 0, 11, 0, 3, 4, 0, 38, 0, 60'229, 129'711, 0, 10, 42, 0, 368, 0,
+        0, 0, 0, 34, 118, 0, 0, 0, 0, 477, 0, 0, 14, 0, 0, 0, 12, 0, 6, 0, 3112, 1, 0, 2, 0, 0, 0, 37'335, 0, 0, 166, 0,
+        1, 3, 0, 0, 0, 9, 103, 9, 0, 90, 7, 1, 0, 281, 91, 179, 42, 0, 3, 2, 1, 3, 0, 96, 19, 295, 0, 0, 2, 87, 0, 0,
+        171, 0, 1, 0, 2, 0, 4, 115, 0, 3, 7, 0, 8, 177, 3187, 4, 0, 27, 0, 143, 1, 0, 18, 0, 17, 1, 0, 0, 0, 0, 0, 0,
+        72'895, 0, 0, 0, 0, 13, 1, 0, 0, 0, 0, 0, 16, 15'621, 0, 4, 3181, 0, 1, 60, 2, 0, 0, 20, 5, 0, 98, 1, 58, 0, 0,
+        2, 3, 0, 0, 0, 4377, 0, 40, 0, 0, 5701, 0, 0, 1, 0, 0, 127, 1, 122'121, 10, 95'595, 147, 0, 3, 0, 0, 1, 1, 55,
+        0, 37, 931, 4199, 0, 34, 21, 7, 0, 0, 4, 0, 1559, 0, 1969, 0, 0, 33, 56, 0, 0, 0, 0, 0, 52, 2, 0, 0, 1, 0, 0, 0,
+        530, 0, 0, 0, 0, 91, 356, 3, 0, 293, 1, 13, 18, 44, 8, 717, 189, 0, 9, 3, 0, 0, 80, 54, 0, 89, 7, 0, 0, 0, 17,
+        8, 12, 0, 138, 0, 163, 0, 0, 0, 2, 1, 16, 0, 0, 0, 0, 0, 3, 0, 0, 4, 1, 0, 29, 3, 0, 0, 102, 0, 1, 0, 40, 0, 0,
+        116, 0, 0, 3, 5, 0, 0, 1, 20, 0, 0, 35, 0, 0, 3, 10, 12, 0, 0, 8, 795};
+    std::vector<int> counts(kEp * kExperts);
+    int firstExtraRank = 0;
+    // Rotate the remainder across the ranks to preserve both the expert histogram and per-source volume.
+    for (int expert = 0; expert < kExperts; ++expert)
+    {
+        int const base = kHistogram[expert] / kEp;
+        int const remainder = kHistogram[expert] % kEp;
+        for (int rank = 0; rank < kEp; ++rank)
+        {
+            counts[((firstExtraRank + rank) % kEp) * kExperts + expert] = base + (rank < remainder);
+        }
+        firstExtraRank = (firstExtraRank + remainder) % kEp;
+    }
     return counts;
 }
 
@@ -206,7 +244,7 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     if (sharedBytes > maxShared)
         GTEST_SKIP() << "needs " << sharedBytes << " B of shared memory per block";
 
-    std::vector<int> const counts = makeCounts(c);
+    std::vector<int> const counts = c.makeInput ? c.makeInput() : makeCounts(c);
     int const stride = kMaxBroadcasts + 3 * helpers;
     int *dCounts, *dPlan, *dPre, *dPost, *dPlanCopy, *dColors, *dStatus;
     ASSERT_EQ(cudaMalloc(&dCounts, counts.size() * sizeof(int)), cudaSuccess);
@@ -291,6 +329,10 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     EXPECT_EQ(loadPre, loadPost) << "quota repair changed a rank's load";
     EXPECT_LE(*std::max_element(loadPre.begin(), loadPre.end()), *std::max_element(resident.begin(), resident.end()))
         << "placement raised the busiest rank's load";
+    if (c.expectedPeak)
+    {
+        EXPECT_EQ(*std::max_element(loadPost.begin(), loadPost.end()), *c.expectedPeak);
+    }
 
     /* Coloring without a residency table: levels coarse first, then broadcasts in order, each takes the lowest slot
      * free on its whole group.  Every rank colors alike, and each rank's slots name the broadcasts that cover it. */
@@ -347,12 +389,12 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     EXPECT_EQ(hash, c.golden) << c.name << ": placement hash " << hex << " (" << broadcasts << " broadcasts)";
 }
 
-/* Inputs make 1 to 69 broadcasts.  EP8/16/32 at S = 2 and 3 take the compile-time placement shapes: four dense
- * plans, except at EP32 S3, where warp 0 writes its plan directly and three dense plans stand behind it.  EP2 (no pair
- * level), EP4 S4, EP8 S16 and EP12 (not a power of two) take the runtime-shape placement with dense plans, EP32 S40
- * with two compact plans.  EP <= 8 prepares in registers (homes up to 64 experts), except EP2 (a 192-expert home).
- * Up to 32 broadcasts take the scheduled pair repair and the warp coloring; EP32 S40 (69 broadcasts, 40 helpers)
- * takes the generic repair and the serial coloring. */
+/* Inputs make 1 to 69 broadcasts. EP8/16/32 at S = 2 and 3 take the compile-time placement shapes. EP32 S2 uses
+ * four dense plans, EP32 S3 writes one plan directly and three in scratch, and the smaller cases fit five dense
+ * plans. EP2 (no pair level), EP4 S4, EP8 S16 and EP12 (not a power of two) take runtime-shape placement with dense
+ * plans. EP32 S40 uses two compact plans. EP <= 8 prepares in registers (homes up to 64 experts), except EP2
+ * (a 192-expert home). Up to 32 broadcasts take the scheduled pair repair and warp coloring. EP32 S40 takes
+ * the generic repair and serial coloring. */
 INSTANTIATE_TEST_SUITE_P(HaloQ, HaloQPlannerTest,
     ::testing::Values(Case{"ep2_e384_s2", 2, 384, 2, false, 1, 0x6289361b7d1c018aull},
         Case{"ep4_e96_s4_hot_half", 4, 96, 4, true, 4, 0x20ef4247f37f6409ull},
@@ -361,6 +403,7 @@ INSTANTIATE_TEST_SUITE_P(HaloQ, HaloQPlannerTest,
         Case{"ep8_e384_s16", 8, 384, 16, false, 5, 0xf46a992ac17e401eull},
         Case{"ep12_e384_s3", 12, 384, 3, false, 7, 0xf302a409d0dcf032ull},
         Case{"ep16_e384_s2", 16, 384, 2, false, 2, 0xe6e786693a67baf7ull},
+        Case{"ep16_e384_s2_standard_l7", 16, 384, 2, false, 7, 0xd6e0d5ed4a2d490cull, makeStandardL7Counts, 50'627},
         Case{"ep16_e384_s3", 16, 384, 3, false, 7, 0x62fc8a7e4f55da36ull},
         Case{"ep32_e384_s2", 32, 384, 2, false, 12, 0x2a8aa6ecb253137cull},
         Case{"ep32_e384_s3", 32, 384, 3, false, 13, 0x0d5cf5f85749022dull},
