@@ -2176,6 +2176,19 @@ def _out_proj(core, x, weight_t, site: str, dense):
     return mid_mm_raw(x, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
 
 
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) two launch orders
+#: of a MoE block's round trip. (1) A trunk block launches its shared expert on the side stream
+#: from inside the round trip, right after the gather, instead of before it: the gather (one
+#: Lamport launch) then reaches the SMs ahead of the shared expert's first GEMM, and the side
+#: stream still runs it beside the routed experts. (2) The draft layer's shared expert runs on the
+#: side stream beside its round trip, launched the same way, instead of after it on the main
+#: stream. The same kernels on the same inputs, so bitwise. Measured on GB300 dep4 inside a step
+#: bundle with the draft attention input pack (0.08-0.2 ms a step derived); the index scores'
+#: PDL launch that bundle also had is already the decode path's. `0` keeps the order before.
+#: Read once, when the target is built.
+DP_LAUNCH_ORDER_ENV = "TRTLLM_QWEN4_EXP_DP_LAUNCH_ORDER"
+
+
 #: Switch, on by default: at a dep8 rank on SM103 (`_dp_decode_rank`, the draft layer's FP8
 #: experts in 64-wide windows) the draft MoE's trtllm-gen runner is entered at the tactic
 #: `_DRAFT_MOE_TACTICS` names for the call's gathered row count instead of the AutoTuner's cold
@@ -2882,6 +2895,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._out_proj = None
         # `DP_DRAFT_MOE_TILE_ENV`: the draft MoE's tactic by gathered rows, built after load.
         self._draft_moe_tactics = None
+        # `DP_LAUNCH_ORDER_ENV`, settled after load.
+        self.dp_launch_order = False
         # `DP_DRAFT_O_MID_ENV` (opt-in): the draft output projection's rows, built after load.
         self._draft_o = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
@@ -3118,6 +3133,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._draft_o = _draft_o_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
+            self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
+                _dp_decode_rank(self, device)
+            )
         # Built after the decode target, whose layer views it checks; a collective-free build.
         self._route_front = (
             _route_front_build(self, self._decode._layers, device)
@@ -4538,7 +4556,9 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
     return _index_query(core, index_scratch)
 
 
-def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False) -> torch.Tensor:
+def _mtp_moe_block(
+    core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False, before_window=None
+) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
     block-scale or native NVFP4 routed experts over this rank's window,
     and the replicated bf16 shared expert in the trunk's form -- one GEMM forms gate|up and
@@ -4554,6 +4574,8 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
     rows an attention-DP group gathers."""
 
     def run(rows: torch.Tensor) -> torch.Tensor:
+        if before_window is not None:
+            before_window()
         parts = []
         for lo in range(0, rows.shape[0], _MTP_MOE_MAX_ROWS):
             chunk = rows[lo : lo + _MTP_MOE_MAX_ROWS]
@@ -4695,8 +4717,26 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Ten
         x, core.tp_sum(_draft_o(core, attn, M.o)), inject, M.mhc_norm, core.eps, core.hc_count
     )
     mixed, inject = _hc_mixer(core, normed, M.mhc_first, M.mhc_up, True)
-    routed = _mtp_moe_block(core, M, mixed, pad_rows, routed_only=True)
-    gate_logits, shared = _mtp_shared_expert(core, M, mixed)
+    if getattr(core, "dp_launch_order", False) and core.dp_size > 1:
+        # `DP_LAUNCH_ORDER_ENV`: the shared expert on the side stream beside the round trip,
+        # launched right after its gather; joined before the combine.
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        side.wait_stream(main)
+        forked = []
+
+        def shared_expert() -> None:
+            if not forked:
+                with torch.cuda.stream(side):
+                    forked.append(_mtp_shared_expert(core, M, mixed))
+
+        routed = _mtp_moe_block(core, M, mixed, pad_rows, True, shared_expert)
+        shared_expert()  # a round trip that never called its window
+        main.wait_stream(side)
+        gate_logits, shared = forked[0]
+    else:
+        routed = _mtp_moe_block(core, M, mixed, pad_rows, routed_only=True)
+        gate_logits, shared = _mtp_shared_expert(core, M, mixed)
     if _combine_inject_fits(x, routed, shared, inject):
         return mtp_moe_combine_inject(x, routed, gate_logits, shared, inject)
     return qwen4_exp_post_inject(x, fused_sigmoid_gate_mul_add(routed, gate_logits, shared), inject)
@@ -6189,25 +6229,41 @@ def _moe_block(
     # Fork: the side stream reads `x` only after everything queued on `main` so far. What it
     # allocates is consumed on `main` after the join below.
     side.wait_stream(main)
+    forked = []
+
+    def shared_expert() -> None:
+        with torch.cuda.stream(side):
+            forked.append(_shared_expert(core, x, L, decode_gemm))
+
     if quarter:
         # A tep4 rank only (`TEP_FINAR_SHARED_ENV` never serves attention DP): the side stream
         # runs this rank's quarter, which the fused launch adds; the next site reads zeros.
         with torch.cuda.stream(side):
             quarter = _tep_finar_quarter(core, x, L)
         rows = x.shape[0]
-        shared, gate_logits = fin.shared.zero_shared[:rows], fin.shared.zero_gate[:rows]
+        forked.append((fin.shared.zero_shared[:rows], fin.shared.zero_gate[:rows]))
     else:
         quarter = None
-        with torch.cuda.stream(side):
-            shared, gate_logits = _shared_expert(core, x, L, decode_gemm)
+        # `DP_LAUNCH_ORDER_ENV`: under attention DP the shared expert is launched from inside the
+        # round trip, right after its gather (the round trip calls its window once).
+        late = getattr(core, "dp_launch_order", False) and core.dp_size > 1
+        if not late:
+            shared_expert()
     routed = None
     if fin is not None:
         routed = _tep_finar_routed(core, fin, x, L, fp4, router_mm, quarter)
     if routed is None:
-        routed = core.expert_sum(
-            lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows
-        )
+
+        def window(rows: torch.Tensor) -> torch.Tensor:
+            if not forked:
+                shared_expert()
+            return _routed_experts(core, rows, L, fp4, router_mm)
+
+        routed = core.expert_sum(window, x, pad_rows)
+    if not forked:
+        shared_expert()
     main.wait_stream(side)
+    shared, gate_logits = forked[0]
     return routed, gate_logits, shared
 
 
