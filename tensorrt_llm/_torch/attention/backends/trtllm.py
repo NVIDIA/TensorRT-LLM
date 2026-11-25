@@ -3321,8 +3321,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
-            gqa_decode (GqaDecodeSetup): Enables the GQA decode FMHA library
-                (fmha/gqa_decode.py) for this layer.
+            gqa_decode (GqaDecodeSetup): Layer settings required by the GQA decode
+                FMHA libraries. Include the desired libraries in fmha_libs or
+                enable their registered names through TLLM_FMHA_LIBS.
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).

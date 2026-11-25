@@ -617,6 +617,13 @@ cold cache. Use `TLLM_FMHA_LIBS=+prims_ts` to prioritize it and consider other
 supported requests, or `TLLM_FMHA_LIBS=-prims_ts` to remove it.
 Generic block-sparse PrimTS remains enabled
 by default because a dense fallback cannot preserve its routing semantics.
+
+GQA decode libraries are opt-in. Include the desired libraries in `fmha_libs`
+or enable their registered names through `TLLM_FMHA_LIBS`. The layer also
+needs a `GqaDecodeSetup`. `Attention` builds it with
+`use_gqa_decode_fmha=True` for TRTLLM layers without Helix CP. Qwen3.5 supplies
+its own FMHA list for TRTLLM layers, with PrimTS ahead of the GQA candidates.
+
 DeepSeek-V4 includes the PrimTS sparse MLA library (`prims_ts_sparse_mla`) in
 its own FMHA candidate list. It serves generation on SM100, ahead of the
 TRTLLM-Gen libraries, unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla` removes it.

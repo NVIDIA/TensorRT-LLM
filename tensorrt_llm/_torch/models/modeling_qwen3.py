@@ -15,6 +15,7 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.attention import (maybe_allgather_for_helix_cp,
                                    maybe_slice_for_helix_cp)
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.registry import FmhaCls
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduceParams
@@ -47,6 +48,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         fp8_output_gate: bool = False,
         context_fmha_head_dim_per_stage_kv: int = 0,
         context_last_rows_only: bool = False,
+        fmha_libs: list[str | FmhaCls] | None = None,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -98,6 +100,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             context_fmha_head_dim_per_stage_kv=
             context_fmha_head_dim_per_stage_kv,
             context_last_rows_only=context_last_rows_only,
+            fmha_libs=fmha_libs,
         )
 
 

@@ -57,6 +57,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3Attention
+from tensorrt_llm._torch.models.modeling_qwen3_next import QWEN3_5_FMHA_LIBS
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -82,6 +83,19 @@ PARTIAL_MAX_REL_ERR, PARTIAL_MEAN_ABS_ERR, LSE_ABS_ERR = 0.07, 2e-3, 0.05
 MIB = 1 << 20
 
 
+@pytest.fixture
+def qwen_gqa_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    create = backend_case.create_attention
+
+    def create_with_qwen_candidates(backend_name, *args, **kwargs):
+        if backend_name == "TRTLLM":
+            kwargs.update(gqa_decode=GqaDecodeSetup(), fmha_libs=QWEN3_5_FMHA_LIBS)
+        return create(backend_name, *args, **kwargs)
+
+    monkeypatch.setattr(backend_case, "create_attention", create_with_qwen_candidates)
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+
+
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,seq_lens,num_cached_tokens,library",
     [
@@ -98,18 +112,13 @@ MIB = 1 << 20
 )
 def test_gqa_decode_matches_golden(
     monkeypatch: pytest.MonkeyPatch,
+    qwen_gqa_backend: None,
     num_heads: int,
     num_kv_heads: int,
     seq_lens: list,
     num_cached_tokens: list,
     library: Optional[str],
 ) -> None:
-    monkeypatch.setattr(
-        backend_case,
-        "create_attention",
-        functools.partial(backend_case.create_attention, gqa_decode=GqaDecodeSetup()),
-    )
-    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     taken = []
     for cls in (GqaSplitKvFmha, GqaSegmentedFmha):
 
@@ -138,7 +147,9 @@ def test_gqa_decode_matches_golden(
         assert taken and all(t == (library, True) for t in taken)
 
 
-def test_generation_call_loads_trtllm_gen_decode_module(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generation_call_loads_trtllm_gen_decode_module(
+    monkeypatch: pytest.MonkeyPatch, qwen_gqa_backend: None
+) -> None:
     """A generation call served by a dedicated kernel (the warmup's) loads FlashInfer's trtllm-gen decode module, so
     the first segmented or trtllm-gen decode does not JIT-build it."""
     import flashinfer
@@ -151,12 +162,6 @@ def test_generation_call_loads_trtllm_gen_decode_module(monkeypatch: pytest.Monk
         return load()
 
     monkeypatch.setattr(flashinfer.decode, "get_trtllm_gen_fmha_module", spy)
-    monkeypatch.setattr(
-        backend_case,
-        "create_attention",
-        functools.partial(backend_case.create_attention, gqa_decode=GqaDecodeSetup()),
-    )
-    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     taken = []
     run_split_kv = GqaSplitKvFmha._run_dedicated
 
@@ -205,6 +210,7 @@ def _qwen3_next_attention(use_gqa_decode_fmha: bool) -> Qwen3Attention:
         attn_output_gate=True,
         use_gemma_rms_norm=True,
         use_gqa_decode_fmha=use_gqa_decode_fmha,
+        fmha_libs=QWEN3_5_FMHA_LIBS,
     ).cuda()
     attn._fuse_qk_norm_rope_gate = True
     generator = torch.Generator(device="cuda").manual_seed(0)
@@ -705,6 +711,7 @@ def _gqa_layer(num_heads: int, setup: GqaDecodeSetup) -> TrtllmAttention:
         num_kv_heads=1,
         quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
         gqa_decode=setup,
+        fmha_libs=QWEN3_5_FMHA_LIBS,
     )
 
 

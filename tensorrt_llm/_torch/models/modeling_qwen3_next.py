@@ -45,6 +45,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.registry import FmhaCls
 from ..attention.backends.interface import PredefinedAttentionMask
 from ..autotuner import AutoTuner
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
@@ -1660,6 +1661,24 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
                                 **kwargs)
 
 
+QWEN3_5_FMHA_LIBS: list[str | FmhaCls] = [
+    "fp4_mla",
+    "triton_custom_mask",
+    "prims_ts",
+    "cute_dsl_mla",
+    "flashinfer_sparse_mla",
+    "prims_ts_block_sparse",
+    "prims_ts_dsa_sparse_mla",
+    "gqa_kv_replica_fused",
+    "gqa_kv_replica",
+    "gqa_split_kv",
+    "gqa_segmented",
+    "gqa_decode",
+    "flashinfer_trtllm_gen",
+    "fallback",
+]
+
+
 class Qwen3NextAttention(Qwen3Attention):
 
     def __init__(self,
@@ -1672,6 +1691,8 @@ class Qwen3NextAttention(Qwen3Attention):
         # FP8 paged context attention stages each K / V tile's whole head.
         stage_kv_head_dim = (model_config.pretrained_config.head_dim
                              if prefill_kernels else 0)
+        fmha_libs = (QWEN3_5_FMHA_LIBS
+                     if model_config.attn_backend == "TRTLLM" else None)
         super().__init__(model_config,
                          layer_idx,
                          fuse_qk_norm_rope=fuse_qk_norm_rope,
@@ -1682,7 +1703,8 @@ class Qwen3NextAttention(Qwen3Attention):
                          and not model_config.mapping.enable_attention_dp,
                          fp8_output_gate=prefill_kernels,
                          context_fmha_head_dim_per_stage_kv=stage_kv_head_dim,
-                         context_last_rows_only=context_last_rows_only)
+                         context_last_rows_only=context_last_rows_only,
+                         fmha_libs=fmha_libs)
         self._fuse_qk_norm_rope_gate = True
 
     # Issues the layer's expert prefetch right before o_proj, after the
