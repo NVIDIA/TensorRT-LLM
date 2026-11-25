@@ -1207,6 +1207,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                             and end == start + interval
                             and end in req.expect_snapshot_points
                             and not any(start < point < end for point in req.expect_snapshot_points)
+                            and self._tp_periodic_snapshot_can_extend(req, budget.remaining_tokens)
                         )
                     if (
                         self._periodic_snapshot_request_id == req.py_request_id
@@ -1770,6 +1771,31 @@ class KVCacheV2Scheduler(RequestScheduler):
             if manager is not None and req.py_request_id in manager.kv_cache_map:
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+    def _tp_periodic_snapshot_can_extend(
+        self, req: LlmRequest, remaining_tokens: int | None
+    ) -> bool:
+        """Whether the leftover budget reaches a legal end beyond the baseline chunk."""
+        chunk_size = req.context_chunk_size
+        desired = req.context_remaining_length
+        if remaining_tokens is not None:
+            desired = min(desired, chunk_size + remaining_tokens)
+        if self.max_context_length is not None:
+            desired = min(desired, self.max_context_length)
+        if desired <= chunk_size:
+            return False
+        # The coordinator can end at a checkpoint, at the prompt end, or
+        # at a full chunk unit. Use logical limits only, so ranks with
+        # different free cache capacity still schedule the same baseline.
+        start = req.context_current_position
+        return (
+            start + desired == req.prompt_len
+            or desired // self.chunk_unit_size > chunk_size // self.chunk_unit_size
+            or any(
+                start + chunk_size < point <= start + desired
+                for point in req.expect_snapshot_points
+            )
+        )
 
     def _try_schedule_context_full(
         self,

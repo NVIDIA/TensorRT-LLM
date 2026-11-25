@@ -4407,6 +4407,31 @@ class TestChunkedContext:
         assert following.context_chunk_size == 128
         mgr.reserve_periodic_snapshots.assert_not_called()
 
+    @pytest.mark.parametrize("next_boundary", [None, 288])
+    def test_tp_periodic_budget_requires_a_reachable_extension(self, next_boundary):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.periodic_snapshot_requires_consensus = True
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=288, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched.periodic_snapshot_tp_enabled = True
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = list(range(256, 2049, 256))
+        if next_boundary is not None:
+            context.expect_snapshot_points.insert(1, next_boundary)
+        following = make_ctx_request(1, context_remaining_length=32, is_last_context_chunk=True)
+
+        out = sched.schedule_request([context, following], set())
+
+        # The leftover 32 tokens can only extend the first context to an explicit boundary.
+        assert ids(out.context_requests) == ([0, 1] if next_boundary is None else [0])
+        assert context.context_chunk_size == 256
+        assert sched.periodic_snapshot_extra_budget == (0 if next_boundary is None else 32)
+
     def test_tp_periodic_snapshots_do_not_hold_budget_for_a_short_final_tail(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         mgr.periodic_snapshot_requires_consensus = True
