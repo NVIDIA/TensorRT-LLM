@@ -285,7 +285,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 
 #### `guided_decoding_backend`
 
-* **Description:** The guided-decoding backend: `xgrammar` or `llguidance`. It constrains structured outputs (`response_format`), and with `llguidance` also `tool_choice: "required"` and named tool calls. **Guided decoding is off unless this key is set**, and requests with `response_format` are then not constrained. With `xgrammar`, a JSON response starts at the first generated token, so no reasoning is returned with it; with `llguidance`, the JSON may follow a reasoning section.
+* **Description:** The guided-decoding backend: `xgrammar` or `llguidance`. It constrains structured outputs (`response_format`), and with `llguidance` also `tool_choice: "required"` and named tool calls. **Guided decoding is off unless this key is set**, and requests with `response_format` are then not constrained. With `xgrammar` (or with `llguidance` when no `--reasoning_parser` is configured), a JSON response starts at the first generated token, so no reasoning is returned with it; with `llguidance` and `--reasoning_parser`, the JSON may follow a reasoning section.
 
 ### Mistral Large 4 API Behavior
 

@@ -346,15 +346,15 @@ def test_llguidance_tool_grammar_takes_a_reasoning_section(tokenizer, llg):
     assert matcher.accept_token(tokenizer.eos_token_id)
 
 
-def _json_matcher(tokenizer, llg, guide_type, guide, *, reasoning_section=True):
+def _json_matcher(tokenizer, llg, guide_type, guide, *, reasoning_parser="mistral_large_4"):
     """An llguidance matcher of a JSON response, built as the executor builds it."""
     from tensorrt_llm._torch.pyexecutor.grammar_matcher import LLGuidanceMatcherFactory
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _llguidance_json_schema_lark
     from tensorrt_llm.bindings.executor import GuidedDecodingParams
 
     config = get_guided_decoding_config("llguidance", tokenizer)
-    json_schema_lark = (
-        _llguidance_json_schema_lark(config, tokenizer) if reasoning_section else None
+    json_schema_lark = _llguidance_json_schema_lark(
+        config, tokenizer, reasoning_parser=reasoning_parser
     )
     factory = LLGuidanceMatcherFactory(
         config, tokenizer.tokenizer.n_words, tokenizer=llg, json_schema_lark=json_schema_lark
@@ -455,16 +455,21 @@ def test_llguidance_json_response_rolls_back_a_draft_across_the_section_end(
     assert _allowed(matcher, tekken.n_words) == before
 
 
-def test_llguidance_json_response_without_the_renderer_starts_at_the_json(
-    tokenizer, llg, reasoning_vocab
+@pytest.mark.parametrize("guide_type, guide", _JSON_GUIDES)
+def test_llguidance_json_response_without_reasoning_parser_starts_at_the_json(
+    tokenizer, llg, reasoning_vocab, guide_type, guide
 ):
-    """Other llguidance models keep the schema alone: [THINK] cannot open the response."""
-    matcher = _json_matcher(
-        tokenizer, llg, "JSON_SCHEMA", json.dumps(_SCHEMA), reasoning_section=False
+    """Without a reasoning parser, JSON is constrained from the first token: [THINK] is rejected."""
+    tekken = reasoning_vocab
+    matcher = _json_matcher(tokenizer, llg, guide_type, guide, reasoning_parser=None)
+    assert _control(tokenizer, "[THINK]") not in _allowed(matcher, tekken.n_words)
+    assert _consume(matcher, tekken.encode('{"city": "Paris"}', bos=False, eos=False))
+    assert matcher.accept_token(tokenizer.eos_token_id)
+
+    with_parser = _json_matcher(
+        tokenizer, llg, guide_type, guide, reasoning_parser="mistral_large_4"
     )
-    assert _control(tokenizer, "[THINK]") not in _allowed(matcher, reasoning_vocab.n_words)
-    matcher = _json_matcher(tokenizer, llg, "JSON_SCHEMA", json.dumps(_SCHEMA))
-    assert _control(tokenizer, "[THINK]") in _allowed(matcher, reasoning_vocab.n_words)
+    assert _control(tokenizer, "[THINK]") in _allowed(with_parser, tekken.n_words)
 
 
 def test_llguidance_json_schema_lark_needs_llguidance_and_a_grammar_tokenizer(tokenizer):
@@ -474,9 +479,22 @@ def test_llguidance_json_schema_lark_needs_llguidance_and_a_grammar_tokenizer(to
     xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
     # A tokenizer mistral-common renders no grammars for (the bundled Tekken file is older
     # than v11) constrains JSON from its first token.
-    rendered = _llguidance_json_schema_lark(llguidance, tokenizer)
+    rendered = _llguidance_json_schema_lark(
+        llguidance, tokenizer, reasoning_parser="mistral_large_4"
+    )
     assert (rendered is not None) is tokenizer.renders_grammars
-    assert _llguidance_json_schema_lark(xgrammar, tokenizer) is None
+    assert _llguidance_json_schema_lark(llguidance, tokenizer, reasoning_parser=None) is None
+    assert _llguidance_json_schema_lark(llguidance, tokenizer) is None
+    assert (
+        _llguidance_json_schema_lark(xgrammar, tokenizer, reasoning_parser="mistral_large_4")
+        is None
+    )
     no_grammars = SimpleNamespace(renders_grammars=False)
-    assert _llguidance_json_schema_lark(llguidance, no_grammars) is None
-    assert _llguidance_json_schema_lark(llguidance, object()) is None
+    assert (
+        _llguidance_json_schema_lark(llguidance, no_grammars, reasoning_parser="mistral_large_4")
+        is None
+    )
+    assert (
+        _llguidance_json_schema_lark(llguidance, object(), reasoning_parser="mistral_large_4")
+        is None
+    )

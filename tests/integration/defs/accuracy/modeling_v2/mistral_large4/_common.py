@@ -628,6 +628,7 @@ class _TpTarget(_Nvfp4Target):
                 ),
                 checkpoint_format="mistral",
                 guided_decoding_backend="llguidance",
+                reasoning_parser="mistral_large_4",
                 kv_cache_config=self.KV.model_copy(update={"enable_block_reuse": True}),
                 modeling_v2="require",
                 env_overrides=rank_env,
