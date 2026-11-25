@@ -75,6 +75,8 @@ _CURATED_PRESETS = {
     'deepseek-v4-pro-latency.yaml',
     'deepseek-v4-pro-throughput.yaml',
     'musespark-open-agentic-balanced.yaml',
+    'nemotron-3-ultra-throughput.yaml',
+    'qwen3.8-flash-next.yaml',
 }
 PERF_CONFIG_PRESETS = _BUILTIN_PRESETS.keys() | _CURATED_PRESETS
 
@@ -188,7 +190,9 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                                           block_size=3))
 
     qwen_max = 'qwen3.8_max_fp4_mtp-serve-pytorch' in label
-    flash_next = 'qwen3.8_flash_next_' in label
+    flash_tep4 = model == 'qwen3.8_flash_next_fp8_mtp_tep4'
+    flash_base = model in ('qwen3.8_flash_next_fp4', 'qwen3.8_flash_next_fp8')
+    flash_next = flash_base or flash_tep4
     if qwen_max or flash_next:
         # MAX TP8/MTP3 (#18071) and Flash-Next with PLE host offload (#18585).
         update(
@@ -196,22 +200,17 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
             speculative_config=_mtp(3),
         )
-    if qwen_max or 'qwen3.8_flash_next_fp8_mtp' in label:
+    if qwen_max or flash_tep4:
         update(moe_config={'backend': 'TRTLLM'})
     if qwen_max:
         update(max_seq_len=8192)
     if flash_next:
         update(enable_chunked_prefill=True)
-    flash_fp4_bench = 'qwen3.8_flash_next_fp4-bench-pytorch-streaming-' in label
-    flash_fp8_bench = 'qwen3.8_flash_next_fp8-bench-pytorch-streaming-' in label
-    if flash_fp4_bench or 'qwen3.8_flash_next_fp4_mtp' in label:
-        update(moe_config={'backend': 'CUTEDSL'})
     # Spark Flash-Next benchmarks use these MoE backends without MTP.
-    if flash_fp4_bench or flash_fp8_bench:
-        update(speculative_config=None)
-    if flash_fp8_bench:
-        update(moe_config={'backend': 'CUTLASS'})
-    if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
+    if flash_base and case.startswith('bench-pytorch-streaming-'):
+        backend = 'CUTEDSL' if model.endswith('_fp4') else 'CUTLASS'
+        update(moe_config={'backend': backend}, speculative_config=None)
+    if flash_tep4 and case.startswith('serve-pytorch'):
         update(
             modeling_v2='require',
             max_seq_len=9216,
@@ -427,26 +426,23 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     super_streaming = super_mtp or 'nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-' in label
     super_throughput = 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
-    ultra = 'nemotron_3_ultra_550b_nvfp4-serve-pytorch-' in label
     super_case = super_streaming or super_throughput or super_fp8
-    if lightning or super_case or ultra:
-        update(
-            kv_cache_config={
-                'mamba_ssm_cache_dtype': 'float16',
-                'mamba_ssm_stochastic_rounding': True,
-                'mamba_ssm_philox_rounds': 5
-            })
     if lightning or super_case:
-        update(enable_chunked_prefill=True)
-    if lightning or ultra:
-        update(stream_interval=10, num_postprocess_workers=4)
+        update(enable_chunked_prefill=True,
+               kv_cache_config={
+                   'mamba_ssm_cache_dtype': 'float16',
+                   'mamba_ssm_stochastic_rounding': True,
+                   'mamba_ssm_philox_rounds': 5
+               })
     bf16_lightning = lightning and 'bf16_mtp' in model
     if super_case or bf16_lightning:
         update(moe_config={'backend': 'CUTLASS'})
-    elif lightning or ultra:
+    elif lightning:
         update(moe_config={'backend': 'CUTEDSL'})
     if lightning:
-        update(speculative_config=_mtp(3),
+        update(stream_interval=10,
+               num_postprocess_workers=4,
+               speculative_config=_mtp(3),
                kv_cache_config={
                    'free_gpu_memory_fraction': 0.8,
                    'mamba_state_config': {
@@ -459,7 +455,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(max_seq_len=1048576)
     if super_streaming:
         update(cuda_graph_config={'max_batch_size': 8})
-    if super_throughput or ultra:
+    if super_throughput:
         update(enable_attention_dp=True,
                cuda_graph_config={'max_batch_size': 256})
     if super_mtp:

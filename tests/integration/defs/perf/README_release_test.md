@@ -123,6 +123,8 @@ The Core test list selects existing recipes by filename, for example
 `-cfg:deepseek-v4-pro-latency.yaml`. The DeepSeek V4 Pro throughput and latency cases
 use their corresponding files in [examples/configs/curated](../../../../examples/configs/curated).
 The 24-session Muse Spark AgentX case uses [musespark-open-agentic-balanced.yaml](../../../../examples/configs/curated/musespark-open-agentic-balanced.yaml).
+Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`. Qwen3.8 Flash-Next single-GPU
+MTP cases share `qwen3.8-flash-next.yaml`. The FP4 cases select `moe:CUTEDSL` in the test list.
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
