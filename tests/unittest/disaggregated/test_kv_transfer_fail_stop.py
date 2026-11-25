@@ -458,7 +458,9 @@ def test_submit_transfer_releases_status_inside_agent_gate() -> None:
     sender._agent_operation_gate = gate
     outcomes = [True, False]
     # Build each status on demand: a list of prebuilt ones would keep them alive past the call.
-    sender._agent = Mock(submit_transfer_requests=Mock(side_effect=lambda _req: _Status(outcomes.pop(0))))
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(side_effect=lambda _req: _Status(outcomes.pop(0)))
+    )
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=21))
 
     assert sender._submit_transfer(task, 3, object()) == (True, None)

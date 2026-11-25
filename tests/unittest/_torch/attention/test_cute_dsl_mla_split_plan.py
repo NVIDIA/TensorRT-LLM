@@ -308,7 +308,9 @@ def test_fp8_reduce_unroll_is_bitwise(monkeypatch, split_kv: int, plan) -> None:
         applied.append(resolve(cls, kernel_class))
         return applied[-1]
 
-    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_kernel_reduce_unroll", classmethod(record))
+    monkeypatch.setattr(
+        CuteDSLNVMlaDecodeBlackwellRunner, "_kernel_reduce_unroll", classmethod(record)
+    )
 
     results = {}
     for unroll in ("1", "4", "8"):

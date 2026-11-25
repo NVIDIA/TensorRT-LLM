@@ -48,7 +48,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.cute_dsl_utils import (
     _current_cu_stream,
 )
 
-
 nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
 nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)

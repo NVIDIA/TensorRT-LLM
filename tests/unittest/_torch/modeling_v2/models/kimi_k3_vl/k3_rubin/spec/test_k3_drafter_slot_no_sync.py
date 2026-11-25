@@ -192,7 +192,9 @@ def _store(worker, seq_lens):
         kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0] * len(seq_lens)),
     )
     position_ids = torch.arange(num_tokens, device="cuda")
-    worker._store_prefill_context(draft_model, spec_metadata, attn_metadata, position_ids, num_tokens)
+    worker._store_prefill_context(
+        draft_model, spec_metadata, attn_metadata, position_ids, num_tokens
+    )
 
 
 def test_prefill_store_on_the_unified_draft_cache_reads_page_counts_on_the_host():

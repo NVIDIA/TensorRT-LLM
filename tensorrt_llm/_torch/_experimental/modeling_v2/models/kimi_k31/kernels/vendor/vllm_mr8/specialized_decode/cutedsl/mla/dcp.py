@@ -117,7 +117,7 @@ LONG_SPLIT.update({(24, 96): (5, 8, 64), (40, 96): (3, 8, 64)})
 LONG_SPLIT.update({(48, 96): (2, 8, 64), (56, 96): (2, 8, 64)})
 # All-long uniform batches pay for the extra splits (1 GPU, local 22.5k = 360k, us,
 # the earlier rule -> this): B4 34.0 -> 38.5, B8 59.4 -> 71.8, B16 109.8 -> 116.7,
-# B32 213.1 -> 227.5; the quanta at 72-256 rows trade mix16 66.6 -> 68.6 for u16 126.0
+# B32 213.1 -> 227.5; the split steps at 72-256 rows trade mix16 66.6 -> 68.6 for u16 126.0
 # -> 116.7, and win both at 136-256 (mix32 121.9 -> 115.9, u32 239.1 -> 227.5). P(all of
 # 8 past 131k) ~0.3%.
 LONG_SPLIT.update({(r, 96): (1, 4, 64, 96) for r in range(72, 129, 8)})

@@ -2226,19 +2226,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 rAccO[j] += rBuf[u, j] * scale
                     for i in cutlass.range(full, local_split_kv, 1, unroll=1):
                         for j in cutlass.range_constexpr(elements_per_thread):
-                            element_idx = (
-                                d_tile_idx * self.reducer_d_tile + tidx +
-                                j * self.threads_per_warp *
-                                self.num_compute_warps)
-                            rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rAccO[j] += gAccO[i,
+                                              element_idx] * smem_lse_scale[i]
                 else:
                     for i in range(local_split_kv):
                         for j in cutlass.range_constexpr(elements_per_thread):
-                            element_idx = (
-                                d_tile_idx * self.reducer_d_tile + tidx +
-                                j * self.threads_per_warp *
-                                self.num_compute_warps)
-                            rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rAccO[j] += gAccO[i,
+                                              element_idx] * smem_lse_scale[i]
                 rO.store(rAccO.load().to(self.o_dtype))
                 for j in cutlass.range_constexpr(elements_per_thread):
                     element_idx = (

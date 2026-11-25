@@ -8388,7 +8388,9 @@ def prepare_moe(
     if options.tail == "tuned":
         tuned, feeds = prepare_tuned_tail(weights, small, tuned_box, rank, ordinal, count)
     wide_parts = None
-    m6_rows: Dict[int, int] = {}  # {rows: N} of the merged front's tiles that this front builds (M6)
+    m6_rows: Dict[
+        int, int
+    ] = {}  # {rows: N} of the merged front's tiles that this front builds (M6)
     h8b_rows: Tuple[int, ...] = ()
     vote_rows: Tuple[int, ...] = ()
     if wider:

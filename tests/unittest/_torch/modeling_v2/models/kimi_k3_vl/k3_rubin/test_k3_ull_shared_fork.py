@@ -29,9 +29,7 @@ from types import SimpleNamespace
 
 import pytest
 
-TEXT_MODEL = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.k3_rubin.text_model"
-)
+TEXT_MODEL = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.k3_rubin.text_model"
 
 
 @pytest.fixture

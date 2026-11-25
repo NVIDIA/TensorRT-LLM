@@ -1370,17 +1370,17 @@ class TopPProbsKernel:
                 for r in cutlass.range_constexpr(4):
                     ms[r] = lds_f64(mass + (127 - 4 * lane - r) * 8)
                     lsum = dadd(lsum, ms[r])
-                linc = lsum
+                lscan = lsum
                 for off in (1, 2, 4, 8, 16):
-                    lup = shfl_up_f64(linc, off)
+                    lup = shfl_up_f64(lscan, off)
                     if lane >= off:
-                        linc = dadd(linc, lup)
-                shist = shfl_idx_f64(linc, 31)
+                        lscan = dadd(lscan, lup)
+                shist = shfl_idx_f64(lscan, 31)
                 stot = dadd(shist, f32_to_f64(sfloor))
                 tgt = dmul(f32_to_f64(top_p), stot)
                 if dsetp_lt(tgt, Float64(1.0e-300)) != 0:
                     tgt = Float64(1.0e-300)
-                lrun = dadd(linc, -lsum)
+                lrun = dadd(lscan, -lsum)
                 hit_e = Int32(-1)
                 hit_above = Float64(0.0)
                 low_e = Int32(-1)

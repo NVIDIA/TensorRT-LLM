@@ -1154,7 +1154,9 @@ class DFlashWorker(SpecWorkerBase):
             # Pinned: a pageable upload would wait for the step in flight.
             table = maybe_pin_memory(table)
             self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
-            counts = [self._ctx_kv_manager.get_draft_num_blocks(rid) for rid in request_ids[:num_seqs]]
+            counts = [
+                self._ctx_kv_manager.get_draft_num_blocks(rid) for rid in request_ids[:num_seqs]
+            ]
             self._ctx_block_counts[:num_seqs].copy_(
                 torch.tensor(counts, dtype=torch.long, device="cpu", pin_memory=prefer_pinned()),
                 non_blocking=True,

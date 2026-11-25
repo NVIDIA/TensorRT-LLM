@@ -87,7 +87,16 @@ def test_strict_accept_one_variant_for_all_batches():
 
     run(3, 0, 0)
     variants = len(caches[device][0])
-    for num_ctx, num_gens in [(1, 0), (16, 0), (17, 0), (0, 1), (0, 16), (2, 5), (1, 130), (200, 7)]:
+    for num_ctx, num_gens in [
+        (1, 0),
+        (16, 0),
+        (17, 0),
+        (0, 1),
+        (0, 16),
+        (2, 5),
+        (1, 130),
+        (200, 7),
+    ]:
         for offset in (0, 1):
             run(num_ctx, num_gens, offset)
     assert len(caches[device][0]) == variants

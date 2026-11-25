@@ -529,10 +529,14 @@ def test_reuse_breakdown_classes_fresh_lookups():
         request, _ = _context_request(request_id, 0, 1000, 1000, [1000])
         if conversation_id is not None:
             request.py_conversation_params = SimpleNamespace(conversation_id=conversation_id)
-        cache = kv_cache if matched else SimpleNamespace(
-            _get_num_reusable_tokens_before_pruning=lambda: 0,
-            _get_num_reusable_tokens_before_hybrid_pruning=lambda: 0,
-            num_committed_tokens=0,
+        cache = (
+            kv_cache
+            if matched
+            else SimpleNamespace(
+                _get_num_reusable_tokens_before_pruning=lambda: 0,
+                _get_num_reusable_tokens_before_hybrid_pruning=lambda: 0,
+                num_committed_tokens=0,
+            )
         )
         mgr._record_branch_snapshot_point(request, cache, num_lookup_tokens=999)
 
