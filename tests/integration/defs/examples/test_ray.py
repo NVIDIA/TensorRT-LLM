@@ -78,10 +78,13 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size):
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
 
-    # Take ports from the stage's CI range instead of fixed ones: multi-GPU
-    # stages can share a node, and its network, with other CI jobs, so a fixed
-    # port may already be held by a process this test cannot see or stop.
-    port, ctx_port, gen_port = (get_free_port_in_ci() for _ in range(3))
+    # CI nodes can be shared with other jobs, so a fixed port may already be
+    # taken. Ask for free ports; get_free_port_in_ci() takes them from the
+    # stage's port range when CI sets one, and otherwise probes for an unused
+    # port.
+    server_port = get_free_port_in_ci()
+    ctx_port = get_free_port_in_ci()
+    gen_port = get_free_port_in_ci()
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
@@ -109,30 +112,44 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size):
             # permanent request hang (https://nvbugs/6670614).
             **single_host_ucx_env(),
         })
+        cmd = [
+            "bash",
+            script_path,
+            "--attach",
+            "--executor",
+            "ray",
+            "--model",
+            model_dir,
+            "--tp_size",
+            str(tp_size),
+            "--transceiver_backend",
+            "NIXL",
+            "--transceiver_runtime",
+            "PYTHON",
+            "--port",
+            str(server_port),
+            "--ctx_port",
+            str(ctx_port),
+            "--gen_port",
+            str(gen_port),
+        ]
         with popen(
-            [
-                "bash", script_path, "--executor", "ray", "--attach", "--model",
-                model_dir, "--tp_size",
-                str(tp_size), "--transceiver_backend", "NIXL",
-                "--transceiver_runtime", "PYTHON", "--port",
-                str(port), "--ctx_port",
-                str(ctx_port), "--gen_port",
-                str(gen_port)
-            ],
+                cmd,
                 cwd=disagg_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env_copy,
         ):
-            assert wait_for_server("localhost", port, timeout_seconds=300), \
+            assert wait_for_server(
+                "localhost", server_port, timeout_seconds=300), \
                 "Disaggregated server failed to start within 5 minutes"
 
-            _run_completion_requests(port)
+            _run_completion_requests(server_port)
     finally:
         ray.shutdown()
 
 
-def _run_completion_requests(port):
+def _run_completion_requests(server_port):
     prompts = [
         "What is the capital of Germany?",
         "Explain the theory of relativity.",
@@ -150,8 +167,9 @@ def _run_completion_requests(port):
             "temperature": 0,
             "ignore_eos": True,
         }
-        async with session.post(f"http://localhost:{port}/v1/completions",
-                                json=payload) as response:
+        async with session.post(
+                f"http://localhost:{server_port}/v1/completions",
+                json=payload) as response:
             response_text = await response.text()
             assert response.status == 200, (
                 f"Completion request failed with HTTP {response.status}: "
