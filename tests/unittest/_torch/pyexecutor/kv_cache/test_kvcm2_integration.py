@@ -5291,7 +5291,10 @@ def test_live_storage_stats_use_the_manager_api() -> None:
 
 @pytest.mark.parametrize(
     "kv_connector_manager, expected_connector_cached_tokens",
-    [(None, None), (SimpleNamespace(capacity_only=False), 9)],
+    [
+        (None, None),
+        (SimpleNamespace(capacity_only=False, requires_block_aligned_reuse=False), 9),
+    ],
     ids=["no_connector", "serving_connector"],
 )
 def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(

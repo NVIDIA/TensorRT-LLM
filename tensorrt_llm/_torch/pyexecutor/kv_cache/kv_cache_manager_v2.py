@@ -8365,13 +8365,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _take_alignment_forfeit(self) -> tuple[int, int] | None:
         """The served and recomputed forfeited tokens since the last call, or None without alignment."""
+        if self._connector_reuse_match_alignment() <= 1:
+            return None
         counts = (
             self._alignment_forfeited_served_tokens,
             self._alignment_forfeited_recomputed_tokens,
         )
         self._alignment_forfeited_served_tokens = 0
         self._alignment_forfeited_recomputed_tokens = 0
-        return counts if self._connector_reuse_match_alignment() > 1 else None
+        return counts
 
     def _record_connector_reuse(self, kv_cache, start: int, end: int) -> None:
         """Book the prompt tokens a connector fills in ``[start, end)`` as cached.
