@@ -3,7 +3,7 @@
     "new model": ["laikhtewari"],
     "Inference runtime": ["funatiq", "pcastonguay", "Shixiaowei02", "MartinMarciniszyn", "schetlur-nv", "dcampora"],
     "Triton backend": ["Tabrizian", "pcastonguay", "schetlur-nv"],
-    "LLM API": ["Superjomn", "syuoni", "nv-guomingz", "litaotju", "QiJune"],
+    "LLM API": ["syuoni", "nv-guomingz", "litaotju", "QiJune"],
     "KV-Cache Management":["thorjohnsen", "schetlur-nv"],
     "Low Precision":["Tracin", "nv-guomingz", "Naveassaf"],
     "Speculative Decoding":["yweng0828", "lfr-0531"],
@@ -14,5 +14,5 @@
     "Doc":["nv-guomingz"],
     "Decoding": ["dcampora", "lfr-0531", "Naveassaf", "syuoni", "yweng0828"],
     "Memory": ["litaotju", "peaceh-nv"],
-    "Installation": ["hchings", "Superjomn", "nv-guomingz", "QiJune"]
+    "Installation": ["hchings", "nv-guomingz", "QiJune"]
 }
