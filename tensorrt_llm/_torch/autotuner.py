@@ -20,9 +20,11 @@ import enum
 import errno
 import fcntl
 import hashlib
+import heapq
 import inspect
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -60,6 +62,71 @@ from tensorrt_llm.mapping import Mapping
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
 
+# TuningConfig.parallel_plan's values; the variable overrides the op's for every op.
+_PARALLEL_PLANS = ("profile", "call")
+_PARALLEL_PLAN_ENV = "TLLM_AUTOTUNER_PARALLEL_PLAN"
+
+
+def plan_parallel_items(
+        custom_op: str, profiles: List[Tuple[Tuple, List[int]]], group_size: int
+) -> Tuple[Dict[Tuple[Tuple, int, int], int], List[float]]:
+    """The rank of a PARALLEL tuning group of ``group_size`` ranks that times each
+    ``(profile, runner, tactic)`` item of a ``choose_one`` call, keyed by ``(opt shapes,
+    runner index, tactic index)``, and the cost each rank is planned; ``profiles`` are
+    ``(opt shapes, tactics per runner)``.
+
+    An item costs ``1 + size / largest size``, a profile's size being the element count of
+    its input shapes: the 1 stands for what timing any pair takes (graph captures, warmup, a
+    kernel build), the rest for the kernel's own time. Items go largest first to the least
+    loaded rank, so the largest items land on different ranks and the busiest rank ends within
+    one item of an even share. Ties go by hashes of the op and the items (between ranks, of
+    the op and the profiles): the plan is the same on every rank and for any order of
+    ``profiles``, and the calls of single profiles start on different ranks.
+    """
+    sizes = {
+        shapes: sum(math.prod(shape) for shape in shapes)
+        for shapes, _ in profiles
+    }
+    largest = max(sizes.values(), default=0) or 1
+    items = []
+    for shapes, tactics in profiles:
+        cost = 1.0 + sizes[shapes] / largest
+        for r, count in enumerate(tactics):
+            for t in range(count):
+                tie = zlib.crc32(repr((custom_op, shapes, r, t)).encode())
+                items.append((-cost, tie, repr(shapes), r, t, shapes))
+    items.sort(key=lambda item: item[:5])
+    start = zlib.crc32(
+        repr((custom_op, sorted(repr(shapes)
+                                for shapes in sizes))).encode()) % group_size
+    # (load, place in the tie order, rank)
+    ranks = [(0.0, (rank - start) % group_size, rank)
+             for rank in range(group_size)]
+    heapq.heapify(ranks)
+    owners = {}
+    for neg_cost, *_, r, t, shapes in items:
+        load, order, rank = heapq.heappop(ranks)
+        owners[(shapes, r, t)] = rank
+        heapq.heappush(ranks, (load - neg_cost, order, rank))
+    loads = [0.0] * group_size
+    for load, _, rank in ranks:
+        loads[rank] = load
+    return owners, loads
+
+
+def _parallel_plan(tuning_config: "TuningConfig") -> str:
+    """How PARALLEL tuning splits the op's pairs (``TuningConfig.parallel_plan``), unless
+    TLLM_AUTOTUNER_PARALLEL_PLAN names a plan for every op."""
+    plan = os.environ.get(_PARALLEL_PLAN_ENV)
+    if plan in _PARALLEL_PLANS:
+        return plan
+    if plan:
+        logger.warning_once(
+            f"[Autotuner] {_PARALLEL_PLAN_ENV}={plan!r} is not one of "
+            f"{_PARALLEL_PLANS}; each op's TuningConfig.parallel_plan applies.",
+            key=("autotuner", "parallel_plan_env"))
+    return tuning_config.parallel_plan
+
 
 class DistributedTuningStrategy(enum.Enum):
     """
@@ -69,8 +136,9 @@ class DistributedTuningStrategy(enum.Enum):
         INDEPENDENT: Each rank tunes independently (default for non-comm ops)
         MERGE: All ranks participate in tuning and reach merge
         PARALLEL: All ranks participate in tuning; each rank times its share of a profile's
-            (runner, tactic) pairs and the merge keeps the fastest. A rank times every pair of
-            a profile that some other rank of the group does not tune.
+            (runner, tactic) pairs (or of the whole call's, ``TuningConfig.parallel_plan``) and
+            the merge keeps the fastest. A rank times every pair of a profile that some other
+            rank of the group does not tune.
     """
     BROADCAST = "broadcast"
     INDEPENDENT = "independent"
@@ -188,6 +256,11 @@ class TuningConfig:
             (``TunableRunner.build``; tensorrt_llm._torch.build_pool), then profiles. For ops whose
             builds are long enough to repay a worker. The runners and tactics must pickle and must
             not be collective. Warmups without a build pass build as without it.
+        parallel_plan (str): How PARALLEL tuning splits the (runner, tactic) pairs the group
+            times. ``"profile"``: each profile's pairs are dealt round robin on their own.
+            ``"call"``: the pairs of every profile of the ``choose_one`` call are planned at
+            once, larger profiles costing more (:func:`plan_parallel_items`), so that ranks
+            finish together. TLLM_AUTOTUNER_PARALLEL_PLAN overrides it for every op.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -201,6 +274,13 @@ class TuningConfig:
     build_strategy: BuildStrategy = BuildStrategy.PER_RANK
     cold_l2_flush_bytes: int = 0
     use_build_pool_in_warmup: bool = False
+    parallel_plan: str = "profile"
+
+    def __post_init__(self):
+        if self.parallel_plan not in _PARALLEL_PLANS:
+            raise ValueError(
+                f"TuningConfig.parallel_plan must be one of {_PARALLEL_PLANS}, "
+                f"got {self.parallel_plan!r}")
 
 
 @dataclass(frozen=True)
@@ -1631,21 +1711,35 @@ class AutoTuner:
                     return not agreed_hits[p.get_opt_shapes()]
                 return not is_cached(p)
 
+            # PARALLEL over a plan of the whole call: this rank's share of each profile.
+            planned = (self._plan_parallel_call(
+                custom_op, runners, profiles, inputs, tuning_config, is_pending,
+                undealt, **kwargs) if agreed_hits is not None
+                       and strategy == DistributedTuningStrategy.PARALLEL
+                       and _parallel_plan(tuning_config) == "call" else None)
+
             def profile_one(p: OptimizationProfile) -> None:
                 nonlocal new_tuning_failure_occurred
-                if is_pending(p):
-                    tensors = self._prepare_input_tensors(p, inputs)
-                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                    with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
-                        *_, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op,
-                            runners,
-                            tensors,
-                            p,
-                            tuning_config,
-                            deal=p.get_opt_shapes() not in undealt,
-                            **kwargs)
-                    new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
+                if not is_pending(p):
+                    return
+                plan = (planned.get(p.get_opt_shapes())
+                        if planned is not None else None)
+                if (plan is not None and any(tactics for tactics, _ in plan)
+                        and not any(mine for _, mine in plan)):
+                    return  # The merge brings in the winner the other ranks find.
+                tensors = self._prepare_input_tensors(p, inputs)
+                # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
+                    *_, has_tuning_failure_occurred = self._profile_runners(
+                        custom_op,
+                        runners,
+                        tensors,
+                        p,
+                        tuning_config,
+                        deal=p.get_opt_shapes() not in undealt,
+                        planned=plan,
+                        **kwargs)
+                new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
             share_builds = (tuning_config.build_strategy is BuildStrategy.SHARED
                             and jit_share.enabled())
@@ -1681,6 +1775,7 @@ class AutoTuner:
             else:
                 self._parallel_jit_warmup(custom_op, runners, profiles, inputs,
                                           tuning_config, **kwargs)
+            profiling_start = time.perf_counter()
             with self._shared_profile_graph_pool():
                 if one_pair:
                     self._profile_sharing_jit_builds(custom_op, profiles,
@@ -1693,6 +1788,10 @@ class AutoTuner:
                           if share_builds else contextlib.nullcontext()):
                         for p in profiles:
                             profile_one(p)
+            if planned is not None:
+                self._debug_logger(
+                    f"[Autotuner] {custom_op}: this rank timed its planned share in "
+                    f"{time.perf_counter() - profiling_start:.1f}s")
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
@@ -1720,6 +1819,51 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _plan_parallel_call(
+            self, custom_op: str, runners: List[TunableRunner],
+            profiles: List[OptimizationProfile], inputs: List[torch.Tensor],
+            tuning_config: TuningConfig,
+            is_pending: Callable[[OptimizationProfile],
+                                 bool], undealt: Set[Tuple],
+            **kwargs) -> Dict[Tuple, List[Tuple[List[Any], List[Any]]]]:
+        """This rank's share of the (profile, runner, tactic) items a PARALLEL call times, from
+        one plan of every pending profile the whole group tunes (:func:`plan_parallel_items`):
+        per profile, each runner's tactics and this rank's share of them. A profile some rank
+        of the group does not tune is not planned, and every rank times all its pairs. As the
+        per-profile deal, the plan relies on every rank listing the same tactics for a profile.
+        """
+        dealt = sorted((p for p in profiles
+                        if is_pending(p) and p.get_opt_shapes() not in undealt),
+                       key=lambda p: repr(p.get_opt_shapes()))
+        tactics: Dict[Tuple, List[List[Any]]] = {}
+        # As in _profile_runners: the ranks' profiling differs, so no NCCL window requests.
+        with nccl_window_allocation_suppressed():
+            for p in dealt:
+                tensors = self._tuning_tensors(p, inputs, tuning_config)
+                tactics[p.get_opt_shapes()] = [
+                    list(runner.get_valid_tactics(tensors, p, **kwargs))
+                    for runner in runners
+                ]
+                del tensors
+        size, index = self._tuning_group()
+        owners, loads = plan_parallel_items(
+            custom_op, [(shapes, [len(t) for t in per_runner])
+                        for shapes, per_runner in tactics.items()], size)
+        plan = {
+            shapes: [(all_tactics, [
+                tactic for t, tactic in enumerate(all_tactics)
+                if owners[(shapes, r, t)] == index
+            ]) for r, all_tactics in enumerate(per_runner)]
+            for shapes, per_runner in tactics.items()
+        }
+        self._debug_logger(
+            f"[Autotuner] {custom_op}: PARALLEL plan of {len(owners)} (profile, runner, "
+            f"tactic) items of {len(plan)} profiles over {size} ranks, planned costs "
+            f"{[round(load, 1) for load in loads]}; rank {index} times "
+            f"{sum(len(mine) for per_runner in plan.values() for _, mine in per_runner)}"
+        )
+        return plan
 
     def _tuning_tensors(self, profile: OptimizationProfile,
                         inputs: List[torch.Tensor],
@@ -2073,10 +2217,13 @@ class AutoTuner:
         tuning_config: TuningConfig,
         *,
         deal: bool = True,
+        planned: Optional[List[Tuple[List[Any], List[Any]]]] = None,
         **kwargs,
     ) -> float:
         """``deal``: under PARALLEL, time this rank's share of the (runner, tactic) pairs; False
-        when another rank of the group does not profile ``profile``, to time them all."""
+        when another rank of the group does not profile ``profile``, to time them all.
+        ``planned``: per runner, its tactics and this rank's share of them, from a plan of the
+        whole call (``TuningConfig.parallel_plan``)."""
         # PARALLEL ranks profile different tactics, so window requests here would diverge the
         # per-rank pools and let a later request register a window collectively on some ranks only.
         window_guard = (nccl_window_allocation_suppressed()
@@ -2096,6 +2243,7 @@ class AutoTuner:
                                                   profile,
                                                   tuning_config,
                                                   deal=deal,
+                                                  planned=planned,
                                                   **kwargs)
             finally:
                 self._profiling_depth -= 1
@@ -2109,6 +2257,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         *,
         deal: bool = True,
+        planned: Optional[List[Tuple[List[Any], List[Any]]]] = None,
         **kwargs,
     ) -> float:
         """Profile runners and select the best tactic.
@@ -2116,7 +2265,9 @@ class AutoTuner:
         Which ranks time which pairs follows the op's ``DistributedTuningStrategy``. Under
         PARALLEL with ``deal``, this rank times only its share of the (runner, tactic) pairs,
         possibly none, and the merge keeps the fastest of the group; without ``deal`` (a profile
-        that another rank of the group does not tune), it times them all.
+        that another rank of the group does not tune), it times them all. ``planned`` gives,
+        per runner, its tactics and this rank's share of them, which a plan of the whole call
+        made (``TuningConfig.parallel_plan``); it replaces the deal.
         """
 
         min_time = float('inf')
@@ -2139,8 +2290,9 @@ class AutoTuner:
                 p.name
                 for p in inspect.signature(runner.forward).parameters.values()
             }
-            all_valid_tactics = runner.get_valid_tactics(
-                input_tensors, profile, **kwargs)
+            all_valid_tactics = (planned[runner_id][0] if planned is not None
+                                 else runner.get_valid_tactics(
+                                     input_tensors, profile, **kwargs))
             total_pairs += len(all_valid_tactics)
             candidates.append(
                 (runner_id, runner, runner_arg_names, all_valid_tactics))
@@ -2211,10 +2363,15 @@ class AutoTuner:
             pair_offset = self._parallel_deal_start(
                 custom_op, profile, tuning_config.distributed_tuning_strategy)
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
-                valid_tactics = (self._maybe_parallelize_tactics(
-                    all_valid_tactics,
-                    tuning_config.distributed_tuning_strategy,
-                    offset=pair_offset) if deal else all_valid_tactics)
+                if planned is not None:
+                    valid_tactics = planned[runner_id][1]
+                elif deal:
+                    valid_tactics = self._maybe_parallelize_tactics(
+                        all_valid_tactics,
+                        tuning_config.distributed_tuning_strategy,
+                        offset=pair_offset)
+                else:
+                    valid_tactics = all_valid_tactics
                 pair_offset += len(all_valid_tactics)
                 local_pairs += len(valid_tactics)
                 if "do_preparation" in runner_arg_names and len(
