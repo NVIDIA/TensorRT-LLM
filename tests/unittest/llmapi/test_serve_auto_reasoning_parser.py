@@ -53,12 +53,18 @@ class _ReachedGetLlmArgs(Exception):
     """Raised by the recorder once serve has resolved its arguments."""
 
 
-def _write_checkpoint(model_dir: Path, model_type: str, jinja: Optional[str] = None) -> str:
+def _write_checkpoint(
+    model_dir: Path,
+    model_type: str,
+    jinja: Optional[str] = None,
+    tokenizer_config_template: Optional[str] = None,
+) -> str:
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({"model_type": model_type}))
-    (model_dir / "tokenizer_config.json").write_text(
-        json.dumps({"tokenizer_class": "Qwen2Tokenizer"})
-    )
+    tokenizer_config = {"tokenizer_class": "Qwen2Tokenizer"}
+    if tokenizer_config_template is not None:
+        tokenizer_config["chat_template"] = tokenizer_config_template
+    (model_dir / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
     if jinja is not None:
         (model_dir / "chat_template.jinja").write_text(jinja)
     return str(model_dir)
@@ -134,12 +140,18 @@ def test_serve_auto_reasoning_parser_rejects_non_chatml_qwen3_template(
     assert recorded == {}
 
 
+@pytest.mark.parametrize("source", ["jinja", "tokenizer_config"])
 def test_serve_auto_reasoning_parser_rejects_qwen3_reasoning_history_template(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
     """A Qwen3 template with <think> only outside the generation prompt is a usage error."""
+    template_files = (
+        {"jinja": _REASONING_HISTORY_TEMPLATE}
+        if source == "jinja"
+        else {"tokenizer_config_template": _REASONING_HISTORY_TEMPLATE}
+    )
     model = _write_checkpoint(
-        tmp_path / "Qwen3-30B-A3B-Thinking-2507-AWQ", "qwen3_moe", jinja=_REASONING_HISTORY_TEMPLATE
+        tmp_path / "Qwen3-30B-A3B-Thinking-2507-AWQ", "qwen3_moe", **template_files
     )
 
     result, recorded = _invoke_serve_auto(monkeypatch, model)

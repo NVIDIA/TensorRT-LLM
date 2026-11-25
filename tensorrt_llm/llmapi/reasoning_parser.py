@@ -858,14 +858,14 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
       → no reasoning parser needed.
 
     Only a template that was actually read can establish the last case; a
-    checkpoint without one falls back to the ``"qwen3"`` parser. The other
-    templates without a toggle or a ``<think>`` in their generation prompt
-    cannot be detected and return a None ``parser`` without
-    ``no_parser_needed``: one in another chat format (e.g.
-    DeepSeek-R1-0528-Qwen3-8B), and a ChatML one that writes ``<think>``
-    only outside the generation prompt, e.g. for the reasoning of past
-    assistant turns, since both thinking and instruct checkpoints ship that
-    template.
+    checkpoint without one falls back to the ``"qwen3"`` parser. Two other
+    kinds of template without a toggle cannot be detected and return a None
+    ``parser`` without ``no_parser_needed``: one whose generation prompt is
+    in another chat format and opens no ``<think>`` (e.g.
+    DeepSeek-R1-0528-Qwen3-8B), and a ChatML one that writes a non-empty
+    ``<think>`` only outside a generation prompt that neither opens nor
+    closes a ``<think>`` block, e.g. for the reasoning of past assistant
+    turns. Both thinking and instruct checkpoints ship the latter template.
     """
     chat_template = _read_chat_template(model)
     if chat_template is None:
@@ -937,11 +937,11 @@ def detect_auto_reasoning_parser(model: str) -> AutoReasoningParserResult:
     suggests it is a reasoning model (contains 'R1' in the name).
 
     For Qwen3 models, inspects the chat template to distinguish hybrid,
-    forced-thinking, and forced-non-thinking variants. Only the last one,
-    which requires a Qwen ChatML (``<|im_start|>``) generation prompt that
-    opens no ``<think>`` block and no reasoning written elsewhere in the
-    template (unless that prompt closes an empty ``<think></think>``
-    block), reports ``no_parser_needed``; every other None result is a
+    forced-thinking, and forced-non-thinking variants. Only the last one
+    reports ``no_parser_needed``. It requires a Qwen ChatML
+    (``<|im_start|>``) generation prompt that opens no ``<think>`` block,
+    and a template that writes no reasoning elsewhere unless that prompt
+    closes an empty ``<think></think>`` block. Every other None result is a
     detection failure.
     """
     config_path = Path(model) / "config.json"
