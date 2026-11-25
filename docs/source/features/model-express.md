@@ -330,6 +330,12 @@ fallback cannot accidentally satisfy the test.
 Each role generates eight fixed prompts for exactly 32 greedy tokens
 (`end_id=-1`, so no sequence stops early), and the test requires exact
 token-ID equality of the donor and the receiver against the HF baseline.
+Exact-token comparison roles opt in with `--exact-token-comparison`, requesting
+`FORCE_ATTENTION_KERNEL_DETERMINISTIC=1` and the compatible
+`FORCE_MULTI_BLOCK_MODE=OFF` in every rank, even when multi-block mode is forced
+in the parent environment. Model dtype and the full prompt workload stay
+unchanged. Accuracy-evaluation workers and their unscored donors retain their
+inherited attention configuration.
 Vision-language rows use an image probe instead of token-ID prompts: each of
 `seashore.png` and `inpaint.png` from `LLM_MODELS_ROOT/multimodals/test_data`
 is asked the same four questions, so every role also runs the vision encoder

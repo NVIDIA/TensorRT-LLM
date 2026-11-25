@@ -78,6 +78,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stop-file", type=Path)
     parser.add_argument("--max-serve-seconds", type=float, default=1800.0)
     parser.add_argument(
+        "--exact-token-comparison",
+        action="store_true",
+        help="Use deterministic attention for exact token comparisons",
+    )
+    parser.add_argument(
         "--probe",
         choices=_PROBES,
         default="text",
@@ -207,6 +212,9 @@ def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
     RDMA completion records reach this process's log.
     """
     overrides: dict[str, str] = {}
+    if args.exact_token_comparison:
+        overrides["FORCE_ATTENTION_KERNEL_DETERMINISTIC"] = "1"
+        overrides["FORCE_MULTI_BLOCK_MODE"] = "OFF"
     manifest_dir = os.environ.get("MX_WEIGHT_MANIFEST_DIR")
     if manifest_dir:
         overrides["MX_WEIGHT_MANIFEST_DIR"] = manifest_dir
