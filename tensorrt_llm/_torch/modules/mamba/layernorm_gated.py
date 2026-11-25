@@ -437,11 +437,12 @@ def _launch_multirow_kernel(x,
     one of them, while every request in flight waits. So the first launch of a
     variant also compiles its siblings, the same call with the other values
     of these flags. GROUPS changes only from _MULTIROW_GROUPS_MIN_ROWS rows,
-    and ROWS from _MULTIROW_TALL_MIN_ROWS rows, which a warmup of the largest
-    batch reaches; the siblings of a grouped or taller-tile launch include the
-    same call with single 4-row tiles, which smaller batches run. (Under
-    torch.compile the launch is traced, not run, so there is no variant to
-    pair.)
+    which a warmup of the largest batch reaches; the siblings of a grouped
+    launch include the same call with one tile per program, which smaller
+    batches run. ROWS changes at _MULTIROW_TALL_MIN_ROWS rows, so the siblings
+    of a launch on either side include the same call with the other tile
+    height. (Under torch.compile the launch is traced, not run, so there is
+    no variant to pair.)
 
     The row strides are compile keys too (== 1, % 16, and CONTIG), and a
     one-token batch can change them: PyTorch gives a dimension of size 1 the
@@ -496,6 +497,11 @@ def _launch_multirow_kernel(x,
                             GROUPS=1,
                             **_multirow_tile(x, 1, stride_x, contig))
             _compile_multirow_siblings(args, one_tile, device_index)
+        tall = _multirow_tile(x, _MULTIROW_TALL_MIN_ROWS, stride_x, contig)
+        if rows == _MULTIROW_ROWS and tall["ROWS"] != _MULTIROW_ROWS:
+            # From _MULTIROW_TALL_MIN_ROWS rows, taller tiles.
+            _compile_multirow_siblings(args, dict(kwargs, GROUPS=1, **tall),
+                                       device_index)
         # One token: `heads` rows, dense x and y rows when that is one row,
         # and a dense gate. All four of its variants are compiled, so that
         # every variant in the set has its siblings.
