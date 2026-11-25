@@ -690,9 +690,12 @@ channel counts are prefill-only settings of the source profile.
 conversation-affinity routing on regardless of engine-config detection. The UCX keep-alive and RC timeout settings apply to the
 remote-KV profiles; the source does not set them on the host-cache profile.
 
-The decode workers' `DYN_ROUTER_MODE` and `DYN_ROUTER_POLICY_CONFIG` must agree with
-the frontend: a decode worker set that advertises the classifier fails to
-register unless the frontend has built it too. Start the donating decode workers
+The decode workers' `DYN_ROUTER_MODE` advertises a router configuration that
+overrides the frontend's routing for the decode worker set only; the frontend
+itself always runs with `--router-mode kv`. `DYN_ROUTER_POLICY_CONFIG` must match
+the frontend's `--router-policy-config`: a decode worker set that advertises the
+classifier fails to register unless the frontend has built it too, so set both or
+neither. Start the donating decode workers
 and the claiming prefill workers together. A claimant waits up to 900 seconds
 (`level.donor_wait_timeout_s`) for the donors in `level.expected`, and fails at
 once when the reported donors cannot cover the claims.
@@ -743,9 +746,10 @@ role differences:
 
 * **High-throughput DEP8:** use `qwen3.5-gb300-agentx-dep8-{prefill,decode}.yaml`,
   start four TEP2 prefill workers, two per prefill node, and one eight-rank decode
-  worker across two nodes. Start the frontend without `--router-policy-config`,
-  and set `DYN_ROUTER_MODE=least-loaded` without `DYN_ROUTER_POLICY_CONFIG` on the
-  decode worker. Both roles use the 2048 MiB transfer-agent bounce buffer
+  worker across two nodes. Start the frontend with `--router-mode kv` and without
+  `--router-policy-config`, and set `DYN_ROUTER_MODE=least-loaded` without
+  `DYN_ROUTER_POLICY_CONFIG` on the decode worker, which overrides the frontend's
+  KV routing for the decode worker set. Both roles use the 2048 MiB transfer-agent bounce buffer
   (`kv_cache_bounce_size_mb: 2048`) with
   `agent_bounce_params.max_average_descriptor_size: 64KB`.
 * **Low-latency TEP16:** use `qwen3.5-gb300-agentx-tep16-{prefill,decode}.yaml`,
@@ -781,9 +785,9 @@ rounded each 200 GiB claim up to 203 GiB and each 160 GiB claim to 162 GiB).
 
 "FCFS" removes `waiting_queue_policy` and `waiting_queue_max_wait_s`; "no
 deferred release" removes `defer_generation_only_release`. On FCFS points, start
-the frontend without `--router-policy-config` and set
+the frontend with `--router-mode kv` and without `--router-policy-config`, and set
 `DYN_ROUTER_MODE=least-loaded` without `DYN_ROUTER_POLICY_CONFIG` on the decode
-workers. On the last two points, the decode workers replace
+workers, which overrides the frontend's KV routing for the decode worker set. On the last two points, the decode workers replace
 `remote_cache_config` with `host_cache_size: 137438953472` (128 GiB) and leave
 the UCX keep-alive and RC timeout variables unset, as in the TEP16 profile.
 Two TEP2 prefill workers share a node; the node counts exclude the frontend,
