@@ -89,10 +89,10 @@ def _assemble_multimodal_encoder_embeddings(
 
 @dataclass(frozen=True)
 class MultimodalEncoderSpec:
-    """A tower, its checkpoint key prefix, and the modalities it encodes."""
+    """A logical tower, its checkpoint key prefixes, and the modalities it encodes."""
 
     cls: type[torch.nn.Module]
-    weight_prefix: str
+    weight_prefix: str | tuple[str, ...]
     modalities: tuple[str, ...]
 
 
@@ -283,6 +283,11 @@ def encode_multimodal_by_groups(
             total = sum(lengths[m])
             per_modality_embeds[m] = out[cursor : cursor + total]
             cursor += total
+        if out.shape[0] != cursor:
+            raise MultimodalEncoderContractError(
+                f"Encoder group {group.modalities} returned {out.shape[0]} embeddings, "
+                f"but the item metadata declares {cursor}"
+            )
         per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 
@@ -495,61 +500,31 @@ class MultimodalModelMixin:
         if not specs:
             return None
         towers = (
-            self.mm_encoders.values() if self.mm_encoders else (spec.cls for spec in specs.values())
+            self.mm_encoders
+            if self.mm_encoders
+            else {name: spec.cls for name, spec in specs.items()}
         )
-        declarations = [getattr(tower, "multimodal_data_device_paths", None) for tower in towers]
-        if all(paths is None for paths in declarations):
+        declarations = {
+            name: getattr(tower, "multimodal_data_device_paths", None)
+            for name, tower in towers.items()
+        }
+        if all(paths is None for paths in declarations.values()):
             return None
         return list(
-            dict.fromkeys(path for paths in declarations if paths is not None for path in paths)
-        )
-
-    def _active_encoders(self, data: dict) -> list[str]:
-        remaining = {m for m in MEDIA_MODALITIES if data.get(m) is not None}
-        active = []
-        for name in self.mm_encoders:
-            modalities = type(self).mm_encoders[name].modalities
-            if any(data.get(m) is not None for m in modalities):
-                active.append(name)
-                remaining.difference_update(modalities)
-        if remaining:
-            raise ValueError(f"No local multimodal encoder supports {sorted(remaining)}")
-        return active
-
-    def _encode_request(self, param: MultimodalParams) -> torch.Tensor:
-        active = self._active_encoders(param.multimodal_data)
-        if not active:
-            raise ValueError("Raw multimodal inputs require a local encoder for their modalities.")
-        if len(active) == 1:
-            return self.mm_encoders[active[0]](param)
-
-        refs, lengths = param.get_item_layout()
-        if not refs:
-            raise ValueError(
-                "Encoding a request with multiple towers requires item_refs and output embedding lengths"
+            dict.fromkeys(
+                path
+                for name, paths in declarations.items()
+                for path in (paths if paths is not None else specs[name].modalities)
             )
-        items = {}
-        for name in active:
-            modalities = type(self).mm_encoders[name].modalities
-            tower_items = {
-                index: length
-                for index, ((modality, _), length) in enumerate(zip(refs, lengths, strict=True))
-                if modality in modalities
-            }
-            embeds = self.mm_encoders[name](param)
-            items.update(zip(tower_items, embeds.split(list(tower_items.values())), strict=True))
-        if len(items) != len(refs):
-            raise ValueError("item_refs must identify items from the request's active encoders")
-        return _assemble_multimodal_encoder_embeddings(items, len(refs))
+        )
 
     def encode_multimodal_inputs(
         self, multimodal_params: Sequence[MultimodalParams]
     ) -> torch.Tensor:
-        """Encode the selected requests in batch order and their items in prompt order."""
-        if not hasattr(type(self), "mm_encoders"):
-            raise NotImplementedError
-        embeds = [self._encode_request(param) for param in multimodal_params]
-        return embeds[0] if len(embeds) == 1 else torch.cat(embeds)
+        """Encode compatible inputs together and restore request and prompt order."""
+        if not self.mm_encoder_groups:
+            raise NotImplementedError("Raw multimodal inputs require a local encoder group")
+        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
 
     def validate_request(self, request: "LlmRequest") -> None:
         """Validate the prompt against the local towers declared by the model."""
@@ -557,7 +532,11 @@ class MultimodalModelMixin:
         if not encoders:
             return
         if request.py_multimodal_data:
-            self._active_encoders(request.py_multimodal_data)
+            media = {m for m in MEDIA_MODALITIES if request.py_multimodal_data.get(m) is not None}
+            for name in encoders:
+                media.difference_update(type(self).mm_encoders[name].modalities)
+            if media:
+                raise ValueError(f"No local multimodal encoder supports {sorted(media)}")
         for tower in encoders.values():
             validate = getattr(tower, "validate_request", None)
             if validate is not None:

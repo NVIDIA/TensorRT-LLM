@@ -523,7 +523,7 @@ def test_no_or_the_breakable_prefill_cuda_graph_matches(member, backend):
 
 def test_engine_choices_the_target_does_not_honor_decline(monkeypatch):
     """A strategy whose buffers only the stock `AllReduce` module sets up, under attention TP; a
-    forced attention-DP MoE round trip; GPU-side pixel normalization. MNNVL and SYMM_MEM run the
+    forced attention-DP MoE round trip. MNNVL and SYMM_MEM run the
     raw all-reduce at AUTO, and one rank has no TP sum."""
     for strategy in ("UB", "LOWPRECISION"):
         config = replace(
@@ -539,8 +539,6 @@ def test_engine_choices_the_target_does_not_honor_decline(monkeypatch):
     _claimed(_model_config(**_LAYOUTS["tep4"]))
     monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", "ALLGATHER")
     _claimed(_model_config(**_DEP2))
-    mm = MultimodalConfig(vision_gpu_normalize=True)
-    _declined(_model_config(), match="vision_gpu_normalize", multimodal_config=mm)
 
 
 def test_the_piecewise_prefill_cuda_graph_declines():

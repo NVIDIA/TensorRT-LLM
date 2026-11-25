@@ -43,6 +43,7 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_multimodal_model.py::test_qwen4_exp_grouped_tower_matches_independent_items
   # EPLB host-accessible memory takes the GPU NUMA path on Grace Blackwell; checks its memory-monitor records.
   - unittest/_torch/memory/test_memory_monitor_native.py::test_eplb_host_accessible_memory_is_recorded
   # MLA context head slices, including FP8 scale-block boundaries.

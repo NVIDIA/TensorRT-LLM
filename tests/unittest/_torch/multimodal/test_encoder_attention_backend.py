@@ -9,8 +9,8 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.model_loader import (
+from tensorrt_llm._torch.model_config import (
+    ModelConfig,
     _validate_encoder_attention_backend_enabled,
     _validate_encoder_attention_backend_support,
 )
@@ -247,80 +247,65 @@ def test_loader_accepts_enabled_encoder() -> None:
     )
 
 
-def test_loader_checks_encoder_after_model_kwargs() -> None:
-    from unittest.mock import MagicMock
+@pytest.mark.parametrize("disable", [False, True])
+def test_loader_checks_encoder_after_model_kwargs(monkeypatch, disable) -> None:
+    from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.models import modeling_auto
     from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.logger import logger
+    from tensorrt_llm.mapping import Mapping
+
+    class Builtin:
+        supported_encoder_attention_backends = {"vision": {"VANILLA"}}
+
+        def __init__(self, config):
+            self.config = config
 
     def load_config(**kwargs):
-        # The checkpoint has a vision encoder; model_kwargs removes it.
-        pretrained_config = SimpleNamespace(vision_config=object())
-        for name, value in kwargs["model_kwargs"].items():
-            setattr(pretrained_config, name, value)
-        return SimpleNamespace(pretrained_config=pretrained_config)
+        pretrained = PretrainedConfig(
+            architectures=["TestConditionalGeneration"],
+            hidden_size=16,
+            vision_config=PretrainedConfig(),
+            torch_dtype=torch.float32,
+        )
+        pretrained.update(kwargs["model_kwargs"])
+        return ModelConfig(
+            pretrained_config=pretrained,
+            disable_mm_encoder=kwargs["disable_mm_encoder"],
+            multimodal_config=kwargs["multimodal_config"],
+        )
 
+    monkeypatch.setattr(modeling_auto, "get_registered_model_class", lambda arch: Builtin)
     llm_args = TorchLlmArgs(
         model="/tmp/dummy_model",
+        modeling_v2="off",
+        disable_mm_encoder=disable,
         model_kwargs={"vision_config": None},
         multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
     )
     loader = ModelLoader(
         llm_args=llm_args,
-        mapping=MagicMock(),
+        mapping=Mapping(),
         spec_config=None,
         sparse_attention_config=None,
         max_num_tokens=128,
         max_seq_len=128,
     )
-    with pytest.raises(ValueError, match="vision.*not enabled"):
-        loader._load_and_validate_config(
-            "/tmp/dummy_model", SimpleNamespace(load_config=load_config)
-        )
-
-
-def test_loader_skips_encoder_check_when_encoder_is_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A text-only run, such as trtllm-bench without --modality, reuses a serving config."""
-    from unittest.mock import MagicMock
-
-    from tensorrt_llm._torch.pyexecutor import model_loader
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-    class ReachedTargetResolution(Exception):
-        pass
-
-    def resolve_target(*args, **kwargs):
-        raise ReachedTargetResolution
-
-    llm_args = TorchLlmArgs(
-        model="/tmp/dummy_model",
-        disable_mm_encoder=True,
-        multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
-    )
-    messages = []
-    monkeypatch.setattr(model_loader.logger, "info", messages.append)
-    monkeypatch.setattr(model_loader, "modeling_v2_resolve_on_all_ranks", resolve_target)
-    loader = model_loader.ModelLoader(
-        llm_args=llm_args,
-        mapping=MagicMock(),
-        spec_config=None,
-        sparse_attention_config=None,
-        max_num_tokens=128,
-        max_seq_len=128,
-    )
-    checkpoint_loader = SimpleNamespace(
-        load_config=lambda **kwargs: SimpleNamespace(pretrained_config=SimpleNamespace())
-    )
-
-    # The check passes without an error and loading continues to target resolution.
-    with pytest.raises(ReachedTargetResolution):
-        loader._load_and_validate_config("/tmp/dummy_model", checkpoint_loader)
-    assert [message for message in messages if "encoder_attention_backend" in message] == [
-        "multimodal_config.encoder_attention_backend is not applied "
-        "to encoders skipped by disable_mm_encoder=True"
-    ]
+    checkpoint = SimpleNamespace(load_config=load_config)
+    if disable:
+        messages = []
+        monkeypatch.setattr(logger, "info", messages.append)
+        config = loader._load_and_validate_config("/tmp/dummy_model", checkpoint)
+        assert config.pretrained_config.vision_config is None
+        assert [message for message in messages if "encoder_attention_backend" in message] == [
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True"
+        ]
+    else:
+        with pytest.raises(ValueError, match="vision.*not enabled"):
+            loader._load_and_validate_config("/tmp/dummy_model", checkpoint)
 
 
 def test_loader_validates_registered_model_class(monkeypatch: pytest.MonkeyPatch) -> None:

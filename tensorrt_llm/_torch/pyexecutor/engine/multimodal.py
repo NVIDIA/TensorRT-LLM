@@ -240,6 +240,36 @@ def setup_mm_encoder_cuda_graphs(
         module.enable_blocks_cuda_graph(max_num_tokens=max_num_tokens)
 
 
+def _mm_max_tokens_per_item(model, input_processor, **budget) -> dict[str, int]:
+    """Combine each local tower's legal item sizes, defaulting to processor geometry."""
+    specs = getattr(type(model), "mm_encoders", None)
+    if not specs:
+        return input_processor.get_mm_max_tokens_per_item(**budget)
+
+    sizes = {}
+    processor_sizes = None
+    for name, tower in model.mm_encoders.items():
+        if hasattr(tower, "get_mm_max_tokens_per_item"):
+            bounds = tower.get_mm_max_tokens_per_item(input_processor, **budget)
+        else:
+            if processor_sizes is None:
+                processor_sizes = input_processor.get_mm_max_tokens_per_item(**budget)
+            bounds = processor_sizes
+        sizes.update({m: bounds[m] for m in specs[name].modalities if m in bounds})
+    return sizes
+
+
+def _mm_dummy_data(model, input_processor, modality, **kwargs):
+    """Build the dummy with the same tower that supplied the item's geometry."""
+    for name, spec in getattr(type(model), "mm_encoders", {}).items():
+        if modality in spec.modalities:
+            tower = model.mm_encoders[name]
+            if hasattr(tower, "get_dummy_mm_data"):
+                return tower.get_dummy_mm_data(input_processor, **kwargs)
+            break
+    return input_processor.get_dummy_mm_data(**kwargs)
+
+
 def setup_mm_encoder_attn_metadata(
     model: nn.Module,
     input_processor: InputProcessor,
@@ -266,7 +296,7 @@ def setup_mm_encoder_attn_metadata(
 
     max_seq_len = encoder_max_num_tokens
     if isinstance(input_processor, BaseMultimodalDummyInputsBuilder):
-        max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
+        max_tokens_per_item = _mm_max_tokens_per_item(model, input_processor)
         max_seq_len = max(max_seq_len, max(max_tokens_per_item.values(), default=0))
 
     for module in encoders:
@@ -459,7 +489,7 @@ class MultimodalItemScheduler:
                 "MM encoder item scheduling requires a token budget; set "
                 "encoder_max_num_tokens or max_num_tokens"
             )
-        max_tokens_per_item = input_processor.get_mm_max_tokens_per_item()
+        max_tokens_per_item = _mm_max_tokens_per_item(model, input_processor)
         if not max_tokens_per_item:
             raise ValueError(
                 "A model with MM encoder item scheduling must implement "

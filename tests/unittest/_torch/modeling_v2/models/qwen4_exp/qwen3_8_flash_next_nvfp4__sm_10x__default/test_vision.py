@@ -12,6 +12,7 @@ grouping and the order of concatenated calls run with no engine. The shared base
 
 from __future__ import annotations
 
+from math import prod
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default import (  # noqa: E501
     vision as V,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -155,9 +157,9 @@ def _random_grid(gen):
 def test_frames_are_grouped_whole_and_in_order():
     # 16-row frames, 32 rows to a call: one item's frames split across calls.
     assert V._frame_calls([(5, 4, 4)], 32) == [[(2, 4, 4)], [(2, 4, 4)], [(1, 4, 4)]]
-    # A call takes the end of one item and the start of the next.
+    # An item's frame boundaries stay the same regardless of its neighbors.
     grid = [(1, 8, 4), (3, 4, 4), (1, 2, 2)]
-    assert V._frame_calls(grid, 48) == [[(1, 8, 4), (1, 4, 4)], [(2, 4, 4), (1, 2, 2)]]
+    assert V._frame_calls(grid, 48) == [[item] for item in grid]
     assert V._frame_calls(grid, 1 << 20) == [grid]
 
 
@@ -170,10 +172,14 @@ def test_a_call_is_filled_to_the_ceiling_and_never_past_it():
         assert [f for call in calls for f in _frames(call)] == _frames(grid)
         sizes = [sum(t * h * w for t, h, w in call) for call in calls]
         assert all(0 < size <= cap for size in sizes)
-        # Greedy: the next call's first frame would not have fit.
+        independent = [
+            tile for item in grid for call in V._frame_calls([item], cap) for tile in call
+        ]
+        assert [tile for call in calls for tile in call] == independent
+        # The next call's first complete tile would not have fit.
         for size, call in zip(sizes, calls[1:]):
-            h, w = _frames(call)[0]
-            assert size + h * w > cap
+            t, h, w = call[0]
+            assert size + t * h * w > cap
 
 
 def test_one_frame_past_the_ceiling_is_refused_and_one_at_it_is_not():
@@ -216,7 +222,7 @@ def _pixels(grid):
 def test_the_tower_concatenates_embeddings_from_whole_frames_in_order(monkeypatch):
     grid = [(1, 8, 4), (3, 4, 4), (2, 2, 6), (1, 2, 2)]
     tower = _stub_tower(monkeypatch, 48)
-    out = tower._encode_patches(_pixels(grid), torch.tensor(grid))
+    out = tower(_pixels(grid), torch.tensor(grid))
     patches = sum(t * h * w for t, h, w in grid)
     assert out[:, 0].tolist() == [float(4 * j) for j in range(patches // 4)]
     assert [call[1] for call in tower.calls] == V._frame_calls(grid, 48)
@@ -235,7 +241,7 @@ def test_a_request_past_one_calls_ceiling_is_served_in_two(monkeypatch):
     ceiling = V.VISION_CALL_MAX_PATCHES
     grid = [(33, 32, 32)]
     tower = _stub_tower(monkeypatch, ceiling)
-    out = tower._encode_patches(_pixels(grid), torch.tensor(grid))
+    out = tower(_pixels(grid), torch.tensor(grid))
     assert [call[1] for call in tower.calls] == [[(32, 32, 32)], [(1, 32, 32)]]
     assert out.shape[0] == 33 * 32 * 32 // 4
     assert out[:, 0].tolist() == [float(4 * j) for j in range(out.shape[0])]
@@ -244,11 +250,11 @@ def test_a_request_past_one_calls_ceiling_is_served_in_two(monkeypatch):
 def test_the_tower_refuses_pixels_its_grid_does_not_describe(monkeypatch):
     tower = _stub_tower(monkeypatch, 64)
     with pytest.raises(AssertionError, match="describes 16 patch rows"):
-        tower._encode_patches(_pixels([(1, 4, 4)])[:12], torch.tensor([(1, 4, 4)]))
+        tower(_pixels([(1, 4, 4)])[:12], torch.tensor([(1, 4, 4)]))
     with pytest.raises(AssertionError, match="divide by spatial_merge_size 2"):
-        tower._encode_patches(_pixels([(1, 4, 3)]), torch.tensor([(1, 4, 3)]))
+        tower(_pixels([(1, 4, 3)]), torch.tensor([(1, 4, 3)]))
     with pytest.raises(AssertionError, match="activation dtype"):
-        tower._encode_patches(_pixels([(1, 4, 4)]).to(torch.bfloat16), torch.tensor([(1, 4, 4)]))
+        tower(_pixels([(1, 4, 4)]).to(torch.bfloat16), torch.tensor([(1, 4, 4)]))
 
 
 # ------------------------------------------------------------------- splice ---
@@ -265,23 +271,32 @@ class _Tower(V.VisionTower):
         nn.Module.__init__(self)
         self.calls = 0
 
-    def _encode_patches(self, pixel_values, grid_thw):
+    def forward(self, pixel_values, grid_thw):
         self.calls += 1
-        modality = int(pixel_values[0, 0])
-        return torch.cat(
-            [
-                torch.full((t * h * w // (MERGE * MERGE), HIDDEN), float(100 * modality + item))
-                for item, (t, h, w) in enumerate(grid_thw.tolist())
-            ]
-        )
+        return pixel_values[:: MERGE**2].expand(-1, HIDDEN)
 
 
 def _media(modality, grids):
-    """One `multimodal_data` entry; `pixel_values` only carries the stub's modality."""
-    patches = sum(t * h * w for t, h, w in grids)
     key = "pixel_values" if modality == IMAGE else "pixel_values_videos"
     grid_key = "image_grid_thw" if modality == IMAGE else "video_grid_thw"
-    return {key: torch.full((patches, 1), float(modality)), grid_key: torch.tensor(grids)}
+    pixels = torch.cat(
+        [torch.full((prod(grid), 1), float(100 * modality + i)) for i, grid in enumerate(grids)]
+    )
+    return {key: pixels, grid_key: torch.tensor(grids)}
+
+
+def _set_item_metadata(data, image, video, order):
+    if image and video and order is None:
+        return
+    lengths = {
+        (modality, i): prod(grid) // MERGE**2
+        for modality, grids in (("image", image or []), ("video", video or []))
+        for i, grid in enumerate(grids)
+    }
+    refs = list(lengths) if order is None else order
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        refs, output_embedding_lengths=[lengths.get(ref, 0) for ref in refs]
+    )
 
 
 def _params(image=None, video=None, order=None, runtime=None, mrope=True):
@@ -292,8 +307,7 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
         data["image"] = _media(IMAGE, image)
     if video is not None:
         data["video"] = _media(VIDEO, video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    _set_item_metadata(data, image, video, order)
     return MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
 
 
@@ -301,8 +315,13 @@ def _splice(tower, params, num_mm_tokens, padding=0):
     """Place the tower's embeddings at their placeholder positions, leaving room for padding."""
     total = num_mm_tokens + 2
     h = torch.full((total + padding, HIDDEN), -1.0)
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.mm_encoder_groups = (
+        EncoderGroup(Model.mm_encoders["vision"].modalities, tower, tower.build_batched_input),
+    )
     step = SimpleNamespace(
-        mm_embeds=tower(params),
+        mm_embeds=model.encode_multimodal_inputs([params]),
         mm_token_indices=torch.arange(1, 1 + num_mm_tokens, dtype=torch.int64),
         num_tokens=total,
     )
@@ -347,11 +366,11 @@ def test_a_mixed_request_is_reassembled_in_prompt_order():
     tower = _Tower()
     params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER)
     assert _splice(tower, params, len(MIXED_EMBEDS)) == MIXED_EMBEDS
-    assert tower.calls == 2
+    assert tower.calls == 1
 
 
 def test_a_mixed_request_needs_its_manifest():
-    with pytest.raises(AssertionError, match="needs item metadata"):
+    with pytest.raises(ValueError, match="item metadata"):
         _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_EMBEDS))
 
 
@@ -412,8 +431,7 @@ def _request(image=None, video=None, order=None, **overrides):
         data["image"] = _request_media("image", image)
     if video is not None:
         data["video"] = _request_media("video", video)
-    if order is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    _set_item_metadata(data, image, video, order)
     fields = {"py_multimodal_data": data, "prompt_len": prompt_len}
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -421,11 +439,10 @@ def _request(image=None, video=None, order=None, **overrides):
 
 def _admit(request):
     """The tower's admission check, which the model's `validate_request` calls."""
-    V.validate_request(_GEOMETRY, request)
+    V.VisionTower.validate_request(_GEOMETRY, request)
 
 
 def test_clean_requests_are_admitted():
-    # A single-modality request needs no manifest.
     _admit(_request(image=IMAGES))
     _admit(_request(video=VIDEOS))
     _admit(_request(image=IMAGES, video=VIDEOS, order=MIXED_ORDER))

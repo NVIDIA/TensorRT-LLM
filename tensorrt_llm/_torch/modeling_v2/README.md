@@ -220,45 +220,49 @@ class ModelingV2MyTargetForConditionalGeneration(MultimodalModelForCausalLM):
     }
 ```
 
-The base constructs each tower with the vision config and activation dtype.
-It passes the checkpoint keys under each prefix to that tower's `load_weights`
-and all other keys to the decoder. With `disable_mm_encoder`, the dictionary
-is empty and the loader skips the tower weights.
+Each spec constructs a local tower with the corresponding checkpoint subconfig
+(for example, `vision_config`) and the decoder activation dtype. When the checkpoint
+has no subconfig for that encoder name, the tower receives the composite config.
+`weight_prefix` accepts one prefix or a tuple of disjoint prefixes for a tower
+and its projector. With `disable_mm_encoder`, the base skips construction and
+leaves every matching checkpoint tensor unread.
 
-A tower's `forward(param: MultimodalParams)` returns a tensor of shape
-`[num_mm_tokens, hidden]` in prompt order for its modalities. `MultimodalModelMixin` calls
-the towers needed by each request and uses the item metadata to put outputs
-from different towers back in prompt order. The mixin handles the encoder
-cache on workers with a local encoder and selects embeddings for the current
-prefill chunk. Its cache dimensions default to the decoder's text embedding layer.
-It combines the towers' `multimodal_data_device_paths` for staging and calls
-each tower's optional `validate_request(request)` after the decoder vocabulary
-check. Position-only M-RoPE data bypasses the encoders.
+| Feature | Tower or processor contract |
+| --- | --- |
+| Chunked prefill | The processor publishes prompt embedding positions. The shared forward retrieves request embeddings and selects the active chunk. |
+| Grouped encoding | One spec defines one compatible group. Its tower's `build_batched_input(params)` packs in declared modality order, then request order. `forward(**packed)` preserves that order. The processor provides prompt-ordered `item_refs` and exact `output_embedding_lengths` for real and dummy inputs. |
+| Item scheduling | Each tower opts in with `supports_mm_encoder_item_scheduling`. The paired processor supplies costs and field partitions in `get_mm_item_metadata`, maximum item sizes, output capacity, and legal dummy inputs. A tower with tighter limits can implement `get_mm_max_tokens_per_item` and `get_dummy_mm_data` together. Both receive the processor as their first argument. |
+| Cross-request cache | Every tower declares `supports_encoder_cache` when its output is reusable by stable media and processor hashes. The mixin builds partial misses from the processor's partitions. A worker needs a local tower and a positive `encoder_cache_max_bytes` for persistent reuse. |
+| Side-stream prefetch | A tower that runs safely on the current stream declares `multimodal_data_device_paths`. The base combines paths across towers. Configure `encoder_side_stream_max_ahead` with item scheduling disabled. |
+| GPU vision normalization | Image and video towers opt in with `supports_vision_gpu_normalize`. The architecture's processor must support raw pixels with `VisionNormalization`. The packer calls `normalize_vision_pixels` after staging. |
+| Encoder attention | The tower's `supported_encoder_attention_backends` set is keyed by its spec name on the model. An empty set declares fixed attention. Configurable towers also receive the selected `model_config` keyword, with a private config for the encoder. |
 
-By default, the mixin fuses multimodal embeddings into the decoder's
-`inputs_embeds`. A decoder that needs the original token IDs sets
-`llm_requires_input_ids = True` on its wrapper. It receives the unchanged
+The default fusion uses the decoder's text embedding layer. A decoder that
+needs the original IDs sets `llm_requires_input_ids = True` and receives
 `input_ids`, the current `mm_embeds` and their `mm_token_indices`.
-Qwen NVFP4 uses the IDs in its PLE layer. To supply additional decoder
-inputs, a target can override `get_language_model_extra_forward_kwargs`.
+Both Qwen targets use this path for PLE. Their processor supplies M-RoPE
+positions, item partitions and merged lengths. Their towers use fixed attention.
+
+A target can customize decoder arguments with `get_language_model_extra_forward_kwargs`.
+A custom forward processing media must call `prepare_multimodal_inputs` or
+`prepare_multimodal_embeds`. Subclass registration checks the grouped encoder
+and shared preparation methods. A custom forward is checked on an actual media step.
 
 Modeling V2 checks admission before batching. A V2 worker without a local
 encoder rejects raw media. Precomputed embeddings require a multimodal V2
 model in encoder/prefill disaggregated mode. M-RoPE positions alone pass
 this check. Modeling V1 models keep their existing admission behavior.
-The Qwen FP8 target uses its existing chunk-local encoder. MiniMax-M3.1 DEP
-uses its registered model's vision tower.
+MiniMax-M3.1 DEP uses its registered model's vision tower.
 
 | Media architecture | Composite | Existing encoder | Text-only targets |
 | --- | --- | --- | --- |
-| Qwen3.8-Flash-Next (sm103, sm107) | NVFP4 | FP8 | — |
+| Qwen3.8-Flash-Next (sm103, sm107) | FP8 and NVFP4 | — | — |
 | GLM-5.3-Flash | — | — | FP8 and NVFP4 TP4 on sm100/sm103, NVFP4 default and default MTP-fused on sm100 |
 | Kimi K3 | — | — | Both sm100 MXFP4 TP16 targets and all four sm107 NVFP4 targets |
 | MiniMax-M3 | — | — | NVFP4 TP4/TP8 on sm103 and TP2/TP4/TP8 on sm107 |
 | MiniMax-M3.1-Flash (sm107) | — | DEP | TP2, TP4, TP8, TP2 context and DEP2 context |
 
-The NVFP4 route declines an encoder side stream or encoder CUDA graph
-when the local tower would need to use it.
+The Qwen vision towers support side-stream prefetch and decline encoder CUDA graphs.
 
 Name a new composite `ModelingV2<Target>ForConditionalGeneration`. Its decoder
 keeps the name `ModelingV2<Target>`. The naming test checks routed composites

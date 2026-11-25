@@ -22,7 +22,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__
     _bilinear_pos_embed_kernel,
 )
 from tensorrt_llm._torch.modules.fla.layernorm_gated import _layer_norm_fwd_1pass_kernel
-from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 assert torch.cuda.is_available(), "the vision tower runs on a CUDA device"
 
@@ -52,14 +51,14 @@ _KERNELS = {
 }
 
 
-def _tower() -> V.VisionTower:
+def _tower(vision=V):
     vcfg = Qwen4ExpVisionConfig(**_VISION)
     with torch.device("cuda"):
-        tower = V.VisionTower(vcfg, torch.bfloat16)
+        tower = vision.VisionTower(vcfg, torch.bfloat16)
     gen = torch.Generator(device="cuda").manual_seed(7)
     for param in tower.w.values():
         param.data.copy_(torch.randn(param.shape, generator=gen, device="cuda") * 0.02)
-    tower._w = V._vision_views(tower.w, tower.depth)
+    tower._w = vision._vision_views(tower.w, tower.depth)
     return tower
 
 
@@ -84,12 +83,7 @@ def test_after_warm_up_no_grid_compiles_a_kernel():
     for grid in ([(1, 16, 16)], [(1, 6, 10)], [(2, 8, 12)], [(1, 62, 90)], [(1, 2, 34), (1, 4, 4)]):
         rows = sum(t * h * w for t, h, w in grid)
         pixels = torch.randn(rows, tower.pixel_width, generator=gen, device="cuda").to(tower.dtype)
-        params = MultimodalParams(
-            multimodal_data={
-                "image": {"pixel_values": pixels, "image_grid_thw": torch.tensor(grid)}
-            }
-        )
-        out = tower(params)
+        out = tower(pixels, torch.tensor(grid))
         torch.cuda.synchronize()
         assert out.shape == (rows // 4, HIDDEN_OUT) and bool(torch.isfinite(out).all()), grid
         assert _variants() == warmed, f"{grid} compiled a kernel after the warm-up"

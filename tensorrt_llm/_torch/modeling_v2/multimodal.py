@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import inspect
+from contextvars import ContextVar
+from functools import wraps
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -14,6 +16,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.model_hooks import call_load_weights
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     MultimodalEncoderSpec,
     MultimodalModelMixin,
 )
@@ -33,7 +36,90 @@ _LANGUAGE_MODEL_CLASS_ATTRIBUTES = {
 }
 
 
+# Only custom forwards need a behavioral check. Calls that inherit the mixin
+# take the ordinary preparation path without any guard on the inference step.
+_pending_preparation = ContextVar("_pending_preparation", default=None)
+
+
+def _prepare_custom_forward(self, **kwargs):
+    prepared = MultimodalModelMixin.prepare_multimodal_embeds(self, **kwargs)
+    if prepared is not None and _pending_preparation.get() is self:
+        _pending_preparation.set(None)
+    return prepared
+
+
+def _check_custom_forward(forward):
+    signature = inspect.signature(forward)
+
+    @wraps(forward)
+    def checked(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs).arguments if args else {}
+        params = kwargs.get("multimodal_params", bound.get("multimodal_params"))
+        metadata = kwargs.get(
+            "attn_metadata", bound.get("attn_metadata", args[0] if args else None)
+        )
+        if (
+            not params
+            or _pending_preparation.get() is self
+            or not self.select_multimodal_params(
+                params, getattr(metadata, "num_contexts", len(params))
+            )
+        ):
+            return forward(self, *args, **kwargs)
+        token = _pending_preparation.set(self)
+        try:
+            result = forward(self, *args, **kwargs)
+            if _pending_preparation.get() is self:
+                raise RuntimeError(
+                    "A custom multimodal forward must call prepare_multimodal_inputs or prepare_multimodal_embeds"
+                )
+            return result
+        finally:
+            _pending_preparation.reset(token)
+
+    return checked
+
+
 class _EncoderSpecs(dict[str, MultimodalEncoderSpec]):
+    def __init__(self, specs):
+        super().__init__(specs)
+        prefixes = []
+        modalities = set()
+        for name, spec in self.items():
+            if (
+                not spec.modalities
+                or modalities.intersection(spec.modalities)
+                or len(set(spec.modalities)) != len(spec.modalities)
+            ):
+                raise ValueError("Each modality must belong to one multimodal encoder")
+            modalities.update(spec.modalities)
+            weights = (
+                (spec.weight_prefix,) if isinstance(spec.weight_prefix, str) else spec.weight_prefix
+            )
+            if not weights or not all(weights):
+                raise ValueError(f"Encoder {name!r} requires a nonempty weight prefix")
+            prefixes.extend(weights)
+            tower = spec.cls
+            if (
+                not issubclass(tower, nn.Module)
+                or inspect.isabstract(tower)
+                or tower.forward is nn.Module.forward
+                or any(
+                    not callable(hook) or getattr(hook, "__isabstractmethod__", False)
+                    for hook in (tower.forward, getattr(tower, "build_batched_input", None))
+                )
+            ):
+                raise TypeError(f"Encoder {name!r} must implement build_batched_input and forward")
+            if hasattr(tower, "get_mm_max_tokens_per_item") != hasattr(tower, "get_dummy_mm_data"):
+                raise TypeError(
+                    f"Encoder {name!r} must implement item sizing and dummy inputs together"
+                )
+        if any(
+            left.startswith(right) or right.startswith(left)
+            for left, right in combinations(prefixes, 2)
+        ):
+            raise ValueError("Multimodal encoder weight prefixes must not overlap")
+
     # nn.Module stores registered children in _modules. Let the instance see its
     # registered ModuleDict under the same name as the class's declarations.
     def __get__(self, instance, owner):
@@ -43,11 +129,11 @@ class _EncoderSpecs(dict[str, MultimodalEncoderSpec]):
 class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
     """Compose ``llm_class`` with the towers declared in ``mm_encoders``.
 
-    A tower takes the vision config and activation dtype. Its forward accepts one
-    MultimodalParams and returns [num_mm_tokens, hidden] for its modalities in
-    prompt order. By default the mixin fuses these embeddings into the language
-    model input. Set ``llm_requires_input_ids`` to pass the original token IDs,
-    ``mm_embeds`` and the engine's ``mm_token_indices`` to the language model.
+    Each tower packs compatible requests with ``build_batched_input``. Its forward
+    returns [num_mm_tokens, hidden] in the same modality-major order. By default
+    the mixin fuses these embeddings into the language model input. Set
+    ``llm_requires_input_ids`` to pass the original token IDs, ``mm_embeds`` and
+    the engine's ``mm_token_indices`` to the language model.
     """
 
     _inputs_embeds_conflict = (
@@ -59,14 +145,52 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if not isinstance(cls.mm_encoders, _EncoderSpecs):
-            for left, right in combinations(cls.mm_encoders.values(), 2):
-                if set(left.modalities).intersection(right.modalities):
-                    raise ValueError("Each modality must belong to one multimodal encoder")
-                if left.weight_prefix.startswith(
-                    right.weight_prefix
-                ) or right.weight_prefix.startswith(left.weight_prefix):
-                    raise ValueError("Multimodal encoder weight prefixes must not overlap")
             cls.mm_encoders = _EncoderSpecs(cls.mm_encoders)
+        specs = cls.mm_encoders
+
+        if not cls.llm_requires_input_ids and (
+            not callable(cls._fuse_multimodal_embeddings)
+            or getattr(cls._fuse_multimodal_embeddings, "__isabstractmethod__", False)
+        ):
+            raise TypeError("A V2 model that fuses embeddings needs a concrete fusion hook")
+        if cls.encode_multimodal_inputs is not MultimodalModelMixin.encode_multimodal_inputs:
+            raise TypeError("V2 encoders must use the grouped encode_multimodal_inputs template")
+        if (
+            cls.prepare_multimodal_inputs is not MultimodalModelMixin.prepare_multimodal_inputs
+            or cls.prepare_multimodal_embeds
+            not in (MultimodalModelMixin.prepare_multimodal_embeds, _prepare_custom_forward)
+        ):
+            raise TypeError("V2 models must use shared multimodal input preparation")
+        if cls.forward is not MultimodalModelMixin.forward and (
+            "forward" in cls.__dict__
+            or cls.prepare_multimodal_embeds is not _prepare_custom_forward
+        ):
+            cls.forward = _check_custom_forward(cls.forward)
+            cls.prepare_multimodal_embeds = _prepare_custom_forward
+
+        for flag in (
+            "supports_encoder_cache",
+            "supports_mm_encoder_item_scheduling",
+            "supports_vision_gpu_normalize",
+        ):
+            if "mm_encoders" not in cls.__dict__ and flag not in cls.__dict__:
+                continue
+            required = [
+                spec.cls
+                for spec in specs.values()
+                if flag != "supports_vision_gpu_normalize"
+                or {"image", "video"}.intersection(spec.modalities)
+            ]
+            supported = bool(required) and all(getattr(tower, flag, False) for tower in required)
+            if cls.__dict__.get(flag) and not supported:
+                raise ValueError(f"{flag} requires support from all participating encoders")
+            if flag not in cls.__dict__:
+                setattr(cls, flag, supported)
+
+        cls.supported_encoder_attention_backends = {
+            name: getattr(spec.cls, "supported_encoder_attention_backends", frozenset())
+            for name, spec in specs.items()
+        }
         llm_class = cls.__dict__.get("llm_class")
         for name, default in _LANGUAGE_MODEL_CLASS_ATTRIBUTES.items():
             if llm_class is not None and name not in cls.__dict__:
@@ -86,16 +210,23 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
         # Built as the engine builds a decoder model (`skip_create_weights_in_init`), on its own
         # shallow copy, where it adopts the text config.
         self.llm = self.llm_class(model_config.copy_with(skip_create_weights_in_init=True))
-        # Everything that sizes the pools reads the text config.
-        model_config.pretrained_config = self.llm.config
         self.config = self.llm.config
-        self.mm_encoders = nn.ModuleDict(
-            {
-                name: spec.cls(composite.vision_config, self.dtype)
-                for name, spec in type(self).mm_encoders.items()
-                if not model_config.disable_mm_encoder
-            }
-        )
+        self.mm_encoders = nn.ModuleDict()
+        groups = []
+        if not model_config.disable_mm_encoder:
+            for name, spec in type(self).mm_encoders.items():
+                kwargs = {}
+                if self.supported_encoder_attention_backends[name]:
+                    kwargs["model_config"] = (
+                        model_config.copy_with().with_encoder_attention_backend(name)
+                    )
+                tower_config = getattr(composite, f"{name}_config", composite)
+                tower = spec.cls(tower_config, self.llm.model_config.torch_dtype, **kwargs)
+                self.mm_encoders[name] = tower
+                groups.append(EncoderGroup(spec.modalities, tower, tower.build_batched_input))
+        self.mm_encoder_groups = tuple(groups)
+        # Publish the text config for KV sizing only after every tower has accepted the deployment.
+        model_config.pretrained_config = self.config
 
     @property
     def language_model(self) -> DecoderModelForCausalLM:

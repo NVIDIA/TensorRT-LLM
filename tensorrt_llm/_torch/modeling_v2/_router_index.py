@@ -346,11 +346,8 @@ def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
         )
 
 
-def _refuse_encoder_side_stream(config: "ModelConfig", target: type) -> None:
-    """Raise ``NoTarget`` when a ``MultimodalModelForCausalLM`` target would build its
-    tower and the engine runs the encoder on a side stream: the base runs its encoder inside
-    the step only. ``auto`` then uses the built-in implementation. An encoder-only deployment
-    (``mm_encoder_only``) builds the architecture's encoder model, not this one."""
+def _check_encoder_features(config: "ModelConfig", target: type) -> None:
+    """Match the requested multimodal features to the routed encoder declarations."""
     from .multimodal import MultimodalModelForCausalLM
 
     if (
@@ -360,11 +357,25 @@ def _refuse_encoder_side_stream(config: "ModelConfig", target: type) -> None:
     ):
         return
     mm_config = config.multimodal_config
-    if mm_config is not None and mm_config.encoder_side_stream_max_ahead > 0:
+    if mm_config is None:
+        return
+    if mm_config.encoder_attention_backend:
+        from ..model_config import _validate_encoder_attention_backend_support
+
+        try:
+            _validate_encoder_attention_backend_support(target, mm_config)
+        except ValueError as error:
+            raise NoTarget(str(error)) from error
+    if mm_config.vision_gpu_normalize and not target.supports_vision_gpu_normalize:
+        raise NoTarget(f"{target.__name__} does not support processor-described raw vision pixels")
+    if mm_config.encoder_side_stream_max_ahead > 0 and any(
+        getattr(spec.cls, "multimodal_data_device_paths", None) is None
+        for spec in target.mm_encoders.values()
+    ):
         raise NoTarget(
             "multimodal_config.encoder_side_stream_max_ahead="
-            f"{mm_config.encoder_side_stream_max_ahead}; {target.__name__} does not run its "
-            "encoder on a side stream"
+            f"{mm_config.encoder_side_stream_max_ahead}; {target.__name__} has an encoder without "
+            "multimodal_data_device_paths for side-stream prefetch"
         )
 
 
@@ -399,7 +410,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if target is not None:
             _check_eplb_mode(target, config)
             _refuse_unhonored_moe_tactics(config, target, arch)
-            _refuse_encoder_side_stream(config, target)
+            _check_encoder_features(config, target)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

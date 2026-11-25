@@ -20,7 +20,10 @@ from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import (
+    ModelConfig,
+    _validate_encoder_attention_backend_support,
+)
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
@@ -41,7 +44,6 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import mm_item_scheduling_enabled
-from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

@@ -102,8 +102,8 @@ def _mapping(member: str, rank: int) -> Mapping:
 
 
 def _dims(configs, member: str, rank: int, mtp: bool = True):
-    text, vision = configs
-    return WT.rank_dims(text, vision, _mapping(member, rank), mtp_enabled=mtp, dtype=torch.bfloat16)
+    text, _ = configs
+    return WT.rank_dims(text, _mapping(member, rank), mtp_enabled=mtp, dtype=torch.bfloat16)
 
 
 def _world(member: str) -> int:
@@ -385,7 +385,7 @@ def test_rank_shard(stored, configs, member, rank):
 
 def _stub_model(configs, member: str, rank: int, mtp: bool):
     """The shell and core that `load` reads, on meta: configs, mapping, parameters, lm_head."""
-    text, vision = configs
+    text, _ = configs
     core = SimpleNamespace(
         model_config=SimpleNamespace(
             pretrained_config=text,
@@ -393,7 +393,6 @@ def _stub_model(configs, member: str, rank: int, mtp: bool):
             spec_config=object() if mtp else None,
             torch_dtype=torch.bfloat16,
         ),
-        vision_config=vision,
     )
     d = WT.MODEL_WEIGHTS.dims(core)
     with torch.device("meta"):
@@ -426,6 +425,9 @@ def test_member_covers_the_checkpoint(stored, configs, id_space, member, mtp, mo
     """Each tensor is read or predicted unread, never both; each expert's tensors by one rank and
     the rest by every rank; the windows tile the 512 experts; and `load` fills every parameter."""
     everything = set(stored)
+    vision = WT.VISION_WEIGHTS.manifest(WT.vision_dims(configs[1], torch.bfloat16))
+    vision_keys = {key for values in vision.values() for key, _, _, _ in values}
+    assert vision_keys == {key for key in stored if key.startswith("model.visual.")}
     read_by = collections.Counter()
     seen = []
     for rank in range(_world(member)):
@@ -438,6 +440,7 @@ def test_member_covers_the_checkpoint(stored, configs, id_space, member, mtp, mo
             for key, _ in _keys_and_cuts(ckpt_key, cut)
         }
         unread = WT.MODEL_WEIGHTS.expected_unconsumed(d, stored.keys())
+        assert claimed.isdisjoint(vision_keys)
         assert claimed <= everything, (
             f"rank {rank} reads unknown {sorted(claimed - everything)[:8]}"
         )
@@ -445,7 +448,7 @@ def test_member_covers_the_checkpoint(stored, configs, id_space, member, mtp, mo
         assert claimed | unread == everything, (
             f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
-        read_by.update(claimed)
+        read_by.update(claimed | vision_keys)
         seen.extend(range(d.expert_offset, d.expert_offset + d.local_experts))
     mtp_keys = set() if mtp else {k for k in everything if k.startswith("mtp.")}
     assert set(read_by) == everything - mtp_keys, "tensors no rank reads: " + str(

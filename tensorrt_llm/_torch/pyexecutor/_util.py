@@ -78,7 +78,8 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
-from .engine.multimodal import is_multimodal, use_mrope
+from .engine.multimodal import (_mm_dummy_data, _mm_max_tokens_per_item,
+                                is_multimodal, use_mrope)
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
@@ -1885,7 +1886,9 @@ class KvCacheCreator:
             return []
 
         try:
-            max_tokens_per_item = input_processor.get_mm_max_tokens_per_item(
+            max_tokens_per_item = _mm_max_tokens_per_item(
+                self._model_engine.model,
+                input_processor,
                 max_num_encoder_tokens=encoder_max_num_tokens)
             for modality, num_tokens in max_tokens_per_item.items():
                 if not modality:
@@ -1910,7 +1913,10 @@ class KvCacheCreator:
                 self._model_engine.encoder_batch_size,
                 encoder_max_num_tokens // num_tokens_per_item,
             )
-            mm_data = input_processor.get_dummy_mm_data(
+            mm_data = _mm_dummy_data(
+                self._model_engine.model,
+                input_processor,
+                modality,
                 max_num_encoder_tokens=encoder_max_num_tokens,
                 mm_counts={modality: num_items},
                 dtype=self._model_engine.model.dtype,

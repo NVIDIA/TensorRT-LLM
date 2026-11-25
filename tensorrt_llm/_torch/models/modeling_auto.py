@@ -6,7 +6,9 @@ from typing import Generic, Optional, Type
 from tensorrt_llm.logger import logger
 
 from ..._errors import UnsupportedError
-from ..model_config import ModelConfig
+from ..model_config import (ModelConfig,
+                            _validate_encoder_attention_backend_enabled,
+                            _validate_encoder_attention_backend_support)
 from ..modeling_v2._router_index import ModelingV2Mode, NoTarget, resolved_mode
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
@@ -57,6 +59,29 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         return get_registered_model_class(model_arch)
 
     @staticmethod
+    def _validate_encoder_attention_backend(config: ModelConfig) -> None:
+        """Validate the worker's effective encoder before allocating its weights."""
+        mm_config = config.multimodal_config
+        if mm_config is None or not mm_config.encoder_attention_backend:
+            return
+        # Encoder-only deployments and V2 construction fallbacks use the
+        # built-in architecture. Validate the class that will own the tower.
+        target = config.modeling_v2_target
+        specs = None if config.mm_encoder_only else getattr(
+            target, "mm_encoders", None)
+        _validate_encoder_attention_backend_enabled(
+            mm_config,
+            config.pretrained_config,
+            disable_mm_encoder=config.disable_mm_encoder,
+            declared_encoders=specs or ())
+        if specs is None:
+            arch = config.pretrained_config.architectures[0]
+            _validate_encoder_attention_backend_support(
+                get_registered_model_class(arch), mm_config)
+        elif not config.disable_mm_encoder:
+            _validate_encoder_attention_backend_support(target, mm_config)
+
+    @staticmethod
     def from_config(
         config: ModelConfig[TConfig],
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
@@ -102,6 +127,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                 # reads the loader's settings (GEMM backends, allreduce sizes)
                 # from extra_attrs.
                 fallback.extra_attrs.update(loader_attrs)
+                AutoModelForCausalLM._validate_encoder_attention_backend(
+                    fallback)
                 return AutoModelForCausalLM.from_config(fallback)
         model.extra_attrs = extra_attrs
         return model

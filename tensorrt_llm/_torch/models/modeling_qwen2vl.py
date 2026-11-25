@@ -6,7 +6,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -954,6 +954,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build processed Qwen tensors for the profiler-selected items."""
+        return self._dummy_mm_data_for_grids(max_num_encoder_tokens, mm_counts,
+                                             dtype,
+                                             self._get_dummy_grid_for_modality)
+
+    def _dummy_mm_data_for_grids(
+        self,
+        max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
+        dtype: Optional[torch.dtype],
+        get_grid: Callable[[str, int], Optional[Tuple[int, int, int]]],
+    ) -> Dict[str, Any]:
+        """Build the processor payload and item metadata for a tower's legal grids."""
         if max_num_encoder_tokens <= 0:
             raise ValueError("max_num_encoder_tokens must be positive")
 
@@ -971,8 +983,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             if num_items == 0:
                 continue
 
-            grid = self._get_dummy_grid_for_modality(modality,
-                                                     max_num_encoder_tokens)
+            grid = get_grid(modality, max_num_encoder_tokens)
             if grid is None:
                 raise ValueError(
                     f"Qwen {modality} dummy does not fit within "

@@ -441,6 +441,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import ple_host_table as _ple_host
+from .._vision import _check_vision_deployment
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -7004,41 +7005,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 f"{MOE_COMM_METHOD_ENV}={comm_method} at {layout}: the target runs the "
                 "attention-DP MoE round trip as ALLGATHER (the default)"
             )
-        if getattr(llm_args.multimodal_config, "vision_gpu_normalize", False):
-            raise NoTarget(
-                "multimodal_config.vision_gpu_normalize: the input processor then ships uint8 "
-                "pixels, and the vision tower runs at the bf16 activation dtype"
-            )
         if prefill_graph == "piecewise":
             raise NoTarget(
                 "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
                 "which the target does not implement; 'breakable' runs the prefill step as a "
                 "breakable CUDA graph"
             )
-        mm_config = llm_args.multimodal_config
-        if (
-            mm_config is not None
-            and mm_config.encoder_cuda_graph
-            and not model_config.disable_mm_encoder
-            and not model_config.mm_encoder_only
-        ):
-            raise NoTarget(
-                "multimodal_config.encoder_cuda_graph: the vision tower has no encoder CUDA graph"
-            )
-        if mm_config is not None and mm_config.encoder_attention_backend:
-            raise NoTarget(
-                "multimodal_config.encoder_attention_backend="
-                f"{mm_config.encoder_attention_backend}; the target's vision tower runs its own "
-                "attention and does not apply it"
-            )
-        # The engine's encoder token budget, which startup profiling fills with dummy images.
-        encoder_budget = llm_args.encoder_max_num_tokens or llm_args.max_num_tokens
-        if not model_config.disable_mm_encoder and encoder_budget > _vision.VISION_CALL_MAX_PATCHES:
-            raise NoTarget(
-                f"an encoder token budget of {encoder_budget} (encoder_max_num_tokens, or "
-                "max_num_tokens when it is unset); one call of the target's vision tower takes "
-                f"at most {_vision.VISION_CALL_MAX_PATCHES} patches"
-            )
+        _check_vision_deployment(model_config, llm_args)
         if spec is None:
             return
         if not is_gdn_replay_enabled():
@@ -7284,7 +7257,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration(
         "vision": MultimodalEncoderSpec(_vision.VisionTower, "model.visual.", ("image", "video"))
     }
     llm_requires_input_ids = True
-    supports_encoder_cache = True
 
     # The decoder looks up its packed embedding weight directly and has no embed_tokens layer.
     @property

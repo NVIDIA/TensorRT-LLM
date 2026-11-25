@@ -48,14 +48,18 @@ class _TinyLlm(nn.Module):
 
 class _TinyTower(nn.Module):
     modality = "image"
+    supports_encoder_cache = True
 
     def __init__(self, config, dtype):
         super().__init__()
         self.calls = 0
 
-    def forward(self, param):
+    def build_batched_input(self, params):
+        return {"values": torch.cat([p.multimodal_data[self.modality]["values"] for p in params])}
+
+    def forward(self, values):
         self.calls += 1
-        return param.multimodal_data[self.modality]["values"]
+        return values
 
     def load_weights(self, weights):
         self.loaded = weights
@@ -63,7 +67,6 @@ class _TinyTower(nn.Module):
 
 class _TinyModel(MultimodalModelForCausalLM):
     llm_class = _TinyLlm
-    supports_encoder_cache = True
     mm_encoders = {"vision": MultimodalEncoderSpec(_TinyTower, "model.visual.", ("image",))}
 
 
@@ -158,8 +161,37 @@ def test_two_towers_restore_interleaved_prompt_order_across_requests():
     )
     embeds = model.encode_multimodal_inputs([params, _params(70)])
     assert embeds[:, 0].tolist() == [10, 20, 30, 40, 60, 50, 70]
-    assert model.mm_encoders["vision"].calls == 2
+    assert model.mm_encoders["vision"].calls == 1
     assert model.mm_encoders["audio"].calls == 1
+
+
+def test_registration_requires_an_encoder_packing_hook():
+    with pytest.raises(TypeError, match="build_batched_input"):
+
+        class Incomplete(_TinyModel):
+            mm_encoders = {"vision": MultimodalEncoderSpec(nn.Identity, "vision.", ("image",))}
+
+
+def test_custom_forward_uses_shared_multimodal_preparation():
+    class Custom(_TinyModel):
+        def forward(self, input_ids, multimodal_params, num_context_requests=1):
+            prepared = self.prepare_multimodal_embeds(
+                input_ids=input_ids,
+                positions=None,
+                multimodal_params=multimodal_params,
+                num_context_requests=num_context_requests,
+            )
+            return prepared[1][0] if prepared is not None else None
+
+    class WithoutPreparation(Custom):
+        def forward(self, input_ids, multimodal_params):
+            return None
+
+    model = _model(Custom)
+    params = [_params(8, 9)]
+    assert model(PROMPT, params).tolist() == [[8], [9]]
+    with pytest.raises(RuntimeError, match="prepare_multimodal"):
+        _model(WithoutPreparation)(PROMPT, params)
 
 
 @pytest.mark.parametrize("cls", [_TinyModel, _InputIdsModel], ids=["fused", "input_ids"])

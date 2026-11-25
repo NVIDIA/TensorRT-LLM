@@ -25,6 +25,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     _is_mm_disagg,
+    _qwen3vl_build_batched_input,
     filter_mm_token_from_input_ids,
     normalize_vision_pixels,
     vision_normalization_from_processor,
@@ -1443,42 +1444,6 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         padded_seq_lengths: Sequence[int],
     ) -> None:
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
-
-
-def _qwen3vl_build_batched_input(
-    multimodal_params: list[MultimodalParams],
-) -> dict[str, Any]:
-    """Cat image items then video items across requests (matching the
-    ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: list[torch.Tensor] = []
-    grids: list[torch.Tensor] = []
-    for m, pv_key, thw_key in (
-        ("image", "pixel_values", "image_grid_thw"),
-        ("video", "pixel_values_videos", "video_grid_thw"),
-    ):
-        for mp in multimodal_params:
-            bucket = mp.multimodal_data.get(m)
-            if bucket is not None:
-                if bucket[pv_key].dtype not in (
-                    torch.uint8,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                ):
-                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
-                pixel_values = bucket[pv_key]
-                if pixel_values.dtype == torch.uint8:
-                    # Normalize each raw bucket before concatenation can promote its dtype.
-                    shape = pixel_values.shape
-                    pixel_values = normalize_vision_pixels(
-                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
-                    ).view(shape)
-                pixels.append(pixel_values)
-                grids.append(bucket[thw_key])
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat(grids, dim=0),
-    }
 
 
 class Qwen3VisionModelBase(nn.Module):

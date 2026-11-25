@@ -83,7 +83,7 @@ _DUMMY_MODEL = "/tmp/dummy_model"
 _ARCH = "Qwen4ExpForConditionalGeneration"
 _TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.modeling."
-    "ModelingV2Qwen38FlashNextFp8Sm10xDefault"
+    "ModelingV2Qwen38FlashNextFp8Sm10xDefaultForConditionalGeneration"
 )
 _NVFP4_DEFAULT_TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.modeling."
@@ -374,8 +374,10 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
         ),
         (
             dict(member="tep4"),
-            dict(multimodal_config=MultimodalConfig(vision_gpu_normalize=True)),
-            "vision_gpu_normalize",
+            dict(
+                multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"})
+            ),
+            "encoder_attention_backend",
         ),
     ],
     ids=[
@@ -399,7 +401,7 @@ def test_every_layout_is_admitted_on_every_served_gpu(on_sm103, monkeypatch, gpu
         "sliding-window",
         "sliding-window-inferred-max-seq-len",
         "eplb",
-        "vision-gpu-normalize",
+        "fixed-vision-backend",
     ],
 )
 def test_what_the_target_does_not_run_declines(on_sm103, config_kwargs, llm_args_kwargs, match):
