@@ -105,14 +105,7 @@ def ordered_video_paths(directory: Path, count: int, suffix: str = ".mp4") -> li
     return paths
 
 
-def build_video_evaluator(
-    name: str,
-    config: dict,
-    base_dir: Path,
-    prompt_ids: list[str],
-    *,
-    output_paths: list[Path] | None = None,
-) -> VideoEvaluator:
+def validate_video_evaluator_options(name: str, config: dict) -> None:
     if name not in ("lpips", "rmse"):
         raise click.BadParameter(
             "Supported video evaluators: lpips, rmse", param_hint="--evaluator"
@@ -121,6 +114,24 @@ def build_video_evaluator(
     unknown = set(config) - allowed
     if unknown:
         raise click.BadParameter(f"Unknown {name.upper()} options: {sorted(unknown)}")
+    if name == "lpips":
+        net = config.get("net", "alex")
+        device = config.get("device", "cpu")
+        if net not in ("alex", "vgg", "squeeze"):
+            raise click.BadParameter("net must be alex, vgg, or squeeze")
+        if not isinstance(device, str) or not device:
+            raise click.BadParameter("device must be a non-empty torch device string")
+
+
+def build_video_evaluator(
+    name: str,
+    config: dict,
+    base_dir: Path,
+    prompt_ids: list[str],
+    *,
+    output_paths: list[Path] | None = None,
+) -> VideoEvaluator:
+    validate_video_evaluator_options(name, config)
     if len(set(prompt_ids)) != len(prompt_ids):
         raise click.BadParameter("Prompt IDs must be unique", param_hint="--prompts")
     directory = resolve_video_directory(config.get("reference_dir"), base_dir, "reference_dir")
@@ -146,8 +157,4 @@ def build_video_evaluator(
         return LatentRMSEEvaluator(dict(zip(prompt_ids, paths, strict=True)))
     net = config.get("net", "alex")
     device = config.get("device", "cpu")
-    if net not in ("alex", "vgg", "squeeze"):
-        raise click.BadParameter("net must be alex, vgg, or squeeze")
-    if not isinstance(device, str) or not device:
-        raise click.BadParameter("device must be a non-empty torch device string")
     return LPIPSVideoEvaluator(dict(zip(prompt_ids, paths, strict=True)), net, device)

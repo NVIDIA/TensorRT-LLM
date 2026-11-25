@@ -8,10 +8,11 @@
 - [Image generation evaluation](#image-generation-evaluation)
   - [Qwen Image Bench](#qwen-image-bench)
 - [Video generation evaluation](#video-generation-evaluation)
+  - [Generate references and targets](#generate-references-and-targets)
   - [LPIPS](#lpips)
   - [Latent RMSE](#latent-rmse)
 
-`image_generation_eval` and `video_generation_eval` use two separate configurations:
+`image_generation_eval` and `video_generation_eval` use separate generator and evaluator configurations:
 
 * `--config generator.yaml` configures the VisualGen generator and its
   `generation_params` (for example, seed, resolution, frame count, and inference steps).
@@ -97,6 +98,65 @@ values are `Quality`, `Aesthetics`, `Alignment`, `Real-world Fidelity`, and
 quote dimension names containing spaces on the command line.
 
 ## Video generation evaluation
+
+
+### Generate references and targets
+
+For either LPIPS or RMSE, pass `--reference-config baseline.yaml` to generate the
+baseline as part of evaluation. This YAML uses the same VisualGen arguments and
+`generation_params` structure as the target `--config`, with an optional `model`
+field (defaults to the root `--model`). Specify the same prompts, seed, dimensions,
+frame count, and scheduler settings in both configurations for a controlled
+comparison; only change the model settings you intend to evaluate. Each side's
+actual generation parameters are recorded in `results.json`.
+
+For example, create `baseline.yaml` with your BF16 generation settings, and
+`target.yaml` with identical generation parameters plus dynamic FP8 quantization:
+
+```yaml
+# baseline.yaml (model is optional)
+model: /path/to/MiniMax-H3
+generation_params:
+  seed: 42
+  height: 256
+  width: 256
+  num_frames: 124
+  frame_rate: 24
+  num_inference_steps: 4
+```
+
+Copy those generation parameters into `target.yaml` and add:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+```
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --evaluator rmse --reference-config baseline.yaml --config target.yaml \
+  --prompts prompts.json --output-dir results --media-dir comparisons
+```
+
+Use `--evaluator lpips` for decoded-video comparison. RMSE automatically requests
+latent outputs for both passes. The command generates one reference and one target
+per prompt: it finishes the reference pass and closes that model before loading
+the target, so both models do not need to fit in GPU memory simultaneously.
+
+`--media-dir comparisons` retains both sets of artifacts in a unique
+`comparisons/trtllm-eval-*/reference/` and `target/` directory, using prompt-order
+filenames (`0000.mp4` for LPIPS, `0000.safetensors` for RMSE). Omitting
+`--media-dir` uses temporary storage that is removed after evaluation, including
+on failure. Reports remain in `--output-dir`; `artifacts_retained` indicates
+whether the artifact paths in the report are still available. Explicitly retained
+artifacts are kept on failure as well, for inspection.
+
+`--evaluator-options` is optional with `--reference-config`; use it for LPIPS
+`net`/`device` overrides. Do not combine reference generation with `reference_dir`
+or `generated_dir` in that YAML. Existing-directory evaluation is unchanged and
+still uses `reference_dir` as described below. `--media-dir` applies only to
+reference-generation mode.
 
 ### LPIPS
 
