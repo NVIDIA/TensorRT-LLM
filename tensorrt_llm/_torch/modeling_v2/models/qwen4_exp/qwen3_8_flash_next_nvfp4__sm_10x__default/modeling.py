@@ -345,6 +345,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_per_tensor_mm
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
+    MAX_ROWS as _MID_ROWS_MAX,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MidWeight,
     mid_mm_raw,
     mid_rows_mm_op,
@@ -622,6 +625,27 @@ DP_MOE_COMM_ENV = "TRTLLM_QWEN4_EXP_DP_MOE_COMM"
 _DP_MOE_COMMS = ("nccl", "lamport", "lamport_step")
 #: The layouts the Lamport transport serves, by attention-DP group size.
 _LAMPORT_LAYOUTS = {4: "dep4", 8: "dep8"}
+#: Off by default (class S). At a dep4 / dep8 rank on the Lamport transport
+#: (`DP_MOE_COMM_ENV`), two launches of a captured decode step's trunk MoE block change, each at
+#: the gathered row counts of the CUDA-graph batch sizes inside its own range:
+#: - the round trip's Lamport gather releases its PDL dependents at its start
+#:   (`_DP_ROUTER_FRONT_RELEASE_ROWS`); the rows, slots and bytes are the plain gather's. The
+#:   gather is no PDL launch itself, so everything before it has completed when a dependent starts.
+#: - the trunk router runs on `mid_rows_mm`'s bf16 kernel (`_DP_ROUTER_FRONT_ROWS` gathered rows):
+#:   a PDL launch that streams its [512, 2560] weight while the gather publishes and polls, and
+#:   reads the gathered rows after its own `griddepcontrol.wait`; cuBLAS elsewhere. Its logits
+#:   differ from cuBLAS's by one bf16 ulp on 0.02-0.08% of the entries (the nearer one to the
+#:   exact product), which can move a near-tie of the top-10. Every rank of the group runs the
+#:   kernel the gathered row count picks, so the ranks agree on every row's experts.
+#: The build checks every router row count against the fp32 product (one bf16 ulp) on every rank
+#: and engages on every rank or none. Read once, when the target is built; set at another
+#: layout or without the Lamport transport it warns and does nothing.
+DP_ROUTER_FRONT_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTER_FRONT"
+#: Gathered rows the bf16 router serves (3..7 requests of four rows at dep4; the kernel loses to
+#: cuBLAS from 8 a rank there), and, by group size, the gathered rows whose gather releases (dep4
+#: 1..24 requests a rank; dep8 1..24, where 32 and more a rank measured a loss).
+_DP_ROUTER_FRONT_ROWS = (33, 112)  # capacity: fixed: dispatch thresholds
+_DP_ROUTER_FRONT_RELEASE_ROWS = {4: (16, 384), 8: (32, 768)}  # capacity: fixed: thresholds
 
 
 def _dp_moe_comm() -> str:
@@ -2111,6 +2135,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # `lamport_step` the registry of its launch indices, which the shell's forward brackets.
         self._lamport_trip = None
         self._lamport_steps: LamportSteps | None = None
+        # The router front (`DP_ROUTER_FRONT_ENV`), built after the route front.
+        self._router_front: "_DpRouterFront | None" = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         # The decode MoE's route front (`DP_ROUTE_FRONT_ENV`), built with the targets.
@@ -2279,6 +2305,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             if device.type == "cuda"
             else None
         )
+        # Collective (the group agrees); once a load.
+        if self._router_front is None and device.type == "cuda":
+            self._router_front = _dp_router_front_build(self, self._decode._layers, device)
         # Collective; once a load (the post-load walk reaches this hook again).
         if self._tep_finar is None and device.type == "cuda":
             self._tep_finar = _tep_finar_build(self, device)
@@ -2401,6 +2430,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # group, as `allreduce_group_args` routes them.
         process_group = self.mapping.tp_group_pg.boxed() if mpi_disabled() else None
         lamport = self._dp_lamport(group) if _dp_moe_comm() != "nccl" else None
+        group_size = len(group)
 
         def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
             rows = x.shape[0]
@@ -2408,7 +2438,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             if lamport is not None and lamport.takes(padded.shape[0], padded):
                 # Every rank takes the same branch: the padded row count and the dtype are the
                 # group's. The window's output is bf16 at the hidden width on every rank.
-                partial = run(dep_lamport_round_trip(padded, lamport, False))
+                front = getattr(self, "_router_front", None)
+                release = front is not None and padded.shape[0] * group_size in front.release_rows
+                partial = run(dep_lamport_round_trip(padded, lamport, False, release))
                 mine = dep_lamport_round_trip(partial, lamport, True)
                 return mine if not pad_rows else mine[:rows]
             gathered = allgather(padded, None, group, process_group)
@@ -4013,7 +4045,9 @@ def _decode_router_mid(core, L: _LayerWeights, captured: bool):
     can) and takes `_decode_router`; an eager one can meet another rank's prefill step and takes
     the prefill router, `cublas_mm`."""
     if core.dp_size > 1:
-        return _decode_router if captured else cublas_mm
+        if not captured:
+            return cublas_mm
+        return getattr(core, "_router_front", None) or _decode_router
     fallback = core.decode_mm if core.one_rank else _decode_router
     if L.router_m is None:
         return fallback
@@ -4311,15 +4345,115 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     return st
 
 
-def _route_front_experts(core, st: _RouteFront, x, L: _LayerWeights, fp4=None):
+def _route_front_experts(
+    core, st: _RouteFront, x, L: _LayerWeights, fp4=None, router_mm=None
+) -> torch.Tensor | None:
     """`_routed_experts` of a captured generation-only step over the route front, or None where
     no route front was built for the row count (the caller's path). `fp4` is the MoE site's
-    NVFP4 activation at a tep4 rank (the runner reads it), None under attention DP."""
+    NVFP4 activation at a tep4 rank (the runner reads it), None under attention DP; `router_mm`
+    the step's decode router (`_decode_router` by default, or the router front)."""
     rows = x.shape[0]
     layer = st.layers.get(L.fc1_w.data_ptr())
     if rows not in st.tactics or layer is None or x.stride(1) != 1 or x.stride(0) != core.hidden:
         return None
-    return _route_front_run(core, st, x, L, layer, _decode_router(x, L.router), fp4)[0]
+    logits = (router_mm or _decode_router)(x, L.router)
+    return _route_front_run(core, st, x, L, layer, logits, fp4)[0]
+
+
+class _DpRouterFront:
+    """What `DP_ROUTER_FRONT_ENV` built (`_dp_router_front_build`), and the decode router of a
+    captured step (`_decode_router_mid`): `front(x, router)` runs `mid_rows_mm` over the layer's
+    bf16 router (`mids`, by the router's pointer) at a gathered row count in `rows`, else
+    `_decode_router`. The row count alone decides, so every rank of the group runs one kernel.
+    `release_rows`: the gathered row counts whose Lamport gather releases its dependents."""
+
+    def __init__(self, rows: frozenset, release_rows: frozenset, mids: dict) -> None:
+        self.rows = rows
+        self.release_rows = release_rows
+        self.mids = mids
+
+    def __call__(self, x: torch.Tensor, router: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] in self.rows:
+            return mid_rows_mm_op(x, self.mids[router.data_ptr()])
+        return _decode_router(x, router)
+
+
+def _dp_router_front_check(mw, rows: int, gen, device) -> int:
+    """Logits of the bf16 router kernel at `rows` random rows off the fp32 product by more than
+    one bf16 ulp (plus the K sum's rounding): their count."""
+    x = torch.randn([rows, mw.k], generator=gen, device=device).to(torch.bfloat16)
+    got = mid_rows_mm_op(x, mw).float()
+    w = mw.w.float()
+    ref = x.float() @ w.t()
+    ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 7)
+    tol = ulp + 2e-5 * (x.float().abs() @ w.abs().t())
+    return int(((got - ref).abs() > tol).sum())
+
+
+def _dp_router_front_build(core, layers, device) -> "_DpRouterFront | None":
+    """`DP_ROUTER_FRONT_ENV`, read once at build (`post_load_weights`, after the route front).
+    None with the switch unset, or with one warning where it cannot take effect: not a dep4 /
+    dep8 rank on SM103, no Lamport transport, no graph row count in either range. Otherwise the
+    releasing gather and the bf16 router of every graph row count in range are compiled now (no
+    serving step or capture meets a compile) and each router row count is checked against the
+    fp32 product of layer 0's router. Collective: the group engages together or not at all."""
+    if not _switch(DP_ROUTER_FRONT_ENV):
+        return None
+    why = ""
+    trip = core._lamport_trip
+    if core.dp_size not in _DP_ROUTER_FRONT_RELEASE_ROWS or trip is None:
+        why = (
+            f"it serves a dep4 or dep8 rank on the Lamport transport ({DP_MOE_COMM_ENV}); this "
+            f"rank: attention DP size {core.dp_size}, transport "
+            f"{'lamport' if trip is not None else 'nccl'}"
+        )
+    elif torch.cuda.get_device_capability(device) != archs.SM_103:
+        why = "it serves SM103 only"
+    if why:
+        logger.warning(f"{DP_ROUTER_FRONT_ENV} is set but ignored: {why}")
+        return None
+    per_batch = core.dp_size * core.max_verify_rows
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    graph_rows = {per_batch * int(b) for b in sizes}
+    lo, hi = _DP_ROUTER_FRONT_RELEASE_ROWS[core.dp_size]
+    release = frozenset(r for r in graph_rows if lo <= r <= hi)
+    lo, hi = _DP_ROUTER_FRONT_ROWS
+    rows = frozenset(r for r in graph_rows if lo <= r <= min(hi, _MID_ROWS_MAX))
+    mids, error = {}, ""
+    try:
+        with torch.cuda.device(device):
+            if release:
+                trip.releasing_gather_fn()
+            for L in layers:
+                mids[L.router.data_ptr()] = MidWeight(L.router.t())
+            if rows:
+                mw = mids[layers[0].router.data_ptr()]
+                mid_rows_precompile(mw, min(rows), max(rows))
+                gen = torch.Generator(device=device).manual_seed(20261125)
+                for r in sorted(rows):
+                    off = _dp_router_front_check(mw, r, gen, device)
+                    if off:
+                        error = (
+                            f"the bf16 router at {r} rows is off the fp32 product on {off} logits"
+                        )
+                        break
+            torch.cuda.synchronize(device)
+    except Exception as e:  # noqa: BLE001 -- every rank decides together below
+        error = f"{type(e).__name__}: {e}"
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    errors = [e for e in Distributed.get(core.mapping).tp_allgather(error) if e]
+    if errors or not (rows or release):
+        logger.warning(
+            f"{DP_ROUTER_FRONT_ENV} is set but not engaged at rank {core.dp_rank}: "
+            f"{errors[0] if errors else 'no CUDA-graph row count in either range'}"
+        )
+        return None
+    logger.info(
+        f"DP router front: rank {core.dp_rank} of {core.dp_size}, bf16 router at gathered rows "
+        f"{sorted(rows)}, releasing gather at {sorted(release)}"
+    )
+    return _DpRouterFront(rows, release, mids)
 
 
 class _TepFinar:
@@ -4518,10 +4652,10 @@ def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) ->
         # Under attention DP the gathered rows come unquantized; a tep4 rank's come with the
         # site's codes.
         and (fp4 is None) == (core.dp_size > 1)
-        and router_mm is _decode_router
+        and (router_mm is _decode_router or isinstance(router_mm, _DpRouterFront))
         and torch.cuda.is_current_stream_capturing()
     ):
-        routed = _route_front_experts(core, route_front, x, L, fp4)
+        routed = _route_front_experts(core, route_front, x, L, fp4, router_mm)
         if routed is not None:
             return routed
     if core.trunk_moe_backend == "CUTEDSL":

@@ -210,7 +210,14 @@ def _round_trip_kernel(
     SUM_ORDER: cutlass.Constexpr[tuple[int, ...]],
     REDUCE: cutlass.Constexpr[bool],
     STEP: cutlass.Constexpr[bool],
+    RELEASE: cutlass.Constexpr[bool],
 ):
+    if cutlass.const_expr(RELEASE and not REDUCE):
+        # The releasing gather: its programmatic dependents (the router behind it, which reads
+        # only its static weight before its own `griddepcontrol.wait`) may launch now. This grid
+        # is not a PDL launch, so everything before it has completed; every CTA is resident once
+        # every CTA has issued this.
+        cute.arch.griddepcontrol_launch_dependents()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     grid_x, _, _ = cute.arch.grid_dim()
@@ -433,6 +440,7 @@ def _round_trip(
     SUM_ORDER: cutlass.Constexpr[tuple[int, ...]],
     REDUCE: cutlass.Constexpr[bool],
     STEP: cutlass.Constexpr[bool],
+    RELEASE: cutlass.Constexpr[bool],
 ) -> None:
     if cutlass.const_expr(REDUCE):
         rows = output_tensor.shape[0]
@@ -452,25 +460,40 @@ def _round_trip(
         SUM_ORDER,
         REDUCE,
         STEP,
+        RELEASE,
     ).launch(grid=(num_blocks, 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
 
-#: Compiled launches by `(rank, world, device, hidden, reduce, sum order, step)`: a rebuild of the
-#: same workspace (the post-load walk reaches the build twice) compiles nothing new.
+#: Compiled launches by `(rank, world, device, hidden, reduce, sum order, step, release)`: a
+#: rebuild of the same workspace (the post-load walk reaches the build twice) compiles nothing new.
 _COMPILED: dict = {}
 
 
 def _compile(
-    rank: int, world: int, device_id: int, hidden: int, reduce: bool, sum_order, step: bool = False
+    rank: int,
+    world: int,
+    device_id: int,
+    hidden: int,
+    reduce: bool,
+    sum_order,
+    step: bool = False,
+    release: bool = False,
 ):
-    key = (rank, world, device_id, hidden, reduce, tuple(sum_order), bool(step))
+    key = (rank, world, device_id, hidden, reduce, tuple(sum_order), bool(step), bool(release))
     if key not in _COMPILED:
         _COMPILED[key] = _compile_new(*key)
     return _COMPILED[key]
 
 
 def _compile_new(
-    rank: int, world: int, device_id: int, hidden: int, reduce: bool, sum_order, step: bool
+    rank: int,
+    world: int,
+    device_id: int,
+    hidden: int,
+    reduce: bool,
+    sum_order,
+    step: bool,
+    release: bool,
 ):
     cutlass.cuda.initialize_cuda_context(device_id)
     rows_in, rows_out = cute.sym_int32(), cute.sym_int32()
@@ -508,6 +531,7 @@ def _compile_new(
         tuple(sum_order),
         reduce,
         step,
+        release,
         options="--enable-tvm-ffi",
     )
 
@@ -619,6 +643,8 @@ class DepRoundTrip:
     advance_fn: object = None
     #: What owns the peer mappings (`build_on`'s caller's holder), kept alive with the workspace.
     keepalive: object = None
+    #: The sum order the launches were compiled with.
+    order: tuple = ()
 
     def takes(self, rows: int, x: torch.Tensor) -> bool:
         """Every rank answers the same: the padded row count and the dtype are the group's."""
@@ -637,11 +663,26 @@ class DepRoundTrip:
         if self.steps is not None and index is None:
             self.advance(1, stream)
 
-    def gather(self, x: torch.Tensor) -> torch.Tensor:
-        """`[R, H]` on every rank -> the group's rows `[world * R, H]`, rank-major."""
+    def releasing_gather_fn(self):
+        """The gather launch that releases its PDL dependents at its start, on this workspace
+        (compiled on the first call: call it at build, outside graph capture)."""
+        return _compile(
+            self.rank,
+            self.world,
+            self.buffer.device.index,
+            self.hidden,
+            False,
+            self.order,
+            self.steps is not None,
+            True,
+        )
+
+    def gather(self, x: torch.Tensor, release: bool = False) -> torch.Tensor:
+        """`[R, H]` on every rank -> the group's rows `[world * R, H]`, rank-major. `release`:
+        the launch releases its PDL dependents at its start (the same rows, slots and bytes)."""
         x = x.contiguous()
         out = torch.empty((self.world * x.shape[0], self.hidden), dtype=x.dtype, device=x.device)
-        self._launch(self.gather_fn, x, out)
+        self._launch(self.releasing_gather_fn() if release else self.gather_fn, x, out)
         return out
 
     def reduce_scatter(self, y: torch.Tensor) -> torch.Tensor:
@@ -705,6 +746,7 @@ def _assemble(
         steps=steps,
         advance_fn=_compile_advance(dev.index) if step else None,
         keepalive=keepalive,
+        order=order,
     )
 
 
@@ -806,8 +848,10 @@ class DepLamportRoundTrip(OpWrapper):
     launch's resident CTAs wait for.
     """
 
-    def __call__(self, x: torch.Tensor, trip: DepRoundTrip, reduce: bool) -> torch.Tensor:
-        return trip.reduce_scatter(x) if reduce else trip.gather(x)
+    def __call__(
+        self, x: torch.Tensor, trip: DepRoundTrip, reduce: bool, release: bool = False
+    ) -> torch.Tensor:
+        return trip.reduce_scatter(x) if reduce else trip.gather(x, release)
 
     def reference(
         self, xs_in_rank_order, trip_rank: int, reduce: bool, sum_order=None
@@ -825,7 +869,10 @@ class DepLamportRoundTrip(OpWrapper):
             acc = (acc.float() + parts[k].float()).to(torch.bfloat16)
         return acc
 
-    def is_valid(self, x: torch.Tensor, trip: DepRoundTrip, reduce: bool) -> None:
+    def is_valid(
+        self, x: torch.Tensor, trip: DepRoundTrip, reduce: bool, release: bool = False
+    ) -> None:
+        assert not (reduce and release), "only the gather releases its dependents"
         assert x.dtype is torch.bfloat16 and x.dim() == 2 and x.shape[1] == trip.hidden
         rows = x.shape[0] // trip.world if reduce else x.shape[0]
         assert (not reduce or rows * trip.world == x.shape[0]) and trip.takes(rows, x)

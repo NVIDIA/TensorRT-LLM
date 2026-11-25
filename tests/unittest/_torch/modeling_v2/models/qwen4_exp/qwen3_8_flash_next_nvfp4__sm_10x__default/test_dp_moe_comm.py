@@ -68,7 +68,8 @@ def _round_trip(monkeypatch, comm: str, max_rows: int = 4):
         lambda x, *a: calls.append(("nccl reduce", x.shape[0])) or x[: x.shape[0] // 4],
     )
 
-    def lamport(x, trip, reduce):
+    def lamport(x, trip, reduce, release=False):
+        assert not release  # no router front
         calls.append(("lamport reduce" if reduce else "lamport gather", x.shape[0]))
         return x[: x.shape[0] // 4] if reduce else x.repeat(4, 1)
 

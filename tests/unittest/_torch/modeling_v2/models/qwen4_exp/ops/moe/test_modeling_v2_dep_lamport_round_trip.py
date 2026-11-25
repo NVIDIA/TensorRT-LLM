@@ -12,7 +12,8 @@ CUDA graph (the three slots rotating across replays):
 * the reduce-scatter of every rank's partials equals `reduce_scatter_tensor` of the same
   sanitized partials (the ring's sum order, bf16 after every add), and the reference.
 
-The host-index cells run each round inside a region with a varying number of launches (one to
+Every other eager gather is the one that releases its PDL dependents at its start. The
+host-index cells run each round inside a region with a varying number of launches (one to
 four round trips), so the slot base moves by every residue mod 3, and also one launch outside any
 region (its own advance). The 8-rank cells run on one node of eight SM103 GPUs. Their workspace,
 and once more the 4-rank host-index one (so a 4-GPU tray runs it too), is built the way the NVFP4
@@ -122,7 +123,9 @@ def _rank_main(rank: int, port: int, world: int, step: bool, via_pointers: bool)
                     rounds = []
                     for _ in range(trips):
                         x, y = _inputs(gen, rows, device), _inputs(gen, world * rows, device)
-                        gathered = op.dep_lamport_round_trip(x, trip, False)
+                        # Every other gather is the releasing one (same rows and bytes).
+                        release = bool((len(rounds) + rows) % 2)
+                        gathered = op.dep_lamport_round_trip(x, trip, False, release)
                         reduced = op.dep_lamport_round_trip(y, trip, True)
                         rounds.append((x, y, gathered, reduced))
                 for k, (x, y, gathered, reduced) in enumerate(rounds):
