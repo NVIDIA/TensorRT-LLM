@@ -457,7 +457,10 @@ class RoutingContracts(unittest.TestCase):
 
     def test_partly_excluded_block_and_all_bf16_blocks_are_rejected(self):
         for ignored, reason in [
-            (_mixed_bf16_block_ignore_patterns() + ["transformer_blocks.3.attn.to_out.0"], "excluded"),
+            (
+                _mixed_bf16_block_ignore_patterns() + ["transformer_blocks.3.attn.to_out.0"],
+                "excluded",
+            ),
             (["transformer_blocks.7.ff*"], "excluded"),
             (["transformer_blocks.*"], "at least one block"),
         ]:

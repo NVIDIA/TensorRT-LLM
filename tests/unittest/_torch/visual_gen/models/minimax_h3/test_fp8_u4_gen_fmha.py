@@ -339,7 +339,9 @@ class TestFp8PureGenFmhaContracts(unittest.TestCase):
     def test_initialize_block_ops_mixed_whole_block_gate(self):
         tree = ast.parse((U4 / "block_ops.py").read_text())
         fn_node = next(
-            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "initialize_block_ops"
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "initialize_block_ops"
         )
         probed = []
 
@@ -362,13 +364,18 @@ class TestFp8PureGenFmhaContracts(unittest.TestCase):
             "logger": SimpleNamespace(warning=lambda msg: None),
             "MiniMaxH3Transformer3DModel": object,
         }
-        exec(compile(ast.Module(body=[fn_node], type_ignores=[]), str(U4 / "block_ops.py"), "exec"), ns)
+        exec(
+            compile(ast.Module(body=[fn_node], type_ignores=[]), str(U4 / "block_ops.py"), "exec"),
+            ns,
+        )
         init_fn = ns["initialize_block_ops"]
 
         def make_transformer(dtypes):
             dev = SimpleNamespace(type="cuda", index=0)
             blocks = [
-                SimpleNamespace(ff=SimpleNamespace(down_proj=SimpleNamespace(weight=SimpleNamespace(dtype=d))))
+                SimpleNamespace(
+                    ff=SimpleNamespace(down_proj=SimpleNamespace(weight=SimpleNamespace(dtype=d)))
+                )
                 for d in dtypes
             ]
             return SimpleNamespace(
@@ -377,7 +384,12 @@ class TestFp8PureGenFmhaContracts(unittest.TestCase):
             )
 
         # Uniform FP8, uniform BF16, and non-50-block layouts must not enter SM107 mixed-block init
-        for rejected in (["FP8"] * 50, ["BF16"] * 50, ["FP8"] * 49 + ["FP16"], ["FP8"] * 25 + ["BF16"] * 24):
+        for rejected in (
+            ["FP8"] * 50,
+            ["BF16"] * 50,
+            ["FP8"] * 49 + ["FP16"],
+            ["FP8"] * 25 + ["BF16"] * 24,
+        ):
             probed.clear()
             init_fn(make_transformer(rejected))
             self.assertEqual(probed, [])
