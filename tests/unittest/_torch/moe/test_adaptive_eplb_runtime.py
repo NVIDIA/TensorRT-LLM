@@ -505,8 +505,8 @@ def test_tables_apply_after_every_rank_copied_and_the_window_opens_as_scheduled(
 
 @closes_runtimes
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
-    """Regression: ranks deciding differently stop before applying. A digest disagreement stops
-    adaptive updates without applying any tables."""
+    """Ranks whose decisions differ (their digests disagree) stop adaptive updates before applying
+    any table."""
     update = script(1)(0)
     same_decision_other_rank = script(0)(0)
     other_table = script(1, 3)(0)
@@ -530,8 +530,7 @@ def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
 
 @closes_runtimes
 def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
-    """Regression: a failed worker keeps the tables. A worker failure stops adaptive updates at
-    the next boundary, preserving tables."""
+    """A worker failure stops adaptive updates at the next boundary and keeps the tables in use."""
     clock = [0]
     ranks = make_ranks([FakeDecision(rank) for rank in range(R)], clock)
     runtime = ranks[0]
@@ -691,8 +690,8 @@ def test_shares_solved_again_on_the_installed_layouts_are_published_without_a_co
 
 
 def test_one_slow_copy_does_not_price_the_next_installs_out(monkeypatch):
-    """Regression: one slow copy priced every later install out (copy price taken as a mean).
-    Copies timed in service price the installs after them."""
+    """Copies timed in service price the installs after them, and one slow copy does not price
+    every later install out."""
     monkeypatch.setattr(rt, "solve_shares", even_split)
     # Priced at start-up only (no copy timed yet), the correction is judged out of sample.
     decider = measured_decider(0.5)
@@ -918,8 +917,8 @@ open(exiting, "w").close()
 
 @pytest.mark.parametrize("peer_joins", ["1", "0"], ids=["peer_joins", "peer_never_joins"])
 def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tmp_path, peer_joins):
-    """Regression: worker-thread leak/close. End workers and decision processes before exit,
-    including unfinished collectives."""
+    """A runtime left open ends its worker thread and decision process before the interpreter
+    finalizes, also with an all-gather its peer never joins."""
     script = tmp_path / "exit.py"
     script.write_text(_EXIT_SCRIPT)
     args = [str(tmp_path / "store"), str(tmp_path / "exiting"), peer_joins]
@@ -962,10 +961,8 @@ def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(mon
 
 
 def test_a_window_whose_ranks_admit_a_request_at_every_call_still_decides(monkeypatch):
-    """Regression: a rank that admits a request at every call of a window ran only batches with
-    context requests, which recorded nothing; its zero forwards voided the window for every rank
-    (the decider's forwards.min() < 1), and under immediate refill at 128 requests per GPU almost
-    no window survived. Counting the generation rows of those batches keeps the window."""
+    """A rank that admits a request at every call of a window runs only batches with context
+    requests; their generation rows count, so the window has forwards on every rank and decides."""
     from _torch.moe import adaptive_eplb_reference as reference
 
     monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_route_into", reference.route_into, False)

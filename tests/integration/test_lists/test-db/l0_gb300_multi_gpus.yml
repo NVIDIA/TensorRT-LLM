@@ -105,7 +105,7 @@ l0_gb300_multi_gpus:
   # MegaMoE on four ranks drops padding rows on the SM103 kernel too (SM100: l0_dgx_b200).
   - unittest/_torch/moe/test_megamoe_live_rows_gpu.py::test_megamoe_cutedsl_drops_padding_rows
   # Adaptive EPLB on four ranks: the dispatch router's route bit for bit against the staged route and a layer
-  # without the balancer, a graph replayed after an install, and the per-layer cost of each path.
+  # without the balancer, and a graph replayed after an install.
   - unittest/_torch/moe/test_megamoe_adaptive_route_e2e.py
   # Adaptive EPLB: expert copies between four local ranks over MNNVL memory (torchrun).
   - unittest/_torch/moe/multi_gpu/test_adaptive_eplb_transport_peer.py

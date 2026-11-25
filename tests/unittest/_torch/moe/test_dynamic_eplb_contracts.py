@@ -3013,8 +3013,8 @@ def test_live_plane_binding_restores_per_expert_scalar_defaults():
 
 
 def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
-    """Regression: ADP rows dropped MoE stats. Fanout must not copy rank zero's MoE counts to
-    other owners or idle ranks."""
+    """Each ADP row carries the MoE stats of the rank that owns it: rank zero's counts are not copied
+    to other owners or to idle ranks."""
     import importlib.util
     import json
     import re

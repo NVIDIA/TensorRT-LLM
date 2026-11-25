@@ -235,8 +235,8 @@ def test_query_and_runner_build_the_same_dedup_kernel(
 def test_runner_passes_an_adaptive_route_only_when_it_has_one(
     op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: the runner passed adaptive_route_experts=0 to the kernel builder and the
-    properties query did not, so the two built the same kernel from different arguments."""
+    """A runner without an adaptive route builds its kernel from the same arguments as the
+    properties query: it passes no adaptive_route_experts at all."""
     calls = []
     original = op._construct_megamoe_kernel
     monkeypatch.setattr(

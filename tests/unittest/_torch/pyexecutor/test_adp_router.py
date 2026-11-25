@@ -2691,8 +2691,8 @@ def test_moe_snapshot_rank_state_roundtrip_and_legacy_frame():
 
 
 def test_moe_snapshot_coexists_with_old_snapshots():
-    """Regression: stats wire version collision. Keep the previous snapshot frames intact and
-    carry MoE after their existing fields."""
+    """The MoE stats frame has a wire version of its own: the earlier snapshot frames stay intact,
+    and the MoE counters follow their fields."""
     kv = RankKvCacheStats(100, 80, 20, 16, 40, 30, 7, 5, 0.375)
     payload = RankIterStatsPayload(
         has_iter_stats=1, kv_cache_stats=kv, specdec_stats=RankSpecDecodingStats(3, 2, 1)

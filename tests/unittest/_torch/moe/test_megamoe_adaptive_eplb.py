@@ -126,8 +126,8 @@ def test_a_calibration_prices_any_gpu_and_its_identity_resolves_tactics_without_
 
 
 def test_an_adaptive_route_launch_builds_its_dsl_scalars_once():
-    """An adaptive route launch's DSL scalars are made once per value, not per launch: building them
-    per launch cost about 80 us of host time per layer call (cProfile of the eager path)."""
+    """An adaptive route launch's DSL scalars are made once per value, not per launch: a layer
+    launches with the same device addresses and few row counts."""
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
     first = op._adaptive_route_scalar(float, 1 << 40)  # float() makes a new object on every call

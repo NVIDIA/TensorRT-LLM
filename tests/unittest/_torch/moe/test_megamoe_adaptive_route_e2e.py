@@ -76,7 +76,7 @@ def _replica_row(packed: list) -> torch.Tensor:
     )
 
 
-def _run() -> list:
+def _run() -> None:
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
         find_backends,
         prepare_layers,
@@ -130,7 +130,6 @@ def _run() -> list:
             config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(num_slots=_NUM_SLOTS)
         return config
 
-    results = []
     with device, torch.inference_mode():
         torch.manual_seed(1701)
         quantizer = NVFP4QuantizeUtil(
@@ -259,7 +258,6 @@ def _run() -> list:
         _assert_on_all_ranks(
             None if not staged_only else f"the router's route still launches {staged_only}"
         )
-        results.append(dict(rank=rank, kernels_per_layer_call=names))
 
         # After every eager pairing has run (as the executor captures after its warmup): a graph captured
         # on the home tables replays an install's replicated tables as an eager forward routes them (replica
@@ -322,7 +320,6 @@ def _run() -> list:
             del graph
             _assert_on_all_ranks(problem)
         use_router(True)
-    return results
 
 
 @pytest.mark.threadleak(enabled=False)

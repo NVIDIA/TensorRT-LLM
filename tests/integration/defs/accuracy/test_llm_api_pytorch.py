@@ -2672,8 +2672,7 @@ def _assert_adaptive_eplb_installed(test_name, stats):
     # must have installed a layout.
     installs = max(
         (s.get("moeLoadBalancerStats") or {}).get("installs", 0) for s in stats)
-    print(f"[EPLB] {test_name} installs = {installs}")
-    assert installs > 0, "adaptive EPLB installed no layout"
+    assert installs > 0, f"{test_name}: adaptive EPLB installed no layout"
 
 
 MEGAMOE_CUTEDSL_TACTIC = "cutedsl.mega_moe"

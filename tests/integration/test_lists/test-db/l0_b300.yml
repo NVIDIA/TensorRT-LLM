@@ -34,11 +34,11 @@ l0_b300:
   - unittest/_torch/speculative/test_dspark_tp1_argmax.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py
   - unittest/_torch/moe/test_dsv4_route_quant.py
-  # The MegaMoE route staging and the adaptive route of the dispatch routers against its definition
-  # (the PTX record of the kernels, two full EP32 builds, runs post-merge).
-  - unittest/_torch/moe/test_megamoe_stage_routes.py -k "not record_their_ptx"
+  # The MegaMoE route staging and the adaptive route of the dispatch routers against its definition.
+  - unittest/_torch/moe/test_megamoe_stage_routes.py
   # Adaptive EPLB GPU tests: only B300 and GB300 run them, B200 does not.
   - unittest/_torch/moe/test_adaptive_eplb_kernels.py
+  - unittest/_torch/moe/test_adaptive_eplb_mixed_step_gpu.py
   - unittest/_torch/moe/test_adaptive_eplb_live_rows.py
   - unittest/_torch/moe/test_moe_module.py::test_dsv4_fused_route_quant_matches_separate_launches
   - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
@@ -270,8 +270,6 @@ l0_b300:
   # Same sm100f routing kernel as the B200 entry; this is the SM103 run.
   # Too heavy for pre_merge, and it does not need the 4-GPU stage.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
-  # The PTX and cubin digests of the MegaMoE kernels without the adaptive route (recorded, not compared).
-  - unittest/_torch/moe/test_megamoe_stage_routes.py::test_megamoe_kernels_without_the_adaptive_route_record_their_ptx
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"

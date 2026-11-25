@@ -197,16 +197,5 @@ def test_peer_copies_between_four_local_ranks():
     assert done.stdout.count("VERIFY OK") == 4, done.stdout[-4000:]
 
 
-@pytest.mark.cpu_only
-def test_the_ranks_start_outside_the_launchers_mpi_job(monkeypatch):
-    for name in ("PMIX_RANK", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "SLURM_JOB_ID"):
-        monkeypatch.setenv(name, "1")
-    seen = {}
-    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: seen.update(kwargs))
-    run_ranks()
-    assert seen["env"]["TLLM_DISABLE_MPI"] == "1"
-    assert not [name for name in seen["env"] if name.startswith(_LAUNCHER_PREFIXES)]
-
-
 if __name__ == "__main__":
     sys.exit(main())

@@ -33,8 +33,8 @@ def _dropped(routes, count):
 )
 @pytest.mark.parametrize("fused", [False, True])
 def test_the_route_drops_the_padding_rows_as_the_megamoe_staging_does(real, requests, fused):
-    """Regression: record counts only live rows. Separate and fused routes preserve live-word
-    staging and statistics bit for bit."""
+    """Under a live-row word the statistics count only the live rows, and the separate and fused
+    routes stage and count the same rows bit for bit."""
     layout, shares, ids = _dsv4_case(2)
     tables = _tables(*build_route_tables(layout, shares, 384, 512))
     ids = torch.tensor(ids[: 32 * TOP_K], dtype=torch.int32, device="cuda").view(32, TOP_K)

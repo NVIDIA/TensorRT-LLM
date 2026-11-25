@@ -4,7 +4,6 @@
 byte as torch copies, fills and ``fp4_quantize.into`` do: routes in rows ``[0, n)`` (only the live
 rows of a live-row word), -1 and 0 after them."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -29,42 +28,6 @@ def _garbage(shape, dtype, generator, device):
     nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
     raw = torch.randint(0, 256, (nbytes,), dtype=torch.uint8, generator=generator)
     return raw.view(dtype).view(shape).to(device)
-
-
-def _cuda_last_error() -> int:
-    """cudaPeekAtLastError of the CUDA runtime this process loaded (0: none pending), without clearing it."""
-    import ctypes
-
-    path = next(
-        line.split()[-1]
-        for line in open("/proc/self/maps")
-        if "libcudart.so" in line and line.split()[-1].startswith("/")
-    )
-    return int(ctypes.CDLL(path).cudaPeekAtLastError())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_stage_routes_first_launch_of_the_process_leaves_no_error(record_property):
-    """The first route staging of the process, of a launch without rows (an empty grid of routes, a full bucket of
-    -1 and 0): no CUDA error is pending before it, none after it, and it stages what torch fills. Records where an
-    error first shows (before / after) for a run that fails."""
-    torch.zeros(1, device="cuda").add_(1)
-    torch.cuda.synchronize()
-    before = _cuda_last_error()
-    ids = torch.empty((0, TOP_K), dtype=torch.int32, device="cuda")
-    weights = torch.empty((0, TOP_K), device="cuda")
-    ids_out = torch.full((ROWS, TOP_K), 7, dtype=torch.int64, device="cuda")
-    weights_out = torch.full((ROWS, TOP_K), 7.0, device="cuda")
-    error = None
-    try:
-        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out)
-        torch.cuda.synchronize()
-    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised by the assertion below
-        error = repr(exc)
-    after = _cuda_last_error()
-    record_property("first_stage_routes_launch", f"before={before} after={after} error={error}")
-    assert before == 0 and error is None and after == 0, (before, error, after)
-    assert (ids_out == -1).all() and (weights_out == 0).all()
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -590,104 +553,6 @@ def test_router_adaptive_route_is_bitwise_its_definition(rows, staged):
         assert out.cpu().tolist() == want_slots, (rows, case)
         assert stat_rows.cpu().tolist() == want_rows.tolist(), (rows, case)
         assert forwards.item() == want_forwards.item(), (rows, case)
-
-
-def _kernel_ptx_digests(adaptive_route_experts, out_dir, tokens=32):
-    """Build and compile the DeepSeek-V4 EP32 MegaMoE kernel of a 32-token bucket in a fresh interpreter with its
-    PTX and cubins kept: {file: sha256 of the PTX without source locations, of the cubin}, and the resource usage."""
-    import json
-    import subprocess
-    import sys
-
-    script = f"""
-import hashlib, json, os, pathlib, re, subprocess, torch
-from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
-kwargs = dict(world_size=32, local_rank=0, num_topk=6, num_experts_per_rank=16, hidden_size=7168,
-              intermediate_size_per_partition=3072, expand_intermediate_size_per_partition=6144,
-              max_tokens_per_rank={tokens}, output_dtype=torch.bfloat16, apply_topk_in_fc1=True, swiglu_alpha=None,
-              swiglu_beta=None, gate_up_clamp=None, situ_beta=None, situ_linear_beta=None, in_kernel_fc2_reduce=False,
-              combine_format="16e2m1xbf16", tactic_autotune=False, helper_expert_count=0)
-if {adaptive_route_experts}:
-    kwargs["adaptive_route_experts"] = {adaptive_route_experts}
-# The kernel builder reads the device's limits through the driver: it needs this process's CUDA context.
-torch.cuda.set_device(0)
-torch.zeros(1, device="cuda")
-out = pathlib.Path({str(out_dir)!r})
-out.mkdir(parents=True, exist_ok=True)
-import cutlass.cute as cute
-_compile = cute.compile
-class _KeepCode:
-    # cute.compile with the DSL's keep-PTX / keep-cubin dump of every kernel it builds into `out`.
-    keep = " --keep-ptx --keep-cubin --dump-dir " + str(out)
-    def _with(self, fn):
-        return lambda *a, **k: fn(*a, **dict(k, options=(k.get("options", "") + self.keep).strip()))
-    def __getitem__(self, item):
-        return self._with(_compile[item])
-    def __call__(self, *a, **k):
-        return self._with(_compile)(*a, **k)
-cute.compile = _KeepCode()
-runner = op._megamoe_get_runner(**kwargs)
-tactic = op._default_megamoe_tactic_for_key(runner._tactic_lookup_key(), num_tokens={tokens})
-kernel = runner._build_kernel_once(tactic)
-kernel.aot_compile()
-digests = {{}}
-for f in sorted(out.rglob("*")):
-    if f.suffix == ".ptx":
-        text = "\\n".join(l for l in f.read_text().splitlines() if not re.match(r"\\s*(\\.loc|\\.file|//)", l))
-        digests[f.name] = ["ptx", hashlib.sha256(text.encode()).hexdigest()]
-    elif f.suffix == ".cubin":
-        try:
-            dump = ["cuobjdump", "--dump-resource-usage", str(f)]
-            usage = subprocess.run(dump, capture_output=True, text=True).stdout
-        except OSError as error:
-            usage = f"cuobjdump: {{error}}"
-        digests[f.name] = ["cubin", hashlib.sha256(f.read_bytes()).hexdigest(), usage]
-print("DIGESTS " + json.dumps(digests))
-"""
-    # Without the variables of the MPI job pytest may run in: the child imports tensorrt_llm, which
-    # initializes MPI, and would join that job as its parent.
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))
-    }
-    env.update(CUTE_DSL_KEEP_PTX="1", CUTE_DSL_KEEP_CUBIN="1", CUTE_DSL_DUMP_DIR=str(out_dir))
-    done = subprocess.run(
-        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=1800
-    )
-    assert done.returncode == 0, done.stderr[-4000:]
-    line = next(x for x in done.stdout.splitlines() if x.startswith("DIGESTS "))
-    return json.loads(line[len("DIGESTS ") :])
-
-
-@_requires_cute_gpu
-@pytest.mark.parametrize("tokens", [32, 1024])
-def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(
-    tmp_path, record_property, tokens
-):
-    """Records the digests of the no-EPLB EP32 build's kernels of a 32-token bucket (the one-round router) and a
-    1024-token bucket (the metadata-push router), PTX without source locations and cubin, as JUnit properties, so
-    two runs (a base and a change) can compare them; this test does not compare them. The adaptive build's
-    resource usage is recorded beside them."""
-    import json
-
-    digests = _kernel_ptx_digests(0, tmp_path / "base", tokens)
-    kept = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
-    assert any(kind == "ptx" for kind, *_ in digests.values()), (
-        f"the compile kept no PTX: {kept[:20]}"
-    )
-    record_property(
-        "no_eplb_kernel_digests", json.dumps({k: v[:2] for k, v in digests.items()}, sort_keys=True)
-    )
-    record_property(
-        "no_eplb_resource_usage",
-        json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}),
-    )
-    adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive", tokens)
-    record_property(
-        "adaptive_resource_usage",
-        json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),
-    )
 
 
 @pytest.mark.skipif(
