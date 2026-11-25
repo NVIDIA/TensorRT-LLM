@@ -1,6 +1,6 @@
 ---
 name: trtllm-modeling-v2-features
-description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
+description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, expert-parallel load balancing (EPLB), or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
 ---
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
@@ -78,8 +78,10 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    *Blind to* accuracy: boot checks only that a few short continuations are
    not empty.
 4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
-   with CUDA graphs; `gate disagg --unit disagg` runs the target's
-   disaggregated-serving test as CI does; `gate acceptance` judges
+   with CUDA graphs; `gate disagg --unit disagg` serves the
+   deployment `accuracy.disagg` states and scores it through its proxy, or
+   runs the target's disaggregated-serving test as CI does when it states a
+   `test`; `gate acceptance` judges
    speculators. *Blind spots* are per feature in the reference; they are why
    each feature carries a proof of its own.
 
@@ -90,9 +92,10 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 | KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no gate reads | variant accuracy |
 | CUDA graphs | `runtime.cuda_graph` (default on) | the options sent; no gate reads the captures | accuracy |
 | overlap scheduler | `runtime.overlap_scheduler` (default on, core) | the argument only | nothing of its own |
-| disaggregation | feature `disagg` + `accuracy.disagg.test` | a benchmark scored through `trtllm-serve disaggregated` | the tree's disaggregated-serving test |
+| disaggregation | feature `disagg` + `accuracy.disagg` (`config`/`context`/`generation`, or `test`) | a benchmark scored through `trtllm-serve disaggregated` | the flow's own serving of the stated deployment, or the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
 | speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | acceptance gate |
+| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member, `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant accuracy |
 
 ## Rules that save hours
 
@@ -112,7 +115,11 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   and chunked prefill are off there. Prove every other feature once, as one
   variant on core at the member the request validates fully (`spec/INTAKE.md`),
   never two at once.
-- **Write the disaggregated test the way the tree's own are written,** in
+- **Write a disaggregated test only when `accuracy.disagg` states a `test`.**
+  With `config`, `context` and `generation` there the flow serves the deployment itself:
+  a failing `gate disagg` is then about the target or its options, never about
+  a launcher to write. When it does state a test, write it the way the tree's
+  own are written, in
   `tests/integration/defs/accuracy/test_disaggregated_serving.py`: a
   `LlmapiAccuracyTestHarness` class with context and generation server configs,
   `launch_disaggregated_llm`, the benchmark task of `accuracy_core.py` (GSM8K

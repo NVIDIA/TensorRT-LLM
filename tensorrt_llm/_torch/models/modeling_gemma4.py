@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import functools
 import math
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
@@ -49,6 +50,7 @@ from ..attention.backends.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..attention.backends.trtllm import trtllm_supports_swa_scratch_reuse
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..kernels.fused_ops.gelu_tanh_mul import gelu_tanh_mul
@@ -75,9 +77,10 @@ from ..modules.linear import (
     WeightsLoadingConfig,
 )
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_gemma3 import build_gemma_attention_mask
+from .modeling_gemma3 import build_gemma_attention_mask, build_gemma_context_variable_window
 from .modeling_speculative import (
     _SPECULATIVE_POSITION_HEADROOM,
     SpecDecOneEngineForCausalLM,
@@ -381,6 +384,13 @@ class Gemma4Attention(QKNormRoPEAttention):
                     "Gemma4Attention could not infer layer_idx: no layer type "
                     f"matches is_sliding={is_sliding}."
                 )
+
+        self._num_kv_writing_layers = config.num_hidden_layers - getattr(
+            config, "num_kv_shared_layers", 0
+        )
+        self._validated_scratch_source: Optional[
+            tuple[weakref.ReferenceType[KVCacheManagerV2], int]
+        ] = None
 
         # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
         # while appending to the cache. Keep RoPE at the model layer so the
@@ -712,6 +722,31 @@ class Gemma4Attention(QKNormRoPEAttention):
         variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        manager = attn_metadata.kv_cache_manager
+        if (
+            self.is_kv_shared
+            and isinstance(manager, KVCacheManagerV2)
+            and manager.enable_swa_scratch_reuse
+            and (
+                self._validated_scratch_source is None
+                or self._validated_scratch_source[0]() is not manager
+                or self._validated_scratch_source[1] != self.attn.layer_idx
+            )
+        ):
+            source = manager.layer_offsets[self.attn.layer_idx]
+            if manager.max_attention_window_vec[source] is not None:
+                group = manager.impl.get_layer_group_id(source)
+                writers = [
+                    layer
+                    for layer in manager.impl.layer_grouping[group]
+                    if manager.pp_layers[layer] < self._num_kv_writing_layers
+                ]
+                # Later writers in this group would overwrite the shared scratch pages.
+                assert source == max(writers), (
+                    "Gemma4 shared KV with SWA scratch reuse requires the source "
+                    "to be the last KV-writing layer in its lifecycle group."
+                )
+            self._validated_scratch_source = (weakref.ref(manager), self.attn.layer_idx)
         if attention_mask_data is not None:
             assert isinstance(
                 attn_metadata,
@@ -1620,10 +1655,23 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         uses_external_shared_kv = (
             spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
         )
+        default_backend = "FLASHINFER" if uses_external_shared_kv or not is_sm_100f() else "TRTLLM"
+        effective_backend = default_backend
+        if "attn_backend" in getattr(llm_args, "model_fields_set", set()):
+            effective_backend = llm_args.attn_backend
+        enable_scratch = (
+            effective_backend.upper() == "TRTLLM"
+            and not uses_external_shared_kv
+            and trtllm_supports_swa_scratch_reuse()
+        )
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
         return {
-            "attn_backend": (
-                "FLASHINFER" if uses_external_shared_kv or not is_sm_100f() else "TRTLLM"
-            ),
+            "attn_backend": default_backend,
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": enable_scratch,
+            },
         }
 
     @classmethod
@@ -1687,42 +1735,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         prefix_len: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build inclusive KV bounds for each packed context query token."""
-        extend_len = mm_token_type_ids.numel()
-        positions = torch.arange(
-            prefix_len,
-            prefix_len + extend_len,
-            device=mm_token_type_ids.device,
-            dtype=torch.int32,
+        return build_gemma_context_variable_window(
+            mm_token_type_ids, effective_sliding_window, prefix_len
         )
-        if effective_sliding_window is None:
-            starts = torch.zeros_like(positions)
-        else:
-            starts = torch.clamp(positions - effective_sliding_window + 1, min=0)
-        ends = positions.clone()
-
-        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
-        previous_types = torch.cat((mm_token_type_ids.new_full((1,), -1), mm_token_type_ids[:-1]))
-        next_types = torch.cat((mm_token_type_ids[1:], mm_token_type_ids.new_full((1,), -1)))
-        blob_starts = is_vision & (mm_token_type_ids != previous_types)
-        blob_ends = is_vision & (mm_token_type_ids != next_types)
-
-        local_positions = torch.arange(
-            extend_len, device=mm_token_type_ids.device, dtype=torch.int32
-        )
-        start_candidates = torch.where(blob_starts, local_positions, -1)
-        vision_starts = torch.cummax(start_candidates, dim=0).values + prefix_len
-        end_candidates = torch.where(blob_ends, local_positions, extend_len)
-        vision_ends = (
-            torch.flip(
-                torch.cummin(torch.flip(end_candidates, dims=(0,)), dim=0).values,
-                dims=(0,),
-            )
-            + prefix_len
-        )
-
-        starts = torch.where(is_vision, torch.minimum(starts, vision_starts), starts)
-        ends = torch.where(is_vision, torch.maximum(ends, vision_ends), ends)
-        return starts.contiguous(), ends.contiguous()
 
     def get_attention_variable_window(
         self,

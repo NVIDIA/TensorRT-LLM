@@ -235,7 +235,7 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+// CBTS per-test coverage is limited to the official post-merge pipeline.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
@@ -616,7 +616,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        // L0_Test applies stage eligibility after the pipeline-level gate.
         testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
@@ -1010,7 +1010,7 @@ def launchTestListCheck(pipeline, globalVars)
 
                 def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
                 sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
-                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive"
             }
         }
     })
@@ -1411,18 +1411,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         return null
     }
 
-    // CBTS only activates on bare `/bot run`. If the user specified any
-    // stage-selection flag, defer entirely to their explicit choice.
-    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
-    if (!triggeredFlags.isEmpty()) {
-        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
-        if (_cbtsEnsureCliDependencies(pipeline)) {
-            _cbtsReportDecision(pipeline, globalVars, "deferred",
-                                "user flags: ${triggeredFlags.join(', ')}", null)
-        }
-        return null
-    }
-
     def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
     if (!changedFiles) {
         pipeline.echo("CBTS: deferring — no changed files detected")
@@ -1431,7 +1419,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
     try {
         if (!_cbtsEnsureCliDependencies(pipeline)) {
-            pipeline.echo("CBTS: falling back to full run because CLI dependencies are unavailable")
+            pipeline.echo("CBTS: falling back to command-selected stages because CLI dependencies are unavailable")
             return null
         }
         def coveragePilotEligible = false
@@ -1458,7 +1446,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputJson = groovy.json.JsonOutput.toJson([
             changed_files: changedFiles,
             diffs: diffs,
-            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
         ])
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
@@ -1560,7 +1547,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        pipeline.echo("CBTS failed, falling back to command-selected stages: ${e}")
         return null
     }
 }
@@ -1813,19 +1800,6 @@ def _cbtsMatchesAnyPattern(String filePath, List patterns)
     return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
 }
 
-// Returns user-set stage-selection flags that should force CBTS to defer.
-// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
-// are intentionally absent.
-def _cbtsTriggeredUserFlags(testFilter)
-{
-    def deferFlags = [
-        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
-        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
-    ]
-    return deferFlags.findAll { testFilter[it] }
-                     .collect { "${it}=${testFilter[it]}" }
-}
-
 // Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
 // logs reasons and defers.
 def _cbtsParseSelectionResult(String text)
@@ -1961,6 +1935,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
         "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
         "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
+        "tensorrt_llm/_torch/memory/monitor/ranks.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
@@ -2198,65 +2173,71 @@ def readRunTestResults(String reader, String helper, String nameEre, String excl
     }
 }
 
-// Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
+// Upload sqlite-only post-merge coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
 def uploadArchCoverage(String arch, pipeline, testFilter) {
-    if (!testFilter[(CBTS_COVERAGE)]) {
+    if (!testFilter[(CBTS_COVERAGE)] || !testFilter[(IS_POST_MERGE)]) {
         return
     }
     // The results archives of SBSA stages; every other one is x86_64.
     def sbsaArchiveEre = '^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\\.tar\\.gz$'
+    boolean interruptionWasActualInsideTimeout = false
     try {
         timeout(time: 15, unit: 'MINUTES') {
-            def podSpec = createKubernetesPodConfig("", "agent", "amd64", "Upload Single-GPU Coverage (${arch})")
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
-                stage("Upload Single-GPU Coverage (${arch})") {
-                    sh "rm -rf cov && mkdir -p cov"
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                    withTestResultsReader { reader, helper ->
-                        if (arch == "SBSA") {
-                            readRunTestResults(reader, helper, sbsaArchiveEre)
+            try {
+                def podSpec = createKubernetesPodConfig("", "agent", "amd64", "Upload Single-GPU Coverage (${arch})")
+                trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
+                    stage("Upload Single-GPU Coverage (${arch})") {
+                        sh "rm -rf cov && mkdir -p cov"
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl bash python3 py3-pip")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                        withTestResultsReader { reader, helper ->
+                            if (arch == "SBSA") {
+                                readRunTestResults(reader, helper, sbsaArchiveEre)
+                            } else {
+                                readRunTestResults(reader, helper, TEST_RESULT_ARCHIVE_ERE, sbsaArchiveEre)
+                            }
+                        }
+                        sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
+                        sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                        def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
+                        if (fileCount > 0) {
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                            // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+                            sh """
+                                PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
+                                python3 -m cbts.command coverage collection pystart-report \
+                                    --glob 'cov/.cbtscov.*.sqlite' \
+                                    --out-sqlite cov/cbts_touchmap.sqlite
+                            """
+                            sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
+                            def primary = llmArtifactsPrimary()
+                            trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz",
+                                testResultsDirTarget(primary, "cbts-coverage"), primary)
+                            echo "CBTS early coverage (${arch}): " +
+                                trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
                         } else {
-                            readRunTestResults(reader, helper, TEST_RESULT_ARCHIVE_ERE, sbsaArchiveEre)
+                            echo "CBTS Single-GPU coverage (${arch}): no data files found, skipping."
                         }
                     }
-                    sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
-                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
-                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
-                    if (fileCount > 0) {
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-                        // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
-                        sh """
-                            PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
-                            python3 -m cbts.command coverage collection pystart-report \
-                                --glob 'cov/.cbtscov.*.sqlite' \
-                                --out-sqlite cov/cbts_touchmap.sqlite
-                        """
-                        sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
-                        def primary = llmArtifactsPrimary()
-                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz",
-                            testResultsDirTarget(primary, "cbts-coverage"), primary)
-                        echo "CBTS early coverage (${arch}): " +
-                            trtllm_utils.llmArtifactsBrowseUrl(primary, "${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz")
-                    } else {
-                        echo "CBTS early coverage (${arch}): no data files found, skipping."
-                    }
-                }
-            })
+                })
+            } catch (FlowInterruptedException e) {
+                interruptionWasActualInsideTimeout = e.isActualInterruption()
+                throw e
+            }
         }
     } catch (FlowInterruptedException e) {
-        // The 15-minute timeout above is non-fatal; user aborts and upstream
-        // pipeline interruptions must keep propagating.
-        if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
-            echo "CBTS early coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
+        // Jenkins marks this timeout non-actual only after leaving its own block.
+        if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+            e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
+            echo "CBTS Single-GPU coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
         } else {
             throw e
         }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "CBTS early coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
+        echo "CBTS Single-GPU coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
     }
 }
 

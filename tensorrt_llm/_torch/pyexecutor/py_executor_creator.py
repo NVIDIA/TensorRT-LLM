@@ -18,6 +18,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
+from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -45,9 +47,18 @@ if TYPE_CHECKING:
 
     from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 
+from ..attention.backends.fp4_mla.config import \
+    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE
+from ..attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..memory.monitor import pools as monitor_pools
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import settings as monitor_settings
+from ..memory.monitor import startup as monitor_startup
+from ..memory.monitor import tagging as monitor_tagging
+from ..memory.monitor import triggers as monitor_triggers
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
@@ -82,9 +93,6 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
-FP4_MLA_TOKENS_PER_BLOCK = 128
-# NVFP4 MLA quantizes the latent cache in 16-token tiles.
-FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 def _validate_fp4_mla_chunk_unit(
@@ -139,6 +147,17 @@ class _ExecutorMemoryMonitor:
     def __init__(self):
         self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
+        # The memory monitor reuses these names and suggestions in its reports.
+        monitor_startup.set_stage_advice(
+            {
+                k.value: v
+                for k, v in self.memory_type_friendly_names.items()
+            },
+            {
+                k.value: v
+                for k, v in self.memory_type_tuning_suggestion.items()
+            },
+        )
 
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
@@ -202,15 +221,16 @@ class _ExecutorMemoryMonitor:
     def _maybe_explain_if_oom(self, e: Exception, *,
                               current_stage: ExecutorMemoryType,
                               free_gpu_memory_bytes_pre: int) -> Optional[str]:
-        if isinstance(e, torch.OutOfMemoryError) or "out of memory" in str(e):
-            msg = "Executor creation failed due to insufficient GPU memory."
-        elif (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e)
-              and "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
-              in str(e)):
-            msg = f"Executor creation failed with NCCL error: {str(e)}"
-            return msg
-        else:
+        # The same test startup classification and the memory monitor use;
+        # host-memory failures get no GPU memory explanation.
+        kind = out_of_memory_kind(e)
+        if kind is None or kind is OomKind.HOST:
             return None
+        if (isinstance(e, RuntimeError) and "Failed, NCCL error" in str(e) and
+                "unhandled cuda error (run with NCCL_DEBUG=INFO for details)"
+                in str(e)):
+            return f"Executor creation failed with NCCL error: {str(e)}"
+        msg = "Executor creation failed due to insufficient GPU memory."
 
         msg = "\n".join([
             msg,
@@ -239,10 +259,17 @@ class _ExecutorMemoryMonitor:
         """Catches OOM and prints instructive message."""
 
         free_gpu_memory_bytes_pre = torch.cuda.mem_get_info()[0]
+        monitor_process_pre = monitor_startup.begin_stage(current_stage.value)
 
         try:
-            yield
+            # Tag what the step allocates so the memory monitor can name its
+            # owner; a no-op unless the monitor is in full mode.
+            with monitor_tagging.tag(current_stage.value):
+                yield
         except Exception as e:
+            monitor_startup.record_failed_stage(current_stage.value,
+                                                free_gpu_memory_bytes_pre,
+                                                monitor_process_pre)
             explanation = self._maybe_explain_if_oom(
                 e,
                 current_stage=current_stage,
@@ -252,6 +279,10 @@ class _ExecutorMemoryMonitor:
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
+            monitor_startup.record_stage(current_stage.value,
+                                         free_gpu_memory_bytes_pre,
+                                         free_gpu_memory_bytes_post,
+                                         monitor_process_pre)
             self._samples.append(
                 self._GpuMemoryUsageSample(
                     creation_stage=current_stage,
@@ -581,6 +612,14 @@ def _extend_full_attention_windows_for_spec_decode(
     kv_cache_config.max_attention_window = adjusted_max_attention_window
 
 
+def _describes_grammar_vocabulary(tokenizer: Optional[TokenizerBase]) -> bool:
+    """Whether `tokenizer` describes the vocabulary grammars are matched
+    against (see `TokenizerBase.describes_grammar_vocabulary`), rather than
+    guided decoding reading it from the Hugging Face tokenizer."""
+    return isinstance(tokenizer,
+                      TokenizerBase) and tokenizer.describes_grammar_vocabulary
+
+
 def get_guided_decoding_config(guided_decoding_backend: str,
                                tokenizer: Optional[TokenizerBase] = None):
     guided_decoding_config = None
@@ -588,16 +627,69 @@ def get_guided_decoding_config(guided_decoding_backend: str,
         assert tokenizer is not None
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-            **_xgrammar_tokenizer_info(tokenizer))
+            **(tokenizer.xgrammar_tokenizer_info()
+               if _describes_grammar_vocabulary(tokenizer) else
+               _xgrammar_tokenizer_info(tokenizer)))
     elif guided_decoding_backend == 'llguidance':
         assert tokenizer is not None
+        # A tokenizer that describes its own vocabulary hands the guided
+        # decoder a ready llguidance tokenizer (see `_llguidance_tokenizer`),
+        # so the config carries none.
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
-            **_llguidance_tokenizer_info(tokenizer))
+            **({} if _describes_grammar_vocabulary(tokenizer) else
+               _llguidance_tokenizer_info(tokenizer)))
     elif guided_decoding_backend is not None:
         raise ValueError(
             f"Unsupported guided decoding backend {guided_decoding_backend}")
     return guided_decoding_config
+
+
+def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
+                          tokenizer: Optional[TokenizerBase],
+                          vocab_size_padded: int):
+    """The ready llguidance tokenizer of a tokenizer that describes its own
+    vocabulary, or None to build it from the config's `tokenizer_str`."""
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or not _describes_grammar_vocabulary(tokenizer)):
+        return None
+    return tokenizer.llguidance_tokenizer(vocab_size_padded)
+
+
+def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
+                                    checkpoint_dir: str) -> TokenizerBase:
+    """Load the tokenizer whose vocabulary guided decoding masks, from the checkpoint.
+
+    A Mistral-native checkpoint (``checkpoint_format`` ``mistral`` or
+    ``mistral_large_3``) with a Tekken tokenizer (``tekken.json``) is read
+    through mistral-common, as its input processor reads it, whatever Hugging
+    Face tokenizer files it also ships; guided decoding supports Tekken
+    vocabularies only, so other checkpoints keep their Hugging Face tokenizer.
+    An explicit ``custom_tokenizer`` takes precedence.
+
+    Args:
+        llm_args: The LLM arguments, for ``custom_tokenizer``,
+            ``checkpoint_format`` and ``trust_remote_code``.
+        checkpoint_dir: The checkpoint directory.
+
+    Returns:
+        The loaded tokenizer.
+    """
+    custom_tokenizer = llm_args.custom_tokenizer
+    if (custom_tokenizer is None and llm_args.checkpoint_format
+            in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3)
+            and os.path.isfile(os.path.join(checkpoint_dir, "tekken.json"))):
+        custom_tokenizer = "mistral_common"
+    if custom_tokenizer:
+        from tensorrt_llm.tokenizer import load_custom_tokenizer
+        return load_custom_tokenizer(
+            custom_tokenizer,
+            checkpoint_dir,
+            trust_remote_code=llm_args.trust_remote_code)
+    from tensorrt_llm.tokenizer import TransformersTokenizer
+    return TransformersTokenizer.from_pretrained(
+        checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
 
 
 def _load_config_and_create_checkpoint_loader(
@@ -770,19 +862,10 @@ def _create_py_executor(
     # when guided decoding needs it.
     if (tokenizer is None and llm_args.guided_decoding_backend is not None
             and checkpoint_dir is not None):
+        tokenizer = _load_guided_decoding_tokenizer(llm_args, checkpoint_dir)
         logger.info(
-            "Tokenizer not provided; loading from checkpoint for guided decoding"
-        )
-        if llm_args.custom_tokenizer:
-            from tensorrt_llm.tokenizer import load_custom_tokenizer
-            tokenizer = load_custom_tokenizer(
-                llm_args.custom_tokenizer,
-                checkpoint_dir,
-                trust_remote_code=llm_args.trust_remote_code)
-        else:
-            from tensorrt_llm.tokenizer import TransformersTokenizer
-            tokenizer = TransformersTokenizer.from_pretrained(
-                checkpoint_dir, trust_remote_code=llm_args.trust_remote_code)
+            "Tokenizer not provided; loaded "
+            f"{type(tokenizer).__name__} from checkpoint for guided decoding")
 
     guided_decoding_config = get_guided_decoding_config(
         llm_args.guided_decoding_backend, tokenizer)
@@ -1215,6 +1298,9 @@ def _create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
+                kwargs["llguidance_tokenizer"] = _llguidance_tokenizer(
+                    guided_decoding_config, tokenizer,
+                    model_engine.model.vocab_size_padded)
                 if spec_config is not None:
                     kwargs[
                         "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
@@ -1430,6 +1516,9 @@ def _create_py_executor(
 
     estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
+    # Resources each executor owns are named for the final executor only.
+    monitor_startup.set_sizing_pass(estimating_kv_cache)
+
     # Without the estimation, build_managers sizes the final KV cache from
     # the device memory free now, so DWDP is set up first: the KV cache
     # then gets the replicated dense weights dense DWDP frees, and the
@@ -1549,6 +1638,7 @@ def _create_py_executor(
                 kv_cache_creator.teardown_managers(resources)
                 gc.collect()
                 torch.cuda.empty_cache()
+            monitor_startup.set_sizing_pass(False)
 
             with allocation_scope(ExecutorMemoryType.KV_CACHE):
                 # Before estimating KV cache size, a minimal KV cache has been allocated using
@@ -1642,10 +1732,14 @@ def create_py_executor(
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
+    # The memory monitor follows one executor per process, the first one
+    # alive; the others are built and served without it.
+    monitor_token = _begin_monitor(llm_args)
     try:
-        with monitor_executor_initialization(), _StartupTimer(
-                "executor_creation") as startup_timer:
-            return _create_py_executor_impl(
+        with _monitor_startup_scope(
+                monitor_token.monitored), monitor_executor_initialization(
+                ), _StartupTimer("executor_creation") as startup_timer:
+            py_executor = _create_py_executor_impl(
                 _startup_timer=startup_timer,
                 llm_args=llm_args,
                 checkpoint_dir=checkpoint_dir,
@@ -1654,6 +1748,8 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
+        monitor_providers.end_executor(monitor_token)
+        monitor_startup.set_sizing_pass(False)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):
@@ -1673,3 +1769,54 @@ def create_py_executor(
                     "Failed to roll back dense DWDP after PyExecutor construction "
                     f"error\n{traceback.format_exc()}")
         raise
+    py_executor._memory_monitor_token = monitor_token
+    if monitor_token.monitored:
+        # Armed only once startup is over: KV sizing, warmup and graph
+        # capture run allocations into the wall on purpose and catch the
+        # error. The executor releases it at shutdown, through
+        # end_executor; reports describe its device, the current one, which
+        # every executor type takes as its own when it is built.
+        monitor_triggers.install_oom_reporter(
+            device=torch.cuda.current_device(),
+            owner=monitor_token,
+            world_size=llm_args.parallel_config.world_size)
+    # Classify the pools startup created now, in every mode, rather than
+    # inside the first report: that may be an OOM report on the executor
+    # thread, or a report request answered next to the serving loop.
+    monitor_pools.prime()
+    return py_executor
+
+
+def _begin_monitor(llm_args: TorchLlmArgs) -> "monitor_providers.ExecutorToken":
+    """Register the executor about to be built with the memory monitor.
+
+    The monitor follows the first executor alive in the process. For it,
+    ``memory_monitor_config`` is applied, with the environment's overrides
+    ``TorchLlmArgs`` folded in already, and a rank filter that selects none
+    of the job's ranks is ignored before startup is recorded, so it does not
+    turn the record off. Any other executor leaves the monitor's settings as
+    they are.
+    """
+    monitor_settings.configure(llm_args.memory_monitor_config,
+                               read_environment=False,
+                               world_size=llm_args.parallel_config.world_size)
+    return monitor_providers.begin_executor()
+
+
+@contextmanager
+def _monitor_startup_scope(monitored: bool):
+    """The memory monitor's view of an executor being built.
+
+    For the monitored executor: creation runs allocations out of memory on
+    purpose and catches the error, so no OOM is reported meanwhile, and its
+    startup is recorded. Any other executor leaves the monitor alone: it
+    records nothing (the monitor drops what it registers), and the
+    monitored executor's OOMs are still reported while it is built.
+    """
+    if monitored:
+        with monitor_triggers.suspend_reporting(
+        ), monitor_tagging.startup_window():
+            yield
+    else:
+        with monitor_startup.recording_paused():
+            yield

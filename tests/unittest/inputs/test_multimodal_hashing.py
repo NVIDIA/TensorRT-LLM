@@ -452,3 +452,18 @@ def test_streamed_hash_pinned_digests(item: object, expected: str) -> None:
     hashes, _ = apply_mm_hashes({"image": [item]})
 
     assert hashes["image"] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (torch.bfloat16, "324ac0efcaa84b719af41ef31a5b967f2382c865b30726ceada65be3ec7c2835"),
+        (torch.float8_e4m3fn, "a5ffaa78cffe8756e7fad42225b7ae9e984ab576ae1082a63bf953cb3e043354"),
+        (torch.float8_e5m2, "a0923c79fa03795451734024956b71fad487023efbd5c5db5529531767201290"),
+    ],
+    ids=["bfloat16", "float8_e4m3fn", "float8_e5m2"],
+)
+def test_tensor_without_numpy_dtype_pinned_digests(dtype: torch.dtype, expected: str) -> None:
+    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(dtype)
+
+    assert apply_mm_hashes({"image": [tensor]}).hashes["image"] == [expected]

@@ -521,10 +521,12 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
     std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool inputKnownNoDigest,
-    std::optional<LocalityDomainId> localityDomainId)
+    std::optional<LocalityDomainId> localityDomainId, int optionalReuseMaxBacktrack)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (optionalReuseMaxBacktrack < 0)
+        throw std::invalid_argument("OPTIONAL reuse max backtrack must be nonnegative");
     if (numLocalityDomains() > 1)
     {
         TLLM_CHECK_WITH_INFO(localityDomainId.has_value(),
@@ -554,12 +556,14 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     if (inputTokens.size() != 0)
     {
         _unlinkPagesOfFailedRemoteLevels();
-        reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()) || inputKnownNoDigest);
+        reuseMatch = mRadixTree->match(reuseScope, inputTokens,
+            textOnly.value_or(this->textOnly()) || inputKnownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff,
+            /*collectOptionalMatches=*/true);
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), localityDomainId, std::move(reuseMatch),
         std::move(id), std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats,
-        std::move(retentionConfig));
+        std::move(retentionConfig), false, optionalReuseMaxBacktrack);
 }
 
 void KvCacheManager::_unlinkPagesIfARemoteLevelFailed()

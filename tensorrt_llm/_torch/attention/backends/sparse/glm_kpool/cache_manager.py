@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _host_slots_to_device,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -81,6 +83,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     _kda_replay_region: KDAReplayRegion | None = None
     # Its sparse MLA backend does not write or read mixed-precision high layers.
     _supports_mixed_precision_kv = False
+
+    @property
+    @override
+    def is_context_only_cache(self) -> bool:
+        return self.kda_context_only is True
 
     @override
     def __init__(
@@ -177,6 +184,17 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay_region is not None:
             buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The KDA replay caches are generation-local and never move."""
+        spec = super().page_table_spec()
+        if self._kda_replay_region is None:
+            return spec
+        return replace(
+            spec,
+            untransferred_roles=spec.untransferred_roles | self._kda_replay_region.roles,
+        )
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:

@@ -994,6 +994,46 @@ class BaseWorker(GenerationExecutor):
         self._check_sleep_wakeup_preconditions("get_memory_status")
         return self.engine.get_memory_status()
 
+    def get_memory_report(self) -> list[str]:
+        """Explain where GPU memory is going, as readable reports.
+
+        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
+        in every monitor mode, including ``off``. This worker's own report comes
+        first. Under the MPI executor only rank 0 is asked; it adds the other
+        ranks' reports in the monitor's full mode, and otherwise one line per
+        rank saying they were not gathered. A report that could not be built
+        is replaced by a line saying so.
+        """
+        from tensorrt_llm._torch.memory.monitor import current_rank
+        from tensorrt_llm._torch.memory.monitor.providers import NOT_MONITORED
+        from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+        token = getattr(self.engine, "_memory_monitor_token", None)
+        if token is not None and not token.monitored:
+            # Another executor in this process holds the monitor; a report
+            # would describe that executor's memory.
+            dist = getattr(self.engine, "dist", None)
+            world_size = dist.world_size if dist is not None else 1
+            return [
+                f"rank {rank}: {NOT_MONITORED}" for rank in range(world_size)
+            ]
+        # Answered on an RPC thread, whose current device is not necessarily
+        # the one this worker serves on; report_now selects it.
+        own = report_now(tag="on_demand",
+                         force=True,
+                         device_index=getattr(self.engine, "device_id", None),
+                         save=False)
+        if own is None:
+            dist = getattr(self.engine, "dist", None)
+            rank = dist.rank if dist is not None else current_rank()
+            own = (f"rank {rank}: the report could not be built; "
+                   "see this rank's log")
+        reports = [own]
+        gather = getattr(self.engine, "gather_memory_reports", None)
+        if gather is not None:
+            reports.extend(gather())
+        return reports
+
     def _prepare_sleep_tags(
         self,
         tags: list[ExecutorMemoryType],
@@ -1279,6 +1319,28 @@ class BaseWorker(GenerationExecutor):
             }
 
         return startup_metrics
+
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_config = getattr(getattr(model_engine, "model", None),
+                               "model_config", None)
+        if model_config is None:
+            return {}
+
+        from .._utils import torch_dtype_to_str
+        dtype = model_config.torch_dtype
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        if dtype is None and pretrained_config is not None:
+            dtype = pretrained_config.get_text_config().torch_dtype
+        quant_config = getattr(model_config, "quant_config", None)
+        kv_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+        quant_algo = getattr(quant_config, "quant_algo", None)
+        return {
+            "dtype": None if dtype is None else torch_dtype_to_str(dtype),
+            "kv_cache_dtype": None if kv_algo is None else str(kv_algo),
+            "quantization": None if quant_algo is None else str(quant_algo),
+        }
 
     def start_profile(self,
                       output_dir: Optional[str] = None,

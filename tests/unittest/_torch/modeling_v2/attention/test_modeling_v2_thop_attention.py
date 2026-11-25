@@ -7664,7 +7664,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default": (
         Cell(
             why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
             "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
@@ -8014,7 +8014,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     ),
     # One rank of each attention layout at the target's largest batches; its other shapes are
     # the NVFP4 target's above.
-    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default": (
         Cell(
             why="tp2 decode 12q/1kv at the dense ceiling: one row over a 2047-token history",
             spec=dict(
