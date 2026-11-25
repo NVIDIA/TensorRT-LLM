@@ -63,6 +63,32 @@ function(add_tllm_kernel_library target)
       PARENT_SCOPE)
 endfunction()
 
+if(ENABLE_MULTI_DEVICE)
+  add_tllm_kernel_library(
+    tllm_kernel_custom_all_reduce SOURCES customAllReduceKernels.cu
+    LINK_LIBRARIES tllm::common_environment)
+else()
+  list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_LIST_DIR}/customAllReduceKernels.cu")
+endif()
+
+add_tllm_kernel_library(tllm_kernel_rms_norm SOURCES rmsnormKernels.cu)
+
+add_tllm_kernel_library(
+  tllm_kernel_all_reduce_fusion
+  SOURCES
+  communicationKernels/allReduceFusionKernels.cu
+  communicationKernels/allReduceWorkspace.cu
+  LINK_LIBRARIES
+  tllm::common_environment
+  tllm::runtime_ipc)
+
+if(NOT USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  add_library(tllm_kernel_gemm_all_reduce INTERFACE)
+  add_library(tllm::kernel_gemm_all_reduce ALIAS tllm_kernel_gemm_all_reduce)
+  target_link_libraries(tllm_kernel_gemm_all_reduce
+                        INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET})
+endif()
+
 add_tllm_kernel_library(tllm_kernel_logits SOURCES logitsBitmask.cu)
 
 add_tllm_kernel_library(
@@ -124,7 +150,7 @@ add_tllm_kernel_library(
   LINK_LIBRARIES trtllm_gen_fmha_interface tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
-  tllm_kernel_cuda_core_gemm SOURCES weightOnlyBatchedGemv/cudaCoreGemm.cu
+  tllm_kernel_cuda_core_gemm SOURCES cudaCoreGemm/cudaCoreGemm.cu
   LINK_LIBRARIES tllm::common_environment tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
@@ -182,3 +208,18 @@ add_tllm_kernel_library(tllm_kernel_quantization SOURCES quantization.cu
 
 add_tllm_kernel_library(tllm_kernel_pre_quant_scale SOURCES
                         preQuantScaleKernel.cu)
+
+add_library(tllm_kernel_moe_internal INTERFACE)
+add_library(tllm::kernel_moe_internal ALIAS tllm_kernel_moe_internal)
+target_link_libraries(
+  tllm_kernel_moe_internal
+  INTERFACE ${INTERNAL_CUTLASS_KERNELS_TARGET}
+            CUDA::cuda_driver
+            tllm::kernel_gemm_utilities
+            tllm::kernel_fp8_block_scale_gemm
+            tllm::kernel_lora
+            tllm::kernel_pre_quant_scale
+            tllm::common_environment)
+if(NOT USING_OSS_CUTLASS_MOE_GEMM)
+  add_library(tllm::kernel_moe ALIAS tllm_kernel_moe_internal)
+endif()

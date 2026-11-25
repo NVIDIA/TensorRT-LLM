@@ -75,6 +75,10 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
     # context length (tens of thousands of tokens), which can exceed the
     # available KV cache on smaller GPUs.
     args.extend(["--max_seq_len", "2048"])
+    # Smaller batch size reduces chance of OOM, because test parametrization results
+    # in several concurrently live engines.
+    args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -94,6 +98,10 @@ def server_with_beam_search(model_name: str, backend: str,
                  "0.2"])  # for co-existence with other servers
     args.extend(["--max_seq_len", "2048"])
     args.extend(["--max_beam_width", "2"])
+    # Smaller batch size reduces chance of OOM, because test parametrization results
+    # in several concurrently live engines.
+    args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])

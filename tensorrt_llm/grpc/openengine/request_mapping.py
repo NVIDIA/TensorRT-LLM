@@ -22,6 +22,7 @@ from tensorrt_llm.inputs.media_io import (
     VideoMediaIO,
     _decoded_video_bytes,
 )
+from tensorrt_llm.inputs.multimodal import _validate_media_io_kwargs
 from tensorrt_llm.inputs.multimodal_data import AudioData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -427,6 +428,7 @@ def _media_io_for_model(
     defaults = None
     if isinstance(input_processor, BaseMultimodalInputProcessor):
         preferences = input_processor.get_preferred_media_io_kwargs() or {}
+        _validate_media_io_kwargs(preferences)
         defaults = preferences.get(modality)
     return media_io_type.create(defaults, runtime_kwargs)
 
@@ -615,6 +617,9 @@ def _prepare_input_from_request(
     media_capabilities: MediaCapabilities | None = None,
 ) -> _PreparedInput:
     """Validate request media without starting any fetch or decode work."""
+    media_io_kwargs = request.extra.fields.get("media_io_kwargs")
+    if media_io_kwargs is not None:
+        _validate_media_io_kwargs(media_io_kwargs.struct_value)
     inputs = _base_input_from_request(request, llm)
     if not request.media:
         return _PreparedInput(inputs, (), None)

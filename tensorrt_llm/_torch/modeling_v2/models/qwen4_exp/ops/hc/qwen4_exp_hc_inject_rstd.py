@@ -20,7 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: Rows from which a wide (`hidden >= 2048`) launch runs two warps a program instead
 #: of eight (`qwen4_exp_hc_inject_norm`'s split; the reduction tree follows it).
@@ -103,7 +104,7 @@ class Qwen4ExpHcInjectRstd(OpWrapper):
     argument: the consumers apply it.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: rows, inject (True), moe (False: shared + gate_logits [T, 1] too). The
     # checkpoint's geometry throughout: hc_count 4, hidden 2560, bf16, contiguous rows.

@@ -1084,6 +1084,11 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
     # Draft-owned attention layers kept after the target layers (layer_specs).
     _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
 
+    @property
+    @override
+    def is_context_only_cache(self) -> bool:
+        return self.kda_context_only is True or self.fp4_mla_context_only_cache is True
+
     @classmethod
     @override
     def accepts_appended_draft_layers(cls) -> bool:
