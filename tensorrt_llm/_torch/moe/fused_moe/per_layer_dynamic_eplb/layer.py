@@ -353,6 +353,14 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self._pending_replica_plan = plan
         return physical
 
+    def reuse_graph_generation(self, generation: int) -> torch.Tensor | None:
+        """Publish an eager generation to the READY cell bound by graph warmup."""
+        group = self._scheduler_group
+        if group is None or group.graph_generation is None:
+            return None
+        group.publish_graph_generation(generation)
+        return group.graph_generation
+
     def require_replica_plan(self) -> Any:
         if self._pending_replica_plan is None:
             raise RuntimeError(

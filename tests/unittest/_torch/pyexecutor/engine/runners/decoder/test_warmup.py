@@ -39,6 +39,8 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import is_parent_moe_graph_enabled
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
@@ -794,6 +796,126 @@ def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
     shapes = [args[1:] for args, _ in requests.create_warmup_request.call_args_list]
     assert shapes == ([(16, 0)] if context_only else [(16, 0), (1, 1)])
     assert engine._forward_warmup.call_count == len(shapes)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("parent_graph", "capture_batch_available"), [(True, True), (True, False), (False, False)]
+)
+def test_autotuner_warmup_prepares_dynamic_moe_graph_tactic(
+    monkeypatch: pytest.MonkeyPatch, parent_graph: bool, capture_batch_available: bool
+) -> None:
+    graph_runner = BreakableCUDAGraphRunner(torch.nn.Identity(), capture_on_current_stream=True)
+    config = decoder_config(
+        enable_autotuner=True,
+        enable_attention_dp=True,
+        max_num_tokens=8192,
+        prefill_cuda_graph_backend=(
+            PrefillCudaGraphBackend.BREAKABLE if parent_graph else PrefillCudaGraphBackend.DISABLED
+        ),
+        prefill_cuda_graph_num_tokens=[8192] if parent_graph else [],
+    )
+    tuner = Mock(profiling_cache={})
+    tuning_enabled = False
+    observed: list[tuple[int, int, bool, bool]] = []
+
+    @contextlib.contextmanager
+    def fake_autotune(**kwargs: object) -> Iterator[None]:
+        nonlocal tuning_enabled
+        tuning_enabled = True
+        try:
+            yield
+        finally:
+            tuning_enabled = False
+
+    def merge_cache(*, custom_op_prefix: str) -> None:
+        assert tuning_enabled
+        assert not observed
+        assert custom_op_prefix == "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+
+    tuner.post_tune_merge_tactics.side_effect = merge_cache
+
+    def dummy_batch(
+        resources: ResourceManager, tokens: int, generation_requests: int
+    ) -> tuple[int, int] | None:
+        if tokens == 8192 and not capture_batch_available:
+            return None
+        return tokens, generation_requests
+
+    def forward(batch: tuple[int, int], resources: ResourceManager, **kwargs: object) -> None:
+        tuner.post_tune_merge_tactics.assert_called_once()
+        observed.append((*batch, is_parent_moe_graph_enabled(), graph_runner.is_warming_up))
+
+    engine = SimpleNamespace(
+        _config=config,
+        _completed_autotuner_warmup_num_tokens=None,
+        _warmup_timer=_WarmupTimer(rank=0),
+        model=SimpleNamespace(modules=lambda: []),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=None,
+        guided_decoder=None,
+        _graphs=SimpleNamespace(
+            no_cuda_graph=contextlib.nullcontext,
+            enabled=False,
+            breakable_cuda_graph_runner=graph_runner if parent_graph else None,
+        ),
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=dummy_batch,
+            release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        ),
+        _agreement=SimpleNamespace(
+            agree_flag=lambda flag: flag,
+            should_run_warmup_batch=lambda batch, *_: batch is not None,
+        ),
+        _release_megamoe_profiling_scratch=Mock(),
+        _forward_warmup=forward,
+    )
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: SimpleNamespace(get_num_available_tokens=lambda **_: 4096)
+    )
+    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(decoder_warmup_module, "autotune", fake_autotune)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    DecoderWarmup._run_autotuner_warmup(engine, resources)
+
+    ordinary = [(4096, 0, False, False), (1, 1, False, False)]
+    assert observed == ordinary + ([(8192, 0, True, True)] if capture_batch_available else [])
+    assert engine._completed_autotuner_warmup_num_tokens == (
+        4096 if capture_batch_available or not parent_graph else None
+    )
+    assert not is_parent_moe_graph_enabled()
+    assert not graph_runner.is_warming_up
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dynamic_parent", [False, True])
+def test_disabled_autotuner_keeps_dynamic_parent_default_available(monkeypatch, dynamic_parent):
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+        MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR,
+    )
+
+    decoder = SimpleNamespace(
+        _config=decoder_config(enable_autotuner=False),
+        _graphs=SimpleNamespace(
+            breakable_cuda_graph_runner=SimpleNamespace(uses_parent_moe_graph=dynamic_parent)
+        ),
+        model=SimpleNamespace(extra_attrs={}),
+    )
+    get_tuner = Mock()
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", get_tuner)
+    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
+
+    DecoderWarmup._run_autotuner_warmup(decoder, Mock())
+
+    get_tuner.assert_not_called()
+    assert decoder.model.extra_attrs == (
+        {MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR: True} if dynamic_parent else {}
+    )
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])

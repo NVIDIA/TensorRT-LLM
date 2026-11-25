@@ -2822,16 +2822,20 @@ class AutoTuner:
 
     def post_tune_merge_tactics(self,
                                 custom_ops: Optional[Set[str]] = None,
-                                majority: bool = False) -> int:
-        """After tuning, keep per cache key (of ``custom_ops`` when given) the ranks' fastest tactic,
-        or with ``majority`` the one most ranks chose. Collective — all ranks must call it.
+                                majority: bool = False,
+                                *,
+                                custom_op_prefix: Optional[str] = None) -> int:
+        """After tuning, keep per cache key the ranks' fastest tactic, or with ``majority`` the one
+        most ranks chose. ``custom_ops`` limits the merge to those op names and ``custom_op_prefix``
+        to op names starting with it. Collective — all ranks must call it with the same scope.
         Returns how many of this rank's tactics changed."""
         if not self._is_distributed():
             return 0
         mine = {
             key: value
             for key, value in self.profiling_cache.cache.items()
-            if custom_ops is None or key[0] in custom_ops
+            if (custom_ops is None or key[0] in custom_ops) and (
+                custom_op_prefix is None or key[0].startswith(custom_op_prefix))
         }
         per_rank = self._dist.tp_cp_allgather(obj=mine)
         merged = (_majority_entries(per_rank)

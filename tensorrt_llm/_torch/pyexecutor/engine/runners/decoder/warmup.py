@@ -11,6 +11,7 @@ import os
 import time
 from collections.abc import Callable
 from enum import Enum, auto
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import enable_parent_moe_graph
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -1346,9 +1348,24 @@ class DecoderWarmup:
             mxfp8_gemm_backend_override,
         )
 
+        enable_megamoe_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
         enable_trtllm_autotuner = self._config.enable_autotuner
         if not enable_trtllm_autotuner:
+            if enable_megamoe_autotune:
+                runner = self._graphs.breakable_cuda_graph_runner
+                if runner is not None and runner.uses_parent_moe_graph:
+                    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                        MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR,
+                    )
+
+                    self.model.extra_attrs[MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR] = True
             return
+
+        graph_runner = None
+        if enable_megamoe_autotune and mode is not AutotunerWarmupMode.GENERATION_ONLY:
+            runner = self._graphs.breakable_cuda_graph_runner
+            if runner is not None and runner.uses_parent_moe_graph:
+                graph_runner = runner
 
         mxfp8_methods = []
         for module in self.model.modules():
@@ -1499,11 +1516,32 @@ class DecoderWarmup:
                 else:
                     warmup_configs.append((tokens_per_gen_request, 1))
 
+        parent_moe_warmup_complete = graph_runner is None
+
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
+            nonlocal parent_moe_warmup_complete
             ran_forward = False
-            with self._graphs.no_cuda_graph(), autotune_context:
-                for num_tokens, batch_gen_requests in warmup_configs:
+            configs = [(tokens, requests, False) for tokens, requests in warmup_configs]
+            if synchronize_trtllm_cache and graph_runner is not None:
+                (capture_tokens,) = self._config.prefill_cuda_graph_num_tokens
+                configs.append((capture_tokens, 0, True))
+            with self._graphs.no_cuda_graph(), autotune_context, contextlib.ExitStack() as scopes:
+                if synchronize_trtllm_cache and enable_megamoe_autotune:
+                    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                        MEGAMOE_TUNING_OP_PREFIX,
+                    )
+                    from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
+                        tune_megamoe_adaptive_buckets,
+                    )
+
+                    # A partial cache would make only the ranks with misses
+                    # run the collective-bearing routed expert profiling.
+                    AutoTuner.get().post_tune_merge_tactics(
+                        custom_op_prefix=MEGAMOE_TUNING_OP_PREFIX
+                    )
+                    scopes.enter_context(tune_megamoe_adaptive_buckets())
+                for num_tokens, batch_gen_requests, parent_moe_graph in configs:
                     warmup_request = self._dummy_requests.create_warmup_request(
                         resource_manager, num_tokens, batch_gen_requests
                     )
@@ -1523,17 +1561,22 @@ class DecoderWarmup:
                             record=False,
                             log_start=True,
                         ):
-                            with discard_nccl_window_tensor_outputs(
-                                (getattr(self, "_warmup_inputs", None), batch)
-                            ):
-                                self._forward_warmup(
-                                    batch,
-                                    resource_manager,
-                                    enable_spec_decode=self._config.is_spec_decode,
-                                    runtime_draft_len=get_static_draft_len(
-                                        self._config.spec_config
-                                    ),
-                                )
+                            forward = partial(
+                                self._forward_warmup,
+                                batch,
+                                resource_manager,
+                                enable_spec_decode=self._config.is_spec_decode,
+                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                            )
+                            scope_inputs = (getattr(self, "_warmup_inputs", None), batch)
+                            if parent_moe_graph:
+                                assert graph_runner is not None
+                                with enable_parent_moe_graph():
+                                    graph_runner.warmup(forward, scope_inputs, steps=1)
+                                parent_moe_warmup_complete = True
+                            else:
+                                with discard_nccl_window_tensor_outputs(scope_inputs):
+                                    forward()
                             ran_forward = True
                             torch.cuda.synchronize()
 
@@ -1620,7 +1663,7 @@ class DecoderWarmup:
         # profiler, reducing memory available for activations during inference.
         clear_memory_buffers()
         torch.cuda.empty_cache()
-        if ran_native_forward:
+        if ran_native_forward and parent_moe_warmup_complete:
             self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
     def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager) -> None:

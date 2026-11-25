@@ -1968,16 +1968,117 @@ def test_megamoe_tuning_config_is_built_once_per_runner():
             "_megamoe_autotune_num_tokens": None,
         },
     )
-    first, second = runner_cls(), runner_cls()
-    for runner in (first, second):
-        runner.max_tokens_per_rank = 8192
+    first, scalar, graph = runner_cls(), runner_cls(), runner_cls()
+    first.max_tokens_per_rank = 8192
+    first.helper_expert_count = 0
+    scalar.max_tokens_per_rank = 1024
+    scalar.helper_expert_count = 3
+    graph.max_tokens_per_rank = 8192
+    graph.helper_expert_count = 3
 
     config = first.get_tuning_config()
     assert first.get_tuning_config() is config
     # The profiling pre-hook stays bound to the runner that built the config.
     assert config.inputs_pre_hook.__self__ is first
-    assert second.get_tuning_config().inputs_pre_hook.__self__ is second
-    assert len(configs) == 2
+    assert config.dynamic_tensor_specs == ((0, 0, None, None),)
+    for runner in (scalar, graph):
+        halo_config = runner.get_tuning_config()
+        assert halo_config.inputs_pre_hook.__self__ is runner
+        assert halo_config.dynamic_tensor_specs == ((0, 0),)
+        assert halo_config.tune_max_num_tokens == runner.max_tokens_per_rank
+    assert len(configs) == 3
+
+
+@pytest.mark.parametrize(
+    ("helpers", "genptr", "tuning", "scoped", "expected_priming"),
+    [
+        (3, False, True, True, [256, 1024, 4096]),
+        (3, False, False, True, []),
+        (3, False, True, False, []),
+        (3, True, True, True, []),
+        (0, False, True, True, []),
+    ],
+)
+def test_tuned_megamoe_primes_eager_rungs_on_the_live_replica_plan(
+    helpers, genptr, tuning, scoped, expected_priming
+):
+    primed = set() if scoped else None
+    impl_type = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py",
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"_run_moe", "_prime_ladder", "_prime_ladder_buckets", "_select_launch_max_tokens"},
+        {
+            "AutoTuner": SimpleNamespace(get=lambda: SimpleNamespace(is_tuning_mode=tuning)),
+            "_MEGAMOE_TUNED_LADDERS": SimpleNamespace(get=lambda: primed),
+            "_MEGAMOE_PRIME_LADDER": True,
+            "logger": SimpleNamespace(debug=lambda *_: None),
+            "torch": SimpleNamespace(empty=lambda *_, **__: None, int32="int32", float32="float32"),
+            "stage_megamoe_inputs": lambda *_, **__: None,
+        },
+    )
+    impl = impl_type()
+    impl._maxt_buckets = [256, 1024, 4096, 6144]
+    impl._parent_graph_bucket = 6144 if genptr else None
+    impl._ugpu_weight_layout = "none"
+    impl._shared_expert = impl._prestaged = impl._slot_of_expert = None
+    impl.ep_size = 16
+    impl.ep_rank = 0
+    impl.tactic_autotune = True
+    impl.intermediate_size_per_partition = 3072
+    impl.compute_slot_count = 24 + helpers
+    impl.combine_format = "16e2m1xbf16"
+    impl.act_clamp = impl.act_alpha = impl.act_beta = None
+    impl.apply_topk_in_fc1 = True
+    weights = object()
+    plan = (
+        SimpleNamespace(ready_generation_tensor=object() if genptr else None) if helpers else None
+    )
+    launches = []
+
+    class TopkWeights:
+        def __getitem__(self, _):
+            return self
+
+    impl._acquire_buffers = lambda **kwargs: SimpleNamespace(
+        activation="activation",
+        activation_sf="sf",
+        topk_weights=TopkWeights(),
+        combine_output="combine",
+        shared_workspace=kwargs["launch_max_T"],
+        peer_offsets=(0,),
+        topk_idx_local="routes",
+    )
+    impl._stage_inputs = lambda **_: None
+    impl._launch_megamoe_kernel = lambda **kwargs: launches.append(kwargs)
+
+    def run():
+        impl._active_launch_max_tokens = 257
+        impl._run_moe(
+            x=None,
+            x_sf=None,
+            topk_idx=SimpleNamespace(dtype="int32", is_contiguous=lambda: True),
+            topk_weights=None,
+            weight_view=weights,
+            num_tokens=257,
+            top_k=6,
+            hidden=7168,
+            device="cuda",
+            output_dtype="bf16",
+            replica_plan=plan,
+        )
+
+    run()
+    launch_capacity = 6144 if tuning else 1024
+    assert [x["launch_max_T"] for x in launches] == [*expected_priming, launch_capacity]
+    assert [x["num_tokens"] for x in launches] == [0] * len(expected_priming) + [257]
+    assert all(x["weight_view"] is weights and x["replica_plan"] is plan for x in launches)
+    assert all(x["shared_workspace"] == x["launch_max_T"] for x in launches)
+    run()
+    assert [x["launch_max_T"] for x in launches] == [
+        *expected_priming,
+        launch_capacity,
+        launch_capacity,
+    ]
 
 
 def test_megamoe_runner_identity_is_built_once():
@@ -2009,8 +2110,19 @@ def _autotune_helpers(torch):
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
         "enumerate_megamoe_candidate_tactics",
+        "_default_megamoe_tactic_for_problem",
+        "_default_megamoe_tactic_for_key",
+        "_shape_tuned_megamoe_tactic",
+        "_megamoe_problem_key",
+        "_megamoe_weight_evict_first",
+        "_sm107_dsv4_pro_problem_key",
+        "_sm107_default_combine_dedup",
+        "_with_combine_dedup",
+        "_sm107_tactic_bucket",
+        "default_megamoe_tactic",
     }
     constants = {
+        "MEGAMOE_TUNING_OP_PREFIX",
         "_NVFP4_BLOCK_SIZE",
         "_SUPPORTED_MMA_TILE_M",
         "_SUPPORTED_MMA_TILE_N",
@@ -2031,6 +2143,21 @@ def _autotune_helpers(torch):
         "_EPI_FLAG_BATCH_SMALL",
         "_EPI_FLAG_BATCH_LARGE",
         "_EPI_FLAG_BATCH_TOKEN_THRESHOLD",
+        "_MEGAMOE_NONBULK_STANDALONE_TACTIC",
+        "_MEGAMOE_QUANTIZED_COMBINE_TACTIC",
+        "_MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS",
+        "_MEGAMOE_NVFP4_COMBINE_BULK_TACTIC",
+        "_SM107_DSV4_PRO_DEFAULT_TACTICS",
+        "_SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS",
+        "_SM107_DSV41_FLASH_DEFAULT_TACTICS",
+        "_SM103_DSV41_FLASH_DEFAULT_TACTICS",
+        "_SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT",
+        "_SM103_DSV41_FLASH_SMALL_RUNG_TACTICS",
+        "_SM107_KIMI_K3_GENPHASE_TACTICS",
+        "_SM107_GENPHASE_TACTICS",
+        "_SM107_GENPHASE_MAX_TOKENS_PER_RANK",
+        "_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_EXPERT",
+        "_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK",
     }
     tree = ast.parse(source.read_text())
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
@@ -2042,7 +2169,7 @@ def _autotune_helpers(torch):
             if any(isinstance(target, ast.Name) and target.id in constants for target in targets):
                 nodes.append(node)
     namespace = {
-        "torch": torch,
+        "torch": torch if torch is not None else SimpleNamespace(bfloat16="torch.bfloat16"),
         "math": math,
         "functools": functools,
         "Tuple": Tuple,
@@ -2142,22 +2269,61 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
     assert len(created) == 4
 
 
-def test_on_autotune_uses_distinct_tactics():
+@pytest.mark.parametrize("sm,tokens", [(100, 8192), (103, 8192), (100, 16384), (107, 8192)])
+def test_on_autotune_uses_distinct_tactics(sm, tokens):
     helpers = _autotune_helpers(None)
 
     off_key = helpers["_megamoe_tuning_op_name"](0)
     on_key = helpers["_megamoe_tuning_op_name"](4)
     assert off_key == "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
-    assert on_key != off_key and "alpha=0.8" in on_key
+    assert "profile_v3:load_balance=1:alpha=0.8" in on_key
+    runner = _extract_class(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "Sm100MegaMoENvfp4Runner",
+        {
+            "__init__",
+            "get_valid_tactics",
+            "unique_id",
+            "_build_unique_id",
+            "_tactic_lookup_key",
+            "_build_tactic_key",
+        },
+        dict(helpers, get_sm_version=lambda: sm),
+    )
+    world_size = 4 if sm == 107 else 16
+    inputs = [SimpleNamespace(shape=(tokens,))]
 
-    off = helpers["enumerate_megamoe_candidate_tactics"](32, 107)
-    on = helpers["enumerate_megamoe_candidate_tactics"](32, 107, load_balance=True)
-    assert all(helpers["_unpack_tactic"](tactic)[10] == "expert" for tactic in off)
-    assert {helpers["_unpack_tactic"](tactic)[10] for tactic in on} == {
-        "expert",
-        "token_tile",
-    }
-    assert any(tactic[2] is not None for tactic in on)
+    def tactics(helper_count, graph=False):
+        instance = runner(
+            local_rank=0,
+            world_size=world_size,
+            num_topk=6,
+            num_experts_per_rank=384 // world_size + helper_count,
+            hidden_size=7168,
+            intermediate_size_per_partition=3072,
+            expand_intermediate_size_per_partition=6144,
+            max_tokens_per_rank=tokens,
+            output_dtype=helpers["torch"].bfloat16,
+            gate_up_clamp=10.0,
+            combine_format="bf16" if sm == 107 else "16e2m1xbf16",
+            helper_expert_count=helper_count,
+            ready_generation_from_device=graph,
+        )
+        return instance.get_valid_tactics(inputs, None)
+
+    off = tactics(0)
+    assert all(t[10] == "expert" for t in off)
+    for count in (2, 3):
+        on = tactics(count)
+        assert on == tactics(count, graph=True)
+        # The provider sizes the combine-dedup default only for a helper-free runner.
+        assert not any(t[11] for t in on)
+        assert all(t in on for t in off if not t[11])
+        if sm == 107:
+            assert any(t[10] == "token_tile" for t in on)
+        else:
+            assert len(off) == 14
+            assert on == off
 
 
 def test_on_autotune_builds_balanced_powerlaw_input(request):
@@ -2186,6 +2352,16 @@ def test_on_autotune_builds_balanced_powerlaw_input(request):
     uniform = helpers["synthesize_profiling_topk"](**{**kwargs, "alpha": 0.0})
     expected = (torch.arange(8192 * 6) % (8 * 52)).view(8192, 6)
     assert torch.equal(uniform, expected)
+
+    # Exercise rotation when a source's assignment count is not divisible by EP.
+    total = torch.zeros(8, 52, dtype=torch.long)
+    for source in range(8):
+        routes = helpers["synthesize_profiling_topk"](
+            **{**kwargs, "num_tokens": 127, "source_rank": source}
+        )
+        total += torch.bincount(routes.flatten(), minlength=8 * 52).view(8, 52)
+    assert (total.sum(1) == 127 * 6).all()
+    assert (total[:, 1:] >= total[:, :-1]).all()
 
 
 def test_per_layer_dynamic_shutdown_reports_in_iter_through_collective_preflight():

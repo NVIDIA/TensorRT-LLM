@@ -54,6 +54,7 @@ from tensorrt_llm._torch.autotuner import (
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import (
     get_last_power_of_2_num_tokens_buckets,
+    get_model_extra_attrs,
     last_positive_power_of_2,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -256,20 +257,24 @@ def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tupl
     return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
 
 
+MEGAMOE_TUNING_OP_PREFIX = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR = "megamoe_allow_untuned_parent_graph"
+
+
 @functools.cache
 def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
     """Separate timing caches without changing the registered op or kernel ABI.
 
     Every launch that may tune asks for it, so each name is built once.
     """
-    base = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
+    base = MEGAMOE_TUNING_OP_PREFIX
     load_balance = helper_expert_count > 0
     alpha = _autotune_pl_alpha(helper_expert_count)
     granularities = _token_back_ready_granularity_choices(load_balance=load_balance)
     if not load_balance and alpha == 0 and granularities == ("expert",):
         return base
     return (
-        f"{base}:profile_v2:load_balance={int(load_balance)}:alpha={alpha!r}"
+        f"{base}:profile_v3:load_balance={int(load_balance)}:alpha={alpha!r}"
         f":ready={','.join(granularities)}"
     )
 
@@ -1628,6 +1633,8 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             f"{_TOKEN_BACK_READY_GRANULARITIES}, got {token_back_ready_granularity!r}."
         )
     if token_back_ready_granularity == "token_tile":  # nosec B105 -- scheduler mode name, not a credential
+        if sm_version != 107:
+            raise ValueError("Blackwell publishes expert-level token-back readiness.")
         # Mirrors the kernel's own guard (kernel_src/*/inference/mega/
         # block_scaled_swap_ab_mega_moe_kernel.py, _validate_geometry). Checking
         # it HERE is the point of putting the granularity in the tuple: the
@@ -2857,12 +2864,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 key = self._tactic_key = self._build_tactic_key()
             return key
 
-        def _build_tactic_key(self):
+        def _build_tactic_key(self, *, include_helpers: bool = True):
+            """Build the problem key; ``include_helpers=False`` keys the shape without helper slots."""
             return _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
                 num_topk=self.num_topk,
-                num_experts_per_rank=self.num_experts_per_rank,
+                num_experts_per_rank=(
+                    self.num_experts_per_rank
+                    if include_helpers
+                    else self.num_experts_per_rank - self.helper_expert_count
+                ),
                 hidden_size=self.hidden_size,
                 intermediate_size_per_partition=self.intermediate_size_per_partition,
                 expand_intermediate_size_per_partition=(
@@ -2878,8 +2890,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 situ_linear_beta=self.situ_linear_beta,
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
-                helper_expert_count=self.helper_expert_count,
-                ready_generation_from_device=self.ready_generation_from_device,
+                helper_expert_count=self.helper_expert_count if include_helpers else 0,
+                ready_generation_from_device=include_helpers and self.ready_generation_from_device,
             )
 
         def get_valid_tactics(
@@ -2916,14 +2928,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            for default_tactic in (
-                _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
-                _SM107_KIMI_K3_GENPHASE_TACTICS.get(self._tactic_lookup_key()),
-            ):
-                if default_tactic is not None:
-                    default_tactic = _unpack_tactic(default_tactic)
-                    if default_tactic not in candidates:
-                        candidates.append(default_tactic)
+            # The static defaults are recorded without helper slots, so a runner with
+            # helper slots also looks its shape up under the helper-free key.
+            lookup_keys = [self._tactic_lookup_key()]
+            if self.helper_expert_count > 0:
+                lookup_keys.append(self._build_tactic_key(include_helpers=False))
+            for key in lookup_keys:
+                for default_tactic in (
+                    _shape_tuned_megamoe_tactic(key),
+                    _SM107_KIMI_K3_GENPHASE_TACTICS.get(key),
+                ):
+                    if default_tactic is not None:
+                        default_tactic = _unpack_tactic(default_tactic)
+                        if default_tactic not in candidates:
+                            candidates.append(default_tactic)
             # The provider fits a dedup default and its non-dedup base (see
             # query_megamoe_kernel_properties); no other dedup tactic is sized for.
             if _sm107_default_combine_dedup(self.unique_id()):
@@ -3039,12 +3057,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
             config = self.__dict__.get("_tuning_config")
             if config is not None:
                 return config
+            # A replica plan always launches the padded capacity of its bucket.
+            token_axis = (
+                DynamicTensorSpec(0, 0)
+                if self.helper_expert_count > 0
+                else DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
+                )
+            )
             config = self._tuning_config = TuningConfig(
-                dynamic_tensor_specs=(
-                    DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
-                    ),
-                ),
+                dynamic_tensor_specs=(token_axis,),
                 constraint_specs=(
                     ConstraintSpec(1, 0, _megamoe_autotune_num_tokens),  # activation_sf
                     ConstraintSpec(2, 0, _megamoe_autotune_num_tokens),  # topk_idx
@@ -3564,6 +3586,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # The cache key distinguishes helper topology and generation ABI.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
+                if _capturing and self.ready_generation_from_device and self.tactic_autotune:
+                    raise RuntimeError("Parent MegaMoE graph reached an uncompiled tuned kernel")
                 compiled = cute.compile(kernel, **runtime_kwargs)
                 self.__class__.kernel_cache[cache_key] = (compiled, kernel)
             else:
@@ -3923,6 +3947,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             prof_peer_offsets = peer_offsets
             prof_shared_workspace = shared_workspace
         try:
+            if (
+                ready_generation_from_device
+                and tuner.is_tuning_mode
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError("Parent MegaMoE graph must select its tactic before capture")
             _, best_tactic = tuner.choose_one(
                 _megamoe_tuning_op_name(runner.helper_expert_count),
                 [runner],
@@ -3937,6 +3967,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runner._profiling_scratch_factory = None
         # Real run always uses the caller's staging buffer + peer_offsets.
         try:
+            if ready_generation_from_device and best_tactic == -1:
+                attrs = get_model_extra_attrs()
+                allow_default = attrs is not None and attrs.get(
+                    MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR, False
+                )
+                if tuner.is_tuning_mode or not allow_default:
+                    raise RuntimeError("Missing warmup tactic for the parent MegaMoE graph")
             runner(
                 inputs,
                 tactic=best_tactic,

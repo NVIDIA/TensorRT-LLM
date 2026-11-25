@@ -91,6 +91,11 @@ class BreakableCUDAGraphRunner:
     def is_capturing(self) -> bool:
         return self._state == BreakableCUDAGraphRunnerState.CAPTURE
 
+    @property
+    def uses_parent_moe_graph(self) -> bool:
+        """Whether this runner prepares dynamic MoE on the executor stream."""
+        return self._capture_on_current_stream
+
     def has_graph(self, num_tokens: int) -> bool:
         return num_tokens in self._graphs
 

@@ -2193,11 +2193,10 @@ class DeepseekV4MoE(nn.Module):
             or not do_finalize
             or self.shared_experts is None
             or do_multi_stream()
-            or self.experts.backend.tactic_autotune
         ):
             raise ValueError(
                 "Breakable prefill CUDA graph with dynamic EPLB requires a finalized "
-                "8192-token attention-DP MoE with shared experts and MegaMoE tactic autotuning disabled"
+                "8192-token attention-DP MoE with shared experts on one execution stream"
             )
 
         if not do_finalize:
