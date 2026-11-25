@@ -366,12 +366,23 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     super_serve = super_streaming or 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
     if lightning or super_serve or super_fp8:
+        backend = 'CUTEDSL' if lightning and 'nvfp4' in model else 'CUTLASS'
         update(enable_chunked_prefill=True,
-               moe_config={'backend': 'CUTLASS'},
+               moe_config={'backend': backend},
                kv_cache_config={
                    'mamba_ssm_cache_dtype': 'float16',
                    'mamba_ssm_stochastic_rounding': True,
                    'mamba_ssm_philox_rounds': 5
+               })
+    if lightning:
+        update(stream_interval=10,
+               num_postprocess_workers=4,
+               speculative_config=_speculative('MTP', 3),
+               kv_cache_config={
+                   'free_gpu_memory_fraction': 0.8,
+                   'mamba_state_config': {
+                       'periodic_snapshot_interval': 8192
+                   }
                })
     if super_serve:
         update(max_seq_len=1048576)

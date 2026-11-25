@@ -137,8 +137,9 @@ Use `field=default` to omit a top-level recipe field. For example, `cuda_graph_c
 lets bench derive capture sizes from the case's batch size.
 
 For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
-`speculative_config`. For Nemotron Lightning, `periodic_snapshot_interval` sets the
-interval in `kv_cache_config.mamba_state_config`. Use the existing `moe:`, `kv_frac:`
+`speculative_config`. The two Nemotron Lightning cases share their MTP, streaming and KV cache
+settings in the Python model rule so their original test and metric names stay stable.
+Use the existing `moe:`, `kv_frac:`
 and `kv_cache_dtype:` labels for the MoE backend, KV memory fraction and KV dtype.
 The Nemotron Super MTP cases select `decoding_type=MTP,num_nextn_predict_layers=3`
 to retain the layer count used by this variant.
