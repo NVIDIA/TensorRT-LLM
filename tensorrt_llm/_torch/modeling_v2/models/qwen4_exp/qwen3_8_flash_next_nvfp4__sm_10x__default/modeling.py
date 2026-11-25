@@ -74,7 +74,9 @@ projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP
 for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by default): the
 decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
 its e4m3 KV head, and the MoE route front over its own rows. With `TEP_FINAR_ENV` (opt-in) such a
-MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`);
+MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`),
+and with `TEP_FINAR_SHARED_ENV` (opt-in) that launch also adds the rank's quarter of the shared
+expert at `_TEP_FINAR_SHARED_ROWS` rows;
 with `TEP_MOE_FRONT_ENV` (opt-in) its router GEMM runs in the front's launch
 (`ops/moe/moe_decode_front__decode`). With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
 draft step runs the draft layer on the one-rank decode form at the rank's shard
@@ -1463,6 +1465,27 @@ def _tep_proj(core) -> bool:
 #: raises on every rank if one fails. Read once, when the target is built; set where it cannot
 #: apply (another layout, no route front, a group across nodes) it warns and does nothing.
 TEP_FINAR_ENV = "TRTLLM_QWEN4_EXP_TEP_FINAR"
+
+
+#: Off by default (opt-in: a same-precision reorder of the shared expert, on the Lamport transport
+#: of `TEP_FINAR_ENV`, which it needs). At the fused finalize all-reduce's row counts in
+#: `_TEP_FINAR_SHARED_ROWS`, a tep4 rank runs its QUARTER of the trunk shared expert instead of the
+#: whole replicated one: the gate|up rows and the gate-logit row of a quarter of the intermediate
+#: (one GEMM), SiLU-and-mul, and the matching quarter of the down projection with an fp32 output,
+#: on the side stream as before. The fused launch adds sigmoid(gate logit) x that quarter to the
+#: rank's fp32 partial before its one rounding, so the four quarters summed over the group are the
+#: layer's gated shared expert, and the block hands the next site a zero shared expert and gate
+#: (`routed + sigmoid(0) x 0` is `routed`, bitwise). Another work split (the down projection's K
+#: over the ranks, fp32 partials, one rounding a rank, an `ex2.approx` sigmoid) where the stock
+#: chain rounds the shared expert to bf16 first. About 2.5 MiB a MoE layer for the quarters. Read
+#: once, when the target is built; set where it cannot apply it warns and does nothing.
+TEP_FINAR_SHARED_ENV = "TRTLLM_QWEN4_EXP_TEP_FINAR_SHARED"
+#: Row counts that take the quarter (3 and 4 requests of four verify rows): GB300 tep4 against the
+#: whole shared expert on the side stream, -0.014 / -0.038 / -0.015 ms a step at 3 / 4 / 5
+#: requests; measured slower at 8 rows and at 20-32.
+_TEP_FINAR_SHARED_ROWS = (12, 16)  # capacity: fixed: a dispatch table
+#: The quarters a shared expert's intermediate splits into: the group's ranks.
+_TEP_FINAR_QUARTERS = 4  # capacity: fixed: the tep4 group
 
 
 def _tep_finar_mode() -> str:
@@ -4942,19 +4965,106 @@ class _TepFinar:
     the row counts it serves, the trunk MoE launches a step, and the layer of the last launch
     (host side, to hold the slot sequence)."""
 
-    def __init__(self, op, rows: tuple, layers: int) -> None:
+    def __init__(self, op, rows: tuple, layers: int, shared=None) -> None:
         self.op = op
         self.rows = rows
         self.layers = layers
         self.prev: int | None = None
+        #: `TEP_FINAR_SHARED_ENV`: the `_TepFinarShared` the build made, None without it.
+        self.shared = shared
 
 
-def _tep_finar_selfcheck(core, op, device, rows: int, slot: int) -> tuple:
+class _TepFinarShared:
+    """What `TEP_FINAR_SHARED_ENV` built: the row counts that take a shared-expert quarter
+    (`rows`), each MoE layer's quarter as GEMM operands keyed by its `sh_gug` storage
+    (`quarters`: `(gate|up + gate-logit rows .t(), down columns .t())`), the quarter's width of the
+    intermediate (`inter_q`), and the zero shared expert and gate the block hands the next site."""
+
+    def __init__(self, rows: tuple, quarters: dict, inter_q: int, zero_shared, zero_gate) -> None:
+        self.rows = rows
+        self.quarters = quarters
+        self.inter_q = inter_q
+        self.zero_shared = zero_shared
+        self.zero_gate = zero_gate
+
+
+def _tep_finar_quarter_weights(core, L, rank: int) -> tuple:
+    """One MoE layer's quarter `rank` of its shared expert, made once at build: rows
+    `[r q, (r + 1) q)` of the gate and of the up halves of `[gate | up | gate logit | pad]`, the
+    gate-logit row, zero-padded to a multiple of 8 rows; and columns `[r q, (r + 1) q)` of the down
+    projection. As the `.t()` views `cublas_mm` / `low_m_bf16_mm` read."""
+    q, inter = core.shared_inter // _TEP_FINAR_QUARTERS, core.shared_inter
+    gu = L.sh_gug.t()  # [gate | up | gate logit | pad, hidden] row-major
+    dn = L.sh_dn.t()  # [hidden, inter] row-major
+    rows = torch.cat(
+        [
+            gu[rank * q : (rank + 1) * q],
+            gu[inter + rank * q : inter + (rank + 1) * q],
+            gu[2 * inter : 2 * inter + 1],
+        ]
+    )
+    width = -(-(2 * q + 1) // 8) * 8
+    gu_q = torch.zeros([width, gu.shape[1]], dtype=gu.dtype, device=gu.device)
+    gu_q[: 2 * q + 1] = rows
+    return gu_q.t(), dn[:, rank * q : (rank + 1) * q].contiguous().t()
+
+
+def _tep_finar_shared_build(core, rows: tuple, device) -> "_TepFinarShared | None":
+    """`TEP_FINAR_SHARED_ENV` at the fused finalize all-reduce's build (`rows` the row counts it
+    serves on every rank): None where it is off or cannot apply (one warning, alike on every
+    rank), else every MoE layer's quarter and the zero hand-off tensors."""
+    if not _switch(TEP_FINAR_SHARED_ENV):
+        return None
+    q = core.shared_inter // _TEP_FINAR_QUARTERS
+    served = tuple(r for r in _TEP_FINAR_SHARED_ROWS if r in rows)
+    why = None
+    if q * _TEP_FINAR_QUARTERS != core.shared_inter or q % 8:
+        why = f"shared intermediate {core.shared_inter} is not four quarters of a multiple of 8"
+    elif not served:
+        why = f"the fused all-reduce serves none of rows {list(_TEP_FINAR_SHARED_ROWS)}"
+    if why is not None:
+        logger.warning(f"{TEP_FINAR_SHARED_ENV} is set but ignored: {why}")
+        return None
+    rank = core.mapping.tp_rank
+    quarters = {
+        L.sh_gug.data_ptr(): _tep_finar_quarter_weights(core, L, rank) for L in core._decode._layers
+    }
+    width = next(iter(quarters.values()))[0].shape[1]
+    zero_shared = torch.zeros([max(served), core.hidden], dtype=torch.bfloat16, device=device)
+    # A column of a `[rows, width]` buffer, as the quarter GEMM hands its gate logit.
+    zero_gate = torch.zeros([max(served), width], dtype=torch.bfloat16, device=device)
+    zero_gate = zero_gate[:, 2 * q : 2 * q + 1]
+    return _TepFinarShared(served, quarters, q, zero_shared, zero_gate)
+
+
+def _tep_finar_takes_quarter(core, x) -> bool:
+    """Whether a MoE block over `x` runs its shared-expert quarter (`TEP_FINAR_SHARED_ENV`): its
+    row count takes it and the block takes the fused launch. Host values only, alike on every
+    rank."""
+    fin = getattr(core, "_tep_finar", None)
+    shared = getattr(fin, "shared", None)
+    return shared is not None and x.shape[0] in shared.rows
+
+
+def _tep_finar_quarter(core, x, L) -> tuple:
+    """This rank's shared-expert quarter over `x` (on the stream the caller set): `(quarter
+    [rows, hidden] fp32, its gate logit [rows, 1] bf16 column view)`. Its gate|up takes the split-K
+    rows of `TEP_PROJ_ENV` where the trunk shared expert does."""
+    sh = core._tep_finar.shared
+    gu_t, dn_t = sh.quarters[L.sh_gug.data_ptr()]
+    mm = _tep_wide_mm if getattr(core, "tep_proj", False) else cublas_mm
+    gu = mm(x, gu_t)
+    part = cublas_mm(silu_and_mul_rows(gu, sh.inter_q), dn_t, None, torch.float32)
+    return part, gu[:, 2 * sh.inter_q : 2 * sh.inter_q + 1]
+
+
+def _tep_finar_selfcheck(core, op, device, rows: int, slot: int, shared: bool = False) -> tuple:
     """One eager launch at `rows` rows on synthetic window outputs (slots of other ranks'
     windows, a row with no local slot, -0.0 lanes, values over 2^-12..2^8) against the entry's
     reference over every rank's operands. `(ok, lanes that differ from the runner's finalize +
     core.tp_sum)`: the second is reported, not required (the engine's all-reduce strategy may sum
-    in another order)."""
+    in another order). With `shared`, the launch with a synthetic fp32 shared-expert quarter
+    whose gate logits (0, 60, -200) have an exact sigmoid on both sides (0.5, 1, 0)."""
     import torch.distributed as dist
 
     world, rank = _TEP_FINAR.WORLD, core.mapping.tp_rank
@@ -4970,12 +5080,20 @@ def _tep_finar_selfcheck(core, op, device, rows: int, slot: int) -> tuple:
     fc2[:, ::37] = -0.0
     wts = (torch.rand([rows, core.topk], generator=g) * 0.5 + 0.01).to(torch.bfloat16)
     fc2, wts, perm = fc2.to(device), wts.to(device), perm.to(device)
-    got = op(fc2, wts, perm, rows, slot)
     mine_ops = (fc2, wts, perm)
+    if shared:
+        quarter = (torch.randn([rows, core.hidden], generator=g) * 0.25).to(device)
+        gate = torch.zeros([rows, 8], dtype=torch.bfloat16)
+        gate[:, 3] = torch.tensor([0.0, 60.0, -200.0])[torch.arange(rows) % 3].to(torch.bfloat16)
+        mine_ops = mine_ops + (quarter, gate.to(device)[:, 3:4])
+    got = op(*mine_ops[:3], rows, slot, *mine_ops[3:])
     everyone = [None] * world
     dist.all_gather_object(everyone, tuple(t.cpu() for t in mine_ops))
     want = tep_finalize_allreduce.reference([tuple(t.to(device) for t in ops) for ops in everyone])
-    stock = core.tp_sum(_tep_finar_local(fc2, wts, perm))
+    local = _tep_finar_local(fc2, wts, perm)
+    if shared:
+        local = (local.float() + torch.sigmoid(mine_ops[4].float()) * mine_ops[3]).to(local.dtype)
+    stock = core.tp_sum(local)
     torch.cuda.synchronize(device)
     ok = tuple(got.shape) == (rows, core.hidden) and torch.equal(got, want)
     return ok, int((got != stock).sum())
@@ -5020,6 +5138,8 @@ def _tep_finar_build(core, device) -> "_TepFinar | None":
     alone."""
     mode = _tep_finar_mode()
     if not mode:
+        if _switch(TEP_FINAR_SHARED_ENV):
+            logger.warning(f"{TEP_FINAR_SHARED_ENV} is set but ignored: it needs {TEP_FINAR_ENV}")
         return None
     # Host values every rank of the group shares: the ranks decline together.
     why = None
@@ -5052,10 +5172,14 @@ def _tep_finar_build(core, device) -> "_TepFinar | None":
     if dist.get_rank() != rank:
         raise RuntimeError(f"{TEP_FINAR_ENV}: the torch WORLD rank order differs from the TP one")
     with torch.cuda.device(device):
-        op = tep_finar_build(rank, get_env_enable_pdl(), early=mode == "early")
+        shared = _tep_finar_shared_build(core, rows, device)
+        op = tep_finar_build(
+            rank, get_env_enable_pdl(), early=mode == "early", with_shared=shared is not None
+        )
+        checks = [(r, False) for r in rows] + [(r, True) for r in (shared.rows if shared else ())]
         verdicts = [
-            _tep_finar_selfcheck(core, op, device, r, i % _TEP_FINAR.SLOTS)
-            for i, r in enumerate(rows)
+            _tep_finar_selfcheck(core, op, device, r, i % _TEP_FINAR.SLOTS, quarter)
+            for i, (r, quarter) in enumerate(checks)
         ]
         ok = torch.tensor([int(all(v[0] for v in verdicts))], dtype=torch.int32, device=device)
         dist.all_reduce(ok, op=dist.ReduceOp.MIN)
@@ -5068,30 +5192,46 @@ def _tep_finar_build(core, device) -> "_TepFinar | None":
         f"MoE finalize all-reduce ({TEP_FINAR_ENV}={mode}): rank {rank} of {_TEP_FINAR.WORLD}, "
         f"rows {list(rows)}, {op.workspace_bytes / (1 << 20):.2f} MiB, lanes that differ from "
         f"the runner's finalize + tp_sum at the build check {[v[1] for v in verdicts]}"
+        + (
+            f"; shared-expert quarter ({TEP_FINAR_SHARED_ENV}=1) {shared.inter_q} of "
+            f"{core.shared_inter} at rows {list(shared.rows)}, {len(shared.quarters)} layers"
+            if shared is not None
+            else ""
+        )
     )
-    return _TepFinar(op, rows, len(st.layers))
+    return _TepFinar(op, rows, len(st.layers), shared)
 
 
-def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm):
-    """A tep4 captured block's routed experts summed over the group in one launch (the route
-    front, the runner without its finalize, `tep_finalize_allreduce`), or None where the block
-    keeps the route front's finalized path and `core.tp_sum` (another row count, an eager step).
-    Host values only, the same on every rank (`fin.rows` the row counts every rank's route
-    front serves)."""
+def _tep_finar_serves(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm) -> bool:
+    """Whether a tep4 block takes the fused launch: a captured block of a row count every rank's
+    route front serves (`fin.rows`), with the site's codes and the decode router. Host values
+    only, the same on every rank."""
     st = core._route_front
     rows = x.shape[0]
-    layer = st.layers.get(L.fc1_w.data_ptr())
-    if not (
+    return (
         rows in fin.rows
         and rows in st.tactics
-        and layer is not None
+        and st.layers.get(L.fc1_w.data_ptr()) is not None
         and fp4 is not None
         and router_mm is _decode_router
         and torch.cuda.is_current_stream_capturing()
         and x.stride(1) == 1
         and x.stride(0) == core.hidden
-    ):
+    )
+
+
+def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm, quarter=None):
+    """A tep4 captured block's routed experts summed over the group in one launch (the route
+    front, the runner without its finalize, `tep_finalize_allreduce`), or None where the block
+    keeps the route front's finalized path and `core.tp_sum` (another row count, an eager step).
+    Host values only, the same on every rank (`fin.rows` the row counts every rank's route
+    front serves). `quarter` is the `(shared, gate)` of `_tep_finar_quarter` in flight on the side
+    stream (`TEP_FINAR_SHARED_ENV`): the launch joins the side stream and adds it."""
+    st = core._route_front
+    rows = x.shape[0]
+    if not _tep_finar_serves(core, fin, x, L, fp4, router_mm):
         return None
+    layer = st.layers[L.fc1_w.data_ptr()]
     if fin.prev is not None and layer != (fin.prev + 1) % fin.layers:
         raise RuntimeError(
             f"{TEP_FINAR_ENV}: MoE layer {layer} follows layer {fin.prev}; three consecutive "
@@ -5101,7 +5241,10 @@ def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm)
     logits = _tep_front_logits(st, x, L)
     fc2, _, _, _, wts = _route_front_run(core, st, x, L, layer, logits, fp4, finalize=False)
     perm = st.views[rows][layer][0].view(rows, core.topk)
-    return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op)
+    if quarter is None:
+        return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op)
+    torch.cuda.current_stream().wait_stream(core._side_stream)
+    return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op, *quarter)
 
 
 def _routed_experts(core, x, L: _LayerWeights, fp4=None, router_mm=cublas_mm) -> torch.Tensor:
@@ -5340,14 +5483,28 @@ def _moe_block(
     entry, under which the shared expert reads the dense FP8 mode's copies when they exist."""
     main = torch.cuda.current_stream()
     side = core._side_stream
+    fin = getattr(core, "_tep_finar", None)
+    # `TEP_FINAR_SHARED_ENV`: this rank's quarter of the shared expert, which the fused launch adds.
+    quarter = _tep_finar_takes_quarter(core, x) and _tep_finar_serves(
+        core, fin, x, L, fp4, router_mm
+    )
     # Fork: the side stream reads `x` only after everything queued on `main` so far. What it
     # allocates is consumed on `main` after the join below.
     side.wait_stream(main)
-    with torch.cuda.stream(side):
-        shared, gate_logits = _shared_expert(core, x, L, decode_gemm)
+    if quarter:
+        # A tep4 rank only (`TEP_FINAR_SHARED_ENV` never serves attention DP): the side stream
+        # runs this rank's quarter, which the fused launch adds; the next site reads zeros.
+        with torch.cuda.stream(side):
+            quarter = _tep_finar_quarter(core, x, L)
+        rows = x.shape[0]
+        shared, gate_logits = fin.shared.zero_shared[:rows], fin.shared.zero_gate[:rows]
+    else:
+        quarter = None
+        with torch.cuda.stream(side):
+            shared, gate_logits = _shared_expert(core, x, L, decode_gemm)
     routed = None
-    if getattr(core, "_tep_finar", None) is not None:
-        routed = _tep_finar_routed(core, core._tep_finar, x, L, fp4, router_mm)
+    if fin is not None:
+        routed = _tep_finar_routed(core, fin, x, L, fp4, router_mm, quarter)
     if routed is None:
         routed = core.expert_sum(
             lambda rows: _routed_experts(core, rows, L, fp4, router_mm), x, pad_rows

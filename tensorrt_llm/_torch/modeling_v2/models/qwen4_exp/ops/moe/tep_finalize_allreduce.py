@@ -17,6 +17,18 @@ fp32 accumulation in rank order. A -0.0 lane is published as +0.0 (it is the not
 as the stock Lamport kernels do. So the output is bitwise the finalize followed by that
 all-reduce, except where every rank's partial of a lane is -0.0.
 
+With a shared addend (`shared`, the launch compiled `with_shared`), each rank also adds a gated
+fp32 term before its one rounding:
+
+    local[t] = bf16( fma(sigmoid(fp32(g[t])), shared[t], <the slot-order sum above>) )
+
+`shared[t]` `[rows, 2560]` fp32 is this rank's quarter of the shared expert (its down projection
+over a quarter of the intermediate, fp32 out) and `g[t]` the bf16 gate logit; sigmoid is
+`1 / (1 + ex2.approx(-g log2 e))` with an IEEE division. Summed over the group, the four quarters
+are the whole shared expert gated once per rank: the layer's `routed + sigmoid(g) * shared`, in
+fp32 up to the one rounding a rank, in place of the next site's bf16 shared expert and its
+gate. Same precision, another work split (the down projection's K is split over the ranks).
+
 Transport: three slots of `[4 ranks, 16 rows, 2560]` bf16 a rank, symmetric over the group,
 filled with bf16 -0.0. The slot is chosen on the host (`slot`: the block's index among the
 step's trunk MoE launches, mod 3) and so is baked into a captured graph; there is no device
@@ -251,6 +263,42 @@ def _select(pred: Int32, a: Float32, b: Float32, *, loc=None, ip=None) -> Float3
 
 
 @dsl_user_op
+def _ld_bf16_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
+    """One bf16 at `addr` (2-byte aligned) as fp32."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [_v(addr, loc, ip)],
+            "{\n.reg .b16 h, z;\nld.global.b16 h, [$1];\nmov.b16 z, 0;\nmov.b32 $0, {z, h};\n}\n",
+            "=f,l",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sigmoid(g: Float32, *, loc=None, ip=None) -> Float32:
+    """1 / (1 + 2^(-g log2 e)) in fp32 (ex2.approx, IEEE division)."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [_v(g, loc, ip)],
+            "{\n.reg .f32 t;\nmul.rn.f32 t, $1, 0fBFB8AA3B;\nex2.approx.ftz.f32 t, t;\n"
+            "add.rn.f32 t, t, 0f3F800000;\ndiv.rn.f32 $0, 0f3F800000, t;\n}\n",
+            "=f,f",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _bits_f32(word: Int32, *, loc=None, ip=None) -> Float32:
+    return Float32(_asm(T.f32(), [_v(word, loc, ip)], "mov.b32 $0, $1;", "=f,r", loc, ip))
+
+
+@dsl_user_op
 def _perm_check(index: Int32, rows: Int32, *, loc=None, ip=None):
     """`(valid, safe_index)`: valid = 0 <= index < rows; safe_index = index when valid, else 0."""
     res = _asm(
@@ -265,8 +313,11 @@ def _perm_check(index: Int32, rows: Int32, *, loc=None, ip=None):
 
 
 # ---------------------------------------------------------------------------- trace time ---
-def _local_partial(k, fc2, fc2_row_bytes, fc2_rows, wts, perm, row, col):
-    """This rank's finalized vector (4 words = 8 bf16 lanes) of (row, col..col+7), sanitized."""
+def _local_partial(
+    k, fc2, fc2_row_bytes, fc2_rows, wts, perm, shared, gate, gate_row_bytes, row, col
+):
+    """This rank's finalized vector (4 words = 8 bf16 lanes) of (row, col..col+7), with the gated
+    shared addend when compiled with one, sanitized."""
     top_k = k.top_k
     pbase = perm + Int64(row) * Int64(top_k * 4)
     wbase = wts + Int64(row) * Int64(top_k * 2)
@@ -291,6 +342,11 @@ def _local_partial(k, fc2, fc2_row_bytes, fc2_rows, wts, perm, row, col):
             acc[2 * j + 1] = _select(
                 checks[s][0], _fma(weights[s], x_hi, acc[2 * j + 1]), acc[2 * j + 1]
             )
+    if k.has_shared:  # trace time: the compiled launch has the addend or not
+        sbase = shared + Int64(row) * Int64(k.hidden * 4) + Int64(col) * Int64(4)
+        sw = _ld_v4(sbase) + _ld_v4(sbase + Int64(16))
+        sig = _sigmoid(_ld_bf16_f32(gate + Int64(row) * gate_row_bytes))
+        acc = [_fma(sig, _bits_f32(sw[i]), acc[i]) for i in range(8)]
     return [_sanitize(_pack_bf16x2(acc[2 * j], acc[2 * j + 1])) for j in range(4)]
 
 
@@ -332,9 +388,9 @@ def _reduce_store_clean(k, local, bufs, slot, row, col, out):
 
 class _Kernel:
     """Compile-time shape of one launch: the rank, the columns a CTA, PDL and its release
-    point."""
+    point, and whether a gated fp32 shared addend joins the local sum."""
 
-    def __init__(self, rank: int, chunk: int, use_pdl: bool, early: bool):
+    def __init__(self, rank: int, chunk: int, use_pdl: bool, early: bool, has_shared: bool):
         assert HIDDEN % chunk == 0 and chunk % 8 == 0
         self.rank = int(rank)
         self.world = WORLD
@@ -345,6 +401,7 @@ class _Kernel:
         self.threads = self.chunk // 8
         self.use_pdl = bool(use_pdl)
         self.early = bool(use_pdl) and bool(early)
+        self.has_shared = bool(has_shared)
 
     @cute.jit
     def __call__(
@@ -354,6 +411,9 @@ class _Kernel:
         fc2_rows: Int32,
         wts: Int64,
         perm: Int64,
+        shared: Int64,
+        gate: Int64,
+        gate_row_bytes: Int64,
         out: Int64,
         b0: Int64,
         b1: Int64,
@@ -366,7 +426,22 @@ class _Kernel:
     ):
         # `state` (an unused int32 tensor) lets the TVM-FFI launcher bind the caller's stream.
         self.kernel(
-            fc2, fc2_row_bytes, fc2_rows, wts, perm, out, b0, b1, b2, b3, slot, state, num_rows
+            fc2,
+            fc2_row_bytes,
+            fc2_rows,
+            wts,
+            perm,
+            shared,
+            gate,
+            gate_row_bytes,
+            out,
+            b0,
+            b1,
+            b2,
+            b3,
+            slot,
+            state,
+            num_rows,
         ).launch(
             grid=[self.hidden // self.chunk, num_rows, 1],
             block=[self.threads, 1, 1],
@@ -382,6 +457,9 @@ class _Kernel:
         fc2_rows: Int32,
         wts: Int64,
         perm: Int64,
+        shared: Int64,
+        gate: Int64,
+        gate_row_bytes: Int64,
         out: Int64,
         b0: Int64,
         b1: Int64,
@@ -399,7 +477,9 @@ class _Kernel:
             cute.arch.griddepcontrol_launch_dependents()
         col = (cta * Int32(self.threads) + tidx) * Int32(8)
         bufs = [b0, b1, b2, b3]
-        local = _local_partial(self, fc2, fc2_row_bytes, fc2_rows, wts, perm, row, col)
+        local = _local_partial(
+            self, fc2, fc2_row_bytes, fc2_rows, wts, perm, shared, gate, gate_row_bytes, row, col
+        )
         _publish(self, local, bufs, slot, row, col)
         if cutlass.const_expr(self.use_pdl and not self.early):
             cute.arch.griddepcontrol_launch_dependents()
@@ -409,21 +489,21 @@ class _Kernel:
 _COMPILED: dict = {}
 
 
-def _compile(rank: int, chunk: int, use_pdl: bool, early: bool):
+def _compile(rank: int, chunk: int, use_pdl: bool, early: bool, has_shared: bool = False):
     """The compiled launch of one shape, once a process."""
-    key = (int(rank), int(chunk), bool(use_pdl), bool(use_pdl) and bool(early))
+    key = (int(rank), int(chunk), bool(use_pdl), bool(use_pdl) and bool(early), bool(has_shared))
     fn = _COMPILED.get(key)
     if fn is None:
         from cutlass.cute import runtime as cute_runtime
 
-        kern = _Kernel(rank, chunk, use_pdl, early)
+        kern = _Kernel(rank, chunk, use_pdl, early, has_shared)
         z64, z32 = Int64(0), Int32(0)
         state_fake = cute_runtime.make_fake_compact_tensor(
             Int32, (4,), stride_order=(0,), assumed_align=16
         )
         fn = cute.compile(
             kern,
-            z64, z64, z32, z64, z64, z64, z64, z64, z64, z64, z32, state_fake, z32,
+            z64, z64, z32, z64, z64, z64, z64, z64, z64, z64, z64, z64, z64, z32, state_fake, z32,
             stream=cute_runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )  # fmt: skip
@@ -433,8 +513,9 @@ def _compile(rank: int, chunk: int, use_pdl: bool, early: bool):
 
 @dataclass
 class TepFinar:
-    """One rank's workspace and compiled launch: `buffer` this rank's `[3, 4, 16 * 2560]` bf16
-    symmetric slots, `peers` the four ranks' slot base addresses in rank order."""
+    """One rank's workspace and compiled launches: `buffer` this rank's `[3, 4, 16 * 2560]` bf16
+    symmetric slots, `peers` the four ranks' slot base addresses in rank order, `fn_shared` the
+    launch with the gated shared addend (None unless built `with_shared`)."""
 
     rank: int
     chunk: int
@@ -447,6 +528,7 @@ class TepFinar:
     fn: object
     #: `[1, 2560]` bf16 zeros: the FC2 operand of a rank whose window is empty.
     empty_fc2: torch.Tensor | None = None
+    fn_shared: object = None
 
     @property
     def workspace_bytes(self) -> int:
@@ -470,12 +552,38 @@ class TepFinar:
             and perm.is_contiguous()
         )
 
-    def __call__(self, fc2, wts, perm, rows: int, slot: int) -> torch.Tensor:
-        if not (self.takes(fc2, wts, perm, rows) and 0 <= slot < SLOTS):
+    def takes_shared(self, shared, gate, rows: int) -> bool:
+        """Whether the shared-addend launch takes `shared` `[rows, 2560]` fp32 (dense) and its
+        gate logit `gate` `[rows, 1]` bf16 at any row pitch."""
+        return (
+            self.fn_shared is not None
+            and shared.dtype == torch.float32
+            and tuple(shared.shape) == (rows, HIDDEN)
+            and shared.is_contiguous()
+            and shared.data_ptr() % 16 == 0
+            and gate.dtype == torch.bfloat16
+            and gate.dim() == 2
+            and tuple(gate.shape) == (rows, 1)
+            and gate.data_ptr() % 2 == 0
+        )
+
+    def __call__(self, fc2, wts, perm, rows: int, slot: int, shared=None, gate=None):
+        with_shared = shared is not None or gate is not None
+        if not (
+            self.takes(fc2, wts, perm, rows)
+            and 0 <= slot < SLOTS
+            and (not with_shared or self.takes_shared(shared, gate, rows))
+        ):
             raise RuntimeError(
                 "tep_finalize_allreduce: operands outside the compiled layout: fc2 "
                 f"{fc2.dtype} {tuple(fc2.shape)} strides {tuple(fc2.stride())}, wts {wts.dtype} "
                 f"{tuple(wts.shape)}, perm {perm.dtype} {tuple(perm.shape)}, rows {rows}, slot {slot}"
+                + (
+                    f", shared {shared.dtype} {tuple(shared.shape)}, gate {gate.dtype} "
+                    f"{tuple(gate.shape)}, shared launch built {self.fn_shared is not None}"
+                    if with_shared and shared is not None and gate is not None
+                    else (", shared and gate must be given together" if with_shared else "")
+                )
             )
         if fc2.shape[0] == 0:
             # No FC2 row to read: every slot is -1, the partial is 0, and the rank still
@@ -486,12 +594,15 @@ class TepFinar:
         if wts.data_ptr() % 4:
             wts = wts.clone()  # the kernel loads the weights in 32-bit pairs
         out = torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=fc2.device)
-        self.fn(
+        (self.fn_shared if with_shared else self.fn)(
             fc2.data_ptr(),
             fc2.stride(0) * 2,
             fc2.shape[0],
             wts.data_ptr(),
             perm.data_ptr(),
+            shared.data_ptr() if with_shared else 0,
+            gate.data_ptr() if with_shared else 0,
+            gate.stride(0) * 2 if with_shared else 0,
             out.data_ptr(),
             self.peers[0],
             self.peers[1],
@@ -504,10 +615,12 @@ class TepFinar:
         return out
 
 
-def build(rank: int, use_pdl: bool, early: bool = False, chunk: int = CHUNK) -> TepFinar:
+def build(
+    rank: int, use_pdl: bool, early: bool = False, chunk: int = CHUNK, with_shared: bool = False
+) -> TepFinar:
     """Pin the three slots over the 4-rank torch process group (WORLD, which must be the TP group
-    of one NVLink domain) and compile the launch. Collective: every rank calls it with the same
-    arguments."""
+    of one NVLink domain) and compile the launch (and with `with_shared` the shared-addend launch,
+    which shares the slots). Collective: every rank calls it with the same arguments."""
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
 
@@ -524,6 +637,7 @@ def build(rank: int, use_pdl: bool, early: bool = False, chunk: int = CHUNK) -> 
     assert all(p % 16 == 0 for p in peers), peers
     state = torch.zeros(4, dtype=torch.int32, device=dev)
     fn = _compile(rank, chunk, use_pdl, early)
+    fn_shared = _compile(rank, chunk, use_pdl, early, True) if with_shared else None
     torch.cuda.synchronize(dev)
     # Every rank holds its buffers and the launch before any of them exchanges a row.
     ok = torch.ones(1, dtype=torch.int32, device=dev)
@@ -532,19 +646,33 @@ def build(rank: int, use_pdl: bool, early: bool = False, chunk: int = CHUNK) -> 
     early = bool(use_pdl) and bool(early)
     empty_fc2 = torch.zeros((1, HIDDEN), dtype=torch.bfloat16, device=dev)
     return TepFinar(
-        rank, int(chunk), bool(use_pdl), early, buffer, peer_buffers, peers, state, fn, empty_fc2
+        rank,
+        int(chunk),
+        bool(use_pdl),
+        early,
+        buffer,
+        peer_buffers,
+        peers,
+        state,
+        fn,
+        empty_fc2=empty_fc2,
+        fn_shared=fn_shared,
     )
 
 
-def _finalize(fc2: torch.Tensor, wts: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
-    """`finalizeKernel` over one rank's window: fp32, slot order, one bf16 rounding, -0.0 as
-    +0.0 (the transport's marker)."""
+def _finalize(fc2, wts, perm, shared=None, gate=None) -> torch.Tensor:
+    """`finalizeKernel` over one rank's window: fp32, slot order, then (with `shared`) plus
+    sigmoid(gate) x shared in fp32, one bf16 rounding, -0.0 as +0.0 (the transport's marker).
+    The sigmoid is torch's: the launch's `ex2.approx` form gives the same fp32 at the gate logits
+    the tests drive (0, large positive and large negative: 0.5, 1 and 0)."""
     acc = torch.zeros((perm.shape[0], fc2.shape[1]), dtype=torch.float32, device=fc2.device)
     for k in range(perm.shape[1] if fc2.shape[0] else 0):  # an empty window adds nothing
         idx = perm[:, k].long()
         live = (idx >= 0) & (idx < fc2.shape[0])
         rows = fc2[idx.clamp(0, fc2.shape[0] - 1)].float()
         acc = torch.where(live[:, None], acc + wts[:, k : k + 1].float() * rows, acc)
+    if shared is not None:
+        acc = acc + torch.sigmoid(gate.float()) * shared.float()
     local = acc.to(torch.bfloat16)
     return torch.where(
         local.view(torch.int16) == _NEG_ZERO_BF16_I16, torch.zeros_like(local), local
@@ -552,13 +680,15 @@ def _finalize(fc2: torch.Tensor, wts: torch.Tensor, perm: torch.Tensor) -> torch
 
 
 class TepFinalizeAllReduce(OpWrapper):
-    """`tep_finalize_allreduce(fc2, wts, perm, rows, slot, finar)`: over `finar` (`build`), every
-    rank's window FC2 rows `fc2` `[P, 2560]` bf16 (the runner's permuted rows, entered without
-    its finalize), the routing weights `wts` `[rows, 10]` bf16 and the slot -> FC2 row table
-    `perm` `[rows, 10]` int32 (-1 for a slot another rank's window serves), the finalized rows
-    summed over the 4-rank group in fp32, rank order, `[rows, 2560]` bf16, on every rank. Every
-    rank calls it at the same point with the same `rows` and `slot` (`slot` cycling 0, 1, 2
-    over consecutive launches)."""
+    """`tep_finalize_allreduce(fc2, wts, perm, rows, slot, finar, shared=None, gate=None)`: over
+    `finar` (`build`), every rank's window FC2 rows `fc2` `[P, 2560]` bf16 (the runner's permuted
+    rows, entered without its finalize), the routing weights `wts` `[rows, 10]` bf16 and the slot
+    -> FC2 row table `perm` `[rows, 10]` int32 (-1 for a slot another rank's window serves), the
+    finalized rows summed over the 4-rank group in fp32, rank order, `[rows, 2560]` bf16, on every
+    rank. With `shared` `[rows, 2560]` fp32 and its gate logit `gate` `[rows, 1]` bf16 (a column
+    view; `finar` built `with_shared`) each rank adds sigmoid(gate) x shared to its partial before
+    its rounding. Every rank calls it at the same point with the same `rows`, `slot` (cycling 0,
+    1, 2 over consecutive launches) and the same choice of the shared addend."""
 
     ARCHS = frozenset({Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
@@ -569,6 +699,12 @@ class TepFinalizeAllReduce(OpWrapper):
             (12, "tep4 MTP-3 verify: 3 requests"),
             (MAX_ROWS, "tep4 MTP-3 verify: 4 requests, the launch's last"),
         )
+    ) + tuple(
+        Cell(why=why, spec=dict(world=WORLD, hidden=HIDDEN, rows=rows, shared=True))
+        for rows, why in (
+            (12, "tep4 MTP-3 verify: 3 requests, shared-expert quarter in the launch"),
+            (MAX_ROWS, "tep4 MTP-3 verify: 4 requests, shared-expert quarter in the launch"),
+        )
     )
 
     note = """
@@ -576,22 +712,34 @@ class TepFinalizeAllReduce(OpWrapper):
     symmetric memory on the 4-rank torch group of one NVLink domain. Certified on tep4 GB300
     only: 4 ranks, hidden 2560, top-10, 1 to `MAX_ROWS` rows. Not certified: other world sizes,
     groups across nodes, a stream holding SMs that a launch's resident CTAs wait for.
+
+    The shared-addend launch (cells with `shared`) reads `shared` and `gate` after its PDL wait,
+    like every other operand. Its sigmoid is `ex2.approx`-based: bitwise torch's at the gate
+    logits the cells drive (0, large positive, large negative), within a few fp32 ulp elsewhere,
+    which the one bf16 rounding a rank mostly absorbs.
     """
 
-    def __call__(self, fc2, wts, perm, rows: int, slot: int, finar: TepFinar) -> torch.Tensor:
-        return finar(fc2, wts, perm, rows, slot)
+    def __call__(
+        self, fc2, wts, perm, rows: int, slot: int, finar: TepFinar, shared=None, gate=None
+    ) -> torch.Tensor:
+        return finar(fc2, wts, perm, rows, slot, shared, gate)
 
     def reference(self, operands_in_rank_order) -> torch.Tensor:
         """Collective (the documented exception to mirroring `__call__`): every rank's
-        `(fc2, wts, perm)` in rank order; the sum every rank gets."""
+        `(fc2, wts, perm)` or `(fc2, wts, perm, shared, gate)` in rank order; the sum every rank
+        gets."""
         parts = [_finalize(*ops) for ops in operands_in_rank_order]
         acc = torch.zeros_like(parts[0], dtype=torch.float32)
         for p in parts:
             acc = acc + p.float()
         return acc.to(torch.bfloat16)
 
-    def is_valid(self, fc2, wts, perm, rows: int, slot: int, finar: TepFinar) -> None:
+    def is_valid(
+        self, fc2, wts, perm, rows: int, slot: int, finar: TepFinar, shared=None, gate=None
+    ) -> None:
         assert finar.takes(fc2, wts, perm, rows) and 0 <= slot < SLOTS
+        assert (shared is None) == (gate is None), "shared and gate come together"
+        assert shared is None or finar.takes_shared(shared, gate, rows)
 
 
 tep_finalize_allreduce = TepFinalizeAllReduce()

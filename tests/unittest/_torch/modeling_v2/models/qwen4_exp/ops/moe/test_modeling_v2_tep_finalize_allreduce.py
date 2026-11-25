@@ -22,8 +22,11 @@ row has no local slot), with -0.0 lanes and values over 2^-12..2^8. For each cel
   with routing weights at a 2-byte offset: eagerly on slots 0, 1, 2 and replayed from one graph,
   every rank's output equals the reference (the empty rank adds 0) and every rank finishes.
 
-Both release points (`early` False / True) run. `QWEN4_EXP_FINAR_REPLAYS` raises the replays
-(default 300 a cell and release point) for a longer stress run.
+Both release points (`early` False / True) run. The `shared` cells add each rank's fp32
+shared-expert quarter with its gate logit (0, 60 or -200 by row: a sigmoid of 0.5, 1 or 0, exact
+in both the launch's form and torch's), the gate a column view of a wider bf16 row.
+`QWEN4_EXP_FINAR_REPLAYS` raises the replays (default 300 a cell and release point) for a longer
+stress run.
 """
 
 import os
@@ -39,7 +42,12 @@ WORLD = op.WORLD
 REPLAYS = int(os.environ.get("QWEN4_EXP_FINAR_REPLAYS", "300"))
 #: Slot cycles a back-to-back graph holds.
 CYCLES = 4
-ROWS = sorted({cell.spec["rows"] for cell in op.tep_finalize_allreduce.CELLS})
+CASES = sorted(
+    {
+        (cell.spec["rows"], cell.spec.get("shared", False))
+        for cell in op.tep_finalize_allreduce.CELLS
+    }
+)
 
 pytestmark = [
     pytest.mark.no_xdist,
@@ -52,9 +60,10 @@ pytestmark = [
 ]
 
 
-def _operands(gen, rank: int, rows: int, device):
-    """One rank's `(fc2, wts, perm)`: slot (t, k) belongs to rank (3 t + k) mod 4, row 0 to none
-    of this rank's; the FC2 rows carry spare rows the table never names."""
+def _operands(gen, rank: int, rows: int, device, shared: bool = False):
+    """One rank's `(fc2, wts, perm)` (with `shared` also `(shared, gate)`): slot (t, k) belongs
+    to rank (3 t + k) mod 4, row 0 to none of this rank's; the FC2 rows carry spare rows the
+    table never names."""
     owner = (torch.arange(rows).unsqueeze(1) * 3 + torch.arange(op.TOP_K).unsqueeze(0)) % WORLD
     owner[0] = (rank + 1) % WORLD
     mine = owner == rank
@@ -65,7 +74,17 @@ def _operands(gen, rank: int, rows: int, device):
     fc2 = (torch.randn([count + 5, op.HIDDEN], generator=gen) * scale).to(torch.bfloat16)
     fc2[:, ::37] = -0.0
     wts = (torch.rand([rows, op.TOP_K], generator=gen) * 0.5 + 0.01).to(torch.bfloat16)
-    return fc2.to(device), wts.to(device), perm.to(device)
+    if not shared:
+        return fc2.to(device), wts.to(device), perm.to(device)
+    quarter = torch.randn([rows, op.HIDDEN], generator=gen) * 0.25
+    gate = torch.zeros([rows, 8], dtype=torch.bfloat16)
+    gate[:, 3] = torch.tensor([0.0, 60.0, -200.0])[torch.arange(rows) % 3].to(torch.bfloat16)
+    gate = gate.to(device)[:, 3:4]  # a strided [rows, 1] view, as the quarter GEMM's gate column
+    return fc2.to(device), wts.to(device), perm.to(device), quarter.to(device), gate
+
+
+def _launch(ops, rows: int, slot: int, finar):
+    return op.tep_finalize_allreduce(*ops[:3], rows, slot, finar, *ops[3:])
 
 
 def _reference(ops_mine):
@@ -131,12 +150,12 @@ def _empty_window(gen, rank: int, rows: int, finar, device, tag: str) -> None:
             _check(f"empty window replay {i} {tag}, slot {s}", outs[s], want[s])
 
 
-def _back_to_back(gen, rank: int, rows: int, finar, device, tag: str) -> None:
+def _back_to_back(gen, rank: int, rows: int, shared: bool, finar, device, tag: str) -> None:
     """`REPLAYS` replays of one graph of `CYCLES` x 3 launches with no host synchronization
     between them; launch i sleeps first on rank i mod 4. Mismatched lanes are counted on the
     device."""
     launches = op.SLOTS * CYCLES
-    static = [_operands(gen, rank, rows, device) for _ in range(launches)]
+    static = [_operands(gen, rank, rows, device, shared) for _ in range(launches)]
     want = [_reference(ops) for ops in static]
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream())
@@ -146,7 +165,7 @@ def _back_to_back(gen, rank: int, rows: int, finar, device, tag: str) -> None:
         for i in range(launches):
             if i % WORLD == rank:
                 torch.cuda._sleep(20000)  # about 10 us
-            outs.append(op.tep_finalize_allreduce(*static[i], rows, i % op.SLOTS, finar))
+            outs.append(_launch(static[i], rows, i % op.SLOTS, finar))
     torch.cuda.current_stream().wait_stream(stream)
     bad = torch.zeros((), dtype=torch.int64, device=device)
     for _ in range(REPLAYS):
@@ -167,27 +186,24 @@ def _rank_main(rank: int, port: int) -> None:
         gen = torch.Generator().manual_seed(20261125 + rank)
         rnd = random.Random(20261125)  # the same late rank on every rank
         for early in (False, True):
-            finar = op.build(rank, use_pdl=True, early=early)
-            for rows in ROWS:
-                tag = f"{rows} rows, early={early}"
+            finar = op.build(rank, use_pdl=True, early=early, with_shared=True)
+            for rows, shared in CASES:
+                tag = f"{rows} rows, shared={shared}, early={early}"
                 for slot in range(op.SLOTS):
-                    ops_mine = _operands(gen, rank, rows, device)
-                    got = op.tep_finalize_allreduce(*ops_mine, rows, slot, finar)
+                    ops_mine = _operands(gen, rank, rows, device, shared)
+                    got = _launch(ops_mine, rows, slot, finar)
                     _check(f"eager {tag}, slot {slot}", got, _reference(ops_mine))
                     _same_on_every_rank(f"eager {tag}, slot {slot}", got)
 
-                static = [_operands(gen, rank, rows, device) for _ in range(op.SLOTS)]
+                static = [_operands(gen, rank, rows, device, shared) for _ in range(op.SLOTS)]
                 stream = torch.cuda.Stream(device=device)
                 stream.wait_stream(torch.cuda.current_stream())
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
-                    outs = [
-                        op.tep_finalize_allreduce(*static[s], rows, s, finar)
-                        for s in range(op.SLOTS)
-                    ]
+                    outs = [_launch(static[s], rows, s, finar) for s in range(op.SLOTS)]
                 torch.cuda.current_stream().wait_stream(stream)
                 for i in range(REPLAYS):
-                    fresh = [_operands(gen, rank, rows, device) for _ in range(op.SLOTS)]
+                    fresh = [_operands(gen, rank, rows, device, shared) for _ in range(op.SLOTS)]
                     for dst, src in zip(static, fresh):
                         # A rank's operand shapes depend on the row count alone.
                         for d, s_ in zip(dst, src):
@@ -200,8 +216,9 @@ def _rank_main(rank: int, port: int) -> None:
                     graph.replay()
                     for s in range(op.SLOTS):
                         _check(f"replay {i} {tag}, slot {s}", outs[s], _reference(static[s]))
-                _back_to_back(gen, rank, rows, finar, device, tag)
-                _empty_window(gen, rank, rows, finar, device, tag)
+                _back_to_back(gen, rank, rows, shared, finar, device, tag)
+                if not shared:
+                    _empty_window(gen, rank, rows, finar, device, tag)
         torch.cuda.synchronize(device)
     finally:
         dist.destroy_process_group()

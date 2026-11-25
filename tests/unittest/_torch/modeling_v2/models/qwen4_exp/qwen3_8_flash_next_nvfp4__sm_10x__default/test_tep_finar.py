@@ -11,6 +11,12 @@
   slot `layer mod 3` over the route front's weights and slot -> row table; anything else returns
   None (the caller keeps the finalized path and `core.tp_sum`). Layers out of order raise.
 
+* The shared-expert quarter (`TEP_FINAR_SHARED_ENV`): off by default; its build takes only the
+  measured rows the fused launch serves; a layer's quarter is its rows of the gate and up halves,
+  the gate-logit row and its down columns; a block of such a row count runs the quarter on the
+  side stream, hands the next site a zero shared expert and gate, and passes the quarter to the
+  fused launch after joining the side stream.
+
 The ops are recorders; no kernel runs.
 """
 
@@ -201,3 +207,127 @@ def test_moe_block_sums_once(monkeypatch):
         )
         routed, gate, shared = M._moe_block(core, torch.zeros(4, 8), None, 0)
         assert routed == ("summed" if folded else "stock") and len(sums) == (0 if folded else 1)
+
+
+def test_shared_quarter_needs_the_fused_launch(monkeypatch):
+    warned = []
+    monkeypatch.delenv(M.TEP_FINAR_ENV, raising=False)
+    monkeypatch.setenv(M.TEP_FINAR_SHARED_ENV, "1")
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    assert M._tep_finar_build(SimpleNamespace(), torch.device("cuda")) is None
+    assert len(warned) == 1 and M.TEP_FINAR_ENV in warned[0]
+
+
+def test_shared_quarter_is_off_by_default(monkeypatch):
+    monkeypatch.delenv(M.TEP_FINAR_SHARED_ENV, raising=False)
+    assert M._tep_finar_shared_build(SimpleNamespace(), (4, 8, 12, 16), None) is None
+
+
+def test_shared_quarter_rows_are_the_measured_ones():
+    assert M._TEP_FINAR_SHARED_ROWS == (12, 16)
+
+
+def _quarter_core(inter=32, hidden=8, layers=2, rank=1):
+    """Layers whose `[gate | up | gate logit | pad]` rows hold their own row index (and the down
+    projection its column index), so a quarter's rows name where they came from."""
+    weights = []
+    for i in range(layers):
+        gu = torch.arange(2 * inter + 8, dtype=torch.float32)[:, None].expand(-1, hidden)
+        dn = torch.arange(inter, dtype=torch.float32)[None, :].expand(hidden, -1) + 64 * i
+        weights.append(
+            SimpleNamespace(
+                sh_gug=(gu + 100 * i).to(torch.bfloat16).contiguous().t(),
+                sh_dn=dn.to(torch.bfloat16).contiguous().t(),
+            )
+        )
+    return SimpleNamespace(
+        shared_inter=inter,
+        hidden=hidden,
+        mapping=SimpleNamespace(tp_rank=rank),
+        _decode=SimpleNamespace(_layers=weights),
+    )
+
+
+@pytest.mark.parametrize(
+    "served, inter, built, warns",
+    [
+        ((4, 8, 12, 16), 32, (12, 16), False),
+        ((4, 16), 32, (16,), False),
+        ((4, 8), 32, None, True),  # the fused launch serves no measured row
+        ((12, 16), 36, None, True),  # an intermediate that does not split into 4 x 8k
+    ],
+)
+def test_shared_quarter_build(monkeypatch, served, inter, built, warns):
+    warned = []
+    monkeypatch.setenv(M.TEP_FINAR_SHARED_ENV, "1")
+    monkeypatch.setattr(M.logger, "warning", warned.append)
+    core = _quarter_core(inter=inter)
+    got = M._tep_finar_shared_build(core, served, torch.device("cpu"))
+    assert (got.rows if got is not None else None) == built
+    assert bool(warned) is warns
+    if got is not None:
+        q = inter // 4
+        assert got.inter_q == q and len(got.quarters) == 2
+        assert tuple(got.zero_shared.shape) == (max(built), core.hidden)
+        assert tuple(got.zero_gate.shape) == (max(built), 1) and not got.zero_gate.any()
+
+
+def test_shared_quarter_weights_take_this_ranks_rows():
+    core = _quarter_core(inter=32, rank=1)
+    L = core._decode._layers[1]
+    gu_t, dn_t = M._tep_finar_quarter_weights(core, L, 1)
+    gu, dn = gu_t.t(), dn_t.t()
+    q = 8
+    rows = gu[:, 0].float().tolist()
+    want = [100 + r for r in range(q, 2 * q)] + [100 + 32 + r for r in range(q, 2 * q)] + [164]
+    assert rows[: 2 * q + 1] == want
+    assert gu.shape[0] == 24 and not gu[2 * q + 1 :].any()  # padded to a multiple of 8 rows
+    assert dn.shape == (core.hidden, q) and dn[0].float().tolist() == [
+        64 + c for c in range(q, 2 * q)
+    ]
+    assert gu_t.stride(0) == 1 and dn_t.stride(0) == 1  # column-major operands
+
+
+def test_moe_block_runs_the_quarter_and_hands_zeros(monkeypatch):
+    """At a quarter row count the side stream runs the quarter, the next site gets the zero
+    shared expert and gate, and the fused launch gets the quarter."""
+    side = SimpleNamespace(wait_stream=lambda s: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: side)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(M, "_shared_expert", lambda *a: ("whole", "whole gate"))
+    monkeypatch.setattr(M, "_tep_finar_quarter", lambda core, x, L: ("quarter", "quarter gate"))
+    monkeypatch.setattr(M, "_tep_finar_serves", lambda *a: True)
+    seen = []
+    monkeypatch.setattr(M, "_tep_finar_routed", lambda *a: seen.append(a[-1]) or "summed")
+    zero = torch.zeros(16, 4)
+    shared = M._TepFinarShared((12, 16), {}, 8, zero, zero[:, 1:2])
+    fin = M._TepFinar("op", (4, 8, 12, 16), 6, shared)
+    core = SimpleNamespace(_side_stream=side, _tep_finar=fin, expert_sum=None)
+    for rows, quarter in ((12, True), (8, False)):
+        seen.clear()
+        routed, gate, sh = M._moe_block(core, torch.zeros(rows, 4), None, 0)
+        assert routed == "summed"
+        if quarter:
+            assert seen == [("quarter", "quarter gate")]
+            assert tuple(sh.shape) == (rows, 4) and tuple(gate.shape) == (rows, 1)
+        else:
+            assert seen == [None] and (sh, gate) == ("whole", "whole gate")
+
+
+def test_routed_joins_the_side_stream_and_passes_the_quarter(monkeypatch):
+    core, fin, weights, calls = _setup(monkeypatch, capturing=True)
+    joined = []
+    main = SimpleNamespace(wait_stream=lambda s: joined.append(s))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    core._side_stream = "side"
+
+    def fused(fc2, wts, perm, rows, slot, op, *quarter):
+        calls.append(("fused", slot, quarter))
+        return "summed"
+
+    monkeypatch.setattr(M, "tep_finalize_allreduce", fused)
+    x = torch.zeros(16, HIDDEN, dtype=torch.bfloat16)
+    act = (torch.zeros(16, 4), torch.zeros(16))
+    out = M._tep_finar_routed(core, fin, x, weights[0], act, M._decode_router, ("q", "g"))
+    assert out == "summed" and joined == ["side"]
+    assert [c for c in calls if c[0] == "fused"] == [("fused", 0, ("q", "g"))]
