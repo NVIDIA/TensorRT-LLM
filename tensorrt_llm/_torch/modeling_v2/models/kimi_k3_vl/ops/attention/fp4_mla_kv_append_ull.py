@@ -44,7 +44,7 @@ class Fp4MlaKvAppend(OpWrapper):
         """Not modelled yet: the post-state of the FP4 cache page, HP ring, V scale and packed V
         pools the KV cache manager owns, in their swizzled layouts. Until it is, the entry has no
         cells; the kernel is checked bitwise against the backend's full generation update
-        (``test_k3_mla_q_fused.py``)."""
+        (``test_k3_fp4_mla_decode.py``)."""
         raise NotImplementedError("Fp4MlaKvAppend.reference: no plain-torch model yet")
 
 

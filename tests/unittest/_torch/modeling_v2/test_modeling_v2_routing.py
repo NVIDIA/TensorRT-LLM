@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -607,6 +608,30 @@ def test_resolve_class_reads_the_decision_off_the_config():
     target = modeling_v2_resolve(config, _llm_args())
     decided = replace(config, modeling_v2_target=target)
     assert AutoModelForCausalLM._resolve_class(decided) is target
+
+
+def test_model_loader_preserves_routing_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    config = _model_config(_gpt_oss_config())
+    llm_args = _llm_args("require")
+
+    class Target:
+        pass
+
+    def resolve(routed_config: ModelConfig, args: TorchLlmArgs) -> type:
+        assert routed_config is config and args is llm_args
+        routed_config.extra_attrs["kimi_k3_ull_pin_executor"] = False
+        return Target
+
+    monkeypatch.setattr(model_loader, "modeling_v2_resolve_on_all_ranks", resolve)
+    checkpoint_loader = Mock(load_config=Mock(return_value=config))
+    loader = model_loader.ModelLoader(llm_args, config.mapping, None, None, 128, 128)
+    resolved = loader._load_and_validate_config(_DUMMY_MODEL, checkpoint_loader)
+
+    assert resolved.modeling_v2_target is Target
+    assert resolved.extra_attrs["kimi_k3_ull_pin_executor"] is False
+    assert resolved.extra_attrs is not config.extra_attrs
 
 
 @pytest.mark.parametrize(
