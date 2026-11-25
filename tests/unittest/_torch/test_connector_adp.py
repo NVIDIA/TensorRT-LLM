@@ -1625,11 +1625,12 @@ def test_prefix_load_recovery_lifetime(
 
 
 @pytest.mark.parametrize("peer_has_work", [False, True])
-@pytest.mark.parametrize("missing_padding", [False, True])
+@pytest.mark.parametrize("missing_row", [None, 0, 1])
 def test_phase_idle_connector_owner_joins_ready_peer(
-    peer_has_work: bool, missing_padding: bool
+    peer_has_work: bool, missing_row: int | None
 ) -> None:
-    """A phase-idle row can join compute, but an all-idle fleet cannot."""
+    """A phase-idle row can join compute, but an all-idle fleet cannot. A rank that lost any of
+    its reserved execution rows, not only row 0, fails the batch start on every rank."""
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     collective = _OwnerCollective()
@@ -1639,11 +1640,13 @@ def test_phase_idle_connector_owner_joins_ready_peer(
         executor = object.__new__(PyExecutor)
         _configure_recovery_controls(executor)
         executor._enable_remote_tail_adp = True
+        # Startup reserves one execution row per draft length (_initialize_remote_tail_adp).
+        executor._remote_tail_reserved_draft_lens = (0, 1)
         executor.model_engine = SimpleNamespace(
-            cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object()})
+            cuda_graph_runner=SimpleNamespace(padding_dummy_requests={0: object(), 1: object()})
         )
-        if rank == 1 and missing_padding:
-            executor.model_engine.cuda_graph_runner.padding_dummy_requests.clear()
+        if rank == 1 and missing_row is not None:
+            del executor.model_engine.cuda_graph_runner.padding_dummy_requests[missing_row]
         executor.kv_connector_manager = _manager(rank)
         executor.dist.tp_size = 2
         executor.dist.tp_allgather.side_effect = partial(collective.gather, rank)
@@ -1661,7 +1664,7 @@ def test_phase_idle_connector_owner_joins_ready_peer(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(e._kv_connector_start_batch, b) for e, b in zip(executors, batches)]
-        if missing_padding:
+        if missing_row is not None:
             for future in futures:
                 with pytest.raises(RuntimeError, match="ADP owner 1:.*reserved CUDA graph padding"):
                     future.result(timeout=10)

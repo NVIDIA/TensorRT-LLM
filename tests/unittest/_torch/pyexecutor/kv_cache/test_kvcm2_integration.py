@@ -4107,6 +4107,53 @@ def test_adp_dummy_holds_paired_draft_kv(path: str, draft_len: int) -> None:
                     assert dummy.py_request_id not in manager.kv_cache_map
 
 
+@pytest.mark.parametrize("failing_step", ["draft_create", "after_draft_create"])
+def test_dummy_allocation_error_releases_both_pools(failing_step: str) -> None:
+    """An unexpected error in the paired draft allocation releases the dummy's target cache,
+    and any draft cache it already has, before it propagates, as a None return does.
+
+    Otherwise the target pages stay held under the dummy ID, which a caller that logs the error
+    and goes on (CUDAGraphRunner.restore_padding_dummies) never frees, and the next allocation
+    of that ID finds it taken.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=3, speculative_model="draft")
+    with ExitStack() as cleanup:
+        _, managers = _adp_dummy_executor(cleanup, spec, joint_reuse=True, transactional=False)
+        target = managers[ResourceManagerType.KV_CACHE_MANAGER]
+        draft = managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+        dummy_id = 4242
+
+        def allocate():
+            return target.add_dummy_requests(
+                [dummy_id],
+                is_gen=True,
+                max_num_draft_tokens=spec.max_draft_len,
+                draft_kv_cache_manager=draft,
+            )
+
+        # The draft cache is not created yet, or it is created and then a later step fails.
+        method = (
+            "_create_kv_cache"
+            if failing_step == "draft_create"
+            else "_ensure_generation_beam_width"
+        )
+        with patch.object(draft, method, side_effect=RuntimeError("draft allocation failed")):
+            with pytest.raises(RuntimeError, match="draft allocation failed"):
+                allocate()
+        for manager in managers.values():
+            assert dummy_id not in manager.kv_cache_map
+
+        # The ID can be allocated again in both pools.
+        (dummy,) = allocate()
+        for manager in managers.values():
+            assert manager.kv_cache_map[dummy_id].is_active
+            manager.free_resources(dummy)
+            assert dummy_id not in manager.kv_cache_map
+
+
 @pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
 def test_adp_dummy_grows_unpaired_draft_mirror(path: str) -> None:
     """An unpaired draft pool sizes the attention-DP dummy's mirror in prepare_resources.

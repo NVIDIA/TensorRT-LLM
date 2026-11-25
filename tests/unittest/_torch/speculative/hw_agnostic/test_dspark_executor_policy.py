@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ADPShapeAgreement
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    ADPShapeAgreement,
+    DSparkCUDAGraphRunner,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     _DSPARK_ADP_WIRE_TRAILER_LEN,
     _DSPARK_EXACT_NATIVE_YIELD_INDEX,
@@ -301,7 +304,7 @@ def test_confidence_draft_len_runs_only_once_per_iteration():
     assert executor._dspark_dynamic_handled_signature == (9, id(batch), 1, 0, 1)
 
 
-def test_rebalance_suspends_both_dummy_variants_and_releases_the_pair_once():
+def test_rebalance_suspends_both_dummy_variants_and_releases_only_the_failed_one():
     low = SimpleNamespace(py_request_id=10)
     high = SimpleNamespace(py_request_id=11)
     suspended_ids = []
@@ -318,12 +321,15 @@ def test_rebalance_suspends_both_dummy_variants_and_releases_the_pair_once():
             resumed_ids.append(request.py_request_id)
             return request.py_request_id != 11
 
-    released = []
-    runner = SimpleNamespace(
-        padding_dummy_requests={5: low},
-        secondary_padding_dummy_requests={5: high},
-        release_padding_dummy=lambda resource, draft_len: released.append((resource, draft_len)),
-    )
+    freed = []
+    runner = DSparkCUDAGraphRunner.__new__(DSparkCUDAGraphRunner)
+    runner.padding_dummy_requests = {5: low}
+    runner.secondary_padding_dummy_requests = {5: high}
+    runner.adp_shape_agreement = object()
+    runner._padding_dummy_managers = lambda resource_manager: [
+        SimpleNamespace(free_resources=freed.append)
+    ]
+    runner.clear = lambda **_kwargs: None
     executor = PyExecutor.__new__(PyExecutor)
     executor.model_engine = SimpleNamespace(cuda_graph_runner=runner)
     executor.resource_manager = object()
@@ -335,7 +341,11 @@ def test_rebalance_suspends_both_dummy_variants_and_releases_the_pair_once():
     assert suspended == [(5, 0, low), (5, 1, high)]
     assert suspended_ids == [10, 11]
     assert resumed_ids == [10, 11]
-    assert released == [(executor.resource_manager, 5)]
+    # The low row resumed and stays held; only the high row that failed is released.
+    assert freed == [high]
+    assert runner.padding_dummy_requests == {5: low}
+    assert runner.secondary_padding_dummy_requests == {}
+    assert runner.adp_shape_agreement is None
 
 
 def _policy_executor():
