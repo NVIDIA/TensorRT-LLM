@@ -16,6 +16,7 @@ import pytest
 import torch
 from mpi4py import MPI
 from transformers import PretrainedConfig
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
@@ -983,9 +984,14 @@ def test_unbacked_slots_back_and_unback():
 
 
 @contextmanager
-def _moe_layer(monkeypatch, fault_tolerance: bool,
-               meta_init: bool) -> Iterator[tuple]:
-    """Load one Cutlass BF16 MoE layer as the model loader does; yield its balancer and module."""
+def _moe_layer(monkeypatch,
+               fault_tolerance: bool,
+               meta_init: bool,
+               moe_backend: str = "CUTLASS",
+               quant_algo: QuantAlgo | None = None) -> Iterator[tuple]:
+    """Load one MoE layer as the model loader does; yield its balancer and module."""
+    from _torch.moe.quantize_utils import NVFP4QuantizeUtil
+
     from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
     from tensorrt_llm._torch.moe.fused_moe import (RenormalizeMoeRoutingMethod,
                                                    create_moe)
@@ -1007,19 +1013,29 @@ def _moe_layer(monkeypatch, fault_tolerance: bool,
                                                tp_size=2,
                                                moe_ep_size=2,
                                                enable_attention_dp=True),
-                               moe_backend="CUTLASS",
+                               quant_config=QuantConfig(quant_algo=quant_algo),
+                               moe_backend=moe_backend,
                                moe_load_balancer=eplb_config)
-    shapes = {
-        "w1": (_INTERMEDIATE, _HIDDEN),
-        "w3": (_INTERMEDIATE, _HIDDEN),
-        "w2": (_HIDDEN, _INTERMEDIATE)
-    }
-    weights = {
-        f"{expert_id}.{name}.weight":
-        torch.full(shape, expert_id + 1.0, dtype=torch.bfloat16)
-        for expert_id in range(_EXPERTS)
-        for name, shape in shapes.items()
-    }
+    if quant_algo == QuantAlgo.NVFP4:
+        weights = NVFP4QuantizeUtil(
+            num_experts=_EXPERTS,
+            dtype=torch.bfloat16,
+            intermediate_size=_INTERMEDIATE,
+            hidden_size=_HIDDEN,
+            quant_config=model_config.quant_config).create_weights(
+                x_sf_global=torch.tensor(1.0, device="cuda"))
+    else:
+        shapes = {
+            "w1": (_INTERMEDIATE, _HIDDEN),
+            "w3": (_INTERMEDIATE, _HIDDEN),
+            "w2": (_HIDDEN, _INTERMEDIATE)
+        }
+        weights = {
+            f"{expert_id}.{name}.weight":
+            torch.full(shape, expert_id + 1.0, dtype=torch.bfloat16)
+            for expert_id in range(_EXPERTS)
+            for name, shape in shapes.items()
+        }
     balancer_cls = MoeLoadBalancer
     if fault_tolerance:
         balancer_cls = functools.partial(FaultTolerantMoeLoadBalancer,
@@ -1046,9 +1062,12 @@ def _moe_layer(monkeypatch, fault_tolerance: bool,
         balancer.shutdown()
 
 
-def _load_moe_layer(monkeypatch, fault_tolerance: bool,
-                    meta_init: bool) -> dict:
-    """Load one Cutlass BF16 MoE layer as the model loader does and measure its memory.
+def _load_moe_layer(monkeypatch,
+                    fault_tolerance: bool,
+                    meta_init: bool,
+                    moe_backend: str = "CUTLASS",
+                    quant_algo: QuantAlgo | None = None) -> dict:
+    """Load one MoE layer as the model loader does and measure its memory.
 
     The memory counts the caching allocator's allocations and the unbacked slot
     memory that VMM maps outside it.
@@ -1060,7 +1079,8 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
     torch.cuda.reset_peak_memory_stats()
     allocated = torch.cuda.memory_allocated()
     unbacked_before = counters.gpu
-    with _moe_layer(monkeypatch, fault_tolerance, meta_init) as (balancer, moe):
+    with _moe_layer(monkeypatch, fault_tolerance, meta_init, moe_backend,
+                    quant_algo) as (balancer, moe):
         torch.cuda.synchronize()
         unbacked = counters.gpu - unbacked_before
         peak = torch.cuda.max_memory_allocated() - allocated + unbacked
@@ -1077,27 +1097,37 @@ def _load_moe_layer(monkeypatch, fault_tolerance: bool,
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("meta_init", [True, False],
                          ids=["meta_init", "regular_init"])
-def test_spare_slots_unbacked_while_loading(monkeypatch, meta_init):
+@pytest.mark.parametrize("moe_backend, quant_algo", [
+    ("CUTLASS", None),
+    pytest.param("CUTLASS", QuantAlgo.NVFP4, marks=skip_pre_blackwell),
+    pytest.param("CUTEDSL", QuantAlgo.NVFP4, marks=skip_pre_blackwell),
+],
+                         ids=["cutlass_bf16", "cutlass_nvfp4", "cutedsl_nvfp4"])
+def test_spare_slots_unbacked_while_loading(monkeypatch, meta_init, moe_backend,
+                                            quant_algo):
     """Load a layer in the device memory it takes without fault tolerance."""
     torch.cuda.set_device(0)
+    load = functools.partial(_load_moe_layer,
+                             monkeypatch,
+                             meta_init=meta_init,
+                             moe_backend=moe_backend,
+                             quant_algo=quant_algo)
     # The first load also makes what a process allocates once.
-    _load_moe_layer(monkeypatch, fault_tolerance=False, meta_init=meta_init)
+    load(fault_tolerance=False)
     gc.collect()
-    with_spares = _load_moe_layer(monkeypatch,
-                                  fault_tolerance=True,
-                                  meta_init=meta_init)
+    with_spares = load(fault_tolerance=True)
     gc.collect()
-    without = _load_moe_layer(monkeypatch,
-                              fault_tolerance=False,
-                              meta_init=meta_init)
+    without = load(fault_tolerance=False)
     # Rank 0 loads its two experts; its two spare slots stay empty.
     assert with_spares["loaded"] == without["loaded"] == [0, 1]
-    assert with_spares["w2"] == without["w2"] == [1.0, 2.0]
-    assert with_spares["unbacked"] == ["w2_weight", "w3_w1_weight"]
+    assert {"w2_weight", "w3_w1_weight"} <= set(with_spares["unbacked"])
     assert without["unbacked"] == []
     tolerance = (len(with_spares["unbacked"]) + 1) * _vmm_granularity()
-    # Two spare slots of w3_w1 and w2 in bfloat16, which loading took before.
-    assert 2 * 3 * _HIDDEN * _INTERMEDIATE * 2 > 4 * tolerance
+    if quant_algo is None:
+        assert with_spares["w2"] == without["w2"] == [1.0, 2.0]
+        assert with_spares["unbacked"] == ["w2_weight", "w3_w1_weight"]
+        # Two spare slots of w3_w1 and w2 in bfloat16, which loading took before.
+        assert 2 * 3 * _HIDDEN * _INTERMEDIATE * 2 > 4 * tolerance
     for key in ("peak", "after"):
         assert abs(with_spares[key] -
                    without[key]) <= tolerance, (key, with_spares[key],
