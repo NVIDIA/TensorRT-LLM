@@ -7741,6 +7741,10 @@ def _validate_wide_ep_fault_tolerance_launch(args: 'TorchLlmArgs') -> None:
     TP and with expert parallelism over more than one rank. What these
     arguments leave open (a MoE parallel split left unset, which a model may
     resolve itself, and the MoE backend) is checked when the model loads.
+
+    Fault tolerance also supports only the default attention-DP router: the
+    options below make the router assume that every rank takes part in each
+    iteration.
     """
     unmet = []
     if not args.enable_attention_dp:
@@ -7758,6 +7762,14 @@ def _validate_wide_ep_fault_tolerance_launch(args: 'TorchLlmArgs') -> None:
     if args.dwdp_config is not None and args.dwdp_config.enable_experts:
         unmet.append("no expert DWDP (dwdp_config.enable_experts=False), "
                      "which runs the MoE layers without expert parallelism")
+    attention_dp_config = args.attention_dp_config
+    if attention_dp_config is not None:
+        for name in ("enable_kv_balanced_admission",
+                     "enable_kv_cache_aware_routing",
+                     "kv_cache_routing_conversation_affinity"):
+            if getattr(attention_dp_config, name):
+                unmet.append("the default attention-DP router "
+                             f"(attention_dp_config.{name}=False, not True)")
     if args.modeling_v2 == "require":
         unmet.append("the built-in model (modeling_v2='auto' or 'off', not "
                      "'require'), because no modeling_v2 target runs its MoE "

@@ -204,6 +204,37 @@ def test_wide_ep_fault_tolerance_launch_rejected(fields: dict[str, Any],
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("option", [
+    "enable_kv_balanced_admission",
+    "enable_kv_cache_aware_routing",
+    "kv_cache_routing_conversation_affinity",
+])
+def test_wide_ep_fault_tolerance_rejects_adp_router_option(option: str) -> None:
+    """Only the default attention-DP router handles a rank that is absent."""
+    with pytest.raises(ValidationError) as error:
+        TorchLlmArgs(model=llama_model_path,
+                     **_FAULT_TOLERANT_ARGS,
+                     attention_dp_config={option: True})
+    assert (f"the default attention-DP router "
+            f"(attention_dp_config.{option}=False, not True)"
+            in str(error.value))
+    # Without fault tolerance the option stays valid.
+    TorchLlmArgs(model=llama_model_path,
+                 enable_attention_dp=True,
+                 tensor_parallel_size=2,
+                 attention_dp_config={option: True})
+
+
+@pytest.mark.cpu_only
+def test_wide_ep_fault_tolerance_accepts_default_adp_router() -> None:
+    """Other attention-DP settings stay valid under fault tolerance."""
+    args = TorchLlmArgs(model=llama_model_path,
+                        **_FAULT_TOLERANT_ARGS,
+                        attention_dp_config={"enable_balance": True})
+    assert args.attention_dp_config.enable_balance
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fields", [{}, {
     "modeling_v2": "auto"
 }],
