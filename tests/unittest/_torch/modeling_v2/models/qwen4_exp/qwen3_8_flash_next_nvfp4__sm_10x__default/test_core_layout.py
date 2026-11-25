@@ -825,15 +825,18 @@ def test_both_draft_targets_pad_the_draft_moe_by_the_workers_counts(target) -> N
     same draft step. Both pad the draft MoE by the `all_rank_num_tokens` the worker passes them
     for that step, never by the metadata's, which still holds the trunk step's counts. The
     decode target's draft-extend step past one rank re-pads by the group's kept-row counts
-    (`_draft_continue`), which it takes only when they match those same worker counts."""
+    (`_draft_continue`), which it takes only when they match those same worker counts. The decode
+    target's tail runs at two sites (the second is `DP_MTP_ATTN_PACK_ENV`'s one-rank attention
+    input), each padded the same way."""
     fn = ast.parse(inspect.getsource(target.mtp_forward).lstrip())
     pad, *kept = _calls(fn, "_draft_pad_rows")
     assert [ast.unparse(a) for a in pad.args] == ["core", "all_rank_num_tokens", "rows"]
     assert [[ast.unparse(a) for a in k.args] for k in kept] == (
         [["core", "cont.counts", "n"]] if target is M.DecodeTarget else []
     )
-    (tail,) = _calls(fn, "_mtp_tail")
-    assert ast.unparse(tail.args[-1]) == "pad_rows"
+    tails = _calls(fn, "_mtp_tail")
+    assert len(tails) == (2 if target is M.DecodeTarget else 1)
+    assert all(ast.unparse(tail.args[-1]) == "pad_rows" for tail in tails)
     assert "_dp_pad_rows" not in ast.unparse(fn)
 
 
