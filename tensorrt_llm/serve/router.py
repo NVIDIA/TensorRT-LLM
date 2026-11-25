@@ -516,6 +516,28 @@ class Router(ABC):
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
 
+    async def mirror_servers(self, servers: List[str]) -> None:
+        """Replace the server list with ``servers`` without preparing them.
+
+        For a router whose servers are prepared elsewhere (the disaggregated
+        coordinator publishes the list): servers that leave lose their
+        prepared state and server info; servers that join are not prepared.
+        Unlike ``add_server``/``remove_server`` it fetches nothing and does
+        not stage servers.
+        """
+        async with self._lock:
+            old_servers = self._servers.copy()
+            if old_servers == servers:
+                return
+            self._servers = list(servers)
+            self._on_servers_updated(old_servers, self._servers)
+            self._prepared_ready_servers.intersection_update(servers)
+            self._server_info = {
+                server: info
+                for server, info in self._server_info.items()
+                if server in servers
+            }
+
     @abstractmethod
     async def get_next_server(self,
                               request: OpenAIRequest,
@@ -1287,6 +1309,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  enable_tokenization_cache: bool = False,
+                 checkpoint_format: Optional[str] = None,
+                 revision: Optional[str] = None,
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -1296,7 +1320,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             tokenizer_dir,
             use_harmony=use_harmony,
             model_path=model_path,
-            enable_tokenization_cache=enable_tokenization_cache)
+            enable_tokenization_cache=enable_tokenization_cache,
+            checkpoint_format=checkpoint_format,
+            revision=revision)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -2598,18 +2624,18 @@ class CoordinatorDelegatingRouter(Router):
 
     async def sync_servers(self, servers: list[str]) -> None:
         """Mirror the coordinator server list without preparing worker state."""
-        async with self._local._lock:
-            old_servers = self._local._servers.copy()
-            if old_servers == servers:
-                return
-            self._local._servers = list(servers)
-            self._local._on_servers_updated(old_servers, self._local._servers)
-            self._local._prepared_ready_servers.intersection_update(servers)
-            self._local._server_info = {
-                server: info
-                for server, info in self._local._server_info.items()
-                if server in servers
-            }
+        await self._local.mirror_servers(servers)
+
+    async def mirror_servers(self, servers: List[str]) -> None:
+        """Mirror ``servers`` onto the wrapped local router.
+
+        The inherited ``Router.mirror_servers`` would run on this wrapper,
+        which holds no server-pool state of its own (``__init__`` skips
+        ``Router.__init__``): its reads would reach the wrapped router via
+        ``__getattr__`` but its assignments would create attributes on the
+        wrapper, silently splitting the state. Delegate explicitly instead.
+        """
+        await self._local.mirror_servers(servers)
 
     def set_unpredicted_priority(self, priority: float) -> None:
         # The local router computes the routing key's priority.

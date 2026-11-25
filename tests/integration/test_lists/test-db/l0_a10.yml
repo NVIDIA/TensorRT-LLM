@@ -47,6 +47,7 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/speculative/test_dspark_recompute_tail_claim.py
   - unittest/_torch/pyexecutor/test_resource_manager.py
   - unittest/_torch/pyexecutor/test_profile_endpoints.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
@@ -128,7 +129,6 @@ l0_a10:
   - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
-  - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_pipeline_config.py

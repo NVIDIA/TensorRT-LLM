@@ -32,10 +32,21 @@ def test_certified_cells(cell, seed, certifying) -> None:  # noqa: F811 — pyte
         cases.TOP_K,
     )
     called, referenced = experts.fresh(), experts.fresh()
+    before = (x.clone(), ids.clone(), w.clone())
     out = op(x, ids, w, called, spec["routed_scaling_factor"])
     ref = op.reference(x, ids, w, referenced, spec["routed_scaling_factor"])
     assert out.dtype == torch.bfloat16 and out.shape == (spec["tokens"], cases.HIDDEN)
     assert cases.bitwise_equal(out, ref)
+    assert out.device == x.device and bool(torch.isfinite(out).all())
+    for actual, saved in zip((x, ids, w), before):
+        assert cases.bitwise_equal(actual, saved)
+    assignments = 0
+    for expert, rows, _ in called.calls:
+        tokens = (ids == expert).any(dim=1).nonzero().squeeze(1)
+        assert rows.shape[0] == tokens.numel() >= 1
+        assert cases.bitwise_equal(rows, x[tokens])
+        assignments += rows.shape[0]
+    assert assignments == ids.numel()
     # One call per selected expert, ascending, on both sides.
     assert (
         [e for e, _, _ in called.calls]

@@ -8,7 +8,7 @@ the 106-TPC part); the 28 SMs on the 14 unpaired TPCs are idle for its whole dur
 requests of the batch to the 2x packed kernel on a concurrent stream shortens the critical path: the 4x kernel loses
 one whole wave while the 2x kernel finishes its share on the SMs the 4x kernel cannot use.
 
-Measured (hecate0369, graph, sustained): B128/q4/30K 4x-only 502 us -> two-stream (r2 = 13) 467 us (-7 %), 2x
+Measured (graph, sustained): B128/q4/30K 4x-only 502 us -> two-stream (r2 = 13) 467 us (-7 %), 2x
 packed 535 us; B128/q4/16K 291.5 -> 275.4 us.  The gain only exists when the 4x grid is launched first (or carries a
 higher priority) so that it takes the pairable TPCs before the 2x pairs land on them; see ``run_two_stream`` in
 ``__init__.py``.
@@ -30,6 +30,8 @@ import functools
 import math
 import os
 from typing import NamedTuple, Optional
+
+from .config import _env_flag_not_disabled
 
 TWOSTREAM_ENV = "TRTLLM_FP4_MLA_TWOSTREAM"
 TWOSTREAM_R2_ENV = "TRTLLM_FP4_MLA_TWOSTREAM_R2"
@@ -116,10 +118,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def two_stream_enabled() -> bool:
-    value = os.getenv(TWOSTREAM_ENV)
-    if value is None or value.strip() == "":
-        return True
-    return value.strip().lower() not in ("0", "false", "off", "no")
+    return _env_flag_not_disabled(TWOSTREAM_ENV, True)
 
 
 def lanes_2x(sm_count: int, lanes_4x: int = LANES_4X) -> int:

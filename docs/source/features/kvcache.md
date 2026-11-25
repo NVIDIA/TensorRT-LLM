@@ -77,7 +77,7 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 ```{warning}
-KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) and RocketKV still require V1 until V2 support is available; keep V1 for these features during migration.
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) still requires V1 until V2 support is available; keep V1 for this feature during migration.
 ```
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
@@ -108,7 +108,7 @@ algorithms select their KV cache manager per algorithm:
 | DeepSeek-V4, MiniMax-M3, CSA2 | The algorithm's V2 manager, whatever the setting |
 | QSA | The algorithm's V2 hybrid manager; the setting must select V2 |
 | DSA | Follows the setting (`DSACacheManagerV2` or `DSACacheManager`) |
-| RocketKV | The algorithm's V1 manager, whatever the setting |
+| RocketKV | Follows the setting (`RocketKVCacheManagerV2` or `RocketKVCacheManager`) |
 | Skip Softmax Attention | The manager a dense model would get |
 
 Skip Softmax Attention changes only the attention kernel and keeps the dense KV
@@ -339,7 +339,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 always returns the derived digest in `mm_keys[].hash` and adds the original identity in the optional `mm_keys[].uuid` field.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. This also holds for embeddings attached with `multi_modal_embeddings`, whose content is the embedding rows together with any metadata passed with them, such as an image grid. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 always returns the derived digest in `mm_keys[].hash` and adds the original identity in the optional `mm_keys[].uuid` field.
 
 **Usage Example:**
 
