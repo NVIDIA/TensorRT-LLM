@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import textwrap
 import time
 import uuid
 import weakref
@@ -229,23 +230,44 @@ def ctx_gen_kv_cache_dtype(request):
     for library in sorted((Path(tensorrt_llm.__file__).parent /
                            "libs").glob("libtensorrt_llm_*_wrapper.so"))
 ])
-def test_cache_transceiver_wrapper_load_and_exit(wrapper_library):
+def test_cache_transceiver_wrapper_load_and_exit(wrapper_library: Path) -> None:
     # Match the package's torch-first loading of wheel-provided CUDA/NCCL
     # dependencies, then run static destructors in a fresh process.
     result = subprocess.run([
         sys.executable,
         "-c",
-        "import ctypes, os, resource, sys; "
-        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
-        "import torch; "
-        "host = ctypes.CDLL(sys.argv[1], mode=os.RTLD_GLOBAL | os.RTLD_NOW); "
-        "wrapper = ctypes.CDLL(sys.argv[2], mode=os.RTLD_LOCAL | os.RTLD_NOW)",
+        textwrap.dedent("""
+            import ctypes
+            import os
+            import resource
+            import sys
+
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            import torch
+
+            host = ctypes.CDLL(sys.argv[1], mode=os.RTLD_GLOBAL | os.RTLD_NOW)
+            try:
+                wrapper = ctypes.CDLL(sys.argv[2], mode=os.RTLD_LOCAL | os.RTLD_NOW)
+            except OSError as error:
+                missing_runtime = (
+                    "libtransfer_engine.so: cannot open shared object file: "
+                    "No such file or directory"
+                )
+                if (os.path.basename(sys.argv[2]) == "libtensorrt_llm_mooncake_wrapper.so"
+                        and str(error) == missing_runtime):
+                    # Mooncake's C API runtime is optional at package import time.
+                    sys.exit(77)
+                raise
+            """),
         wrapper_library.parent / "libtensorrt_llm.so",
         wrapper_library,
     ],
                             capture_output=True,
                             text=True,
                             timeout=30)
+    if result.returncode == 77:
+        pytest.skip(
+            "Mooncake C API runtime not installed (libtransfer_engine.so)")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
