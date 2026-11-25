@@ -769,8 +769,9 @@ at::Tensor adaptiveEplbSolveShares(
         auto const& v = costs.value();
         bool const valid
             = v.size() == 6 && std::all_of(v.begin(), v.end(), [](double x) { return std::isfinite(x) && x >= 0.0; });
-        TORCH_CHECK_VALUE(valid && v[4] > 0.0 && v[5] > 0.0,
-            "costs must be six finite values, none negative, the scale and the tile rows positive");
+        TORCH_CHECK_VALUE(valid && v[4] > 0.0 && v[5] > 0.0 && v[1] + v[2] > 0.0,
+            "costs must be six finite values, none negative, the scale and the tile rows positive, and a row or "
+            "a tile costing time");
         c = TimeCosts{v[0], v[1], v[2], v[3], v[5]}; // the scale multiplies every GPU alike
         offset = timeOffsets(load, layoutPtr, n, ranks, local, slotsOf, c);
     }

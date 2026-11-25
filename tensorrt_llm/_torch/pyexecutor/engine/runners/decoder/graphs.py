@@ -558,8 +558,8 @@ class DecoderCudaGraphs:
             return "TLLM_CUDA_GRAPH_GEMM_TUNING tunes the GEMMs in the warmup-only pass"
         if not self.supports_single_pass_capture:
             return f"{type(self).__name__} relies on the warmup-only pass"
-        if getattr(self._moe_load_balancer, "before_capture", None) is not None:
-            return "the MoE load balancer's before_capture runs between the two passes"
+        if getattr(self._moe_load_balancer, "calibrates_before_capture", False):
+            return "the MoE load balancer calibrates between the two passes (before_capture)"
         if self._agreement.is_distributed_forward() and self._agreement.allgather() is None:
             return "the ranks cannot agree on it through this engine's communicator"
         return None

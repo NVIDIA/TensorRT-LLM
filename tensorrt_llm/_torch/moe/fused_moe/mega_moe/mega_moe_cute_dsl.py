@@ -1305,6 +1305,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(device.index)
         mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM)
+        pynvml.nvmlShutdown()
         # Twice the enqueue time at the highest clock: the launches queue up behind the sleep.
         cycles = int(2 * host_us * (warmup + iters) * mhz)
         events = []

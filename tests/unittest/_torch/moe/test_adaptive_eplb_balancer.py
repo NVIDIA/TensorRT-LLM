@@ -812,8 +812,8 @@ def test_forced_routes_realize_a_design_with_distinct_slots_per_token():
 def test_single_pass_capture_is_refused_while_the_balancer_calibrates_between_the_passes(
     monkeypatch,
 ):
-    """Regression: adaptive EPLB calibrates its time model between the warmup's two passes
-    (before_capture), so the opt-in single-pass capture must not skip that point."""
+    """A balancer with a time model to calibrate between the warmup's two passes (before_capture)
+    refuses the opt-in single-pass capture; one with nothing to calibrate leaves it."""
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 
     monkeypatch.delenv("TLLM_CUDA_GRAPH_GEMM_TUNING", raising=False)
@@ -823,9 +823,10 @@ def test_single_pass_capture_is_refused_while_the_balancer_calibrates_between_th
         _lora=SimpleNamespace(cuda_graph_manager=None),
         _flashinfer_mxfp8_autotune_methods=lambda: [],
         supports_single_pass_capture=True,
-        _moe_load_balancer=SimpleNamespace(before_capture=lambda: None),
+        _moe_load_balancer=SimpleNamespace(calibrates_before_capture=True),
         _agreement=SimpleNamespace(is_distributed_forward=lambda: False),
     )
     assert "before_capture" in DecoderCudaGraphs._single_pass_blocker(graphs)
-    graphs._moe_load_balancer = None
-    assert DecoderCudaGraphs._single_pass_blocker(graphs) is None
+    for balancer in (SimpleNamespace(calibrates_before_capture=False), None):
+        graphs._moe_load_balancer = balancer
+        assert DecoderCudaGraphs._single_pass_blocker(graphs) is None

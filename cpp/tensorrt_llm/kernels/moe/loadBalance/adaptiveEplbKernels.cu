@@ -115,7 +115,8 @@ __device__ __forceinline__ int weightedSlot(int expert, int ordinal, uint32_t st
     }
     int const copies = counts[expert];
     int const start = starts[expert];
-    if (copies <= 0 || start < 0 || start + copies > numSlots)
+    // Not start + copies > numSlots: the sum of two loaded words can wrap in int.
+    if (copies <= 0 || copies > numSlots || start < 0 || start > numSlots - copies)
     {
         return numSlots;
     }

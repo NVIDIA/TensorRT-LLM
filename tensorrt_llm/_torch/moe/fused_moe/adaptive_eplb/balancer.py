@@ -96,10 +96,13 @@ def nvlink_domain_error(comm: object) -> tuple[str | None, int]:
     try:  # every rank reaches the vote below: a failure here only marks this GPU
         up = MnnvlMemory.supports_mnnvl()
         pynvml.nvmlInit()
-        info = pynvml.c_nvmlGpuFabricInfoV_t()  # pynvml structures take no keyword arguments
-        info.version = pynvml.nvmlGpuFabricInfo_v2
-        handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
-        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
+        try:
+            info = pynvml.c_nvmlGpuFabricInfoV_t()  # pynvml structures take no keyword arguments
+            info.version = pynvml.nvmlGpuFabricInfo_v2
+            handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
+        finally:
+            pynvml.nvmlShutdown()
         if info.state == pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
             fabric = (bytes(info.clusterUuid).hex(), int(info.cliqueId))
     except Exception:  # noqa: BLE001 - whatever fails, this rank still votes
@@ -600,6 +603,11 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         identity = calibration_identity(backend, self.ep_size, hosts, tokens, self.num_slots)
         return identity, [t for t in tokens if str(t) in identity["tactics"]]
 
+    @property
+    def calibrates_before_capture(self) -> bool:
+        """Whether :meth:`before_capture` has a time model to calibrate between the warmup's passes."""
+        return self._pending is not None
+
     def before_capture(self) -> None:
         """Under ``time_model`` ``auto``, take rank 0's cached calibration of this run, else calibrate
         the decode time model (:func:`~.calibrate.calibrate`) and cache it, and start the runtime on
@@ -774,8 +782,8 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
 
         A batch that also runs context requests records the rows of its generation tokens only,
         ``generation_rows`` (``[start, stop)`` of the forward's local tokens); without them it
-        records nothing. Skipping such batches whole left a window without a single forward on a
-        rank that admits a request at every call, and the window's other ranks lost it too.
+        records nothing, so a rank that admits a request at every call still counts forwards in a
+        window.
         """
         mixed = not generation_only
         counted = generation_rows is not None and generation_rows[1] > generation_rows[0]
