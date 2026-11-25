@@ -49,6 +49,8 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
+from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
 from tensorrt_llm._torch.pyexecutor.sampler import (
     SampleStateTensorsHostTorch,
     SampleStateTorch,
@@ -77,6 +79,7 @@ def _request(
     request_id: int,
     *,
     context: bool = False,
+    streaming: bool = False,
     num_return_sequences: int = 1,
     lora_task_id: int | None = None,
 ) -> LlmRequest:
@@ -85,6 +88,7 @@ def _request(
     Args:
         request_id: Executor and transfer identity.
         context: Whether to create the context-side request.
+        streaming: Whether to return intermediate responses.
         num_return_sequences: Number of sequences, including any native children.
         lora_task_id: Adapter identity, if the request holds PEFT resources.
 
@@ -96,7 +100,7 @@ def _request(
         max_new_tokens=8,
         input_tokens=list(range(8)),
         sampling_config=SamplingConfig(1, num_return_sequences=num_return_sequences),
-        is_streaming=False,
+        is_streaming=streaming,
         draft_tokens=None,
         lora_task_id=lora_task_id,
         llm_request_type=(
@@ -155,9 +159,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.executor_request_queue = ExecutorRequestQueue(
         dist=engine.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0.0
     )
-    engine.response_cv = threading.Condition()
-    engine.responses = {}
-    engine.result_wait_queues = {}
+    engine._response_channel = ResponseChannel()
     engine._disagg_pp_termination_handler = None
     engine._prefetched_request_ids = set()
     engine.resource_manager = Mock(spec=["free_resources"])
@@ -227,12 +229,12 @@ def _assert_released_once(executor: PyExecutor, request: LlmRequest) -> None:
     assert request.is_finished_due_to_cancellation
     assert request not in executor.active_requests
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert response.error_msg is None
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
@@ -484,11 +486,11 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
             assert executor._pending_transfer_responses == []
             assert executor._pending_response_terminations == []
         if not should_flush:
-            assert executor.responses == {}
+            assert executor._response_channel.responses == {}
             executor.dist.tp_gather.assert_not_called()
             executor.dist.allgather.assert_not_called()
         else:
-            (response,) = executor.responses[1]
+            (response,) = executor._response_channel.responses[1]
             assert response.error_msg == "Disagg KV cache transfer error"
             response_gather.assert_called_once()
         if failure_rank == 0 and should_flush:
@@ -544,6 +546,50 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
     assert not request.is_finished
     assert executor._pending_transfer_responses == []
     executor.resource_manager.free_resources.assert_not_called()
+
+
+def test_between_batch_cancellation_preserves_current_response_counters(
+    executor: PyExecutor,
+) -> None:
+    request = _request(1, streaming=True, lora_task_id=0)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([9])
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [11, 12]
+    request.py_per_pos_drafted[0] = 4
+    request.py_per_pos_accepted[0] = 2
+    request.py_total_draft_tokens = 4
+    request.py_total_accepted_draft_tokens = 2
+    earlier = prepare_response(request, publish_metadata=True)
+    assert earlier is not None
+    assert earlier.result.spec_dec_totals == (2, 4)
+
+    request.add_new_tokens([10])
+    request.py_decoding_iter = 2
+    request.py_draft_tokens = [13]
+    request.py_per_pos_drafted[0] = 5
+    request.py_per_pos_accepted[0] = 3
+    request.py_total_draft_tokens = 5
+    request.py_total_accepted_draft_tokens = 3
+    assert request.decoding_iter == 1
+    executor.active_requests = [request]
+    _abort(executor, request)
+
+    assert executor._cancel_waiting_disagg_requests([]) == []
+
+    ((request_id, response),) = executor._pending_transfer_responses
+    assert request_id == request.py_request_id
+    assert response.result.is_final
+    assert response.result.get_result().decoding_iter == 2
+    assert request.draft_tokens == [13]
+    assert response.result.per_pos_drafted[0] == 5
+    assert response.result.per_pos_accepted[0] == 3
+    assert response.result.spec_dec_totals == (3, 5)
+    assert earlier.result.get_result().decoding_iter == 1
+    assert earlier.result.per_pos_drafted[0] == 4
+    assert earlier.result.per_pos_accepted[0] == 2
+    assert earlier.result.spec_dec_totals == (2, 4)
+    _assert_released_once(executor, request)
 
 
 @pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
@@ -676,12 +722,12 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     assert request.is_finished_due_to_cancellation is not completed
     assert executor.active_requests == []
     assert executor.canceled_req_ids == []
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor.sampler.release_request.assert_called_once_with(request)
     executor._cancel_waiting_disagg_requests([])
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
 
@@ -1119,7 +1165,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     executor._handle_errors(message, requests=[request], charge_budget=False)
     assert executor._held_transfer_failures() == {id(request): (request, message)}
     assert not request.is_finished
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
     def settle() -> None:
@@ -1141,13 +1187,13 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     assert executor.active_requests == [request]
     assert set(executor.canceled_req_ids) == {1}
     assert not request.is_finished_due_to_cancellation
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     assert executor.disagg._retiring_gen_receives == {}
     executor.resource_manager.free_resources.assert_not_called()
     if not settled_before_cancel:
         executor._sweep_transfer_held_failures()
         assert executor._held_transfer_failures() == {id(request): (request, message)}
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
         aux.free_slot.assert_not_called()
         executor.resource_manager.free_resources.assert_not_called()
         settle()
@@ -1158,7 +1204,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
 
     assert executor.active_requests == []
     assert executor._held_transfer_failures() == {}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg == message
     assert not request.is_finished_due_to_cancellation
     executor.resource_manager.free_resources.assert_called_once_with(request)
@@ -1167,7 +1213,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
     executor.disagg.reap_gen_receives(0)
     executor._sweep_transfer_held_failures()
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
 
@@ -1203,7 +1249,7 @@ def test_parked_native_failure_waits_for_physical_cancel_completion(
     assert executor.canceled_req_ids == [1]
     assert executor.active_requests == [request]
     assert executor._held_transfer_failures() == {id(request): (request, message)}
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
 
@@ -1260,7 +1306,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
     assert transceiver.has_inflight_transfer(request)
     assert executor.active_requests == [request]
     assert not request.is_finished_due_to_cancellation
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     executor.resource_manager.free_resources.assert_not_called()
 
     clock[0] = 0.75
@@ -1271,7 +1317,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
     assert len(watchdog._owners) == 1
     assert watchdog.fatal is None
     assert executor._held_transfer_failures() == {id(request): (request, message)}
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     transceiver.request_and_receive_async.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1290,7 +1336,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         assert executor.active_requests == [request]
         assert executor._held_transfer_failures() == {id(request): (request, message)}
         assert transceiver._recv_reqs == {1: request}
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
         executor.resource_manager.free_resources.assert_not_called()
     else:
         containment.assert_not_called()
@@ -1298,7 +1344,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         assert executor._held_transfer_failures() == {}
         assert transceiver._recv_reqs == {}
         assert not transceiver._cancelled_receive_fences
-        (response,) = executor.responses[1]
+        (response,) = executor._response_channel.responses[1]
         assert response.error_msg == message
         executor.resource_manager.free_resources.assert_called_once_with(request)
         watchdog.require_retired()
@@ -1307,7 +1353,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         executor.disagg.poll_gen_transfers()
         executor._sweep_transfer_held_failures()
         executor._flush_pending_transfer_responses()
-        assert len(executor.responses[1]) == 1
+        assert len(executor._response_channel.responses[1]) == 1
         executor.resource_manager.free_resources.assert_called_once_with(request)
     assert not request.is_finished_due_to_cancellation
     assert executor.disagg._retiring_gen_receives == {}
@@ -1362,14 +1408,14 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     if failure_first:
         assert executor.active_requests == [request]
         assert not request.is_finished
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
     else:
         if boundary == "post_batch":
             executor._handle_responses()
         executor._flush_pending_transfer_responses()
         assert executor.active_requests == []
         assert request.is_finished_due_to_cancellation
-        (response,) = executor.responses[request.py_request_id]
+        (response,) = executor._response_channel.responses[request.py_request_id]
         assert response.error_msg is None
         assert executor.disagg._retiring_gen_receives == {1: request}
     aux.free_slot.assert_not_called()
@@ -1394,7 +1440,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     executor._flush_pending_transfer_responses()
 
     assert executor.active_requests == []
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert (response.error_msg is not None) is failure_first
     assert request.is_finished_due_to_cancellation is not failure_first
     executor.resource_manager.free_resources.assert_called_once_with(request)
@@ -1403,7 +1449,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     cancel()
     executor.disagg.reap_gen_receives(0)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
     watchdog.require_retired()
@@ -1442,7 +1488,7 @@ def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
         assert request.py_kv_transfer_start_time == 12.0
         assert session.status is SessionStatus.CANCELLED
         assert isinstance(handle.poll(), Cancelled)
-        (response,) = executor.responses[request.py_request_id]
+        (response,) = executor._response_channel.responses[request.py_request_id]
         assert response.error_msg is None
         assert request.is_finished_due_to_cancellation
         executor.sampler.release_request.assert_not_called()
@@ -1478,11 +1524,11 @@ def test_settled_receive_waits_for_terminal_response_before_request_release(
 
     executor.disagg.poll_gen_transfers()
 
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     assert executor.disagg._retiring_gen_receives == {1: request}
     executor.resource_manager.free_resources.assert_not_called()
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     executor.resource_manager.free_resources.assert_not_called()
     executor.disagg.poll_gen_transfers()
@@ -1613,21 +1659,21 @@ def test_peer_notification_error_does_not_delay_logical_cancellation(executor: P
     assert request.is_finished_due_to_cancellation
     assert executor.active_requests == []
     assert executor.disagg._retiring_gen_receives == {1: request}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     notify.assert_called_once_with(1, {"ctx"})
     executor.resource_manager.free_resources.assert_not_called()
     aux.free_slot.assert_not_called()
 
     executor.disagg.poll_gen_transfers()
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_not_called()
     notify.reset_mock()
     notify.side_effect = lambda _rid, endpoints: set(endpoints)
     executor.disagg.poll_gen_transfers()
     executor.disagg.poll_gen_transfers()
     assert [call.args for call in notify.call_args_list if call.args[1]] == [(1, {"ctx"})]
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     executor.resource_manager.free_resources.assert_not_called()
     session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
@@ -1671,7 +1717,7 @@ def test_cancelled_unpublished_receive_retains_local_fence_with_fixed_grace(
     assert transceiver.has_inflight_transfer(request)
     assert not transceiver.check_gen_transfer_complete()
     assert transceiver._recv_reqs == {1: request}
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1681,7 +1727,7 @@ def test_cancelled_unpublished_receive_retains_local_fence_with_fixed_grace(
     executor.disagg.poll_gen_transfers()
     assert len(watchdog._owners) == 1
     assert watchdog.fatal is None
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     transceiver.request_and_receive_async.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -1738,7 +1784,7 @@ def test_cancelled_receive_shutdown_preserves_roots_until_fence_settles(
     executor._flush_pending_transfer_responses()
 
     assert request.is_finished_due_to_cancellation
-    (response,) = executor.responses[1]
+    (response,) = executor._response_channel.responses[1]
     assert response.error_msg is None
     expected = "CUDA completion query failed" if query_raises else "still owns destination memory"
     with pytest.raises(RuntimeError, match=expected):
@@ -2457,6 +2503,7 @@ def test_pending_cancel_idle_hold_needs_the_consensus_vote(
 
     executor.canceled_req_ids = [9]
     executor.control_requests = []
+    executor.enable_iter_perf_stats = False
     executor._disable_mpi = False
     executor.request_accumulated = []
     executor.hang_detector = MagicMock()

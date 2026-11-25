@@ -34,7 +34,7 @@ import re
 import socket
 import subprocess
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -127,7 +127,7 @@ def _groovy_unescape(literal: str) -> str:
         if escape[0] in "01234567":
             return chr(int(escape, 8))
         if escape not in _GROOVY_ESCAPES:
-            pytest.fail(f"boltFetchLib contains \\{escape}, which is not a Groovy escape")
+            pytest.fail(f"the Groovy string contains \\{escape}, which is not a Groovy escape")
         return _GROOVY_ESCAPES[escape]
 
     return _GROOVY_ESCAPE.sub(replace, literal)
@@ -200,6 +200,8 @@ class Request:
     method: str
     path: str
     headers: dict[str, str]
+    # What the request uploaded; empty when it has no body.
+    body: bytes = b""
 
     @property
     def opted_out(self) -> bool:
@@ -216,10 +218,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._answer(with_body=False)
 
+    def do_PUT(self) -> None:
+        self._answer(with_body=True)
+
     def _answer(self, *, with_body: bool) -> None:
         server = cast(_Server, self.server)
         headers = {name.lower(): value for name, value in self.headers.items()}
-        reply = server.fake.answer(Request(server.name, self.command, self.path, headers))
+        body = self.rfile.read(int(headers.get("content-length", "0")))
+        reply = server.fake.answer(Request(server.name, self.command, self.path, headers, body))
         self.send_response(reply.status)
         for name, value in reply.headers.items():
             self.send_header(name, value)
@@ -239,19 +245,19 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, name: str, fake: FakeServers) -> None:
-        super().__init__((HOSTS[name], 0), _Handler)
+    def __init__(self, name: str, host: str, fake: FakeServers) -> None:
+        super().__init__((host, 0), _Handler)
         self.name = name
         self.fake = fake
 
 
 class FakeServers:
-    """The aws location and its CDN, each a loopback HTTP server on its own host.
+    """Loopback HTTP servers, each on its own host: the aws location and its CDN by default.
 
     Routes map ``(server, path with query)`` to a reply. A request without a route gets 404.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hosts: Mapping[str, str] = HOSTS) -> None:
         self.routes: dict[tuple[str, str], Route] = {}
         self.requests: list[Request] = []
         self._lock = threading.Lock()
@@ -259,8 +265,8 @@ class FakeServers:
         self._held: list[threading.Thread] = []
         self._servers: dict[str, _Server] = {}
         try:
-            for name in HOSTS:
-                self._servers[name] = _Server(name, self)
+            for name, host in hosts.items():
+                self._servers[name] = _Server(name, host, self)
         except OSError as error:
             for server in self._servers.values():
                 server.server_close()
@@ -415,6 +421,9 @@ class FetchVerified:
         for path in (netrc, home / ".netrc"):
             path.write_text(entry)
             path.chmod(0o600)
+        # A curlrc that would show the Authorization header and the signed CDN URL in the output,
+        # were curl to read it.
+        (home / ".curlrc").write_text("verbose\n")
 
         env = {
             name: value
@@ -520,8 +529,9 @@ def test_long_scripts_are_not_sent_on_the_ssh_command_line() -> None:
 
     ``b64BashRemoteCmd`` and ``b64BashRemoteCmdStdin`` put the whole script, base64-encoded, into
     one word of the remote command, and a csh/tcsh login shell rejects a word that long with
-    "Word too long". Every script that carries the library is long, and so is ``publish``, the
-    script that publishes the BOLTed build.
+    "Word too long". Every script that carries the library is long, and so are ``publish``, the
+    script that publishes the BOLTed build, and ``promote``, the script that promotes the profile
+    bundle to each location.
     """
     source = BOLT_PROFILE_GEN.read_text()
     carriers = re.findall(
@@ -529,7 +539,7 @@ def test_long_scripts_are_not_sent_on_the_ssh_command_line() -> None:
     )
 
     assert sorted(carriers) == ["llvmStage", "tarStage"]
-    for name in [*carriers, "publish"]:
+    for name in [*carriers, "publish", "promote"]:
         assert not re.search(rf"b64BashRemoteCmd(?:Stdin)?\(\s*{name}\b", source), name
         assert re.search(rf"bashRemoteScriptFile\(pipeline, remote, {name},", source), name
 

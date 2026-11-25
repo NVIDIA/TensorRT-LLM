@@ -106,6 +106,19 @@ Custom processors must use this common hook and type. The former
 `get_mm_encoder_item_metadata` hook, `MultimodalEncoderItemMetadata` tuple, and
 Params order/length fallbacks have been removed.
 
+A processor that accepts caller-attached embeddings (`multi_modal_embeddings`)
+stores the same record in the `multimodal_data` that
+`_attach_multimodal_embeddings_impl` returns, under
+`MULTIMODAL_ENCODER_ITEM_METADATA_KEY`, with each item's attached rows as
+`output_embedding_lengths`. The wrapper keys each item by the content of those
+rows, by any metadata passed with them (such as Qwen-VL's `image_grid_thw`,
+which sets the item's positions), and by its `multi_modal_uuids` entry when one
+is given, so KV-cache reuse matches only identical embeddings. Attached
+requests fail for a processor that returns no record. Llama 4 is an exception
+for reuse: its forward does not drop the cached embedding rows, so a request
+that reuses the blocks of an identical attached image fails in
+`fuse_input_embeds` with a token-count mismatch.
+
 ## Onboarding a Model
 
 Follow [Adding a New Model](../models/adding-new-model.md) for model definition,

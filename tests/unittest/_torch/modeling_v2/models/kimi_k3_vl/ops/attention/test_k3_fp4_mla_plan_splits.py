@@ -45,6 +45,8 @@ def _modules(monkeypatch):
         monkeypatch.setattr(module, "_fp4_mla_packed_rows_per_seq", _rows_per_seq)
     monkeypatch.setattr(decode, "_reduce_module", lambda: reduce)
     monkeypatch.setitem(sys.modules, _REDUCE, reduce)
+    # The workspace helper asks whether a CUDA graph is being captured; CPU nodes have no device.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     return packed_plan, decode
 
 
@@ -54,6 +56,7 @@ def _metadata(num_requests, is_cuda_graph=True):
         page_table_stride=3904,
         generation_kv_lens=torch.zeros(num_requests, dtype=torch.int32),
         workspaces={"_fp4_mla_packed_plan": torch.empty(1 << 16, dtype=torch.int32)},
+        packed_split=None,
     )
     return SimpleNamespace(page_size=128, is_cuda_graph=is_cuda_graph, fp4_mla_state=state)
 

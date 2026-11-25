@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,11 +27,14 @@ namespace kernels
 // if merge_op[b] == 0, we just skip this batch, if merge_op[b] == 1, we merge the pre-attn and curr-attn, if
 // merge_op[b]
 // == 2, we only copy curr_attn and curr_softmax_sum to merged_attn and merged_softmax_sum
+// isLse selects compact FP32 base-2 LSE for both inputs and the output; otherwise
+// all statistics are natural-log maximum/sum pairs. The format is fixed for the
+// entire in-place merge chain.
 template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
     float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
     int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
-    cudaStream_t stream);
+    cudaStream_t stream, bool isLse = false);
 
 // load single chunk kv from kv_cache for each request
 template <typename T, typename TCache>

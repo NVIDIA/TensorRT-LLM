@@ -186,11 +186,28 @@ modes.
     with `enable_penalty: true` in the speculative decoding config, because they need
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
-    without them. Tree speculation (a dynamic tree) is not
-    supported and such requests are rejected even when the flag is on. Only the
+    without them. Tree speculation (a dynamic tree), relaxed acceptance for thinking and
+    suffix automaton are not supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the
     acceptance rate as the penalty grows.
+
+* An embedding bias (`embedding_bias`, or `logit_bias` of the OpenAI API) is added to the
+  logits before the penalties, and bad words (`bad`, `bad_token_ids`) are excluded from
+  sampling after them: a single-token bad word always, a longer one when the sequence
+  (prompt included) ends with all of its tokens but the last.
+
+  * With one-model speculative decoding both must be enabled at deploy time with
+    `enable_penalty: true` in the speculative decoding config, the flag that also enables
+    the occurrence penalties; while it is off, a request that sets either is rejected at
+    admission. A request may bias at most 1024 tokens and carry at most 256 bad words of
+    at most 16 tokens each; a request beyond these limits is rejected at admission.
+    Tree speculation (a dynamic tree), relaxed acceptance for thinking and
+    SA are not supported, and such requests are rejected even when the flag is on. Both
+    exact-match verification and rejection sampling verify against the edited target
+    distribution, so the sampled result is the one of non-speculative decoding. The
+    draft model proposes from its unedited distribution, which can lower the acceptance
+    rate: a draft token that is a bad word is never accepted.
 
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
@@ -266,6 +283,74 @@ spec_config = MTPDecodingConfig(
     advanced_sampling_mode="no_topk_no_topp",  # temperature-only deploy config
 )
 ```
+
+### Rejection sampling options
+
+With `use_rejection_sampling=True`, a one-model speculative config verifies the drafts of a
+non-greedy batch by rejection sampling, which keeps the output distribution of the target with
+the request's sampling parameters. The prototype option `rejection_sample_method` on
+`DecodingBaseConfig` chooses how the drafts are judged and requires `use_rejection_sampling=True`:
+`standard` (default) is token-level rejection sampling, and `block` is block verification
+([Sun et al., 2024](https://arxiv.org/abs/2403.10444)), which judges the drafted block jointly. It
+is also lossless and accepts at least as many tokens in expectation, at the cost of a few more
+kernels per verification step.
+
+`block` is not supported with the dynamic tree (`use_dynamic_tree=True`), with relaxed
+thinking-phase acceptance (`use_relaxed_acceptance_for_thinking=True`, which accepts drafts
+without the rejection rule) or with DSpark confidence scheduling (which admits only greedy
+requests under rejection sampling); those combinations are rejected when the config is built.
+
+With a standalone DSpark drafter that has a Markov head, sampled drafts are drawn ancestrally
+when the deployment drops the sampling filters with
+`advanced_sampling_mode="no_topk_no_topp"`: each position is sampled from the drafter's
+distribution given the token drawn before it, so the stored proposals are the drafter's own
+joint distribution. A fused Triton chain draws the block with three launches per position and one
+normalization at the end; on GB300 its sampler time stayed below the block sampler's at every
+batch size measured, so the acceptance gain comes without extra per-step cost. The choice is made per deployment, not per request: under the default
+`advanced_sampling_mode="full"`, a request that sets no top-k/top-p still takes the existing
+path. `DSparkDecodingConfig.use_ancestral_draft_sampling=True` (prototype, off by default) extends
+ancestral drawing to all other sampled drafts, which cost one sampler call per draft position; at
+low concurrency that outweighs the acceptance gain.
+
+```python
+from tensorrt_llm.llmapi import MTPDecodingConfig
+
+spec_config = MTPDecodingConfig(
+    max_draft_len=3,
+    use_rejection_sampling=True,
+    rejection_sample_method="block",
+)
+```
+
+### Vocab-parallel target tokens under tensor parallelism
+
+With plain tensor parallelism (no attention DP, no pipeline or context
+parallelism) and an evenly vocab-sharded LM head, the one-model MTP, MTP-Eagle,
+Eagle3 (linear), draft-target, PARD and SA workers select their target tokens
+from each rank's vocab shard of the target logits instead of gathering them:
+
+* Greedy batches take the global argmax across the ranks: the same tokens as
+  the gathered logits.
+* Temperature-only batches are sampled from the gathered logits by default.
+  With `TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1` (opt-in), they draw their target
+  tokens by Gumbel-max on the shards instead when every sampled request sets
+  only a `temperature` of at least 1e-4 (no `top_k` / `top_p` / `min_p`, no
+  `seed`), the spec config enables neither rejection sampling nor penalties,
+  there is no guided decoding, CUDA graphs are enabled and `watermark_config`
+  is not set (with `cuda_graph_config.sampling_variants`, only if it lists
+  `temperature_only`, which it accepts for MTP-Eagle only). The tokens follow
+  the same distribution, softmax(logits / temperature), as the gathered sampler
+  (up to a tail below ~4e-9 probability that is never drawn), but from a
+  different random stream, so an unseeded request does not reproduce the tokens
+  of a run that gathers the logits. A request that sets `seed`, or a
+  temperature below 1e-4, keeps the gathered sampler.
+
+`TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for greedy batches too.
+The models that take the speculative fast paths (`spec_decode_fast_paths`) read
+neither variable. Their MTP-Eagle workers also gather logits when a sampled
+request has a positive temperature below 1e-4, so tied maxima retain their
+sampling probabilities. With only `["greedy", "temperature_only"]` captured,
+such batches run eagerly because they need the `advanced` variant.
 
 ## Beam search
 

@@ -490,41 +490,74 @@ class RocketVanillaAttention(VanillaAttention):
 
         return selected_indices.transpose(1, 2)
 
+    @staticmethod
+    def _locate_kt_rows(
+        rows: Tensor, kt_cache_tensor: Tensor, kt_cache_block_offsets: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Map a request's KT rows to ``(block, slot)`` indices into the KT cache.
+
+        Like the TRTLLM kernels, KT row ``r`` is row ``r % kt_tokens_per_block`` of
+        the request's KT block ``kt_cache_block_offsets[r // kt_tokens_per_block]``.
+        """
+        kt_tokens_per_block = kt_cache_tensor.shape[1]
+        blocks = kt_cache_block_offsets[rows // kt_tokens_per_block].long()
+        return blocks, rows % kt_tokens_per_block
+
     def _single_request_update_kt_cache(
-        self, k, kt_cache_tensor, kt_cache_block_offsets, seq_len, cache_position, update=True
-    ):
-        """Update KT cache for RocketKV algorithm."""
-        # (1, num_pages_per_block, num_kv_heads, 2*head_dim)
-        k_out = kt_cache_tensor[kt_cache_block_offsets[0], :, :, :].unsqueeze(0)
+        self,
+        k: Tensor,
+        kt_cache_tensor: Tensor,
+        kt_cache_block_offsets: Tensor,
+        seq_len: int,
+        cache_position: Tensor,
+        update: bool = True,
+    ) -> None:
+        """Write a request's KT rows at ``cache_position``.
 
-        # k: (1, seq_len, num_kv_heads, head_dim)
-        if k is not None:
-            padding_len = self.page_size - ((k.size(1) - 1) % self.page_size + 1)
-            padding_tensor = torch.full(
-                (1, padding_len, self.num_kv_heads, self.head_dim),
-                float("inf"),
-                device=k.device,
-                dtype=k.dtype,
-            )
-            # (1, seq_len+padding_len, num_kv_heads, head_dim)
-            k_min = torch.cat([k, padding_tensor], dim=1)
-            k_min = k_min.reshape(1, -1, self.page_size, self.num_kv_heads, self.head_dim).amin(
-                dim=2
-            )
-            k_max = torch.cat([k, -padding_tensor], dim=1)
-            k_max = k_max.reshape(1, -1, self.page_size, self.num_kv_heads, self.head_dim).amax(
-                dim=2
-            )
-            if update and (seq_len - 1) % self.page_size > 0:  # gen phase
-                k_min = torch.min(k_min, k_out[:, cache_position, :, : self.head_dim])
-                k_max = torch.max(k_max, k_out[:, cache_position, :, self.head_dim :])
-            k_value = torch.cat([k_min, k_max], dim=-1)
-            access_type = self._access_type[k_value.dtype.itemsize]
-            k_out.view(dtype=access_type).index_copy_(
-                1, cache_position, k_value.view(dtype=access_type)
-            )
+        Args:
+            k: New keys ``(1, num_tokens, num_kv_heads, head_dim)``.
+            kt_cache_tensor: KT cache ``(num_blocks, kt_tokens_per_block, num_kv_heads,
+                2 * head_dim)``.
+            kt_cache_block_offsets: The request's KT block table.
+            seq_len: Number of cached tokens after the update.
+            cache_position: Indices of the KT rows that ``k`` writes.
+            update: Whether a partially filled last row merges with its cached landmarks.
+        """
+        padding_len = self.page_size - ((k.size(1) - 1) % self.page_size + 1)
+        padding_tensor = torch.full(
+            (1, padding_len, self.num_kv_heads, self.head_dim),
+            float("inf"),
+            device=k.device,
+            dtype=k.dtype,
+        )
+        # (1, num_tokens+padding_len, num_kv_heads, head_dim)
+        k_min = torch.cat([k, padding_tensor], dim=1)
+        k_min = k_min.reshape(1, -1, self.page_size, self.num_kv_heads, self.head_dim).amin(dim=2)
+        k_max = torch.cat([k, -padding_tensor], dim=1)
+        k_max = k_max.reshape(1, -1, self.page_size, self.num_kv_heads, self.head_dim).amax(dim=2)
+        blocks, slots = self._locate_kt_rows(
+            cache_position, kt_cache_tensor, kt_cache_block_offsets
+        )
+        if update and (seq_len - 1) % self.page_size > 0:  # gen phase
+            cached = kt_cache_tensor[blocks, slots].unsqueeze(0)
+            k_min = torch.min(k_min, cached[..., : self.head_dim])
+            k_max = torch.max(k_max, cached[..., self.head_dim :])
+        k_value = torch.cat([k_min, k_max], dim=-1)
+        access_type = self._access_type[k_value.dtype.itemsize]
+        kt_cache_tensor.view(dtype=access_type)[blocks, slots] = k_value[0].view(dtype=access_type)
 
-        return k_out[:, : math.ceil(seq_len / self.page_size), :, :]
+    def _single_request_read_kt_cache(
+        self, kt_cache_tensor: Tensor, kt_cache_block_offsets: Tensor, seq_len: int
+    ) -> Tensor:
+        """Gather the KT rows covering a request's first ``seq_len`` tokens.
+
+        Returns:
+            The request's ``ceil(seq_len / page_size)`` KT rows
+            ``(1, num_kt_rows, num_kv_heads, 2 * head_dim)``.
+        """
+        rows = torch.arange(math.ceil(seq_len / self.page_size), device=kt_cache_tensor.device)
+        blocks, slots = self._locate_kt_rows(rows, kt_cache_tensor, kt_cache_block_offsets)
+        return kt_cache_tensor[blocks, slots].unsqueeze(0)
 
     def _rocketkv_selection(
         self,
@@ -557,12 +590,12 @@ class RocketVanillaAttention(VanillaAttention):
             math.ceil(target_seq_len / self.page_size),
             device=q.device,
         )
-        kt_states = self._single_request_update_kt_cache(
-            k,
-            kt_cache_tensor,
-            metadata.kt_cache_block_offsets[sample_idx],
-            target_seq_len,
-            kt_cache_position,
+        kt_cache_block_offsets = metadata.kt_cache_block_offsets[sample_idx]
+        self._single_request_update_kt_cache(
+            k, kt_cache_tensor, kt_cache_block_offsets, target_seq_len, kt_cache_position
+        )
+        kt_states = self._single_request_read_kt_cache(
+            kt_cache_tensor, kt_cache_block_offsets, target_seq_len
         )
 
         # Reshape query for multi-head processing
