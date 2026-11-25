@@ -162,11 +162,17 @@ def test_shared_geometry_caches_are_released_at_module_teardown(failure: bool) -
     class Layer:
         pass
 
-    namespace = {"_DSV3": Layer(), "_DSR1": Layer(), "_DSR1_SLICE": {256: Layer()}}
+    namespace = {
+        "_DSV3": Layer(),
+        "_DSR1": Layer(),
+        "_DSR1_SLICE": {256: Layer()},
+        "_DSV41_SLICE": {2304: Layer()},
+    }
     references = [
         weakref.ref(namespace["_DSV3"]),
         weakref.ref(namespace["_DSR1"]),
         weakref.ref(namespace["_DSR1_SLICE"][256]),
+        weakref.ref(namespace["_DSV41_SLICE"][2304]),
     ]
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
     fixture = namespace["_release_reference_layers"]()
@@ -180,4 +186,5 @@ def test_shared_geometry_caches_are_released_at_module_teardown(failure: bool) -
     gc.collect()
     assert namespace["_DSV3"] is None and namespace["_DSR1"] is None
     assert namespace["_DSR1_SLICE"] == {}
+    assert namespace["_DSV41_SLICE"] == {}
     assert all(reference() is None for reference in references)

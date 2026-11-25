@@ -201,6 +201,21 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
+  # DeepSeek-V4.1-Flash (sm_103): one entry per target and per family-op category (ops/<category>, the mirror of the
+  # family's ops/ package), so CBTS runs only what a change reaches. The multi-rank MegaMoE and all-to-all matrices
+  # launch their own mpirun and, with the 4-rank ops/comm collectives, run on l0_gb300_multi_gpus; the routing test is
+  # cpu_only (l0_cpu).
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep2 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep/test_modeling_v2_dep_megamoe_target_layer.py --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__dep/test_modeling_v2_dep_megamoe_placement.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/flash_nvfp4__sm_103__tep8_moe_tp4_ep2 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/activation TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/attention TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/embedding TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/engram --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/ops/engram/test_modeling_v2_engram_adp_exchange.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_cute_dsl_megamoe_nvfp4.py --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_moe_a2a.py --ignore=unittest/_torch/modeling_v2/models/deepseek_v41/ops/moe/test_modeling_v2_moe_a2a_vs_stock.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/ops/residual TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_expert_scalars.py
+  - unittest/_torch/modeling_v2/models/deepseek_v41/test_modeling_v2_deepseek_v41_fc1_scale_fold.py
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_ctx_kv/test_k3_ctx_kv.py

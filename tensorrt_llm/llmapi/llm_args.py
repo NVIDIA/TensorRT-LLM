@@ -9120,8 +9120,9 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
-        "no-op otherwise. "
+        "it (currently Mistral3, the Qwen3-VL / Qwen3.5-VL family and the "
+        "DeepSeek-V4.1 ModelingV2 targets, which serve a vision checkpoint "
+        "only with it set); a no-op otherwise. "
         "Defaults to False.",
         status="prototype")
 

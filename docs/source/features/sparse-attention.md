@@ -411,6 +411,36 @@ fresh prompts, reused prefixes, chunk boundaries and speculative verification;
 component tests of cache bytes and graph replay do not establish whole-model
 accuracy or end-to-end disaggregated-serving support.
 
+##### ModelingV2 targets on GB300
+
+On SM103 (GB300), DeepSeek-V4.1-Flash-NVFP4 checkpoints (NVFP4 routed experts,
+FP8 or MXFP4 Engram tables) are served by default by the ModelingV2 targets of
+`tensorrt_llm/_torch/modeling_v2/models/deepseek_v41` instead of the built-in
+model, at three parallel layouts:
+
+| Target | Layout |
+|---|---|
+| `flash_nvfp4__sm_103__dep2` | 2 ranks, attention DP, MoE EP2 (the context role; no speculative decoding) |
+| `flash_nvfp4__sm_103__dep` | 8 or 32 ranks, attention DP, MoE EP over every rank; DSpark or no speculation |
+| `flash_nvfp4__sm_103__tep8_moe_tp4_ep2` | 8 ranks, tensor-parallel attention, MoE TP4 x EP2; DSpark or no speculation |
+
+They need an FP8 KV cache (`kv_cache_config.dtype: fp8`) with 128-token blocks,
+and a checkpoint with a vision tower only with `disable_mm_encoder: true`
+(image requests are then refused). A deployment with a setting a target does
+not implement runs the built-in model instead, with a log line naming the
+setting: other MoE backends (each target runs AUTO and the backend it
+implements: CUTEDSL for `dep2`, TRTLLM or MEGAMOE_CUTEDSL for `dep`, TRTLLM
+for `tep8_moe_tp4_ep2`), expert load balancers other than MegaMoE's static and
+warmup placement, low-precision MoE combine where a target combines in bf16,
+the CSA2 options `use_fp8_staging: false`, `use_cute_dsl_paged_mqa_logits`,
+`use_gvr_emission` and the temporal-hint GVR engine, `FORCE_DETERMINISTIC`,
+LoRA, `torch_compile_config`, piecewise prefill CUDA graphs, dummy weights, the
+Ray orchestrator, `bounded_replay_on_generation`, and more than 13 DSpark
+drafts per step. The full list is `limits.py` of that family.
+
+Set `modeling_v2: off` to serve these layouts with the built-in model, or
+`modeling_v2: require` to fail instead of falling back.
+
 #### MiniMax-M3 Block-Sparse GQA
 
 MiniMax-M3 uses model-native block-sparse GQA in its sparse layers. An index

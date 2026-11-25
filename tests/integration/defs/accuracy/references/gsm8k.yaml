@@ -162,6 +162,23 @@ deepseek-ai/DeepSeek-V4.1-Flash:
     accuracy: 95.6785
     threshold: 91.0
     num_samples: 1319
+  # DeepSeek-V4.1-Flash-NVFP4 (nvidia, hf_quant_config MIXED_PRECISION: NVFP4 routed experts, FP8 attention
+  # and shared experts, bf16 head) served by the modeling_v2 deepseek_v41 targets. Measured on 3 GB300
+  # trays as a disaggregated pair (ctx dep2 + gen tep8_moe_tp4_ep2, NIXL), full 5-shot split, flexible-extract:
+  # 0.9196 (DSpark on); the built-in implementation scored 0.9158 +/- 0.0076 on the same pair. The floor is
+  # that anchor minus 2 SE (SE = 0.0076), shared by both rows because DSpark is lossless. The three
+  # deepseek_v41 targets (dep2, tep8_moe_tp4_ep2, dep) read these rows: same checkpoint, same evaluator.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 91.96
+    threshold: 90.05
+    num_samples: 1319
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    accuracy: 91.96
+    threshold: 90.05
+    num_samples: 1319
 deepseek-ai/DeepSeek-V4-Flash-Base:
   # Base (pretrained, non-instruct) checkpoint, so GSM8K lands well below the
   # instruct DeepSeek-V4-Flash above. GSM8K measurements from

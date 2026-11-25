@@ -151,7 +151,16 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     rows only at <= 256 experts, a single-cluster one up to 8192 rows.
 
     `act_type` 0 (SwiGlu) only. `gemm1_bias`, `gemm1_alpha`, `gemm1_beta`,
-    `gemm1_clamp_limit` and `gemm2_bias` are `None`. `hidden_states_scale` is
+    `gemm1_clamp_limit` and `gemm2_bias` are `None` at every cell above.
+
+    `gemm1_clamp_limit` is in accumulator units. The kernel clamps the FC1
+    accumulator, before `output1_scale_gate_scalar[e]` turns it into real
+    values. A model whose checkpoint defines the clamp in real units (a SwiGLU
+    limit `L`: up clamped to `[-L, L]`, gate to at most `L`) passes
+    `L / output1_scale_gate_scalar` per local expert; passing `L` itself
+    clamps at a different value than the checkpoint defines.
+    `test_gemm1_clamp_limit_is_in_accumulator_units` pins the unit on random
+    weights. `hidden_states_scale` is
     the linear (unswizzled) e4m3 block-scale layout, one scale per 16 elements
     of each row.
 
