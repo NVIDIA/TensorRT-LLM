@@ -1122,6 +1122,56 @@ def test_detect_qwen3_empty_think_prefill(tmp_path, jinja, expected):
     assert resolve_auto_reasoning_parser(model_dir) == expected
 
 
+# Message loops without a generation prompt. The first re-renders the reasoning
+# of past assistant turns in a <think> block, as the chat_template.jinja of
+# nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4 does.
+_REASONING_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if message.role == 'assistant' and message.reasoning_content %}"
+    "{{- '<|im_start|>assistant\\n<think>\\n' + message.reasoning_content"
+    " + '\\n</think>\\n\\n' + message.content + '<|im_end|>\\n' }}"
+    "{%- else %}"
+    "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+    " + '<|im_end|>\\n' }}"
+    "{%- endif %}{%- endfor %}")
+_PLAIN_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message.role + '\\n' + message.content"
+    " + '<|im_end|>\\n' }}"
+    "{%- endfor %}")
+
+
+@pytest.mark.parametrize(("jinja", "expected"), [
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+                 None,
+                 id="history_only"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE +
+                 "{# add_generation_prompt: <think> #}",
+                 None,
+                 id="comment_after_prompt"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="history_and_prompt"),
+    pytest.param(_PLAIN_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
+                 "deepseek-r1",
+                 id="prompt_only"),
+    pytest.param("<|im_start|>assistant\n<think>\n",
+                 "deepseek-r1",
+                 id="no_generation_prompt"),
+])
+def test_detect_qwen3_think_in_generation_prompt(tmp_path, jinja, expected):
+    """Only a <think> in the generation prompt marks a forced-thinking model."""
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
+    _write_qwen3_checkpoint(model_dir,
+                            "qwen3_moe",
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        expected, no_parser_needed=expected is None)
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
 @pytest.mark.parametrize(("name", "model_type"), [
     ("DeepSeek-V3.1", "deepseek_v3"),
     ("SomeUnknownModel", "some_unknown_type"),
