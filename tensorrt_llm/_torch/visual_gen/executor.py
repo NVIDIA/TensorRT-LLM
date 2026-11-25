@@ -1030,19 +1030,18 @@ class DiffusionExecutor:
     def _fail_rank(self, what: str, exc: BaseException) -> None:
         """A pipeline call raised on this rank while peers may be inside a
         collective, so no further collective (status, CLOSE) can be trusted to
-        complete. End this worker without touching the process group: a dedicated
-        worker process exits with status 1, which the coordinator (or the
-        external launcher) turns into an abort of the whole group; a worker
-        thread inside the client's process raises ``FatalRankError`` instead, so
-        the thread ends and the application survives. With a single rank this
-        returns and does nothing: there is no peer to fall out of step with, and
-        the caller reports the error at the boundary."""
+        complete. End this rank's process with status 1 without touching the
+        process group. A worker the client spawned is seen dead by the client,
+        which kills the other workers and raises the failure to its callers.
+        Under an external launcher every rank ends this way, rank 0 with the
+        application it shares a process with: the client has no handle on the
+        launcher's other ranks, so the exit is what they and the launcher see.
+        With a single rank this returns and does nothing: there is no peer to
+        fall out of step with, and the caller reports the error at the boundary."""
         if self.world_size == 1:
             return
         logger.error(f"Worker {self.device_id}: {what}: {exc}; aborting this rank")
         logger.error(traceback.format_exc())
-        if self.in_client_process:
-            raise FatalRankError(f"{what}: {exc}") from exc
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(1)
@@ -1062,22 +1061,17 @@ class DiffusionExecutor:
         if opened is None:
             return _SessionExit.CLOSE
         session, pool, pipeline_state = opened
-        fatal = False
         ending = _SessionExit.CLOSE
         try:
             ending = self._run_session(session, pool, pipeline_state)
             pool.wait_for_readers()
-        except FatalRankError:
-            fatal = True
-            raise
         except Exception as e:
             # Not from a pipeline call (a broadcast, a slot, the state); with
             # peers it still cannot be followed by a CLOSE broadcast.
-            fatal = self.world_size > 1
             self._fail_rank(f"session {session.session_id}", e)
             raise
         finally:
-            self._end_session(session, pipeline_state, fatal=fatal)
+            self._end_session(session, pipeline_state)
         return ending
 
     def _open_session(self, req: DiffusionRequest) -> Optional[Tuple[SessionState, SlotPool, Any]]:
@@ -1215,13 +1209,9 @@ class DiffusionExecutor:
                 self._advance_session(session, pool, pipeline_state)
                 active_at = time.monotonic()
 
-    def _end_session(self, session: SessionState, pipeline_state: Any, *, fatal: bool) -> None:
-        """Tear the session down. ``fatal``: this rank is dying with peers possibly
-        stuck in a collective, so nothing shared is touched: no CLOSE broadcast,
-        no pipeline close, no ``SessionClosed``; the coordinator reports the dead
-        worker and tears the group down."""
-        if fatal:
-            return
+    def _end_session(self, session: SessionState, pipeline_state: Any) -> None:
+        """Tear the session down: the CLOSE broadcast, the pipeline's close and
+        ``SessionClosed`` to the client."""
         session.discard_inputs()
         self._send_tag(_RankTag.CLOSE)
         self._close_pipeline(pipeline_state, f"session {session.session_id}")
@@ -1568,15 +1558,6 @@ def _consume_exception(fut: "asyncio.Future") -> None:
 class SessionsUnsupported(ValueError):
     """A session was requested from a pipeline that does not implement the session
     hooks. Refused by the worker before any pipeline work, as the caller's mistake."""
-
-
-class FatalRankError(BaseException):
-    """A rank hit an exception while its peers may be inside a collective. Raised
-    only when the rank shares the client's process; a dedicated worker process
-    exits instead. Either way the coordinator sees a dead worker and aborts the
-    group, so the client gets the failure raised, not a terminal result. Not an
-    ``Exception``: like ``SystemExit`` it ends the rank's thread, so no handler
-    on the way out mistakes it for a failure to report."""
 
 
 class PendingSubmit(NamedTuple):

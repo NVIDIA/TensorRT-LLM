@@ -43,7 +43,6 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionRemoteClient,
     DiffusionRequest,
     DiffusionResponse,
-    FatalRankError,
     SessionChannel,
     _SessionExit,
 )
@@ -1002,8 +1001,7 @@ def test_liveness_check_sees_a_dead_in_process_worker_thread():
 # ``open_event`` / ``advance_event``). Either way the other rank is inside a
 # collective the failing rank will never join. Required: the failing rank enters no
 # further collective (no status all-reduce after a pipeline failure, no CLOSE
-# broadcast ever) and ends its worker at once; as a thread in the client's process
-# it raises FatalRankError, as a dedicated process it exits 1. The surviving rank
+# broadcast ever) and ends its process at once with status 1. The surviving rank
 # hits the collective timeout, which is the same rank-local exception, and takes
 # the same path.
 
@@ -1084,9 +1082,21 @@ class _EventLog(list):
                 f.flush()
 
 
-def _instrument(ex, events):
-    """Record every status all-reduce and tag broadcast the rank performs."""
+def _instrument(ex, events, published=None):
+    """Record every status all-reduce and tag broadcast the rank performs, and
+    in ``published`` the kind of every message it queues for the client."""
     finalize, send, recv = ex._finalize_advance, ex._send_tag, ex._recv_tag
+    if published is not None:
+        put = ex.response_queue.put
+
+        def _put(message, *args, **kwargs):
+            kind = type(message).__name__
+            if isinstance(message, SessionResultMessage):
+                kind += ":" + message.type.value
+            published.append(kind)
+            return put(message, *args, **kwargs)
+
+        ex.response_queue.put = _put
 
     def _finalize(outcome):
         events.append("status")
@@ -1120,7 +1130,9 @@ def _wait_for(path, timeout_s=IMPORT_WAIT_S):
         time.sleep(0.02)
 
 
-def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, holder, timeout_s):
+def _run_rank(
+    rank, port, fail_rank, fail_phase, events, in_client_process, holder, timeout_s, published=None
+):
     """One rank's whole life for the test: join the group, run the session. The
     executor is handed out through ``holder`` before the run so its published
     messages can be inspected after it raised. Callers line the ranks up before
@@ -1141,7 +1153,7 @@ def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, hold
     )
     pipe = CollectivePipeline(rank, fail_rank, fail_phase, events)
     ex = _make_executor(pipe, rank=rank, world_size=2, in_client_process=in_client_process)
-    _instrument(ex, events)
+    _instrument(ex, events, published)
     holder["executor"] = ex
     if fail_phase == "prepare":
         # A request every rank rejects in preparation, then a session that runs
@@ -1173,7 +1185,18 @@ def _child_main(argv):
         pass
     _wait_for(events_path + ".go")
     events = _EventLog(events_path)
-    _run_rank(int(rank), int(port), int(fail_rank), fail_phase, events, False, {}, float(timeout_s))
+    published = _EventLog(events_path + ".published")
+    _run_rank(
+        int(rank),
+        int(port),
+        int(fail_rank),
+        fail_phase,
+        events,
+        False,
+        {},
+        float(timeout_s),
+        published,
+    )
     events.append("returned")  # only a coordinated path gets here
 
 
@@ -1263,6 +1286,13 @@ class _RankProcess:
             return []
         return [tuple(json.loads(line)) for line in open(self.events_path) if line.strip()]
 
+    def published(self):
+        """The kinds of the messages the rank queued for the client, in order."""
+        path = f"{self.events_path}.published"
+        if not os.path.exists(path):
+            return []
+        return [json.loads(line)[1] for line in open(path) if line.strip()]
+
     def stderr(self):
         return self.stderr_path.read_text()[-2000:]
 
@@ -1331,69 +1361,41 @@ def _published(ex):
 @pytest.mark.parametrize("fail_phase", ["open", "advance", "open_event", "advance_event"])
 @pytest.mark.parametrize("fail_rank", [0, 1])
 def test_rank_local_exception_is_fatal_not_a_hung_collective(start_rank, fail_rank, fail_phase):
-    """Rank 0 as a thread in this process (the external-launch shape), rank 1 as a
-    dedicated process."""
+    """Both ranks as processes of their own, as under an external launcher, where
+    nothing but a rank's own exit ends it."""
     port = _free_port()
-    child = start_rank(1, port, fail_rank, fail_phase, COLLECTIVE_TIMEOUT_S)
-    child.ready()
-    rank0_events = _EventLog()
-    outcome = {}
-
-    def rank0():
-        child.go()
-        try:
-            _run_rank(
-                0, port, fail_rank, fail_phase, rank0_events, True, outcome, COLLECTIVE_TIMEOUT_S
-            )
-        except BaseException as exc:  # noqa: BLE001
-            outcome["error"] = exc
-        outcome["ended"] = time.time()
-
-    t = threading.Thread(target=rank0, daemon=True)
-    t.start()
-    try:
-        t.join(timeout=120)
-        assert not t.is_alive(), "rank 0 hung"
-        child.join(timeout=60)
-        assert not child.is_alive(), "rank 1 hung"
-    finally:
-        if child.is_alive():
-            child.kill()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-    rank1_events = child.events()
-
-    # The in-process rank 0 raised and the caller (this test) is alive; the
-    # dedicated rank-1 process exited with status 1.
-    assert isinstance(outcome.get("error"), FatalRankError), outcome
-    assert child.exitcode == 1, child.stderr()
+    ranks = [start_rank(rank, port, fail_rank, fail_phase, COLLECTIVE_TIMEOUT_S) for rank in (0, 1)]
+    for proc in ranks:
+        proc.ready()
+    for proc in ranks:
+        proc.go()
+    for proc in ranks:
+        proc.join(timeout=120)
+        assert not proc.is_alive(), "a rank hung"
+        assert proc.exitcode == 1, proc.stderr()
+    failing, surviving = ranks[fail_rank], ranks[1 - fail_rank]
 
     # The failing rank entered no further collective after raising ...
-    failing = rank0_events if fail_rank == 0 else rank1_events
-    assert f"raise:{fail_phase}" in _names(failing)
-    assert _after(failing, f"raise:{fail_phase}") == []
+    assert f"raise:{fail_phase}" in _names(failing.events())
+    assert _after(failing.events(), f"raise:{fail_phase}") == []
     # ... and left well inside the collective timeout, so it waited in none.
-    raise_ts = next(ts for ts, n in failing if n == f"raise:{fail_phase}")
-    left_ts = outcome["ended"] if fail_rank == 0 else child.exited_at
-    assert left_ts - raise_ts < COLLECTIVE_TIMEOUT_S * 0.75
+    raise_ts = next(ts for ts, n in failing.events() if n == f"raise:{fail_phase}")
+    assert failing.exited_at - raise_ts < COLLECTIVE_TIMEOUT_S * 0.75
 
     # The surviving rank was inside a collective (the pipeline's, or the status
     # barrier after an event failure), got the timeout there and took the same
     # fatal path: nothing after it, in particular no CLOSE.
-    surviving = rank1_events if fail_rank == 0 else rank0_events
     base = fail_phase.removesuffix("_event")
     last = "status" if fail_phase.endswith("_event") else f"enter:{base}"
-    assert _names(surviving)[-1] == last, _names(surviving)
-    assert "tag:close" not in _names(surviving)
+    assert _names(surviving.events())[-1] == last, _names(surviving.events())
+    assert "tag:close" not in _names(surviving.events())
 
     # Nothing coordinated was published by rank 0: no SessionClosed, no terminal.
-    published = _published(outcome["executor"])
-    assert not any(isinstance(m, SessionClosed) for m in published)
-    assert not any(
-        isinstance(m, SessionResultMessage) and m.type is ResultType.TERMINAL for m in published
-    )
+    published = ranks[0].published()
+    assert "SessionClosed" not in published
+    assert f"SessionResultMessage:{ResultType.TERMINAL.value}" not in published
     if fail_phase.startswith("advance"):
-        assert any(isinstance(m, SessionOpened) for m in published)
+        assert "SessionOpened" in published
 
 
 def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(start_rank):
