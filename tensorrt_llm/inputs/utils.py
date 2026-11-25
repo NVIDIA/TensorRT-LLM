@@ -188,6 +188,10 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
                             and isinstance(qualname, str)):
                         raise ValueError("Tensor payload pickle is malformed.")
                     arg = f"{module} {qualname}"
+                # genops decodes backslash escapes that the unpickler keeps.
+                elif pickled[pos + 1:end] != (arg.replace(" ", "\n", 1) +
+                                              "\n").encode():
+                    raise ValueError("Tensor payload pickle is malformed.")
                 if (arg not in (_TENSOR_REBUILD, _TENSOR_HOOKS)
                         and arg not in _TENSOR_STORAGE_DTYPES):
                     raise ValueError(

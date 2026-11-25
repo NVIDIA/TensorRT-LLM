@@ -385,6 +385,10 @@ _PICKLE_REJECTED = {
     "frame-inside-frame": (_NESTED + _BODY, "malformed"),
     # The frame ends two bytes into GLOBAL's "torch._utils" argument.
     "opcode-across-frame": (b"\x80\x04\x95" + struct.pack("<Q", 2) + _BODY, "malformed"),
+    "escaped-global": (
+        _pickle((4, 2), (2, 1), 8, rebuild=b"ctorch\\x2e_utils\n_rebuild_tensor_v2\n"),
+        "malformed",
+    ),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
     # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
     "reducer-wrapping-tensor": (_pickle((10**8, 2), (0, 0), 1, wrap=True), "exactly one"),
@@ -437,7 +441,8 @@ _ARCHIVE_REJECTED = {
     "unknown-record": (_rewrite(_ZEROS, add=["archive/notes"]), "only the records"),
     "duplicate-record": (_rewrite(_ZEROS, add=["archive/version"]), "only the records"),
     # zipfile would read archive/version~ as archive/version; torch.load would not.
-    "unicode-path-alias": (_alias(_ZEROS, "/version"), "stored as is"),
+    # Python 3.10's zipfile ignores the field, leaving the unknown name.
+    "unicode-path-alias": (_alias(_ZEROS, "/version"), "stored as is|only the records"),
     "directory-over-limit": (_rewrite(_ZEROS, add=[f"x/{i}" for i in range(400)]), "is over"),
     "zip64-directory-over-limit": (
         _patch(_ZEROS, _zip64_edit(40, lambda _: 8192, True)),
