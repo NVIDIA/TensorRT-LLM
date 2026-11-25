@@ -134,13 +134,7 @@ class WebSearchConfig:
         return self.provider != "off"
 
 
-def _env(suffix: str) -> Optional[str]:
-    """Read one ``TRTLLM_WEB_SEARCH*`` setting."""
-    return getattr(envs, f"TRTLLM_WEB_SEARCH{suffix}")
-
-
-def _env_float(suffix: str, default: float) -> float:
-    raw = _env(suffix)
+def _env_float(suffix: str, raw: str | None, default: float) -> float:
     if not raw:
         return default
     try:
@@ -150,8 +144,7 @@ def _env_float(suffix: str, default: float) -> float:
         return default
 
 
-def _env_int(suffix: str, default: int) -> int:
-    raw = _env(suffix)
+def _env_int(suffix: str, raw: str | None, default: int) -> int:
     if not raw:
         return default
     try:
@@ -167,13 +160,15 @@ def load_web_search_config() -> WebSearchConfig:
     Called per request so a provider can be switched without a restart; the
     work is a handful of ``os.environ`` lookups.
     """
-    provider = (_env("") or "off").strip().lower()
+    provider = (envs.TRTLLM_WEB_SEARCH or "off").strip().lower()
     config = WebSearchConfig(
         provider=provider,
-        max_results=_env_int("_MAX_RESULTS", DEFAULT_MAX_RESULTS),
-        timeout_s=_env_float("_TIMEOUT_S", DEFAULT_TIMEOUT_S),
-        max_uses=_env_int("_MAX_USES", DEFAULT_MAX_USES),
-        retries=_env_int("_RETRIES", DEFAULT_RETRIES),
+        max_results=_env_int(
+            "_MAX_RESULTS", envs.TRTLLM_WEB_SEARCH_MAX_RESULTS, DEFAULT_MAX_RESULTS
+        ),
+        timeout_s=_env_float("_TIMEOUT_S", envs.TRTLLM_WEB_SEARCH_TIMEOUT_S, DEFAULT_TIMEOUT_S),
+        max_uses=_env_int("_MAX_USES", envs.TRTLLM_WEB_SEARCH_MAX_USES, DEFAULT_MAX_USES),
+        retries=_env_int("_RETRIES", envs.TRTLLM_WEB_SEARCH_RETRIES, DEFAULT_RETRIES),
     )
     if provider == "brave":
         config.api_key = envs.BRAVE_SEARCH_API_KEY

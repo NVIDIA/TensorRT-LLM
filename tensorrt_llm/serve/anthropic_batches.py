@@ -72,8 +72,7 @@ def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = getattr(envs, name)
+def _int_env(name: str, raw: str | None, default: int) -> int:
     if not raw:
         return default
     try:
@@ -166,10 +165,14 @@ class AnthropicBatchStore:
         self._runner = runner
         self._batches: Dict[str, _BatchRecord] = {}
         self._concurrency = concurrency or _int_env(
-            BATCH_CONCURRENCY_ENV, DEFAULT_BATCH_CONCURRENCY
+            BATCH_CONCURRENCY_ENV,
+            envs.TRTLLM_ANTHROPIC_BATCH_CONCURRENCY,
+            DEFAULT_BATCH_CONCURRENCY,
         )
         self._max_retained = max_retained or _int_env(
-            MAX_RETAINED_BATCHES_ENV, DEFAULT_MAX_RETAINED_BATCHES
+            MAX_RETAINED_BATCHES_ENV,
+            envs.TRTLLM_ANTHROPIC_BATCH_MAX_RETAINED,
+            DEFAULT_MAX_RETAINED_BATCHES,
         )
         self._semaphore = asyncio.Semaphore(self._concurrency)
 
