@@ -110,6 +110,7 @@ def test_hc_tiles_build_gating(monkeypatch):
     [
         (8, 1, False, (10, 3), True),  # dep8
         (4, 1, False, (10, 3), True),  # dep4
+        (2, 1, False, (10, 3), False),  # dep2: never measured with these forms
         (4, 1, False, (10, 7), False),  # not measured on SM107
         (1, 4, False, (10, 3), False),  # tep4
         (1, 1, True, (10, 3), False),

@@ -1154,9 +1154,9 @@ def _tep_finar_mode() -> str:
     raise ValueError(f"{TEP_FINAR_ENV}={raw!r}: expected 0, 1 or early")
 
 
-#: Switch, on by default: at an attention-DP rank on SM103 the hyper-connection mixers of a
-#: decode or short prefill step take row-count plans of their two tcgen05 kernels that sum the
-#: same K slices in the same order as the 128-row plans, so every output is bitwise:
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) the hyper-connection
+#: mixers of a decode or short prefill step take row-count plans of their two tcgen05 kernels
+#: that sum the same K slices in the same order as the 128-row plans, so every output is bitwise:
 #: - `qwen4_exp_hc_decode_tc_first` on a 64-row M tile at `_HC_TILE64_ROWS` rows (half the
 #:   normed bytes a CTA streams), and for a mixer with the injection the rows-on-N kernel (the
 #:   weight rows on a 64-row MMA M, the normed rows on the MMA N in 16-row steps) at
@@ -1174,11 +1174,11 @@ DP_HC_TILES_ENV = "TRTLLM_QWEN4_EXP_DP_HC_TILES"
 _HC_TILE64_ROWS = (5, _HC_TILE64_MAX_ROWS)  # capacity: fixed: dispatch thresholds
 #: Rows at which an up kernel that does not release early takes two 64-row tiles.
 _HC_UP2_ROWS = (65, 128)  # capacity: fixed: dispatch thresholds
-#: Switch, on by default: at an attention-DP rank on SM103 with PDL, trunk site A of a decode
-#: step (the mixer in front of a GDN or attention block) releases its dependents before its own
-#: wait (`qwen4_exp_hc_up_gate_mean(release_early=True)`), and the block's bf16 input projection
-#: runs on `mid_rows_mm`'s bf16 tcgen05 GEMM over the checkpoint's `[N, K]` weight (a view, no
-#: copy) at the plan `_INPROJ_RELEASE_PLANS` names for the weight geometry and row count. That
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) with PDL, trunk site
+#: A of a decode step (the mixer in front of a GDN or attention block) releases its dependents
+#: before its own wait (`qwen4_exp_hc_up_gate_mean(release_early=True)`), and the block's bf16
+#: input projection runs on `mid_rows_mm`'s bf16 tcgen05 GEMM over the checkpoint's `[N, K]`
+#: weight (a view, no copy) at the plan `_INPROJ_RELEASE_PLANS` names for the weight geometry and row count. That
 #: GEMM is launched with PDL, streams its weight before its wait and reads `mixed` after it, so
 #: it is the launch that runs beside the released up kernel (the stock entry, `low_m_bf16_mm`,
 #: runs cuBLAS without PDL at these rows, and a release in front of it moves nothing). It
@@ -1215,12 +1215,19 @@ _INPROJ_RELEASE_PLANS: dict = {
 }
 
 
+#: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
+#: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
+#: dep2 was never run with them; it keeps the stock forms.
+_DP_DECODE_SIZES = (4, 8)  # capacity: fixed: the measured layouts, not a buffer size
+
+
 def _dp_decode_rank(core, device) -> bool:
-    """Whether this core is an attention-DP rank (no attention TP) on an SM103 GPU: where the
-    attention-DP decode forms (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`, ...) are measured."""
+    """Whether this core is an attention-DP rank (no attention TP) of a measured group size
+    (`_DP_DECODE_SIZES`: dep4, dep8) on an SM103 GPU: where the attention-DP decode forms
+    (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`, ...) are measured."""
     return (
         not core.one_rank
-        and core.dp_size > 1
+        and core.dp_size in _DP_DECODE_SIZES
         and core.attn_tp_size == 1
         and device.type == "cuda"
         and torch.cuda.get_device_capability(device) == archs.SM_103
