@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import inspect
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -631,9 +633,9 @@ def _parse_for(model_type: str, messages: list) -> tuple:
     """Parse ``messages`` for ``model_type``, leaving any media unloaded."""
     config = type("_StubConfig", (), {"model_type": model_type})()
     conversation, mm_coroutine, placeholder_counts, item_order = parse_chat_messages_coroutines(
-        messages, config, None
+        messages, config, None, resolve_media=False
     )
-    mm_coroutine.close()
+    asyncio.run(mm_coroutine)
     return conversation, placeholder_counts, item_order
 
 
@@ -733,6 +735,24 @@ class TestMediaTheModelCannotTake:
                 _parse_for(_TEXT_ONLY_MODEL_TYPE, _ending_in_tool_result(_IMAGE_PART, _IMAGE_PART))
         emitted = [call for call in log.call_args_list if "tool result" in str(call)]
         assert len(emitted) == 1
+
+    def test_unsupported_media_loader_coroutine_is_closed(self):
+        async def _load_image():
+            return "decoded"
+
+        tool_coro = _load_image()
+        note = _chat_utils._media_or_note(
+            "tool", {"modality": "image", "data": tool_coro}, _TEXT_ONLY_MODEL_TYPE
+        )
+        assert note == "[image omitted: this model accepts text only]"
+        assert inspect.getcoroutinestate(tool_coro) == inspect.CORO_CLOSED
+
+        user_coro = _load_image()
+        with pytest.raises(ValueError, match="carries image input"):
+            _chat_utils._media_or_note(
+                "user", {"modality": "image", "data": user_coro}, _TEXT_ONLY_MODEL_TYPE
+            )
+        assert inspect.getcoroutinestate(user_coro) == inspect.CORO_CLOSED
 
 
 class TestParseChatMessageContentPart:

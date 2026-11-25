@@ -518,9 +518,9 @@ def _tool_message_as_rendered(request, model_type):
     """The tool message the chat template is given for ``model_type``."""
     config = type("_StubConfig", (), {"model_type": model_type})()
     conversation, mm_coroutine, placeholder_counts, _ = parse_chat_messages_coroutines(
-        convert_anthropic_request(request).messages, config, None
+        convert_anthropic_request(request).messages, config, None, resolve_media=False
     )
-    mm_coroutine.close()
+    asyncio.run(mm_coroutine)
     return conversation[2], placeholder_counts[2]
 
 
