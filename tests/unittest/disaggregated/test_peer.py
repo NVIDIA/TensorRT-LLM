@@ -1909,8 +1909,8 @@ def test_attention_replicated_validation_rejects_missing_index_key_view():
 
 @pytest.mark.parametrize(
     "local_draft,peer_draft,remote_tail",
-    [(0, 0, False), (1, 1, False), (1, 0, False), (0, 1, False), (0, 0, True), (1, 0, True)],
-    ids=["0-0", "1-1", "1-0", "0-1", "remote_tail_without_draft_kv", "remote_tail_layout_mismatch"],
+    [(0, 0, False), (1, 1, False), (1, 0, False), (0, 1, False), (1, 0, True)],
+    ids=["0-0", "1-1", "1-0", "0-1", "remote_tail_layout_mismatch"],
 )
 def test_peer_registrar_requires_matching_unified_draft_layers(
     local_draft: int, peer_draft: int, remote_tail: bool

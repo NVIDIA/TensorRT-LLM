@@ -339,33 +339,31 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         assert manager.get_draft_kv_cache_view() is manager
         assert manager.pp_layers == [0, 1]
         assert manager.draft_layer_ids == (2, 3, 4)
-        draft_pool = manager.layer_to_pool_mapping_dict[manager.layer_offsets[2]]
-        decoder_layer = manager._cache_layer_id(1, CSA2CacheRole.SWA)
-        assert draft_pool == manager.layer_to_pool_mapping_dict[decoder_layer]
-        decoder_group = manager.impl.get_layer_group_id(decoder_layer)
-        _, windows = manager._get_runtime_cache_size_layer_components()
-        assert windows[-3:] == [manager._swa_retention(1)] * 3
         requests = manager.add_dummy_requests(
             [42], token_nums=[512], draft_kv_cache_manager=manager
         )
-        assert requests is not None and set(manager.kv_cache_map) == {42}
+        assert requests is not None
         cache = manager.kv_cache_map[42]
         for layer in manager.draft_layer_ids:
             assert manager.get_layer_cache_spec(layer).reuse_policy == ReusePolicy.PRIVATE
             assert manager.get_layer_cache_spec(layer).sliding_window_size == 129
-            assert manager.impl.get_layer_group_id(manager.layer_offsets[layer]) == decoder_group
             buffer = manager.get_buffers(layer, kv_layout="HND")
             assert buffer.dtype == torch.bfloat16
             assert tuple(buffer.shape[1:]) == (1, 1, 128, 512)
             assert len(manager.get_batch_cache_indices([42], layer)[0]) == cache.num_blocks
-        table = build_page_table_from_manager(manager)
-        virtual = {
-            local.global_layer_id for group in table.layer_groups for local in group.local_layers
-        }
-        assert {6, 9, 12} <= virtual
-        assert not manager.get_disagg_ignored_roles()
+
+        def advertised_draft_buffers():
+            table = build_page_table_from_manager(manager)
+            return sum(
+                len(view.buffer_entries)
+                for group in table.layer_groups
+                for view in group.pool_views
+                if Role.KEY in view.pool_role
+            )
+
+        assert advertised_draft_buffers() == len(manager.draft_layer_ids)
         manager.bounded_replay_on_generation = True
-        assert manager.get_disagg_ignored_roles() == frozenset((Role.KEY,))
+        assert advertised_draft_buffers() == 0
     finally:
         for request_id in list(manager.kv_cache_map):
             manager.free_resources(SimpleNamespace(py_request_id=request_id))

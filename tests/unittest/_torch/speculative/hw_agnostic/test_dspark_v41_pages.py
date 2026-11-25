@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import device_copy
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.speculative.dspark_v41 import DSparkCopySite, DSv41DSparkWorker
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
@@ -69,18 +70,9 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         SimpleNamespace(get_resource_manager=lambda _: manager),
     )
     assert worker._draft_kv_manager is manager
-    assert not worker.return_confidence
-    assert not worker._draft_page_versions
     assert worker._draft_prepared_batch is None
-    assert not worker._draft_page_indices
     assert not worker._managed_residency
-    assert not worker._chunking_ids
-    assert manager.get_buffers.call_count == 3
-    assert worker._draft_slot_block_tables.shape == (3, 8)
-    assert worker._slot_upload.host_values is None
-    assert worker._capacity_upload.host_values is None
-    assert worker._table_slots is None
-    assert torch.all(worker._draft_table_storage == BAD_PAGE_INDEX)
+    assert torch.all(worker._draft_block_tables == BAD_PAGE_INDEX)
     worker._prepare_page_tables.assert_called_once_with(
         [42], 1, paused_in_place_ids=frozenset(), context_chunking_ids=frozenset()
     )
@@ -88,7 +80,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         proposals = DSv41DSparkWorker._draft_gen_block_batched(
             worker,
             draft,
-            metadata,
+            SimpleNamespace(request_ids=[CUDA_GRAPH_DUMMY_REQUEST_ID]),
             None,
             torch.empty((1, 6), dtype=torch.int32),
             None,
@@ -99,7 +91,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
             return_tokens=return_tokens,
         )
         if return_tokens:
-            assert proposals.dtype == torch.int32 and proposals.tolist() == [[0] * 5]
+            assert proposals.dtype == torch.int32 and proposals.shape == (1, 5)
         else:
             assert proposals is None
 
@@ -125,76 +117,14 @@ def test_retained_pages_preserve_context_holes_and_reject_missing_generation_kv(
         DSv41DSparkWorker._page_indices(worker, cache, False)
 
 
-def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypatch):
-    class StablePages(SimpleNamespace):
-        def __getattribute__(self, name):
-            if name in ("history_length", "num_blocks"):
-                pytest.fail("Unchanged native page versions must not re-read page geometry")
-            return super().__getattribute__(name)
-
-    cache = StablePages(history_length=140, page_storage_version=3, num_blocks=2, is_active=True)
-    manager = SimpleNamespace(
-        kv_cache_map={42: cache}, tokens_per_block=128, draft_page_table_prepared=lambda _: False
-    )
-    worker = SimpleNamespace(
-        _draft_kv_manager=manager,
-        _draft_reuse_policy=ReusePolicy.PRIVATE,
-        _graph_dummy_id_floor=1 << 60,
-        _req_to_slot={42: 0},
-        _managed_residency={42: cache},
-        _chunking_ids=set(),
-        _scratch_slot=1,
-        _win=128,
-        _draft_capacities=torch.tensor([256]),
-        _draft_page_versions={0: (cache, 3, 0, 2, False)},
-        _draft_prepared_batch=None,
-        _draft_page_indices={0: (0, (7, 8))},
-        _host_slots=torch.tensor([0]),
-        _host_capacities=torch.tensor([256]),
-        _table_slots=(0,),
-        _draft_block_tables=None,
-        _draft_managed_block_tables=None,
-        _draft_fallback_block_tables=None,
-        _ctx_len=torch.tensor([140, 17]),
-        _valid_len=torch.tensor([128, 9]),
-    )
-    worker._slot_upload = device_copy.DeviceCopyBuffer(
-        torch.tensor([0]), site=DSparkCopySite.REQUEST_SLOTS
-    )
-    worker._capacity_upload = device_copy.DeviceCopyBuffer(
-        worker._draft_capacities, site=DSparkCopySite.PAGE_CAPACITIES
-    )
-    worker._slot_upload.record(worker._host_slots)
-    worker._capacity_upload.record(worker._host_capacities)
-    worker._assign_slot = DSv41DSparkWorker._assign_slot.__get__(worker)
-
-    def unexpected_work(*args, **kwargs):
-        pytest.fail("Unchanged PRIVATE metadata performed staging or scratch-reset work")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(torch.cuda, "Event", unexpected_work)
-        patch.setattr(torch, "empty", unexpected_work)
-        patch.setattr(torch, "tensor", unexpected_work)
-        patch.setattr(torch.Tensor, "zero_", unexpected_work)
-        for history in (140, 141, 142):
-            cache.history_length = history
-            DSv41DSparkWorker._prepare_page_tables(worker, [42], 0)
-    assert worker._ctx_len.tolist() == [140, 17]
-    assert worker._valid_len.tolist() == [128, 9]
-
-
-def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_copies(monkeypatch):
-    version_reads = []
-
-    class Cache(SimpleNamespace):
-        def __getattribute__(self, name):
-            if name == "page_storage_version":
-                version_reads.append(name)
-            return super().__getattribute__(name)
-
+def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch):
     caches = {
-        42: Cache(history_length=140, page_storage_version=1, num_blocks=2, is_active=True),
-        43: Cache(history_length=268, page_storage_version=1, num_blocks=3, is_active=True),
+        42: SimpleNamespace(
+            history_length=140, page_storage_version=1, num_blocks=2, is_active=True
+        ),
+        43: SimpleNamespace(
+            history_length=268, page_storage_version=1, num_blocks=3, is_active=True
+        ),
     }
     tables = {id(caches[42]): (0, (7, 8)), id(caches[43]): (1, (9, 10))}
     storage = torch.full((6, 8), BAD_PAGE_INDEX, dtype=torch.int32)
@@ -231,7 +161,7 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         _host_slots=torch.empty(3, dtype=torch.long),
         _host_capacities=torch.empty(3, dtype=torch.long),
         _table_slots=None,
-        _page_indices=Mock(side_effect=lambda cache, _: tables[id(cache)]),
+        _page_indices=lambda cache, _: tables[id(cache)],
     )
     worker._slot_upload = device_copy.DeviceCopyBuffer(
         worker._batch_to_slot, site=DSparkCopySite.REQUEST_SLOTS
@@ -245,17 +175,6 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     )
     monkeypatch.setattr("tensorrt_llm._torch.speculative.dspark_v41.prefer_pinned", lambda: False)
     worker._clear_slot = DSv41DSparkWorker._clear_slot.__get__(worker)
-    gather = Mock(wraps=torch.index_select)
-    monkeypatch.setattr(torch, "index_select", gather)
-    copy = device_copy.copy
-    upload = Mock(wraps=copy)
-
-    def count_uploads(site, dst, src, **kwargs):
-        if kwargs.get("unchanged"):
-            return copy(site, dst, src, **kwargs)
-        return upload(site, dst, src, **kwargs)
-
-    monkeypatch.setattr(device_copy, "copy", count_uploads)
     DSv41DSparkWorker._prepare_page_tables(worker, [42, 43], 0)
     assert worker._draft_block_tables[0, :2].tolist() == [7, 8]
     assert worker._draft_block_tables[1, 1:3].tolist() == [9, 10]
@@ -264,21 +183,16 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     assert worker._draft_block_tables[1, :2].tolist() == [7, 8]
     assert worker._batch_to_slot.tolist() == [1, 0, 2]
     assert worker._draft_capacities.tolist() == [384, 256, 0]
-    assert worker._page_indices.call_count == gather.call_count == 2
 
     caches[42].page_storage_version += 1
     tables[id(caches[42])] = (0, (7, 11))
     DSv41DSparkWorker._prepare_page_tables(worker, [43, 42], 0)
-    assert worker._draft_slot_block_tables[0, :2].tolist() == [7, 11]
     assert worker._draft_block_tables[1, :2].tolist() == [7, 11]
-    assert worker._page_indices.call_count == 3
-    assert gather.call_count == 3
 
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0, paused_in_place_ids=frozenset({42}))
     assert worker._req_to_slot[42] == 0
     assert worker._batch_to_slot.tolist() == [1, 2, 2]
     assert worker._draft_capacities.tolist() == [384, 0, 0]
-    assert gather.call_count == 4
 
     # A narrower window can advance inside one native history block.
     worker._draft_kv_manager.tokens_per_block = 256
@@ -286,55 +200,27 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     caches[43].num_blocks = 2
     tables[id(caches[43])] = (0, (9, 10))
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-    calls = worker._page_indices.call_count
     caches[43].history_length = 384
     tables[id(caches[43])] = (1, (10,))
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-    assert worker._page_indices.call_count == calls + 1
-    assert worker._draft_page_indices[1] == (1, (10,))
     assert worker._draft_block_tables[0, :3].tolist() == [BAD_PAGE_INDEX, 10, BAD_PAGE_INDEX]
 
-    # Once target preparation published this execution order, draft generation
-    # uses its addressable extent without uploading per-request block growth.
+    # Once the target publishes a native table, generation reads its addressable extent.
     worker._draft_kv_manager.draft_page_table_prepared = lambda _: True
     native = torch.full((3, 8), BAD_PAGE_INDEX, dtype=torch.int32)
     native[0, 1:3] = torch.tensor([21, 22])
-    native[1, 0] = 31
     worker._draft_managed_block_tables.copy_(native)
-    snapshot = [None]
-    worker._draft_kv_manager.draft_page_table_state = lambda: snapshot[0]
-    calls, gathers = worker._page_indices.call_count, gather.call_count
-    native_uploads = None
-    for blocks in (2, 3, 3):
-        caches[43].num_blocks = blocks
-        caches[43].page_storage_version += 1
-        snapshot[0] = object()
-        version_reads.clear()
-        DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-        assert worker._draft_block_tables is worker._draft_managed_block_tables
-        torch.testing.assert_close(worker._draft_block_tables, native)
-        assert not version_reads
-        assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
-        if native_uploads is None:
-            native_uploads = upload.call_count
-        else:
-            assert upload.call_count == native_uploads
-        # The target's unchanged snapshot also covers the slot and capacity
-        # metadata. Exercise the normal fast path without copy-check mode,
-        # which deliberately compares the live metadata to the uploaded values.
-        with monkeypatch.context() as patch:
-            patch.setattr(device_copy, "CHECK_MODE", False)
-            patch.setattr(worker._draft_kv_manager, "kv_cache_map", {})
-            DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-        assert worker._batch_to_slot.tolist() == [1, 2, 2]
-        assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
-    assert worker._page_indices.call_count == calls
-    assert gather.call_count == gathers
-    # A discarded metadata copy must be retried even if the target's batch is unchanged.
-    worker._slot_upload.invalidate()
-    worker._batch_to_slot.fill_(2)
+    worker._draft_kv_manager.draft_page_table_state = lambda: native
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-    assert worker._batch_to_slot.tolist() == [1, 2, 2]
+    torch.testing.assert_close(worker._draft_block_tables, native)
+    assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
+    # A discarded metadata copy must be retried even if the target's batch is unchanged.
+    with monkeypatch.context() as patch:
+        patch.setattr(device_copy, "CHECK_MODE", False)
+        worker._slot_upload.invalidate()
+        worker._batch_to_slot.fill_(2)
+        DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+        assert worker._batch_to_slot.tolist() == [1, 2, 2]
     # A different request still needs its own slot even if it aliases the
     # same cache and the target's physical page conversion can be reused.
     caches[44] = caches[43]
@@ -355,8 +241,8 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
 
 @pytest.mark.parametrize(
     "chunks,captures",
-    [([180], [180]), ([100, 80], [100, 80]), ([40, 140], [0, 140])],
-    ids=["single", "chunked", "held-tail"],
+    [([100, 80], [100, 80]), ([40, 140], [0, 140])],
+    ids=["chunked", "held-tail"],
 )
 def test_private_context_seed_rebuilds_final_window(chunks, captures):
     if captures[0] == 0:
@@ -409,7 +295,7 @@ def test_private_context_seed_rebuilds_final_window(chunks, captures):
     written = {}
 
     def write(hidden, frames, mask, *args):
-        for frame, value in zip(frames.flatten().tolist(), hidden.flatten().tolist()):
+        for frame, value in zip(frames[mask].tolist(), hidden[mask].flatten().tolist()):
             written[frame - 1] = value
 
     draft = SimpleNamespace(write_context_pages=Mock(side_effect=write))

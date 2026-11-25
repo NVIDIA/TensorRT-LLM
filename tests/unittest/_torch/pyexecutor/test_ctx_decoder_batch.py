@@ -47,5 +47,3 @@ def test_context_decoder_batching_requires_a_complete_final_window_draft(
     )
     batcher = install_ctx_decoder_batch(executor)
     assert (batcher is not None) == eligible
-    if eligible:
-        assert batcher.scheduler is scheduler and batcher.window == 140

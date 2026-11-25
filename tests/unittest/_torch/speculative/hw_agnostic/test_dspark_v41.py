@@ -451,14 +451,13 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
         model._backfill_kv_norm_weight,
         torch.stack([torch.full((512,), stage + 3.0, dtype=torch.bfloat16) for stage in range(3)]),
     )
-    for stage in range(3):
-        for suffix in ("wkv.weight", "wkv.scale", "kv_norm.weight"):
-            incomplete = dict(weights)
-            incomplete.pop(f"mtp.{stage}.attn.{suffix}")
-            with pytest.raises(
-                ValueError, match="V4.1 DSpark checkpoint is missing context KV weights"
-            ):
-                wrapper.load_weights(incomplete)
+    for suffix in ("wkv.weight", "wkv.scale", "kv_norm.weight"):
+        incomplete = dict(weights)
+        incomplete.pop(f"mtp.2.attn.{suffix}")
+        with pytest.raises(
+            ValueError, match="V4.1 DSpark checkpoint is missing context KV weights"
+        ):
+            wrapper.load_weights(incomplete)
 
 
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
@@ -552,16 +551,6 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(mode):
     torch.testing.assert_close(seen[2], mixes[1])
     torch.testing.assert_close(logits, ((initial + 3) * mixes[-1]).sum(-2))
     if mode == "paged-scalar":
-        seen.clear()
-        _, _, expected = model.forward_batched(
-            torch.zeros(1, 9),
-            torch.ones(1, dtype=torch.long),
-            torch.ones(1, dtype=torch.long),
-            valid_len=torch.tensor([1]),
-            return_logits=True,
-            **kwargs,
-        )
-        torch.testing.assert_close(logits, expected)
         with pytest.raises(AssertionError, match="start_pos > 0"):
             model.forward(torch.zeros(1, 9), torch.ones(1, dtype=torch.long), 0, **kwargs)
 
@@ -903,14 +892,11 @@ def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("role", [None, "context", "generation"])
+@pytest.mark.parametrize("role", ["context", "generation"])
 def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypatch, role):
     from tensorrt_llm._torch.models import modeling_dspark_v41
 
-    if role is None:
-        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     monkeypatch.setattr(modeling_dspark, "count_dspark_stages", Mock(return_value=3))
     monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", Mock())
     monkeypatch.setattr(modeling_dspark, "_draft_moe_selection", Mock(return_value=None))

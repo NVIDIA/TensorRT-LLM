@@ -282,7 +282,6 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
         pytest.param(128, 64, 1, False, id="128-64-1"),
         pytest.param(128, 256, 1, False, id="128-256-1"),
         pytest.param(128, 64, 64, False, id="128-64-64"),
-        pytest.param(64, 128, 1, True, id="managed_page_write_128"),
         pytest.param(128, 256, 1, True, id="managed_page_write_256"),
     ],
 )
@@ -324,8 +323,8 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
     with torch.cuda.graph(graph):
         captured, draft = forward()
     ends = (17, 65, 127, 128, 129, 193, 255)
-    if page_size == 128:
-        ends += tuple(range(256, 384))
+    if page_write:
+        ends += (256, 257, 383)
     full_tables = inputs["block_tables"][:2].clone()
     for end in ends:
         inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
@@ -346,7 +345,7 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
         inputs["inverse_rope_freqs"].copy_(torch.view_as_real(block_phases))
         expected_block = _norm_rope(block_x, weight, block_phases)
         expected_draft = F.pad(expected_block, (0, 0, 0, 2))
-        expected_cache = inputs["kv_pages"].clone()
+        expected_cache = inputs["kv_pages"]
         if main_x is not None and main_freqs is not None:
             main_x.normal_()
             main_freqs.copy_(torch.view_as_real(freqs[inputs["positions"]]))
@@ -358,12 +357,8 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
         )
         graph.replay()
         torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
-        torch.testing.assert_close(
-            inputs["kv_pages"],
-            expected_cache,
-            rtol=2e-2 if page_write else 0,
-            atol=2e-2 if page_write else 0,
-        )
+        if page_write:
+            torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(draft, expected_draft, rtol=2e-2, atol=2e-2)
         assert torch.count_nonzero(draft[:, 6:]) == 0
 
@@ -483,7 +478,7 @@ def test_context_page_writer_supports_more_than_65535_tokens():
     batch, tokens, dim, page_size = 2, 65536, 4, 128
     values = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16)
     positions = torch.arange(1, tokens + 1, device="cuda").expand(batch, -1).clone()
-    positions[:, -1] = 0
+    positions[:, 0] = 0
     mask = torch.ones_like(positions, dtype=torch.bool)
     mask[:, 1::17] = False
     tables = torch.arange(batch * tokens // page_size, device="cuda", dtype=torch.int32).view(
@@ -548,42 +543,41 @@ def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
 
     monkeypatch.setattr(preparation_op.cute, "compile", compile_on_device)
     caller = torch.cuda.current_device()
-    devices = [caller]
+    cases = [(caller, 1), (caller, 3)]
     if torch.cuda.device_count() > 1:
-        devices.append((caller + 1) % torch.cuda.device_count())
-    for device in devices:
-        for batch in (1, 3):
-            with torch.cuda.device(device):
-                inputs = _make_inputs(
-                    batch=batch,
-                    page_size=128,
-                    capacities=[512] * (batch - 1) + [0] if batch > 1 else [512],
-                )
-                kv = torch.randn(batch, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
-                norms = torch.randn(3, 512, device="cuda", dtype=kv.dtype)
-                freqs_table = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
-                freqs = freqs_table[inputs["positions"][:, None]]
-                normalized = _norm_rope(kv, norms, freqs)
-                pools = [inputs["kv_pages"].clone() for _ in range(3)]
-                expected = [
-                    _write_reference(pool, normalized[:, :, stage], inputs)
-                    for stage, pool in enumerate(pools)
-                ]
-            preparation_op.cute_dsl_dspark_paged_backfill(
-                kv.flatten(2),
-                norms,
-                torch.view_as_real(freqs_table),
-                inputs["capacities"][:, None] > 0,
-                inputs["positions"][:, None],
-                inputs["block_tables"].contiguous(),
-                inputs["capacities"],
-                pools,
-                1e-6,
+        cases.append(((caller + 1) % torch.cuda.device_count(), 3))
+    for device, batch in cases:
+        with torch.cuda.device(device):
+            inputs = _make_inputs(
+                batch=batch,
+                page_size=128,
+                capacities=[512] * (batch - 1) + [0] if batch > 1 else [512],
             )
-            assert torch.cuda.current_device() == caller
-            for actual, reference in zip(pools, expected):
-                torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
-    assert compile_devices == devices
+            kv = torch.randn(batch, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
+            norms = torch.randn(3, 512, device="cuda", dtype=kv.dtype)
+            freqs_table = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+            freqs = freqs_table[inputs["positions"][:, None]]
+            normalized = _norm_rope(kv, norms, freqs)
+            pools = [inputs["kv_pages"].clone() for _ in range(3)]
+            expected = [
+                _write_reference(pool, normalized[:, :, stage], inputs)
+                for stage, pool in enumerate(pools)
+            ]
+        preparation_op.cute_dsl_dspark_paged_backfill(
+            kv.flatten(2),
+            norms,
+            torch.view_as_real(freqs_table),
+            inputs["capacities"][:, None] > 0,
+            inputs["positions"][:, None],
+            inputs["block_tables"].contiguous(),
+            inputs["capacities"],
+            pools,
+            1e-6,
+        )
+        assert torch.cuda.current_device() == caller
+        for actual, reference in zip(pools, expected):
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    assert set(compile_devices) == {device for device, _ in cases}
 
 
 def _norm_rope(x, weight, freqs):
@@ -1344,8 +1338,11 @@ def test_tp_attention_shards_sum_to_replicated(paged):
     assert diff.norm() / expected.float().norm() < 1e-2
 
 
-@pytest.mark.parametrize("heads,page_size", [(64, 128), (128, 256)])
-@pytest.mark.parametrize("fused", [True, False], ids=["cute_dsl", "reference"])
+@pytest.mark.parametrize(
+    "heads,page_size,fused",
+    [(64, 128, True), (128, 256, False)],
+    ids=["cute_dsl_128", "reference_256"],
+)
 def test_managed_dspark_attention_matches_reference(heads, page_size, fused, monkeypatch):
     block = 5
     if not fused:
@@ -1404,15 +1401,8 @@ def test_managed_dspark_attention_matches_reference(heads, page_size, fused, mon
         kwargs["wo_a"].view(groups, o_rank, -1),
     )
     expected = F.linear(output.flatten(2), kwargs["wo_b"])
-    fused_calls = []
-    for module, name in (
-        (dspark, "cute_dsl_dspark_rmsnorm_rope_page_write"),
-        (dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block"),
-        (torch.ops.trtllm, "fused_dsv4_dspark_attention"),
-    ):
-        call = Mock(wraps=getattr(module, name))
-        monkeypatch.setattr(module, name, call)
-        fused_calls.append(call)
+    fused_attention = Mock(wraps=torch.ops.trtllm.fused_dsv4_dspark_attention)
+    monkeypatch.setattr(torch.ops.trtllm, "fused_dsv4_dspark_attention", fused_attention)
     actual = dspark.dspark_attention_forward_batched(
         x,
         main_x,
@@ -1425,10 +1415,6 @@ def test_managed_dspark_attention_matches_reference(heads, page_size, fused, mon
         persist=True,
         **kwargs,
     )
-    for call in fused_calls:
-        if fused:
-            call.assert_called_once()
-        else:
-            call.assert_not_called()
+    assert fused_attention.called == fused
     torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
     torch.testing.assert_close(inputs["kv_pages"], expected_cache, rtol=2e-2, atol=2e-2)

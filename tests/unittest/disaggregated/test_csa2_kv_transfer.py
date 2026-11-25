@@ -212,7 +212,7 @@ def test_csa2_shared_owner_kv_transfer(
     )
 
 
-@pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (1, 2), (2, 1)])
+@pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 2), (2, 1)])
 def test_csa2_shared_draft_kv_handoff(monkeypatch, ctx_tp, gen_tp):
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)

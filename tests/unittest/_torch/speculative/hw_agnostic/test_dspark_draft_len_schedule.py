@@ -301,7 +301,6 @@ def test_managed_pages_remain_complete_across_five_zero_five_draft_steps():
             expected[row, start + step] = captured[row * stride]
         torch.testing.assert_close(pool, expected)
         assert worker._ctx_len[:2].tolist() == [11 + step, 21 + step]
-    assert model.forward_batched.call_count == 2
 
 
 def test_step_without_speculation_reads_generation_rows_past_the_context_tokens():

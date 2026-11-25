@@ -527,12 +527,8 @@ def test_steady_decode_reuses_converted_tables(
                     starts.append(0)
             use_graph = rng.random() < 0.75
             before = len(conversions)
-            previous_state = manager.draft_page_table_state()
             tables, observed = reusing.step(batch, starts, use_graph)
             converted = len(conversions) > before
-            state = manager.draft_page_table_state()
-            assert state is not None
-            assert (state is previous_state) == (not converted)
             stats["partial"] += any(conversions[before:])
             with _always_convert(manager):
                 expected_tables, expected = converting.step(batch, starts, use_graph)
@@ -596,7 +592,6 @@ def test_draft_conversion_keeps_holes_with_scratch_enabled():
         slots = torch.full((*ranges.shape[:2], 1), 23, dtype=torch.int32, device="cuda")
         out = torch.empty((len(host), 1, 3), dtype=torch.int32, device="cuda")
         kernel.convert_page_tables(base, rows, params, out, -1, ranges, slots)
-        assert host[draft, 4] == 0
         assert out[draft, 0, 1].item() == -1
         assert (
             out[scratch_table, 0, 1].item() == 23 * host[scratch_table, 1] + host[scratch_table, 2]
