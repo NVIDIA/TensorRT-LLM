@@ -915,9 +915,12 @@ def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypa
     monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", Mock())
     monkeypatch.setattr(modeling_dspark, "_draft_moe_selection", Mock(return_value=None))
 
-    def init_draft(self, *args, **kwargs):
+    selected_draft = Mock()
+
+    def init_draft(self, *args, draft_model_cls, **kwargs):
         nn.Module.__init__(self)
         self.dspark_model = SimpleNamespace()
+        selected_draft(draft_model_cls)
 
     monkeypatch.setattr(modeling_dspark.DSv4DSparkForCausalLM, "__init__", init_draft)
     target = SimpleNamespace(
@@ -935,10 +938,10 @@ def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypa
         spec_config=None,
         moe_load_balancer=None,
     )
-    model = modeling_dspark._build_dspark_draft(target, draft, None, SimpleNamespace())
+    modeling_dspark._build_dspark_draft(target, draft, None, SimpleNamespace())
     expected = (
         modeling_dspark_v41._DSv41DSparkContextDraftModel
         if role == "context"
         else DSv41DSparkDraftModel
     )
-    assert model.draft_model_cls is expected
+    selected_draft.assert_called_once_with(expected)

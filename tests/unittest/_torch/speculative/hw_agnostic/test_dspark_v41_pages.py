@@ -320,8 +320,10 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         else:
             assert upload.call_count == native_uploads
         # The target's unchanged snapshot also covers the slot and capacity
-        # metadata. Reading native properties again would duplicate its work.
+        # metadata. Exercise the normal fast path without copy-check mode,
+        # which deliberately compares the live metadata to the uploaded values.
         with monkeypatch.context() as patch:
+            patch.setattr(device_copy, "CHECK_MODE", False)
             patch.setattr(worker._draft_kv_manager, "kv_cache_map", {})
             DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
         assert worker._batch_to_slot.tolist() == [1, 2, 2]
