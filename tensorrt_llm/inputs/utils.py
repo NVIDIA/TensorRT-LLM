@@ -149,6 +149,8 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
         ops = list(pickletools.genops(pickled))
     except ValueError as e:
         raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
+    if not ops or ops[0][0].name != "PROTO":
+        raise ValueError("Tensor payload pickle is malformed.")
     stack: list[object] = []
     try:
         for opcode, arg, pos in ops:
@@ -158,9 +160,9 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
                     f"Tensor payload uses unsupported pickle opcode {name}.")
             if name == "STOP":
                 break
-            # Python's unpickler accepts protocols up to 5 and frames that
-            # end within the pickle (a FRAME opcode is 9 bytes).
-            if (name == "PROTO" and not 2 <= arg <= 5
+            # torch.save starts the pickle with one PROTO of 2 to 5, and
+            # frames end within the pickle (a FRAME opcode is 9 bytes).
+            if (name == "PROTO" and (pos or not 2 <= arg <= 5)
                     or name == "FRAME" and pos + 9 + arg > len(pickled)):
                 raise ValueError("Tensor payload pickle is malformed.")
             if name in ("PROTO", "FRAME", "BINPUT", "LONG_BINPUT", "MEMOIZE"):
@@ -347,19 +349,31 @@ def _read_tensor_archive(content: bytes,
                         or member.flag_bits & 0x1):
                     raise ValueError("Tensor payload members must be stored "
                                      "uncompressed and unencrypted.")
+                # A zip64 offset past the archive would overflow the seek.
+                if not 0 <= member.header_offset <= len(content) - 30:
+                    raise ValueError(
+                        "Tensor payload record lies outside the archive.")
                 total += member.file_size
             if total > max_bytes:
                 raise ValueError(
                     f"Tensor payload expands to {total} bytes, over the "
                     f"{max_bytes}-byte limit.")
-            # Metadata records are sized before they are read.
-            pickle_size = archive.getinfo(prefix + "data.pkl").file_size
-            if pickle_size > _TENSOR_PICKLE_MAX_BYTES:
-                raise ValueError(
-                    f"Tensor payload pickle is {pickle_size} bytes; one tensor "
-                    f"needs far less than {_TENSOR_PICKLE_MAX_BYTES}.")
-            spec = _check_tensor_pickle(archive.read(prefix + "data.pkl"),
-                                        max_bytes)
+            # Metadata records are sized before they are read, and all are
+            # read so that zipfile checks their CRCs.
+            sized = [(m.filename[len(prefix):], m) for m in members
+                     if not m.filename[len(prefix):].startswith("data/")]
+            for record, member in sized:
+                if record == "byteorder" and member.file_size != len(b"little"):
+                    raise ValueError("Tensor payload must be little-endian.")
+                if member.file_size > _TENSOR_PICKLE_MAX_BYTES:
+                    raise ValueError(
+                        f"Tensor payload record {record} is {member.file_size} "
+                        f"bytes; one tensor needs far less than "
+                        f"{_TENSOR_PICKLE_MAX_BYTES}.")
+            metadata = {r: archive.read(m) for r, m in sized}
+            if metadata.get("byteorder", b"little") != b"little":
+                raise ValueError("Tensor payload must be little-endian.")
+            spec = _check_tensor_pickle(metadata["data.pkl"], max_bytes)
             storage_bytes = spec.storage_numel * spec.dtype.itemsize
             # The archive must hold the storage bytes before they are
             # allocated; the declared sizes alone are the client's to choose.
@@ -368,11 +382,6 @@ def _read_tensor_archive(content: bytes,
                     or storage_bytes > len(content)):
                 raise ValueError(
                     "Tensor payload storage record does not match its tensor.")
-            if (prefix + "byteorder" in names
-                    and (archive.getinfo(prefix + "byteorder").file_size
-                         != len(b"little")
-                         or archive.read(prefix + "byteorder") != b"little")):
-                raise ValueError("Tensor payload must be little-endian.")
             # Copy in chunks into the tensor's buffer, so no second full copy
             # exists; zipfile checks the record's CRC once all of it is read.
             # The buffer is not zero-filled, since every byte is overwritten.
@@ -409,6 +418,9 @@ def _b64decode_strict(text: str, strip_whitespace: bool = False) -> bytes:
     else:
 
         def decode(piece: str) -> bytes:
+            # Before 3.11, b64decode ignores characters after the padding.
+            if len(piece) % 4:
+                raise binascii.Error("Incorrect padding")
             return base64.b64decode(piece, validate=True)
 
     parts, carry, padded = [], "", False

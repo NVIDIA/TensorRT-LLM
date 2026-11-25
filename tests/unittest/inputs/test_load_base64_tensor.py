@@ -4,8 +4,10 @@
 
 import asyncio
 import base64
+import binascii
 import io
 import pickle
+import re
 import struct
 import threading
 import tracemalloc
@@ -127,11 +129,14 @@ def _encrypt(raw: bytearray, archive: zipfile.ZipFile) -> None:
         raw[central + 8] |= 1
 
 
-def _corrupt_storage(raw: bytearray, archive: zipfile.ZipFile) -> None:
-    """Overwrite the storage bytes, keeping the record's declared CRC."""
-    local, _ = _headers(raw, archive, "archive/data/0")
-    start = local + 30 + sum(struct.unpack_from("<HH", raw, local + 26))
-    raw[start : start + 4] = b"\x01\x02\x03\x04"
+def _corrupt(record: str) -> Callable:
+    """An edit flipping a bit of one record's first byte, keeping its declared CRC."""
+
+    def edit(raw: bytearray, archive: zipfile.ZipFile) -> None:
+        local, _ = _headers(raw, archive, f"archive/{record}")
+        raw[local + 30 + sum(struct.unpack_from("<HH", raw, local + 26))] ^= 1
+
+    return edit
 
 
 def _zip64_edit(field: int, value: Callable[[int], int], in_record: bool) -> Callable:
@@ -146,16 +151,32 @@ def _zip64_edit(field: int, value: Callable[[int], int], in_record: bool) -> Cal
     return edit
 
 
+def _offset_past_archive(raw: bytearray, archive: zipfile.ZipFile) -> None:
+    """Point data.pkl's local header at 2**64 - 1 through a zip64 extra field."""
+    _, central = _headers(raw, archive, "archive/data.pkl")
+    end = central + 46 + len("archive/data.pkl")
+    raw[end:end] = struct.pack("<HHQ", 1, 8, 2**64 - 1)
+    struct.pack_into("<H", raw, central + 30, 12)
+    struct.pack_into("<I", raw, central + 42, 0xFFFFFFFF)
+    # The central directory grew by 12 bytes, moving the zip64 record after it.
+    _zip64_edit(8, lambda v: v + 12, False)(raw, archive)
+    _zip64_edit(40, lambda v: v + 12, True)(raw, archive)
+    struct.pack_into("<I", raw, len(raw) - 10, struct.unpack_from("<I", raw, len(raw) - 10)[0] + 12)
+
+
 def _spy_reads(monkeypatch) -> list:
-    """Record the names of archive records the loader reads."""
-    read = zipfile.ZipFile.read
+    """Record the names of archive records the loader opens; ZipFile.read opens them too.
+
+    Install it after building the payload, whose construction reads records.
+    """
+    open_ = zipfile.ZipFile.open
     reads = []
 
-    def spy(self: zipfile.ZipFile, name: str, *args: object) -> bytes:
-        reads.append(name)
-        return read(self, name, *args)
+    def spy(self: zipfile.ZipFile, name: object, *args: object, **kwargs: object) -> object:
+        reads.append(getattr(name, "filename", name))
+        return open_(self, name, *args, **kwargs)
 
-    monkeypatch.setattr(zipfile.ZipFile, "read", spy)
+    monkeypatch.setattr(zipfile.ZipFile, "open", spy)
     return reads
 
 
@@ -174,6 +195,8 @@ _ACCEPTED = [
     (torch.arange(6.0).reshape(3, 2).t(), {}),
     (torch.arange(4.0, requires_grad=True), {}),
     (torch.zeros(0, 4), {}),
+    # Storage just over one 1 MiB copy chunk, with distinct values across its end.
+    (torch.arange(float((1 << 18) + 1)), {}),
 ]
 
 
@@ -183,7 +206,7 @@ def test_saved_tensors_round_trip(monkeypatch, tensor: torch.Tensor, save_kwargs
     monkeypatch.setattr(torch, "load", None)
     payload = _encode(tensor, **save_kwargs)
     with torch.device("meta"):
-        decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
+        decoded = load_base64_tensor(payload, max_bytes=2 * _LIMIT)
     assert decoded.device.type == "cpu" and decoded.dtype == tensor.dtype
     assert torch.equal(decoded, tensor.detach())
 
@@ -248,11 +271,13 @@ def test_base64_rejected(monkeypatch, text: object, limit: int, error: type, mat
 def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
     """Python 3.10 has no a2b_base64 strict_mode; validated b64decode is used instead."""
     calls = []
-    b64decode = base64.b64decode
 
     def spy(text: str, validate: bool = False) -> bytes:
+        """Python 3.10's b64decode, which ignores characters after the padding."""
         calls.append(validate)
-        return b64decode(text, validate=validate)
+        if validate and not re.fullmatch("[A-Za-z0-9+/]*={0,2}", text):
+            raise binascii.Error("Non-base64 digit found")
+        return binascii.a2b_base64(text)
 
     monkeypatch.setattr(utils.sys, "version_info", (3, 10, 0))
     monkeypatch.setattr(utils.base64, "b64decode", spy)
@@ -260,6 +285,9 @@ def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
     assert torch.equal(load_base64_tensor(_encode(tensor), max_bytes=_LIMIT), tensor)
     with pytest.raises(ValueError, match="not valid base64"):
         load_base64_tensor("not base64!", max_bytes=_LIMIT)
+    assert utils._b64decode_strict("QUI=") == b"AB"
+    with pytest.raises(ValueError):
+        utils._b64decode_strict("QUI==")
     assert calls and all(calls)
 
 
@@ -306,6 +334,8 @@ def test_whitespace_retry_releases_the_failed_attempt() -> None:
     """A trailing newline costs a second decode, but not a third copy of the payload."""
     raw = bytes(range(256)) * (1 << 14)
     text = base64.b64encode(raw).decode() + "\n"
+    if tracemalloc.is_tracing():
+        pytest.skip("tracemalloc is already tracing; its peak would include the caller's.")
     tracemalloc.start()
     try:
         with pytest.raises(ValueError, match="zip"):
@@ -323,6 +353,7 @@ _PICKLE_REJECTED = {
     "allocating-global": (pickle.dumps(_BigBytearray(), protocol=2), "bytearray"),
     "opcode": (pickle.dumps([1.0], protocol=2), "unsupported pickle opcode"),
     "truncated": (b"\x80\x02" + _REBUILD, "malformed"),
+    "missing-protocol": (_pickle((4, 2), (2, 1), 8, head=b""), "malformed"),
     "protocol": (_pickle((4, 2), (2, 1), 8, head=b"\x80\xff"), "malformed"),
     "frame-past-end": (_pickle((4, 2), (2, 1), 8, head=_FRAMED), "malformed"),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
@@ -340,9 +371,10 @@ _PICKLE_REJECTED = {
 
 
 @pytest.mark.parametrize("pickled, match", _PICKLE_REJECTED.values(), ids=_PICKLE_REJECTED)
-def test_pickle_rejected(pickled: bytes, match: str) -> None:
+def test_pickle_rejected(monkeypatch, pickled: bytes, match: str) -> None:
     """Pickles that are not one bounded dense float tensor are refused before allocating."""
     payload = _with_pickle(pickled)
+    monkeypatch.setattr(torch, "empty", None)
     with pytest.raises(ValueError, match=match):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
@@ -369,7 +401,9 @@ _ARCHIVE_REJECTED = {
     "legacy-format": (_encode(torch.zeros(4), _use_new_zipfile_serialization=False), "zip"),
     "deflated": (_rewrite(_ZEROS, compression=zipfile.ZIP_DEFLATED), "uncompressed"),
     "encrypted": (_patch(_ZEROS, _encrypt), "unencrypted"),
-    "crc-mismatch": (_patch(_ZEROS, _corrupt_storage), "CRC"),
+    "crc-mismatch": (_patch(_ZEROS, _corrupt("data/0")), "CRC"),
+    "version-crc-mismatch": (_patch(_ZEROS, _corrupt("version")), "CRC"),
+    "offset-past-archive": (_patch(_ZEROS, _offset_past_archive), "outside the archive"),
     "missing-pickle": (_rewrite(_ZEROS, {"data.pkl": None}), "only the records"),
     "unknown-record": (_rewrite(_ZEROS, add=["archive/notes"]), "only the records"),
     "directory-over-limit": (_rewrite(_ZEROS, add=[f"x/{i}" for i in range(400)]), "is over"),
@@ -415,7 +449,7 @@ def test_record_sizes_must_agree(monkeypatch, record: str) -> None:
 @pytest.mark.parametrize(
     "record, value, match",
     [
-        ("data.pkl", b"N" * 8192, "pickle is"),
+        ("data.pkl", b"N" * 8192, "data.pkl is"),
         ("byteorder", b"little\n", "little-endian"),
         ("byteorder", b"bigend", "little-endian"),
     ],
