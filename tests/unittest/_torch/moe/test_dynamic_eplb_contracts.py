@@ -1273,7 +1273,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     )
     torch = SimpleNamespace(cuda=cuda, _C=raw, Tensor=_Routes, int32="int32")
     source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/planner.py"
-    namespace = {"torch": torch}
+    namespace = {"torch": torch, "contextmanager": contextmanager}
     group_cls = _extract_class(source, "RebalanceSlotSchedulerGroup", None, namespace)
     lease_cls = _extract_class(source, "_LiveBankLeaseProvider", None, namespace)
     group = group_cls.__new__(group_cls)
@@ -1292,6 +1292,10 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group._lent_rows = -1
     group._lent_routes = None
     group._closed = False
+    group.graph_generation = None
+    group.is_capturing_parent_graph = False
+    group._captured_route_wait = False
+    group._graph_replay_failed = False
     group._execution_stream_handle = None
     group.device = 0
     group.topk = 6
@@ -1671,20 +1675,33 @@ def test_native_launch_and_release_order_the_copy_stream_after_main():
     # HALO-Q must not read routes before MAIN wrote them, and the next generation's
     # copy must not overwrite the live bank before MAIN's consumer of it.
     source = (_ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceTmaOp.cpp").read_text()
-    submit = _cpp_method_body(source, "void submitFused(torch::Tensor const& routes")
+    # The eager and the captured submit check the routes, then share one launch path.
+    checks = _cpp_method_body(
+        source, "kernels::MoeRebalanceHaloQParams schedulerForRoutes(torch::Tensor const& routes"
+    )
+    _assert_in_order(
+        checks, ("TORCH_CHECK_VALUE(routes.is_cuda()", "TORCH_CHECK_VALUE(spinCycles > 0")
+    )
+    for signature in (
+        "void submitFused(torch::Tensor const& routes",
+        "void submitGraph(torch::Tensor const& routes",
+    ):
+        entry = _cpp_method_body(source, signature)
+        _assert_in_order(entry, ("schedulerForRoutes(routes, spinCycles)", "submit("))
+        assert "currentExecutionStream()" in entry
+    submit = _cpp_method_body(
+        source, "void submit(kernels::MoeRebalanceHaloQParams const& scheduler"
+    )
     _assert_in_order(
         submit,
         (
-            "TORCH_CHECK_VALUE(routes.is_cuda()",
-            "TORCH_CHECK_VALUE(spinCycles > 0",
-            "cudaStream_t const execution = currentExecutionStream();",
             "cudaEventRecord(mInputReady, execution)",
             "cudaStreamWaitEvent(mCopyStream, mInputReady, 0)",
             "megamoe_tma_copy_submit_fused(",
         ),
     )
     launch = submit[submit.index("megamoe_tma_copy_submit_fused(") :]
-    assert "reinterpret_cast<void*>(mCopyStream)" in launch
+    assert "mCopyStream" in launch
     release = _cpp_method_body(source, "void releaseAfterCurrentStream()")
     _assert_in_order(
         release,
