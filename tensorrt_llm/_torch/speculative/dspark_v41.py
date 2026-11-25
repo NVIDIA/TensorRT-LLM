@@ -5,7 +5,7 @@
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import is_blackwell_datacenter, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
 from ..configs.deepseek_v41 import disagg_context_draft_kv_only_enabled
@@ -52,8 +52,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
 
     def _can_backfill_main_kv(self, draft_model) -> bool:
         return (
-            is_blackwell_datacenter()
-            and bool(self._draft_kv_buffers)
+            bool(self._draft_kv_buffers)
             and not self.mapping.enable_attention_dp
             and draft_model.dspark_model._tp_attention_ready
         )
