@@ -2844,7 +2844,7 @@
         },
         "enable_wide_ep_fault_tolerance": {
           "default": false,
-          "description": "Keep a wide expert-parallel deployment serving at reduced capacity when one of its ranks fails, until a replacement rejoins. Requires attention DP over more than one rank, no MoE TP, the built-in MoE layers, EPLB and KV cache manager V2; unsupported configurations are rejected at startup with the reason. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all.",
+          "description": "Keep a wide expert-parallel deployment serving at reduced capacity when one of its ranks fails, until a replacement rejoins. Failover covers every rank except rank 0: losing rank 0 (or node 0) ends the deployment. Requires attention DP over more than one rank, no MoE TP, the built-in MoE layers, EPLB and KV cache manager V2; unsupported configurations are rejected at startup with the reason. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all.",
           "status": "prototype",
           "title": "Enable Wide Ep Fault Tolerance",
           "type": "boolean"
@@ -11433,7 +11433,7 @@
     },
     "enable_wide_ep_fault_tolerance": {
       "default": false,
-      "description": "Keep a wide expert-parallel deployment serving at reduced capacity when one of its ranks fails, until a replacement rejoins. Requires attention DP over more than one rank, no MoE TP, the built-in MoE layers, EPLB and KV cache manager V2; unsupported configurations are rejected at startup with the reason. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all.",
+      "description": "Keep a wide expert-parallel deployment serving at reduced capacity when one of its ranks fails, until a replacement rejoins. Failover covers every rank except rank 0: losing rank 0 (or node 0) ends the deployment. Requires attention DP over more than one rank, no MoE TP, the built-in MoE layers, EPLB and KV cache manager V2; unsupported configurations are rejected at startup with the reason. Turns off the sentinel transport and the two-rank pull combine of the NVLink one-sided all-to-all.",
       "status": "prototype",
       "title": "Enable Wide Ep Fault Tolerance",
       "type": "boolean"
