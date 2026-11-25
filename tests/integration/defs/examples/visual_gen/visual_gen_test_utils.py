@@ -68,26 +68,21 @@ class FeatureConfigState:
     embedded static quantization recipe, including its calibrated activation
     scales and excluded modules. ``mha_quantize=True`` additionally selects
     CUTEDSL static E4M3 attention and therefore requires calibrated Q/K/V amax
-    tensors from ModelOpt ``--quantize-mha``. ``deco_attention=True`` selects
-    the DeCo-Attention recipe of the CUTEDSL backend (compensated NVFP4 Q/K,
-    FP8 V) for self-attention and leaves the weights as they are.
-    ``torch.compile`` is intentionally omitted because all feature tests
-    disable it to match the existing upstream LPIPS baseline configuration.
+    tensors from ModelOpt ``--quantize-mha``. ``torch.compile`` is intentionally
+    omitted because all feature tests disable it to match the existing upstream
+    LPIPS baseline configuration.
     """
 
     quantization: QuantizationMode = "none"
     quantization_source: QuantizationSource = "dynamic"
     mha_quantize: bool = False
     cuda_graph: bool = False
-    deco_attention: bool = False
 
     def __post_init__(self):
         if self.mha_quantize and not (
             self.quantization == "NVFP4" and self.quantization_source == "static"
         ):
             raise ValueError("MHA quantization requires a static NVFP4 checkpoint")
-        if self.mha_quantize and self.deco_attention:
-            raise ValueError("MHA quantization and DeCo-Attention both set the attention recipe")
 
 
 def _enabled_feature_ids(features):
@@ -102,8 +97,6 @@ def _enabled_feature_ids(features):
         )
     if features.cuda_graph:
         enabled.append("cuda-graph")
-    if features.deco_attention:
-        enabled.append("deco-attention")
     return tuple(enabled)
 
 
@@ -165,13 +158,6 @@ def _build_single_device_feature_args(
                 v_block_size=0,
             ),
         )
-    elif features.deco_attention:
-        attention_config = AttentionConfig(
-            backend="CUTEDSL",
-            quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
-            ),
-        )
 
     kwargs = dict(
         model=model_path,
@@ -229,9 +215,7 @@ def _assert_resolved_single_device_feature_config(
 
     assert config.cache_backend is None
     assert pipeline.cache_accelerator is None
-    expected_attention_backend = (
-        "CUTEDSL" if features.mha_quantize or features.deco_attention else "VANILLA"
-    )
+    expected_attention_backend = "CUTEDSL" if features.mha_quantize else "VANILLA"
     assert config.attention.backend == expected_attention_backend
     quant_attention_config = config.attention.quant_attention_config
     if features.mha_quantize:
@@ -241,11 +225,6 @@ def _assert_resolved_single_device_feature_config(
         assert quant_attention_config.q_block_size == 0
         assert quant_attention_config.k_block_size == 0
         assert quant_attention_config.v_block_size == 0
-    elif features.deco_attention:
-        assert quant_attention_config is not None
-        assert quant_attention_config.deco_attention
-        assert quant_attention_config.qk_dtype == "nvfp4"
-        assert quant_attention_config.v_dtype == "fp8"
     else:
         assert quant_attention_config is None
     assert config.attention.sparse_attention_config is None
@@ -328,25 +307,6 @@ def _assert_single_device_feature_executed(pipeline, features):
             assert runner.graphs, f"CUDA graph runner {name} captured no graphs"
     else:
         assert not runners, f"CUDA graph runners exist with cuda_graph=False: {list(runners)}"
-
-    if features.deco_attention:
-        from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
-
-        layers = [
-            module.attn
-            for component in _transformer_components(pipeline)
-            for module in component.modules()
-            if isinstance(getattr(module, "attn", None), DeCoAttention)
-        ]
-        assert layers, "DeCo-Attention was requested but no layer runs on its backend"
-        # A layer notes the first self-attention call that it hands to VANILLA; a layer without
-        # a kernel for its heads hands over every call and notes nothing.
-        delegated = [
-            layer.layer_idx
-            for layer in layers
-            if layer._noted_unquantized or not layer._has_kernel_geometry
-        ]
-        assert not delegated, f"DeCo-Attention layers {delegated} ran self-attention unquantized"
 
 
 # =============================================================================

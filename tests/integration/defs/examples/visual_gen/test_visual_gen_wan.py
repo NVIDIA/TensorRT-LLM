@@ -85,9 +85,6 @@ FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_LPIPS_THRESHOLD = 0.25
 WAN_FEATURE_LPIPS_THRESHOLD = 0.05
 WAN_STANDARD_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
-# DeCo-Attention runs on one model. Its backend runs self-attention of fewer than 8192 tokens
-# on VANILLA: the frames of the other cases give 4680 tokens, 21 frames give 9360.
-WAN22_DECO_ATTENTION_NUM_FRAMES = 21
 
 
 @dataclass(frozen=True)
@@ -156,47 +153,40 @@ WAN_FEATURE_PROFILES = (
 )
 
 
-def _wan_accuracy_case(model, profile_id, features, supported_features, num_frames=None):
-    """One model with one feature; ``num_frames`` replaces the frames of the model's cases."""
-    _validate_single_feature_config(features, supported_features, model.id)
-    case_id = f"{model.id}-{profile_id}"
-    return pytest.param(
-        WanAccuracyCase(
-            id=case_id,
-            model_id=model.id,
-            checkpoint_subdir=model.checkpoint_subdir,
-            golden_file=f"{model.id}_{profile_id.replace('-', '_')}_lpips_golden_video.mp4",
-            prompt=model.prompt,
-            negative_prompt=model.negative_prompt,
-            height=model.height,
-            width=model.width,
-            num_frames=model.num_frames if num_frames is None else num_frames,
-            num_inference_steps=model.num_inference_steps,
-            guidance_scale=model.guidance_scale,
-            seed=model.seed,
-            features=features,
-            lpips_threshold=WAN_FEATURE_LPIPS_THRESHOLD,
-        ),
-        id=case_id,
-    )
-
-
 def _build_wan_accuracy_cases():
-    cases = [
-        _wan_accuracy_case(model, profile_id, features, WAN_STANDARD_SUPPORTED_FEATURES)
-        for model in WAN_MODEL_SPECS
-        for profile_id, features in WAN_FEATURE_PROFILES
-    ]
-    wan22 = next(model for model in WAN_MODEL_SPECS if model.id == "wan22")
-    cases.append(
-        _wan_accuracy_case(
-            wan22,
-            "deco-attention",
-            FeatureConfigState(deco_attention=True),
-            {"deco-attention"},
-            num_frames=WAN22_DECO_ATTENTION_NUM_FRAMES,
-        )
-    )
+    cases = []
+    for model in WAN_MODEL_SPECS:
+        for profile_id, features in WAN_FEATURE_PROFILES:
+            _validate_single_feature_config(
+                features,
+                WAN_STANDARD_SUPPORTED_FEATURES,
+                model.id,
+            )
+            case_id = f"{model.id}-{profile_id}"
+            cases.append(
+                pytest.param(
+                    WanAccuracyCase(
+                        id=case_id,
+                        model_id=model.id,
+                        checkpoint_subdir=model.checkpoint_subdir,
+                        golden_file=(
+                            f"{model.id}_{profile_id.replace('-', '_')}_lpips_golden_video.mp4"
+                        ),
+                        prompt=model.prompt,
+                        negative_prompt=model.negative_prompt,
+                        height=model.height,
+                        width=model.width,
+                        num_frames=model.num_frames,
+                        num_inference_steps=model.num_inference_steps,
+                        guidance_scale=model.guidance_scale,
+                        seed=model.seed,
+                        features=features,
+                        lpips_threshold=WAN_FEATURE_LPIPS_THRESHOLD,
+                    ),
+                    id=case_id,
+                )
+            )
+
     return cases
 
 

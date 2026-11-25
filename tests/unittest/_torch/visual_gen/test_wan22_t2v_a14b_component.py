@@ -376,12 +376,14 @@ def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     _assert_within(scores, SAGE_LOSS_BUDGET, f"{EXPERT} SageAttention vs BF16")
 
 
+@pytest.mark.parametrize("v_dtype", ("fp8", "nvfp4"))
 def test_deco_attention_loss_budget(
-    checkpoint, dit_inputs, require_deco_kernels, deco_recipe, monkeypatch
+    checkpoint, dit_inputs, require_deco_kernels, deco_recipe, monkeypatch, v_dtype
 ):
-    """DeCo-Attention against dense BF16 attention on the same block and inputs."""
-    recipe = deco_recipe()
-    require_deco_kernels(recipe.v_dtype)
+    """DeCo-Attention against dense BF16 attention on the same block and inputs, with V in
+    ``v_dtype`` (NVFP4 on SM120 only)."""
+    recipe = deco_recipe(v_dtype)
+    require_deco_kernels(v_dtype)
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 
     weights = _block_weights(checkpoint, EXPERT)
