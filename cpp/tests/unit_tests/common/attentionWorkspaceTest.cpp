@@ -269,6 +269,7 @@ TEST(AttentionWorkspaceManagerTest, Fp8SeparateContextStagesOneByteQueries)
 TEST(AttentionWorkspaceManagerTest, SageContiguousContextStagesPackedKvAndSmoothing)
 {
     auto params = fusedContextParams();
+    params.fp8ContextFmha = true;
     params.separateQAndKvInput = true;
     params.sageAttention = true;
     params.sageSmoothK = true;
@@ -276,10 +277,12 @@ TEST(AttentionWorkspaceManagerTest, SageContiguousContextStagesPackedKvAndSmooth
     params.sageKBlockSize = 32;
     params.sageVBlockSize = 1;
     auto expected = fusedContextSizes();
-    expected.qBuf = 100608;
+    expected.qBuf = 50304;
     expected.fp8QBuf = 50304;
     expected.fp8KBuf = 25216;
     expected.fp8VBuf = 25216;
+    expected.fmhaBmm1Scale = 8;
+    expected.fmhaBmm2Scale = 4;
     expected.sageQScale = 264;
     expected.sageKScale = 72;
     expected.sageVScale = 512;
@@ -296,9 +299,9 @@ TEST(AttentionWorkspaceManagerTest, SageHopperContextUsesAlignedPerThreadScaleGe
     params.separateQAndKvInput = true;
     params.sageAttention = true;
     params.hopperSage = true;
-    params.sageQBlockSize = 16;
-    params.sageKBlockSize = 32;
-    params.sageVBlockSize = 4;
+    params.sageQBlockSize = 2;
+    params.sageKBlockSize = 16;
+    params.sageVBlockSize = 1;
     auto expected = fusedContextSizes();
     expected.qBuf = 50304;
     expected.fp8QBuf = 50304;
@@ -308,7 +311,7 @@ TEST(AttentionWorkspaceManagerTest, SageHopperContextUsesAlignedPerThreadScaleGe
     expected.fmhaBmm2Scale = 4;
     expected.sageQScale = 3864;
     expected.sageKScale = 608;
-    expected.sageVScale = 128;
+    expected.sageVScale = 512;
     expectContextSizes(tcop::AttentionWorkspaceManager::buildContextSizes(params), expected);
 }
 
