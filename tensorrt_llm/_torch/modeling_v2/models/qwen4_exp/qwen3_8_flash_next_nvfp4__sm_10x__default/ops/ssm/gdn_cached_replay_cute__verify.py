@@ -38,6 +38,25 @@ are issued first. Small batches (the launch is latency-bound there) bring every 
 bulk copy as soon as the slot is known (`pf=0`: no tile held in registers through the prologue) and
 take the tiles' state dots before the first barrier, while the history is still in flight
 (`early_acc`).
+
+Norm mode (`norm=` on `cached_replay_update`, compile-time `norm`; a CTA owns whole v heads, tpc
+8 or 24, and the token count is even): the output stage writes the gated RMS norm of the
+recurrence output (sigmoid gate, plain weight) instead of that output, so the gated norm launch
+leaves the chain. Per (token, v head) row of 128 the kernel repeats the instructions of the
+registered norm's 4-row kernel (`layernorm_gated._rms_norm_gated_fwd_multirow_kernel`, 4 warps)
+on the bf16 value this kernel would have stored:
+    x    = bf16(o)
+    var  = sum(x * x) / 128    summed as the Triton kernel sums (a lane holds 4 consecutive
+                               elements e0..e3 and adds (e0 + e2) + (e1 + e3), then lanes by
+                               xor-shuffles 16, 8, 4, 2, 1; squares of bf16 values are exact in
+                               fp32, so only the order of the adds matters); `div.full.f32`
+    rstd = div.full(1, sqrt.approx.ftz(var + eps))
+    y    = bf16(((x * rstd) * w) * div.full(1, 1 + ex2.approx(z * -log2 e)))
+and stores `y`, so the tensor is the norm launch's bit for bit. The lanes of half 0 store their
+rounded output over the v element they consumed, one warp a row squares and reduces them, and
+both lane halves take half of the tokens each for the gate; z and the norm weight come in by
+cp.async with the step's v rows, after the grid-dependency wait. State, history and commits are
+unchanged. The state tiles of a norm kernel are read with coherent loads.
 """
 
 from __future__ import annotations
@@ -136,6 +155,20 @@ def _ldg4_hint(gaddr, pol, *, loc=None, ip=None):
         llvm.StructType.get_literal([_ty.i32()] * 4),
         [_ir(gaddr, cutlass.Int64, loc, ip), _ir(pol, cutlass.Int64, loc, ip)],
         "ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32 {$0, $1, $2, $3}, [$4], $5;",
+        "=r,=r,=r,=r,l,l",
+        loc,
+        ip,
+        side=True,
+    )
+    return _unpack(res, 4, cutlass.Int32, loc, ip)
+
+
+@dsl_user_op
+def _ldg4_hint_c(gaddr, pol, *, loc=None, ip=None):
+    res = _asm(
+        llvm.StructType.get_literal([_ty.i32()] * 4),
+        [_ir(gaddr, cutlass.Int64, loc, ip), _ir(pol, cutlass.Int64, loc, ip)],
+        "ld.global.L1::no_allocate.L2::cache_hint.v4.b32 {$0, $1, $2, $3}, [$4], $5;",
         "=r,=r,=r,=r,l,l",
         loc,
         ip,
@@ -685,6 +718,64 @@ def _mbar_wait(mbar, phase, *, loc=None, ip=None):
     )
 
 
+# ---- norm mode: the gated norm's arithmetic, one instruction each (nothing for the compiler
+# to contract or reorder) -------------------------------------------------------------------
+def _n_unary(text, side=False):
+    @dsl_user_op
+    def op(x, *, loc=None, ip=None):
+        return cutlass.Float32(
+            _asm(_ty.f32(), [_ir(x, cutlass.Float32, loc, ip)], text, "=f,f", loc, ip, side=side)
+        )
+
+    return op
+
+
+def _n_binary(text, side=False):
+    @dsl_user_op
+    def op(a, b, *, loc=None, ip=None):
+        return cutlass.Float32(
+            _asm(
+                _ty.f32(),
+                [_ir(a, cutlass.Float32, loc, ip), _ir(b, cutlass.Float32, loc, ip)],
+                text,
+                "=f,f,f",
+                loc,
+                ip,
+                side=side,
+            )
+        )
+
+    return op
+
+
+_n_round_bf16 = _n_unary("{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }")
+_n_mul = _n_binary("mul.rn.f32 $0, $1, $2;")
+_n_add = _n_binary("add.rn.f32 $0, $1, $2;")
+_n_div = _n_binary("div.full.f32 $0, $1, $2;")
+_n_sqrt = _n_unary("sqrt.approx.ftz.f32 $0, $1;")
+# the same instructions pinned in program order (the gate is issued stage by stage)
+_np_mul = _n_binary("mul.rn.f32 $0, $1, $2;", True)
+_np_add = _n_binary("add.rn.f32 $0, $1, $2;", True)
+_np_round_bf16 = _n_unary("{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }", True)
+_np_div = _n_binary("div.full.f32 $0, $1, $2;", True)
+_np_ex2 = _n_unary("ex2.approx.f32 $0, $1;", True)
+
+
+@dsl_user_op
+def _n_lds2(saddr, *, loc=None, ip=None):
+    """8 bytes from shared memory as two words."""
+    res = _asm(
+        llvm.StructType.get_literal([_ty.i32()] * 2),
+        [_ir(saddr, cutlass.Int32, loc, ip)],
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        loc,
+        ip,
+        side=True,
+    )
+    return _unpack(res, 2, cutlass.Int32, loc, ip)
+
+
 def _exp(x):
     return _ex2(x * LOG2E)
 
@@ -727,8 +818,13 @@ class _Replay:
         early_acc=False,
         h=16,
         hv=48,
+        norm=False,
     ):
         assert 1 <= T <= 8
+        # The output stage writes the gated norm's bf16 output (module docstring): a CTA owns
+        # whole v heads, the two lane halves split an even token count.
+        self.norm = bool(norm)
+        assert not norm or (tpc in (8, 24) and T % 2 == 0), f"norm mode: tpc {tpc}, T {T}"
         assert (h, hv) in GEOMETRIES, (h, hv)
         self.H, self.HV = h, hv
         assert tpc in (24, 12, 8, 4, 2, 1) and tpc % warps == 0
@@ -797,6 +893,14 @@ class _Replay:
         o += self.nhv * 64 * 4
         self.o_egs = o
         o += 16
+        self.o_ns = o
+        # norm mode: 1 / std of each row, the gate input z of the CTA's rows ([nhv * T][128]
+        # bf16) and the norm weight ([128] bf16), the last two by cp.async with the step's v rows
+        o += -(-(self.nhv * T * 4) // 16) * 16 if norm else 0
+        self.o_nz = o
+        o += self.nhv * T * 256 if norm else 0
+        self.o_ngw = o
+        o += 256 if norm else 0
         self.smem = -(-o // 128) * 128 + 128
 
     @cute.jit
@@ -833,8 +937,13 @@ class _Replay:
         g_ss: cutlass.Int64,
         pnat_ss: cutlass.Int64,
         buf_ss: cutlass.Int64,
+        z_ptr: cutlass.Int64,
+        z_st: cutlass.Int64,
+        gw_ptr: cutlass.Int64,
+        y_ptr: cutlass.Int64,
         n_rows: cutlass.Int32,
         scale: cutlass.Float32,
+        eps: cutlass.Float32,
         stream,
     ):
         self.kernel(
@@ -869,7 +978,12 @@ class _Replay:
             g_ss,
             pnat_ss,
             buf_ss,
+            z_ptr,
+            z_st,
+            gw_ptr,
+            y_ptr,
             scale,
+            eps,
         ).launch(
             grid=[n_rows * (self.H * self.S), 1, 1],
             block=[32 * self.W, 1, 1],
@@ -1033,13 +1147,15 @@ class _Replay:
         return [_ldg_i32(base + 4 * f) for f in range(fields)]
 
     def _load_tile(self, addr, pol=None):
+        # Norm mode: coherent loads. Some tiles are read after a `griddepcontrol.wait` that is
+        # not the kernel's first statement, above which ptxas may hoist a non-coherent load.
         regs = []
         for jj in range(4):
             for off in (jj * 64, 2048 + jj * 64):
                 if pol is not None:
-                    regs.extend(_ldg4_hint(addr + off, pol))
+                    regs.extend((_ldg4_hint_c if self.norm else _ldg4_hint)(addr + off, pol))
                 else:
-                    regs.extend(_LDG4[self.ld](addr + off))
+                    regs.extend(_LDG4["plain" if self.norm else self.ld](addr + off))
         return regs
 
     @cute.kernel
@@ -1076,7 +1192,12 @@ class _Replay:
         g_ss: cutlass.Int64,
         pnat_ss: cutlass.Int64,
         buf_ss: cutlass.Int64,
+        z_ptr: cutlass.Int64,
+        z_st: cutlass.Int64,
+        gw_ptr: cutlass.Int64,
+        y_ptr: cutlass.Int64,
         scale: cutlass.Float32,
+        eps: cutlass.Float32,
     ):
         T: cutlass.Constexpr = self.T
         TP: cutlass.Constexpr = self.TP
@@ -1129,6 +1250,9 @@ class _Replay:
         s_a = sbase + self.o_a
         s_cq = sbase + self.o_cq
         s_egs = sbase + self.o_egs
+        s_ns = sbase + self.o_ns
+        s_nz = sbase + self.o_nz
+        s_ngw = sbase + self.o_ngw
 
         if const_expr(self.pdl and not self.state_before_wait and not self.qk_first):
             cute.arch.griddepcontrol_wait()
@@ -1187,6 +1311,29 @@ class _Replay:
                         * 2
                     )
                     _cp16z(s_v + (hl0 * T + tv0) * 256 + qv0 * 16, sv0, cutlass.Int32(16))
+            if const_expr(self.norm):
+                # the gate input z of the CTA's rows and the norm weight, by
+                # cp.async with the v rows (after the grid-dependency wait: z is the input
+                # projection's output; nothing stalls on them)
+                n_z0: cutlass.Constexpr = NHV * T * 16
+                for itz0 in cutlass.range_constexpr(-(-n_z0 // NTHR)):
+                    ez0 = tidx + itz0 * NTHR
+                    if ez0 < n_z0:
+                        hlz0 = ez0 // (T * 16)
+                        tz0 = (ez0 // 16) % T
+                        qz0 = ez0 % 16
+                        _cp16z(
+                            s_nz + (hlz0 * T + tz0) * 256 + qz0 * 16,
+                            z_ptr
+                            + (
+                                (n64 * T + cutlass.Int64(tz0)) * z_st
+                                + cutlass.Int64((hv0 + hlz0) * V + qz0 * 8)
+                            )
+                            * 2,
+                            cutlass.Int32(16),
+                        )
+                if tidx < 16:
+                    _cp16z(s_ngw + tidx * 16, gw_ptr + cutlass.Int64(tidx * 16), cutlass.Int32(16))
             _cp_commit()
 
         if const_expr(self.use_wi):
@@ -1349,6 +1496,31 @@ class _Replay:
                             * 2
                         )
                         _cp16z(s_v + (hl * T + t) * 256 + qq * 16, src, cutlass.Int32(16))
+                if const_expr(self.norm):
+                    # the gate input z of the CTA's rows and the norm weight, by
+                    # cp.async with the v rows (after the grid-dependency wait: z is the input
+                    # projection's output; nothing stalls on them)
+                    n_z1: cutlass.Constexpr = NHV * T * 16
+                    for itz1 in cutlass.range_constexpr(-(-n_z1 // NTHR)):
+                        ez1 = tidx + itz1 * NTHR
+                        if ez1 < n_z1:
+                            hlz1 = ez1 // (T * 16)
+                            tz1 = (ez1 // 16) % T
+                            qz1 = ez1 % 16
+                            _cp16z(
+                                s_nz + (hlz1 * T + tz1) * 256 + qz1 * 16,
+                                z_ptr
+                                + (
+                                    (n64 * T + cutlass.Int64(tz1)) * z_st
+                                    + cutlass.Int64((hv0 + hlz1) * V + qz1 * 8)
+                                )
+                                * 2,
+                                cutlass.Int32(16),
+                            )
+                    if tidx < 16:
+                        _cp16z(
+                            s_ngw + tidx * 16, gw_ptr + cutlass.Int64(tidx * 16), cutlass.Int32(16)
+                        )
                 _cp_commit()
 
             # key / query B fragments: column nt * 8 + g of the m16n8 tiles; lane quad c holds
@@ -1556,6 +1728,8 @@ class _Replay:
             mask89 = cutlass.Int32(
                 cutlass.select_(2 * c + 8 < p, cutlass.Int32(0xFFFF), zi)
             ) | cutlass.Int32(cutlass.select_(2 * c + 9 < p, cutlass.Int32(-65536), zi))
+            # a lane's bf16-rounded outputs, [tile][token]
+            nxb = []
             for i in cutlass.range_constexpr(TPW):
                 if const_expr(NSM == 0 and not self.use_early):
                     if const_expr(i + self.pf < TPW):
@@ -1645,17 +1819,42 @@ class _Replay:
                     for s in cutlass.range_constexpr(t):
                         u = u - _lds_f32(s_a + (hl * 64 + t * 8 + s) * 4) * us[s]
                     us.append(u)
-                if hf == 0:
+                if const_expr(self.norm):
+                    # the output is kept, rounded to bf16 as the store
+                    # rounds it (every lane computes it; the lanes of half 0 own it), and
+                    # its squares are summed over 4 consecutive elements in order -- the
+                    # Triton norm's lane -- by the lane of element 4q.
+                    xb = []
                     for t in cutlass.range_constexpr(T):
                         o = ys[t]
                         for s in cutlass.range_constexpr(t + 1):
                             o = o + _lds_f32(s_cq + (hl * 64 + t * 8 + s) * 4) * us[s]
-                        _stg_bf16(o_ptr + (((n64 * T + t) * HV + hv) * V + v0 + r) * 2, o)
+                        xb.append(_n_round_bf16(o))
+                    nxb.append(xb)
+                    if hf != 0:
+                        for t in cutlass.range_constexpr(T):
+                            _stg_bf16(
+                                u_wr + cutlass.Int64((((woff + t) * HV + hv) * V + v0 + r) * 2),
+                                us[t],
+                            )
+                    # the rounded output over the v element this lane just
+                    # consumed (its warp alone reads that element, above)
+                    if hf == 0:
+                        for t in cutlass.range_constexpr(T):
+                            _sts_bf16(s_v + ((hl * T + t) * 128 + v0 + r) * 2, xb[t])
                 else:
-                    for t in cutlass.range_constexpr(T):
-                        _stg_bf16(
-                            u_wr + cutlass.Int64((((woff + t) * HV + hv) * V + v0 + r) * 2), us[t]
-                        )
+                    if hf == 0:
+                        for t in cutlass.range_constexpr(T):
+                            o = ys[t]
+                            for s in cutlass.range_constexpr(t + 1):
+                                o = o + _lds_f32(s_cq + (hl * 64 + t * 8 + s) * 4) * us[s]
+                            _stg_bf16(o_ptr + (((n64 * T + t) * HV + hv) * V + v0 + r) * 2, o)
+                    else:
+                        for t in cutlass.range_constexpr(T):
+                            _stg_bf16(
+                                u_wr + cutlass.Int64((((woff + t) * HV + hv) * V + v0 + r) * 2),
+                                us[t],
+                            )
                 cute.arch.sync_warp()
 
                 # the checkpoint commit of a wrapping row, over the tile just used
@@ -1707,6 +1906,71 @@ class _Replay:
                             _stg4(taddr + jj * 64, ng[0], ng[1], ng[2], ng[3])
                             _stg4(taddr + (2048 + jj * 64), nh8[0], nh8[1], nh8[2], nh8[3])
 
+            if const_expr(self.norm):
+                # the gated norm of the CTA's (v head, token) rows. Warp w
+                # reduces rows w, w + W, ...: lane l holds the sum of elements 4l .. 4l + 3.
+                cute.arch.sync_threads()
+                n_nr: cutlass.Constexpr = NHV * T
+                one = cutlass.Float32(1.0)
+                for itn in cutlass.range_constexpr(-(-n_nr // W)):
+                    nrow = warp + itn * W
+                    if nrow < n_nr:
+                        w2 = _n_lds2(s_v + (nrow * 128 + lane * 4) * 2)
+                        e4 = [_bf2_lo(w2[0]), _bf2_hi(w2[0]), _bf2_lo(w2[1]), _bf2_hi(w2[1])]
+                        e4 = [_n_mul(x_, x_) for x_ in e4]
+                        sq = _n_add(_n_add(e4[0], e4[2]), _n_add(e4[1], e4[3]))
+                        sq = _n_add(sq, _shfl_xor(sq, 16))
+                        sq = _n_add(sq, _shfl_xor(sq, 8))
+                        sq = _n_add(sq, _shfl_xor(sq, 4))
+                        sq = _n_add(sq, _shfl_xor(sq, 2))
+                        sq = _n_add(sq, _shfl_xor(sq, 1))
+                        var = _n_div(sq, cutlass.Float32(V))
+                        rstd = _n_div(one, _n_sqrt(_n_add(var, eps)))
+                        if lane == 0:
+                            _sts_f32(s_ns + nrow * 4, rstd)
+                cute.arch.sync_threads()
+                # every lane: half 0 takes tokens 0 .. T/2 - 1 of its tiles, half 1 the
+                # rest (both halves hold the same outputs); z and the weight from shared
+                # memory; the instructions stage by stage over the lane's outputs.
+                nl2e = cutlass.Float32(-LOG2E)
+                kx = []
+                krs = []
+                kad = []
+                kz = []
+                kw = []
+                for i2 in cutlass.range_constexpr(TPW):
+                    mt2 = sp * TPC + warp + W * i2
+                    hvr2 = mt2 // 8
+                    hv2 = h * GRP + hvr2
+                    hl2 = hvr2 - hv_first
+                    v02 = (mt2 % 8) * 16
+                    gw2 = _lds_bf16(s_ngw + (v02 + r) * 2)
+                    for tt in cutlass.range_constexpr(T // 2):
+                        td = tt + (T // 2) * hf
+                        kx.append(
+                            cutlass.Float32(
+                                cutlass.select_(hf == 0, nxb[i2][tt], nxb[i2][tt + T // 2])
+                            )
+                        )
+                        krs.append(_lds_f32(s_ns + (hl2 * T + td) * 4))
+                        kad.append(
+                            y_ptr + (((n64 * T + cutlass.Int64(td)) * HV + hv2) * V + v02 + r) * 2
+                        )
+                        kz.append(_lds_bf16(s_nz + ((hl2 * T + td) * 128 + v02 + r) * 2))
+                        kw.append(gw2)
+                ky = [_np_mul(x_, r_) for x_, r_ in zip(kx, krs)]
+                ky = [_np_mul(y_, w_) for y_, w_ in zip(ky, kw)]
+                kg = [_np_mul(z_, nl2e) for z_ in kz]
+                kg = [_np_ex2(g_) for g_ in kg]
+                kg = [_np_add(g_, one) for g_ in kg]
+                kg = [_np_div(one, g_) for g_ in kg]
+                ky = [_np_mul(y_, g_) for y_, g_ in zip(ky, kg)]
+                ky = [_np_round_bf16(y_) for y_ in ky]
+                # the gated norm's bf16 value itself (the rounding above is the store's:
+                # `cvt.rn.bf16.f32` of a bf16 value is that value)
+                for k_ in cutlass.range_constexpr(TPW * (T // 2)):
+                    _stg_bf16(kad[k_], ky[k_])
+
             if const_expr(self.pdl and not self.early_trigger):
                 cute.arch.griddepcontrol_launch_dependents()
 
@@ -1751,11 +2015,13 @@ def _kernel_kw(
     config: Optional[dict] = None,
     work_item_width: int = 4,
     separate_replay_slots: bool = False,
+    norm: bool = False,
 ) -> dict:
     """The kernel's compile-time parameters for a call of `n` requests: its key in `_COMPILED`.
 
     `work_item_width` is the int32 fields per work item; `separate_replay_slots` says the
-    history is addressed by replay slots of its own (`replay_indices`)."""
+    history is addressed by replay slots of its own (`replay_indices`); `norm` selects the norm
+    mode's output stage (the key gains `norm` only then)."""
     cfg = dict(default_config(n, t, commit))
     if config:
         cfg.update(config)
@@ -1765,6 +2031,8 @@ def _kernel_kw(
     cfg["use_wi"] = bool(cfg.pop("use_wi", True)) and work_items
     cfg["wi_w"] = work_item_width if cfg["use_wi"] else 4
     cfg["rsep"] = separate_replay_slots
+    if norm:
+        cfg["norm"] = True
     return dict(
         T=t,
         h=h,
@@ -1790,6 +2058,7 @@ def precompile(
     work_item_width: int = 4,
     separate_replay_slots: bool = False,
     configs: Optional[dict] = None,
+    norm_counts: tuple = (),
 ) -> int:
     """Compile every kernel a verify step of 1..`max_requests` requests launches, the way a
     target calls this entry: work items, and with them no in-kernel commit, from
@@ -1797,11 +2066,14 @@ def precompile(
     A compile costs 5-10 s, so a target runs this at bind, before any step: the captured
     decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests, which an
     eager mixed step carries). `configs` (`{requests: launch mapping}`): the mapping the
-    target passes as `config` at those request counts. Returns the number of distinct
-    kernels."""
+    target passes as `config` at those request counts. `norm_counts`: the request counts whose
+    norm-mode kernel (`cached_replay_norm_update`) is compiled too. Returns the number of
+    distinct kernels."""
     keys = set()
     configs = configs or {}
-    for n in range(1, max_requests + 1):
+    for n, norm in [(n, False) for n in range(1, max_requests + 1)] + [
+        (n, True) for n in norm_counts
+    ]:
         partitioned = n >= partition_from
         kw = _kernel_kw(
             n,
@@ -1818,12 +2090,22 @@ def precompile(
             config=configs.get(n),
             work_item_width=work_item_width,
             separate_replay_slots=separate_replay_slots,
+            norm=norm,
         )
         key = tuple(sorted(kw.items()))
         if key not in keys:
             keys.add(key)
             _compile(key, _Replay(**kw))
     return len(keys)
+
+
+def norm_tpc_ok(n: int, t: int, commit: bool, config: Optional[dict] = None) -> bool:
+    """Whether a call of `n` requests x `t` tokens can take the norm mode: its launch mapping
+    gives a CTA whole v heads (tpc 8 or 24) and `t` is even."""
+    cfg = dict(default_config(n, t, commit))
+    if config:
+        cfg.update(config)
+    return cfg["tpc"] in (8, 24) and t % 2 == 0
 
 
 def _compile(key, kern):
@@ -1834,8 +2116,9 @@ def _compile(key, kern):
         fn = cute.compile(
             kern,
             from_dlpack(dummy, assumed_align=4).mark_layout_dynamic(leading_dim=0),
-            *([i64] * 30),
+            *([i64] * 34),
             cutlass.Int32(1),
+            cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--opt-level 2 --enable-tvm-ffi",
@@ -1872,9 +2155,13 @@ def cached_replay_update(
     in_kernel_commit: Optional[bool] = None,
     config: Optional[dict] = None,
     replay_indices: Optional[torch.Tensor] = None,
+    norm: Optional[tuple] = None,
     **ignored,
 ) -> torch.Tensor:
     """Same contract as `fused_recurrent_gated_delta_rule_cached_replay_update` (bf16 state).
+
+    `norm` (`cached_replay_norm_update`): `(z3, weight, eps)` -- the output is then the gated
+    RMS norm of the recurrence output (module docstring), `[N, T, HV, V]` bf16.
 
     `replay_indices` (`state_indices` when None) address the history (`old_u` / `old_k` /
     `old_G`) and its bookkeeping (`prev_num_accepted_tokens` / `cache_buf_idx`); each
@@ -1947,6 +2234,18 @@ def cached_replay_update(
     commit = replay_work_items is None if in_kernel_commit is None else bool(in_kernel_commit)
     if scale is None:
         scale = K**-0.5
+    if norm is not None:
+        z3, gw, eps = norm
+        assert output is None, "the norm mode allocates its output"
+        assert z3.dtype == torch.bfloat16 and tuple(z3.shape) == (N * T, HV, V)
+        assert z3.stride(2) == 1 and z3.stride(1) == V, f"z strides {tuple(z3.stride())}"
+        assert (
+            z3.data_ptr() % 16 == 0 and (z3.stride(0) * 2) % 16 == 0 and gw.data_ptr() % 16 == 0
+        ), "z rows and the norm weight must be 16-byte aligned (cp.async)"
+        assert gw.dtype == torch.bfloat16 and gw.numel() == V and gw.is_contiguous()
+    else:
+        z3 = gw = None
+        eps = 0.0
     if output is None:
         output = torch.empty((N, T, HV, V), dtype=q.dtype, device=q.device)
     assert output.is_contiguous() and output.dtype == torch.bfloat16
@@ -1993,6 +2292,10 @@ def cached_replay_update(
         config=config,
         work_item_width=replay_work_items.shape[1] if replay_work_items is not None else 4,
         separate_replay_slots=rsep,
+        norm=norm is not None,
+    )
+    assert norm is None or norm_tpc_ok(N, T, commit, config), (
+        f"the norm mode needs whole v heads a CTA and an even token count ({N} x {T})"
     )
     use_wi = kw["use_wi"]
     key = tuple(sorted(kw.items()))
@@ -2032,10 +2335,26 @@ def cached_replay_update(
         old_G.stride(0) * old_G.element_size(),
         prev_num_accepted_tokens.stride(0) * prev_num_accepted_tokens.element_size(),
         cache_buf_idx.stride(0) * cache_buf_idx.element_size(),
+        z3.data_ptr() if z3 is not None else 0,
+        z3.stride(0) if z3 is not None else 0,
+        gw.data_ptr() if gw is not None else 0,
+        output.data_ptr() if norm is not None else 0,
         N,
         float(scale),
+        float(eps),
     )
     return output
+
+
+def cached_replay_norm_update(*, norm: tuple, **kwargs) -> torch.Tensor:
+    """`cached_replay_update` in norm mode: `norm` = `(z3, weight, eps)` with `z3` `[N * T, HV,
+    V]` bf16 (any token stride, the (heads, V) block contiguous: the column view of the input
+    projection the registered norm reads) and `weight` `[V]` bf16 contiguous. Returns `[N, T,
+    HV, V]` bf16: what `rms_norm_gated_token_major(out, z3, weight, eps, gate_activation=
+    "sigmoid")` returns for the output `cached_replay_update` would have returned (which is not
+    stored). State, history and commits are `cached_replay_update`'s. The launch mapping must
+    give a CTA whole v heads and the token count be even (`norm_tpc_ok`)."""
+    return cached_replay_update(norm=norm, **kwargs)
 
 
 #: A tp4/tep4 rank's GDN heads: 16 key / 48 value split four ways.

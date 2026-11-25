@@ -744,3 +744,148 @@ def test_dp_replay_map_is_bitwise_at_replay_slots(n, pdl) -> None:
     assert torch.equal(outs[1], outs[0]), f"out: {cfg} vs the kernel's own mapping at {n} requests"
     for name, x, y in zip(_SLOT_STATE, _slot_state(sides[1]), _slot_state(sides[0])):
         assert torch.equal(x, y), f"{name}: {cfg} vs the kernel's own mapping at {n} requests"
+
+
+def _norm_operands(n, t, hv, seed):
+    """The gated norm's operands as the target hands them: `z` the column view of a dep rank's
+    `[n * t, 16480]` input projection seen as `[n * t, hv, 128]`, the layer's norm weight."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    proj = torch.randn(n * t, 16480, generator=g, device=DEV).to(torch.bfloat16)
+    z3 = torch.reshape(proj[:, 10240 : 10240 + hv * 128], [n * t, hv, 128])
+    weight = (torch.rand(128, generator=g, device=DEV) + 0.5).to(torch.bfloat16)
+    return z3, weight, 1e-6
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("n", [5, 8, 12, 13, 16, 17, 24, 48, 64])
+def test_norm_mode_is_bitwise_the_replay_and_the_norm_launch(n, pdl) -> None:
+    """Norm mode at an attention-DP rank's geometry (16 / 48 heads, 4 rows a request) at the
+    launch mapping the target uses (`M._gdn_replay_map`, else the kernel's own): its output is
+    `rms_norm_gated_token_major` of the plain call's output bit for bit, and the checkpoint and
+    the u / k / G history are the plain call's."""
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+    t = 4
+    cfg = M._gdn_replay_map(n)
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    if not cr.norm_tpc_ok(n, t, path == "small", cfg):
+        pytest.skip(f"{n} requests: the mapping splits a v head over CTAs (the target declines)")
+    spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)
+    bench = trep._Bench(spec, 6500 + n, exact=False)
+    bench.prepare()
+    act = bench.inputs()
+    a, b = _gates(bench, act, True)
+    z3, weight, eps = _norm_operands(n, t, 48, 6600 + n)
+    snap = [x.clone() for x in bench.state(0)]
+    results = []
+    for norm in (None, (z3, weight, eps)):
+        for x, y in zip(bench.state(0), snap):
+            x.copy_(y)
+        kw = bench.kwargs(0, act)
+        kw.update(g=a, beta=b, config=cfg, launch_with_pdl=pdl)
+        out = op(**kw) if norm is None else cr.cached_replay_norm_update(norm=norm, **kw)
+        torch.cuda.synchronize()
+        results.append([out.clone()] + [x.clone() for x in bench.state(0)])
+    expected = rms_norm_gated_token_major(
+        torch.reshape(results[0][0], [-1, 128]), z3, weight, eps, None, "sigmoid"
+    )
+    assert torch.equal(torch.reshape(results[1][0], [-1, 128]), expected), "the gated norm"
+    for name, x, y in zip(("state", "u", "k", "G"), results[1][1:], results[0][1:]):
+        assert torch.equal(x, y), f"{name}: norm mode vs the plain call at {n} requests"
+
+
+@pytest.mark.parametrize("n", [5, 17])
+def test_norm_mode_under_graph_replay(n) -> None:
+    """Captured with PDL and replayed over fresh activations and gates: the norm mode's output
+    still equals the norm launch over a plain call's output from the same state."""
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+    t = 4
+    cfg = M._gdn_replay_map(n)
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)
+    bench = trep._Bench(spec, 6700 + n, exact=False)
+    bench.prepare()
+    act = bench.inputs()
+    a, b = _gates(bench, act, True)
+    z3, weight, eps = _norm_operands(n, t, 48, 6800 + n)
+    kw = bench.kwargs(0, act)
+    kw.update(g=a, beta=b, config=cfg, launch_with_pdl=True)
+    snap = [x.clone() for x in bench.state(0)]
+    cr.cached_replay_norm_update(norm=(z3, weight, eps), **kw)  # compile
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = cr.cached_replay_norm_update(norm=(z3, weight, eps), **kw)
+    gen = torch.Generator(device=DEV).manual_seed(n)
+    for _ in range(3):
+        for x, y in zip(bench.state(0), snap):
+            x.copy_(y)
+        z3.copy_(torch.randn(z3.shape, generator=gen, device=DEV).to(torch.bfloat16))
+        graph.replay()
+        torch.cuda.synchronize()
+        norm_out = got.clone()
+        for x, y in zip(bench.state(0), snap):
+            x.copy_(y)
+        plain = op(**kw)
+        expected = rms_norm_gated_token_major(
+            torch.reshape(plain, [-1, 128]), z3, weight, eps, None, "sigmoid"
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(torch.reshape(norm_out, [-1, 128]), expected)
+
+
+_NORM_SASS_CHILD = """
+import sys
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+import importlib
+cr = importlib.import_module(
+    "tensorrt_llm._torch.modeling_v2.models.qwen4_exp."
+    "qwen3_8_flash_next_nvfp4__sm_10x__default.ops.ssm.gdn_cached_replay_cute__verify"
+)
+n, commit, tpc, warps, pf, minb = (int(v) for v in sys.argv[1:7])
+cfg = dict(tpc=tpc, warps=warps, pf=pf, minb=minb)
+kw = cr._kernel_kw(n, 4, 16, 48, commit=bool(commit), pdl=True, l2norm=True, gating=True,
+                   g_f32=False, b_f32=False, work_items=not commit, config=cfg, norm=True)
+dummy = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=4)
+cute.compile(cr._Replay(**kw), dummy, *([cutlass.Int64(0)] * 34), cutlass.Int32(1),
+             cutlass.Float32(1.0), cutlass.Float32(1.0),
+             make_fake_stream(use_tvm_ffi_env_stream=True), options="--opt-level 2 --enable-tvm-ffi")
+"""
+
+
+@pytest.mark.parametrize(
+    "n, commit, cfg",
+    [(5, 1, (8, 8, 0, 4)), (13, 1, (8, 4, 1, 5)), (17, 0, (8, 8, 0, 4)), (16, 0, (24, 8, 1, 2))],
+)
+def test_norm_mode_has_no_non_coherent_load(n, commit, cfg, tmp_path) -> None:
+    """The norm kernel reads state tiles after a `griddepcontrol.wait` that is not its first
+    statement: every global load of a norm variant is coherent (no `ld.global.nc` in the PTX,
+    no `LDG.*.CONSTANT` in the SASS). Compiles only (sm_103a, no launch)."""
+    import os
+    import re
+    import subprocess
+
+    env = dict(
+        os.environ,
+        CUTE_DSL_ARCH="sm_103a",
+        CUTE_DSL_KEEP="ptx,sass",
+        CUTE_DSL_DUMP_DIR=str(tmp_path),
+        CUTE_DSL_CACHE_DIR=str(tmp_path / "cache"),
+        CUTE_DSL_DISABLE_FILE_CACHING="1",
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", _NORM_SASS_CHILD, str(n), str(commit), *map(str, cfg)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    ptx = [p.read_text() for p in tmp_path.glob("*.ptx")]
+    sass = [p.read_text() for p in tmp_path.glob("*.sass")]
+    assert ptx and sass
+    assert all("ld.global.nc" not in t for t in ptx), "a non-coherent global load in the PTX"
+    assert not any(re.search(r"\bLDG\b[\w.]*\.CONSTANT", t) for t in sass)
