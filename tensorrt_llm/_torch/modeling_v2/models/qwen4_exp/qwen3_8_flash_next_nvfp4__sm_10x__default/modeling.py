@@ -1644,6 +1644,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             flush=True,
         )
 
+    def release_host_resident_weights(self) -> None:
+        """Close the host-resident n-gram table and, in `node`, its broker threads."""
+        _weights._close_ngram_table(self)
+
     # ---------------------------------------------------------------- bind ---
 
     def _bind_cache_manager(self, md, position_ids) -> None:
@@ -6843,6 +6847,10 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     runtime_hooks: RuntimeHooks | None = None
     # Keeps a requested NVFP4 KV pool, which the engine otherwise turns into FP8 on sm_107.
     supports_nvfp4_kv_cache = True
+
+    #: PLE seeds a fresh request's n-gram history and conv state in its prefill only, so the
+    #: engine must not run a one-token prompt as a decode row.
+    resets_recurrent_state_in_context = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config=None) -> str:

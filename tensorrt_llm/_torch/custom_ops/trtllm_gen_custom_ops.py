@@ -1371,7 +1371,7 @@ def _fp4_block_scale_moe_fake(
         routed_scaling_factor,
         routing_method_type,
         do_finalize,
-        act_type,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,

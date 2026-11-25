@@ -1,6 +1,6 @@
 ---
 name: trtllm-modeling-v2-features
-description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
+description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, expert-parallel load balancing (EPLB), or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
 ---
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
@@ -95,6 +95,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 | disaggregation | feature `disagg` + `accuracy.disagg` (`config`/`context`/`generation`, or `test`) | a benchmark scored through `trtllm-serve disaggregated` | the flow's own serving of the stated deployment, or the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
 | speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | acceptance gate |
+| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member, `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant accuracy |
 
 ## Rules that save hours
 

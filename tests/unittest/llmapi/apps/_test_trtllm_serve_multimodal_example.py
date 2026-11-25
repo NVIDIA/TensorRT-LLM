@@ -22,7 +22,7 @@ import yaml
 from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = [".."]
-from test_llm import get_model_path
+from model_paths import get_model_path
 from utils.llm_data import llm_models_root
 
 
