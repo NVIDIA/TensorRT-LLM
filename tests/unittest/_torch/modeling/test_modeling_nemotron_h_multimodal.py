@@ -1307,3 +1307,63 @@ def test_nemotron_nano_frees_the_modelopt_projector_shard():
 
     assert "vision_projector.mlp1.linear1.weight" not in weights
     assert "vision_model.radio_model.weight" not in weights
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_profiling_dummy_matches_group_sizes(dynamic):
+    from tensorrt_llm._torch.models.modeling_parakeet import ParakeetExtractor
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+    proc = object.__new__(NemotronHMultimodalInputProcessor)
+    proc._config = SimpleNamespace(
+        vision_config=SimpleNamespace(args={"register_multiple": 4, "cpe_max_size": 1024}),
+    )
+    proc.dynamic_tiler = SimpleNamespace(_max_num_patches=256) if dynamic else None
+    proc._processor = SimpleNamespace(max_num_tiles=4, use_thumbnail=True)
+    proc.patch_size = 16
+    proc.spatial_merge_size = 32
+    proc.image_size = 128
+    proc.downsample_ratio = 0.5
+    proc.video_temporal_patch_size = 2
+    proc.video_target_num_patches = 16
+    proc.video_maintain_aspect_ratio = False
+    proc.video_pruning_rate = 0
+    proc._audio_extractor = ParakeetExtractor(
+        SimpleNamespace(
+            num_mel_bins=32,
+            sampling_rate=16000,
+            subsampling_factor=8,
+            subsampling_conv_kernel_size=3,
+            subsampling_conv_stride=2,
+        )
+    )
+    vision = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=800, mm_counts={"vision": 1}, dtype=torch.bfloat16
+    )
+    assert MultimodalParams(multimodal_data=vision).item_metadata.item_refs == (("image", 0),)
+    small = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=20, mm_counts={"vision": 1}, dtype=torch.bfloat16
+    )
+    modality = "image" if dynamic else "video"
+    assert MultimodalParams(multimodal_data=small).item_metadata.item_refs == ((modality, 0),)
+    counts = {"image": 2, "video": 1, "audio": 1}
+    data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=3200, mm_counts=counts, dtype=torch.bfloat16
+    )
+    metadata = MultimodalParams(multimodal_data=data).item_metadata
+    assert metadata.item_refs == (("image", 0), ("image", 1), ("video", 0), ("audio", 0))
+    image = data["image"]["pixel_values"]
+    img_tokens = (
+        sum(h * w for h, w in data["image"]["image_sizes"]) if dynamic else image.numel() // 3
+    )
+    video = data["video"]["pixel_values"]
+    audio = data["audio"]
+    assert audio["audio_num_clips"].tolist() == [2]
+    assert audio["feature_attention_mask"].shape == audio["input_audio_features"].shape[:2]
+    assert list(metadata.output_embedding_lengths) == [
+        img_tokens // (32**2 * 2),
+        img_tokens // (32**2 * 2),
+        video.numel() // (3 * 32**2 * 2),
+        int(audio["audio_output_lengths"].sum()),
+    ]
