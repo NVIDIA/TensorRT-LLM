@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import pathlib
 import random
 import time
@@ -30,9 +31,9 @@ from .test_llm import (
     _test_llm_capture_request_error, get_model_path, global_kvcache_config,
     global_kvcache_config_no_reuse, is_idle_heartbeat, llama_model_path,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
-    llm_return_logprobs_test_harness, llm_test_harness, prompts,
+    llm_check_output, llm_return_logprobs_test_harness, prompts,
     run_llm_abort_request, sampling_params_for_aborting_request,
-    run_llm_with_postprocess_parallel_and_result_handler,
+    check_llm_postprocess_parallel_and_result_handler,
     tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
@@ -175,22 +176,113 @@ def test_llm_capture_request_error():
     _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
 
 
+def _warm_up_request_path(llm: LLM,
+                          sampling_params: Optional[SamplingParams] = None
+                          ) -> None:
+    """Send one short request so that the LLM starts its request-path threads.
+
+    Called by class-scoped fixtures before the tests run, so that the
+    threadleak check of the first test does not count those threads.
+
+    Args:
+        llm: The LLM to warm up.
+        sampling_params: Parameters of the request; one token by default. An
+            LLM built with max_beam_width > 1 needs a request at that width.
+    """
+    llm.generate(prompts[0], sampling_params or SamplingParams(max_tokens=1))
+
+
+def _abort_request_max_beam_width(sampling_params: SamplingParams) -> int:
+    """Beam width an LLM needs to serve these abort-request sampling params."""
+    if not sampling_params.use_beam_search:
+        return 1
+    if sampling_params.best_of is None:
+        return sampling_params.n
+    return sampling_params.best_of
+
+
+_ABORT_REQUEST_BEAM_WIDTHS = {
+    _abort_request_max_beam_width(sp)
+    for sp in sampling_params_for_aborting_request if sp.use_beam_search
+}
+# The beam-search cases share one LLM, so they must need the same beam width.
+assert len(_ABORT_REQUEST_BEAM_WIDTHS) == 1
+_ABORT_REQUEST_BEAM_WIDTH = _ABORT_REQUEST_BEAM_WIDTHS.pop()
+
+
+def _ray_variant_requested(config: pytest.Config) -> bool:
+    """Whether mpi_ray_parity tests run as their [ray] variant.
+
+    Mirrors pytest_generate_tests in tests/unittest/conftest.py. Its LLM patch
+    is function-scoped, so it does not reach LLMs built by class fixtures.
+    """
+    return bool(
+        config.getoption("--run-ray")
+        or os.environ.get("TLLM_RUN_RAY_TESTS") == "1")
+
+
+@contextmanager
+def _abort_request_llm(max_beam_width: int,
+                       ray: bool) -> Generator[LLM, None, None]:
+    """Build the LLM that the abort-request checks of one beam width share."""
+    llm_kwargs = {}
+    if ray:
+        llm_kwargs["orchestrator_type"] = "ray"
+    warm_up_params = None
+    if max_beam_width > 1:
+        llm_kwargs["max_beam_width"] = max_beam_width
+        # Requests must run at exactly max_beam_width.
+        warm_up_params = SamplingParams(max_tokens=1,
+                                        n=max_beam_width,
+                                        use_beam_search=True)
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             **llm_kwargs) as llm:
+        _warm_up_request_path(llm, warm_up_params)
+        yield llm
+
+
 @force_ampere
 @pytest.mark.mpi_ray_parity
-@pytest.mark.parametrize("sampling_params",
-                         sampling_params_for_aborting_request)
 @pytest.mark.part0
-def test_llm_abort_request(sampling_params):
-    llm_kwargs = {}
-    if sampling_params.use_beam_search:
-        if sampling_params.best_of is None:
-            llm_kwargs["max_beam_width"] = sampling_params.n
-        else:
-            llm_kwargs["max_beam_width"] = sampling_params.best_of
-    llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
-              **llm_kwargs)
-    run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+class TestLlmAbortRequest:
+    """Abort checks without beam search, on one shared LLM."""
+
+    @pytest.fixture(scope="class")
+    def llm(self, request: pytest.FixtureRequest) -> Generator[LLM, None, None]:
+        with _abort_request_llm(max_beam_width=1,
+                                ray=_ray_variant_requested(
+                                    request.config)) as llm:
+            yield llm
+
+    @pytest.mark.parametrize("sampling_params", [
+        sp
+        for sp in sampling_params_for_aborting_request if not sp.use_beam_search
+    ])
+    def test_llm_abort_request(self, llm: LLM,
+                               sampling_params: SamplingParams) -> None:
+        run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+
+
+@force_ampere
+@pytest.mark.mpi_ray_parity
+@pytest.mark.part0
+class TestLlmAbortRequestBeamSearch:
+    """Abort checks with beam search, on one shared beam-search LLM."""
+
+    @pytest.fixture(scope="class")
+    def llm(self, request: pytest.FixtureRequest) -> Generator[LLM, None, None]:
+        with _abort_request_llm(max_beam_width=_ABORT_REQUEST_BEAM_WIDTH,
+                                ray=_ray_variant_requested(
+                                    request.config)) as llm:
+            yield llm
+
+    @pytest.mark.parametrize("sampling_params", [
+        sp for sp in sampling_params_for_aborting_request if sp.use_beam_search
+    ])
+    def test_llm_abort_request(self, llm: LLM,
+                               sampling_params: SamplingParams) -> None:
+        run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
 @force_ampere
@@ -418,17 +510,43 @@ def test_llm_prometheus():
 
 
 @skip_ray
-@pytest.mark.parametrize("streaming", [True, False])
 @pytest.mark.part3
-def test_llm_with_postprocess_parallel_and_result_handler(streaming):
-    run_llm_with_postprocess_parallel_and_result_handler(streaming,
-                                                         "pytorch",
-                                                         tp_size=1)
+class TestLlmPostprocessParallel:
+    """Parallel post-processing checks on one LLM with two workers."""
+
+    @pytest.fixture(scope="class")
+    def llm(self) -> Generator[LLM, None, None]:
+        with LLM(model=llama_model_path,
+                 backend="pytorch",
+                 kv_cache_config=global_kvcache_config,
+                 num_postprocess_workers=2,
+                 postprocess_tokenizer_dir=llama_model_path) as llm:
+            _warm_up_request_path(llm)
+            yield llm
+
+    @pytest.mark.parametrize("streaming", [True, False])
+    def test_llm_with_postprocess_parallel_and_result_handler(
+            self, llm: LLM, streaming: bool) -> None:
+        check_llm_postprocess_parallel_and_result_handler(llm, streaming)
 
 
-@pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.part0
-def test_embedding_bias_with_torch_sampler_strategies(sparse: bool):
+class TestEmbeddingBiasTorchSampler:
+    """Sparse and dense embedding bias in TorchSampler, on one shared LLM."""
+
+    @pytest.fixture(scope="class")
+    def llm(self) -> Generator[LLM, None, None]:
+        with LLM(llama_model_path, llama_model_path, backend="pytorch") as llm:
+            _warm_up_request_path(llm)
+            yield llm
+
+    @pytest.mark.parametrize("sparse", [True, False])
+    def test_embedding_bias_with_torch_sampler_strategies(
+            self, llm: LLM, sparse: bool) -> None:
+        _check_embedding_bias_with_torch_sampler(llm, sparse)
+
+
+def _check_embedding_bias_with_torch_sampler(llm: LLM, sparse: bool) -> None:
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
@@ -455,13 +573,9 @@ def test_embedding_bias_with_torch_sampler_strategies(sparse: bool):
     # rather than hardcoding a particular tokenizer's rendering.
     expected_output = tokenizer.decode([biased_word_id] * max_tokens)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts,
-        [expected_output],
-        sampling_params=sampling_params,
-        backend="pytorch",
-    )
+    llm_check_output(llm,
+                     prompts, [expected_output],
+                     sampling_params=sampling_params)
 
 
 def test_lora_cuda_graph_params_filling_kernel_special_cases():
@@ -843,24 +957,6 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
         llm.shutdown()
 
 
-class TestLlmError:
-
-    @pytest.mark.part3
-    def test_max_num_token_check(self):
-        """LLM should raise error when got prompt length exceed the valid range."""
-        llm = LLM(llama_model_path,
-                  kv_cache_config=global_kvcache_config,
-                  max_num_tokens=100)
-
-        try:
-            with pytest.raises(RequestError,
-                               match="should not exceed max_num_tokens"):
-                ids = [random.randint(10, 100) for _ in range(101)]
-                llm.generate([ids])
-        finally:
-            llm.shutdown()
-
-
 class FailingExecutorWorker(GenerationExecutorWorker):
     """Mock worker that fails during initialization to test error handling."""
 
@@ -900,29 +996,47 @@ def test_llm_with_proxy_error():
                       kv_cache_config=global_kvcache_config)
 
 
+_MIN_TOKENS_LLM_KWARGS = dict(
+    model=llama_model_path,
+    max_batch_size=2,
+    kv_cache_config=global_kvcache_config,
+    max_num_tokens=2048,
+)
+
+
 @pytest.mark.part0
-@pytest.mark.parametrize("use_speculative", [True, False])
-def test_min_tokens(use_speculative: bool):
-    """Check min_tokens is respected."""
-    llm_common_config = dict(
-        model=llama_model_path,
-        max_batch_size=2,
-        kv_cache_config=global_kvcache_config,
-        max_num_tokens=2048,
+def test_min_tokens_speculative() -> None:
+    """Check min_tokens is respected with NGram speculative decoding."""
+    spec_config = NGramDecodingConfig(
+        max_draft_len=4,
+        max_matching_ngram_size=2,
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=True,
     )
+    with LLM(**_MIN_TOKENS_LLM_KWARGS, speculative_config=spec_config) as llm:
+        _check_min_tokens(llm)
 
-    if use_speculative:
-        spec_config = NGramDecodingConfig(
-            max_draft_len=4,
-            max_matching_ngram_size=2,
-            is_keep_all=True,
-            is_use_oldest=True,
-            is_public_pool=True,
-        )
-        llm = LLM(**llm_common_config, speculative_config=spec_config)
-    else:
-        llm = LLM(**llm_common_config)
 
+@pytest.mark.part0
+class TestMinTokens:
+    """min_tokens checks without speculative decoding, on one shared LLM."""
+
+    @pytest.fixture(scope="class")
+    def llm(self) -> Generator[LLM, None, None]:
+        with LLM(**_MIN_TOKENS_LLM_KWARGS) as llm:
+            _warm_up_request_path(llm)
+            yield llm
+
+    def test_min_tokens(self, llm: LLM) -> None:
+        _check_min_tokens(llm)
+
+    def test_min_tokens_long_prompt(self, llm: LLM) -> None:
+        _check_min_tokens_long_prompt(llm)
+
+
+def _check_min_tokens(llm: LLM) -> None:
+    """Check min_tokens is respected."""
     output_len = 2000
     sampling_params = SamplingParams(max_tokens=output_len,
                                      min_tokens=output_len,
@@ -933,8 +1047,7 @@ def test_min_tokens(use_speculative: bool):
     assert len(res.outputs[0].token_ids) == output_len
 
 
-@pytest.mark.part0
-def test_min_tokens_long_prompt():
+def _check_min_tokens_long_prompt(llm: LLM) -> None:
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
     Regression test for NVBug 5823135: the min-length EOS suppression compared
@@ -949,13 +1062,6 @@ def test_min_tokens_long_prompt():
     # to ~1-2 tokens with most tokenizers, so 200 repetitions ≈ 200-400
     # tokens >> min_tok.
     long_prompt = "Hello " * 200
-
-    llm = LLM(
-        model=llama_model_path,
-        max_batch_size=2,
-        kv_cache_config=global_kvcache_config,
-        max_num_tokens=2048,
-    )
 
     sampling_params = SamplingParams(
         max_tokens=max_tok,

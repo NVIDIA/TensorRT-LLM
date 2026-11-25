@@ -1561,8 +1561,14 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
     assert {args.stream_created for args in generator.postproc_args} == created
 
 
-def run_llm_with_postprocess_parallel_and_result_handler(
-        streaming, backend, tp_size: int = 1):
+def check_llm_postprocess_parallel_and_result_handler(llm: LLM,
+                                                      streaming: bool) -> None:
+    """Check chat post-processing in parallel workers and its result handler.
+
+    The LLM must run post-processing workers with the model's tokenizer:
+    ``num_postprocess_workers=2`` and ``postprocess_tokenizer_dir`` set to
+    ``llama_model_path``.
+    """
     # avoid import error when running in CI
     from tensorrt_llm.executor.postproc_worker import PostprocParams
     from tensorrt_llm.serve.postprocess_handlers import (
@@ -1578,12 +1584,6 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
                                       postproc_args=post_proc_args)
 
-    llm = LLM(model=llama_model_path,
-              backend=backend,
-              kv_cache_config=global_kvcache_config,
-              tensor_parallel_size=tp_size,
-              num_postprocess_workers=2,
-              postprocess_tokenizer_dir=llama_model_path)
     # Qwen3's byte-level BPE tokenizer folds the space before the first
     # generated token into that token itself, so the decoded continuation
     # of "A B C" carries a leading space that TinyLlama's tokenizer didn't.
