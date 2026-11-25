@@ -422,7 +422,10 @@ _DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attentio
 # and FP8 at tep4 once more with each decode MoE block's finalize and all-reduce in one Lamport
 # launch (`TRTLLM_QWEN4_EXP_TEP_FINAR=early`, SM103 only). FP8 at dep4 once more with both
 # output projections on the bf16 mid-rows GEMM (`TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16=all`, opt-in,
-# another K split; SM103 only).
+# another K split; SM103 only), and once more with the two opt-in attention-DP row ranges: the
+# grouped sparse GQA from 2 requests a rank (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another
+# summation order than split-K) and the cluster top-k up to 256 rows
+# (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`).
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -443,6 +446,16 @@ _QUANTIZED_KV = [
         marks=pytest.mark.skipif(
             get_sm_version() != 103,
             reason="the bf16 mid-rows output projections are measured on SM103",
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(dp_rows=True),
+        id="dep4_fp8_kv_dp_rows",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (103, 107),
+            reason="the grouped sparse GQA serves an e4m3 pool on SM103/SM107",
         ),
     ),
     pytest.param(
@@ -872,6 +885,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             env["TRTLLM_QWEN4_EXP_TEP_FINAR"] = variant["finar"]
         if variant.get("out_proj_bf16"):
             env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_BF16"] = variant["out_proj_bf16"]
+        if variant.get("dp_rows"):
+            env["TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"] = "2"
+            env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"
         with (
             scoped_env_overrides(env) as rank_env,
