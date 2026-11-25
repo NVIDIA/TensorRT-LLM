@@ -484,6 +484,12 @@ class Qwen3CoderToolParser(BaseToolParser):
         result = self._parse_streaming("", tools, complete=True)
         if not self._in_tool_call:
             result.normal_text += self._buf
+        elif self._function_name_sent:
+            # The stream ended inside a call: EOS after </function> but before
+            # </tool_call>, or max_tokens mid-call. Flush its parameters and
+            # close the arguments so clients never receive "" or an unterminated
+            # object.
+            result.calls.extend(self._close_unterminated_call(tools))
         self._buf = ""
         self._reset_streaming_state()
         return result
@@ -558,6 +564,36 @@ class Qwen3CoderToolParser(BaseToolParser):
             self._current_parameters = new_params
             self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
 
+        return calls
+
+    @staticmethod
+    def _strip_partial_suffix(text: str, tag: str) -> str:
+        """Drop a trailing proper prefix of ``tag`` (a tag cut off mid-way)."""
+        for size in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:size]):
+                return text[:-size]
+        return text
+
+    def _close_unterminated_call(self, tools: list[Tool]) -> list[ToolCallItem]:
+        """Flush and close a call the stream ended inside.
+
+        If the body ends with ``</function>`` (EOS before or partway through
+        ``</tool_call>``), the function is complete, so an unclosed last parameter ends at that
+        tag. Otherwise generation was cut off (e.g. ``max_tokens``) and only
+        closed parameters are kept, so a truncated value or a partial closing
+        tag is never reported as a final value.
+        """
+        body = self._strip_partial_suffix(self._buf.rstrip(), "</tool_call>").rstrip()
+        function_closed = not self.grammar_constrained and body.endswith("</function>")
+        if function_closed:
+            body = body[: -len("</function>")]
+        param_config = self._get_arguments_config(self._current_function_name, tools)
+        calls = self._parse_and_stream_parameters(body, param_config, complete=function_closed)
+        current_streamed = self.streamed_args_for_tool[self.current_tool_id]
+        closing = "}" if current_streamed else "{}"
+        calls.append(ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing))
+        self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
+        self.current_tool_id += 1
         return calls
 
     def _reset_streaming_state(self):
