@@ -2662,14 +2662,14 @@ def forward_gen_q_fused(
         rows_per_seq=rows_per_seq or gen_len * heads,
         use_pdl=USE_PDL,
         norm=(norm.weight, norm.variance_epsilon) if fuse_norm else None,
-        # The decode prefetches KV before its grid wait. An aux-stream append is joined by
-        # kv_ready below. On a single stream Q must first wait for the append before releasing
-        # the decode, so Q triggers its dependent from the epilogue.
-        early_trigger=_gen_F.ull2_mla_decode_pdl and kv_stream is not None,
+        # The same-stream append must complete before Q releases a decode that prefetches KV.
+        early_trigger=False,
     )
-    fp4_mla_decode.mark_query_launch(md)
     if kv_stream is not None:
         kv_ready.wait()
+    # A captured event join can become a programmatic dependency. Use a regular decode
+    # launch for the aux-stream append so even the initial KV prefetch follows the join.
+    fp4_mla_decode.mark_query_launch(md, allow_pdl=kv_stream is None)
     # The decode reads only the packed FP4 query rows; this BF16 tensor provides shapes. (Served
     # also allocates the unused cu_q / cu_kv / scheduler / BMM-scale / FP8-query buffers here: no
     # kernels.)

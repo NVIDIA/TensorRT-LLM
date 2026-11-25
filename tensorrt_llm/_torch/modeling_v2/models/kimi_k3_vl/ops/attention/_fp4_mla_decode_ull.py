@@ -146,7 +146,7 @@ class _Step:
     """The served ``Fp4MlaState`` fields #21996's state does not carry (kept on the metadata's
     ``fp4_mla_state``): whether another kernel writes this step's query rows, the count of
     decode-metadata kernels this module launched and that count when the query kernel was
-    launched (:func:`mark_query_launch`)."""
+    launched with K/V ready for programmatic decode (:func:`mark_query_launch`)."""
 
     q_rows_external: bool = False
     metadata_launches: int = 0
@@ -176,12 +176,10 @@ def _count_metadata_launch(metadata: Any) -> None:
     _step(metadata).metadata_launches += 1
 
 
-def mark_query_launch(metadata: Any) -> None:
-    """Record that the kernel writing this step's query rows was just launched (the fused
-    query): a decode launched as its programmatic dependent (``features.ull2_mla_decode_pdl``)
-    requires that no metadata kernel was launched since."""
+def mark_query_launch(metadata: Any, *, allow_pdl: bool) -> None:
+    """Mark a fused query launch whose K/V can be read before the decode's grid wait."""
     step = _step(metadata)
-    step.query_launch_mark = step.metadata_launches
+    step.query_launch_mark = step.metadata_launches if allow_pdl else None
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +565,7 @@ def _run_packed_decode(
     use_pdl_wait = (
         _features().ull2_mla_decode_pdl
         and step.q_rows_external
-        and (step.query_launch_mark is None or step.query_launch_mark == metadata_launches)
+        and step.query_launch_mark == metadata_launches
     )
     output_rows = output.view(num_requests * valid_m, 512)
     stats_rows = None
