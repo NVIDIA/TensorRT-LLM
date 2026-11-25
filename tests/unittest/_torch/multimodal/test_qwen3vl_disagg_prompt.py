@@ -268,9 +268,10 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         image_token_id=_IMAGE_TOKEN_ID,
         video_token_id=_VIDEO_TOKEN_ID,
         vision_start_token_id=_VISION_START_TOKEN_ID,
-        text_config=SimpleNamespace(hidden_size=16),
+        text_config=SimpleNamespace(hidden_size=16, vocab_size=152064),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[], spatial_merge_size=2),
     )
+    processor._processor = SimpleNamespace()
     tokens = [11, *([_IMAGE_TOKEN_ID] * 4), 12, *([_IMAGE_TOKEN_ID] * 9), 13]
     processor._tokenizer = Mock(return_value=SimpleNamespace(input_ids=torch.tensor([tokens])))
     mrope_config = {"mrope_position_deltas": torch.zeros(1, dtype=torch.int32)}
@@ -288,7 +289,9 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         {"image": items},
         SamplingParams(),
     )
-    params = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    params = MultimodalParams(
+        multimodal_input=extra["multimodal_input"], multimodal_data=extra["multimodal_data"]
+    )
 
     image = "<|vision_start|>{}<|vision_end|>"
     processor._tokenizer.assert_called_once_with(
@@ -299,7 +302,8 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] == embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config
-    assert params.multimodal_input is None
+    assert params.multimodal_input.multimodal_positions == [1, 6]
+    assert params.multimodal_input.multimodal_lengths == [4, 9]
 
 
 def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
