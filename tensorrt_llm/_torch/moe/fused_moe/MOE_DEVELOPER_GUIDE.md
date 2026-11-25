@@ -1381,9 +1381,13 @@ set wrong has a test that catches it:
   `add_layer` returns a `PerLayerDynamicMoeLayerLoadBalancer` with
   `produces_replica_plan = True`. In every chunk `_load_balancer_route` plans,
   the backend reads `MoERunContext.replica_plan`, and the post-`run_moe` hook
-  releases the plan. Such a layer routes separately: `FusedCommMoEScheduler`
-  skips the backend's fused route + quantize launch, whose routes the plan has
-  not remapped. The planner consumes logical routes, so the expert
+  releases the plan. `FusedCommMoEScheduler` gives such a layer the backend's
+  fused route + quantize launch only when the backend declares
+  `replica_plan_fuses_route_quant`, as MegaMoE CuteDSL does: the launch returns
+  the expert IDs for the planner, and `run_moe` stages the planner's slots over
+  the IDs the launch wrote and keeps its weights, activation and scales. Any
+  other backend routes and quantizes such a layer separately, leaving the
+  plan's SMs to the copy kernel. The planner consumes logical routes, so the expert
   statistics and the layer-wise calibrator record (or replay) them before the
   route; standard EPLB records the slots after it. When the forward raises,
   `MoeLoadBalancerIterContext` calls `abort_iter`, which releases the pending

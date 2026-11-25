@@ -2591,8 +2591,13 @@ class _ChunkRoutes:
         self.name = name
 
 
-@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
+@pytest.mark.parametrize(
+    "mode", ["per_layer_dynamic", "per_layer_dynamic_fused", "standard", "off"]
+)
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+    # "per_layer_dynamic_fused": the backend's route+quant launch also serves a replica plan.
+    fused = mode == "per_layer_dynamic_fused"
+    mode = mode.removesuffix("_fused")
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
     labels = []
@@ -2647,6 +2652,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        assert (ctx.x, ctx.x_sf) == (("fused x", "fused sf") if fused else ("x", "sf"))
         return "out"
 
     moe = SimpleNamespace(
@@ -2677,7 +2683,18 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_count_warmup=lambda *args: None,
         backend=SimpleNamespace(
-            fused_route_quant_enabled=False,
+            fused_route_quant_enabled=fused,
+            replica_plan_fuses_route_quant=fused,
+            try_fused_route_quant=lambda x, logits: (
+                trace.append("fused_route_quant")
+                or SimpleNamespace(
+                    token_selected_experts=_ChunkRoutes("logical"),
+                    token_final_scales=SimpleNamespace(dtype="float32"),
+                    x="fused x",
+                    x_sf="fused sf",
+                    routes_counted=False,
+                )
+            ),
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
@@ -2701,12 +2718,15 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
+        # A backend whose route+quant launch serves a replica plan routes and quantizes
+        # in that launch, ahead of the planner, which still gets the logical routes.
         expected = [
             ("bucket", 6),
+            *(["fused_route_quant"] if fused else []),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            ("quantize", {"reserved_sms": 4}),
+            *([] if fused else [("quantize", {"reserved_sms": 4})]),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]

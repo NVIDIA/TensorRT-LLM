@@ -1799,7 +1799,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
         # path; the fused-comm backend casts to int64 internally. A replica plan
-        # remaps the routes after routing, so its layers route separately.
+        # remaps the routes after routing, so its layers route separately unless
+        # the backend's fused launch hands the planner the expert IDs.
+        fuses_route_quant = not uses_replica_plan or moe.backend.replica_plan_fuses_route_quant
         fused_result = (
             self._try_fused_route_quant(
                 x_chunk_real,
@@ -1807,7 +1809,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 routing_aux,
                 moe._warmup_placement_route_counters(row_offset),
             )
-            if num_tokens > 0 and not uses_replica_plan
+            if num_tokens > 0 and fuses_route_quant
             else None
         )
         if (

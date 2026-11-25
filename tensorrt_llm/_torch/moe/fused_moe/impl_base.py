@@ -290,6 +290,11 @@ class MoEImplBase(
     #: replaces ``routing_method.apply``, which the fused launch would bypass.
     fused_route_quant_enabled = True
 
+    #: Whether ``try_fused_route_quant`` also serves a layer whose replica plan remaps the routes
+    #: after routing: the launch returns the expert IDs for the planner, and ``run_moe`` takes the
+    #: remapped slots with the launch's weights, activation and scales.
+    replica_plan_fuses_route_quant = False
+
     def try_fused_route(
         self, x: "Fp4QuantizedTensor", router_logits: "torch.Tensor"
     ) -> "MoEFusedRouteQuant | None":

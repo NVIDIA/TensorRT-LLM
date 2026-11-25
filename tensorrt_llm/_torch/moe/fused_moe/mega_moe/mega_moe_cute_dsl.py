@@ -1493,6 +1493,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # The routing launch adds its picks to the warmup placement's counters.
     counts_routes = True
+    # The routing launch returns expert IDs as a tensor of its own, which a replica plan's planner
+    # reads; ``_run_moe`` then stages the planner's slots over whatever IDs the launch staged.
+    replica_plan_fuses_route_quant = True
 
     def _route_quant_fuses(self) -> bool:
         # The fused launch quantizes x as is; a pre-quant scale (AWQ/ARC) must apply first.
@@ -1948,10 +1951,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         num_tokens: int,
         top_k: int,
         stage_activation: bool,
+        stage_weights: bool = True,
         replica_plan=None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
-        pre-allocated buffers and refresh the padded tail.
+        pre-allocated buffers and refresh the padded tail. ``stage_activation``
+        and ``stage_weights`` are cleared for live rows a fused route+quant
+        launch already wrote there.
 
         Same code for single-rank (writes land in local CUDA) and
         multi-rank (writes land in symmetric heap regions visible to
@@ -1983,7 +1989,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             if stage_activation:
                 bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
                 bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
-            bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
+            if stage_weights:
+                bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
         if num_tokens > 0:
@@ -2402,12 +2409,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             launch_max_T=launch_max_T,
         )
         prestaged, self._prestaged = self._prestaged, None
+        in_bucket = prestaged is not None and prestaged[0] is bufs.topk_idx_local
         # The fused route+quant launch already wrote exactly these inputs into this bucket, as expert
         # slots when a static placement maps them.
-        inputs_staged = (
-            prestaged is not None
-            and prestaged[0] is bufs.topk_idx_local
-            and all(a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:]))
+        inputs_staged = in_bucket and all(
+            a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:])
+        )
+        # Under a replica plan the launch wrote the weights, activation and scales there, and the
+        # planner's slots replace the IDs it wrote.
+        payload_staged = (
+            in_bucket
+            and replica_plan is not None
+            and all(a is b for a, b in zip((topk_weights, x, x_sf), prestaged[2:]))
         )
         if replica_plan is None and (topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()):
             topk_idx = topk_idx.to(torch.int32).contiguous()
@@ -2447,7 +2460,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 topk_weights=topk_weights,
                 num_tokens=num_tokens,
                 top_k=top_k,
-                stage_activation=not use_direct_inputs,
+                stage_activation=not use_direct_inputs and not payload_staged,
+                stage_weights=not payload_staged,
                 replica_plan=replica_plan,
             )
         elif not use_direct_routing_inputs and not inputs_staged:
