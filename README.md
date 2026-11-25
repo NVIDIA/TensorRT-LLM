@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 <div align="center">
 
 TensorRT LLM
@@ -30,6 +33,9 @@ TensorRT LLM
 
 * [11/11] Dense DWDP: Extending Distributed Weight Data Parallelism to Dense Weights on Vera Rubin NVL72
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog31_Dense_DWDP_Extending_Distributed_Weight_Data_Parallelism_to_Dense_Weights_on_Vera_Rubin_NVL72.md)
+
+* [11/04] WinoVAE: Faster Video Decoding in TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog34_WinoVAE_Faster_Video_VAE_with_Winograd_Convolutions.md)
 
 * [11/03] ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog32_ISER-MoE_In-Switch_Expert_Replication_for_Load-Balanced_MoE_Prefill.md)
