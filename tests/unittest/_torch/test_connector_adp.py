@@ -2215,24 +2215,29 @@ def test_loads_of_a_skipped_forward_are_waited_on_every_layer() -> None:
     manager = _manager()
     manager.register_load_layers([0, 1, 2])
     stream = MagicMock()
+    # One log for both, so the stream is checked to be synchronized after every layer.
+    events: list[tuple] = []
+    manager.worker.wait_for_layer_load.side_effect = lambda layer_idx, s: events.append(
+        ("wait", layer_idx, s)
+    )
+    stream.synchronize.side_effect = lambda: events.append(("synchronize",))
 
     # Nothing was started: nothing to wait for.
     manager.finish_loads_of_skipped_forward(stream)
-    manager.worker.wait_for_layer_load.assert_not_called()
+    assert events == []
 
     # A forward ran: its layer hooks already waited.
     manager.mark_loads_started()
     manager.mark_loads_waited()
     manager.finish_loads_of_skipped_forward(stream)
-    manager.worker.wait_for_layer_load.assert_not_called()
+    assert events == []
 
     # The forward is skipped: every layer is waited for once, then the stream.
     manager.mark_loads_started()
     manager.finish_loads_of_skipped_forward(stream)
+    expected = [("wait", 0, stream), ("wait", 1, stream), ("wait", 2, stream), ("synchronize",)]
+    assert events == expected
+
+    # A repeated call finds nothing left to wait for.
     manager.finish_loads_of_skipped_forward(stream)
-    assert [c.args for c in manager.worker.wait_for_layer_load.call_args_list] == [
-        (0, stream),
-        (1, stream),
-        (2, stream),
-    ]
-    stream.synchronize.assert_called_once()
+    assert events == expected
