@@ -31,7 +31,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -65,6 +65,9 @@ from ._host_memory import (
 from ._node_share import NodeShare
 from .functional import engram_history_scatter
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+
 # Decode rows up to which one single-CTA launch scatters and hashes every layer (per-layer above).
 DECODE_REFRESH_MAX_ROWS = 64
 
@@ -72,6 +75,23 @@ DECODE_REFRESH_MAX_ROWS = 64
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
 _DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
 _HistorySeed = tuple[int, tuple[int, ...], tuple[bool, ...] | None]
+
+
+@dataclass(frozen=True)
+class EngramPreReplayHook:
+    """A graph hook whose Engram refresh can be staged with the decode inputs."""
+
+    provider: "EngramHashProvider"
+    refresh: Callable[["KeyType", int, dict[str, Any], dict[str, Any]], None]
+
+    def __call__(
+        self,
+        key: "KeyType",
+        num_tokens: int,
+        static_tensors: dict[str, Any],
+        current_inputs: dict[str, Any],
+    ) -> None:
+        self.refresh(key, num_tokens, static_tensors, current_inputs)
 
 
 @dataclass(frozen=True)

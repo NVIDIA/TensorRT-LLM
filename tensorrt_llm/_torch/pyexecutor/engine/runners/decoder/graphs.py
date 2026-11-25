@@ -830,6 +830,8 @@ class DecoderCudaGraphs:
                         inputs,
                         position_id_offsets=position_id_offsets,
                         static_inputs_staged=static_inputs_staged,
+                        # Capture can update the inputs the Engram hook reads.
+                        pre_replay_staged=False,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -844,8 +846,7 @@ class DecoderCudaGraphs:
                             inputs,
                             position_id_offsets=position_id_offsets,
                             static_inputs_staged=static_inputs_staged,
-                            # Passed only when set, so other replay calls keep their signature.
-                            **({"pre_replay_staged": True} if pre_replay_staged else {}),
+                            pre_replay_staged=pre_replay_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)

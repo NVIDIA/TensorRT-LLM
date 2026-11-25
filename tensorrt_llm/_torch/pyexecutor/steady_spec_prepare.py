@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.kernels.blackwell.engram.steady_refresh import scatter_and_hash_decode_rows
 from tensorrt_llm._utils import current_cuda_stream, is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.logger import logger
 
@@ -348,20 +349,6 @@ def _steady_decode_stage_kernel(
         # The hook positions, then the Engram refresh as EngramDecodeRefreshKernel computes it
         # (static ids and hook positions as the token inputs; no padding rows, B == B_ALL).
         ks = tl.arange(0, BLOCK_NGRAM)
-        heads = tl.arange(0, BLOCK_HEAD)
-        in_heads = heads < N_HEAD
-        layer_ids = tl.arange(0, BLOCK_LAYERS)
-        mults = tl.load(
-            multipliers + layer_ids[:, None] * MAX_NGRAM + ks[None, :],
-            mask=(layer_ids[:, None] < NUM_LAYERS) & (ks[None, :] < MAX_NGRAM),
-            other=0,
-        )
-        orders = tl.arange(0, BLOCK_ORDERS)
-        mods = tl.load(
-            moduli + orders[:, None] * N_HEAD + heads[None, :],
-            mask=(orders[:, None] < NUM_LAYERS * (MAX_NGRAM - 1)) & in_heads[None, :],
-            other=1,
-        )
         hooked = pos + lens.to(tl.int32)
         position = hooked.to(tl.int64)
         if FROM_HOST:
@@ -450,44 +437,34 @@ def _steady_decode_stage_kernel(
             window_history = tl.load(
                 cells[:, None] + tl.maximum(cell, 0), mask=earlier, other=dead
             ).to(tl.int64)
-        target = tl.where(position < 0, position + history_columns, position)
-        tl.store(
-            cells + target,
-            compressed.to(tl.int32),
-            mask=real & (target >= 0) & (target < history_columns),
-        )
         # This step's cells as the history holds them (int32); dead out of range.
         window = tl.where(
             here,
             tl.where(in_range, window_compressed.to(tl.int32).to(tl.int64), dead),
             window_history,
         )
-        width = (MAX_NGRAM - 1) * N_HEAD
-        for layer in tl.static_range(NUM_LAYERS):
-            current = tl.sum(tl.where(ks[None, :] == 0, window, 0), axis=1)
-            blocked = (position < 0) | (current == dead)
-            first = tl.sum(tl.where((layer_ids[:, None] == layer) & (ks[None, :] == 0), mults, 0))
-            mix = tl.where(blocked, pad_id, current) * first
-            for offset in tl.static_range(1, MAX_NGRAM):
-                previous = position - offset
-                source = tl.sum(tl.where(ks[None, :] == offset, window, 0), axis=1)
-                blocked = blocked | (previous < 0) | (source == dead)
-                multiplier = tl.sum(
-                    tl.where((layer_ids[:, None] == layer) & (ks[None, :] == offset), mults, 0)
-                )
-                mix = mix ^ (tl.where(blocked, pad_id, source) * multiplier)
-                modulus = tl.sum(
-                    tl.where(orders[:, None] == layer * (MAX_NGRAM - 1) + offset - 1, mods, 0),
-                    axis=0,
-                )
-                remainder = mix[:, None] % modulus[None, :]
-                remainder = tl.where(remainder < 0, remainder + modulus[None, :], remainder)
-                out = (
-                    (layer * hash_rows + i[:, None]) * width
-                    + (offset - 1) * N_HEAD
-                    + heads[None, :]
-                )
-                tl.store(hashes + out, remainder, mask=real[:, None] & in_heads[None, :])
+        scatter_and_hash_decode_rows(
+            cells,
+            history_columns,
+            position,
+            compressed,
+            window,
+            multipliers,
+            moduli,
+            hashes,
+            hash_rows,
+            i,
+            real,
+            pad_id,
+            dead,
+            N_HEAD,
+            MAX_NGRAM,
+            NUM_LAYERS,
+            BLOCK_HEAD,
+            BLOCK_NGRAM,
+            BLOCK_LAYERS,
+            BLOCK_ORDERS,
+        )
 
 
 def stage_steady_inputs(
@@ -821,14 +798,13 @@ class SteadyMtpPrepare:
                 and has_static_inputs
                 and not use_mrope
             ):
-                hooks = graph_runner.pre_replay_hooks
-                provider = getattr(hooks[0], "engram_provider", None) if len(hooks) == 1 else None
-                if provider is not None:
+                hook = graph_runner.fusible_engram_hook
+                if hook is not None:
                     from ..modules.engram.engram import DECODE_REFRESH_MAX_ROWS
 
                     # The block covers the engine's configured maximum batch and draft width.
                     if self.block <= DECODE_REFRESH_MAX_ROWS:
-                        self.glue_runner, self.glue_provider = graph_runner, provider
+                        self.glue_runner, self.glue_provider = graph_runner, hook.provider
                     else:
                         logger.info(
                             "Engram refresh uses the replay hook: the engine's staging block %d "
@@ -1174,30 +1150,29 @@ class SteadyMtpPrepare:
         """The Engram refresh the staging launch does in place of the replay's hook, or None."""
         provider = self.glue_provider
         plan = rec.glue_plan
-        if plan is False or provider is None:
+        if plan is False or provider is None or not self._glue_applies(rec, num_tokens):
             return None
         if plan is not None and provider.decode_refresh_plan_current(plan):
             return plan
-        plan = None
-        if self._glue_applies(rec, num_tokens):
-            plan = provider.decode_refresh_plan(
-                rec.request_ids,
-                rec.attn_metadata.seq_lens,
-                num_tokens,
-                getattr(rec.attn_metadata.kv_cache_manager, "max_seq_len", None),
-            )
+        plan = provider.decode_refresh_plan(
+            rec.request_ids,
+            rec.attn_metadata.seq_lens,
+            num_tokens,
+            getattr(rec.attn_metadata.kv_cache_manager, "max_seq_len", None),
+        )
         # Looked up once per record: a batch the refresh did not record takes the hook every step.
         rec.glue_plan = plan if plan is not None else False
         return plan
 
     def _glue_applies(self, rec: SteadyMtpRecord, num_tokens: int) -> bool:
         """Whether the replay's only hook is the provider's refresh of the recorded batch."""
-        hooks = self.glue_runner.pre_replay_hooks
+        assert self.glue_runner is not None
+        hook = self.glue_runner.fusible_engram_hook
         return (
             rec.num_padding == 0
             and rec.static_ids is not None
-            and len(hooks) == 1
-            and getattr(hooks[0], "engram_provider", None) is self.glue_provider
+            and hook is not None
+            and hook.provider is self.glue_provider
             and rec.attn_metadata.num_tokens == num_tokens
         )
 

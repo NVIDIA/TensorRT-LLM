@@ -340,6 +340,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.attach_cuda_graph_runners(
             self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
         )
+        self._metadata.keep_steady_growth_blocks = self._inputs.steady_decode_prepare_enabled
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -1404,8 +1405,7 @@ class DecoderRunner(ScheduledModelRunner):
     @property
     def steady_mtp_reads_output_rows(self) -> bool:
         """Whether steady MTP graph prepare can read the previous step's output rows."""
-        steady_mtp = self._inputs._steady_mtp
-        return self._graphs.enabled and steady_mtp is not None and steady_mtp.steady_decode_prepare
+        return self._graphs.enabled and self._inputs.steady_decode_prepare_enabled
 
     @property
     def previous_request_ids(self):

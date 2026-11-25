@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields, replace
 from itertools import accumulate
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -993,6 +993,12 @@ class DecoderInputPreparer:
                 stage_rng=stage_rng,
             )
 
+    @property
+    def steady_decode_prepare_enabled(self) -> bool:
+        """Whether this preparer built the opted-in, loads-first steady path."""
+        steady = self._steady_mtp
+        return steady is not None and steady.steady_decode_prepare
+
     def _steady_mtp_fast_prepare_mode(
         self,
         steady_mtp: SteadyMtpPrepare | None,
@@ -1003,7 +1009,7 @@ class DecoderInputPreparer:
         promoted_context_request_ids: frozenset[int],
         runtime_draft_len: int,
         is_dummy: bool,
-    ) -> str | None:
+    ) -> Literal["steady", "admit"] | None:
         """Check whether the recorded steady one-model MTP decode prepare applies.
 
         The record is only kept by a full pass whose batch consisted of generation

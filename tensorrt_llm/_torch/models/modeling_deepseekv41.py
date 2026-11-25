@@ -57,7 +57,13 @@ from ..configs.deepseek_v41 import (
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
 from ..model_config import ModelConfig
-from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, adp_exchange, engram_gate
+from ..modules.engram import (
+    Engram,
+    EngramPreReplayHook,
+    ShardedFp8MultiHeadEmbedding,
+    adp_exchange,
+    engram_gate,
+)
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
 from ..modules.mhc.mhc_lowm import (
@@ -4031,7 +4037,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
         """Refresh local hash rows before the captured DP gather and lookup."""
-        if not self.model.use_engram or self.model.engram_hash_provider is None:
+        if not self.model.use_engram:
+            return
+        provider = self.model.engram_hash_provider
+        if provider is None:
             return
 
         def _refresh(
@@ -4051,6 +4060,4 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 refresh=True,
             )
 
-        # A steady decode prepare may do this refresh in its own launch (steady_spec_prepare).
-        _refresh.engram_provider = self.model.engram_hash_provider
-        runner.register_pre_replay_hook(_refresh)
+        runner.register_pre_replay_hook(EngramPreReplayHook(provider, _refresh))

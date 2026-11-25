@@ -644,16 +644,16 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
             preparer.dist = types.SimpleNamespace(tp_cp_allgather_int64=allgather)
             preparer.attach_cuda_graph_runners(None, None)
             assert preparer._steady_mtp is not None
-            attn_metadata = (
-                DecoderMetadata(
-                    config=config,
-                    mapping=Mapping(),
-                    model=model,
-                    buffers=preparer._buffers,
-                    attention_runtime_features=AttentionRuntimeFeatures(),
-                )
-                .setup_attention(manager)
-                .create_cuda_graph_metadata(len(rows), False, draft_len)
+            metadata = DecoderMetadata(
+                config=config,
+                mapping=Mapping(),
+                model=model,
+                buffers=preparer._buffers,
+                attention_runtime_features=AttentionRuntimeFeatures(),
+            )
+            metadata.keep_steady_growth_blocks = preparer.steady_decode_prepare_enabled
+            attn_metadata = metadata.setup_attention(manager).create_cuda_graph_metadata(
+                len(rows), False, draft_len
             )
             assert type(attn_metadata) is TrtllmAttentionMetadata
             spec_metadata = Mock(

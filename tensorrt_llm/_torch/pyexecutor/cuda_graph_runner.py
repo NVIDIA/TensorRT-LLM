@@ -5,8 +5,8 @@ import bisect
 import contextlib
 import os
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Sequence, Tuple, TypeAlias)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    NamedTuple, Optional, Sequence, Tuple, TypeAlias)
 
 import torch
 
@@ -41,6 +41,9 @@ from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
 from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from ..modules.engram import EngramPreReplayHook
 
 
 # Opt-in: catches attn_metadata/spec_metadata tensors rebound between capture
@@ -739,9 +742,14 @@ class CUDAGraphRunner:
         self._pre_replay_hooks.append(hook)
 
     @property
-    def pre_replay_hooks(self) -> Tuple[Callable[..., None], ...]:
-        """The registered pre-replay hooks, in call order."""
-        return tuple(self._pre_replay_hooks)
+    def fusible_engram_hook(self) -> "EngramPreReplayHook | None":
+        """The sole Engram hook, which can run early without reordering another hook."""
+        if len(self._pre_replay_hooks) != 1:
+            return None
+        from ..modules.engram import EngramPreReplayHook
+
+        hook = self._pre_replay_hooks[0]
+        return hook if isinstance(hook, EngramPreReplayHook) else None
 
     def pre_replay_hook_positions(self, num_tokens: int) -> torch.Tensor:
         """Flat storage of the hooks' corrected positions for a ``num_tokens``
@@ -1389,7 +1397,7 @@ class CUDAGraphRunner:
         positions the input preparation already wrote (see PreparedInputs); the
         replay copies them only when it runs another token count.
         ``pre_replay_staged``: with those staged tokens and the offsets, the
-        preparation also wrote the hooks' positions and did the hooks' work.
+        preparation also wrote the sole Engram hook's positions and refreshed its hashes.
         """
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -1418,7 +1426,7 @@ class CUDAGraphRunner:
                           != static_input_ids.data_ptr())
         hooks_done = (prestaged and pre_replay_staged
                       and position_id_offsets is not None
-                      and len(self._pre_replay_hooks) == 1)
+                      and self.fusible_engram_hook is not None)
 
         position_ids = current_inputs["position_ids"]
         # Hooks get their own corrected positions: the captured preprocessing

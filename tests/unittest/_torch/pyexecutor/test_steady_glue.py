@@ -10,7 +10,7 @@ import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 
-from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
+from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider, EngramPreReplayHook
 from tensorrt_llm._torch.modules.engram import engram as engram_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.steady_spec_prepare import SteadyMtpPrepare
@@ -104,8 +104,7 @@ class _Side:
                 padded_num_tokens=num_tokens,
             )
 
-        refresh.engram_provider = self.provider
-        self.runner.register_pre_replay_hook(refresh)
+        self.runner.register_pre_replay_hook(EngramPreReplayHook(self.provider, refresh))
         self.steady = SteadyMtpPrepare(
             max_batch_size=b,
             max_num_tokens=n,

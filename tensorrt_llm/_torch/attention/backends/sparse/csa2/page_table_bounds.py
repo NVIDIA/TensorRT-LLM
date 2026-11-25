@@ -26,8 +26,13 @@ class PageTableBounds:
         start = tensor.data_ptr()
         return start, start + (extent if tensor.numel() else 0) * tensor.element_size()
 
-    def get(
-        self, target: torch.Tensor, address_range: tuple[int, int] | None = None
+    def get(self, target: torch.Tensor) -> np.ndarray | None:
+        """Return the recorded bound for this destination's current view."""
+        extent = self._address_range(target) if self._track_overlaps else None
+        return self._get(target, extent)
+
+    def _get(
+        self, target: torch.Tensor, address_range: tuple[int, int] | None
     ) -> np.ndarray | None:
         entry = self._entries.get(id(target))
         if entry is not None and entry[0]() is target and entry[1] == address_range:
@@ -37,7 +42,7 @@ class PageTableBounds:
     def claim(self, target: torch.Tensor) -> np.ndarray | None:
         """Take the previous bound and invalidate entries that this write may affect."""
         address_range = self._address_range(target)
-        live = self.get(target, address_range)
+        live = self._get(target, address_range if self._track_overlaps else None)
         first, last = address_range
         for key, (tensor_ref, extent, _) in list(self._entries.items()):
             if tensor_ref() is None or (
