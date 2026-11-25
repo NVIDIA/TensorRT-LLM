@@ -1454,13 +1454,7 @@ MINIMAX_M3_V1_FMHA_LIBS: list[str | type[Fmha]] = [
     MsaPrefillFmha,
     "flashinfer_sparse_mla",
     "prims_ts_block_sparse",
-    "prims_ts_sparse_mla",
     "prims_ts_dsa_sparse_mla",
-    "gqa_kv_replica_fused",
-    "gqa_kv_replica",
-    "gqa_split_kv",
-    "gqa_segmented",
-    "gqa_decode",
     "flashinfer_trtllm_gen",
     "fallback",
 ]
