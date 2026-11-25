@@ -898,8 +898,11 @@ _CUTE_DSL_MOE_MAX_ROWS = 16384  # capacity: fixed: the op's certified rows
 #: At one rank without that copy, a context-step launch of more than `_MOE_MAX_ROWS` rows and at
 #: most this many is one trtllm-gen runner call (the routed op's certified rows over the whole
 #: layer): the runner streams the layer's experts once instead of once a chunk. GB300, 16384
-#: rows: 1356 -> 1059 us a layer, an engine step's GPU forward 225.4 -> 212.5 ms.
-_MOE_ONE_LAUNCH_MAX_ROWS = 16384  # capacity: fixed: the routed op's certified rows
+#: rows: 1356 -> 1059 us a layer, an engine step's GPU forward 225.4 -> 212.5 ms. A CTX whose
+#: `max_num_tokens` is 24576 steps that many rows in one launch too (every row bitwise the
+#: chunks at 20480 and 24576 rows); with that chunk size its saturated context loop took 5-7%
+#: more tokens a second than at 16384.
+_MOE_ONE_LAUNCH_MAX_ROWS = 24576  # capacity: fixed: the routed op's certified rows
 # Whether one rank keeps that second copy (about 1.3 GiB a layer). No engine arg owns it, hence
 # an env var read at construction (`_switch`, default on); off drops the copy and every launch
 # runs on trtllm-gen.

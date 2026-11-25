@@ -179,16 +179,17 @@ def test_second_expert_copy_kept_only_where_its_launches_can_happen(
     [
         (True, True, 12288, [12288]),
         (True, True, 16384, [16384]),
+        (True, True, 24576, [24576]),
         (True, True, 8192, [8192]),
-        (True, True, 16385, [8192, 8192, 1]),
+        (True, True, 24577, [8192, 8192, 8192, 1]),
         (True, False, 12288, [8192, 4096]),
         (False, True, 12288, [8192, 4096]),
     ],
 )
-def test_one_rank_context_launch_up_to_16384_rows_is_one_runner_call(
+def test_one_rank_context_launch_up_to_24576_rows_is_one_runner_call(
     monkeypatch, one_rank, prefill_router, rows, launches
 ):
-    """Without the CuteDSL copy a one-rank context launch of 8193..16384 rows is one runner
+    """Without the CuteDSL copy a one-rank context launch of 8193..24576 rows is one runner
     call; its router logits still come from 8192-row GEMMs (cuBLAS picks its kernel by the row
     count). A decode router, another layout or more rows keep the chunks."""
     router_rows, runner_rows = [], []

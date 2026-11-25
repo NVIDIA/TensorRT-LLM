@@ -214,9 +214,9 @@ def test_decode_tactic_valid_and_bitwise(bucket, many_expert_layer):  # noqa: F8
     assert differing == 0, f"{differing} of {bucket} rows differ from the AutoTuner path"
 
 
-@pytest.mark.parametrize("rows", [12288, 16384])
+@pytest.mark.parametrize("rows", [12288, 16384, 20480, 24576])
 def test_one_launch_is_bitwise_the_8192_row_chunks(rows, many_expert_layer):  # noqa: F811
-    """A context launch of up to 16384 rows at one rank is one call (the NVFP4 target's
+    """A context launch of up to 24576 rows at one rank is one call (the NVFP4 target's
     `_routed_experts`); every row equals what the 8192-row chunks it replaces answer."""
     spec = _ckpt(rows)
     args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
