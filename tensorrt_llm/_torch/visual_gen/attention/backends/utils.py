@@ -30,22 +30,46 @@ from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 from .interface import AttentionBackend
 
 
+def get_quant_algorithm(
+    quant_attention_config: Optional[QuantAttentionConfig],
+) -> Optional[str]:
+    """
+    Get the algorithm of a quantized attention config.
+
+    Args:
+        quant_attention_config: The quantized attention config, if any.
+
+    Returns:
+        "deco_attention" or "vc_attention" for a recipe that sets that field; None without
+        a config and for the other recipes, which the config gives by their dtypes and
+        block sizes alone
+    """
+    if quant_attention_config is None:
+        return None
+    if quant_attention_config.deco_attention:
+        return "deco_attention"
+    if quant_attention_config.vc_attention:
+        return "vc_attention"
+    return None
+
+
 def get_visual_gen_attention_backend(
     backend_name: str,
     sparse_algorithm: Optional[str] = None,
-    quant_attention_config: Optional[QuantAttentionConfig] = None,
+    quant_algorithm: Optional[str] = None,
 ) -> Type[AttentionBackend]:
     """
-    Get diffusion attention backend class by name, sparse algorithm and quantization recipe.
+    Get diffusion attention backend class by name, sparse algorithm and quantization algorithm.
 
     Args:
         backend_name: Backend identifier ("VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4")
         sparse_algorithm: ``algorithm`` of the sparse attention config, if any. VSA
             ("vsa") and SOL ("sol_attn") have their own TRTLLM and CUTEDSL classes;
             other algorithms, such as skip-softmax, run in the dense class.
-        quant_attention_config: The quantized attention config, if any. A recipe with
-            ``deco_attention`` has its own CUTEDSL class; the other recipes run in the class
-            of their backend.
+        quant_algorithm: Algorithm of the quantized attention config, if any
+            (``get_quant_algorithm``). DeCo-Attention ("deco_attention") has its own
+            CUTEDSL class; the other recipes, such as VC-Attention, run in the class of
+            their backend.
 
     Returns:
         Diffusion attention backend class
@@ -66,7 +90,6 @@ def get_visual_gen_attention_backend(
     """
 
     backend_name = backend_name.upper()
-    is_deco = quant_attention_config is not None and quant_attention_config.deco_attention
 
     if sparse_algorithm == "vsa" and backend_name == "TRTLLM":
         from .sparse.vsa.backend import VSATrtllmAttention
@@ -84,7 +107,7 @@ def get_visual_gen_attention_backend(
         from .sparse.sol.backend import SOLCuTeDSLAttention
 
         return SOLCuTeDSLAttention
-    elif is_deco and backend_name == "CUTEDSL":
+    elif quant_algorithm == "deco_attention" and backend_name == "CUTEDSL":
         from .cute_dsl import DeCoAttention
 
         return DeCoAttention
@@ -155,7 +178,7 @@ def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
     # A config object without the field carries no quantization recipe.
     quant_attention_config = getattr(attention_config, "quant_attention_config", None)
     backend_cls = get_visual_gen_attention_backend(
-        attention_config.backend, quant_attention_config=quant_attention_config
+        attention_config.backend, quant_algorithm=get_quant_algorithm(quant_attention_config)
     )
     supports_mask = backend_cls.support_key_padding_mask()
     supports_length = backend_cls.support_valid_seq_len()
@@ -226,7 +249,7 @@ def create_attention(
 
     backend_name = backend.upper()
     attn_cls = get_visual_gen_attention_backend(
-        backend_name, sparse_algorithm, quant_attention_config
+        backend_name, sparse_algorithm, get_quant_algorithm(quant_attention_config)
     )
 
     if is_vsa:

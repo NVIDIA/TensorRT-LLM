@@ -28,7 +28,7 @@ from ..config import DiffusionModelConfig
 from ..modules.rms_norm import RMSNormTPAware
 from .backends.interface import AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
-from .backends.utils import create_attention
+from .backends.utils import create_attention, get_quant_algorithm
 
 
 class QKVMode(str, Enum):
@@ -128,8 +128,7 @@ class Attention(nn.Module):
         quant_attention_config = getattr(config.attention, "quant_attention_config", None)
         is_deco = (
             base_backend == "CUTEDSL"
-            and quant_attention_config is not None
-            and quant_attention_config.deco_attention
+            and get_quant_algorithm(quant_attention_config) == "deco_attention"
         )
 
         # Cross-attention fallback: every TRTLLM backend and every VSA backend are

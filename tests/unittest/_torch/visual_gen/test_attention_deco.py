@@ -34,7 +34,10 @@ from tensorrt_llm._torch.visual_gen.attention.backends import (
 )
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
-from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import (
+    get_padding_support,
+    get_quant_algorithm,
+)
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.runtime import num_sms
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
@@ -196,14 +199,23 @@ def test_deco_selection(deco_recipe) -> None:
     behind its tokens."""
     assert not QuantAttentionConfig().deco_attention
     plain = QuantAttentionConfig(qk_dtype="nvfp4")
+    assert get_quant_algorithm(None) is None and get_quant_algorithm(plain) is None
+    assert get_quant_algorithm(deco_recipe()) == "deco_attention"
+    assert get_quant_algorithm(QuantAttentionConfig(vc_attention=True)) == "vc_attention"
     assert get_visual_gen_attention_backend("CUTEDSL") is CuTeDSLAttention
     assert (
-        get_visual_gen_attention_backend("CUTEDSL", quant_attention_config=plain)
-        is CuTeDSLAttention
+        get_visual_gen_attention_backend("CUTEDSL", quant_algorithm="deco_attention")
+        is DeCoAttention
+    )
+    # The algorithm selects a class on CUTEDSL only, as the config validator binds it, and
+    # VC-Attention runs in the class of its backend.
+    assert (
+        get_visual_gen_attention_backend("VANILLA", quant_algorithm="deco_attention")
+        is get_visual_gen_attention_backend("VANILLA")
     )
     assert (
-        get_visual_gen_attention_backend("CUTEDSL", quant_attention_config=deco_recipe())
-        is DeCoAttention
+        get_visual_gen_attention_backend("TRTLLM", quant_algorithm="vc_attention")
+        is get_visual_gen_attention_backend("TRTLLM")
     )
     assert DeCoAttention.support_key_padding_mask()
     assert DeCoAttention.requires_trailing_padding()
