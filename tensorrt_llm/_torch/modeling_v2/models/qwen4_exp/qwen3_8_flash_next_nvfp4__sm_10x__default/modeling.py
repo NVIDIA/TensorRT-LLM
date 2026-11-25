@@ -214,6 +214,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonica
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_fp8 import (
+    index_anchors_to_fp8,
+    qsa_index_scores_fp8,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_index_scores_groups_cute__decode import (  # noqa: E501
     index_scores_groups as index_scores_groups_cute,
 )
@@ -887,6 +891,19 @@ _GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
 #: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
 #: set at a layout without attention DP it warns and does nothing.
 DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
+#: Opt-in and LOSSY against the stock bf16 index keys: `TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1` keeps
+#: each four-token group's compressed index key (its anchor) as e4m3 in the first half of its
+#: bf16 slot (`qsa_index_scores_fp8`): every anchor writer converts what it wrote
+#: (`_index_anchors_fp8`) and every index score call reads it with the e4m3-rounded query
+#: (`_index_scores`; a context call past 256 rows on the ctx-tile kernel). The plane keeps its
+#: size and layout, so the cache manager and the KV transfer are unchanged, but a context worker
+#: and the generation workers it hands requests to must all set it (the anchors travel as
+#: written). Part of the DLSim recipe the AgentX front follows (every dep4 / dep8 point ran it,
+#: CTX and GEN): GB300 dep4, the index-score kernels of a step 2.19 -> 1.82 ms at 96 requests a
+#: rank, a 16384-row context step's scores 14.9 -> 9.5 ms; GSM8K 95.91 / 95.98; the AgentX
+#: top-2048 block overlap with bf16 keys p50 0.976. Read once, when the core is built, at every
+#: layout.
+INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
 #: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
 #: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
 #: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
@@ -2261,6 +2278,13 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._out_proj = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
+        # e4m3 index anchors (`INDEX_KEY_FP8_ENV`, lossy, opt-in).
+        self.index_key_fp8 = _switch(INDEX_KEY_FP8_ENV)
+        if self.index_key_fp8:
+            logger.warning(
+                f"{INDEX_KEY_FP8_ENV}=1: the QSA index anchors are e4m3 (lossy against bf16 "
+                "keys); every context and generation worker of this deployment must set it"
+            )
         # The most generation rows the cluster top-k serves (`DP_TOPK_CLUSTER_ROWS_ENV`).
         self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
 
@@ -3854,6 +3878,14 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
         compress_ratio=core.compress_ratio,
         mrope_section=_QSA_MROPE_SECTION,
     )
+    _index_anchors_fp8(
+        core,
+        draft.index_cache,
+        block_table,
+        req_idx,
+        logical,
+        tokens_per_block,
+    )
     return _index_query(core, index_scratch)
 
 
@@ -5375,6 +5407,14 @@ def _index_plane(core, proj, i, L: _LayerWeights, qsa) -> None:
         compress_ratio=core.compress_ratio,
         mrope_section=_QSA_MROPE_SECTION,
     )
+    _index_anchors_fp8(
+        core,
+        index_cache,
+        block_table,
+        req_idx,
+        logical,
+        tokens_per_block,
+    )
 
 
 def _select(core, scores, row_starts, row_ends, topk_indices, live_cols=None) -> None:
@@ -5497,7 +5537,8 @@ def _score_and_select(
     for lo, hi, context_rows in parts:
         for a in range(lo, hi, chunk):
             b = min(a + chunk, hi)
-            scores = qsa_paged_index_scores(
+            scores = _index_scores(
+                core,
                 q=q_index[a:b],
                 index_cache=index_cache,
                 block_table=block_table,
@@ -5852,6 +5893,32 @@ def _sparse_gqa(
     )
 
 
+def _index_scores(core, **kw):
+    """`qsa_paged_index_scores(**kw)`, or under `INDEX_KEY_FP8_ENV` the e4m3 anchors' kernel
+    (`qsa_index_scores_fp8`), which takes no launch hints (PDL, prefetch, the visible split)."""
+    if not getattr(core, "index_key_fp8", False):
+        return qsa_paged_index_scores(**kw)
+    return qsa_index_scores_fp8(
+        kw["q"],
+        kw["index_cache"],
+        kw["block_table"],
+        kw["query_positions"],
+        kw["request_indices"],
+        kw["tokens_per_block"],
+        kw["compress_ratio"],
+        kw["only_visible_blocks"],
+        kw["context_rows"],
+        kw.get("rows_per_request", 1),
+    )
+
+
+def _index_anchors_fp8(core, index_cache, block_table, req_idx, logical, tpb) -> None:
+    """Under `INDEX_KEY_FP8_ENV`, the anchors a writer just compressed (as bf16) at `logical`'s
+    group ends, converted to e4m3 in place; on the writer's stream, right behind it."""
+    if getattr(core, "index_key_fp8", False):
+        index_anchors_to_fp8(index_cache, block_table, req_idx, logical, tpb, core.compress_ratio)
+
+
 def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tpb, p: int):
     """`qsa_paged_index_scores` (visible blocks only) of a sparse generation step's rows, `p`
     consecutive rows a request: from `_INDEX_GROUP_MIN_ROWS` rows (and at a tep4 rank's
@@ -5860,6 +5927,11 @@ def _decode_index_scores(core, q, index_cache, block_table, logical, req_idx, tp
     rows = q.shape[0]
     grouped = rows >= _INDEX_GROUP_MIN_ROWS or (core.tep_fast and rows in _TEP_INDEX_GROUP_ROWS)
     rpr = p if p > 1 and grouped else 1
+    if getattr(core, "index_key_fp8", False):
+        return qsa_index_scores_fp8(
+            q, index_cache, block_table, logical, req_idx, tpb, core.compress_ratio, True, False,
+            p if p > 1 else 1,
+        )  # fmt: skip
     if (
         rpr > 1
         and rows >= _INDEX_SCORES_CUTE_MIN_GROUPS * rpr
@@ -7323,7 +7395,8 @@ class PrefillTarget:
             seq_lens_q = md.qsa_sequence_lengths[:rows][keep]
             row_starts = md.qsa_topk_row_starts[:rows][keep]
             topk_indices = md.qsa_topk_indices[:q_rows]
-            scores = qsa_paged_index_scores(
+            scores = _index_scores(
+                core,
                 q=q_index[keep],
                 index_cache=draft.index_cache,
                 block_table=block_table,
@@ -7558,6 +7631,14 @@ class DecodeTarget:
                 compress_ratio=core.compress_ratio,
                 mrope_section=_QSA_MROPE_SECTION,
             )
+            _index_anchors_fp8(
+                core,
+                index_cache,
+                block_table,
+                req_idx,
+                logical,
+                tokens_per_block,
+            )
 
     def _attention_one_rank(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
         """`_attention_block` at one rank, where a layer holds every head: the input
@@ -7605,7 +7686,13 @@ class DecodeTarget:
         q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
         q_index = _index_query(core, index_scratch)
         scores = None
-        if fused_prologue and not stage and num_tokens <= _PROLOGUE_SCORE_ROWS:
+        # The prologue's in-launch scores read bf16 anchors: e4m3 anchors score after it.
+        if (
+            fused_prologue
+            and not stage
+            and num_tokens <= _PROLOGUE_SCORE_ROWS
+            and not getattr(core, "index_key_fp8", False)
+        ):
             scores = torch.empty(
                 (num_tokens, block_table.shape[1] * tokens_per_block // core.compress_ratio),
                 dtype=torch.float32,
@@ -7652,6 +7739,7 @@ class DecodeTarget:
                 rows_per_request=rows_per_request,
                 index_scores=scores,
             )
+            _index_anchors_fp8(core, index_cache, block_table, req_idx, logical, tokens_per_block)
         else:
             self._attention_prologue(proj, q_index, index_view, index_cache, L, qsa, side, stage)
         if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
@@ -7662,7 +7750,8 @@ class DecodeTarget:
                 main.wait_stream(side)
                 _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
             if scores is None:
-                scores = qsa_paged_index_scores(
+                scores = _index_scores(
+                    core,
                     q=q_index,
                     index_cache=index_cache,
                     block_table=block_table,
@@ -7851,6 +7940,9 @@ class DecodeTarget:
                 core.mrope_section1,
                 core.mrope_section2,
                 rows_per_request=step["predicted_tokens_per_seq"],
+            )
+            _index_anchors_fp8(
+                core, pools.index_cache[i], block_table, req_idx, logical, tokens_per_block
             )
         else:
             _, k_dst, v_dst = _attn_in_heads(core, proj)
@@ -8229,6 +8321,14 @@ class DecodeTarget:
                     compress_ratio=core.compress_ratio,
                     mrope_section=_QSA_MROPE_SECTION,
                 )
+                _index_anchors_fp8(
+                    core,
+                    draft.index_cache,
+                    block_table,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                )
         main.wait_stream(side)
         if not core.one_rank:
             return _draft_mm(
@@ -8279,7 +8379,8 @@ class DecodeTarget:
                     token_topk=core.token_topk,
                 )
             else:
-                scores = qsa_paged_index_scores(
+                scores = _index_scores(
+                    core,
                     q=q_index,
                     index_cache=draft.index_cache,
                     block_table=block_table,

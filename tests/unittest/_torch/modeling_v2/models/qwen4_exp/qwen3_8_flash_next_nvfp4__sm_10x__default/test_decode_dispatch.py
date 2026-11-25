@@ -17,6 +17,8 @@
 The ops are replaced by recorders; no kernel runs.
 """
 
+import ast
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -336,3 +338,112 @@ def test_dp_topk_cluster_rows_switch(monkeypatch, env, dp_size, expected):
             M._dp_topk_cluster_rows(core)
     else:
         assert M._dp_topk_cluster_rows(core) == expected
+
+
+def _fp8_recorders(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        M, "qsa_index_scores_fp8", lambda *a: calls.append(("fp8", a[-3], a[-2], a[-1])) or "fp8"
+    )
+    monkeypatch.setattr(
+        M,
+        "qsa_paged_index_scores",
+        lambda **kw: calls.append(("bf16", kw["context_rows"])) or "bf16",
+    )
+    monkeypatch.setattr(M, "index_scores_groups_cute", lambda *a: calls.append(("cute",)) or "cute")
+    monkeypatch.setattr(M, "_index_groups_cute_serves", lambda q, cache, rpr: True)
+    monkeypatch.setattr(
+        M, "index_anchors_to_fp8", lambda *a: calls.append(("convert", a[-2], a[-1]))
+    )
+    return calls
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("rows, p", [(4, 4), (32, 4), (24, 3), (8, 1)])
+def test_index_key_fp8_decode_scores(monkeypatch, fp8, rows, p):
+    """`INDEX_KEY_FP8_ENV`: every generation step's scores on the e4m3 kernel with the step's
+    rows a request, never the bf16 Triton or CuTe kernels."""
+    calls = _fp8_recorders(monkeypatch)
+    core = SimpleNamespace(**{**vars(CORE), "index_key_fp8": fp8})
+    t = torch.zeros(rows, dtype=torch.int64)
+    M._decode_index_scores(core, torch.zeros(rows, 4, 128), None, None, t, t.int(), 32, p)
+    if fp8:
+        assert calls == [("fp8", True, False, p)]
+    else:
+        assert calls and calls[0][0] in ("bf16", "cute")
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_index_key_fp8_reader_and_writer_helpers(monkeypatch, fp8):
+    calls = _fp8_recorders(monkeypatch)
+    core = SimpleNamespace(**{**vars(CORE), "index_key_fp8": fp8})
+    kw = dict(
+        q=torch.zeros(300, 4, 128), index_cache=None, block_table=None, query_positions=None,
+        request_indices=None, tokens_per_block=32, compress_ratio=4, only_visible_blocks=True,
+        context_rows=True, rows_per_request=1,
+    )  # fmt: skip
+    M._index_scores(core, **kw)
+    M._index_anchors_fp8(core, None, None, None, None, 32)
+    if fp8:
+        assert calls == [("fp8", True, True, 1), ("convert", 32, 4)]
+    else:
+        assert calls == [("bf16", True)]
+
+
+def test_index_key_fp8_switch(monkeypatch):
+    monkeypatch.delenv(M.INDEX_KEY_FP8_ENV, raising=False)
+    assert M._switch(M.INDEX_KEY_FP8_ENV) is False
+    monkeypatch.setenv(M.INDEX_KEY_FP8_ENV, "1")
+    assert M._switch(M.INDEX_KEY_FP8_ENV) is True
+
+
+#: The launches that write a QSA index anchor (the group compression and the two fused
+#: prologues, which compress at a group's last token), and the bf16-key score kernels.
+_ANCHOR_WRITERS = frozenset(
+    {"qsa_prefill_compress", "one_rank_attn_decode_prologue", "qwen4_exp_attn_decode_prologue"}
+)
+_BF16_SCORE_KERNELS = frozenset({"qsa_paged_index_scores", "index_scores_groups_cute"})
+
+
+def _calls_by_function():
+    """`(qualified name, called names)` of every function of the modeling source."""
+    found = []
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, f"{prefix}{child.name}.")
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names = []
+                for sub in ast.walk(child):
+                    if isinstance(sub, ast.Call):
+                        f = sub.func
+                        names.append(f.id if isinstance(f, ast.Name) else getattr(f, "attr", None))
+                found.append((prefix + child.name, names))
+
+    visit(ast.parse(inspect.getsource(M)), "")
+    return found
+
+
+def test_index_key_fp8_every_anchor_writer_converts():
+    """Under `INDEX_KEY_FP8_ENV` a bf16 anchor left in the plane is read as e4m3 bytes: every
+    function that launches an anchor writer converts behind each launch (`_index_anchors_fp8`),
+    so a writer added without its conversion fails here."""
+    writers = 0
+    for name, calls in _calls_by_function():
+        launched = sum(c in _ANCHOR_WRITERS for c in calls)
+        writers += launched
+        assert calls.count("_index_anchors_fp8") == launched, (
+            f"{name}: {launched} anchor writer launches, "
+            f"{calls.count('_index_anchors_fp8')} conversions"
+        )
+    assert writers >= 6, "the writers were renamed: update _ANCHOR_WRITERS"
+
+
+def test_index_key_fp8_every_score_call_is_routed():
+    """Every bf16-key score kernel call sits in the two routers that take the e4m3 kernel under
+    `INDEX_KEY_FP8_ENV` (`_index_scores`, `_decode_index_scores`)."""
+    callers = {
+        name for name, calls in _calls_by_function() if any(c in _BF16_SCORE_KERNELS for c in calls)
+    }
+    assert callers == {"_index_scores", "_decode_index_scores"}
