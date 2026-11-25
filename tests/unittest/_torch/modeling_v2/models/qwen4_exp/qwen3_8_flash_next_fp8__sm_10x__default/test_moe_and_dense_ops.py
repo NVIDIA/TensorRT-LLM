@@ -538,7 +538,12 @@ def _wide_tactic_under_skewed_routing(rows, offset):
     under skewed routing like a real decode batch's is bitwise the fallback and in the gate."""
     x, router = _front_operands(rows, 17 * rows + offset)
     logits = (x.float() @ router.float().t()).to(torch.bfloat16)
-    xq, xsf = fp8_quantize_1x128(x, use_ue8m0=False)
+    # The layer gets unit-normal rows, which keep FC1 inside SiLU's live range. `x`'s 36-octave
+    # blocks saturate SiLU, and the FC2 input then lands on e4m3 rounding ties that any two fp32
+    # implementations break differently (this reference on two GPUs, too).
+    g = torch.Generator(device=DEV).manual_seed(19 * rows + offset)
+    rows_in = torch.randn(rows, 2560, device=DEV, generator=g).to(torch.bfloat16)
+    xq, xsf = fp8_quantize_1x128(rows_in, use_ue8m0=False)
     hot = offset + 7
     logits[:, hot] = logits.abs().amax() + 4.0
     logits[: rows // 3, offset + 100] = logits.abs().amax() + 2.0
