@@ -59,7 +59,8 @@ def get_visual_gen_attention_backend(
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
-                     ``sparse_algorithm``, or DeCo-Attention.
+                     ``sparse_algorithm``. quant_attention_config with ``deco_attention``
+                     selects DeCo-Attention (NVFP4 Q/K, FP8 or NVFP4 PV).
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).
     """
@@ -139,10 +140,17 @@ class PaddingSupport(NamedTuple):
 
 
 def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
-    """Return what the dense attention backend of a config takes for the padding of a sequence.
+    """
+    Get what the dense attention backend of a config takes for the padding of a sequence.
 
     A model hands a backend that takes a mask the mask, and one that takes only the length the
     length; a backend that takes neither cannot attend a padded sequence.
+
+    Args:
+        attention_config: AttentionConfig that selects the backend and its quantization recipe.
+
+    Returns:
+        PaddingSupport of the backend class under that recipe
     """
     # A config object without the field carries no quantization recipe.
     quant_attention_config = getattr(attention_config, "quant_attention_config", None)
@@ -230,8 +238,8 @@ def create_attention(
         # construct a backend directly get the same lowering here.
         kwargs["sparse_params"] = sparse_config.to_sparse_params()
 
-    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, the dense CuTe DSL
-    # FMHA backend, or DeCo-Attention.
+    # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
+    # FMHA or DeCo-Attention backend.
     if quant_attention_config is not None:
         kwargs["quant_attention_config"] = quant_attention_config
     if backend_name == "TRTLLM":
