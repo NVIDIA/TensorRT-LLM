@@ -145,18 +145,21 @@ def _as_mask(mask: Sequence[bool] | torch.Tensor, length: int) -> torch.Tensor:
             raise ValueError(f"prompt_embeds_mask must be 1-D, got shape {tuple(mask.shape)}")
         if mask.dtype != torch.bool:
             raise TypeError(f"prompt_embeds_mask tensor must be torch.bool, got {mask.dtype}")
-        mask_t = mask.detach().to("cpu")
-    else:
-        values = list(mask)
-        if not all(isinstance(v, bool) for v in values):
-            raise TypeError("prompt_embeds_mask must contain only bools")
-        mask_t = torch.tensor(values, dtype=torch.bool, device="cpu")
-    if mask_t.numel() != length:
+        _check_mask_length(mask.numel(), length)
+        return mask.detach().to("cpu").to_dense()
+    values = list(mask)
+    if not all(isinstance(v, bool) for v in values):
+        raise TypeError("prompt_embeds_mask must contain only bools")
+    _check_mask_length(len(values), length)
+    return torch.tensor(values, dtype=torch.bool, device="cpu")
+
+
+def _check_mask_length(mask_length: int, length: int) -> None:
+    if mask_length != length:
         raise ValueError(
-            f"prompt_embeds_mask length ({mask_t.numel()}) must equal the "
+            f"prompt_embeds_mask length ({mask_length}) must equal the "
             f"number of prompt tokens ({length})"
         )
-    return mask_t
 
 
 def build_prompt_embeds(

@@ -203,6 +203,7 @@ def test_reuse_scoped_to_embeddings(llm: LLM, table: torch.Tensor) -> None:
     # The plain prompt still reuses its own blocks and is unaffected.
     plain = llm.generate([ids], _greedy(), cache_salt=salt)[0]
     assert list(plain.outputs[0].token_ids) == expected
+    assert plain.cached_tokens > 0
 
 
 def test_reuse_shares_plain_prefix(llm: LLM, table: torch.Tensor) -> None:

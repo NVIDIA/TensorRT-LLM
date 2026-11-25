@@ -44,8 +44,9 @@ def _rows(n: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
         ([7, 8, 9], None, [7, 8, 9], [0, 1, 2]),
         ([1, 2, 3, 4], [False, True, True, False], [1, 2, 3, 4], [1, 2]),
         ([1, 2, 3, 4], torch.tensor([False, True, True, False]), [1, 2, 3, 4], [1, 2]),
+        ([1, 2, 3], torch.tensor([False, True, False]).to_sparse(), [1, 2, 3], [1]),
     ],
-    ids=["no_ids", "no_mask", "mask", "mask_tensor"],
+    ids=["no_ids", "no_mask", "mask", "mask_tensor", "mask_sparse"],
 )
 def test_build_positions(
     ids: list[int] | None,
@@ -64,6 +65,13 @@ def test_build_positions(
     [
         ([1, 2, 3], _rows(2), None, ValueError, "rows for"),
         ([1, 2, 3], _rows(2), [True, False], ValueError, "length"),
+        (
+            [1, 2, 3],
+            _rows(1),
+            torch.sparse_coo_tensor([[1]], [True], (1 << 40,)),
+            ValueError,
+            "length",
+        ),
         ([1, 2, 3], _rows(1), [True, True, False], ValueError, "selects"),
         ([1, 2, 3], _rows(2), [1, 1, 0], TypeError, "only bools"),
         ([1, 2, 3], _rows(2), torch.tensor([1, 1, 0]), TypeError, "torch.bool"),
