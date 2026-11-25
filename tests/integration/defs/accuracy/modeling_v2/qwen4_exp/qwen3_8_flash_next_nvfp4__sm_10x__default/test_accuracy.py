@@ -453,8 +453,12 @@ _DEP8 = dict(
 # slots, the router front, both output projections on the bf16 GEMM, both row ranges at their
 # widest on the bitmap-union verify kernel, the e4m3 index anchors, and the dep follow-ups'
 # forms above; SM103 only), at dep4 and at dep8 (two nodes of one rack; there with the
-# heads' group over the NVLink domain and the low-row floors at 2 requests a rank, as the dep8
-# front ran them).
+# heads' group over the NVLink domain, the low-row floors at 2 requests a rank, and the dep8
+# front's decode fusions:
+# the MoE-side site folded into the output projection at every row count with the 6-way plan at
+# MMA N 32; as
+# the dep8 front ran them). FP8 at dep4 once more with those fusions alone on top of the bf16
+# output projections and the host-indexed Lamport slots (SM103 only).
 _DP_FRONT_STACK = dict(
     lamport="lamport_step",
     router_front=True,
@@ -464,7 +468,7 @@ _DP_FRONT_STACK = dict(
     dp_opt_in=True,
     index_key_fp8=True,
 )
-_DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True)
+_DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True, dp_fuse=True)
 _QUANTIZED_KV = [
     pytest.param(_TP4, "nvfp4", dict(breakable=True), id="tp4_nvfp4_kv_breakable"),
     pytest.param(_DEP4, "fp8", {}, id="dep4_fp8_kv"),
@@ -504,6 +508,16 @@ _QUANTIZED_KV = [
         marks=pytest.mark.skipif(
             get_sm_version() != 103,
             reason="the opt-in attention-DP decode forms are measured on SM103",
+        ),
+    ),
+    pytest.param(
+        _DEP4,
+        "fp8",
+        dict(lamport="lamport_step", out_proj_bf16="all", dp_fuse=True),
+        id="dep4_fp8_kv_dp_fuse",
+        marks=pytest.mark.skipif(
+            get_sm_version() != 103,
+            reason="the attention-DP decode fusions are measured on SM103",
         ),
     ),
     pytest.param(
@@ -1018,6 +1032,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 ("DRAFT_O_MID", "1"),
             ):
                 env[f"TRTLLM_QWEN4_EXP_DP_{name}"] = value
+        if variant.get("dp_fuse"):
+            env["TRTLLM_QWEN4_EXP_DP_OUT_PROJ_INJECT"] = "all"
+            env["TRTLLM_QWEN4_EXP_DP_SITEB_PLAN32"] = "1"
         if variant.get("dp8_domain"):
             env["TRTLLM_QWEN4_EXP_DP_HEAD_SHARD_GROUP"] = "domain"
             env["TRTLLM_QWEN4_EXP_DP_LOWROWS"] = "2"

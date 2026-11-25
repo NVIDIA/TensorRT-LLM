@@ -389,10 +389,14 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm imp
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
+    INJECT_UNIT_COLS as _INJECT_UNIT_COLS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MAX_ROWS as _MID_ROWS_MAX,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (
     MidWeight,
+    mid_mm_inject,
     mid_mm_raw,
     mid_rows_mm_op,
 )
@@ -632,11 +636,16 @@ from .ops.attention.qwen4_exp_attn_decode_prologue__decode import qwen4_exp_attn
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import MAX_ROWS as _HC_TC_FIRST_ROWS
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import ROWSN_ROWS as _HC_ROWSN_ROWS
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import TILE64_MAX_ROWS as _HC_TILE64_MAX_ROWS
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import hc_first_ss as hc_tc_first_ss
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import precompile as hc_tc_first_precompile
 from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import (
     precompile_rowsn as hc_tc_first_precompile_rowsn,
 )
-from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_first
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import (
+    qwen4_exp_hc_decode_tc_first,
+    qwen4_exp_hc_decode_tc_first_ss,
+)
+from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import ss_plan as hc_tc_first_ss_plan
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
 from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
@@ -2252,7 +2261,307 @@ def _out_proj(core, x, weight_t, site: str, dense):
     ent = None if table is None else table[site].get(x.shape[0])
     if ent is None or not x.is_contiguous() or x.data_ptr() % 16:
         return dense()
+    arm = getattr(core, "_siteb_pending", None)
+    if arm is not None and arm.site == site and x.shape[0] == arm.hc.shape[0]:
+        # `DP_OUT_PROJ_INJECT_ENV`: the trunk loop armed this projection with its site B.
+        core._siteb_pending = None
+        mpad, plan = core._siteb.gemm[x.shape[0]]
+        return _SiteBFolded(
+            *mid_mm_inject(x, weight_t.t(), plan, arm.hc, arm.inject, arm.norm, mpad=mpad)
+        )
     return mid_mm_raw(x, weight_t.t(), ent[1], pdl=True, mpad=ent[0])
+
+
+#: Off by default (class S). With `DP_OUT_PROJ_BF16_ENV` engaged, the MoE-side hyper-connection
+#: site (site B) of a trunk layer launches no `qwen4_exp_hc_inject_norm`: the block's output
+#: projection runs `mid_rows_mm`'s bf16 GEMM in inject mode (`mid_mm_inject`: same MMA N, plan and
+#: operands as `_out_proj`), whose split-K store writes the injected residual (bitwise the inject
+#: kernel's), the stream before its rstd `bf16(hc * (1 + norm))` and the partial sums of squares;
+#: the site's first projection and up / gate / mean run their deferred-rstd forms
+#: (`qwen4_exp_hc_decode_tc_first_ss`, `qwen4_exp_hc_up_gate_mean(rstd=)`). Three launches a site
+#: B where there were four. The activation is rounded to bf16 once on both paths, before the rstd
+#: factor here and after it there, and the rstd is summed in another order: `mixed` and the
+#: injection move at rounding level. Values: `1` -- `_SITEB_ROWS`; `all` -- every row count of
+#: the output projections' table; `<lo>:<hi>` -- that range of requests a rank (4 rows a
+#: request). Only the CUDA-graph row counts of `_out_proj`'s table engage, at each site where
+#: `_out_proj` takes the GEMM (the GDN out projection; the attention o projection where its rows
+#: are served). The layer in front of the PLE layer keeps the inject kernel. GB300 dep4 server
+#: A/B, both arm orders: -0.059 / -0.060 / -0.052 ms a step at 10 / 12 / 16 requests a rank.
+#: Read once, when the target is built.
+DP_OUT_PROJ_INJECT_ENV = "TRTLLM_QWEN4_EXP_DP_OUT_PROJ_INJECT"
+#: Rows the value `1` serves: 5..20 requests a rank. GB300 dep4 trunk-loop micro, ms a step saved
+#: at `all`: 0.045..0.073 at 5..16 requests a rank, 0.019..0.027 at 17..20, within +-0.009 from 22
+#: (a warp of the GEMM then owns two or three units, and the fold's store loop eats the launch it
+#: saves).
+_SITEB_ROWS = (17, 80)  # capacity: fixed: dispatch thresholds
+#: Off by default (class S, as `DP_OUT_PROJ_INJECT_ENV`, which it needs engaged). The injecting
+#: GEMM at the row counts whose `_OUT_PROJ_TABLE` entry is `_SITEB_PLAN32[0]` (MMA N 32 on the
+#: 12-way split: up to 28 rows) runs `_SITEB_PLAN32[1]`, the plan of 29..32 rows, instead: the
+#: 12-CTA cluster's split-K store of the fold is slower than the 6-CTA one. Every row of an MMA
+#: N 32 tile is computed on its own, so each row is bitwise the row 32 rows would compute; against
+#: the table's plan it is another K split. GB300 dep8, with `DP_OUT_PROJ_BF16=all`: -0.133..-0.169
+#: ms a step at 5..7 requests a rank. Read once, when the target is built.
+DP_SITEB_PLAN32_ENV = "TRTLLM_QWEN4_EXP_DP_SITEB_PLAN32"
+_SITEB_PLAN32 = ((32, MidPlan(12, 2, 8, 2)), (32, MidPlan(6, 4, 10, 1)))
+#: The norm weight the fold reads is the site's `[C * H]` bf16 vector; its stream width is the
+#: output projections' N.
+_SITEB_STREAMS = 4  # capacity: fixed: the fold's compiled stream count
+#: The most rows the fold serves: the output projections' table's last.
+_SITEB_MAX_ROWS = 144  # capacity: fixed: dispatch threshold
+
+
+class _SiteB(NamedTuple):
+    """`DP_OUT_PROJ_INJECT_ENV` engaged at this rank (`core._siteb`): `gemm` = `{rows: (MMA N,
+    plan)}` of the injecting GEMM, `attn_rows` the row counts the attention site also takes,
+    `first` = `{rows: plan arguments of the first projection}`, `up` = `{rows: the up kernel's
+    M tile}`, `skip` the layer that keeps the inject kernel (in front of the PLE layer),
+    `plan32` the row counts `DP_SITEB_PLAN32_ENV` moved."""
+
+    gemm: dict
+    attn_rows: frozenset
+    first: dict
+    up: dict
+    skip: int
+    plan32: tuple
+
+
+class _SiteBArm(NamedTuple):
+    """The operands `_siteb_arm` hands the layer's output projection: the site it applies to
+    (`gdn_out` / `attn_o`), the residual, the injection and the site's norm weight."""
+
+    site: str
+    hc: torch.Tensor
+    inject: torch.Tensor
+    norm: torch.Tensor
+
+
+class _SiteBFolded(NamedTuple):
+    """What a folded output projection returns in place of its output: the injected residual,
+    `y = bf16(hc * (1 + norm))` and the partial sums of squares of `hc` (fp32 `[rows, C, N /
+    32]`)."""
+
+    hc: torch.Tensor
+    y: torch.Tensor
+    ss: torch.Tensor
+
+
+def _siteb_wanted(rows_a_request: int) -> tuple | None:
+    """`DP_OUT_PROJ_INJECT_ENV` as a `(first rows, last rows)` range, None unset / off."""
+    raw = os.environ.get(DP_OUT_PROJ_INJECT_ENV, "")
+    value = raw.strip().lower()
+    if not value or value in _SWITCH_OFF:
+        return None
+    if value in _SWITCH_ON:
+        return _SITEB_ROWS
+    if value == "all":
+        return (1, _SITEB_MAX_ROWS)
+    lo, sep, hi = value.partition(":")
+    if sep and lo.isdigit() and hi.isdigit() and 1 <= int(lo) <= int(hi):
+        return (int(lo) * rows_a_request, int(hi) * rows_a_request)
+    raise ValueError(
+        f"{DP_OUT_PROJ_INJECT_ENV}={raw!r}: expected 0, 1, all or <lo>:<hi> requests a rank"
+    )
+
+
+def _hc_first_form(core, rows: int, with_inject: bool) -> dict:
+    """The plan arguments `_hc_first` gives `qwen4_exp_hc_decode_tc_first` at `rows` rows (up to
+    `_HC_TC_FIRST_MAX_ROWS`): `{}` is the default plan."""
+    if core.hc_tiles:
+        rowsn_lo = getattr(core, "hc_rowsn_lo", _HC_ROWSN_ROWS[0])
+        rowsn = _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1] or (
+            rowsn_lo <= rows <= _DP_LOWROWS_MAX_ROWS
+        )
+        if with_inject and rowsn:
+            if getattr(core, "hc_first_x2", False) and rows >= _HC_ROWSN_ROWS[0]:
+                return {"tm64x2": True}
+            return {"rows_on_n": True}
+        if _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]:
+            return {"tm": 64}
+    return {}
+
+
+def _hc_up_tile(core, rows: int, release: bool) -> int:
+    """The M tile `_hc_mixer` gives the up kernel at `rows` rows."""
+    if core.hc_tiles and (
+        _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]
+        or (not release and _HC_UP2_ROWS[0] <= rows <= _HC_UP2_ROWS[1])
+    ):
+        return 64
+    return 128
+
+
+def _siteb_selfcheck(core, st: _SiteB, L, rows: int, device) -> str | None:
+    """One fold at `rows` rows on this rank's weights of a GDN layer against the stock site
+    (`mid_mm_raw` at the fold's plan, `qwen4_exp_hc_inject_norm`, `_hc_mixer`): the residual
+    must be bitwise, `mixed` / `low` / `inject` within 1/64 of their scale (rounding level). None
+    when it holds, else what differed."""
+    gen = torch.Generator(device=device).manual_seed(rows)
+    w = L.out.t()
+    x = torch.randn(rows, w.shape[1], generator=gen, device=device).to(torch.bfloat16)
+    hc = torch.randn(rows, core.stream, generator=gen, device=device).to(torch.bfloat16)
+    inject = (torch.rand(rows, core.hc_count, generator=gen, device=device) * 2).to(torch.bfloat16)
+    mpad, plan = st.gemm[rows]
+    b = mid_mm_raw(x, w, plan, pdl=True, mpad=mpad)
+    hc_ref, normed = qwen4_exp_hc_inject_norm(hc, b, inject, L.mhc_norm, core.eps, core.hc_count)
+    mixed_ref, inj_ref = _hc_mixer(core, normed, L.mhc_first, L.mhc_up, True)
+    folded = _SiteBFolded(*mid_mm_inject(x, w, plan, hc, inject, L.mhc_norm, mpad=mpad))
+    hc2, mixed, inj = _siteb_site(core, folded, L, st)[:3]
+    if not torch.equal(hc2, hc_ref):
+        return f"the injected residual differs from qwen4_exp_hc_inject_norm's at {rows} rows"
+    for name, got, ref in (("mixed", mixed, mixed_ref), ("inject", inj, inj_ref)):
+        scale = ref.float().abs().max().clamp_min(1e-6)
+        if not bool(((got.float() - ref.float()).abs().max() <= scale / 64).item()):
+            return f"{name} is past rounding level of the stock site's at {rows} rows"
+    return None
+
+
+def _siteb_build(core, device) -> _SiteB | None:
+    """`DP_OUT_PROJ_INJECT_ENV` (and `DP_SITEB_PLAN32_ENV`), read once at build after
+    `_out_proj_build` and the hc plan switches whose launches it mirrors: the `_SiteB` of this
+    rank, every kernel compiled and one fold checked against the stock site at each distinct
+    launch shape (GEMM plan, first-projection plan, up tile); None where it is off. Set where it
+    cannot apply (`DP_OUT_PROJ_BF16_ENV` not engaged, another stream count): one warning, None.
+    A kernel that does not compile: one warning, that row count keeps the inject kernel. A
+    failed check, or one that raises: one warning, the whole switch keeps it (the exception does
+    not leave the build, so no rank dies). Nothing here is collective: a rank that declines runs
+    the stock site, which no other rank depends on."""
+    want = _siteb_wanted(core.max_verify_rows)
+    plan32 = _switch(DP_SITEB_PLAN32_ENV)
+    if want is None:
+        if plan32:
+            logger.warning(
+                f"{DP_SITEB_PLAN32_ENV} is set but ignored: it rides on {DP_OUT_PROJ_INJECT_ENV}, "
+                "which is not set"
+            )
+        return None
+    out = core._out_proj
+    why = None
+    if out is None:
+        why = f"it rides on {DP_OUT_PROJ_BF16_ENV}, which is not engaged at this rank"
+    elif core.hc_count != _SITEB_STREAMS or core.stream != _SITEB_STREAMS * _OUT_PROJ_GEOM[0]:
+        why = (
+            f"the fold is compiled for {_SITEB_STREAMS} streams of the output projections' "
+            f"width (this model: {core.hc_count} streams of {core.stream // core.hc_count})"
+        )
+    if why is not None:
+        logger.warning(f"{DP_OUT_PROJ_INJECT_ENV} is set but ignored: {why}")
+        return None
+    layers = core._decode._layers
+    skip = core.ple_layer - 1
+    gdn = next((i for i in core.gdn_layers if i != skip), None)
+    n, k = _OUT_PROJ_GEOM
+    w = core.w[f"l{gdn}_out_w"]
+    gemm, first, up, moved, missed = {}, {}, {}, [], []
+    shape = {}  # rows -> the launch shape the self-check keys on
+    for rows, (mpad, plan) in sorted(out["gdn_out"].items()):
+        if not want[0] <= rows <= want[1]:
+            continue
+        if plan32 and (mpad, plan) == _SITEB_PLAN32[0]:
+            mpad, plan = _SITEB_PLAN32[1]
+            moved.append(rows)
+        form = _hc_first_form(core, rows, True)
+        fplan = hc_tc_first_ss_plan(
+            rows, form.get("tm", 128), "rows_on_n" in form, "tm64x2" in form
+        )
+        if rows % 4 or rows > min(_SITEB_MAX_ROWS, _HC_TC_FIRST_MAX_ROWS) or fplan[2] % 4:
+            missed.append(rows)
+            continue
+        tm_up = _hc_up_tile(core, rows, False)
+        try:
+            x = torch.empty(rows, k, dtype=torch.bfloat16, device=device)
+            mid_mm_inject(x, w, plan, x, x[:, :4], x, mpad=mpad, compile_only=True)
+            y = torch.empty(rows, core.stream, dtype=torch.bfloat16, device=device)
+            ss = torch.empty(rows, 4, n // _INJECT_UNIT_COLS, dtype=torch.float32, device=device)
+            hc_tc_first_ss(
+                y, ss, layers[gdn].mhc_first, core.hc_lowrank, core.hc_count, core.eps, fplan,
+                compile_only=True,
+            )  # fmt: skip
+            hc_up_precompile(
+                core.hc_count, core.hidden, core.hc_lowrank, device, [(False, tm_up)], ss=True
+            )
+        except Exception as e:  # noqa: BLE001 -- an opt-in form declines a row count it cannot compile
+            missed.append(rows)
+            logger.warning(
+                f"{DP_OUT_PROJ_INJECT_ENV}: a kernel of {rows} rows did not compile at rank "
+                f"{core.dp_rank} ({type(e).__name__}: {str(e)[:300]}); it keeps the inject kernel"
+            )
+            continue
+        gemm[rows], first[rows], up[rows] = (mpad, plan), form, tm_up
+        shape[rows] = ((mpad, plan), fplan, tm_up)
+    attn = frozenset(r for r in out["attn_o"] if r in gemm)
+    st = _SiteB(gemm, attn, first, up, skip, tuple(moved))
+    if not gemm:
+        logger.warning(
+            f"{DP_OUT_PROJ_INJECT_ENV} is set but ignored at rank {core.dp_rank}: no row count of "
+            f"the output projections' table ({sorted(out['gdn_out'])}) in {want[0]}..{want[1]} "
+            f"rows takes the fold (not served: {missed})"
+        )
+        return None
+    # One check a distinct launch shape (each first-projection kind and up tile, not only each
+    # GEMM plan), at its smallest row count.
+    for key in sorted(set(shape.values()), key=str):
+        rows = min(r for r, e in shape.items() if e == key)
+        try:
+            bad = _siteb_selfcheck(core, st, layers[gdn], rows, device)
+        except Exception as e:  # noqa: BLE001 -- an opt-in form declines; the rank must not die
+            bad = f"the check at {rows} rows raised {type(e).__name__}: {str(e)[:300]}"
+        if bad is not None:
+            logger.warning(
+                f"{DP_OUT_PROJ_INJECT_ENV} is set but ignored at rank {core.dp_rank}: {bad}; every "
+                "MoE-side site keeps qwen4_exp_hc_inject_norm"
+            )
+            return None
+    logger.info(
+        f"site-B fold into the output projection ({DP_OUT_PROJ_INJECT_ENV}="
+        f"{os.environ.get(DP_OUT_PROJ_INJECT_ENV, '').strip()}): rank {core.dp_rank} of "
+        f"{core.dp_size}, GDN rows {sorted(gemm)}, attention rows {sorted(attn)}, every trunk layer "
+        f"but {skip}; not served {missed or 'none'}"
+        + (f"; {DP_SITEB_PLAN32_ENV}=1 at {moved}" if moved else "")
+    )
+    return st
+
+
+def _siteb_arm(core, L, i: int, rows: int, hc, inject) -> bool:
+    """`DP_OUT_PROJ_INJECT_ENV`: called by the trunk loop in front of layer `i`'s block. Where the
+    layer's site B takes the fold it hands the site's operands to the block's output projection
+    (`core._siteb_pending`, read and cleared by `_out_proj`) and returns True."""
+    st = getattr(core, "_siteb", None)
+    if st is None or i == st.skip:
+        return False
+    attn = bool(core.is_attn[i])
+    if rows not in (st.attn_rows if attn else st.gemm):
+        return False
+    norm = L.mhc_norm
+    if not (
+        inject is not None
+        and hc.dtype == inject.dtype == norm.dtype == torch.bfloat16
+        and tuple(hc.shape) == (rows, core.stream)
+        and tuple(inject.shape) == (rows, core.hc_count)
+        and norm.numel() == core.stream
+        and all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (hc, inject, norm))
+    ):
+        return False
+    core._siteb_pending = _SiteBArm("attn_o" if attn else "gdn_out", hc, inject, norm)
+    return True
+
+
+def _siteb_disarm(core) -> None:
+    """Drops a fold `_siteb_arm` armed that the block's output projection did not take."""
+    core._siteb_pending = None
+
+
+def _siteb_site(core, folded: _SiteBFolded, L, st: _SiteB | None = None) -> tuple:
+    """`DecodeTarget._hc_moe_site` behind a folded output projection: the site's mixer on the
+    deferred-rstd forms. Returns `(hc, mixed, inject, None)`."""
+    st = core._siteb if st is None else st
+    rows = folded.hc.shape[0]
+    low, inject, rstd = qwen4_exp_hc_decode_tc_first_ss(
+        folded.y, folded.ss, L.mhc_first, core.hc_lowrank, core.hc_count, core.eps, **st.first[rows]
+    )
+    mixed = qwen4_exp_hc_up_gate_mean(
+        low, L.mhc_up, folded.y, core.hc_count, tm=st.up[rows], rstd=rstd
+    )
+    return folded.hc, mixed, inject, None
 
 
 #: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) two launch orders
@@ -2570,6 +2879,8 @@ def _decode_forms(core) -> str:
             "in-proj release rows": rows({r for t in (inproj or {}).values() for r in t}),
             "out-proj gdn rows": rows(out["gdn_out"] if out else None),
             "out-proj attn rows": rows(out["attn_o"] if out else None),
+            "out-proj inject rows": rows(getattr(getattr(core, "_siteb", None), "gemm", None)),
+            "siteb plan32 rows": list(getattr(getattr(core, "_siteb", None), "plan32", ())),
             "grouped gqa from requests": core.dp_gqa_min_requests,
             "cluster top-k up to rows": core.dp_topk_cluster_rows,
             "bitmap gqa from requests": getattr(core, "dp_gqa_bitmap", 0),
@@ -3014,6 +3325,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.dp_launch_order = False
         # `DP_DRAFT_O_MID_ENV` (opt-in): the draft output projection's rows, built after load.
         self._draft_o = None
+        # `DP_OUT_PROJ_INJECT_ENV` (opt-in): the site-B fold, built after load, and the operands
+        # the trunk loop hands the next output projection (`_siteb_arm`).
+        self._siteb = None
+        self._siteb_pending = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
         # The trunk verify step's bitmap-union sparse GQA floor, 0 = off (`DP_GQA_BITMAP_ENV`).
@@ -3248,6 +3563,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._inproj_release = _inproj_release_build(self, device)
             self._out_proj = _out_proj_build(self, device)
             self._draft_o = _draft_o_build(self, device)
+            self._siteb = _siteb_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
             self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
@@ -5023,25 +5339,13 @@ def _hc_first(core, normed, first, with_inject):
     place of the rows-on-N kernel."""
     rows = normed.shape[0]
     if rows <= _HC_TC_FIRST_MAX_ROWS:
-        if core.hc_tiles:
-            rowsn_lo = getattr(core, "hc_rowsn_lo", _HC_ROWSN_ROWS[0])
-            rowsn = _HC_ROWSN_ROWS[0] <= rows <= _HC_ROWSN_ROWS[1] or (
-                rowsn_lo <= rows <= _DP_LOWROWS_MAX_ROWS
-            )
-            if with_inject and rowsn:
-                if getattr(core, "hc_first_x2", False) and rows >= _HC_ROWSN_ROWS[0]:
-                    return qwen4_exp_hc_decode_tc_first(
-                        normed, first, core.hc_lowrank, core.hc_count, True, tm64x2=True
-                    )
-                return qwen4_exp_hc_decode_tc_first(
-                    normed, first, core.hc_lowrank, core.hc_count, True, rows_on_n=True
-                )
-            if _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]:
-                return qwen4_exp_hc_decode_tc_first(
-                    normed, first, core.hc_lowrank, core.hc_count, with_inject, tm=64
-                )
         return qwen4_exp_hc_decode_tc_first(
-            normed, first, core.hc_lowrank, core.hc_count, with_inject
+            normed,
+            first,
+            core.hc_lowrank,
+            core.hc_count,
+            with_inject,
+            **_hc_first_form(core, rows, with_inject),
         )
     return qwen4_exp_hc_lowrank_act(
         cublas_mm(normed, first[:, : core.hc_first_cols], None, torch.float32),
@@ -5061,13 +5365,7 @@ def _hc_mixer(core, normed, first, up, with_inject, release: bool = False):
     `mixed` after its own wait). With `core.hc_tiles` the up kernel runs on 64-row tiles at
     `_HC_TILE64_ROWS` rows, and at `_HC_UP2_ROWS` rows unless it releases (bitwise)."""
     low, inject = _hc_first(core, normed, first, with_inject)
-    rows = normed.shape[0]
-    tm = 128
-    if core.hc_tiles and (
-        _HC_TILE64_ROWS[0] <= rows <= _HC_TILE64_ROWS[1]
-        or (not release and _HC_UP2_ROWS[0] <= rows <= _HC_UP2_ROWS[1])
-    ):
-        tm = 64
+    tm = _hc_up_tile(core, normed.shape[0], release)
     if tm == 128 and not release:
         return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
     mixed = qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count, release_early=release, tm=tm)
@@ -9893,6 +10191,9 @@ class DecodeTarget:
         window quantizes the group's gathered rows itself and `fp4` is None. Returns `(hc,
         mixed, inject, fp4)`."""
         core = self.core
+        if type(block_out) is _SiteBFolded:
+            # `DP_OUT_PROJ_INJECT_ENV`: the block's output projection injected already.
+            return _siteb_site(core, block_out, L)
         if core.dp_size > 1:
             hc, mixed, inject = self._hc_site(
                 hc, block_out, inject, L.mhc_norm, L.mhc_first, L.mhc_up, True
@@ -10430,14 +10731,21 @@ class DecodeTarget:
                 moe,
                 release=q_in is not None,
             )
-            if core.is_attn[i]:
-                block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify, q_in
-                )
-            else:
-                block_out = self._gdn_block(
-                    mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph, q_in
-                )
+            # `DP_OUT_PROJ_INJECT_ENV`: where this layer's site B folds, the residual and the
+            # injection ride the block's output projection (False with the switch off).
+            armed = _siteb_arm(core, L, i, num_tokens, hc, inject)
+            try:
+                if core.is_attn[i]:
+                    block_out = self._attention_block(
+                        mixed, i, L, qkv, index_scratch, attn_out, qsa, step, is_verify, q_in
+                    )
+                else:
+                    block_out = self._gdn_block(
+                        mixed, i, L, si_all, verify, gen_p, md.is_cuda_graph, q_in
+                    )
+            finally:
+                if armed:
+                    _siteb_disarm(core)
             hc, mixed, inject, fp4 = self._hc_moe_site(hc, block_out, inject, L)
             block_out, moe = self._moe(
                 mixed,

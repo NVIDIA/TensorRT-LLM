@@ -60,6 +60,7 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_lamport_step_router_front] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_out_proj_bf16] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_opt_in] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_fuse] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_dp_rows] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv_front_stack] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
