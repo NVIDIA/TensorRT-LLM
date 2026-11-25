@@ -20,7 +20,6 @@ TensorRT LLM perf tests
 # import_allowed_perf_config() below.
 __extra_import_path__ = ["."]
 
-import copy
 import json
 import os
 import re
@@ -585,7 +584,6 @@ class PerfTestConfig:
         self.prefix_len = prefix_len
         # "+"-joined presets with optional per-recipe field overrides.
         self.cfg_presets = cfg_presets
-        self._label_config = None
         self.explicit_options: set[str] = set()
 
     def to_string(self,
@@ -594,12 +592,6 @@ class PerfTestConfig:
                   custom_bs: int = None,
                   custom_input_len: int = None,
                   custom_output_len: int = None) -> str:
-
-        if self._label_config is not None:
-            return self._label_config.to_string(custom_server_name,
-                                                custom_client_name, custom_bs,
-                                                custom_input_len,
-                                                custom_output_len)
 
         # First, add the model name.
         entries = [self.model_name]
@@ -839,11 +831,7 @@ class PerfTestConfig:
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
 
         supplied = self.explicit_options.copy()
-        self._label_config = None
         if self.cfg_presets is not None:
-            # Keep exported names tied to the case even if a recipe changes.
-            self._label_config = copy.copy(self)
-            self._label_config._resolve_topology(supplied)
             for selection in self.cfg_presets.split("+"):
                 recipe = get_perf_config_preset(selection)
                 for option, attribute, section, key in _launch_options_in(

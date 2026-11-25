@@ -120,32 +120,30 @@ For example, both Kimi K3 serve variants disable KV block reuse and use 64 token
 The Core and Spark test lists select existing recipes by filename, for example
 `-cfg:deepseek-v4-pro-latency.yaml`. The DeepSeek V4 Pro throughput and latency cases
 use their corresponding files in [examples/configs/curated](../../../../examples/configs/curated).
-Muse Spark serve cases use `musespark-open.yaml`, and the 24-session AgentX case uses
-`musespark-open-agentic-balanced.yaml`. Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
+Muse Spark serve cases use `musespark-open.yaml` with remote-code trust and guided decoding
+disabled. The 24-session AgentX case uses `musespark-open-agentic-balanced.yaml`.
+Nemotron 3 Ultra uses `nemotron-3-ultra-throughput.yaml`.
 Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases select
 `cuda_graph_config.max_batch_size=128` for their larger CUDA graphs. The Spark streaming
-benchmarks inherit MTP from the same recipe and select their MoE backend with
-`moe_config.backend` in the `cfg:` suffix.
+benchmarks use `speculative_config=null` to disable MTP and select their MoE backend with `moe:`.
 Explicit test-name options override the selected YAML. An omitted option inherits its
 YAML value and falls back to the code default when the YAML also omits it. This includes
 `maxbs`, `maxnt`, `tp`, `pp`, `ep` and `kv_frac` for both bench and serve.
-With `minimax-m3-throughput.yaml`, for example, `maxnt:4096` launches with 4096 tokens
-and omitting `maxnt` launches with the recipe's 8192. Database names keep the historical
-case prefix, which can include a default such as `maxnt:2048` even when the recipe supplies 8192.
+The MiniMax M3 FP4 cases explicitly set `kv_frac:0.9`. Their two low-latency cases
+set `maxnt:2048` to keep the original token budget with the 8192-token recipe.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
 Use `cfg:field=value` for a case-specific setting, for example the two Qwen3 235B
 throughput cases use `cfg:enable_attention_dp=true`. Separate fields with commas, or
 append them to a curated filename as in `cfg:minimax-m3-throughput.yaml,max_seq_len=2560`.
 The loader keeps the recipe's model settings unless the case supplies a different value.
-For example, GPT-OSS inherits `moe_config.backend=TRTLLM` from its throughput recipe,
-and `cfg:gpt-oss-120b-throughput.yaml,stream_interval=10` changes just the stream interval.
+The GPT-OSS 120B cases use inline streaming and worker settings so the runtime selects
+the historical MoE backend. The three high-concurrency cases also set `enable_attention_dp=true`.
 
 For DSpark, `cfg:decoding_type=DSpark,max_draft_len=5,block_size=5` sets fields in
 `speculative_config`. The two Nemotron Lightning cases share their MTP, streaming and KV cache
 settings in the Python model rule so their original test and metric names stay stable.
-When updating an existing case, keep its full original name as the database matching prefix.
-Append configuration changes after a final `-cfg:`, for example
+Put recipe selections and inline overrides in the final `-cfg:` suffix, for example
 `-cfg:stream_interval=10,moe_config.backend=DEEPGEMM,kv_cache_config.dtype=fp8`.
 The Nemotron Super MTP cases select `decoding_type=MTP,num_nextn_predict_layers=3`
 to retain the layer count used by this variant.

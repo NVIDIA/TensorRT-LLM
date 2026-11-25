@@ -90,7 +90,7 @@ def get_perf_config_preset(selection: str) -> dict:
 
     boolean_fields = ('print_iter_log', 'enable_attention_dp',
                       'enable_chunked_prefill', 'disable_overlap_scheduler',
-                      'disable_mm_encoder')
+                      'disable_mm_encoder', 'trust_remote_code')
     integer_fields = ('max_seq_len', 'stream_interval',
                       'num_postprocess_workers', 'max_draft_len', 'block_size',
                       'periodic_snapshot_interval',
@@ -103,6 +103,9 @@ def get_perf_config_preset(selection: str) -> dict:
         elif (field in integer_fields and value.isascii() and value.isdecimal()
               and (int(value) > 0 or field == 'num_postprocess_workers')):
             parsed = int(value)
+        elif field in ('speculative_config',
+                       'guided_decoding_backend') and value == 'null':
+            parsed = None
         elif field == 'decoding_type' and value in ('MTP', 'DSpark'):
             parsed = value
         elif field == 'moe_config.backend' and value in ('CUTEDSL', 'CUTLASS',
