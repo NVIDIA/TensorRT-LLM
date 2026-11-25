@@ -41,6 +41,12 @@ _DEEPSEEK_TOKEN_TEMPLATE = (
     "{%- for message in messages %}{{- '<｜User｜>' + message.content }}{%- endfor %}"
     "{%- if add_generation_prompt %}{{- '<｜Assistant｜>' }}{%- endif %}"
 )
+_REASONING_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + message.reasoning_content"
+    " + '\\n</think>\\n\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}"
+    "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+)
 
 
 class _ReachedGetLlmArgs(Exception):
@@ -119,6 +125,21 @@ def test_serve_auto_reasoning_parser_rejects_non_chatml_qwen3_template(
     """A non-ChatML Qwen3 template that never opens <think> is a usage error."""
     model = _write_checkpoint(
         tmp_path / "DeepSeek-R1-0528-Qwen3-8B", "qwen3", jinja=_DEEPSEEK_TOKEN_TEMPLATE
+    )
+
+    result, recorded = _invoke_serve_auto(monkeypatch, model)
+
+    assert result.exit_code == 2, result.output
+    assert "Cannot auto-detect reasoning parser" in result.output
+    assert recorded == {}
+
+
+def test_serve_auto_reasoning_parser_rejects_qwen3_reasoning_history_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Qwen3 template with <think> only outside the generation prompt is a usage error."""
+    model = _write_checkpoint(
+        tmp_path / "Qwen3-30B-A3B-Thinking-2507-AWQ", "qwen3_moe", jinja=_REASONING_HISTORY_TEMPLATE
     )
 
     result, recorded = _invoke_serve_auto(monkeypatch, model)

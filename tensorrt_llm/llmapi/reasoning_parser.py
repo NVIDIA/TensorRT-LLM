@@ -756,7 +756,7 @@ class AutoReasoningParserResult:
     Attributes:
         parser: The reasoning parser key to use, or None.
         no_parser_needed: True only when ``parser`` is None because the
-            model's Qwen ChatML chat template shows that it never emits a
+            model's Qwen ChatML chat template shows that its replies carry no
             reasoning block. A None ``parser`` without this flag means
             detection could not pick a parser, and the caller should report
             it.
@@ -851,16 +851,21 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
       → use the ``"deepseek-r1"`` parser (``reasoning_at_start=True``).
     - **Forced-non-thinking** (e.g. Qwen3-235B-A22B-Instruct-2507): the
       generation prompt is in the Qwen ChatML format (``<|im_start|>``) and
-      never injects ``<think>``, or only an empty, closed ``<think></think>``
-      block (e.g. Qwen3-Reranker). ``<think>`` tags that only re-render the
-      reasoning of past assistant turns do not count.
+      injects no ``<think>``, or only an empty, closed ``<think></think>``
+      block (e.g. Qwen3-Reranker). Unless the generation prompt closes such
+      an empty block itself, the template must also write no non-empty
+      ``<think>`` anywhere else.
       → no reasoning parser needed.
 
     Only a template that was actually read can establish the last case; a
-    checkpoint without one falls back to the ``"qwen3"`` parser. A template
-    in another chat format (e.g. DeepSeek-R1-0528-Qwen3-8B) without a toggle
-    or a ``<think>`` in its generation prompt cannot be detected and returns
-    a None ``parser`` without ``no_parser_needed``.
+    checkpoint without one falls back to the ``"qwen3"`` parser. The other
+    templates without a toggle or a ``<think>`` in their generation prompt
+    cannot be detected and return a None ``parser`` without
+    ``no_parser_needed``: one in another chat format (e.g.
+    DeepSeek-R1-0528-Qwen3-8B), and a ChatML one that writes ``<think>``
+    only outside the generation prompt, e.g. for the reasoning of past
+    assistant turns, since both thinking and instruct checkpoints ship that
+    template.
     """
     chat_template = _read_chat_template(model)
     if chat_template is None:
@@ -898,10 +903,29 @@ def _resolve_qwen3_reasoning_parser(model: str) -> AutoReasoningParserResult:
         )
         return AutoReasoningParserResult(None)
 
+    if (not _EMPTY_THINK_BLOCK.search(_generation_prompt_source(chat_template))
+            and "<think>" in _EMPTY_THINK_BLOCK.sub(
+                "", _JINJA_COMMENT.sub("", chat_template))):
+        # Reasoning is written outside the generation prompt, which neither
+        # opens nor closes a <think> block, so the model may still emit it.
+        logger.warning(
+            "The chat template of Qwen3 model at '%s' writes <think> blocks "
+            "outside the generation prompt (e.g. the reasoning of past "
+            "assistant turns), but its generation prompt neither opens nor "
+            "closes one and it has no enable_thinking toggle, so it does not "
+            "show whether the model emits reasoning. Specify the parser "
+            "explicitly: '--reasoning_parser deepseek-r1' if the model's "
+            "replies start with reasoning, or leave out --reasoning_parser "
+            "if they do not.",
+            model,
+        )
+        return AutoReasoningParserResult(None)
+
     # Forced-non-thinking model: no <think> tag, or only empty blocks.
     logger.info(
-        "Detected forced-non-thinking Qwen3 model (no <think> tag other "
-        "than empty <think></think> blocks in the generation prompt). No "
+        "Detected forced-non-thinking Qwen3 model (the generation prompt "
+        "opens no <think> block, and the template writes no reasoning "
+        "elsewhere or the prompt closes an empty <think></think> block). No "
         "reasoning parser needed.", )
     return AutoReasoningParserResult(None, no_parser_needed=True)
 
@@ -914,9 +938,11 @@ def detect_auto_reasoning_parser(model: str) -> AutoReasoningParserResult:
 
     For Qwen3 models, inspects the chat template to distinguish hybrid,
     forced-thinking, and forced-non-thinking variants. Only the last one,
-    which requires a Qwen ChatML (``<|im_start|>``) generation prompt,
-    reports ``no_parser_needed``; every other None result is a detection
-    failure.
+    which requires a Qwen ChatML (``<|im_start|>``) generation prompt that
+    opens no ``<think>`` block and no reasoning written elsewhere in the
+    template (unless that prompt closes an empty ``<think></think>``
+    block), reports ``no_parser_needed``; every other None result is a
+    detection failure.
     """
     config_path = Path(model) / "config.json"
     if not config_path.exists():

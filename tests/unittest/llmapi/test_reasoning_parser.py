@@ -1139,6 +1139,15 @@ _PLAIN_HISTORY_TEMPLATE = (
     "{{- '<|im_start|>' + message.role + '\\n' + message.content"
     " + '<|im_end|>\\n' }}"
     "{%- endfor %}")
+# As in PrimeIntellect/Qwen3-1.7B: past turns without reasoning get an empty
+# block, which is not a prefill of the generation prompt.
+_REASONING_OR_EMPTY_HISTORY_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{{- '<|im_start|>' + message.role + '\\n' }}"
+    "{%- if message.reasoning_content %}"
+    "{{- '<think>' + message.reasoning_content + '</think>' }}"
+    "{%- else %}{{- '<think></think>' }}{%- endif %}"
+    "{{- message.content + '<|im_end|>\\n' }}{%- endfor %}")
 
 
 @pytest.mark.parametrize(("jinja", "expected"), [
@@ -1154,6 +1163,10 @@ _PLAIN_HISTORY_TEMPLATE = (
                  _REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
                  None,
                  id="default_set_before_history"),
+    pytest.param(
+        _REASONING_OR_EMPTY_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+        None,
+        id="reasoning_or_empty_block_in_history"),
     pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
                  "deepseek-r1",
                  id="history_and_prompt"),
@@ -1165,7 +1178,11 @@ _PLAIN_HISTORY_TEMPLATE = (
                  id="no_generation_prompt"),
 ])
 def test_detect_qwen3_think_in_generation_prompt(tmp_path, jinja, expected):
-    """Only a <think> in the generation prompt marks a forced-thinking model."""
+    """Only a <think> in the generation prompt marks a forced-thinking model.
+
+    A non-empty <think> written only outside the generation prompt cannot be
+    detected: thinking and instruct checkpoints ship such templates alike.
+    """
     model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
     _write_qwen3_checkpoint(model_dir,
                             "qwen3_moe",
@@ -1173,8 +1190,38 @@ def test_detect_qwen3_think_in_generation_prompt(tmp_path, jinja, expected):
                             tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
 
     assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
-        expected, no_parser_needed=expected is None)
+        expected)
     assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
+@pytest.mark.parametrize("jinja", [
+    pytest.param("{%- for message in messages %}"
+                 "{{- '<|im_start|>' + message.role + '\\n<think>\\n\\n"
+                 "</think>\\n\\n' + message.content + '<|im_end|>\\n' }}"
+                 "{%- endfor %}" + _FORCED_NON_THINKING_TEMPLATE,
+                 id="empty_block_in_history"),
+    pytest.param(_REASONING_HISTORY_TEMPLATE + "{%- if add_generation_prompt %}"
+                 "{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+                 "{%- endif %}",
+                 id="empty_prefill_after_history"),
+    pytest.param("{#- <think> is never written -#}" + _PLAIN_HISTORY_TEMPLATE +
+                 _FORCED_NON_THINKING_TEMPLATE,
+                 id="think_in_comment"),
+])
+def test_detect_qwen3_no_reasoning_outside_generation_prompt(tmp_path, jinja):
+    """Empty blocks and comments outside the prompt still need no parser.
+
+    So does reasoning in past turns when the generation prompt itself closes
+    an empty <think></think> block, as in t-tech/T-pro-it-2.1.
+    """
+    model_dir = str(tmp_path / "Qwen3-235B-A22B-Instruct-2507")
+    _write_qwen3_checkpoint(model_dir,
+                            "qwen3_moe",
+                            jinja=jinja,
+                            tokenizer_config=_TOKENIZER_CONFIG_WITHOUT_TEMPLATE)
+
+    assert detect_auto_reasoning_parser(model_dir) == AutoReasoningParserResult(
+        None, no_parser_needed=True)
 
 
 # DeepSeek-R1-0528-Qwen3-8B layout: a Qwen3 base with a DeepSeek chat template
