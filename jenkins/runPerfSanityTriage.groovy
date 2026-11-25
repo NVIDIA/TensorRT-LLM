@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['trtllm-jenkins-shared-lib@main']) _
+@Library(['trtllm-jenkins-shared-lib@user/tburt/ubuntu_mirror_script']) _
 
 DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.09-py3-x86_64-ubuntu24.04-skip-tritondevel-202610150933-20252"
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"

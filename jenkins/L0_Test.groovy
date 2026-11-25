@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/tburt/ubuntu_mirror_script']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -2078,6 +2078,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, s
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
+                trtllm_utils.setupUbuntuMirror()
                 runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
@@ -2601,6 +2602,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptUbuntuMirrorLocalPath = Utils.createTempLocation(pipeline, "./ubuntu_mirror.sh")
+            def scriptUbuntuMirrorPathNode = "${jobWorkspace}/ubuntu_mirror.sh"
             def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
             def scriptFatBuildPathNode = "${jobWorkspace}/${jobUID}-fat_build_inline.sh"
             // Fat builder sbatch wrapper: generated inline by Groovy (not a static file).
@@ -2669,6 +2672,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
+                pipeline.writeFile(file: scriptUbuntuMirrorLocalPath, text: trtllm_utils.setupUbuntuMirror(true))
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptUbuntuMirrorLocalPath,
+                    scriptUbuntuMirrorPathNode,
+                    true
+                )
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
@@ -3069,6 +3080,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Define environment variables to export
                 def envVarNames = [
+                    'PIP_INDEX_URL',
                     'OPEN_SEARCH_DB_BASE_URL',
                     'OPEN_SEARCH_DB_CREDENTIALS_USR',
                     'OPEN_SEARCH_DB_CREDENTIALS_PSW',
@@ -3143,6 +3155,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
+                    export TRTLLM_UBUNTU_MIRROR_SCRIPT="$scriptUbuntuMirrorPathNode"
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"

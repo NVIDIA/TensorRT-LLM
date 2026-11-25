@@ -21,7 +21,7 @@
 // it. Also prunes enroot layer cache files neither read nor modified within the
 // retention period.
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/tburt/ubuntu_mirror_script']) _
 
 import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.SlurmConfig

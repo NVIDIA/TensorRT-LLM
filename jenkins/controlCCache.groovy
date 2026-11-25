@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['trtllm-jenkins-shared-lib@main']) _
+@Library(['trtllm-jenkins-shared-lib@user/tburt/ubuntu_mirror_script']) _
 
 import java.lang.InterruptedException
 
