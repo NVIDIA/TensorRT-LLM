@@ -1092,6 +1092,97 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
 
     @skip_unserved_gpu
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.skipif(
+        get_sm_version() != 103, reason="the lean GDN verify forms serve dep4 / dep8 on SM103"
+    )
+    def test_dep4_gdn_lean_replay_matches_stock(self):
+        """Greedy tokens with the lean GDN verify forms and without, under decode-graph replay.
+
+        dep4 over an FP8 pool, three drafts unforced, decode graphs [1..16] with padding, the
+        overlap scheduler on, and the same 64 word problems through three engines: the lean conv,
+        the conv in the input projection and the norm in the replay at their defaults (twice), then
+        all three off. The op tests hold the lean conv and its promotion bitwise to the stock pair;
+        only an engine runs the promotion on the speculative worker's side, after replayed steps
+        with every accepted count. Every request's tokens must be identical across the three.
+
+        Arrival is pinned so the engines run the same steps: `max_batch_size` is the prompt count
+        and `batch_wait_timeout_ms` lets rank 0 take every prompt in its first fetch, so each rank
+        serves the same 16 requests. The answers' lengths differ, so a rank's request count walks
+        from 16 down to 1 across every row range of the three forms.
+        """
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        rng = random.Random(17)
+        items = ("apples", "books", "coins", "marbles", "stamps", "tickets", "pencils", "cards")
+        prompts, params = [], []
+        for i in range(64):
+            a, b, c, d = (
+                rng.randint(3, 40),
+                rng.randint(2, 30),
+                rng.randint(1, 99),
+                rng.randint(2, 9),
+            )
+            thing = items[i % len(items)]
+            question = (
+                f"A shop has {a} boxes of {b} {thing} each. It sells {c} {thing} and then "
+                f"receives {d} more boxes. How many {thing} does it have now?"
+            )
+            if i % 3 == 0:
+                question += " Explain every step in detail."
+            prompts.append(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": f"{question} {_WORD_PROBLEM_SUFFIX}"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            )
+            params.append(SamplingParams(max_tokens=40 + (i * 37) % 200, temperature=0))
+        engine = dict(
+            max_seq_len=4096,
+            max_batch_size=len(prompts),
+            max_num_tokens=8192,
+            enable_chunked_prefill=False,
+            kv_cache_config=KvCacheConfig(
+                dtype="fp8",
+                free_gpu_memory_fraction=0.6,
+                enable_block_reuse=False,
+                mamba_ssm_cache_dtype="bfloat16",
+            ),
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, batch_sizes=list(range(1, 17))),
+            moe_config=self.MOE,
+            disable_overlap_scheduler=False,
+            batch_wait_timeout_ms=2000,
+        )
+        base = dict(_VALIDATE, TRTLLM_QWEN4_EXP_DP_MOE_COMM="lamport_step")
+        off = {
+            f"TRTLLM_QWEN4_EXP_DP_GDN_{name}": "0"
+            for name in ("CONV_LEAN", "INPROJ_CONV_BF16", "REPLAY_NORM_BF16")
+        }
+
+        def run(extra):
+            with (
+                scoped_env_overrides({**base, **extra}) as rank_env,
+                LLM(
+                    self.MODEL_PATH,
+                    speculative_config=self.MTP3,
+                    **engine,
+                    **_DEP4,
+                    modeling_v2="require",
+                    env_overrides=rank_env,
+                ) as llm,
+            ):
+                outputs = llm.generate(prompts, params, use_tqdm=False)
+            return [list(output.outputs[0].token_ids) for output in outputs]
+
+        def differing(x, y):
+            return [i for i, (p, q) in enumerate(zip(x, y)) if p != q]
+
+        lean, again, stock = run({}), run({}), run(off)
+        assert not differing(lean, again), "the engine did not repeat itself"
+        assert not differing(lean, stock), "the lean GDN forms changed greedy tokens"
+
+    @skip_unserved_gpu
+    @pytest.mark.skip_less_device(4)
     def test_mtp3_mmmu(self):
         """MMMU at tep4 with three drafts, against the MTP row of references/mmmu.yaml.
 
