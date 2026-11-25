@@ -3,7 +3,7 @@
 
 # Developing MiniMax-H3 with Modeling V2
 
-**Write new H3 features and kernels in `visual_gen/modeling_v2/models/minimax_h3/`.** A *target* is the pipeline for a particular checkpoint or deployment. Base H3 and FastH3 are targets in the same family. During rollout, [V1](../../../models/minimax_h3/) remains the default and is available for fixes and comparisons. V1 and V2 use the same VisualGen API, CLI and checkpoint names. [LLM Modeling V2 guide](../../../../modeling_v2/README.md)
+**Write new H3 features and kernels only in V2.** H3 is retiring [V1](../../../models/minimax_h3/), which remains the default during rollout and is available for fixes and comparisons. A *target* is the pipeline for a particular checkpoint or deployment. Base H3 and FastH3 are targets in the same family under `visual_gen/modeling_v2/models/minimax_h3/`. V1 and V2 use the same VisualGen API, CLI and checkpoint names. [VisualGen migration policy](../../README.md#where-to-add-a-feature) · [LLM Modeling V2 guide](../../../../modeling_v2/README.md)
 
 ## Code layout
 
