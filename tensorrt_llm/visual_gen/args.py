@@ -1032,7 +1032,7 @@ class VisualGenArgs(StrictBaseModel):
         description="HuggingFace Hub revision (branch, tag, or commit SHA) to download.",
     )
 
-    quant_config: Union[LinearQuantConfig, QuantConfig, Dict[str, Any]] = Field(
+    quant_config: Union[QuantConfig, LinearQuantConfig, Dict[str, Any]] = Field(
         default_factory=QuantConfig,
         status="prototype",
         description=(

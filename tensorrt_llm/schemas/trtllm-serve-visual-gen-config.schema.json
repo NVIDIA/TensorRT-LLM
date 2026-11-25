@@ -1526,10 +1526,10 @@
     "quant_config": {
       "anyOf": [
         {
-          "$ref": "#/$defs/LinearQuantConfig"
+          "$ref": "#/$defs/QuantConfig"
         },
         {
-          "$ref": "#/$defs/QuantConfig"
+          "$ref": "#/$defs/LinearQuantConfig"
         },
         {
           "additionalProperties": true,
