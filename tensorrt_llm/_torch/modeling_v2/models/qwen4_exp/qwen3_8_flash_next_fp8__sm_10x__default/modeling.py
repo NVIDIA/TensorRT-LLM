@@ -178,6 +178,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_g
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
     qsa_sparse_gqa_splitk_cute,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
+    SpecStepMetadataPrologue,
+    take_step_positions,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
     qsa_topk_expand_cluster,
 )
@@ -309,10 +313,6 @@ from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
 from .ops.attention.qsa_paged_sparse_gqa import qsa_paged_sparse_gqa
 from .ops.attention.qsa_sparse_gqa_rowtile__prefill import qsa_sparse_gqa_rowtile
-from .ops.attention.qsa_spec_step_metadata__decode import (
-    SpecStepMetadataPrologue,
-    take_step_positions,
-)
 from .ops.attention.qsa_topk_rows_cute__prefill import qsa_topk_rows
 from .ops.attention.qsa_topk_rows_cute__prefill import supports as _topk_rows_supports
 from .ops.attention.qsa_triton_kernels__stable_jit import splitk_launch_config as _gqa_splitk_config

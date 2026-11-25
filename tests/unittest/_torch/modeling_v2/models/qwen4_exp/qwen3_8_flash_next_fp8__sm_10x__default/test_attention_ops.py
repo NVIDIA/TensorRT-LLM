@@ -33,6 +33,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_g
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
     qsa_sparse_gqa_splitk_cute as _sgc_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
+    qsa_spec_step_metadata,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
     qsa_topk_expand_cluster as _tkc_op,
 )
@@ -77,9 +80,6 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     rows_per_group,
-)
-from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
-    qsa_spec_step_metadata,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_fp8__sm_10x__default.ops.attention.qsa_topk_rows_cute__prefill import (  # noqa: E501
     qsa_topk_rows as _tkr_op,

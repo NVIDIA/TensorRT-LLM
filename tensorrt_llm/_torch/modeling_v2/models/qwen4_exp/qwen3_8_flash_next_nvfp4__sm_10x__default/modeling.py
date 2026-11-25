@@ -287,6 +287,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_g
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_gqa_splitk_cute__decode import (  # noqa: E501
     qsa_sparse_gqa_splitk_cute,
 )
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_spec_step_metadata__decode import (  # noqa: E501
+    SpecStepMetadataPrologue,
+    take_step_positions,
+)
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
     MAX_ROWS as _TOPK_CLUSTER_MAX_ROWS,
 )
@@ -8755,6 +8759,9 @@ class DecodeTarget:
         si_all = mm.state_indices[:batch]
         verify = _verify_state(core, mm, batch) if is_verify else None
         pools = core._bound.pools
+        # The corrected positions the engine's decode prologue wrote for this step
+        # (`SpecStepMetadataPrologue`), consumed here whichever branch reads them.
+        step_pos3 = take_step_positions(md, position_ids)
         # A captured verify step builds `pos3`, the PLE segmentation vector and the rollback's
         # staging in one launch (`verify_step_setup`).
         rollback = core.spec_rollback
@@ -8779,7 +8786,7 @@ class DecodeTarget:
                 )
             )
         else:
-            pos3 = _copy_positions(position_ids)
+            pos3 = step_pos3 if step_pos3 is not None else _copy_positions(position_ids)
             # Under speculation `query_start_loc_long` has one row per generation sequence:
             # with `gen_p > 1` the PLE segmentation is rebuilt from `seq_lens_cuda`.
             ple_qsl = (
@@ -9548,6 +9555,15 @@ class SpeculativeRollback:
 # -------------------------------------------------------------------- shell ---
 
 
+def _runtime_hooks() -> RuntimeHooks:
+    """The engine hooks of a speculative shell, as the FP8 target's: the spec loop on the
+    execution stream, and the decode prologue -- a generation-only verify step's position and
+    KV-length corrections and the QSA row mapping in one launch during input preparation
+    (`qsa_spec_step_metadata`), bitwise what it replaces; the decode forward reads the corrected
+    positions it leaves (`take_step_positions`)."""
+    return RuntimeHooks(loop_on_execution_stream=True, decode_prologue=SpecStepMetadataPrologue())
+
+
 class _WidenedHead:
     """`lm_head` whose bf16 logits come back as fp32 from `bf16_to_fp32` (one vectorized
     kernel; torch's `.float()` is an unvectorized copy at under half the bandwidth), so the
@@ -9963,7 +9979,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # default, the draft step would be handed a manager that maps no draft layer.
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
             self.spec_decode_fast_paths = True
-            self.runtime_hooks = RuntimeHooks(loop_on_execution_stream=True)
+            self.runtime_hooks = _runtime_hooks()
             # Under attention TP the TP group's key exchange, as the FP8 target builds it: the
             # worker then takes the target tokens of greedy and temperature-only batches, and
             # the greedy draft tokens, from this rank's vocabulary shard (argmax or Gumbel-max
