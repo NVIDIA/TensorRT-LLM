@@ -282,6 +282,7 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import layer_ids_of
     from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
@@ -339,6 +340,13 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         assert manager.get_draft_kv_cache_view() is manager
         assert manager.pp_layers == [0, 1]
         assert manager.draft_layer_ids == (2, 3, 4)
+        names = layer_ids_of(manager)
+        for layer in manager.draft_layer_ids:
+            assert names[manager.layer_offsets[layer]][1] == layer
+        for group, layers in enumerate(manager.impl.layer_grouping):
+            assert manager.get_disagg_global_layer_ids(group) == [
+                names[int(layer)][0] for layer in layers
+            ]
         requests = manager.add_dummy_requests(
             [42], token_nums=[512], draft_kv_cache_manager=manager
         )
@@ -362,8 +370,10 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
             )
 
         assert advertised_draft_buffers() == len(manager.draft_layer_ids)
+        assert str(Role.KEY) not in manager.page_table_spec().untransferred_roles
         manager.bounded_replay_on_generation = True
         assert advertised_draft_buffers() == 0
+        assert str(Role.KEY) in manager.page_table_spec().untransferred_roles
     finally:
         for request_id in list(manager.kv_cache_map):
             manager.free_resources(SimpleNamespace(py_request_id=request_id))

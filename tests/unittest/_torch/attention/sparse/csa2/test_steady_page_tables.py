@@ -596,6 +596,19 @@ def test_draft_conversion_keeps_holes_with_scratch_enabled():
         assert (
             out[scratch_table, 0, 1].item() == 23 * host[scratch_table, 1] + host[scratch_table, 2]
         )
+        _admit(manager, 2, 900)
+        manager.compute_batch_page_tables([1], 0)
+        table = manager.draft_page_table()
+        original = table[0].clone()
+        assert manager.compute_batch_page_tables([1], 0) is None
+        pages = manager.get_batch_cache_indices([2], manager.draft_layer_ids[0])[0]
+        assert len(pages) > manager.kv_cache_map[1].num_blocks
+        # A fallback batch shares the graph-stable table address with the next conversion.
+        with manager.overwrite_draft_page_table(1):
+            table[0, : len(pages)] = torch.tensor(pages, device=table.device, dtype=table.dtype)
+        assert not manager.draft_page_table_prepared([1])
+        assert manager.compute_batch_page_tables([1], 0) is not None
+        torch.testing.assert_close(table[0], original)
     finally:
         manager.shutdown()
 

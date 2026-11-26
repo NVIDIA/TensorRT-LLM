@@ -32,7 +32,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+    PageTableSpec,
+    Replicated,
+    virtual_layers,
+)
 from tensorrt_llm._utils import (
     CUASSERT,
     TensorWrapper,
@@ -825,15 +829,13 @@ class CSA2CacheManager(KVCacheManagerV2):
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
         """Stable virtual IDs for target cache roles and appended draft layers."""
-        kinds = max(kind.value for kind in _CSA2LayerKind) + 1
-        inverse = {}
-        for (model_layer, kind), local_layer in self._layer_attn_to_layer_id.items():
-            inverse.setdefault(int(local_layer), model_layer * kinds + kind.value)
-        inverse.update(
-            (local_layer, spec.global_layer_id * kinds)
-            for local_layer, spec in self._appended_draft_layer_specs.items()
-        )
-        return [inverse[int(layer)] for layer in self.impl.layer_grouping[layer_group_id]]
+        names, kinds = virtual_layers(self._layer_attn_to_layer_id)
+        return [
+            model_layer * kinds + kind
+            for model_layer, kind in (
+                names[int(layer)] for layer in self.impl.layer_grouping[layer_group_id]
+            )
+        ]
 
     def _get_runtime_cache_size_layer_components(self):
         sizes, windows, _ = self._runtime_cache_size_layer_components()
@@ -1021,6 +1023,9 @@ class CSA2CacheManager(KVCacheManagerV2):
                 raise ValueError(f"Duplicate draft layer {spec.global_layer_id}")
             self._appended_draft_layer_specs[local_id] = spec
             self.layer_offsets[spec.global_layer_id] = local_id
+            self._layer_attn_to_layer_id[spec.global_layer_id, _CSA2LayerKind.SWA] = LayerId(
+                local_id
+            )
             for values, value in (
                 (self.num_kv_heads_per_layer, spec.num_kv_heads),
                 (self.head_dim_per_layer, spec.head_dim),
@@ -1549,6 +1554,21 @@ class CSA2CacheManager(KVCacheManagerV2):
         batch = self._batch_caches
         return batch is not None and batch[0] == tuple(request_ids)
 
+    @contextmanager
+    def overwrite_draft_page_table(self, rows: int):
+        """Allow a fallback write at the address captured by generation graphs."""
+        # The next conversion must clear all columns the fallback could have written.
+        self._table_live[:rows] = self._draft_page_table.shape[1]
+        self._batch_conversion_inputs = None
+        self._batch_caches = None
+        self._swa_publication = None
+        stream = self._wait_for_page_table_conversion()
+        try:
+            yield
+        finally:
+            self._base_rows_read[self._base_rows_slot].record(stream)
+            self._page_tables_stream = stream
+
     def draft_page_table_state(self) -> object | None:
         """Opaque generation snapshot, retained while all conversion inputs match.
 
@@ -1940,6 +1960,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             spec,
             role_layouts={},
             default_layout=Replicated(),
+            untransferred_roles=spec.untransferred_roles | self.get_disagg_ignored_roles(),
             request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
             quant_mode="csa2_packed",
             retention_margins=True,

@@ -3,6 +3,7 @@
 """V4.1 retained draft pages and bounded context seed lifecycle."""
 
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -139,7 +140,10 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
     storage = torch.full((6, 8), BAD_PAGE_INDEX, dtype=torch.int32)
     worker = SimpleNamespace(
         _draft_kv_manager=SimpleNamespace(
-            kv_cache_map=caches, tokens_per_block=128, draft_page_table_prepared=lambda _: False
+            kv_cache_map=caches,
+            tokens_per_block=128,
+            draft_page_table_prepared=lambda _: False,
+            overwrite_draft_page_table=Mock(side_effect=lambda _: nullcontext()),
         ),
         _draft_reuse_policy=ReusePolicy.PRIVATE,
         _graph_dummy_id_floor=1 << 60,
@@ -192,9 +196,25 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
     assert worker._draft_block_tables[1, :2].tolist() == [7, 8]
     assert worker._batch_to_slot.tolist() == [1, 0, 2]
     assert worker._draft_capacities.tolist() == [384, 256, 0]
+    worker._draft_kv_manager.overwrite_draft_page_table.assert_called_with(3)
 
     caches[42].page_storage_version += 1
     tables[id(caches[42])] = (0, (7, 11))
+    original_copy = device_copy.copy
+
+    def fail_page_upload(site, *args, **kwargs):
+        if site is DSparkCopySite.PAGE_VALUES:
+            raise torch.OutOfMemoryError("draft page upload")
+        return original_copy(site, *args, **kwargs)
+
+    with (
+        monkeypatch.context() as patch,
+        pytest.raises(torch.OutOfMemoryError, match="draft page upload"),
+    ):
+        patch.setattr(device_copy, "copy", fail_page_upload)
+        DSv41DSparkWorker._prepare_page_tables(worker, [43, 42], 0)
+    assert worker._draft_block_tables[1, :2].tolist() == [7, 8]
+
     DSv41DSparkWorker._prepare_page_tables(worker, [43, 42], 0)
     assert worker._draft_block_tables[1, :2].tolist() == [7, 11]
 
@@ -255,31 +275,37 @@ def test_private_page_tables_follow_request_lifetime_and_batch_order(monkeypatch
 )
 def test_private_context_seed_rebuilds_final_window(chunks, captures):
     if captures[0] == 0:
-        from tensorrt_llm._torch.pyexecutor.scheduler.ctx_decoder_batch import (
-            ContextPassPlan,
-            CtxDecoderBatcher,
-        )
+        from tensorrt_llm._torch.pyexecutor.scheduler.ctx_decoder_batch import CtxDecoderBatcher
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
         scheduler = object.__new__(KVCacheV2Scheduler)
-        scheduler.max_num_tokens, scheduler.chunk_unit_size = 32, 1
+        scheduler.max_num_tokens, scheduler.chunk_unit_size = 180, 1
+        scheduler.max_num_requests = 1
+        scheduler._context_init_state_value = 0
+        scheduler._ctx_demote_uncached_tokens = 0
         scheduler._ctx_decoder_held = False
         scheduler._num_ctx_decoder_hold_passes = scheduler._num_ctx_decoder_held_requests = 0
-        scheduler.plan_context_pass = Mock(return_value=ContextPassPlan(140, 140, 180))
         executor = SimpleNamespace(
             model_engine=SimpleNamespace(replays_final_windows_only=lambda: True),
             dist=SimpleNamespace(tp_allgather_int64=lambda values: torch.tensor([values, values])),
         )
         batcher = CtxDecoderBatcher(executor, scheduler, 140)
-        request = SimpleNamespace(
+        context_fields = dict(
             is_context_only_request=True,
             is_dummy=False,
+            is_attention_dp_dummy=False,
+            is_first_context_chunk=True,
+            state_value=scheduler._context_init_state_value,
+            py_uncached_prefill_tokens=None,
             py_ctx_decoder_held=False,
             py_csa2_remote_tail_mode=None,
             context_current_position=0,
             prompt_len=180,
+            context_remaining_length=180,
         )
-        batcher.before_schedule([request], set())
+        request = SimpleNamespace(request_id=42, **context_fields)
+        backlog = SimpleNamespace(request_id=43, **context_fields)
+        batcher.before_schedule([request, backlog], set())
         assert scheduler._ctx_decoder_hold_window == 140
         first_chunk = scheduler._ctx_decoder_hold_chunk(request, 180)
         assert request.py_ctx_decoder_held and scheduler._ctx_decoder_held
@@ -292,43 +318,58 @@ def test_private_context_seed_rebuilds_final_window(chunks, captures):
         _draft_reuse_policy=ReusePolicy.PRIVATE,
         _draft_kv_manager=SimpleNamespace(enable_block_reuse=True),
         _win=128,
-        _req_to_slot={42: 0},
-        _scratch_slot=1,
-        _ctx_len=torch.zeros(2, dtype=torch.long),
-        _valid_len=torch.zeros(2, dtype=torch.long),
-        _batch_to_slot=torch.tensor([0]),
+        _req_to_slot={42: 0, 43: 1},
+        _scratch_slot=2,
+        _ctx_len=torch.zeros(3, dtype=torch.long),
+        _valid_len=torch.zeros(3, dtype=torch.long),
+        _batch_to_slot=torch.tensor([0, 1]),
         _draft_kv_buffers=(),
-        _draft_block_tables=torch.zeros((1, 2), dtype=torch.int32),
-        _draft_capacities=torch.tensor([256]),
+        _draft_block_tables=torch.tensor([[7, BAD_PAGE_INDEX], [19, 31]], dtype=torch.int32),
+        _draft_capacities=torch.tensor([256, 512]),
     )
     written = {}
 
-    def write(hidden, frames, mask, *args):
-        for frame, value in zip(frames[mask].tolist(), hidden[mask].flatten().tolist()):
-            written[frame - 1] = value
+    def write(hidden, frames, mask, _, tables, capacities):
+        for values, frame_row, live, table, capacity in zip(
+            hidden, frames, mask, tables, capacities
+        ):
+            for frame, value in zip(frame_row[live].tolist(), values[live, 0].tolist()):
+                token = frame - 1
+                assert 0 <= token < capacity
+                page, local_token = divmod(token, 256)
+                written[int(table[page]), local_token] = value
 
     draft = SimpleNamespace(write_context_pages=Mock(side_effect=write))
     offset = 0
-    for length, capture_len in zip(chunks, captures):
+    for chunk, (length, capture_len) in enumerate(zip(chunks, captures)):
         positions = torch.arange(offset, offset + length)
+        request_ids, lengths, capture_lens = [42], [length], [capture_len]
+        if chunk == len(chunks) - 1:
+            # The 80-token tail in the chunked case is sorted behind this peer.
+            positions = torch.cat((positions, torch.arange(256, 384)))
+            request_ids.append(43)
+            lengths.append(128)
+            capture_lens.append(128)
         metadata = SimpleNamespace(
-            context_capture_lens=(capture_len,),
-            request_ids=[42],
+            context_capture_lens=tuple(capture_lens),
+            request_ids=request_ids,
             get_hidden_states=lambda count: positions[:, None].float(),
         )
         DSv41DSparkWorker._seed_context_windows(
             worker,
             draft,
             metadata,
-            SimpleNamespace(num_contexts=1, _seq_lens=[length]),
+            SimpleNamespace(num_contexts=len(request_ids), _seq_lens=lengths),
             positions,
-            length,
+            positions.numel(),
         )
         offset += length
         if capture_len == 0:
             assert not written
             assert worker._ctx_len[0] == offset
             assert worker._valid_len[0] == 0
-    assert worker._ctx_len[0] == 180
-    assert worker._valid_len[0] == 128
-    assert [written[token] for token in range(52, 180)] == list(range(52, 180))
+    assert worker._ctx_len.tolist() == [180, 384, 0]
+    assert worker._valid_len.tolist() == [128, 128, 0]
+    assert [written[7, token] for token in range(52, 180)] == list(range(52, 180))
+    assert [written[31, token] for token in range(128)] == list(range(256, 384))
+    assert {page for page, _ in written} == {7, 31}

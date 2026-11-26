@@ -265,8 +265,8 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
         block=block,
         page_size=page_size,
         positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99],
-        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 1, 127, 32, 3, 128],
-        capacities=[512] * 14 + [0],
+        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 2, 127, 32, 3, 128],
+        capacities=[512] * 10 + [128] + [512] * 3 + [0],
     )
     original_cache = inputs["kv_pages"].clone()
     expected = _reference(**inputs)
@@ -514,17 +514,43 @@ def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
         expected_main = _norm_rope(main, weight, main_freqs)
         expected_cache[slots, start % 128] = expected_main[:, 0]
         expected_block = _norm_rope(block, weight, block_freqs)
+        main_rope = torch.view_as_real(main_freqs).view(batch, 32, 2)
+        block_rope = inputs["inverse_rope_freqs"].view(-1, 32, 2)
+        if batch == 1:
+            supports = preparation_op.is_fused_dspark_attention_preparation_supported
+            tail = (block_rope, inputs["kv_pages"], slots, start)
+            assert supports(
+                main,
+                block,
+                weight,
+                main_rope,
+                *tail,
+                block_tables=inputs["block_tables"],
+                capacities=inputs["capacities"],
+            )
+            assert not supports(
+                main, block, weight, main_rope, *tail, block_tables=inputs["block_tables"]
+            )
+            assert not supports(
+                main,
+                block,
+                weight,
+                F.pad(main_rope, (0, 0, 0, 1)),
+                *tail,
+                block_tables=inputs["block_tables"],
+                capacities=inputs["capacities"],
+            )
         actual_slots, cache_seqs = preparation_op.cute_dsl_dspark_rmsnorm_rope_cache_write(
             main,
             weight,
-            torch.view_as_real(main_freqs).view(batch, 32, 2),
+            main_rope,
             cache,
             slots,
             start,
             1e-6,
         )
         draft = preparation_op.cute_dsl_dspark_rmsnorm_rope_draft_block(
-            block, weight, inputs["inverse_rope_freqs"].view(-1, 32, 2), 1e-6
+            block, weight, block_rope, 1e-6
         )
         torch.testing.assert_close(cache, expected_cache, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(actual_slots, slots.to(torch.int32), rtol=0, atol=0)
@@ -553,22 +579,33 @@ def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
                 page_size=128,
                 capacities=[512] * (batch - 1) + [0] if batch > 1 else [512],
             )
-            kv = torch.randn(batch, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
+            width = min(batch, 2)
+            positions = inputs["positions"][:, None] + torch.arange(width, device="cuda")
+            mask = (inputs["capacities"] > 0)[:, None].expand_as(positions).clone()
+            if width == 2:
+                mask[0, 1] = False
+            kv = torch.randn(batch, width, 3, 512, device="cuda", dtype=torch.bfloat16)
             norms = torch.randn(3, 512, device="cuda", dtype=kv.dtype)
             freqs_table = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
-            freqs = freqs_table[inputs["positions"][:, None]]
+            freqs = freqs_table[positions]
             normalized = _norm_rope(kv, norms, freqs)
             pools = [inputs["kv_pages"].clone() for _ in range(3)]
-            expected = [
-                _write_reference(pool, normalized[:, :, stage], inputs)
-                for stage, pool in enumerate(pools)
-            ]
+            expected = list(pools)
+            for frame in range(width):
+                frame_inputs = inputs | {
+                    "positions": positions[:, frame],
+                    "capacities": inputs["capacities"].masked_fill(~mask[:, frame], 0),
+                }
+                expected = [
+                    _write_reference(pool, normalized[:, frame : frame + 1, stage], frame_inputs)
+                    for stage, pool in enumerate(expected)
+                ]
         preparation_op.cute_dsl_dspark_paged_backfill(
             kv.flatten(2),
             norms,
             torch.view_as_real(freqs_table),
-            inputs["capacities"][:, None] > 0,
-            inputs["positions"][:, None],
+            mask,
+            positions,
             inputs["block_tables"].contiguous(),
             inputs["capacities"],
             pools,

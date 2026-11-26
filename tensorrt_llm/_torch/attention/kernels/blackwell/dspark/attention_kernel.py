@@ -940,6 +940,7 @@ class DSparkAttentionKernel:
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
+                window_end_pos = self.get_window_end_pos(cache_seqs, blk_coord[2])
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     smem_exchange=softmax_smem_exchange,
@@ -948,7 +949,8 @@ class DSparkAttentionKernel:
                     window_valid_len=self.get_window_valid_len(
                         window_valid_lens, capacities, cache_seqs, blk_coord[2]
                     ),
-                    window_end_pos=self.get_window_end_pos(cache_seqs, blk_coord[2]),
+                    window_end_pos=window_end_pos,
+                    window_min_age=max(0, window_end_pos - cutlass.Int32(capacities[blk_coord[2]])),
                     L=mCL_draft.shape[1],
                     tmem_ptr=tmem_ptr,
                     tidx=tidx,
@@ -1065,6 +1067,7 @@ class DSparkAttentionKernel:
         total_seq_len: cutlass.Int32,
         window_valid_len: cutlass.Int32,
         window_end_pos: cutlass.Int32,
+        window_min_age: cutlass.Int32,
     ) -> cutlass.Boolean:
         """Return the stream-aware softmax mask for a score column."""
         valid = cute.elem_less(
@@ -1075,7 +1078,7 @@ class DSparkAttentionKernel:
             age = (window_end_pos - 1 - local_col + cutlass.Int32(self.window_len)) % cutlass.Int32(
                 self.window_len
             )
-            valid = valid and (k_index != 0 or cute.elem_less(age, window_valid_len))
+            valid = valid and (k_index != 0 or (window_min_age <= age and age < window_valid_len))
         return valid
 
     @cute.jit
@@ -2128,6 +2131,7 @@ class DSparkAttentionKernel:
                             common_params.K,
                             common_params.window_valid_len,
                             common_params.window_end_pos,
+                            common_params.window_min_age,
                         )
                         else -self.acc_dtype.inf
                     )
@@ -2171,6 +2175,7 @@ class DSparkAttentionKernel:
                             common_params.K,
                             common_params.window_valid_len,
                             common_params.window_end_pos,
+                            common_params.window_min_age,
                         )
                         else -self.acc_dtype.inf
                     )

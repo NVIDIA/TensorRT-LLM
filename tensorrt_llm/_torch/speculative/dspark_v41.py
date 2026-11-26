@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Embedded DSpark over the CSA2 manager's explicit draft layers."""
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 
@@ -253,6 +255,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._chunking_ids.update(context_chunking_ids & real_ids)
         slots = [self._scratch_slot] * len(request_ids)
         updates = []
+        page_records = []
         capacities = [0] * self._draft_capacities.shape[0]
         # Unmapped native pages are BAD_PAGE_INDEX. The published table's fixed
         # width bounds addressing; zero capacities keep synthetic rows masked.
@@ -268,6 +271,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 capacities[row] = native_capacity
             else:
                 previous = self._draft_page_versions.get(slot)
+                page_indices = self._draft_page_indices.get(slot)
                 page_version = cache.page_storage_version
                 # A page-sized window moves only at a history-block boundary,
                 # which the native storage version tracks alongside page changes.
@@ -283,8 +287,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                     first = max(0, cache.history_length - self._win) // manager.tokens_per_block
                     version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
                 if previous != version:
+                    old_indices = page_indices
                     page_indices = self._page_indices(cache, row < num_contexts)
-                    old_indices = self._draft_page_indices.get(slot)
                     if old_indices != page_indices:
                         first, indices = page_indices
                         if old_indices is not None:
@@ -312,9 +316,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                                     )
                                 )
                         updates.append((slot, row, first, indices))
-                        self._draft_page_indices[slot] = page_indices
-                    self._draft_page_versions[slot] = version
-                first, indices = self._draft_page_indices[slot]
+                    page_records.append((slot, version, page_indices))
+                first, indices = page_indices
                 capacities[row] = (first + len(indices)) * manager.tokens_per_block
             if self._managed_residency.get(rid) is not cache:
                 if managed:
@@ -343,7 +346,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._capacity_upload.update(self._host_capacities)
         if managed:
             self._table_slots = None
-        gather_table = not managed and self._table_slots != slot_values
+        gather_table = not managed and (native or self._table_slots != slot_values)
         direct = private and not native and self._table_slots == slot_values
         count = sum(len(indices) for _, _, _, indices in updates) * (2 if direct else 1)
         if count:
@@ -373,23 +376,30 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                     values[offset:end] = indices
                     offset = end
             if self._draft_updates_device is None or self._draft_updates_device.numel() < count:
-                self._draft_updates_device = torch.empty(
-                    count, dtype=torch.int32, device=self._ctx_len.device
-                )
-                self._draft_indices_device = torch.empty(
-                    count, dtype=torch.long, device=self._ctx_len.device
+                self._draft_updates_device, self._draft_indices_device = (
+                    torch.empty(count, dtype=torch.int32, device=self._ctx_len.device),
+                    torch.empty(count, dtype=torch.long, device=self._ctx_len.device),
                 )
             indices_device = self._draft_indices_device[:count]
             values_device = self._draft_updates_device[:count]
-            device_copy.copy(DSparkCopySite.PAGE_INDICES, indices_device, host["indices"][:count])
-            device_copy.copy(DSparkCopySite.PAGE_VALUES, values_device, host["values"][:count])
-            self._draft_table_storage.view(-1).index_copy_(0, indices_device, values_device)
-            host["event"].record()
+            try:
+                device_copy.copy(
+                    DSparkCopySite.PAGE_INDICES, indices_device, host["indices"][:count]
+                )
+                device_copy.copy(DSparkCopySite.PAGE_VALUES, values_device, host["values"][:count])
+                self._draft_table_storage.view(-1).index_copy_(0, indices_device, values_device)
+            finally:
+                host["event"].record()
+        # These records describe the per-slot storage, even if the batch gather fails.
+        for slot, version, page_indices in page_records:
+            self._draft_page_versions[slot] = version
+            self._draft_page_indices[slot] = page_indices
         if not managed and not direct and (updates or gather_table):
-            torch.index_select(
-                self._draft_slot_block_tables, 0, self._batch_to_slot, out=self._draft_block_tables
-            )
-            self._table_slots = slot_values
+            self._table_slots = None
+            with manager.overwrite_draft_page_table(table.shape[0]) if native else nullcontext():
+                torch.index_select(self._draft_slot_block_tables, 0, self._batch_to_slot, out=table)
+            if not native:
+                self._table_slots = slot_values
         self._draft_prepared_batch = batch_snapshot
 
     def _seed_context_windows(
