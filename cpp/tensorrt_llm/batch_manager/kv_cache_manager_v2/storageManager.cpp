@@ -547,9 +547,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_CHECK_WITH_INFO(maxColdPageBytes <= std::numeric_limits<size_t>::max() / kPageStagingDepth,
             "Cold-page staging size overflow");
         pageStagingBytes = std::max(config.pageStagingBytes, kPageStagingDepth * maxColdPageBytes);
-        if (config.pageStagingBytes != StorageConfig::kDefaultPageStagingBytes)
+        mPageStagingDepth = std::max<size_t>(config.pageStagingDepth, 1);
+        if (config.pageStagingBytes != StorageConfig::kDefaultPageStagingBytes || mPageStagingDepth != 1)
         {
-            TLLM_LOG_INFO("[kvCacheManagerV2] page staging ring %zu MiB", pageStagingBytes >> 20u);
+            TLLM_LOG_INFO("[kvCacheManagerV2] page staging ring %zu MiB, %zu stretches in flight per disk move",
+                pageStagingBytes >> 20u, mPageStagingDepth);
         }
     }
 
@@ -1215,19 +1217,28 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     }
 
     TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
+    submitStagedDiskMigration(
+        srcIsHot, batchingLayerGroupId, srcPoolGroup, dstPoolGroup, coldPageBytes, pageIndices, numPages, stream);
+}
+
+void StorageManager::submitStagedDiskMigration(bool srcIsHot, LayerGroupId batchingLayerGroupId,
+    PoolGroupBase& srcPoolGroup, PoolGroupBase& dstPoolGroup, size_t coldPageBytes, PageIndexPair const* pageIndices,
+    size_t numPages, CUstream stream)
+{
     thread_local std::vector<PageIndexPair> stagingPageIndices;
-    size_t remaining = numPages;
-    size_t offset = 0;
-    while (remaining > 0)
+    // One stretch of the ring: up to `maxPages` pages from `offset`, as many as the ring hands out, copied through it
+    // on `chunkStream`. Returns the pages it took.
+    auto stageChunk = [&](size_t offset, size_t maxPages, CUstream chunkStream) -> size_t
     {
-        size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
+        size_t const maxStagingBytes = maxPages > std::numeric_limits<size_t>::max() / coldPageBytes
             ? std::numeric_limits<size_t>::max()
-            : coldPageBytes * remaining;
+            : coldPageBytes * maxPages;
         // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
         // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
         // this is a floor rather than a computed requirement.
-        auto const staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
-        size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+        auto const staging
+            = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, chunkStream);
+        size_t const batchSize = std::min(maxPages, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 
         if (srcIsHot)
@@ -1236,8 +1247,8 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
             {
                 stagingPageIndices[index] = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
             }
-            TLLM_CHECK_WITH_INFO(
-                encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(), batchSize, stream),
+            TLLM_CHECK_WITH_INFO(encodeColdPages(batchingLayerGroupId, reinterpret_cast<void*>(staging.address()),
+                                     stagingPageIndices.data(), batchSize, chunkStream),
                 "Cold-page codec rejected a migration batch");
 
             std::vector<CopyTask> tasks;
@@ -1247,7 +1258,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(PoolIndex{0}),
                     Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes}});
             }
-            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::DISK, CacheTier::HOST_MEM, coldPageBytes, tasks, chunkStream);
         }
         else
         {
@@ -1258,20 +1269,67 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({Address{std::in_place_type<MemAddress>, staging.address() + index * coldPageBytes},
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(PoolIndex{0})});
             }
-            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, stream);
+            mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::DISK, coldPageBytes, tasks, chunkStream);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 stagingPageIndices[index] = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
             }
-            TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
-                                     stagingPageIndices.data(), batchSize, stream),
+            TLLM_CHECK_WITH_INFO(decodeColdPages(batchingLayerGroupId, reinterpret_cast<void const*>(staging.address()),
+                                     stagingPageIndices.data(), batchSize, chunkStream),
                 "Cold-page codec rejected a migration batch");
         }
+        return batchSize;
+    };
 
-        offset += batchSize;
-        remaining -= batchSize;
+    // Stretches in flight: at most the depth, the pages of the move, and the cold pages the ring holds.
+    size_t const ringPages = mPageStagingManager->totalSize() / coldPageBytes;
+    size_t const lanes = std::min({mPageStagingDepth, numPages, ringPages});
+    if (lanes <= 1)
+    {
+        // One stretch after another on `stream`, each as large as the ring hands out.
+        size_t offset = 0;
+        while (offset < numPages)
+        {
+            offset += stageChunk(offset, numPages - offset, stream);
+        }
+        trimRetainedPageIndices(stagingPageIndices);
+        return;
     }
 
+    // Bounded parallel form. Every stretch is at most 1/lanes of the ring, so `lanes` of them fit side by side and
+    // the ring stays open to other moves; stretch i runs on lane i % lanes. Issued round-robin, each lease reuses the
+    // part of the ring that the lane's previous stretch (or an older move) used, so a lane waits only for that
+    // stretch and the lanes' disk reads and writes overlap on the async disk I/O pool. Every lane starts after
+    // `stream` (which already waits for the move's source pages and destination slots) and `stream` waits for every
+    // lane before returning, so the caller's finish event covers the whole move -- also when a stretch throws.
+    size_t const lanePages = ringPages / lanes;
+    CachedCudaEvent const forkEvent(reinterpret_cast<CudaStream>(stream));
+    std::vector<std::unique_ptr<TemporaryCudaStream>> laneStreams;
+    laneStreams.reserve(lanes);
+    auto join = FuncGuard(
+        [&]()
+        {
+            std::vector<CUevent> laneEnds;
+            std::vector<CachedCudaEvent> laneEvents;
+            laneEvents.reserve(laneStreams.size());
+            for (auto const& lane : laneStreams)
+            {
+                laneEvents.emplace_back(reinterpret_cast<CudaStream>(lane->get()));
+                laneEnds.push_back(laneEvents.back().handle());
+            }
+            streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(laneEnds));
+        });
+    for (size_t lane = 0; lane < lanes; ++lane)
+    {
+        laneStreams.push_back(std::make_unique<TemporaryCudaStream>(std::vector<CUevent>{forkEvent.handle()}));
+    }
+    size_t offset = 0;
+    for (size_t chunk = 0; offset < numPages; ++chunk)
+    {
+        offset += stageChunk(offset, std::min(lanePages, numPages - offset), laneStreams[chunk % lanes]->get());
+        ++mPageStagingLaneChunks;
+    }
+    join.run();
     trimRetainedPageIndices(stagingPageIndices);
 }
 
@@ -1521,7 +1579,7 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 
 StorageManager::PageStagingInfo StorageManager::pageStagingInfo() const noexcept
 {
-    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0};
+    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0, mPageStagingDepth, mPageStagingLaneChunks};
 }
 
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept

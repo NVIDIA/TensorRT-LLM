@@ -6675,6 +6675,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "earlier move that used the same stretch, so a burst of restores from disk larger than the buffer runs "
         "one buffer-full at a time. The buffer is never smaller than three of the largest cold blocks. Per KV "
         "cache manager. Only used by KV cache manager v2.")
+    page_staging_depth: PositiveInt = Field(
+        default=1,
+        le=16,
+        status="prototype",
+        description=
+        "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU "
+        "and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer "
+        "allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA "
+        "streams, so up to N of its disk reads or writes run at once and other moves still find room in the "
+        "buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2."
+    )
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -7298,6 +7309,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 ("disk_write_behind_mib", self.disk_write_behind_mib > 0),
                 ("host_cache_free_reserve_fraction",
                  self.host_cache_free_reserve_fraction > 0.0),
+                ("page_staging_depth", self.page_staging_depth > 1),
             ) if value
         ]
         if disk_options:

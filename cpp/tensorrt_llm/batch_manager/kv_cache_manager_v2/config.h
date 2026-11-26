@@ -807,6 +807,16 @@ struct KVCacheManagerConfig
     //! one ring-full at a time. The ring is never smaller than three of the largest cold pages. Per manager.
     int pageStagingMiB = kDefaultPageStagingMiB;
 
+    //! Upper bound of pageStagingDepth, matching KvCacheConfig.page_staging_depth.
+    static constexpr int kMaxPageStagingDepth = 16;
+
+    //! Stretches of the page staging ring, 1 to kMaxPageStagingDepth, that one page move between GPU and the disk tier
+    //! keeps in flight. 1 (default): the move takes as much of the ring as it needs and copies one stretch after
+    //! another on its own stream. N > 1: the move is cut into stretches of at most 1/N of the ring, issued round-robin
+    //! on N streams that start after the move's stream and that it waits for at the end, so up to N disk reads of one
+    //! move run at once and other moves find room in the ring. Per manager.
+    int pageStagingDepth = 1;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

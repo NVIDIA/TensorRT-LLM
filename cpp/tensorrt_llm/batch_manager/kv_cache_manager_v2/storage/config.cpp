@@ -234,6 +234,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     out.hostSparsePoolQuota = config.hostSparsePoolQuota;
     out.hostMemBacking = config.hostMemBacking;
     out.pageStagingBytes = static_cast<size_t>(config.pageStagingMiB) << 20u; // validate() bounds it
+    out.pageStagingDepth = static_cast<size_t>(config.pageStagingDepth);
     out.expansion = expansionMap;
 
     for (auto& [key, variants] : poolGroups)

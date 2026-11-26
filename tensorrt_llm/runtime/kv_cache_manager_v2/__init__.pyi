@@ -617,6 +617,8 @@ class KVCacheManagerConfig:
     # Size in MiB, 1 to 65536, of the pinned ring page moves between GPU and disk (or a remote level) pass
     # through; at least three of the largest cold pages. Per manager.
     page_staging_mib: int = 64
+    # Ring stretches, 1 to 16, one page move between GPU and disk keeps in flight on its own streams. Per manager.
+    page_staging_depth: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

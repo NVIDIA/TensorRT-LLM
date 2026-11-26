@@ -5283,6 +5283,7 @@ class KVCacheManagerV2(BaseResourceManager):
             host_copy_threads=kv_cache_config.host_copy_threads,
             copy_stream_busy_skip=kv_cache_config.copy_stream_busy_skip,
             page_staging_mib=kv_cache_config.page_staging_mib,
+            page_staging_depth=kv_cache_config.page_staging_depth,
         )
 
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:

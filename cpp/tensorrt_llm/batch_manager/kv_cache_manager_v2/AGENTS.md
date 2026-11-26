@@ -503,6 +503,14 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   `acquire` hands a move as much of the ring as it asks for, and a later move
   waits for the earlier move that used the same stretch, so a burst of disk
   restores larger than the ring runs one ring-full at a time.
+- Page staging depth (`page_staging_depth` -> `pageStagingDepth`, per manager,
+  default 1 = one stretch after another on the move's stream):
+  `submitStagedDiskMigration` cuts a GPU <-> disk move into stretches of at most
+  1/depth of the ring and issues them round-robin on `depth` pooled streams that
+  wait for the move's stream first; the move's stream waits for all of them
+  before returning (also on unwinding), so the caller's finish event still covers
+  the whole move. Their disk reads and writes overlap on the async disk I/O pool.
+  Remote moves keep their own loop.
 
 ### Remote cache levels
 

@@ -323,7 +323,8 @@ def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, li
 
 
 def page_staging(manager: Any) -> dict[str, int]:
-    """The page staging ring of the storage manager: ``bytes`` (0 without one)."""
+    """The page staging ring of the storage manager: ``bytes`` (0 without one), ``depth`` (stretches one disk move
+    keeps in flight) and ``lane_chunks`` (stretches issued on a move's extra streams so far)."""
     return dict(_cpp().page_staging(manager))
 
 

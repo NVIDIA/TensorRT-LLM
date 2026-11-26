@@ -12446,14 +12446,15 @@ class TestKVCacheManagerConfigReplace(unittest.TestCase):
 
 
 class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
-    """The disk-option tests again through a 1 MiB page staging ring.
+    """The disk-option tests again through a 1 MiB page staging ring with four stretches in flight per move.
 
     The ring is never smaller than three of the largest cold pages, so at 1 MiB it holds only a few, and every move
-    between GPU and disk takes ring-full after ring-full on its stream. The option is per manager. The restores still
-    pass refcheck.
+    between GPU and disk takes many stretches of it. With page_staging_depth 4 each move cuts them to a quarter of the
+    ring and issues them round-robin on four streams of its own, which the move's stream waits for. Both options are per
+    manager. The restores still pass refcheck.
     """
 
-    manager_options = {"page_staging_mib": 1}
+    manager_options = {"page_staging_mib": 1, "page_staging_depth": 4}
 
     def setUp(self) -> None:
         # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
@@ -12466,10 +12467,10 @@ class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
             self.skipTest("inherited test does not reach the disk tier")
         TestNoBatching.setUp(self)
 
-    def _restore_prefix_from_disk(self) -> None:
+    def _restore_prefix_from_disk(self) -> tuple[int, int]:
         # Push the first request's prefix down to disk, then restore it; refcheck verifies the restored KV. Only a
         # restore from disk keeps a copy (keep_copy_after_restore), so copies created by the restore show it read
-        # disk.
+        # disk. Returns the lane stretches issued before and after the restore.
         self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
         self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
         seq_len = 32 * 22
@@ -12478,6 +12479,7 @@ class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
         self._run_and_close(first)
         for _ in range(7):
             self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        before = _introspection.page_staging(self.manager)["lane_chunks"]
         filled = _introspection.disk_copy_counters(self.manager)
         prompt = first.kv_cache.committed_tokens[: seq_len // 2]
         reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
@@ -12486,22 +12488,46 @@ class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
         restored = _introspection.disk_copy_counters(self.manager)
         self.assertGreater(restored["created"], filled["created"])
         self._assert_copies_balance(restored)
+        after = _introspection.page_staging(self.manager)["lane_chunks"]
         self.manager.clear_reusable_blocks()
+        return before, after
 
     def test_default_options_build_the_64_mib_ring(self) -> None:
-        # Without the option a manager builds the ring KV cache manager v2 always had.
+        # Without the options a manager builds the ring KV cache manager v2 always had.
         self.manager_options = {}
         self.disk_tier_options = {"num_io_threads": 4}
         self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
-        self.assertEqual(self.cfg.page_staging_mib, 64)
-        self.assertEqual(_introspection.page_staging(self.manager)["bytes"], 64 << 20)
-
-    def test_disk_moves_run_through_a_small_ring(self) -> None:
-        self._restore_prefix_from_disk()
-        self.assertEqual(self.cfg.page_staging_mib, 1)
+        self.assertEqual((self.cfg.page_staging_mib, self.cfg.page_staging_depth), (64, 1))
         staging = _introspection.page_staging(self.manager)
+        self.assertEqual(
+            (staging["bytes"], staging["depth"], staging["lane_chunks"]), (64 << 20, 1, 0)
+        )
+
+    def test_disk_moves_run_in_ring_stretches_on_extra_streams(self) -> None:
+        before, after = self._restore_prefix_from_disk()
+        self.assertEqual((self.cfg.page_staging_mib, self.cfg.page_staging_depth), (1, 4))
+        staging = _introspection.page_staging(self.manager)
+        self.assertEqual(staging["depth"], 4)
         self.assertGreaterEqual(staging["bytes"], 1 << 20)
         self.assertLess(staging["bytes"], 64 << 20)  # not the default ring
+        # The disk -> GPU restore ran in stretches on the move's extra streams.
+        self.assertGreater(after, before)
+
+
+class TestNoBatchingDiskSmallStagingRing(TestNoBatchingDiskPageStaging):
+    """The same through a 1 MiB ring with the default depth.
+
+    Every move takes ring-full after ring-full on its own stream, as with the default ring, only more of them.
+    """
+
+    manager_options = {"page_staging_mib": 1}
+
+    def test_disk_moves_stay_on_the_move_stream(self) -> None:
+        before, after = self._restore_prefix_from_disk()
+        staging = _introspection.page_staging(self.manager)
+        self.assertEqual(staging["depth"], 1)
+        self.assertLess(staging["bytes"], 64 << 20)
+        self.assertEqual((before, after), (0, 0))
 
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):

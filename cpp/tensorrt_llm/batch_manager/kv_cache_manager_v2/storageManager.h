@@ -441,10 +441,13 @@ public:
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
 
-    //! The page staging ring as built (KVCacheManagerConfig::pageStagingMiB).
+    //! The page staging ring as built (KVCacheManagerConfig::pageStagingMiB / pageStagingDepth), and how many ring
+    //! stretches page moves between GPU and disk have issued on extra streams (pageStagingDepth > 1).
     struct PageStagingInfo
     {
-        size_t bytes{0}; //!< Ring size; 0 when no level needs one.
+        size_t bytes{0};        //!< Ring size; 0 when no level needs one.
+        size_t depth{1};        //!< Stretches one move keeps in flight.
+        uint64_t laneChunks{0}; //!< Stretches issued on a move's extra streams so far.
     };
 
     [[nodiscard]] PageStagingInfo pageStagingInfo() const noexcept;
@@ -586,6 +589,12 @@ private:
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+    //! The disk half of submitMigrationBatch: the pages pass through the page staging ring, one stretch at a time on
+    //! `stream`, or with mPageStagingDepth > 1 in stretches of at most 1/depth of the ring, round-robin on that many
+    //! extra streams that start after `stream` and that `stream` waits for before returning.
+    void submitStagedDiskMigration(bool srcIsHot, LayerGroupId batchingLayerGroupId, PoolGroupBase& srcPoolGroup,
+        PoolGroupBase& dstPoolGroup, size_t coldPageBytes, PageIndexPair const* pageIndices, size_t numPages,
+        CUstream stream);
 
     //! The level's storage when it is a remote level (storage/remoteMem.h), else null.
     [[nodiscard]] RemoteCacheLevelStorage* remoteLevel(CacheLevel level) const;
@@ -715,6 +724,9 @@ private:
 
     // The page staging ring holds at least this many of the largest cold pages, whatever its configured size.
     static constexpr size_t kPageStagingDepth = 3;
+    // Ring stretches one page move between GPU and disk keeps in flight (StorageConfig::pageStagingDepth).
+    size_t mPageStagingDepth = 1;
+    uint64_t mPageStagingLaneChunks = 0;
     static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.

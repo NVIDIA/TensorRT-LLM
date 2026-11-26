@@ -3102,9 +3102,10 @@ def test_KvCacheConfig_host_cache_free_reserve(tmp_path):
 
 
 @pytest.mark.cpu_only
-def test_KvCacheConfig_page_staging_mib():
-    # The default is the ring KV cache manager v2 always had: 64 MiB.
+def test_KvCacheConfig_page_staging(tmp_path):
+    # The defaults are the ring KV cache manager v2 always had: 64 MiB, one stretch in flight per move.
     assert KvCacheConfig().page_staging_mib == 64
+    assert KvCacheConfig().page_staging_depth == 1
     # The ring also serves remote cache levels, so its size needs no disk cache.
     assert KvCacheConfig(page_staging_mib=1024).page_staging_mib == 1024
     KvCacheConfig(page_staging_mib=65536)
@@ -3115,13 +3116,29 @@ def test_KvCacheConfig_page_staging_mib():
             ValidationError,
             match="page_staging_mib requires use_kv_cache_manager_v2"):
         KvCacheConfig(page_staging_mib=1024, use_kv_cache_manager_v2=False)
+    # The depth acts only on moves between GPU and disk.
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    assert KvCacheConfig(**disk, page_staging_depth=4).page_staging_depth == 4
+    KvCacheConfig(**disk, page_staging_depth=16)
+    for depth in (0, 17):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, page_staging_depth=depth)
+    with pytest.raises(ValidationError,
+                       match="page_staging_depth requires disk_cache_size"):
+        KvCacheConfig(page_staging_depth=4)
 
-    assert _kvcm2_manager_config().page_staging_mib == 64
-    assert _kvcm2_manager_config(page_staging_mib=1024).page_staging_mib == 1024
+    config = _kvcm2_manager_config()
+    assert (config.page_staging_mib, config.page_staging_depth) == (64, 1)
+    config = _kvcm2_manager_config(page_staging_mib=1024, page_staging_depth=4)
+    assert (config.page_staging_mib, config.page_staging_depth) == (1024, 4)
     for value in (0, 65537):
         with pytest.raises(ValueError,
                            match="pageStagingMiB must be between 1 and 65536"):
             _kvcm2_manager_config(page_staging_mib=value)
+    for value in (0, 17):
+        with pytest.raises(ValueError,
+                           match="pageStagingDepth must be between 1 and 16"):
+            _kvcm2_manager_config(page_staging_depth=value)
 
 
 @pytest.mark.cpu_only

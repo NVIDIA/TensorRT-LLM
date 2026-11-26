@@ -353,6 +353,11 @@ void KVCacheManagerConfig::validate() const
         throw std::invalid_argument(
             "KVCacheManagerConfig: pageStagingMiB must be between 1 and " + std::to_string(kMaxPageStagingMiB));
     }
+    if (pageStagingDepth < 1 || pageStagingDepth > kMaxPageStagingDepth)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: pageStagingDepth must be between 1 and " + std::to_string(kMaxPageStagingDepth));
+    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.
