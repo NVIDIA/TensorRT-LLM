@@ -22,7 +22,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-
 def cosmos3_nano_checkpoint(root=None) -> str:
     """Resolve the Nano checkpoint under LLM_MODELS_ROOT.
 
