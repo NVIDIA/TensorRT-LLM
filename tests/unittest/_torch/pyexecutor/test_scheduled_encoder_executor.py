@@ -10,6 +10,7 @@ delivery are real.
 """
 
 import gc
+import json
 import re
 import threading
 import time
@@ -743,7 +744,15 @@ def test_shutdown_runs_queued_requests_first(completion):
 
 
 def test_profiling_writes_a_trace_of_the_window(tmp_path):
+    scope_name = "test::scheduled_encoder_forward"
+    operand = torch.ones(1, device="cpu")
+
+    def record_worker_add():
+        with torch.profiler.record_function(scope_name):
+            operand.add(operand)
+
     with _harness() as h:
+        h.runner.on_forward = record_worker_add
         h.executor.start_worker()
         h.executor.start_profile(output_dir=str(tmp_path), activities=["CPU"])
         deadline = time.monotonic() + 30
@@ -756,7 +765,22 @@ def test_profiling_writes_a_trace_of_the_window(tmp_path):
 
         assert not h.executor._profiler.enabled
         (trace,) = tmp_path.glob("trtllm-trace-*-rank-0.json")
-        assert trace.stat().st_size > 0
+
+    events = json.loads(trace.read_text())["traceEvents"]
+    (scope,) = (
+        event
+        for event in events
+        if event.get("name") == scope_name and event.get("cat") == "user_annotation"
+    )
+    assert any(
+        event.get("name") == "aten::add"
+        and event.get("ph") == "X"
+        and event["pid"] == scope["pid"]
+        and event["tid"] == scope["tid"]
+        and event["ts"] >= scope["ts"]
+        and event["ts"] + event["dur"] <= scope["ts"] + scope["dur"]
+        for event in events
+    )
 
 
 def test_line_profiler_profiles_the_loop_by_default(tmp_path, monkeypatch):

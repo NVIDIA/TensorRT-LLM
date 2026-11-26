@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,12 +30,18 @@ namespace torch_ext
 class NcclCommunicatorOp : public th::jit::CustomClassHolder
 {
 public:
+    //! Create the pipeline communicator for rank within the worldSize participating ranks.
     NcclCommunicatorOp(int64_t worldSize, int64_t rank);
 
+    //! Submit tensor's byte payload to a pipeline peer on the current CUDA stream.
     void send(th::Tensor tensor, int64_t toRank) const;
+    //! Receive a pipeline peer's byte payload into tensor on the current CUDA stream.
     void recv(th::Tensor& tensor, int64_t fromRank) const;
 
 private:
+#if TRTLLM_ENABLE_NCCL_PROFILING && ENABLE_MULTI_DEVICE
+    int32_t mWorldSize;
+#endif
     int32_t mRank;
     std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> mPipelineComm;
 };
