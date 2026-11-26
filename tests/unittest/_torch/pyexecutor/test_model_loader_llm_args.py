@@ -12,6 +12,8 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.model_loader import _reject_unsupported_model_llm_args
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     "model_cls, supported",

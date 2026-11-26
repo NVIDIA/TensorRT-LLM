@@ -15,16 +15,24 @@ from .metadata import configure_fp4_mla_device_page_table, populate_fp4_mla_appe
 if TYPE_CHECKING:
     from ....memory_buffer_utils import Buffers
     from ..trtllm import TrtllmAttentionMetadata
+    from .cache_update import _Fp4MlaContextScatterPlan
     from .fp4_mla_context import _Fp8MlaContextScratch
+
+
+# Names of the graph variants the FP4 MLA decode graphs can be keyed by (graph_resolvers).
+KV_REGIME_VARIANT = "kv_regime"
+PACKED_SPLIT_VARIANT = "packed_split"
 
 
 @dataclass
 class Fp4MlaState:
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
 
-    Allocate through the metadata buffer allocator so eager forwards and each
-    CUDA graph retain their existing storage/aliasing rules. This state is not
-    layer-local: MTP and metadata preparation update it before any FMHA runs.
+    Allocate through the metadata buffer allocator. CUDA graphs of one runner
+    share per-forward Triton/4x decode scratch through metadata.forward_scratch_buffers;
+    CUDAGraphRunner.clear() releases it. Persistent caches remain metadata-local.
+    This state is not layer-local: MTP and metadata preparation update it before
+    any FMHA runs.
     """
 
     hp_pool: torch.Tensor | None = None
@@ -43,10 +51,25 @@ class Fp4MlaState:
     # Packed decode plans its KV split once per step (the plan depends only on
     # the step's lengths); this key marks the plan as current.
     packed_plan_key: tuple | None = None
+    # Per-step serial of the generation lengths: the 4x split plan (one launch per step, not per layer)
+    # re-plans when it changes. Monotonic across steps, never reset.
+    generation_lengths_serial: int = 0
+    plan_4x_key: tuple | None = None
+    # Ceiling (tokens) of the KV regime this CUDA graph metadata serves, an upper bound of its steps' longest live KV,
+    # set as the KV_REGIME_VARIANT graph variant by a graph runner that keys its decode graphs by KV regime
+    # (fp4_mla_dispatch.kv_regimes_for_batch). None (eager metadata, graphs without regimes): decide on the
+    # page-table capacity.
+    kv_regime_max_kv: int | None = None
+    # Split decision of the packed decode this CUDA graph metadata serves, set as the PACKED_SPLIT_VARIANT graph
+    # variant by a graph runner that keys its decode graphs by it (packed_plan.packed_split_variants): True launches
+    # the split budget, False one task per request. None (eager metadata, graphs without it): decide per call
+    # (packed_plan._on_demand_split_count).
+    packed_split: bool | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False
     device_page_table_valid: bool = False
     page_table_stride: int = 0
+    generation_max_pages: int = 0
     context_repack_max_touched_pages: int = 1
     cache_pool_id: int = 0
     cache_page_index_scale: int = 0
@@ -57,16 +80,15 @@ class Fp4MlaState:
     q_batch_capacity: int | None = None
     prequantized_q_rows_per_seq: int | None = None
     fp8_context_state: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
+    # Context cache-update inputs shared by every layer of the current step.
+    context_scatter_plan: _Fp4MlaContextScatterPlan | None = None
     _paged_kv_indptr: torch.Tensor | None = None
     paged_kv_indptr_decode: torch.Tensor | None = None
     _paged_kv_indices: torch.Tensor | None = None
     num_sequences: int = 0
-    num_blocks: list[int] | None = None
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
-    full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
-    v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -80,17 +102,35 @@ class Fp4MlaState:
             raise RuntimeError("FP4 MLA paged_kv_indptr is not allocated.")
         return self._paged_kv_indptr[: self.num_sequences + 1]
 
+    def set_decode_graph_variant(self, name: str, value: int | None) -> None:
+        """Take the value of a decode graph variant from the CUDA graph runner (graph_resolvers)."""
+        if name == KV_REGIME_VARIANT:
+            self.kv_regime_max_kv = value
+        elif name == PACKED_SPLIT_VARIANT:
+            self.packed_split = None if value is None else bool(value)
+        else:
+            raise ValueError(f"The FP4 MLA decode serves no graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> int | None:
+        """The value last set for a decode graph variant; None when unset or unknown."""
+        if name == KV_REGIME_VARIANT:
+            return self.kv_regime_max_kv
+        if name == PACKED_SPLIT_VARIANT:
+            return None if self.packed_split is None else int(self.packed_split)
+        return None
+
     @classmethod
     def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
         manager = metadata.kv_cache_manager
-        hp_ring_size = manager.fp4_mla_hp_pool_size
+        layout = manager.fp4_mla_layout
+        hp_ring_size = layout.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
             raise RuntimeError(
                 "FP4 MLA high-precision ring must retain at least one "
                 f"{HP_BLOCK_SIZE}-token quantization tile, got {hp_ring_size} slots."
             )
-        hp_pool = manager.get_fp4_mla_hp_pool()
-        fp4_layers = manager._fp4_mla_compact_to_local
+        hp_pool = layout.get_fp4_mla_hp_pool()
+        fp4_layers = layout._fp4_mla_compact_to_local
         if (
             not isinstance(hp_pool, torch.Tensor)
             or hp_pool.dtype != torch.bfloat16
@@ -117,7 +157,7 @@ class Fp4MlaState:
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        state = cls(hp_pool=hp_pool, v_scale_pool=layout.get_mla_v_scale_pool())
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)
@@ -142,10 +182,13 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
+        self.plan_4x_key = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
-        # All local layers reuse this FP8 view only within the current batch.
+        # All local layers reuse this FP8 view and this cache-update plan only
+        # within the current batch.
         self.fp8_context_state = None
+        self.context_scatter_plan = None
         self.invalidate_generation_lengths()
         if metadata.kv_cache_manager is None or metadata.request_ids is None:
             raise RuntimeError(
@@ -163,6 +206,7 @@ class Fp4MlaState:
 
     def on_update_kv_lens(self, metadata: TrtllmAttentionMetadata) -> None:
         self.device_page_table_valid = False
+        self.context_scatter_plan = None
         if metadata.num_tokens > 0:
             self.invalidate_generation_lengths()
             if metadata.num_contexts > 0:
@@ -173,16 +217,22 @@ class Fp4MlaState:
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.generation_max_pages = (
+            self.page_table_stride if num_seqs > metadata.num_contexts else 0
+        )
         self.on_update_kv_lens(metadata)
 
     def restore_from_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
         # Rebind aliases to the restored stable tensors, never to the temporary
         # spec-dec clone whose storage may be released after graph capture.
         num_seqs = metadata.num_seqs
+        self.context_scatter_plan = None
         metadata.kv_lens_cuda_runtime = metadata.kv_lens_cuda[:num_seqs]
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.device_page_table_valid = False
+        self.invalidate_generation_lengths()
 
     def populate_append_metadata(self, metadata: TrtllmAttentionMetadata) -> None:
         num_seqs = metadata.num_contexts + metadata.num_generations

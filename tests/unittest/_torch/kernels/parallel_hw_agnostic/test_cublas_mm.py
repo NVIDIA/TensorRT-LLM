@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,19 @@ def test_cublas_mm(dtype, m, k_n):
     )
     ref = torch.matmul(x, w.t())
     np.testing.assert_allclose(ref.float().cpu(), output.float().cpu(), atol=0.01, rtol=0.01)
+
+
+# The first and last M of each SM120 algo table range (hidden 2560: m 33-64, hidden 1536: m 17-64).
+@pytest.mark.parametrize("m,k", [(33, 2560), (64, 2560), (17, 1536), (64, 1536)])
+def test_cublas_mm_lm_head(m, k):
+    """Gemma tied lm_head shapes, which have algo table entries on SM120."""
+    n = 262144
+    torch.random.manual_seed(0)
+    x = torch.randn((m, k), device="cuda").to(torch.bfloat16)
+    w = (torch.randn((n, k), device="cuda") * 0.02).to(torch.bfloat16)
+    output = torch.ops.trtllm.cublas_mm(x, w.t(), bias=None, out_dtype=None)
+    ref = torch.matmul(x, w.t())
+    torch.testing.assert_close(output.float(), ref.float(), atol=0.01, rtol=0.01)
 
 
 @pytest.mark.parametrize(

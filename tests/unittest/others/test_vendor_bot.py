@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import dataclasses
@@ -37,6 +38,8 @@ m = importlib.import_module(f"{_PACKAGE}.metadata")
 p = importlib.import_module(f"{_PACKAGE}.promote")
 
 pytestmark = pytest.mark.cpu_only
+
+_SCOPED_LOCK = "models/demo/3rdparty/vendor_sources.lock.yaml"
 
 
 def _body(content: str) -> str:
@@ -497,7 +500,7 @@ def test_resolve_rejects_selection_changes_before_fetch(tmp_path: Path, change: 
     reviewed = dataclasses.replace(previous, commit="b" * 40, **change)
     cache = tmp_path / "cache"
     with pytest.raises(ValueError, match="unchanged lock source/include"):
-        m.resolve(None, previous, reviewed, {}, cache)
+        m.resolve(argparse.Namespace(lock=p._LOCK), previous, reviewed, {}, cache)
     assert not cache.exists()
 
 
@@ -735,8 +738,11 @@ def test_similarity_error_also_reports_accepted_matches(source: Path) -> None:
 
 
 class FakeGitHub(p.GitHub):
-    def __init__(self) -> None:
-        super().__init__("org/consumer", "toy", "org/library")
+    def __init__(self, lock: str = p._LOCK) -> None:
+        super().__init__("org/consumer", "toy", "org/library", lock=lock)
+        self.vendors = {
+            "toy": _vendor("a" * 40, "https://github.com/operator/library.git", "dev").to_mapping()
+        }
         self.pr = {
             "number": 7,
             "user": {"login": "author"},
@@ -760,6 +766,13 @@ class FakeGitHub(p.GitHub):
             self.writes.append((endpoint, method, payload))
         if endpoint == "user":
             return {"login": "operator"}
+        if endpoint == f"repos/org/consumer/git/ref/heads/{self.base_branch}":
+            return {"object": {"sha": "d" * 40}}
+        if endpoint == f"repos/org/consumer/contents/{self.lock}?ref={'d' * 40}":
+            if self.vendors is None:
+                raise RuntimeError("gh failed: gh: Not Found (HTTP 404)")
+            document = json.dumps({"schema_version": 1, "vendors": self.vendors})
+            return {"encoding": "base64", "content": base64.b64encode(document.encode()).decode()}
         if endpoint in ("repos/author/library", "repos/operator/library", "repos/org/library"):
             return {"source": {"full_name": self.upstream_repo}}
         if endpoint == "repos/operator/library/git/ref/heads/dev":
@@ -771,7 +784,7 @@ class FakeGitHub(p.GitHub):
         if "/pulls?" in endpoint:
             return [copy.deepcopy(self.pr)]
         if "/files?" in endpoint:
-            return [{"filename": p._LOCK}]
+            return [{"filename": self.lock}]
         if "/reviews/" in endpoint and endpoint.endswith("/dismissals"):
             number = int(endpoint.split("/")[-2])
             self.reviews[number - 1]["state"] = "DISMISSED"
@@ -811,7 +824,7 @@ class FakeGitHub(p.GitHub):
 
 
 @pytest.fixture
-def monitor(tmp_path: Path):
+def monitor(tmp_path: Path, request: pytest.FixtureRequest):
     b._STOP.clear()
     args = argparse.Namespace(
         canonical_repo="operator/library",
@@ -825,7 +838,7 @@ def monitor(tmp_path: Path):
         since=None,
     )
     store = b.Store(tmp_path / "state.sqlite")
-    gh = FakeGitHub()
+    gh = FakeGitHub(getattr(request, "param", p._LOCK))
     instance = b.Monitor(args, gh, store)
     yield instance
     store.close()
@@ -1814,11 +1827,19 @@ def test_monitors_discover_only_their_consumer_base(monitor: b.Monitor, base_bra
     assert not monitor.gh.writes
 
 
-def test_workdir_cannot_change_consumer_base(monitor: b.Monitor) -> None:
-    monitor.gh.base_branch = "release/1.3"
+@pytest.mark.parametrize(
+    "attribute,value",
+    [("base_branch", "release/1.3"), ("lock", _SCOPED_LOCK)],
+    ids=["base_branch", "lock"],
+)
+def test_workdir_cannot_change_consumer_base_or_lock(
+    monitor: b.Monitor, attribute: str, value: str
+) -> None:
+    original = getattr(monitor.gh, attribute)
+    setattr(monitor.gh, attribute, value)
     with pytest.raises(ValueError, match="different operator/vendor configuration"):
         b.Monitor(monitor.args, monitor.gh, monitor.store)
-    assert monitor.store.get("settings")["base_branch"] == "main"
+    assert monitor.store.get("settings")[attribute] == original
 
 
 @pytest.mark.parametrize("base_branch", ["main", "release/1.3"])
@@ -2733,7 +2754,18 @@ def test_daemon_launch_status_stop_without_systemd(tmp_path: Path) -> None:
     gh = binary / "gh"
     gh.write_text(
         "#!/usr/bin/env python3\nimport json, sys\n"
-        "print(json.dumps({'login': 'operator'} if sys.argv[-1] == 'user' else []))\n"
+        "import base64\n"
+        "arg = sys.argv[-1]\n"
+        "if arg == 'user':\n"
+        "    out = {'login': 'operator'}\n"
+        "elif '/git/ref/heads/' in arg:\n"
+        "    out = {'object': {'sha': 'd' * 40}}\n"
+        "elif '/contents/models/demo/3rdparty/vendor_sources.lock.yaml?' in arg:\n"
+        "    doc = json.dumps({'schema_version': 1, 'vendors': {'toy': {}}})\n"
+        "    out = {'encoding': 'base64', 'content': base64.b64encode(doc.encode()).decode()}\n"
+        "else:\n"
+        "    out = []\n"
+        "print(json.dumps(out))\n"
     )
     gh.chmod(0o700)
     workdir = tmp_path / "state"
@@ -2749,6 +2781,9 @@ def test_daemon_launch_status_stop_without_systemd(tmp_path: Path) -> None:
         str(workdir),
         "--vendor",
         "toy",
+        "--lock",
+        # main() normalizes --lock so that it matches the file names GitHub reports.
+        _SCOPED_LOCK.replace("models/", "models/./"),
         "--upstream-repo",
         "org/library",
         "--canonical-repo",
@@ -2778,6 +2813,7 @@ def test_daemon_launch_status_stop_without_systemd(tmp_path: Path) -> None:
         assert state["pid"] is not None
         assert state["publish"] is False
         assert state["vendor"] == "toy"
+        assert state["lock"] == _SCOPED_LOCK
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = b._status(workdir)
@@ -2966,7 +3002,11 @@ def test_heartbeat_during_blocked_discovery_does_not_fake_progress(
         original()
         reported.set()
 
+    served = monitor.gh.api
+
     def wait_for_heartbeat(endpoint: str, **kwargs):
+        if "/pulls" not in endpoint:
+            return served(endpoint, **kwargs)
         before = monitor.store.get("health")
         discovery_blocked.set()
         assert reported.wait(2), "No heartbeat during blocked API call"
@@ -3007,17 +3047,35 @@ def test_completed_promotion_clears_stale_problem_without_remote_writes(monitor:
     assert not monitor.gh.writes
 
 
-@pytest.mark.parametrize("status", ["added", "removed", "modified"])
+@pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
+@pytest.mark.parametrize(
+    ("status", "moved_away"),
+    [
+        ("added", False),
+        ("removed", False),
+        ("renamed", False),
+        ("renamed", True),
+        ("modified", False),
+    ],
+    ids=["added", "removed", "renamed", "renamed-away", "modified"],
+)
 def test_lock_creation_removal_is_not_a_promotion_but_other_404s_fail(
     monitor: b.Monitor,
     monkeypatch: pytest.MonkeyPatch,
     status: str,
+    moved_away: bool,
 ) -> None:
     original = monitor.gh.api
+    change = {"filename": monitor.gh.lock, "status": status}
+    if moved_away:
+        change.update(
+            filename="models/other/3rdparty/vendor_sources.lock.yaml",
+            previous_filename=monitor.gh.lock,
+        )
 
     def files(endpoint: str, **kwargs):
         if "/files?" in endpoint:
-            return [{"filename": p._LOCK, "status": status}]
+            return [change]
         return original(endpoint, **kwargs)
 
     def missing(*args):
@@ -3069,6 +3127,7 @@ def test_status_exposes_consumer_base_and_refresh_policy(monitor: b.Monitor) -> 
     b.Monitor(monitor.args, monitor.gh, monitor.store)
     state = b._status(monitor.args.workdir)
     assert state["base_branch"] == "main"
+    assert state["lock"] == p._LOCK
     assert state["canonical_branch"] == "dev"
     assert state["refresh_branches"] == ["dev-new"]
     assert not state["running"]
@@ -3168,6 +3227,7 @@ def test_serve_reports_backoff_and_clears_process_on_exit(
         publish=False,
         consumer_repo="org/consumer",
         vendor="toy",
+        lock=p._LOCK,
         upstream_repo="org/library",
         base_branch="main",
         upstream_branch="main",
@@ -3214,6 +3274,7 @@ def test_startup_error_is_visible_after_process_exits(
         publish=False,
         consumer_repo="org/consumer",
         vendor="toy",
+        lock=p._LOCK,
         upstream_repo="org/library",
         base_branch="main",
         upstream_branch="main",
@@ -3233,3 +3294,45 @@ def test_startup_error_is_visible_after_process_exits(
     assert state["last_completed_poll"] is None
     assert state["next_poll_at"] is None
     assert not any(t.name == "vendor-bot-heartbeat" for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
+def test_monitor_tracks_only_its_configured_lock(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = monitor.gh.api
+    changed = [p._LOCK]
+
+    def files(endpoint: str, **kwargs):
+        if "/files?" in endpoint:
+            return [{"filename": name} for name in changed]
+        return original(endpoint, **kwargs)
+
+    monkeypatch.setattr(monitor.gh, "api", files)
+    assert monitor._discover() == []
+    changed[:] = [_SCOPED_LOCK]
+    monitor.gh.pr["head"]["sha"] = "e" * 40
+    assert monitor._discover() == [7]
+
+
+def test_workdir_lock_defaults_to_repository_lock(monitor: b.Monitor) -> None:
+    settings = monitor.store.get("settings")
+    del settings["lock"]
+    monitor.store.put("settings", settings)
+    b.Monitor(monitor.args, monitor.gh, monitor.store)
+    assert monitor.store.get("settings")["lock"] == p._LOCK
+
+
+@pytest.mark.parametrize("monitor", [_SCOPED_LOCK], ids=["scoped-vendor-lock"], indirect=True)
+@pytest.mark.parametrize("vendors", [{}, None], ids=["vendor-missing", "lock-deleted"])
+def test_vendor_missing_from_configured_lock_fails_poll(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, vendors: dict | None
+) -> None:
+    monitor.gh.vendors = vendors
+    monkeypatch.setattr(monitor, "_discover", lambda: pytest.fail("discovery must not run"))
+    with pytest.raises(ValueError, match="start a new workdir with --lock"):
+        monitor.poll()
+    health = monitor.store.get("health")
+    assert health["last_poll_summary"]["outcome"] == "failed"
+    assert f"'toy' is not in {monitor.gh.lock} on main" in health["last_error"]["message"]
+    assert monitor.gh.writes == []

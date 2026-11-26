@@ -9,13 +9,13 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.mxfp8_quantize
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mxfp8_pinned_quantize import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_mxfp8_pinned_quantize import (  # noqa: E501
     m3_mxfp8_pinned_quantize as op,
 )
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating  # noqa: E402 — needs the path declared above

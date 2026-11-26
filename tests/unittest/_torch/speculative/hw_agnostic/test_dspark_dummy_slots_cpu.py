@@ -50,7 +50,7 @@ def test_all_padding_families_preserve_real_slot_ownership(monkeypatch, physical
         num_stages=1,
         _attn_params={"window_size": 4, "head_dim": 2},
     )
-    DSv4DSparkWorker._lazy_init(worker, draft, SimpleNamespace(max_num_requests=4))
+    DSv4DSparkWorker._lazy_init(worker, draft, SimpleNamespace(max_num_requests=4, num_seq_slots=4))
     meta = SimpleNamespace(
         _dspark_worker=worker, batch_indices_cuda=torch.empty(4, dtype=torch.int32)
     )

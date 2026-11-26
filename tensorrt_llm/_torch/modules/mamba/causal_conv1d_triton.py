@@ -563,7 +563,9 @@ def causal_conv1d_fn(
 # When calculating token 3's convolution, it should conv to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's convolution, it should conv to token 0 (parent)
 # This kernel is a fused kernel which will also produce retrieve_parent_token based on retrieve_next_token & retrieve_next_sibling
-@triton.jit()
+# The request count and the slot vector's offset (on a mixed step, the decode half starts after the
+# prefill entries) change every step: keep them out of the cache key.
+@triton.jit(do_not_specialize=["batch"], do_not_specialize_on_alignment=["conv_state_indices_ptr"])
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)

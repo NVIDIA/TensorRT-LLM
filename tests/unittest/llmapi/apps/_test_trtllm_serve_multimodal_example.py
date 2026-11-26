@@ -22,7 +22,7 @@ import yaml
 from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = [".."]
-from test_llm import get_model_path
+from model_paths import get_model_path
 from utils.llm_data import llm_models_root
 
 
@@ -64,8 +64,8 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     # The example client sends local paths under the test data root.
     env = os.environ.copy()
-    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = str(llm_models_root() /
-                                                 "multimodals" / "test_data")
+    env["TRTLLM_MEDIA_ALLOWED_INPUT_DIR"] = str(llm_models_root() /
+                                                "multimodals" / "test_data")
     with RemoteOpenAIServer(model_path, port=8000, cli_args=args,
                             env=env) as remote_server:
         yield remote_server

@@ -22,7 +22,7 @@ from typing import Iterator
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import OpWrapper
 
 #: One unit in the last place of each accumulating dtype's mantissa.
 ULP = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11, torch.float32: 2.0**-23}

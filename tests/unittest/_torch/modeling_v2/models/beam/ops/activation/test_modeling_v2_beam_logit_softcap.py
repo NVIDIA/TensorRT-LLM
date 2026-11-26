@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
     beam_logit_softcap as op,
 )
 

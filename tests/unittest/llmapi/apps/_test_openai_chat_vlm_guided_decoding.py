@@ -29,7 +29,7 @@ import yaml
 from .openai_server import RemoteOpenAIServer
 
 __extra_import_path__ = ["..", "~/tests/unittest"]
-from test_llm import get_model_path
+from model_paths import get_model_path
 from utils.llm_data import llm_models_root
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -74,7 +74,7 @@ def server(temp_extra_llm_api_options_file: str):
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     # The tests send _IMAGE_URL, a local path under the test data root.
     env = os.environ.copy()
-    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = os.path.dirname(_IMAGE_URL)
+    env["TRTLLM_MEDIA_ALLOWED_INPUT_DIR"] = os.path.dirname(_IMAGE_URL)
     with RemoteOpenAIServer(model_path, cli_args=args, env=env) as remote_server:
         yield remote_server
 

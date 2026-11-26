@@ -296,6 +296,31 @@ add_tllm_gtest(
   "unit;batch-manager;host")
 
 add_tllm_gtest(
+  kvCacheManagerV2SmallObjectPoolTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2SmallObjectPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2LocalityTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2LocalityTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
   kvCacheManagerV2ReentrantSharedMutexTest
   OWNER
   batch-manager
@@ -388,8 +413,16 @@ add_tllm_gtest(
   LABELS
   "unit;batch-manager;gpu")
 
-add_tllm_gtest(rnnCacheFormatterTest SOURCES rnnCacheFormatterTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
+add_tllm_gtest(
+  rnnCacheFormatterTest
+  OWNER
+  batch-manager
+  SOURCES
+  rnnCacheFormatterTest.cpp
+  LINK_LIBRARIES
+  tllm::batch_rnn_cache_routing
+  LABELS
+  "unit;batch-manager;rnn;host")
 
 add_tllm_gtest(
   agentTreeTest

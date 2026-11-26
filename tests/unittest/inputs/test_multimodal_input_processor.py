@@ -35,6 +35,8 @@ from tensorrt_llm.inputs.registry import (
     BaseMultimodalInputProcessor,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_subclass(*, hf_post_merger_tokens: int = 999):
     """Build a subclass whose token counts come from a mocked HF processor."""

@@ -25,7 +25,7 @@ import torch
 
 __extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as W,
 )
 
@@ -55,8 +55,9 @@ def _core(mtp: bool):
     """The configuration surface the table reads, at the dep4 layout: attention DP over
     four ranks, the experts split four ways, this rank the second.
 
-    `dims` derives the expert window from the mapping; the reference below hard-codes
-    the hand-written `local_experts`, so the comparison also checks that the two agree.
+    `dims` derives the expert slots from the mapping; the reference below hard-codes
+    the hand-written expert count per rank, so the comparison also checks that the two
+    agree.
     """
     cfg = SimpleNamespace(**_CFG)
     mapping = SimpleNamespace(

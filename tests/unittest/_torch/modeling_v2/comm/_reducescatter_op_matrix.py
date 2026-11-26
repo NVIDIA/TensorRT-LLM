@@ -1356,7 +1356,7 @@ def _run_one_rank(device: Optional[int] = None) -> int:
     # that measurably wedges a watchdog at exit.
     dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", device))
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import reducescatter as entry
 
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
     # One partial instead of a per-call argument: every check's call site keeps

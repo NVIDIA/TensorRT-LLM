@@ -28,6 +28,7 @@
 #include <array>
 #include <cstring>
 #include <cuda.h>
+#include <fstream>
 #include <map>
 #include <numaif.h>
 #include <string>
@@ -102,8 +103,17 @@ std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
     return {begin, end > begin ? static_cast<size_t>(end - begin) : 0};
 }
 
-//! Places the pages of [addr, addr + size) on the NUMA node the current GPU
-//! attaches to.
+//! Whether the host has more than one NUMA node, read from sysfs because libnuma may be unusable.
+bool hostHasMultipleNumaNodes()
+{
+    std::ifstream online("/sys/devices/system/node/online");
+    std::string nodes;
+    // One node reads as its number, several as a range or list such as "0-1" or "0,2".
+    return static_cast<bool>(online >> nodes) && nodes.find_first_of(",-") != std::string::npos;
+}
+
+//! Places the pages of [addr, addr + size) on `numaNode`, or on the NUMA node
+//! the current GPU attaches to when it is unset.
 //!
 //! The policy is attached to the address range, not to a thread, so it holds
 //! whichever thread happens to fault a page in. Setting it on the whole range
@@ -127,21 +137,40 @@ std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
 //! prefers the local node and silently takes a remote page when that node
 //! cannot satisfy it, which is MPOL_PREFERRED's behaviour. Only MPOL_BIND
 //! refuses, and nothing unprivileged reproduces that -- set_mempolicy is gated
-//! with mbind. So where mbind is denied, a strict request degrades to a
-//! preference, which is why that case is reported differently below.
+//! with mbind. So on a multi-node host a strict request fails wherever mbind
+//! cannot be applied, rather than degrading to a preference.
 //!
 //! Note for containers: mbind, set_mempolicy and get_mempolicy sit behind
 //! CAP_SYS_NICE in Docker's default seccomp profile, so an unprivileged
 //! container falls back to first touch.
-void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallback)
+void bindRangeToNumaNode(MemAddress addr, size_t size, std::optional<int> numaNode, bool allowRemoteFallback)
 {
-    if (numa_available() < 0 || numa_max_node() < 1)
+    if (numa_available() < 0)
+    {
+        if (!allowRemoteFallback && hostHasMultipleNumaNodes())
+        {
+            throw LogicError(
+                "KVCM2 host tier: a strict NUMA binding needs the NUMA system calls, which libnuma reports "
+                "unavailable (in a container, the seccomp profile may block them); allow a remote fallback "
+                "(allow_remote_numa_fallback=true, kv_cache_config.host_cache_bind_to_gpu_numa_node=false) to accept "
+                "first-touch placement.");
+        }
+        return;
+    }
+    if (numa_max_node() < 1)
     {
         return;
     }
-    int const node = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();
+    int const gpuNode = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();
+    int const node = numaNode.value_or(gpuNode);
     if (node < 0)
     {
+        if (!allowRemoteFallback)
+        {
+            throw LogicError(
+                "KVCM2 host tier: a strict NUMA binding needs a node, but the GPU reports none; name one "
+                "(numa_node) or allow a remote fallback (allow_remote_numa_fallback=true).");
+        }
         TLLM_LOG_WARNING("KVCM2 host tier: GPU reports no NUMA node; leaving page placement to first touch");
 
         return;
@@ -159,22 +188,34 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
     int const mode = allowRemoteFallback ? MPOL_PREFERRED : MPOL_BIND;
     if (::mbind(reinterpret_cast<void*>(addr), size, mode, mask->maskp, mask->size + 1, 0) != 0)
     {
+        int const error = errno;
         if (!allowRemoteFallback)
         {
             // First touch prefers the local node but takes a remote page rather
             // than failing, so it cannot stand in for a strict binding. Refusing
             // here is better than running as though the request was honoured.
-            throw LogicError(
-                "KVCM2 host tier: allow_remote_numa_fallback=false requires mbind, which failed with errno "
-                + std::to_string(errno) + " for NUMA node " + std::to_string(node)
-                + ". In a container this usually means CAP_SYS_NICE is absent; grant it, or set "
-                  "allow_remote_numa_fallback=true to accept first-touch placement.");
+            throw LogicError("KVCM2 host tier: a strict binding to NUMA node " + std::to_string(node)
+                + " requires mbind, which failed with errno " + std::to_string(error)
+                + ". In a container this usually means CAP_SYS_NICE is absent; grant it, or allow a remote "
+                  "fallback (allow_remote_numa_fallback=true, kv_cache_config.host_cache_bind_to_gpu_numa_node="
+                  "false) to accept first-touch placement.");
         }
-        TLLM_LOG_WARNING(
-            "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; falling back to first-touch placement by "
-            "the fill worker, which is bound to that node (in a container this usually means CAP_SYS_NICE is "
-            "absent). Placement is preserved; no behaviour is lost here.",
-            node, errno);
+        if (node == gpuNode)
+        {
+            TLLM_LOG_WARNING(
+                "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; falling back to first-touch placement "
+                "by the fill worker, which is bound to that node (in a container this usually means CAP_SYS_NICE is "
+                "absent). Placement is preserved; no behaviour is lost here.",
+                node, error);
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; pages fall to first-touch placement by "
+                "the fill worker, which is bound to the GPU's NUMA node %d instead (in a container this usually "
+                "means CAP_SYS_NICE is absent).",
+                node, error, gpuNode);
+        }
         return;
     }
     TLLM_LOG_INFO("KVCM2 host tier: pages bound to NUMA node %d (%s)", node,
@@ -212,7 +253,7 @@ HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& optio
     //! Applied once over the whole mapping. Per-chunk page-mode advice would
     //! change VMA flags and split the mapping into one VMA per chunk.
     hostMadvisePageMode(mAddr, mSize, hostUseThp(options.useThp));
-    bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
+    bindRangeToNumaNode(mAddr, mSize, options.numaNode, mAllowRemoteNumaFallback);
 
     // Nothing is reachable until a step opens it, so a read that runs ahead of
     // the fill faults rather than returning zeros from an untouched page. Costs

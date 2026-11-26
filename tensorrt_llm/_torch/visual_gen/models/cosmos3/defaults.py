@@ -12,20 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-model default generation parameters for Cosmos3 pipelines.
-
-Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
+"""The Cosmos3 tables: generation defaults per family and mode, the action and
+policy presets per embodiment domain, the prompt templates, and the schema of the
+request's extra parameters. The parameter resolver reads them as the defaults, after
+the request and the checkpoint.
 """
 
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, TypedDict
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    COSMOS3_ACTION_RESOLUTIONS,
-    EMBODIMENT_TO_DOMAIN_ID,
-    normalize_action_resolution,
-    resolve_raw_action_dim,
-)
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 
@@ -33,10 +28,15 @@ from tensorrt_llm.inputs.media_io import sniff_media_kind
 # Constant tables
 # ---------------------------------------------------------------------------
 
-# Cosmos3 output resolution buckets keyed by target level, then aspect ratio;
-# each value is (width, height). A source frame maps onto the bucket whose
-# aspect ratio is closest (see ``find_closest_target_size`` in ``transfer.py``).
-VIDEO_RES_SIZE_INFO = {
+# The reference's ``W,H`` aspect buckets: every canvas is one of these shapes, and a
+# request's bucket string is carried into the caption verbatim, so a resolved frame
+# size maps back to the nearest bucket rather than to its exact reduced ratio
+# (832x480 reduces to "15,26", which the model never saw).
+COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+# Output sizes per resolution level and aspect bucket, as (width, height).
+VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
     "256": {
         "1,1": (256, 256),
         "4,3": (320, 256),
@@ -67,16 +67,313 @@ VIDEO_RES_SIZE_INFO = {
     },
 }
 
-# The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
+
+COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
+
+
+def normalize_action_resolution(resolution: Any) -> int:
+    if resolution is None:
+        raise ValueError("Cosmos3 action_resolution is required for action generation.")
+    try:
+        bucket = int(resolution)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
+        ) from exc
+    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
+        raise ValueError(
+            f"Unknown Cosmos3 action_resolution={bucket}; "
+            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
+        )
+    return bucket
+
+
+def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
+    """The ``resolution`` bucket whose aspect ratio is closest to ``h/w``, as
+    ``(width, height)``, so a source frame lands on a supported size undistorted."""
+    key = str(resolution)
+    if key not in VIDEO_RES_SIZE_INFO:
+        raise ValueError(
+            f"Unknown Cosmos3 resolution={resolution!r}; "
+            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
+        )
+    input_ratio = h / w
+    best_size = None
+    best_diff = float("inf")
+    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
+        diff = abs(input_ratio - cand_h / cand_w)
+        if diff < best_diff:
+            best_diff = diff
+            best_size = (cand_w, cand_h)
+    assert best_size is not None
+    return best_size
+
+
+EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
+    "no_action": 0,
+    "av": 1,
+    "camera_pose": 2,
+    "hand_pose": 3,
+    "pusht": 4,
+    "libero": 5,
+    "umi": 6,
+    "bridge_orig_lerobot": 7,
+    "droid_lerobot": 8,
+    "robomind-franka": 8,
+    "galbot": 9,
+    "robomind-franka-dual": 12,
+    "robomind-ur": 13,
+    "agibotworld": 15,
+    "agibot_gear_gripper": 15,
+    "agibot_gear_gripper_ext": 15,
+    "fractal": 20,
+}
+
+# Canonical unpadded action width per embodiment.  Widths compose the Cosmos3
+# unified action representation from shared geometric blocks: a 9-D pose (3-D
+# translation + 6-D rotation), a 1-D grasp state, and a 15-D fingertip state.
+# One arm is 9 + 1 = 10; a dual-arm setup is 20; the AgiBot humanoid is
+# 9 + 2 x (9 + 1) = 29; two-hand egocentric motion is 9 + 2 x (9 + 15) = 57.
+#
+# This is a property of the embodiment, not a tunable, so it is keyed by the
+# real domain name rather than by the sampling presets below (where several of
+# these names share one preset).  ``libero`` is absent on purpose:
+# its width depends on the dataset's rotation space (7/10/13), so callers must
+# pass ``raw_action_dim`` explicitly.
+EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
+    "av": 9,
+    "camera_pose": 9,
+    "hand_pose": 57,
+    "pusht": 2,
+    "umi": 10,
+    "bridge_orig_lerobot": 10,
+    "droid_lerobot": 10,
+    "robomind-franka": 10,
+    "robomind-franka-dual": 20,
+    "robomind-ur": 10,
+    "galbot": 30,
+    "agibotworld": 29,
+    "agibot_gear_gripper": 29,
+    "agibot_gear_gripper_ext": 29,
+    "fractal": 10,
+}
+
+
+def normalize_domain_name(domain_name: Any) -> str | None:
+    """The embodiment name as the tables key it (stripped, lower case); ``None`` when
+    unset or blank."""
+    if domain_name is None:
+        return None
+    return str(domain_name).strip().lower() or None
+
+
+def resolve_raw_action_dim(
+    domain_name: Any = None,
+    domain_id: Any = None,
+) -> int | None:
+    """Look up the canonical action width, or None when it cannot be determined.
+
+    Resolves by name first.  A bare ``domain_id`` is only usable when every
+    embodiment sharing that id agrees on a width (true for all current ids).
+    """
+    name = normalize_domain_name(domain_name)
+    if name is not None:
+        return EMBODIMENT_TO_RAW_ACTION_DIM.get(name)
+
+    if domain_id is None:
+        return None
+
+    widths = {
+        EMBODIMENT_TO_RAW_ACTION_DIM[name]
+        for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items()
+        if mapped_id == int(domain_id) and name in EMBODIMENT_TO_RAW_ACTION_DIM
+    }
+    return widths.pop() if len(widths) == 1 else None
+
+
+# Every default a Cosmos3 request can fall back on, in one place. A value here is
+# used only when the request, the overrides and the checkpoint provide none.
 _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
-COSMOS3_720P_PARAMS = {
-    "height": _DEFAULT_VIDEO_H,
-    "width": _DEFAULT_VIDEO_W,
-    "num_inference_steps": 35,
-    "guidance_scale": 6.0,
-    "max_sequence_length": 4096,
-    "num_frames": 189,
-    "frame_rate": 24.0,
+
+# Action requests, by embodiment: training-aligned sampling settings, mirroring
+# the Cosmos3 omni ``action_*.json`` inputs where those exist. The embodiment's
+# action width is not a default; it lives in ``EMBODIMENT_TO_RAW_ACTION_DIM``.
+_ACTION_DEFAULTS: dict[str, dict[str, Any]] = {
+    # The sampling recipe every action request shares, and the resolution bucket the
+    # action models were trained at; an embodiment's row supplies the canvas, clip
+    # length and frame rate.
+    "common": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "num_inference_steps": 30,
+        "guidance_scale": 1.0,
+        "frame_rate": 24.0,
+    },
+    # WidowX bridge.
+    "bridge_orig_lerobot": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 5.0,
+    },
+    # Autonomous-vehicle steering/throttle; longer action horizon.
+    "av": {
+        "action_chunk_size": 60,
+        "action_resolution": 480,
+        "frame_rate": 10.0,
+    },
+    # 6-DoF camera pose + shutter; matches AV-style horizon.
+    "camera_pose": {
+        "action_chunk_size": 60,
+        "action_resolution": 480,
+        "frame_rate": 30.0,
+    },
+    # Franka single-arm tabletop; same domain_id as robomind-franka.
+    "droid_lerobot": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 15.0,
+    },
+    # LIBERO sim single-arm; lower action resolution bucket.
+    "libero": {
+        "action_chunk_size": 16,
+        "action_resolution": 256,
+        "frame_rate": 10.0,
+    },
+    # MANO hand pose.
+    "hand_pose": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 24.0,
+    },
+    # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
+    "agibotworld": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 10.0,
+    },
+    # Google Robot (RT-1 / fractal) single-arm.
+    "fractal": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 5.0,
+    },
+    # 2-D planar push task.
+    "pusht": {
+        "action_chunk_size": 16,
+        "action_resolution": 256,
+        "frame_rate": 10.0,
+    },
+    # UMI handheld gripper setup.
+    "umi": {
+        "action_chunk_size": 16,
+        "action_resolution": 480,
+        "frame_rate": 10.0,
+    },
+}
+
+# Policy checkpoints, by embodiment: the recipe facts ``checkpoint.json`` does
+# not carry (its ``policy`` block owns the horizon, rate and domain).
+_POLICY_DEFAULTS: dict[str, dict[str, Any]] = {
+    # DROID Policy is joint_pos: seven joints plus one gripper channel. The
+    # current 8-D state is a clean leading action row and is not returned as a
+    # predicted command.
+    "droid_lerobot": {
+        "num_inference_steps": 4,
+        "guidance_scale": 3.0,
+        # Apply CFG only to the first, highest-noise UniPC step.
+        "guidance_interval": (960.0, 1001.0),
+        "raw_action_dim": 8,
+        "action_resolution": 480,
+        "use_state": True,
+    },
+}
+
+# Transfer requests. "common" holds the settings every transfer request shares;
+# the other rows are the guidance tuning per kind of request: the control's own
+# row for a single control, "mixed" for two or more (``transfer_defaults``).
+_TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "common": {
+        "num_video_frames_per_chunk": 93,  # frames per autoregressive chunk (4k+1 form)
+        "num_conditional_frames": 1,  # overlap frames reused from the previous chunk
+        "max_frames": 5000,  # hard cap on total input frames
+        "show_control_condition": False,  # debug: also emit the control frames
+        "show_input": False,  # debug: also emit the input frames
+        "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
+        "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
+        "emphasize_control_in_prompt": True,  # name the active hints in the user prompt
+    },
+    "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+    "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+    "depth": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
+    # Leans harder on control.
+    "seg": {"guidance_scale": 3.0, "control_guidance": 2.0, "flow_shift": 10.0},
+    # Precomputed control; control-only guidance (text off), 10 fps / 101-frame chunks.
+    "wsm": {
+        "guidance_scale": 1.0,
+        "control_guidance": 3.0,
+        "flow_shift": 10.0,
+        "num_frames": 101,
+        "fps": 10,
+        "num_video_frames_per_chunk": 101,
+    },
+    # Two or more controls: the controls' rows are not combined. Text guidance is
+    # the Nano/Super video value and control guidance is neutral.
+    "mixed": {"guidance_scale": 6.0, "control_guidance": 1.0, "flow_shift": 10.0},
+}
+
+# By model family (the architecture recipe name from the transformer config), then
+# by workflow. "video" and "image" are the request's output type, never inferred
+# from the checkpoint name: a task-specialized checkpoint can still be asked to run
+# either. A field "image" omits falls back to the family's "video" row. The
+# "action", "policy" and "transfer" rows are the same for both families.
+COSMOS3_DEFAULTS: dict[str, dict[str, Any]] = {
+    # Nano and Super.
+    "qwen3": {
+        "video": {
+            "height": _DEFAULT_VIDEO_H,
+            "width": _DEFAULT_VIDEO_W,
+            "num_inference_steps": 35,
+            "guidance_scale": 6.0,
+            "max_sequence_length": 4096,
+            "num_frames": 189,
+            "frame_rate": 24.0,
+        },
+        "image": {
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 7.0,
+            "guidance_interval": (400.0, 1000.0),
+        },
+        "action": _ACTION_DEFAULTS,
+        "policy": _POLICY_DEFAULTS,
+        "transfer": _TRANSFER_DEFAULTS,
+    },
+    # Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
+    # model-card I2V command (T2V mirrors it; the model card documents I2V
+    # only). Image values are the cosmos-framework t2i mode defaults at Edge's
+    # native resolution (480p at 1:1 aspect), with full-range CFG.
+    "nemotron_dense": {
+        "video": {
+            "height": 480,
+            "width": 832,
+            "num_inference_steps": 50,
+            "guidance_scale": 5.0,
+            "max_sequence_length": 4096,
+            "num_frames": 121,
+            "frame_rate": 24.0,
+        },
+        "image": {
+            "height": 640,
+            "width": 640,
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "guidance_interval": None,
+        },
+        "action": _ACTION_DEFAULTS,
+        "policy": _POLICY_DEFAULTS,
+        "transfer": _TRANSFER_DEFAULTS,
+    },
 }
 
 COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
@@ -237,41 +534,6 @@ def _validate_non_negative_frames(value: Any) -> None:
         raise ValueError(f"must be a non-negative frame count, got {value}.")
 
 
-# Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
-COSMOS3_T2I_PARAMS = {
-    "height": 1024,
-    "width": 1024,
-    "num_inference_steps": 50,
-    "guidance_scale": 7.0,
-    "flow_shift": 3.0,
-    "guidance_interval": (400.0, 1000.0),
-}
-
-# Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
-# model-card I2V command (T2V mirrors it — the model card documents I2V only);
-# ``flow_shift`` rides the checkpoint-declared native flow schedule. T2I values
-# are the cosmos-framework t2i mode defaults at Edge's native resolution
-# (480p at 1:1 aspect), with full-range CFG.
-COSMOS3_EDGE_VIDEO_PARAMS = {
-    "height": 480,
-    "width": 832,
-    "num_inference_steps": 50,
-    "guidance_scale": 5.0,
-    "max_sequence_length": 4096,
-    "num_frames": 121,
-    "frame_rate": 24.0,
-    "flow_shift": 3.0,
-}
-
-COSMOS3_EDGE_T2I_PARAMS = {
-    "height": 640,
-    "width": 640,
-    "num_inference_steps": 50,
-    "guidance_scale": 4.0,
-    "flow_shift": 3.0,
-    "guidance_interval": None,
-}
-
 # Model-card validated envelope for Edge; advisory only (the reference
 # runtime accepts a wider range), surfaced as a log line per request.
 COSMOS3_EDGE_ENVELOPE = {
@@ -294,43 +556,9 @@ COSMOS3_EDGE_ENVELOPE = {
     ),
 }
 
-# (family, mode) → generation defaults. Family is the architecture recipe
-# name resolved from the transformer config; mode is the request's output
-# type — never inferred from the checkpoint name (a task-specialized
-# checkpoint can still be asked to run any mode).
-COSMOS3_GENERATION_DEFAULTS: Dict = {
-    ("qwen3", "video"): COSMOS3_720P_PARAMS,
-    ("qwen3", "image"): COSMOS3_T2I_PARAMS,
-    ("nemotron_dense", "video"): COSMOS3_EDGE_VIDEO_PARAMS,
-    ("nemotron_dense", "image"): COSMOS3_EDGE_T2I_PARAMS,
-}
-
-# Action's table carries the sampling recipe only; the canvas, clip length and
-# frame rate resolve from the embodiment preset in the pipeline, and anything
-# missing here falls back to the family's video table inside
-# _resolve_generation_params. Same recipe for both families.
-
-
 # Families without an entry get no envelope advisory.
 COSMOS3_ENVELOPES: Dict = {
     "nemotron_dense": COSMOS3_EDGE_ENVELOPE,
-}
-
-COSMOS3_ACTION_PARAMS = {
-    "action_chunk_size": 16,
-    "num_inference_steps": 30,
-    "guidance_scale": 1.0,
-    "frame_rate": 24.0,
-}
-
-# Released policy checkpoints carry a ``policy`` block in checkpoint.json.
-# The block owns checkpoint-specific horizon/rate/domain values; the remaining
-# recipe facts are keyed by that domain below.
-COSMOS3_POLICY_SAMPLING_PARAMS = {
-    "num_inference_steps": 4,
-    "guidance_scale": 3.0,
-    # Apply CFG only to the first, highest-noise UniPC step.
-    "guidance_interval": (960.0, 1001.0),
 }
 
 
@@ -345,22 +573,6 @@ class Cosmos3PolicyDomainPreset(TypedDict, total=False):
     use_state: bool
 
 
-COSMOS3_POLICY_DOMAIN_PRESETS: dict[str, Cosmos3PolicyDomainPreset] = {
-    # DROID Policy is joint_pos: seven joints plus one gripper channel. The
-    # current 8-D state is a clean leading action row and is not returned as a
-    # predicted command.
-    "droid_lerobot": {
-        **COSMOS3_POLICY_SAMPLING_PARAMS,
-        "raw_action_dim": 8,
-        "action_resolution": 480,
-        "use_state": True,
-    },
-}
-
-COSMOS3_GENERATION_DEFAULTS[("qwen3", "action")] = COSMOS3_ACTION_PARAMS
-COSMOS3_GENERATION_DEFAULTS[("nemotron_dense", "action")] = COSMOS3_ACTION_PARAMS
-
-
 def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict[str, Any]:
     """Normalize a checkpoint.json ``policy`` block into pipeline defaults."""
     if policy is None:
@@ -371,11 +583,11 @@ def resolve_checkpoint_policy_defaults(policy: Mapping[str, Any] | None) -> dict
     defaults: dict[str, Any] = {}
     domain_name = policy.get("domain_name")
     if domain_name is not None:
-        domain_name = str(domain_name).strip().lower()
-        if not domain_name:
+        domain_name = normalize_domain_name(domain_name)
+        if domain_name is None:
             raise ValueError("Cosmos3 checkpoint policy domain_name must not be empty.")
         defaults["domain_name"] = domain_name
-        defaults.update(COSMOS3_POLICY_DOMAIN_PRESETS.get(domain_name, {}))
+        defaults.update(_POLICY_DEFAULTS.get(domain_name, {}))
 
     if policy.get("action_chunk_size") is not None:
         action_chunk_size = int(policy["action_chunk_size"])
@@ -419,78 +631,13 @@ class Cosmos3DomainPreset(TypedDict, total=False):
     """Recommended action sampling settings for a trained embodiment.
 
     Sampling settings only — the embodiment's action width lives in
-    ``action.EMBODIMENT_TO_RAW_ACTION_DIM``, keyed by the unaliased domain name.
+    ``EMBODIMENT_TO_RAW_ACTION_DIM``, keyed by the unaliased domain name.
     """
 
     action_chunk_size: int
     action_resolution: int
     frame_rate: float
 
-
-# Training-aligned defaults, mirroring the Cosmos3 omni ``action_*.json`` inputs
-# (bridge, av, droid, libero, ...) where those exist.
-COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
-    # WidowX bridge.
-    "bridge_orig_lerobot": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # Autonomous-vehicle steering/throttle; longer action horizon.
-    "av": {
-        "action_chunk_size": 60,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # 6-DoF camera pose + shutter; matches AV-style horizon.
-    "camera_pose": {
-        "action_chunk_size": 60,
-        "action_resolution": 480,
-        "frame_rate": 30.0,
-    },
-    # Franka single-arm tabletop; same domain_id as robomind-franka.
-    "droid_lerobot": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 15.0,
-    },
-    # LIBERO sim single-arm; lower action resolution bucket.
-    "libero": {
-        "action_chunk_size": 16,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # MANO hand pose.
-    "hand_pose": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 24.0,
-    },
-    # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
-    "agibotworld": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # Google Robot (RT-1 / fractal) single-arm.
-    "fractal": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # 2-D planar push task.
-    "pusht": {
-        "action_chunk_size": 16,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # UMI handheld gripper setup.
-    "umi": {
-        "action_chunk_size": 16,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-}
 
 # Map alias domain_name keys to a canonical preset entry. These share *sampling*
 # settings only; each alias keeps its own action width (e.g. robomind-franka-dual
@@ -509,10 +656,10 @@ def canonical_domain_preset_key(
     domain_name: str | None = None,
     domain_id: str | int | None = None,
 ) -> str | None:
-    if domain_name is not None and str(domain_name).strip():
-        key = str(domain_name).strip().lower()
+    key = normalize_domain_name(domain_name)
+    if key is not None:
         key = COSMOS3_DOMAIN_PRESET_ALIASES.get(key, key)
-        if key in COSMOS3_DOMAIN_PRESETS:
+        if key in _ACTION_DEFAULTS and key != "common":
             return key
         return None
 
@@ -528,7 +675,7 @@ def canonical_domain_preset_key(
         if mapped_id != resolved_id:
             continue
         canon = COSMOS3_DOMAIN_PRESET_ALIASES.get(name, name)
-        if canon in COSMOS3_DOMAIN_PRESETS and canon not in candidates:
+        if canon in _ACTION_DEFAULTS and canon != "common" and canon not in candidates:
             candidates.append(canon)
 
     if len(candidates) == 1:
@@ -543,180 +690,20 @@ def get_domain_preset(
     key = canonical_domain_preset_key(domain_name, domain_id)
     if key is None:
         return None
-    return COSMOS3_DOMAIN_PRESETS[key]
+    return _ACTION_DEFAULTS[key]
 
 
-def resolve_domain_action_config(
-    *,
-    domain_name: str | None = None,
-    domain_id: str | int | None = None,
-    raw_action_dim: int | None = None,
-    action_chunk_size: int | None = None,
-    action_resolution: int | None = None,
-    frame_rate: float | None = None,
-    action_fps: float | None = None,
-    use_state: bool | None = None,
-    checkpoint_policy_defaults: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Merge user action params with domain presets and generic fallbacks.
-
-    A recognized ``domain_name`` (or a uniquely mapped ``domain_id``) fills
-    whichever of ``action_chunk_size``, ``action_resolution`` and ``frame_rate``
-    the caller left unset; an explicit value wins but is reported in
-    ``warnings`` when it differs from the preset. ``num_frames`` is derived as
-    ``action_chunk_size + 1`` and is never a preset field.
-    """
-    checkpoint_policy_defaults = dict(checkpoint_policy_defaults or {})
-    checkpoint_domain = checkpoint_policy_defaults.get("domain_name")
-    warnings: list[str] = []
-
-    if checkpoint_domain is not None:
-        checkpoint_domain = str(checkpoint_domain).strip().lower()
-        explicit_domain_name = (
-            str(domain_name).strip().lower()
-            if domain_name is not None and str(domain_name).strip()
-            else None
-        )
-        checkpoint_domain_id = EMBODIMENT_TO_DOMAIN_ID.get(checkpoint_domain)
-        domain_id_matches = domain_id is not None and checkpoint_domain_id == int(domain_id)
-        if explicit_domain_name is None and (domain_id is None or domain_id_matches):
-            domain_name = checkpoint_domain
-        elif explicit_domain_name != checkpoint_domain:
-            warnings.append(
-                f"Cosmos3 domain_name={domain_name!r}, domain_id={domain_id!r} overrides "
-                f"checkpoint policy domain_name={checkpoint_domain!r}; checkpoint domain "
-                "defaults will not be applied."
-            )
-
-    policy_domain_matches = checkpoint_domain is not None and (
-        (domain_name is not None and str(domain_name).strip().lower() == checkpoint_domain)
-        or (
-            domain_name is None
-            and domain_id is not None
-            and EMBODIMENT_TO_DOMAIN_ID.get(checkpoint_domain) == int(domain_id)
-        )
-    )
-    policy_defaults = checkpoint_policy_defaults if policy_domain_matches else {}
-
-    preset_key = canonical_domain_preset_key(domain_name, domain_id)
-    preset = COSMOS3_DOMAIN_PRESETS.get(preset_key) if preset_key else None
-
-    domain_requested = (domain_name is not None and str(domain_name).strip() != "") or (
-        domain_id is not None and str(domain_id).strip() not in {"", "0"}
-    )
-    if domain_requested and preset is None:
-        warnings.append(
-            "Cosmos3 action domain preset was not found for "
-            f"domain_name={domain_name!r}, domain_id={domain_id!r}; "
-            "using generic action defaults for omitted fields."
-        )
-
-    def _resolve_field(
-        field: str,
-        current: Any,
-        *,
-        fallback: Any = None,
-    ) -> Any:
-        recommended = policy_defaults.get(field)
-        if recommended is None:
-            recommended = preset.get(field) if preset else None
-        if current is not None:
-            if recommended is not None and current != recommended:
-                warnings.append(
-                    f"Cosmos3 {field}={current} differs from recommended "
-                    f"{recommended} for domain {preset_key!r}."
-                )
-            return current
-        if recommended is not None:
-            return recommended
-        return fallback
-
-    # The action width is canonical per embodiment, so it comes from the
-    # embodiment table rather than the (alias-shared) sampling preset.
-    canonical_raw_action_dim = resolve_raw_action_dim(domain_name=domain_name, domain_id=domain_id)
-    recommended_raw_action_dim = policy_defaults.get("raw_action_dim", canonical_raw_action_dim)
-    if raw_action_dim is not None:
-        if recommended_raw_action_dim is not None and int(raw_action_dim) != int(
-            recommended_raw_action_dim
-        ):
-            warnings.append(
-                f"Cosmos3 raw_action_dim={raw_action_dim} differs from the recommended width "
-                f"{recommended_raw_action_dim} for domain_name={domain_name!r}."
-            )
-        resolved_raw_action_dim = raw_action_dim
-    else:
-        resolved_raw_action_dim = recommended_raw_action_dim
-        if domain_requested and recommended_raw_action_dim is None:
-            warnings.append(
-                "Cosmos3 has no canonical action width for "
-                f"domain_name={domain_name!r}, domain_id={domain_id!r}; "
-                "pass raw_action_dim explicitly for policy/inverse_dynamics."
-            )
-    resolved_chunk = _resolve_field(
-        "action_chunk_size",
-        action_chunk_size,
-        fallback=COSMOS3_ACTION_PARAMS["action_chunk_size"],
-    )
-    resolved_resolution = normalize_action_resolution(
-        _resolve_field(
-            "action_resolution",
-            action_resolution,
-            fallback=480,
-        )
-    )
-    resolved_frame_rate = _resolve_field(
-        "frame_rate",
-        frame_rate,
-        fallback=COSMOS3_ACTION_PARAMS["frame_rate"],
-    )
-    # Always derived: an action clip is the chunk plus its initial frame. Both
-    # references fix this, and diffusers rejects a caller-supplied num_frames
-    # for action runs outright, so a preset must not pin it independently of
-    # an overridden action_chunk_size.
-    resolved_num_frames = int(resolved_chunk) + 1
-    resolved_action_fps = (
-        float(action_fps)
-        if action_fps is not None
-        else float(policy_defaults.get("action_fps", resolved_frame_rate))
-    )
-    recommended_use_state = bool(policy_defaults.get("use_state", False))
-    resolved_use_state = recommended_use_state if use_state is None else bool(use_state)
-    if (
-        use_state is not None
-        and "use_state" in policy_defaults
-        and resolved_use_state != recommended_use_state
-    ):
-        warnings.append(
-            f"Cosmos3 use_state={resolved_use_state} differs from checkpoint policy "
-            f"default {recommended_use_state}."
-        )
-    if resolved_raw_action_dim is not None and int(resolved_raw_action_dim) <= 0:
-        raise ValueError(f"Cosmos3 raw_action_dim must be positive, got {resolved_raw_action_dim}.")
-    if int(resolved_chunk) <= 0:
-        raise ValueError(f"Cosmos3 action_chunk_size must be positive, got {resolved_chunk}.")
-    if float(resolved_frame_rate) <= 0.0:
-        raise ValueError(f"Cosmos3 frame_rate must be positive, got {resolved_frame_rate}.")
-    if resolved_action_fps <= 0.0:
-        raise ValueError(f"Cosmos3 action_fps must be positive, got {resolved_action_fps}.")
-    if int(resolved_num_frames) <= 0:
-        raise ValueError(f"Cosmos3 num_frames must be positive, got {resolved_num_frames}.")
-
-    return {
-        "domain_name": domain_name,
-        "checkpoint_policy_domain_matches": policy_domain_matches,
-        "raw_action_dim": resolved_raw_action_dim,
-        "action_chunk_size": int(resolved_chunk),
-        "action_resolution": resolved_resolution,
-        "frame_rate": float(resolved_frame_rate),
-        "action_fps": resolved_action_fps,
-        "use_state": resolved_use_state,
-        "num_frames": int(resolved_num_frames),
-        "preset_key": preset_key,
-        "warnings": warnings,
-    }
-
-
-COSMOS3_V2V_DEFAULT_FLOW_SHIFT = 10.0
+# Prompt format the checkpoints were trained with. The "give" typo is the training
+# text; keep it. Metadata sentences are appended to the caption the same way.
+COSMOS3_DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant who will generate videos from a give prompt."
+)
+COSMOS3_T2I_SYSTEM_PROMPT = (
+    "You are a helpful assistant who will generate images from a give prompt."
+)
+COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
+COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
+COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
@@ -775,9 +762,11 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="float",
         default=None,
         description=(
-            "Optional scheduler flow shift override. Uses the Cosmos3 mode default when "
-            "omitted. Applies to the shifted-linear flow grids; it has no effect on the "
-            "Karras grid (an error with sigma_grid='karras', a warning otherwise)."
+            "Optional scheduler flow shift. When omitted, the shift is the override for "
+            "this kind of request if one applies, else the checkpoint scheduler's value "
+            "(see the Cosmos3 README). Applies to the shifted-linear flow grids; it has no "
+            "effect on the Karras grid (an error with sigma_grid='karras', a warning "
+            "otherwise)."
         ),
     ),
     "sigma_grid": ExtraParamSchema(
@@ -787,7 +776,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "Sigma grid for base (non-distilled) checkpoints. 'karras': the checkpoint's "
             "Karras levels; 'native': the Cosmos framework's shifted-linear flow grid; "
             "'diffusers': the Diffusers UniPC shifted-linear flow grid. Both linear grids "
-            "use flow_shift, or the mode default when it is omitted. Unset uses the mode's "
+            "use flow_shift, or the resolved shift when it is omitted. Unset uses the mode's "
             "grid (see the Cosmos3 README). Rejected for distilled checkpoints."
         ),
     ),
@@ -807,7 +796,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description=(
             "Embodiment domain name for action generation (e.g. bridge_orig_lerobot, av). "
             "When set, omitted raw_action_dim/action_chunk_size/action_resolution/frame_rate "
-            "are filled from COSMOS3_DOMAIN_PRESETS; mismatches are logged as warnings."
+            "are filled from the embodiment's defaults; mismatches are logged as warnings."
         ),
     ),
     "domain_id": ExtraParamSchema(

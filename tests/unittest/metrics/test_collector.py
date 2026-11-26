@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+from collections.abc import Iterator
 from typing import Dict
 
 import pytest
@@ -28,18 +29,17 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
-def clean_registry():
+def clean_registry() -> Iterator[None]:
     """Unregister all custom collectors between tests to avoid duplicate metric errors."""
-    collectors_to_remove = []
-    for collector in REGISTRY._names_to_collectors.values():
-        if hasattr(collector, "_name") and collector._name.startswith("trtllm_"):
-            collectors_to_remove.append(collector)
-    for collector in set(collectors_to_remove):
-        try:
-            REGISTRY.unregister(collector)
-        except Exception:
-            pass
+
+    def clear() -> None:
+        for metric in tuple(REGISTRY._collector_to_names):
+            if getattr(metric, "_name", "").startswith("trtllm_"):
+                REGISTRY.unregister(metric)
+
+    clear()
     yield
+    clear()
 
 
 @pytest.fixture
@@ -124,6 +124,40 @@ class TestIterationStatsTopLevel:
     def test_iteration_latency_ms_to_seconds(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
         assert _get_gauge_value(collector, "iteration_latency_seconds") == pytest.approx(0.0155)
+
+    def test_encoder_samples_preserve_calls_and_convert_units(self, collector):
+        collector.log_iteration_stats({"multimodalEncoderStats": {"gpuTimesMS": [2.0, 4.0]}})
+        collector.log_iteration_stats({})
+        labels = collector.labels
+        assert (
+            REGISTRY.get_sample_value("trtllm_multimodal_encoder_gpu_time_seconds_count", labels)
+            == 2
+        )
+        assert REGISTRY.get_sample_value(
+            "trtllm_multimodal_encoder_gpu_time_seconds_sum", labels
+        ) == pytest.approx(0.006)
+
+    def test_input_processing_separates_stages_and_worker_queue(self, collector):
+        collector.log_input_processing("media_load", 0.25)
+        collector.log_input_processing("processor", 0.04)
+        collector.log_input_processing("processor_queue", 0.1)
+        for stage, elapsed in (("media_load", 0.25), ("processor", 0.04)):
+            assert REGISTRY.get_sample_value(
+                "trtllm_input_processing_seconds_sum", {**collector.labels, "stage": stage}
+            ) == pytest.approx(elapsed)
+        assert REGISTRY.get_sample_value(
+            "trtllm_input_processing_queue_seconds_sum", collector.labels
+        ) == pytest.approx(0.1)
+
+    def test_media_processing_is_labeled_per_item(self, collector):
+        collector.log_input_processing("download", 0.1, "image")
+        collector.log_input_processing("decode", 0.02, "image")
+        collector.log_input_processing("decode", 0.03, "image")
+        labels = {**collector.labels, "stage": "decode", "modality": "image"}
+        assert REGISTRY.get_sample_value("trtllm_media_processing_seconds_count", labels) == 2
+        assert REGISTRY.get_sample_value(
+            "trtllm_media_processing_seconds_sum", labels
+        ) == pytest.approx(0.05)
 
     def test_memory_usage(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
@@ -443,6 +477,45 @@ class TestSpecDecodingStats:
         """No error when specDecodingStats is absent."""
         stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "specDecodingStats"}
         collector.log_iteration_stats(stats)
+
+
+class TestSharedPrefixAttnStats:
+    """Cumulative shared-prefix attention counters become per-rank Prometheus increments."""
+
+    NAMES = {
+        "requestSteps": "trtllm_shared_prefix_attn_request_steps_total",
+        "shareableRequestSteps": "trtllm_shared_prefix_attn_shareable_request_steps_total",
+        "sharedRequestSteps": "trtllm_shared_prefix_attn_shared_request_steps_total",
+    }
+
+    def _values(self, collector, rank="0"):
+        labels = {**collector.labels, "dp_rank": rank}
+        return {key: REGISTRY.get_sample_value(name, labels) for key, name in self.NAMES.items()}
+
+    def test_counts_increase_per_rank(self, collector):
+        records = [
+            (0, {"requestSteps": 10, "shareableRequestSteps": 8, "sharedRequestSteps": 6}),
+            (1, {"requestSteps": 7, "shareableRequestSteps": 7, "sharedRequestSteps": 7}),
+            # A record was missed in between: the totals are still exact.
+            (0, {"requestSteps": 30, "shareableRequestSteps": 20, "sharedRequestSteps": 15}),
+            # The engine restarted its counts: new baseline, no increment.
+            (0, {"requestSteps": 4, "shareableRequestSteps": 4, "sharedRequestSteps": 4}),
+            (0, {"requestSteps": 9, "shareableRequestSteps": 6, "sharedRequestSteps": 5}),
+        ]
+        for rank, record in records:
+            collector.log_iteration_stats(
+                {"attentionDpRank": rank, "sharedPrefixAttnStats": record}
+            )
+        assert self._values(collector, "0") == {
+            "requestSteps": 35.0,
+            "shareableRequestSteps": 22.0,
+            "sharedRequestSteps": 16.0,
+        }
+        assert self._values(collector, "1") == {
+            "requestSteps": 7.0,
+            "shareableRequestSteps": 7.0,
+            "sharedRequestSteps": 7.0,
+        }
 
 
 class TestPartialStats:
@@ -871,6 +944,81 @@ class TestProcessReqPerfMetrics:
 
     def test_empty_stats_returns_empty(self):
         assert process_req_perf_metrics(None, output_length=10) == {}
+
+
+class TestCollectedRequestRecords:
+    @pytest.mark.parametrize("exposure", ["http", "openengine"])
+    def test_completed_request_record_is_collected_once_and_exposed_directly(
+        self, collector, exposure
+    ):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm.executor.result import GenerationResultBase
+        from tensorrt_llm.metrics.perf import PerfMetricsCollector, PerfMetricsRecord
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result.finished = True
+        result.prompt_token_ids = [1, 2]
+        result.per_pos_drafted = [4, 2]
+        result.per_pos_accepted = [3, 1]
+        output = SimpleNamespace(
+            finish_reason="end_id",
+            token_ids=[3, 4],
+            request_perf_metrics=None,
+            prompt_logprobs=None,
+            length=2,
+            cumulative_logprob=None,
+            logprobs=None,
+        )
+        stats = {
+            RequestEventTiming.ARRIVAL_TIME: 10.0,
+            RequestEventTiming.FIRST_TOKEN_TIME: 11.0,
+            RequestEventTiming.LAST_TOKEN_TIME: 12.0,
+        }
+        with (
+            patch.object(
+                PerfMetricsCollector, "collect_request", wraps=PerfMetricsCollector.collect_request
+            ) as collect,
+            patch.object(
+                PerfMetricsRecord, "request_metrics", side_effect=AssertionError("unexpected thaw")
+            ),
+        ):
+            result.record_stats(output, stats)
+            result.per_pos_accepted[0] = 99
+            result.per_pos_drafted[0] = 99
+            assert result.candidate_metrics[0][MetricNames.SPEC_DEC_ACCEPTED_PER_POS] == [3, 1]
+            assert result.candidate_metrics[0][MetricNames.SPEC_DEC_DRAFTED_PER_POS] == [4, 2]
+            # Compatibility dictionaries stay mutable without changing the collected observation.
+            result.candidate_metrics[0][MetricNames.E2E] = 999
+            result.candidate_metrics[0][MetricNames.SPEC_DEC_ACCEPTED_PER_POS][0] = 999
+            if exposure == "http":
+                from tensorrt_llm.serve.openai_server import OpenAIServer
+
+                server = SimpleNamespace(
+                    metrics_collector=collector,
+                    _collect_perf_metrics=False,
+                    _iteration_stats_collector_task=None,
+                )
+                asyncio.run(OpenAIServer._extract_metrics(server, result, None))
+            else:
+                from tensorrt_llm.grpc.openengine.metrics import OpenEngineMetrics
+
+                metrics = SimpleNamespace(
+                    collector=collector, _collect_requests=True, _record_error=Mock()
+                )
+                OpenEngineMetrics.record_result(metrics, result)
+                metrics._record_error.assert_not_called()
+            assert collect.call_count == 1
+        assert _get_counter_value(collector, "counter_generation_tokens") == 2
+        assert _get_counter_value(collector, "counter_prompt_tokens") == 2
+        assert _get_histogram_count(collector, "histogram_e2e_time_request") == 1
+        assert _get_histogram_sum(collector, "histogram_e2e_time_request") == 2.0
+        assert result.candidate_metric_records[0].per_req[
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS
+        ] == (3, 1)
 
 
 class TestCustomHistogramBuckets:

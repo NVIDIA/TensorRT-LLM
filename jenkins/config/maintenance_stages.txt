@@ -28,6 +28,5 @@
 # H100_PCIe-*
 # DGX_H100-*
 
-Reason: nsc-svg-slurm-1 compute outage with no backup route, 2026-11-13 00:00-07:00 Beijing time. H100_PCIe-PyTorch-Perf-1 was retired from main; skip the legacy stage in older PR revisions.
+Reason: H100_PCIe-PyTorch-Perf-1 was retired from main; skip the legacy stage in older PR revisions.
 H100_PCIe-PyTorch-Perf-1
-DGX_B200-*

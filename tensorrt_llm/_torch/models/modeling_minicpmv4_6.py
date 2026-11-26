@@ -22,7 +22,7 @@ model does *not* use mRoPE).
 """
 
 import dataclasses
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -65,7 +65,15 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata
-from .modeling_utils import QuantConfig, _load_weights_impl, register_auto_model
+from .modeling_utils import (
+    QuantConfig,
+    _load_weights_impl,
+    register_auto_model,
+    resolve_recurrent_state_spec,
+)
+
+if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
@@ -526,7 +534,9 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
         # projection would then all-reduce data that was never sharded across
         # ranks and produce wrong output.
         vision_model_config = dataclasses.replace(
-            model_config, quant_config=QuantConfig(), mapping=Mapping()
+            model_config.with_encoder_attention_backend("vision"),
+            quant_config=QuantConfig(),
+            mapping=Mapping(),
         )
         self.model_config = vision_model_config
         self.config = self.vision_config
@@ -541,7 +551,7 @@ class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
         self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(vision_model_config)
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
-        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        self.metadata_cls = get_attention_backend(vision_model_config.attn_backend).Metadata
         # Per-segment capacity required by the shared encoder metadata helper.
         # Like the Qwen-VL and Cosmos3 vision towers, default to the model's
         # token budget rather than the live grid length. The engine replaces it
@@ -771,8 +781,6 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         do_rescale = True
         if images and isinstance(images[0], torch.Tensor):
             do_rescale = False
-        # load_video hands us CHW float frames already scaled to [0, 1], so
-        # the HF rescale (x / 255) must be skipped for video.
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
         call_kwargs = dict(
@@ -802,7 +810,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     def get_num_tokens_per_video(self, *, video, video_metadata=None, **kwargs) -> int:
         # `video` is the list of pre-sampled frames (see find_mm_token_lengths).
         frames = video
-        do_rescale = not (frames and isinstance(frames[0], torch.Tensor))
+        do_rescale = not (len(frames) and isinstance(frames[0], torch.Tensor))
         processed = self.processor(
             text=[self.video_token_str],
             videos=[frames],
@@ -901,6 +909,26 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ),
 )
 class MiniCPMV4_6Model(PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec | None":
+        """Return the declaration of the language model that ``text_config`` selects."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return resolve_recurrent_state_spec(text_config, quant_config=quant_config)
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)

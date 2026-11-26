@@ -9,7 +9,7 @@ import torch
 
 source = (
     Path(__file__).resolve().parents[8]
-    / "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/_pool_layout.py"
+    / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/_pool_layout.py"
 )
 spec = importlib.util.spec_from_file_location("_k3_kda_pool_layout_test", source)
 op = importlib.util.module_from_spec(spec)

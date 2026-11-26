@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
 PRIMS_TS = "prims_ts"
 PRIMS_TS_BLOCK_SPARSE = "prims_ts_block_sparse"
 PRIMS_TS_SPARSE_MLA = "prims_ts_sparse_mla"
+SAMPLING_SHARED_PREFIX = "sampling_shared_prefix"
 
 
 def _canonical_names() -> tuple[str, ...]:
@@ -35,19 +36,38 @@ def _enabled_names() -> tuple[str, ...]:
 
 def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
     names = _canonical_names()
+    assert names.index("triton_custom_mask") < names.index(PRIMS_TS)
+    assert names.index(PRIMS_TS) < names.index("cute_dsl_mla")
     assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
     assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("flashinfer_trtllm_gen")
     assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("fallback")
 
 
-def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_fmha_libs_include_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
-    assert PRIMS_TS not in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS in registry.DEFAULT_FMHA_LIBS
     assert PRIMS_TS_SPARSE_MLA in registry.DEFAULT_FMHA_LIBS
     assert PRIMS_TS_BLOCK_SPARSE in registry.DEFAULT_FMHA_LIBS
     assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
+
+
+def test_sampling_shared_prefix_is_opt_in_and_precedes_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert SAMPLING_SHARED_PREFIX not in registry.DEFAULT_FMHA_LIBS
+    assert not registry.is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX)
+
+    names = _canonical_names()
+    assert names.index(SAMPLING_SHARED_PREFIX) < names.index("fallback")
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{SAMPLING_SHARED_PREFIX}")
+    assert registry.is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX)
+    enabled = _enabled_names()
+    assert SAMPLING_SHARED_PREFIX in enabled
+    assert enabled.index(SAMPLING_SHARED_PREFIX) < enabled.index("fallback")
 
 
 def test_only_the_block_sparse_fmha_declares_block_sparse_support() -> None:
@@ -75,7 +95,7 @@ def test_exact_fmha_lib_env_preserves_order_and_deduplicates(
     assert _enabled_names() == (other_name, PRIMS_TS)
 
 
-def test_delta_fmha_lib_env_adds_prims_ts_in_canonical_order(
+def test_delta_fmha_lib_env_keeps_prims_ts_in_canonical_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{PRIMS_TS}")
@@ -85,7 +105,7 @@ def test_delta_fmha_lib_env_adds_prims_ts_in_canonical_order(
 
 
 def test_delta_fmha_lib_env_removes_default_library(monkeypatch: pytest.MonkeyPatch) -> None:
-    removed_name = registry.DEFAULT_FMHA_LIBS[-1]
+    removed_name = PRIMS_TS
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{removed_name}")
 
     expected_names = set(registry.DEFAULT_FMHA_LIBS) - {removed_name}
@@ -114,3 +134,39 @@ def test_empty_delta_fmha_lib_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ValueError, match="Invalid empty FMHA library entry"):
         registry.get_enabled_fmha_lib_classes()
+
+
+def test_beam_shared_prefix_is_opt_in_and_precedes_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    beam = "beam_shared_prefix"
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert beam not in registry.DEFAULT_FMHA_LIBS
+    assert beam not in _enabled_names()
+
+    names = _canonical_names()
+    assert names.index(beam) < names.index("fallback")
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{beam}")
+    enabled = _enabled_names()
+    assert beam in enabled
+    assert enabled.index(beam) < enabled.index("fallback")
+
+
+def test_only_enabled_libraries_that_plan_steps_are_planned_and_report_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare() runs ``plan_step`` of, and the executor reports ``step_stats`` of, the enabled
+    libraries that define them; with the default libraries there are none, so steady decode steps
+    stay available."""
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    assert registry.step_planning_fmha_lib_classes() == ()
+    assert registry.step_stats_fmha_lib_classes() == ()
+
+    shared_prefix = registry.FMHA_LIBS[SAMPLING_SHARED_PREFIX]
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{SAMPLING_SHARED_PREFIX},+flash_attn4_generation")
+    assert registry.step_planning_fmha_lib_classes() == (shared_prefix,)
+    assert registry.step_stats_fmha_lib_classes() == (shared_prefix,)
+    assert {name for name, cls in registry.FMHA_LIBS.items() if cls.plans_steps()} == {
+        SAMPLING_SHARED_PREFIX
+    }
