@@ -44,9 +44,10 @@ Keep parallel rules with their caller. Create a component when several operation
 
 ### Allowed dependencies
 
-- **Start in V2.** Check the LLM and VisualGen V2 catalogs first. Implement missing ops and kernels in the V2 model or catalog that owns them. You can use VisualGen runtime services and public third-party APIs directly.
-- **Keep V1 unchanged.** V2 may call a mature, model-agnostic kernel or runner through its existing interface when reimplementing it would duplicate substantial work. Attention and GEMM are common examples. Keep adapters and model decisions in V2.
-- **Review every V1 backend dependency.** In the migration PR, list the V2 caller, the V1 file and symbol, and the reason for reuse. Include indirect calls and fallbacks. If there are no exceptions, say so.
+- **Prefer a self-contained V2 implementation from op to kernel.** Check the LLM and VisualGen V2 catalogs first. Use VisualGen runtime services and public third-party APIs directly.
+- **Keep V1 model and backend implementations unchanged during migration.** Keep model decisions in the V2 family or target and put each adapter with its V2 caller.
+- **Treat imports from a V1 backend as an exception.** Reuse a mature, model-agnostic kernel or runner through its existing interface when reimplementing it would duplicate substantial work. Attention and GEMM are common examples. Write or port a V2 kernel if existing implementations fall short on results, layout, hardware support or measured performance.
+- **List every V1 backend dependency in the migration PR for review.** Give the V2 caller, V1 file and symbol, and reason for reuse. Include indirect calls and fallbacks. If there are no exceptions, say so.
 
 ## Feature development during migration
 
