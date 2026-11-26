@@ -103,7 +103,8 @@ from .benchmark_request_stages import (BenchmarkRequestStage,
                                        parse_benchmark_request_stages)
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .connectors.kv_cache_layout import build_kv_cache_layout_v2
+from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
+                                         has_state_layers)
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
@@ -2003,7 +2004,14 @@ class PyExecutor:
                     "is registered with a single primary pool, but VSWA "
                     "models allocate one pool per window size.")
 
-            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+            # A V2 cache says in its layout which layers keep recurrent state.
+            # V1 has no layout to ask, so its recurrent managers are named.
+            if is_kv_cache_manager_v2:
+                keeps_recurrent_state = has_state_layers(self.kv_cache_manager)
+            else:
+                keeps_recurrent_state = isinstance(self.kv_cache_manager,
+                                                   BaseMambaCacheManager)
+            if keeps_recurrent_state:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with Mamba / hybrid "
                     "linear-attention models. Mamba layers carry SSM state "
@@ -4582,8 +4590,7 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
-                    if hasattr(self.kv_cache_manager,
-                               "prepare_expect_snapshot_points"):
+                    if self.kv_cache_manager is not None:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
@@ -8963,6 +8970,8 @@ class PyExecutor:
                     raise ValueError(
                         f"Embedding bias index must be in [0, {self._num_embeddings - 1}]"
                     )
+                if not math.isfinite(val):
+                    raise ValueError("Embedding bias values must be finite")
 
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
@@ -10841,7 +10850,7 @@ class PyExecutor:
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
                                                  forward_completion="clear")
-        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+        if self.kv_cache_manager is not None:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
@@ -11944,7 +11953,7 @@ class PyExecutor:
         if self.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            if isinstance(kv_mgr, BaseMambaCacheManager):
+            if kv_mgr is not None:
                 kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
@@ -13243,9 +13252,8 @@ class PyExecutor:
                 # request has filled; give it the same finish handshake the
                 # post-batch cancellation path runs before pages are freed.
                 self._start_connector_async_save(request)
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13324,10 +13332,8 @@ class PyExecutor:
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)

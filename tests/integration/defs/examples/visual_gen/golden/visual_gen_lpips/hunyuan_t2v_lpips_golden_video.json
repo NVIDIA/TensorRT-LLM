@@ -15,9 +15,13 @@
   "deterministic_algorithms": true,
   "lpips_net": "alex",
   "lpips_threshold": 0.05,
-  "diffusers_version": "0.39.0",
-  "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
-  "tensorrt_llm_version": "1.3.0rc28",
-  "tensorrt_llm_commit": "aacb3bd13af3c31d36084b762e0f9443795d9c4c",
-  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607271403-16694"
+  "diffusers_version": "0.40.0",
+  "torch_version": "2.14.0a0+b2c75dd062.nv26.09",
+  "flashinfer_version": "0.7.3",
+  "tensorrt_llm_version": "1.4.0rc5",
+  "tensorrt_llm_commit": "c82d8d6bc317fd3a2ad9de86da5b8252a6420ded",
+  "native_artifacts_commit": "81339f9ecd48106186b956dce158a5ee68611679",
+  "container_image_tag": "pytorch-26.09-py3-x86_64-ubuntu24.04-skip-tritondevel-202611191904-21381",
+  "gpu": "NVIDIA B200",
+  "sha256": "e8c28a756c4a0991cf8c3bbc73fa925cebb50891957bf377cef3c9a1dead5bff"
 }

@@ -54,7 +54,8 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
-from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            _validate_media_io_kwargs)
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -704,6 +705,7 @@ class OpenAIServer(_VideoRoutesMixin):
         ip = getattr(self.generator, "input_processor", None)
         if isinstance(ip, BaseMultimodalInputProcessor):
             model_pref = ip.get_preferred_media_io_kwargs() or {}
+            _validate_media_io_kwargs(model_pref)
             if model_pref:
                 cfg = self.multimodal_server_config or MultimodalServerConfig()
                 merged = {m: dict(kw) for m, kw in model_pref.items()}
@@ -3687,6 +3689,19 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
+            # The promise yields itself as each result, so a promise that is
+            # already finished is its own first and last result and the
+            # stream ends with that result's terminal event.
+            first_response = await anext(promise, promise)
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+            pp_results = first_response.outputs[
+                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                    first_response, args)
+            for pp_res in pp_results:
+                yield pp_res
+            # The loop below binds nothing when there is only one result.
+            res = first_response
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(

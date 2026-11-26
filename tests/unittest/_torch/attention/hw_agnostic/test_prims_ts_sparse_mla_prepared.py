@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-only checks for the prepared sparse MLA launch contract."""
+"""Host-only check of the sparse MLA exported kernel calling convention."""
+
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -28,7 +30,9 @@ def _assert_same_argument(actual: object, expected: object) -> None:
 
 @pytest.mark.parametrize("extra_pool", [False, True])
 @pytest.mark.parametrize("has_workspace", [False, True])
-def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_workspace: bool) -> None:
+def test_trusted_sparse_mla_matches_exported_launch_abi(
+    extra_pool: bool, has_workspace: bool
+) -> None:
     rows, heads, topk = 2, 64, 4
     extra_topk = 3 if extra_pool else 0
     query = torch.zeros(rows, 1, heads, 512, dtype=torch.bfloat16)
@@ -38,114 +42,78 @@ def test_prepared_sparse_mla_matches_full_launch_abi(extra_pool: bool, has_works
     extra_indices = torch.zeros(rows, max(extra_topk, 1), dtype=torch.int32)
     extra_lengths = torch.full((rows,), extra_topk, dtype=torch.int32)
     primary = torch.ones(8, 1, 512, dtype=torch.bfloat16)
-    secondary = torch.full_like(primary, 2) if extra_pool else primary
+    secondary = torch.full_like(primary, 2)
     core = torch.empty(1024 if has_workspace else 0, dtype=torch.int8)
     lse = torch.empty(rows, 1, heads, dtype=torch.float32)
     sinks = torch.zeros(heads)
     split_kv = 2 if has_workspace else 1
-    calls = []
-
-    def compiled(
-        q_latent: torch.Tensor,
-        q_rope: torch.Tensor,
-        c_latent: torch.Tensor,
-        c_rope: torch.Tensor,
-        page_offsets: torch.Tensor,
-        output: torch.Tensor,
-        softmax_lse: torch.Tensor,
-        workspace: torch.Tensor | None,
-        splits: int,
-        cache_seqs: torch.Tensor,
-        cu_seqlens_q: torch.Tensor | None,
-        sparse_inputs: tuple,
-        softmax_scale: float,
-        output_scale: float,
-        output_quant_args: tuple | None,
-        max_q_len: int,
-        cp_rank: int,
-    ) -> None:
-        # The exported TVM-FFI callable has no Python defaults for these slots.
-        calls.append(
-            (
-                q_latent,
-                q_rope,
-                c_latent,
-                c_rope,
-                page_offsets,
-                output,
-                softmax_lse,
-                workspace,
-                splits,
-                cache_seqs,
-                cu_seqlens_q,
-                sparse_inputs,
-                softmax_scale,
-                output_scale,
-                output_quant_args,
-                max_q_len,
-                cp_rank,
-            )
-        )
+    compiled = Mock()
 
     wrapper = object.__new__(mla_decode.BatchSparseMLADecodePagedTSWrapper)
     wrapper._state = dict(
-        batch_size=rows,
-        num_qo_heads=heads,
         device=query.device,
-        q_dtype=query.dtype,
-        requested_splits=split_kv,
-        buffers={"core": core, "public_lse": lse},
-        compiled=compiled,
-    )
-    prepared = dict(
-        ks=topk,
-        kc=extra_topk,
-        dummy_indices=extra_indices,
-        default_cl=extra_lengths,
-        c_latent=primary.permute(1, 2, 0),
-        c_rope=secondary.permute(1, 2, 0),
-        sinks=sinks,
-        bmm=(0.5, 1.0),
-    )
-    assert (
-        wrapper._run_prepared(
-            prepared,
-            query,
-            indices,
-            lengths,
-            extra_indices if extra_pool else None,
-            extra_lengths if extra_pool else None,
-            out,
-        )
-        is out
-    )
-    assert len(calls) == 1
-    assert calls[0][-3:] == (None, 1, 0)
-
-    runtime = mla_decode._MLARuntime(
-        query=query,
-        normalized_cache=primary,
-        out=out,
-        num_physical_pages=primary.shape[0],
+        num_qo_heads=heads,
+        packed_query=False,
+        kv_cache_format="native",
+        extra_kv_cache_format="native",
+        cache_dim=512,
+        extra_cache_dim=512,
+        max_topk=topk,
+        max_extra_topk=extra_topk,
+        use_attention_sinks=True,
         softmax_scale=0.5,
         output_scale=1.0,
-        extra_cache=secondary,
-        sparse_inputs=(indices, extra_indices, lengths, extra_lengths, sinks, 1.0),
+        kv_cache_scale=1.0,
+        output_quant=None,
+        return_lse=False,
+        reload_d576=False,
+        requested_splits=split_kv,
+        buffers={"core": core, "public_lse": lse},
+        dummy_cache=secondary,
+        dummy_indices=extra_indices,
+        default_cl=extra_lengths,
+        view_cache={
+            name: mla_decode._TensorViewCache()
+            for name in ("query", "kv_cache", "extra_kv_cache", "indices", "out", "lse")
+        },
+        view_context=None,
+        compiled=compiled,
     )
-    assert (
-        mla_decode._launch_mla_decode(
-            runtime,
-            block_tables=indices,
-            seq_lens_kv=lengths,
-            qo_indptr=None,
-            packed_query=False,
-            kv_lora_rank=512,
-            split_kv=split_kv,
-            max_q_len=1,
-            workspace=mla_decode._MLAWorkspaceViews(core if has_workspace else None, lse),
-            compiled=compiled,
+    q_view = query.permute(2, 3, 1, 0)
+    expected = (
+        q_view,
+        q_view,
+        primary.permute(1, 2, 0),
+        secondary.permute(1, 2, 0),
+        indices.T,
+        out.permute(2, 3, 1, 0),
+        lse.permute(2, 1, 0),
+        core if has_workspace else None,
+        split_kv,
+        lengths,
+        None,
+        (indices, extra_indices, lengths, extra_lengths, sinks, 1.0),
+        0.5,
+        1.0,
+        None,
+        1,
+        0,
+    )
+    # The third launch reuses bindings admitted on the second observation.
+    for _ in range(3):
+        result = wrapper.run(
+            query,
+            primary,
+            indices,
+            lengths,
+            secondary if extra_pool else None,
+            extra_indices=extra_indices if extra_pool else None,
+            extra_lengths=extra_lengths if extra_pool else None,
+            attention_sinks=sinks,
+            out=out,
+            validate=False,
         )
-        is out
-    )
-    assert len(calls) == 2
-    _assert_same_argument(calls[0], calls[1])
+        assert result is out
+        assert not compiled.call_args.kwargs
+        _assert_same_argument(compiled.call_args.args, expected)
+    assert compiled.call_count == 3

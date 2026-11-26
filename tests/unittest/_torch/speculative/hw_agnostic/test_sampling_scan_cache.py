@@ -5,10 +5,11 @@ and sets the temperature-only graph key bit only for batches the sharded Gumbel-
 
 import types
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.speculative.interface import SpecMetadata, one_model_sampling_mode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -134,15 +135,31 @@ def _temperature_only(requests):
         (dict(_TEMPERATURE_ONLY, min_p=0.05), False),
         (dict(_TEMPERATURE_ONLY, seed=7), False),
         (dict(_TEMPERATURE_ONLY, seed=2**64 - 1), False),
+        # Below the greedy threshold the sharded draw is an argmax, while the stock sampler
+        # still splits tied maxima.
+        (
+            dict(
+                _TEMPERATURE_ONLY, temperature=float(np.nextafter(np.float32(1e-4), np.float32(0)))
+            ),
+            False,
+        ),
+        (dict(_TEMPERATURE_ONLY, temperature=float(np.float32(1e-4))), True),
     ],
 )
 def test_temperature_only_takes_unfiltered_unseeded_sampled_rows(params, expected):
+    params = dict(params)
+    temperature = params.pop("temperature", 0.7)
     # Greedy rows stay greedy on the sharded path whatever their filters or seed.
     greedy = [_Req(6, 0, 0.0, seed=3), _Req(7, 1, 0.7, top_k=1, top_p=None, seed=3)]
-    assert _temperature_only([_Req(5, 2, 0.7, **params), *greedy]) is expected
-    # One filtered or seeded sampled row keeps the whole batch on the stock sampler.
+    batch = [_Req(5, 2, temperature, **params), *greedy]
+    assert _temperature_only(batch) is expected
+    dspark = _metadata(samples_from_vocab_shards=True)
+    _scan(dspark, batch)
+    assert dspark.is_all_temperature_only is expected
+    assert bool(one_model_sampling_mode(batch, dspark) & 2) is expected
+    # One filtered, seeded or sub-threshold sampled row keeps the whole batch on the stock sampler.
     other = _Req(8, 3, 1.3, **_TEMPERATURE_ONLY)
-    assert _temperature_only([other, _Req(5, 2, 0.7, **params)]) is expected
+    assert _temperature_only([other, _Req(5, 2, temperature, **params)]) is expected
 
 
 def test_temperature_only_min_p_alone_samples_off_the_sharded_path():

@@ -219,7 +219,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
         executor.scheduler.schedule_request.return_value = SimpleNamespace(
             fitting_disagg_gen_init_requests=[]
         )
-        executor.kv_cache_manager = Mock(spec=[])
+        executor.kv_cache_manager = Mock(spec=["prepare_expect_snapshot_points"])
     return executor
 
 
