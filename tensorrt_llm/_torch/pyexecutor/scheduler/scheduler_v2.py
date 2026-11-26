@@ -139,15 +139,30 @@ class BudgetTracker:
         self._claimed_peft_pages += peft_pages
         self._seen_peft_task_ids.add(lora_task_id)
 
+    def uncommit_peft(self, lora_task_id: int, peft_pages: int) -> None:
+        """Release a tentative PEFT reservation that no scheduled request used."""
+        if peft_pages > 0 and lora_task_id in self._seen_peft_task_ids:
+            self._claimed_peft_pages -= peft_pages
+            self._seen_peft_task_ids.discard(lora_task_id)
+
     # ---- PEFT budget ----
+
+    @property
+    def claimed_peft_pages(self) -> int:
+        return self._claimed_peft_pages
+
+    def has_seen_peft_task(self, lora_task_id: int) -> bool:
+        return lora_task_id in self._seen_peft_task_ids
 
     def peft_pages_needed(self, req: LlmRequest) -> Optional[int]:
         """Return PEFT pages needed for *req*, or ``None`` if budget exceeded."""
         if self._peft_cache_manager is None:
             return 0
         lora_task_id = getattr(req, "lora_task_id", None)
-        if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
+        if lora_task_id is None:
             return 0
+        if lora_task_id in self._seen_peft_task_ids:
+            return None if self._claimed_peft_pages > self._max_peft_pages else 0
         required = self._peft_cache_manager.determine_num_pages(req)
         if self._claimed_peft_pages + required > self._max_peft_pages:
             return None
@@ -780,41 +795,156 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prevents PEFT adapter eviction failures when gen requests hold
         # adapters that can't be evicted mid-iteration.
         pending_ctx: RequestList = []
+        # PEFT-paused started contexts that reserved PEFT pages, a request slot,
+        # and minimum token budget in Phase 1 so Phase 2 can admit them ahead of
+        # later requests. Maps py_request_id -> (held_tokens, reserved_peft_pages).
+        reserved_paused_ctx: RequestList = []
+        reserved_paused_ctx_meta: dict[int, tuple[int, int]] = {}
+        # PEFT-paused started contexts skipped in Phase 1 or rejected in Phase 2a;
+        # contexts blocked by an earlier reservation are reconsidered in Phase 1b,
+        # and any still-unscheduled ones are reported to deadlock detection.
+        stalled_paused_ctx: RequestList = []
+        failed_reserved_ctx: RequestList = []
+        failed_reserved_ids: set[int] = set()
+        # Phase 1 indices skipped or unvisited after a paused-context reservation
+        # (or held behind paused_peft_barrier), reconsidered in Phase 1b if a
+        # reserved context fails.
+        phase1_blocked_indices: list[int] = []
+        phase1_barrier_blocked_indices: list[int] = []
+        phase1_break_it: Optional[int] = None
+        pre_reserve_peft_waiter_arrival: Optional[int] = None
         # Index of each pending context request in requests_list.
         pending_ctx_index: dict[int, int] = {}
 
-        # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
-        # every live decode, including requests omitted from this batch.
-        # In the overlap executor these requests are no longer scheduled
-        # (state outside schedulable range) but their adapters haven't
-        # been released yet (mark_request_done runs after prepare_resources
-        # in the next iteration).  Without this, the budget would appear
-        # empty and context requests with a different adapter could be
-        # admitted, causing ensure_batch to crash when it can't evict the
-        # still-active adapter.
+        # Pre-claim PEFT pages for every request that currently holds an active
+        # device adapter: terminal requests awaiting release in the overlap
+        # executor, and started requests (decodes and started context chunks)
+        # whose PEFT ownership has not been paused. Pre-claiming up front keeps
+        # their adapters accounted for even when they are omitted from this
+        # batch (GEN preemption, phase 2 context chunks checked after phase 1
+        # resumes, KV-suspended requests awaiting post-batch PEFT pause, or
+        # rebalance-suspended requests that still own PEFT).
         if self.peft_cache_manager is not None:
             for req in active_requests:
-                if req.state_value == self._gen_to_complete_state_value or (
-                    self._gen_preemption_enabled
-                    and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
-                ):
-                    # Paused and displaced decode requests still hold their adapters.
+                tid = getattr(req, "lora_task_id", None)
+                if tid is None or budget.has_seen_peft_task(tid):
+                    continue
+                if (
+                    req.state_value == self._gen_to_complete_state_value
+                    or (
+                        self._is_started_request(req)
+                        and not (req.is_generation_only_request and req.py_decoding_iter == 0)
+                    )
+                ) and not self.peft_cache_manager.is_paused(req):
                     budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         # Membership costs two binding calls per request; the set is usually empty.
         has_inflight = len(inflight_request_ids) > 0
-        while req_it < req_it_end:
-            req = requests_list[req_it]
 
-            if req_it in recompute_pause_state.victim_indices:
-                req_it += 1
-                continue
+        # Earliest arrival position in active_requests of a request that needs
+        # to acquire a LoRA adapter this pass (PEFT-paused decode/started chunk,
+        # DISAGG_GENERATION_INIT, or first-step gen-only decode) and cannot fit
+        # in the device PEFT budget. Skipping it instead of breaking lets active
+        # holders behind it run and drain the resident adapter, while holding
+        # newer LoRA arrivals behind its arrival position preserves FCFS order
+        # so steady traffic on the resident adapter cannot starve it.
+        peft_waiter_arrival: Optional[int] = None
+        paused_peft_barrier: Optional[int] = None
+        arrival_pos: Optional[dict[int, int]] = None
+
+        def record_peft_waiter(waiting_req: LlmRequest) -> None:
+            nonlocal peft_waiter_arrival, arrival_pos
+            if arrival_pos is None:
+                arrival_pos = {id(r): idx for idx, r in enumerate(active_requests)}
+            pos = arrival_pos.get(id(waiting_req))
+            if pos is not None and (peft_waiter_arrival is None or pos < peft_waiter_arrival):
+                peft_waiter_arrival = pos
+
+        def is_held_behind_peft_waiter(
+            candidate: LlmRequest, *, include_paused_barrier: bool = False
+        ) -> bool:
+            barrier = peft_waiter_arrival
+            if include_paused_barrier and paused_peft_barrier is not None:
+                barrier = (
+                    paused_peft_barrier if barrier is None else min(barrier, paused_peft_barrier)
+                )
+            if barrier is None or getattr(candidate, "lora_task_id", None) is None:
+                return False
+            assert arrival_pos is not None
+            pos = arrival_pos.get(id(candidate))
+            return pos is not None and pos > barrier
+
+        def compute_paused_peft_barrier(exclude_ids: set[int]) -> Optional[int]:
+            nonlocal arrival_pos
+            barrier: Optional[int] = None
+            if self.peft_cache_manager is None or not self._prioritize_first_token_gen:
+                return None
+            # _prioritize_first_token_gen moves newer iter-0 requests ahead of
+            # older paused requests in requests_list. Hold those reordered
+            # newcomers behind any older un-inflight PEFT-paused request whose
+            # adapter is not yet claimed so they cannot steal freed or partially
+            # free PEFT capacity and starve it.
+            for candidate in requests_list:
+                if exclude_ids and candidate.py_request_id in exclude_ids:
+                    continue
+                if has_inflight and candidate.request_id in inflight_request_ids:
+                    continue
+                tid = getattr(candidate, "lora_task_id", None)
+                if tid is None or budget.has_seen_peft_task(tid):
+                    continue
+                if not self.peft_cache_manager.is_paused(candidate):
+                    continue
+                cand_state = candidate.state_value
+                if not (
+                    cand_state >= self._no_schedule_until_state_value
+                    and cand_state < self._no_schedule_after_state_value
+                ):
+                    continue
+                if cand_state == self._encoder_init_state_value or (
+                    cand_state == self._context_init_state_value
+                    and candidate.is_first_context_chunk
+                ):
+                    continue
+                if (
+                    exclusive_remote_mode is not None
+                    and cand_state != self._context_init_state_value
+                ):
+                    continue
+                if arrival_pos is None:
+                    arrival_pos = {id(r): idx for idx, r in enumerate(active_requests)}
+                pos = arrival_pos.get(id(candidate))
+                if pos is not None and (barrier is None or pos < barrier):
+                    barrier = pos
+            return barrier
+
+        paused_peft_barrier = compute_paused_peft_barrier(failed_reserved_ids)
+
+        def try_phase1_index(idx: int, *, is_retry: bool) -> bool:
+            nonlocal req_it_end, scheduled_beam_width, phase1_break_it
+            nonlocal pre_reserve_peft_waiter_arrival
+
+            if idx >= req_it_end or idx in recompute_pause_state.victim_indices:
+                return True
+
+            req = requests_list[idx]
 
             # --- Filter ---
             if has_inflight and req.request_id in inflight_request_ids:
-                req_it += 1
-                continue
+                return True
+            if is_retry and (
+                req.py_request_id in failed_reserved_ids
+                or any(
+                    r is req
+                    for r in (
+                        *scheduled_gen,
+                        *scheduled_ctx,
+                        *scheduled_encoder,
+                        *disagg_candidates,
+                    )
+                )
+            ):
+                return True
 
             req_state_value = req.state_value
 
@@ -836,11 +966,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                 ):
                     # Admitted in a later pass, in order.
                     self._num_gen_init_cap_holds += 1
-                    req_it += 1
-                    continue
+                    return True
+                if is_held_behind_peft_waiter(req, include_paused_barrier=True):
+                    if reserved_paused_ctx:
+                        phase1_blocked_indices.append(idx)
+                    elif paused_peft_barrier is not None:
+                        phase1_barrier_blocked_indices.append(idx)
+                    return True
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
-                    break
+                    record_peft_waiter(req)
+                    if reserved_paused_ctx:
+                        phase1_blocked_indices.append(idx)
+                    return True
 
                 if disagg_gate is not None and disagg_gate.closed:
                     # The KV-transfer budget of this pass is exhausted: the executor's FCFS admission
@@ -851,15 +989,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                     self._num_gen_init_transfer_budget_holds += 1
                     if peft_pages > 0:
                         budget.commit_peft(req, peft_pages)
-                    req_it += 1
-                    continue
+                    return True
 
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
-                    break
+                    return False
                 if action is ScheduleAction.SKIP:
-                    req_it += 1
-                    continue
+                    return True
                 disagg_candidates.append(req)
                 if disagg_gate is not None:
                     disagg_gate.observe_candidate(req)
@@ -870,77 +1006,175 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # (via prepare_context) is the real capacity guard.
                 if peft_pages > 0:
                     budget.commit_peft(req, peft_pages)
-                req_it += 1
-                continue
+                return True
 
             # Budget check for non-disagg requests (disagg bypasses this
             # because it doesn't participate in the forward pass).
             if budget.requests_full:
-                break
+                if reserved_paused_ctx:
+                    phase1_break_it = idx
+                return False
 
             if not (
                 req_state_value >= self._no_schedule_until_state_value
                 and req_state_value < self._no_schedule_after_state_value
             ):
-                req_it += 1
-                continue
+                return True
 
             # --- Dispatch by request type ---
             if (
                 req_state_value == self._encoder_init_state_value
                 or req_state_value == self._context_init_state_value
             ):
+                # A PEFT-paused started context chunk needs device PEFT capacity
+                # in FCFS order just like a PEFT-paused decode. Reserve its
+                # request slot and minimum token budget alongside its PEFT pages
+                # so later Phase 1 requests cannot fill the batch and leave the
+                # reserved PEFT pages unused in Phase 2.
+                if (
+                    self.peft_cache_manager is not None
+                    and req_state_value == self._context_init_state_value
+                    and not req.is_first_context_chunk
+                    and getattr(req, "lora_task_id", None) is not None
+                    and self.peft_cache_manager.is_paused(req)
+                ):
+                    if is_held_behind_peft_waiter(req):
+                        stalled_paused_ctx.append(req)
+                        if reserved_paused_ctx:
+                            phase1_blocked_indices.append(idx)
+                        return True
+                    held_tokens = self._paused_ctx_reserve_tokens(
+                        req, budget, defer_remote_tail_context, exclusive_remote_mode
+                    )
+                    if held_tokens is None:
+                        # Cannot fit in Phase 2 this pass; do not hold PEFT
+                        # capacity away from later requests.
+                        remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
+                        excluded_by_remote_mode = (
+                            defer_remote_tail_context and remote_mode is not None
+                        ) or (
+                            exclusive_remote_mode is not None
+                            and remote_mode != exclusive_remote_mode
+                        )
+                        if not excluded_by_remote_mode:
+                            stalled_paused_ctx.append(req)
+                        if reserved_paused_ctx:
+                            phase1_blocked_indices.append(idx)
+                        return True
+                    peft_pages = budget.peft_pages_needed(req)
+                    if peft_pages is None:
+                        record_peft_waiter(req)
+                        stalled_paused_ctx.append(req)
+                        if reserved_paused_ctx:
+                            phase1_blocked_indices.append(idx)
+                        return True
+                    if peft_pages > 0:
+                        if not reserved_paused_ctx:
+                            pre_reserve_peft_waiter_arrival = peft_waiter_arrival
+                        budget.commit_peft(req, peft_pages)
+                        budget.hold(held_tokens, 1)
+                        reserved_paused_ctx.append(req)
+                        reserved_paused_ctx_meta[req.py_request_id] = (held_tokens, peft_pages)
+                        pending_ctx_index[req.py_request_id] = idx
+                        return True
                 # Defer to phase 2 so gen PEFT budget is settled first.
-                pending_ctx.append(req)
-                pending_ctx_index[req.py_request_id] = req_it
-                req_it += 1
-                continue
+                if (
+                    req.py_request_id not in pending_ctx_index
+                    and req.py_request_id not in failed_reserved_ids
+                ):
+                    pending_ctx.append(req)
+                    pending_ctx_index[req.py_request_id] = idx
+                return True
 
-            else:
-                if exclusive_remote_mode is not None:
-                    # Source-only batches harvest the preceding decode on CPU
-                    # without launching its next step. On resume, use the host
-                    # token count rather than the one-step-behind overlap path.
-                    self._clear_request_runtime_state(req)
-                    req_it += 1
-                    continue
-                peft_pages = budget.peft_pages_needed(req)
-                if peft_pages is None:
-                    break
-                action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
-                    req,
-                    budget,
-                    requests_list,
-                    req_it,
-                    req_it_end,
-                    recompute_pause_state,
-                    evicted,
-                    recompute_paused,
-                    inflight_request_ids,
-                    scheduled_beam_width,
-                )
-                if action is ScheduleAction.STOP:
-                    break
-                if action is ScheduleAction.SKIP:
-                    req_it += 1
-                    continue
-                scheduled_gen.append(req)
-                budget.commit(req, tokens, peft_pages)
+            if exclusive_remote_mode is not None:
+                # Source-only batches harvest the preceding decode on CPU
+                # without launching its next step. On resume, use the host
+                # token count rather than the one-step-behind overlap path.
+                self._clear_request_runtime_state(req)
+                return True
+            is_first_step_gen_only = req.is_generation_only_request and req.py_decoding_iter == 0
+            if is_first_step_gen_only and is_held_behind_peft_waiter(
+                req, include_paused_barrier=True
+            ):
+                if reserved_paused_ctx:
+                    phase1_blocked_indices.append(idx)
+                elif paused_peft_barrier is not None:
+                    phase1_barrier_blocked_indices.append(idx)
+                return True
+            if (
+                peft_waiter_arrival is not None
+                and self.peft_cache_manager is not None
+                and is_held_behind_peft_waiter(req)
+                and self.peft_cache_manager.is_paused(req)
+            ):
+                if reserved_paused_ctx:
+                    phase1_blocked_indices.append(idx)
+                return True
+            peft_pages = budget.peft_pages_needed(req)
+            if peft_pages is None:
+                if self.peft_cache_manager is not None and (
+                    is_first_step_gen_only or self.peft_cache_manager.is_paused(req)
+                ):
+                    record_peft_waiter(req)
+                    if reserved_paused_ctx:
+                        phase1_blocked_indices.append(idx)
+                    return True
+                if reserved_paused_ctx:
+                    phase1_break_it = idx
+                return False
+            prev_evicted = len(evicted)
+            prev_recompute = len(recompute_paused)
+            # In Phase 1b, requests at indices > idx may already have been
+            # admitted in Phase 1 or Phase 2a; protect them from eviction and
+            # recompute pause.
+            gen_protected_ids = (
+                inflight_request_ids
+                if not is_retry
+                else inflight_request_ids
+                | {r.request_id for r in scheduled_gen}
+                | {r.request_id for r in scheduled_ctx}
+                | {r.request_id for r in scheduled_encoder}
+                | {r.request_id for r in disagg_candidates}
+            )
+            action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
+                req,
+                budget,
+                requests_list,
+                idx,
+                req_it_end,
+                recompute_pause_state,
+                evicted,
+                recompute_paused,
+                gen_protected_ids,
+                scheduled_beam_width,
+            )
+            if action is ScheduleAction.STOP:
+                if (
+                    reserved_paused_ctx
+                    and len(evicted) == prev_evicted
+                    and len(recompute_paused) == prev_recompute
+                ):
+                    phase1_break_it = idx
+                return False
+            if action is ScheduleAction.SKIP:
+                if reserved_paused_ctx:
+                    phase1_blocked_indices.append(idx)
+                return True
+            scheduled_gen.append(req)
+            budget.commit(req, tokens, peft_pages)
+            return True
 
+        while req_it < req_it_end:
+            if not try_phase1_index(req_it, is_retry=False):
+                break
             req_it += 1
 
         # Requests whose pages were given up during this pass. A victim that is
         # itself a started context request still sits in pending_ctx, so
         # re-admitting it would spend the pages its own preemption released.
         preempted_ids: set[int] = set()
-
-        # Long-prefill demotion (see __init__). Reorder here rather than on
-        # requests_list: phase 1 walks that list by index, pending_ctx is this
-        # loop's own.
-        arrival_ctx = pending_ctx
+        arrival_ctx: RequestList = []
         demoted_ids: set[int] = set()
-        if self._ctx_demote_uncached_tokens:
-            pending_ctx, demoted_ids = self._defer_long_context(pending_ctx)
 
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
@@ -977,7 +1211,160 @@ class KVCacheV2Scheduler(RequestScheduler):
                 locality_domain_id=getattr(req, "py_locality_domain_id", None),
             )
 
-        # --- Phase 2: schedule deferred context / encoder requests ---
+        def release_unused_reserved_peft(failed_req: LlmRequest, reserved_peft: int) -> None:
+            if reserved_peft <= 0:
+                return
+            tid = getattr(failed_req, "lora_task_id", None)
+            if tid is not None and not any(
+                getattr(r, "lora_task_id", None) == tid
+                for r in (*scheduled_gen, *disagg_candidates, *scheduled_ctx, *scheduled_encoder)
+            ):
+                budget.uncommit_peft(tid, reserved_peft)
+
+        ctx_stopped = False
+        phase2a_snapshots_armed = False
+        # --- Phase 2a / 1b: admit PEFT-paused started contexts that reserved
+        # capacity in Phase 1; if any fails without preempting a victim, release
+        # its reservation and retry blocked Phase 1 work (preserving FCFS
+        # reservation for any subsequent paused started context). ---
+        while reserved_paused_ctx:
+            batch_reserved = reserved_paused_ctx
+            reserved_paused_ctx = []
+            round_failed = False
+            # Avoid in-forward Mamba snapshots if a Phase 1b retry may still add
+            # a generation request into this same batch.
+            if not phase2a_snapshots_armed:
+                phase2a_snapshots_armed = not (
+                    scheduled_gen
+                    or phase1_blocked_indices
+                    or phase1_barrier_blocked_indices
+                    or phase1_break_it is not None
+                )
+                self._inforward_snapshot_rows_left = (
+                    self._inforward_snapshot_rows if phase2a_snapshots_armed else 0
+                )
+            for req in batch_reserved:
+                reserved_peft = 0
+                meta = reserved_paused_ctx_meta.pop(req.py_request_id, None)
+                if meta is not None:
+                    held_tokens, reserved_peft = meta
+                    budget.release(held_tokens, 1)
+                admitted = False
+                try:
+                    if preempted_ids or budget.requests_full:
+                        continue
+                    if self.chunking_enabled and not self._has_context_chunk_budget(budget):
+                        continue
+                    if req.py_request_id in preempted_ids:
+                        continue
+                    remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
+                    if defer_remote_tail_context and remote_mode is not None:
+                        continue
+                    if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
+                        continue
+                    if remote_mode == "destination" and not budget.can_fit_tokens(
+                        req.context_remaining_length
+                    ):
+                        continue
+                    if (
+                        scheduled_ctx
+                        and remote_mode != scheduled_remote_mode
+                        and (remote_mode == "source" or scheduled_remote_mode == "source")
+                    ):
+                        continue
+                    peft_pages = budget.peft_pages_needed(req)
+                    if peft_pages is None:
+                        continue
+                    try:
+                        action, tokens, chunking_flag = self._try_schedule_context(
+                            req, budget, preempt_for_pages, None
+                        )
+                    except RemoteMemError as error:
+                        self._lost_kv_error = error
+                        action = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+                    if action is ScheduleAction.STOP:
+                        ctx_stopped = True
+                        continue
+                    if action is ScheduleAction.SKIP:
+                        continue
+                    has_chunking = has_chunking or chunking_flag
+                    scheduled_ctx.append(req)
+                    if self._prefix_wait_planner is not None:
+                        self._prefix_wait_planner.add_owner(req)
+                    if len(scheduled_ctx) == 1:
+                        scheduled_remote_mode = remote_mode
+                    budget.commit(req, tokens, peft_pages)
+                    admitted = True
+                finally:
+                    if not admitted:
+                        release_unused_reserved_peft(req, reserved_peft)
+                        failed_reserved_ctx.append(req)
+                        failed_reserved_ids.add(req.py_request_id)
+                        round_failed = True
+
+            # --- Phase 1b: retry Phase 1 work blocked by a failed reservation ---
+            # Even if _try_schedule_context_full returned STOP (setting
+            # ctx_stopped for Phase 2b contexts), retry Phase 1 candidates
+            # whenever no victim was preempted for the failed context.
+            if (
+                round_failed
+                and not preempted_ids
+                and (
+                    phase1_blocked_indices
+                    or phase1_barrier_blocked_indices
+                    or phase1_break_it is not None
+                )
+            ):
+                retry_indices = sorted(
+                    set(phase1_blocked_indices)
+                    | set(phase1_barrier_blocked_indices)
+                    | (
+                        set(range(phase1_break_it, req_it_end))
+                        if phase1_break_it is not None
+                        else set()
+                    )
+                )
+                phase1_blocked_indices = []
+                phase1_barrier_blocked_indices = []
+                phase1_break_it = None
+                peft_waiter_arrival = pre_reserve_peft_waiter_arrival
+                paused_peft_barrier = compute_paused_peft_barrier(failed_reserved_ids)
+                for idx in retry_indices:
+                    if idx >= req_it_end:
+                        break
+                    if not try_phase1_index(idx, is_retry=True):
+                        break
+                if pending_ctx and (evicted or recompute_paused):
+                    dropped_ids = {r.py_request_id for r in evicted} | {
+                        r.py_request_id for r in recompute_paused
+                    }
+                    pending_ctx = [r for r in pending_ctx if r.py_request_id not in dropped_ids]
+
+        # Hold new LoRA arrivals (first-chunk context / encoder) behind any
+        # earlier PEFT waiter before demotion aging or prefix-wait planning.
+        # Non-LoRA requests and already-started context chunks keep running so
+        # the resident adapter drains.
+        if peft_waiter_arrival is not None and pending_ctx:
+            pending_ctx = [
+                req
+                for req in pending_ctx
+                if not (
+                    (
+                        req.state_value == self._encoder_init_state_value
+                        or req.is_first_context_chunk
+                    )
+                    and is_held_behind_peft_waiter(req)
+                )
+            ]
+
+        # Long-prefill demotion (see __init__). Reorder here rather than on
+        # requests_list: phase 1 walks that list by index, pending_ctx is this
+        # loop's own.
+        arrival_ctx = pending_ctx
+        if self._ctx_demote_uncached_tokens:
+            pending_ctx, demoted_ids = self._defer_long_context(pending_ctx)
+
+        # --- Phase 2b: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
         #
         # Prefix-aware skip: when several first-chunk context requests would
@@ -988,15 +1375,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         # context requests running this iteration, or None when the skip cannot
         # fire at all and every probe below can be avoided.
         contributed_blocks = self._collect_contributed_blocks(
-            requests_list, pending_ctx, inflight_request_ids
+            requests_list,
+            scheduled_ctx + pending_ctx if scheduled_ctx else pending_ctx,
+            inflight_request_ids,
         )
+        if contributed_blocks is not None and scheduled_ctx:
+            for req in scheduled_ctx:
+                block = self.kv_cache_manager.probe_first_new_block_key(req)
+                if block is not None:
+                    contributed_blocks.add(block)
         # A deferral behind an in-flight contributor leaves nothing on any of
         # the scheduled lists, so the deadlock detector below would read the
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
         # Only context-only batches take Mamba snapshots inside the forward.
-        self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
+        # Preserve any remaining allowance already decremented by Phase 2a.
+        if not phase2a_snapshots_armed:
+            self._inforward_snapshot_rows_left = (
+                0 if scheduled_gen else self._inforward_snapshot_rows
+            )
         first_chunk_contributors: dict = {}
         context_init_ids = (
             {
@@ -1029,10 +1427,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # New requests that wait for a prefix another request prefills, planned
         # in scheduling order. Planned once per schedule_request, so a retry
         # below spends no wait budget.
+        all_phase2_ctx = (
+            scheduled_ctx + pending_ctx + starved_ctx
+            if scheduled_ctx
+            else pending_ctx + starved_ctx
+        )
         if prefix_waits is None:
             prefix_waits = (
-                self._prefix_wait_planner.plan(pending_ctx + starved_ctx)
-                if self._prefix_wait_planner is not None and (pending_ctx or starved_ctx)
+                self._prefix_wait_planner.plan(all_phase2_ctx)
+                if self._prefix_wait_planner is not None and all_phase2_ctx
                 else {}
             )
             if prefix_waits:
@@ -1040,21 +1443,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._ctx_demote_exact and prefix_waits:
             # The probe of a waiting request predates the prefix it waits for;
             # it is probed again once it stops waiting.
-            for req in pending_ctx + starved_ctx:
+            for req in all_phase2_ctx:
                 if req.py_request_id in prefix_waits:
                     req.py_uncached_prefill_probed = False
-        # Starved requests are scheduled after the others, but their first shares
-        # and request slots are held back while the others fill the budget.
-        starved_shares = self._starved_ctx_shares(starved_ctx, budget)
-        budget.hold(sum(starved_shares), len(starved_ctx))
+
+        starved_shares: list[int] = []
+        starved_held = False
         held = 0
-        ctx_stopped = False
-        for starved_pass, ctx_requests in ((False, pending_ctx), (True, starved_ctx)):
-            if starved_pass:
+        for pass_kind, ctx_requests in (("normal", pending_ctx), ("starved", starved_ctx)):
+            if pass_kind == "normal":
+                if ctx_stopped:
+                    break
+                # Starved requests are scheduled after the others, but their
+                # first shares and request slots are held back while the others
+                # fill the budget.
+                if starved_ctx:
+                    starved_shares = self._starved_ctx_shares(starved_ctx, budget)
+                    budget.hold(sum(starved_shares), len(starved_ctx))
+                    starved_held = True
+            elif pass_kind == "starved":
                 if not starved_ctx:
                     break
-                held = sum(starved_shares)
-                budget.release(held, len(starved_ctx))
+                if starved_held:
+                    held = sum(starved_shares)
+                    budget.release(held, len(starved_ctx))
+                    starved_held = False
                 if ctx_stopped:
                     break
             # A DEFER re-appends its request to the tail of this pass, so the
@@ -1062,7 +1475,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             ctx_requests = list(ctx_requests)
             for idx, req in enumerate(ctx_requests):
                 token_cap = None
-                if starved_pass:
+                if pass_kind == "starved":
                     # Its own share plus what the shortest-first fill left,
                     # minus the shares still held for the starved requests after it.
                     held -= starved_shares[idx]
@@ -1230,13 +1643,35 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req.py_request_id for req in active_requests
             )
 
+        # A PEFT waiter whose resident holder is temporarily absent from this
+        # pass (paused in place under GEN preemption, in flight, or finishing)
+        # is not a KV deadlock, but does not suppress remote-tail fallback.
+        deferred_for_peft_waiter = (
+            not made_progress
+            and peft_waiter_arrival is not None
+            and budget.claimed_peft_pages > 0
+            and (
+                bool(self._gen_paused_ids)
+                or has_inflight
+                or any(r.state_value == self._gen_to_complete_state_value for r in active_requests)
+            )
+        )
+        deadlock_ctx_candidates = pending_ctx
+        if starved_ctx or failed_reserved_ctx or stalled_paused_ctx:
+            seen_ctx_ids = {r.py_request_id for r in pending_ctx}
+            seen_ctx_ids.update(r.py_request_id for r in scheduled_ctx)
+            deadlock_ctx_candidates = list(pending_ctx)
+            for req in (*starved_ctx, *failed_reserved_ctx, *stalled_paused_ctx):
+                if req.py_request_id not in seen_ctx_ids:
+                    deadlock_ctx_candidates.append(req)
+                    seen_ctx_ids.add(req.py_request_id)
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(
             requests_list,
             inflight_request_ids,
-            pending_ctx,
+            deadlock_ctx_candidates,
             preempted_ids,
-            made_progress=made_progress,
+            made_progress=made_progress or deferred_for_peft_waiter,
         )
         if disagg_gate is not None and disagg_gate.num_skipped:
             logger.debug(
@@ -1789,6 +2224,57 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or remaining >= self.chunk_unit_size
             )
         )
+
+    def _paused_ctx_reserve_tokens(
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        defer_remote_tail_context: bool,
+        exclusive_remote_mode: Optional[str],
+    ) -> Optional[int]:
+        """Minimum tokens to hold in Phase 1 for a PEFT-paused started context,
+        or ``None`` if Phase 2 cannot admit *req* under current pass filters or
+        token budget."""
+        remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
+        if defer_remote_tail_context and remote_mode is not None:
+            return None
+        if exclusive_remote_mode is not None and remote_mode != exclusive_remote_mode:
+            return None
+        if remote_mode == "destination" and not budget.can_fit_tokens(req.context_remaining_length):
+            return None
+        if self.chunking_enabled:
+            if not self._has_context_chunk_budget(budget):
+                return None
+            if budget.max_num_tokens is None:
+                return 0
+            if remote_mode == "destination":
+                return req.context_remaining_length
+            replay_tokens = self.kv_cache_manager.context_replay_tokens(req) or 0
+            pregrown = self._pregrown_context_tokens(req)
+            min_chunk = min(req.context_remaining_length, self.chunk_unit_size)
+            if self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK:
+                snapshot_points = getattr(req, "expect_snapshot_points", None)
+                if isinstance(snapshot_points, list):
+                    pos = req.context_current_position
+                    next_point = min((p for p in snapshot_points if p > pos), default=None)
+                    if next_point is not None:
+                        min_chunk = min(min_chunk, next_point - pos)
+                if pregrown > 0:
+                    min_chunk = max(min_chunk, pregrown)
+                min_tokens = replay_tokens + min_chunk
+            else:
+                if pregrown > 0:
+                    min_chunk = max(min_chunk, pregrown)
+                min_tokens = max(self.chunk_unit_size, replay_tokens + min_chunk)
+            if not budget.can_fit_tokens(min_tokens):
+                return None
+            return min_tokens
+        draft_len = get_draft_token_length(req)
+        replay_tokens = self.kv_cache_manager.context_replay_tokens(req) or 0
+        min_tokens = req.context_remaining_length + replay_tokens + draft_len
+        if not budget.can_fit_tokens(min_tokens):
+            return None
+        return min_tokens if budget.max_num_tokens is not None else 0
 
     def _first_chunk_waits_for_budget(self, req: LlmRequest, budget: BudgetTracker) -> bool:
         """Whether a first chunk should wait for the next iteration's budget.
@@ -2649,11 +3135,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache in both main and draft managers.
 
-        TODO: Also release PEFT resources (mark_request_done) for the
-        suspended request so the C++ PeftCacheManager can evict its
-        adapter pages.  Currently only KV cache is freed; the adapter
-        remains "active" on device, which could cause ensure_batch to
-        fail if it needs to load a different adapter into a full cache.
+        PEFT device ownership for evicted requests is paused by the executor
+        once any in-flight forward that may still read the adapter has
+        completed, and re-acquired in ``PeftCacheManager.prepare_resources``
+        when the request resumes.
         """
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)

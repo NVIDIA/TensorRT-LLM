@@ -3410,6 +3410,7 @@ class PeftCacheManager(BaseResourceManager):
 
         self._batch_peft_table: Optional[Dict[int, list[
             TaskLayerModuleConfig]]] = None  # task_id -> layer-module-configs mapping for the current batch
+        self._paused_request_ids: set[int] = set()
 
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
@@ -3417,6 +3418,26 @@ class PeftCacheManager(BaseResourceManager):
     @property
     def data_type(self) -> torch.dtype:
         return binding_to_torch_dtype(self.impl.data_type)
+
+    @property
+    def max_device_pages(self) -> int:
+        return self.impl.max_device_pages
+
+    def determine_num_pages(self, request: LlmRequest) -> int:
+        return self.impl.determine_num_pages(request)
+
+    def is_paused(self, request: LlmRequest) -> bool:
+        return request.py_request_id in self._paused_request_ids
+
+    def pause_request(self, request: LlmRequest) -> None:
+        """Release active device-cache ownership while keeping the adapter pinned on host."""
+        if request.lora_task_id is None:
+            return
+        req_id = request.py_request_id
+        if req_id in self._paused_request_ids:
+            return
+        self.impl.mark_request_done(request, pause=True)
+        self._paused_request_ids.add(req_id)
 
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
@@ -3449,6 +3470,7 @@ class PeftCacheManager(BaseResourceManager):
             if request.lora_config is not None:
                 request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
+        self._paused_request_ids.discard(request.py_request_id)
 
     def ensure_batch(self,
                      context_batch: List[LlmRequest],
@@ -3468,6 +3490,9 @@ class PeftCacheManager(BaseResourceManager):
         generation_batch = scheduled_batch.generation_requests
         for req in context_batch:
             self.add_request_peft(req)
+        for req in generation_batch:
+            if self.is_paused(req):
+                self.add_request_peft(req)
 
         self._batch_peft_table, _ = self.impl.ensure_batch_map_task_id(
             context_batch, generation_batch, False)
@@ -3476,6 +3501,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
+        self._paused_request_ids.discard(request.py_request_id)
         self.impl.mark_request_done(request)
 
     def shutdown(self):

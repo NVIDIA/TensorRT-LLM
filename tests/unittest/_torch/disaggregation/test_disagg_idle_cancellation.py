@@ -140,6 +140,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.waiting_queue = FCFSWaitingQueue()
     engine._pending_transfer_responses = []
     engine._pending_response_terminations = []
+    engine._pending_peft_pause_requests = []
     engine.is_shutdown = False
     engine.enable_attention_dp = False
     engine.gather_all_responses = False

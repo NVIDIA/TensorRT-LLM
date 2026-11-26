@@ -601,10 +601,11 @@ def defer_preemption(mgr, *request_ids):
     return deferred
 
 
-def make_peft_cache_manager(max_device_pages, pages_per_task=1):
+def make_peft_cache_manager(max_device_pages: int, pages_per_task: int = 1) -> Mock:
     mgr = Mock()
     mgr.max_device_pages = max_device_pages
     mgr.determine_num_pages.return_value = pages_per_task
+    mgr.is_paused.return_value = False
     return mgr
 
 
@@ -2170,10 +2171,11 @@ class TestGenSlotPreemption:
         resident = make_gen_request(0, lora_task_id=10)
         waiter = make_disagg_request(1, lora_task_id=20)
         # Transfer admission precedes decode and bypasses the batch-slot budget.
-        # The resident adapter must be claimed even when decode is not reached.
+        # The resident adapter must be claimed even when decode is not reached,
+        # while skipping the blocked transfer lets an unpaused decode drain.
         out = sched.schedule_request([waiter, resident], set())
         assert out.fitting_disagg_gen_init_requests == []
-        assert out.generation_requests == []
+        assert ids(out.generation_requests) == ([] if paused_ids else [0])
         resumed = sched.schedule_request([resident], set())
         assert ids(resumed.generation_requests) == ([] if paused_ids else [0])
 
@@ -3240,6 +3242,1529 @@ class TestPEFT:
         reqs2 = [make_ctx_request(1, 100, lora_task_id=2)]
         out2 = sched.schedule_request(reqs2, set())
         assert len(out2.context_requests) == 1
+
+
+# ===========================================================================
+# PEFT Suspend / Resume Lifecycle
+# ===========================================================================
+
+
+class _FakeCppPeftCacheManager:
+    """In-memory model of C++ PeftCacheManager ownership and device/host cache rules."""
+
+    def __init__(
+        self,
+        max_device_pages: int,
+        pages_per_task: int | dict[int, int] = 1,
+        initial_active: dict[int, set[int]] | None = None,
+    ) -> None:
+        self.max_device_pages = max_device_pages
+        self._pages_per_task = pages_per_task
+        self.active_tasks: dict[int, set[int]] = {
+            tid: set(rids) for tid, rids in (initial_active or {}).items()
+        }
+        self.paused_tasks: dict[int, set[int]] = {}
+        self.host_cached: set[int] = set(self.active_tasks.keys())
+        self.device_cached: set[int] = set(self.active_tasks.keys())
+        self.mark_request_done = Mock(side_effect=self._mark_request_done)
+        self.add_request_peft = Mock(side_effect=self._add_request_peft)
+        self.ensure_batch_map_task_id = Mock(side_effect=self._ensure_batch_map_task_id)
+
+    def _task_pages(self, task_id: int) -> int:
+        if isinstance(self._pages_per_task, dict):
+            return self._pages_per_task.get(task_id, 1)
+        return self._pages_per_task
+
+    def determine_num_pages(self, req: object) -> int:
+        tid = getattr(req, "lora_task_id", None)
+        if tid is None:
+            return 0
+        return self._task_pages(tid)
+
+    def is_task_cached(self, task_id: int) -> bool:
+        return task_id in self.host_cached
+
+    def _mark_request_done(self, req: Mock, pause: bool = False) -> None:
+        tid = req.lora_task_id
+        if tid is None:
+            return
+        if tid in self.active_tasks:
+            self.active_tasks[tid].discard(req.py_request_id)
+            if not self.active_tasks[tid]:
+                del self.active_tasks[tid]
+        if pause:
+            self.paused_tasks.setdefault(tid, set()).add(req.py_request_id)
+        elif tid in self.paused_tasks:
+            self.paused_tasks[tid].discard(req.py_request_id)
+            if not self.paused_tasks[tid]:
+                del self.paused_tasks[tid]
+        if tid not in self.active_tasks and tid not in self.paused_tasks:
+            self.host_cached.discard(tid)
+
+    def _add_request_peft(self, req: Mock, try_gpu_cache: bool = True) -> None:
+        del try_gpu_cache
+        tid = req.lora_task_id
+        if tid is None:
+            return
+        has_weights = getattr(req, "lora_weights", None) is not None
+        has_config = getattr(req, "lora_config", None) is not None
+        if has_weights != has_config:
+            raise RuntimeError(
+                "Request for LoRA inference must have both lora_weights and lora_keys"
+            )
+        self.host_cached.add(tid)
+        self.active_tasks.setdefault(tid, set()).add(req.py_request_id)
+        if tid in self.paused_tasks:
+            self.paused_tasks[tid].discard(req.py_request_id)
+            if not self.paused_tasks[tid]:
+                del self.paused_tasks[tid]
+
+    def _ensure_batch_map_task_id(
+        self,
+        context_batch: list[Mock],
+        generation_batch: list[Mock],
+        reset_gpu_cache: bool = False,
+    ) -> tuple[dict[int, list[object]], dict[int, list[int]]]:
+        if reset_gpu_cache:
+            self.device_cached.clear()
+        task_ids: list[int] = []
+        for req in (*context_batch, *generation_batch):
+            tid = req.lora_task_id
+            if tid is not None and tid not in task_ids:
+                task_ids.append(tid)
+        for tid in task_ids:
+            assert tid in self.host_cached, f"adapter {tid} missing from host cache"
+            if tid in self.device_cached:
+                continue
+            needed_pages = self._task_pages(tid)
+            while (
+                sum(self._task_pages(t) for t in self.device_cached) + needed_pages
+                > self.max_device_pages
+            ):
+                evictable = [t for t in self.device_cached if t not in self.active_tasks]
+                if not evictable:
+                    raise RuntimeError(
+                        f"Cache is full; cannot load adapter {tid} ({needed_pages} pages) "
+                        f"with active {self.active_tasks}"
+                    )
+                self.device_cached.remove(evictable[0])
+            self.device_cached.add(tid)
+        return ({tid: [] for tid in task_ids}, {})
+
+
+def _make_peft_wrapper(
+    max_device_pages: int = 1,
+    pages_per_task: int | dict[int, int] = 1,
+    initial_active: dict[int, set[int]] | None = None,
+) -> tuple[object, _FakeCppPeftCacheManager]:
+    """Create a real Python PeftCacheManager backed by _FakeCppPeftCacheManager."""
+    from tensorrt_llm._torch.pyexecutor.resource_manager import PeftCacheManager
+
+    impl = _FakeCppPeftCacheManager(
+        max_device_pages=max_device_pages,
+        pages_per_task=pages_per_task,
+        initial_active=initial_active,
+    )
+    wrapper = object.__new__(PeftCacheManager)
+    wrapper.impl = impl
+    wrapper._paused_request_ids = set()
+    wrapper._batch_peft_table = None
+    return wrapper, impl
+
+
+def _make_peft_executor_stub(
+    kv_cache_manager: Mock,
+    peft_cache_manager: object,
+    active_requests: list[Mock],
+) -> object:
+    """Create a minimal PyExecutor instance wired for deferred PEFT pause helpers."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    exe = object.__new__(PyExecutor)
+    exe.kv_cache_manager = kv_cache_manager
+    exe.active_requests = active_requests
+    exe._pending_peft_pause_requests = []
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.side_effect = lambda mgr_type: (
+        peft_cache_manager if mgr_type == ResourceManagerType.PEFT_CACHE_MANAGER else None
+    )
+    exe.resource_manager = resource_manager
+    return exe
+
+
+def _init_lora_req(req: Mock) -> Mock:
+    """Configure default LlmRequest lifecycle fields expected by PyExecutor and PeftCacheManager."""
+    req.is_finished = False
+    req.state = (
+        LlmRequestState.GENERATION_IN_PROGRESS
+        if req.is_generation_in_progress_state
+        else LlmRequestState.CONTEXT_INIT
+    )
+    req.is_generation_only_request = False
+    req.py_decoding_iter = 1 if req.is_generation_in_progress_state else 0
+    req.lora_weights = None
+    req.lora_config = None
+    req.py_lora_path = None
+
+    def _remove_lora_tensors() -> None:
+        req.lora_weights = None
+        req.lora_config = None
+
+    req.remove_lora_tensors = Mock(side_effect=_remove_lora_tensors)
+    return req
+
+
+class TestPeftSuspendResume:
+    def test_overlap_deferral_keeps_evicted_adapter_preclaimed_during_suspend_pass(self) -> None:
+        """During the scheduling pass that suspends a LoRA decode, its adapter stays
+        pre-claimed and unpaused so an overlapped previous forward cannot have its pages
+        evicted; pausing after the previous batch completes frees the cache for the next pass."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda _req: False, can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        req_b = _init_lora_req(make_ctx_request(1, 64, lora_task_id=2))
+        exe = _make_peft_executor_stub(mgr, peft, [req_b, req_a])
+
+        # Pass 1 ordered [req_b, req_a]: B is deferred to phase 2 before A self-evicts, so A
+        # staying pre-claimed and unpaused through prepare_resources is what blocks B.
+        out1 = sched.schedule_request([req_b, req_a], set())
+        assert out1.generation_requests == []
+        assert ids(out1.paused_requests) == [0]
+        assert out1.context_requests == []
+        assert not peft.is_paused(req_a)
+        impl.mark_request_done.assert_not_called()
+
+        # After previous batch completes on GPU, executor flushes deferred PEFT pauses.
+        exe._pending_peft_pause_requests.extend(out1.paused_requests)
+        exe._flush_pending_peft_pauses()
+        assert peft.is_paused(req_a)
+        impl.mark_request_done.assert_called_once_with(req_a, pause=True)
+        assert 1 not in impl.active_tasks and 0 in impl.paused_tasks[1]
+        assert 1 in impl.host_cached
+
+        # Pass 2: A is PEFT-paused, so B is admitted and safely evicts adapter 1 from device.
+        out2 = sched.schedule_request([req_b, req_a], set())
+        assert ids(out2.context_requests) == [1]
+        peft.prepare_resources(out2)
+        assert impl.device_cached == {2}
+        assert 1 in impl.host_cached
+
+    def test_deferred_peft_pause_skips_ineligible_requests_and_pauses_valid_ones(self) -> None:
+        """Deferred PEFT pausing skips finished, terminal, removed, recomputed, KV-active,
+        base, and unstarted disagg-gen requests, while pausing surviving KV-suspended ones."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=8)
+
+        finished = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        finished.is_finished = True
+        mgr.kv_cache_map[0].is_active = False
+
+        terminal = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        terminal.state = LlmRequestState.GENERATION_TO_COMPLETE
+        mgr.kv_cache_map[1].is_active = False
+
+        removed = _init_lora_req(make_gen_request(2, lora_task_id=3))
+        mgr.kv_cache_map[2].is_active = False
+
+        recomputed = _init_lora_req(
+            make_ctx_request(3, 64, is_first_context_chunk=True, lora_task_id=4)
+        )
+        mgr.kv_cache_map[3].is_active = False
+
+        still_kv_active = _init_lora_req(make_gen_request(4, lora_task_id=5))
+        mgr.kv_cache_map[4].is_active = True
+
+        no_lora = _init_lora_req(make_gen_request(5, lora_task_id=None))
+        mgr.kv_cache_map[5].is_active = False
+
+        unstarted_disagg = _init_lora_req(make_gen_request(6, lora_task_id=6))
+        unstarted_disagg.is_generation_only_request = True
+        unstarted_disagg.py_decoding_iter = 0
+        mgr.kv_cache_map[6].is_active = False
+
+        valid_task_zero = _init_lora_req(make_gen_request(7, lora_task_id=0))
+        mgr.kv_cache_map[7].is_active = False
+
+        active = [
+            finished,
+            terminal,
+            recomputed,
+            still_kv_active,
+            no_lora,
+            unstarted_disagg,
+            valid_task_zero,
+        ]
+        exe = _make_peft_executor_stub(mgr, peft, active)
+        exe._pending_peft_pause_requests.extend(
+            [
+                finished,
+                terminal,
+                removed,
+                recomputed,
+                still_kv_active,
+                no_lora,
+                unstarted_disagg,
+                valid_task_zero,
+            ]
+        )
+        exe._flush_pending_peft_pauses()
+
+        impl.mark_request_done.assert_called_once_with(valid_task_zero, pause=True)
+        assert peft.is_paused(valid_task_zero)
+        for skipped in (
+            finished,
+            terminal,
+            removed,
+            recomputed,
+            still_kv_active,
+            no_lora,
+            unstarted_disagg,
+        ):
+            assert not peft.is_paused(skipped)
+
+    def test_chunked_prefill_resume_waits_for_started_context_adapter(self) -> None:
+        """On a 1-adapter cache with chunked prefill, a paused gen request whose KV becomes
+        resumable must wait while a started context request still holds another adapter, then
+        resume and reload its adapter once the context request frees it."""
+        allow_gen = [False]
+        mgr = make_kv_cache_manager(can_evict=True)
+
+        def alloc_gen(req: Mock) -> bool:
+            if not allow_gen[0]:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=64,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+            peft_cache_manager=peft,
+        )
+
+        req_b = _init_lora_req(
+            make_ctx_request(1, context_remaining_length=128, prompt_len=128, lora_task_id=2)
+        )
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        active = [req_b, req_a]
+        exe = _make_peft_executor_stub(mgr, peft, active)
+
+        # Pass 1: A self-evicts; B waits until A's PEFT is paused post-batch.
+        out1 = sched.schedule_request(active, set())
+        assert ids(out1.paused_requests) == [0]
+        assert out1.context_requests == []
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert peft.is_paused(req_a)
+
+        # Pass 2: B runs its first chunk and evicts adapter 1 from device cache.
+        out2 = sched.schedule_request(active, set())
+        assert ids(out2.context_requests) == [1]
+        assert out2.generation_requests == []
+        peft.prepare_resources(out2)
+        assert impl.device_cached == {2}
+        req_b.is_first_context_chunk = False
+        req_b.context_remaining_length = 64
+
+        # Pass 3: A's KV can now resume, while B still has chunk 2 and owns adapter 2.
+        # Pre-claiming B's adapter keeps A from resuming and crashing ensure_batch.
+        allow_gen[0] = True
+        out3 = sched.schedule_request(active, set())
+        assert out3.generation_requests == []
+        assert ids(out3.context_requests) == [1]
+        peft.prepare_resources(out3)
+        assert impl.device_cached == {2}
+
+        # B completes and releases adapter 2.
+        peft.free_resources(req_b)
+        active.remove(req_b)
+
+        # Pass 4: A resumes KV and prepare_resources restores PEFT ownership once.
+        out4 = sched.schedule_request(active, set())
+        assert ids(out4.generation_requests) == [0]
+        peft.prepare_resources(out4)
+        assert not peft.is_paused(req_a)
+        assert impl.device_cached == {1}
+        assert impl.add_request_peft.call_count == 3  # B chunk 1, B chunk 2, A resume
+
+        # Pass 5: steady-state decode of A does not call add_request_peft again.
+        out5 = sched.schedule_request(active, set())
+        assert ids(out5.generation_requests) == [0]
+        peft.prepare_resources(out5)
+        assert impl.add_request_peft.call_count == 3
+
+    def test_gen_preemption_resumed_paused_request_does_not_deadlock_active_waiter(self) -> None:
+        """Under GEN preemption on a 1-adapter cache, a PEFT-paused request sorted first via
+        resumed IDs skips past an adapter conflict so the active decode holding the cache can
+        advance and finish without deadlocking."""
+        allow_gen = [False]
+        mgr = make_kv_cache_manager(can_evict=True)
+
+        def alloc_gen(req: Mock) -> bool:
+            if req.py_request_id == 0 and not allow_gen[0]:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={10: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(frozenset())
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=10))
+        waiter = _init_lora_req(make_ctx_request(1, 64, lora_task_id=20))
+        exe = _make_peft_executor_stub(mgr, peft, [waiter, req_a])
+
+        # Pass 1 ordered [waiter, req_a]: pre-claiming req_a blocks waiter even though waiter
+        # appears before req_a in FCFS order; req_a fails KV alloc and self-evicts.
+        out1 = sched.schedule_request([waiter, req_a], set())
+        assert ids(out1.paused_requests) == [0]
+        assert out1.context_requests == []
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert peft.is_paused(req_a)
+
+        # Pass 2: req_a is PEFT-paused, so waiter is admitted and loads adapter 20.
+        sched.set_gen_paused_ids(frozenset({0}))
+        out2 = sched.schedule_request([waiter, req_a], set())
+        assert ids(out2.context_requests) == [1]
+        peft.prepare_resources(out2)
+        assert impl.device_cached == {20}
+
+        # Pass 3: waiter is now decoding with adapter 20, while req_a is prioritized first via
+        # resumed IDs. req_a must skip (continue) rather than break, letting waiter advance.
+        waiter_gen = _init_lora_req(make_gen_request(1, lora_task_id=20))
+        sched.set_gen_paused_ids(frozenset(), resumed_ids=frozenset({0}))
+        allow_gen[0] = True
+        out3 = sched.schedule_request([waiter_gen, req_a], set())
+        assert ids(out3.generation_requests) == [1]
+        peft.prepare_resources(out3)
+        assert impl.device_cached == {20}
+
+        # Pass 4: waiter finishes and frees adapter 20; req_a resumes cleanly.
+        peft.free_resources(waiter_gen)
+        out4 = sched.schedule_request([req_a], set())
+        assert ids(out4.generation_requests) == [0]
+        peft.prepare_resources(out4)
+        assert impl.device_cached == {10}
+        assert not peft.is_paused(req_a)
+
+    @pytest.mark.parametrize("gen_preemption", [False, True], ids=["default", "gen_preemption"])
+    def test_rebalance_suspended_request_still_owning_peft_stays_preclaimed(
+        self, gen_preemption: bool
+    ) -> None:
+        """A request left KV-suspended by KV pool rebalance without pausing PEFT still owns
+        its adapter, so the scheduler keeps it pre-claimed and blocks conflicting adapters."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda _req: False, can_evict=True)
+        peft, _impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        # Simulate _rebalance_kv_pools_now leaving KV suspended without pausing PEFT.
+        mgr.kv_cache_map[0].is_active = False
+        assert not peft.is_paused(req_a)
+
+        waiter = _init_lora_req(make_ctx_request(1, 64, lora_task_id=2))
+        if gen_preemption:
+            sched.set_gen_paused_ids(frozenset({0}))
+
+        out = sched.schedule_request([waiter, req_a], set())
+        assert out.context_requests == []
+        assert out.generation_requests == []
+
+    def test_disagg_gen_resume_clears_dangling_lora_config_before_cpp_add(self) -> None:
+        """A generation-only request on a disaggregated worker carries enqueue-time lora_config
+        without lora_weights. Resuming through PeftCacheManager.prepare_resources removes the
+        cached request's tensors before calling C++ add_request_peft."""
+        allow_gen = [False]
+        mgr = make_kv_cache_manager(can_evict=True)
+
+        def alloc_gen(req: Mock) -> bool:
+            if not allow_gen[0]:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={7: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req = _init_lora_req(make_gen_request(0, lora_task_id=7))
+        req.is_generation_only_request = True
+        req.py_decoding_iter = 1
+        req.lora_config = object()
+        req.lora_weights = None
+        exe = _make_peft_executor_stub(mgr, peft, [req])
+
+        out1 = sched.schedule_request([req], set())
+        assert ids(out1.paused_requests) == [0]
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert peft.is_paused(req)
+
+        allow_gen[0] = True
+        out2 = sched.schedule_request([req], set())
+        assert ids(out2.generation_requests) == [0]
+        # prepare_resources must strip dangling lora_config before calling C++ add_request_peft.
+        peft.prepare_resources(out2)
+        req.remove_lora_tensors.assert_called_once()
+        impl.add_request_peft.assert_called_once_with(req, True)
+        assert not peft.is_paused(req)
+        assert impl.device_cached == {7}
+
+    def test_failed_partial_resume_does_not_double_pause_and_later_resumes(self) -> None:
+        """A failed partial resume that activates KV before resize fails and re-suspends must
+        not call C++ mark_request_done a second time, and a later resume restores PEFT once."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        phase = ["initial_fail"]
+
+        def alloc_gen(req: Mock) -> bool:
+            if phase[0] == "initial_fail":
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return phase[0] == "succeed"
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        exe = _make_peft_executor_stub(mgr, peft, [req_a])
+
+        # Pass 1: reach paused state through a real suspend + executor pause.
+        out1 = sched.schedule_request([req_a], set())
+        assert ids(out1.paused_requests) == [0]
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert impl.mark_request_done.call_count == 1
+        assert peft.is_paused(req_a)
+
+        # Pass 2: partial resume flips is_active=True before failing and re-suspending KV.
+        phase[0] = "partial_fail"
+        out2 = sched.schedule_request([req_a], set())
+        assert out2.generation_requests == []
+        assert ids(out2.paused_requests) == [0]
+        assert not mgr.is_request_active(0)
+        exe._pause_peft_for_suspended_requests(out2.paused_requests)
+        assert impl.mark_request_done.call_count == 1
+        assert peft.is_paused(req_a)
+
+        # Pass 3: resume succeeds and prepare_resources re-acquires PEFT once.
+        phase[0] = "succeed"
+        out3 = sched.schedule_request([req_a], set())
+        assert ids(out3.generation_requests) == [0]
+        peft.prepare_resources(out3)
+        impl.add_request_peft.assert_called_once_with(req_a, True)
+        assert impl.mark_request_done.call_count == 1
+        assert not peft.is_paused(req_a)
+
+    @pytest.mark.parametrize("victim_kind", ["gen", "started_ctx"])
+    def test_victim_eviction_pauses_and_resumes_through_prepare_resources(
+        self, victim_kind: str
+    ) -> None:
+        """Both generation and started-context victims pause PEFT after eviction and restore
+        active ownership in prepare_resources when they resume."""
+        call_count = [0]
+        mgr = make_kv_cache_manager(can_evict=True)
+
+        def alloc_gen(req: Mock) -> bool:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req_0 = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        if victim_kind == "gen":
+            victim = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        else:
+            victim = _init_lora_req(
+                make_ctx_request(1, 100, is_first_context_chunk=False, lora_task_id=2)
+            )
+        exe = _make_peft_executor_stub(mgr, peft, [req_0, victim])
+
+        out1 = sched.schedule_request([req_0, victim], set())
+        assert ids(out1.generation_requests) == [0]
+        assert ids(out1.paused_requests) == [1]
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert peft.is_paused(victim)
+        impl.mark_request_done.assert_called_once_with(victim, pause=True)
+
+        out2 = sched.schedule_request([req_0, victim], set())
+        if victim_kind == "gen":
+            assert ids(out2.generation_requests) == [0, 1]
+        else:
+            assert ids(out2.generation_requests) == [0]
+            assert ids(out2.context_requests) == [1]
+        peft.prepare_resources(out2)
+        assert not peft.is_paused(victim)
+        impl.add_request_peft.assert_called_once_with(victim, True)
+
+    def test_lost_kv_on_resume_clears_paused_state_via_free_resources(self) -> None:
+        """If resuming a paused LoRA request hits RemoteMemError, recompute teardown frees
+        PEFT resources and clears the paused record without re-acquiring PEFT."""
+        fail_remote = [False]
+        mgr = make_kv_cache_manager(can_evict=True)
+
+        def alloc_gen(_req: Mock) -> bool:
+            if fail_remote[0]:
+                raise RemoteMemError("remote tier failed")
+            return False
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft, enable_recompute_pause=True)
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        exe = _make_peft_executor_stub(mgr, peft, [req_a])
+
+        out1 = sched.schedule_request([req_a], set())
+        exe._pause_peft_for_suspended_requests(out1.paused_requests)
+        assert peft.is_paused(req_a)
+
+        fail_remote[0] = True
+        out2 = sched.schedule_request([req_a], set())
+        assert out2.generation_requests == []
+        assert ids(out2.recompute_paused_requests) == [0]
+        peft.free_resources(req_a)
+        assert not peft.is_paused(req_a)
+        assert 1 not in impl.paused_tasks
+        assert 1 not in impl.host_cached
+        impl.add_request_peft.assert_not_called()
+
+    def test_no_peft_manager_suspend_and_resume_unaffected(self) -> None:
+        mgr = make_kv_cache_manager(can_evict=True)
+        allow = [False]
+
+        def alloc_gen(req: Mock) -> bool:
+            if not allow[0]:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        sched = make_scheduler(mgr, peft_cache_manager=None)
+
+        req = make_gen_request(0, lora_task_id=1)
+        out1 = sched.schedule_request([req], set())
+        assert ids(out1.paused_requests) == [0]
+        allow[0] = True
+        out2 = sched.schedule_request([req], set())
+        assert ids(out2.generation_requests) == [0]
+
+    def test_peft_paused_gen_not_starved_by_steady_resident_adapter_traffic(self) -> None:
+        """A PEFT-paused decode on adapter 1 must hold newer LoRA arrivals behind
+        its FCFS position so steady adapter-2 traffic cannot starve its resume,
+        while active adapter-2 holders and base-model requests continue to run."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        allow_a = [False]
+
+        def alloc_gen(req: Mock) -> bool:
+            if req.py_request_id == 0 and not allow_a[0]:
+                return False
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_gen
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        req_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        req_b = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        base_ctx = _init_lora_req(make_ctx_request(99, 64, lora_task_id=None))
+        exe = _make_peft_executor_stub(mgr, peft, [req_a, req_b])
+
+        # Suspend req_a and pause its PEFT ownership so only req_b holds adapter 2.
+        out0 = sched.schedule_request([req_a], set())
+        assert ids(out0.paused_requests) == [0]
+        exe._pause_peft_for_suspended_requests(out0.paused_requests)
+        assert peft.is_paused(req_a)
+        # Adapter 2 replaced adapter 1 on device while req_a was suspended.
+        impl.device_cached = {2}
+
+        # Allow req_a KV allocation again, but adapter 2 is still held by req_b.
+        allow_a[0] = True
+        arrivals: list[Mock] = []
+        for step in range(2):
+            arriving = _init_lora_req(
+                make_ctx_request(10 + step, 64, is_first_context_chunk=True, lora_task_id=2)
+            )
+            arrivals.append(arriving)
+            out = sched.schedule_request([req_a, req_b, *arrivals, base_ctx], set())
+            # req_b keeps running to drain adapter 2; base_ctx still runs;
+            # new adapter-2 first-chunk contexts are held behind req_a.
+            assert ids(out.generation_requests) == [1]
+            assert ids(out.context_requests) == [99]
+            for ctx in out.context_requests:
+                if ctx.lora_task_id == 2:
+                    ctx.is_first_context_chunk = False
+
+        # req_b finishes and releases adapter 2 while another adapter-2 arrival joins.
+        peft.free_resources(req_b)
+        arrivals.append(
+            _init_lora_req(make_ctx_request(12, 64, is_first_context_chunk=True, lora_task_id=2))
+        )
+        out_resume = sched.schedule_request([req_a, *arrivals], set())
+        assert ids(out_resume.generation_requests) == [0]
+        assert out_resume.context_requests == []
+        peft.prepare_resources(out_resume)
+        assert not peft.is_paused(req_a)
+        assert impl.device_cached == {1}
+
+    def test_peft_paused_started_context_not_starved_by_resident_adapter_traffic(self) -> None:
+        """A PEFT-paused started context chunk on adapter 1 holds newer LoRA
+        arrivals behind it and resumes as soon as the resident adapter drains."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        paused_ctx = _init_lora_req(
+            make_ctx_request(0, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_ctx)
+        # Adapter 2 replaced adapter 1 on device while paused_ctx was suspended.
+        impl.device_cached = {2}
+
+        active_gen = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        new_ctx = _init_lora_req(
+            make_ctx_request(2, 64, is_first_context_chunk=True, lora_task_id=2)
+        )
+
+        # Pass 1: active_gen holds adapter 2 -> paused_ctx waits and holds new_ctx.
+        out1 = sched.schedule_request([paused_ctx, active_gen, new_ctx], set())
+        assert ids(out1.generation_requests) == [1]
+        assert out1.context_requests == []
+
+        # Pass 2: active_gen finishes -> paused_ctx reserves adapter 1 and resumes ahead of new_ctx.
+        peft.free_resources(active_gen)
+        out2 = sched.schedule_request([paused_ctx, new_ctx], set())
+        assert ids(out2.context_requests) == [0]
+        peft.prepare_resources(out2)
+        assert not peft.is_paused(paused_ctx)
+        assert impl.device_cached == {1}
+
+        # One-slot case: with 1 PEFT page, max_batch_size=1, and arrival order
+        # [A (paused started ctx on adapter 1), B (paused decode on adapter 2),
+        #  C (base-model decode)], A's PEFT reservation must also hold a batch
+        # slot so C cannot crowd A out of Phase 2 and starve both A and B.
+        mgr1 = make_kv_cache_manager(can_evict=True)
+        peft1, impl1 = _make_peft_wrapper(max_device_pages=1, initial_active={1: {10}, 2: {11}})
+        sched1 = make_scheduler(mgr1, max_batch_size=1, peft_cache_manager=peft1)
+
+        req_a = _init_lora_req(
+            make_ctx_request(10, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr1.kv_cache_map[10].is_active = False
+        peft1.pause_request(req_a)
+
+        req_b = _init_lora_req(make_gen_request(11, lora_task_id=2))
+        mgr1.kv_cache_map[11].is_active = False
+        peft1.pause_request(req_b)
+        impl1.device_cached.clear()
+
+        req_c = make_gen_request(12)
+
+        out_one_slot = sched1.schedule_request([req_a, req_b, req_c], set())
+        assert ids(out_one_slot.context_requests) == [10]
+        assert out_one_slot.generation_requests == []
+        peft1.prepare_resources(out_one_slot)
+        assert not peft1.is_paused(req_a)
+        assert impl1.device_cached == {1}
+
+        # Token-budget guard: if paused started context A cannot fit in the
+        # remaining token budget, it must not reserve the PEFT page and block B.
+        mgr_tok = make_kv_cache_manager(can_evict=True)
+        peft_tok, impl_tok = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {20}, 2: {21}}
+        )
+        sched_tok = make_scheduler(
+            mgr_tok, max_batch_size=2, max_num_tokens=32, peft_cache_manager=peft_tok
+        )
+        ctx_too_big = _init_lora_req(
+            make_ctx_request(20, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_tok.kv_cache_map[20].is_active = False
+        peft_tok.pause_request(ctx_too_big)
+        gen_b = _init_lora_req(make_gen_request(21, lora_task_id=2))
+        mgr_tok.kv_cache_map[21].is_active = False
+        peft_tok.pause_request(gen_b)
+        impl_tok.device_cached.clear()
+
+        out_tok = sched_tok.schedule_request([ctx_too_big, gen_b], set())
+        assert ids(out_tok.generation_requests) == [21]
+        assert out_tok.context_requests == []
+        peft_tok.prepare_resources(out_tok)
+        assert not peft_tok.is_paused(gen_b)
+        assert impl_tok.device_cached == {2}
+
+        # Phase-2 KV failure rollback: if A reserves PEFT+slot in Phase 1 but
+        # fails KV admission in Phase 2, its tentative PEFT claim is released so
+        # a later Phase-2 context on another adapter can use that page.
+        mgr_kv = make_kv_cache_manager(
+            can_evict=True,
+            resize_context_fn=lambda req, _toks: req.py_request_id != 30,
+        )
+        peft_kv, impl_kv = _make_peft_wrapper(max_device_pages=1, initial_active={1: {30}})
+        sched_kv = make_scheduler(mgr_kv, max_batch_size=2, peft_cache_manager=peft_kv)
+        ctx_kv_fail = _init_lora_req(
+            make_ctx_request(30, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_kv.kv_cache_map[30].is_active = False
+        peft_kv.pause_request(ctx_kv_fail)
+        impl_kv.device_cached.clear()
+        ctx_other = _init_lora_req(
+            make_ctx_request(31, 32, is_first_context_chunk=True, lora_task_id=2)
+        )
+        impl_kv.host_cached.add(2)
+
+        out_kv = sched_kv.schedule_request([ctx_kv_fail, ctx_other], set())
+        assert ids(out_kv.context_requests) == [31]
+        peft_kv.prepare_resources(out_kv)
+        assert impl_kv.device_cached == {2}
+
+        # One-slot failed KV resume: when A reserves the only slot + PEFT page in
+        # Phase 1 but fails KV resume in Phase 2a without preempting a victim,
+        # its reservation is released and the blocked following decode B is
+        # reconsidered in the same pass ahead of C.
+        mgr_retry = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 40,
+        )
+        peft_retry, impl_retry = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {40}, 2: {41}}
+        )
+        sched_retry = make_scheduler(mgr_retry, max_batch_size=1, peft_cache_manager=peft_retry)
+        ctx_fail = _init_lora_req(
+            make_ctx_request(40, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_retry.kv_cache_map[40].is_active = False
+        peft_retry.pause_request(ctx_fail)
+        gen_follow = _init_lora_req(make_gen_request(41, lora_task_id=2))
+        mgr_retry.kv_cache_map[41].is_active = False
+        peft_retry.pause_request(gen_follow)
+        impl_retry.device_cached.clear()
+        base_follow = make_gen_request(42)
+
+        out_retry = sched_retry.schedule_request([ctx_fail, gen_follow, base_follow], set())
+        assert out_retry.context_requests == []
+        assert ids(out_retry.generation_requests) == [41]
+        peft_retry.prepare_resources(out_retry)
+        assert not peft_retry.is_paused(gen_follow)
+        assert peft_retry.is_paused(ctx_fail)
+        assert impl_retry.device_cached == {2}
+
+        # Two-slot failed KV resume: A reserves slot 1 + adapter 1, B (adapter 2)
+        # is PEFT-blocked during Phase 1, C (base decode) takes slot 2, then A
+        # fails KV in Phase 2a -> Phase 1b retries B into the freed slot + page.
+        mgr_retry2 = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda req: req.py_request_id != 50,
+        )
+        peft_retry2, impl_retry2 = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {50}, 2: {51}}
+        )
+        sched_retry2 = make_scheduler(mgr_retry2, max_batch_size=2, peft_cache_manager=peft_retry2)
+        ctx_fail2 = _init_lora_req(
+            make_ctx_request(50, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_retry2.kv_cache_map[50].is_active = False
+        peft_retry2.pause_request(ctx_fail2)
+        gen_blocked = _init_lora_req(make_gen_request(51, lora_task_id=2))
+        mgr_retry2.kv_cache_map[51].is_active = False
+        peft_retry2.pause_request(gen_blocked)
+        impl_retry2.device_cached.clear()
+        base_gen = make_gen_request(52)
+
+        out_retry2 = sched_retry2.schedule_request([ctx_fail2, gen_blocked, base_gen], set())
+        assert out_retry2.context_requests == []
+        assert sorted(ids(out_retry2.generation_requests)) == [51, 52]
+        peft_retry2.prepare_resources(out_retry2)
+        assert not peft_retry2.is_paused(gen_blocked)
+        assert impl_retry2.device_cached == {2}
+
+        # Token-budget STOP retry: A holds all 64 tokens so base decode 62 hits
+        # ScheduleAction.STOP in _try_schedule_generation before 61 is visited;
+        # when A fails KV in Phase 2a, Phase 1b must retry both 62 and 61.
+        mgr_tok_retry = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 60,
+        )
+        peft_tok_retry, impl_tok_retry = _make_peft_wrapper(
+            max_device_pages=2, initial_active={1: {60}, 2: {61}}
+        )
+        sched_tok_retry = make_scheduler(
+            mgr_tok_retry,
+            max_batch_size=4,
+            max_num_tokens=64,
+            peft_cache_manager=peft_tok_retry,
+        )
+        ctx_tok_fail = _init_lora_req(
+            make_ctx_request(60, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_tok_retry.kv_cache_map[60].is_active = False
+        peft_tok_retry.pause_request(ctx_tok_fail)
+        base_tok_follow = make_gen_request(62)
+        gen_tok_follow = _init_lora_req(make_gen_request(61, lora_task_id=2))
+        mgr_tok_retry.kv_cache_map[61].is_active = False
+        peft_tok_retry.pause_request(gen_tok_follow)
+        impl_tok_retry.device_cached.clear()
+
+        out_tok_retry = sched_tok_retry.schedule_request(
+            [ctx_tok_fail, base_tok_follow, gen_tok_follow], set()
+        )
+        assert out_tok_retry.context_requests == []
+        assert ids(out_tok_retry.generation_requests) == [62, 61]
+
+        # Phase 1b eviction safety: when B (index 1) is retried after C (index 2)
+        # was already admitted in Phase 1 and B's KV allocation fails, B must not
+        # evict or recompute-pause already-scheduled C.
+        mgr_evict = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda req: req.py_request_id != 70,
+            try_allocate_generation_fn=lambda req: req.py_request_id != 71,
+        )
+        peft_evict, impl_evict = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {70}, 2: {71}}
+        )
+        sched_evict = make_scheduler(mgr_evict, max_batch_size=2, peft_cache_manager=peft_evict)
+        ctx_evict_fail = _init_lora_req(
+            make_ctx_request(70, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_evict.kv_cache_map[70].is_active = False
+        peft_evict.pause_request(ctx_evict_fail)
+        gen_evict_fail = _init_lora_req(make_gen_request(71, lora_task_id=2))
+        mgr_evict.kv_cache_map[71].is_active = False
+        peft_evict.pause_request(gen_evict_fail)
+        impl_evict.device_cached.clear()
+        already_scheduled_c = make_gen_request(72)
+
+        out_evict = sched_evict.schedule_request(
+            [ctx_evict_fail, gen_evict_fail, already_scheduled_c], set()
+        )
+        assert ids(out_evict.generation_requests) == [72]
+        assert 72 not in ids(out_evict.paused_requests)
+        assert 72 not in ids(out_evict.recompute_paused_requests)
+
+        # Phase 1b FCFS paused-context ordering: [A (paused ctx, adapter 1,
+        # KV resume fails), B (paused ctx, adapter 2, runnable), C (paused
+        # decode, adapter 3)] with 1 PEFT page -> after A fails, B reserves
+        # adapter 2 and runs ahead of younger decode C.
+        mgr_fcfs = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 80,
+        )
+        peft_fcfs, impl_fcfs = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {80}, 2: {81}, 3: {82}}
+        )
+        sched_fcfs = make_scheduler(mgr_fcfs, max_batch_size=4, peft_cache_manager=peft_fcfs)
+        ctx_a = _init_lora_req(
+            make_ctx_request(80, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_fcfs.kv_cache_map[80].is_active = False
+        peft_fcfs.pause_request(ctx_a)
+        ctx_b = _init_lora_req(
+            make_ctx_request(81, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_fcfs.kv_cache_map[81].is_active = False
+        peft_fcfs.pause_request(ctx_b)
+        gen_c = _init_lora_req(make_gen_request(82, lora_task_id=3))
+        mgr_fcfs.kv_cache_map[82].is_active = False
+        peft_fcfs.pause_request(gen_c)
+        impl_fcfs.device_cached.clear()
+
+        out_fcfs = sched_fcfs.schedule_request([ctx_a, ctx_b, gen_c], set())
+        assert ids(out_fcfs.context_requests) == [81]
+        assert out_fcfs.generation_requests == []
+        peft_fcfs.prepare_resources(out_fcfs)
+        assert not peft_fcfs.is_paused(ctx_b)
+        assert peft_fcfs.is_paused(gen_c)
+        assert impl_fcfs.device_cached == {2}
+
+        # Two-page / two-slot FCFS ordering after STOP without preemption:
+        # [A (adapter 1, 1p, KV fails STOP), B (adapter 2, 1p, runnable),
+        #  C (paused decode, adapter 3, 2p)] -> A and B both reserve in Phase 1;
+        # A's STOP skips B in round 1, but B must NOT be marked failed and must
+        # be reconsidered and admitted ahead of younger decode C.
+        mgr_fcfs2 = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 90,
+        )
+        peft_fcfs2, impl_fcfs2 = _make_peft_wrapper(
+            max_device_pages=2,
+            pages_per_task={1: 1, 2: 1, 3: 2},
+            initial_active={1: {90}, 2: {91}, 3: {92}},
+        )
+        sched_fcfs2 = make_scheduler(mgr_fcfs2, max_batch_size=2, peft_cache_manager=peft_fcfs2)
+        ctx_a2 = _init_lora_req(
+            make_ctx_request(90, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_fcfs2.kv_cache_map[90].is_active = False
+        peft_fcfs2.pause_request(ctx_a2)
+        ctx_b2 = _init_lora_req(
+            make_ctx_request(91, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_fcfs2.kv_cache_map[91].is_active = False
+        peft_fcfs2.pause_request(ctx_b2)
+        gen_c2 = _init_lora_req(make_gen_request(92, lora_task_id=3))
+        mgr_fcfs2.kv_cache_map[92].is_active = False
+        peft_fcfs2.pause_request(gen_c2)
+        impl_fcfs2.device_cached.clear()
+
+        out_fcfs2 = sched_fcfs2.schedule_request([ctx_a2, ctx_b2, gen_c2], set())
+        assert ids(out_fcfs2.context_requests) == [91]
+        assert out_fcfs2.generation_requests == []
+        peft_fcfs2.prepare_resources(out_fcfs2)
+        assert not peft_fcfs2.is_paused(ctx_b2)
+        assert peft_fcfs2.is_paused(gen_c2)
+        assert impl_fcfs2.device_cached == {2}
+
+        # Shared-adapter 2-page / 3-slot case: [A (adapter 1, KV fails STOP),
+        # B (adapter 2, runnable), C (paused decode sharing adapter 2)].
+        # A's STOP without preemption must not skip B even though C already
+        # shares B's adapter; both B and C run in the same pass.
+        mgr_shared = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 100,
+        )
+        peft_shared, impl_shared = _make_peft_wrapper(
+            max_device_pages=2,
+            initial_active={1: {100}, 2: {101, 102}},
+        )
+        sched_shared = make_scheduler(mgr_shared, max_batch_size=3, peft_cache_manager=peft_shared)
+        ctx_a3 = _init_lora_req(
+            make_ctx_request(100, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_shared.kv_cache_map[100].is_active = False
+        peft_shared.pause_request(ctx_a3)
+        ctx_b3 = _init_lora_req(
+            make_ctx_request(101, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_shared.kv_cache_map[101].is_active = False
+        peft_shared.pause_request(ctx_b3)
+        gen_c3 = _init_lora_req(make_gen_request(102, lora_task_id=2))
+        mgr_shared.kv_cache_map[102].is_active = False
+        peft_shared.pause_request(gen_c3)
+        impl_shared.device_cached.clear()
+
+        out_shared = sched_shared.schedule_request([ctx_a3, ctx_b3, gen_c3], set())
+        assert ids(out_shared.context_requests) == [101]
+        assert ids(out_shared.generation_requests) == [102]
+        peft_shared.prepare_resources(out_shared)
+        assert not peft_shared.is_paused(ctx_b3)
+        assert not peft_shared.is_paused(gen_c3)
+        assert impl_shared.device_cached == {2}
+
+    def test_failed_reserved_paused_context_trips_deadlock_detector(self) -> None:
+        """A lone PEFT-paused started context whose KV resume always fails or
+        whose token requirement exceeds max_num_tokens must still count as a
+        context candidate in _detect_deadlock."""
+        mgr = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda _req: False,
+            has_cache_tier_below_gpu=False,
+        )
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, max_batch_size=2, peft_cache_manager=peft)
+        sched._DEADLOCK_STALL_ITERS = 3
+
+        paused_ctx = _init_lora_req(
+            make_ctx_request(0, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_ctx)
+        impl.device_cached.clear()
+
+        for _ in range(2):
+            out = sched.schedule_request([paused_ctx], set())
+            assert out.context_requests == []
+            assert out.generation_requests == []
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([paused_ctx], set())
+
+        # Pre-reservation token-budget stall (rejected before reserving PEFT).
+        mgr_small = make_kv_cache_manager(can_evict=False, has_cache_tier_below_gpu=False)
+        peft_small, impl_small = _make_peft_wrapper(max_device_pages=1, initial_active={1: {1}})
+        sched_small = make_scheduler(
+            mgr_small, max_batch_size=2, max_num_tokens=32, peft_cache_manager=peft_small
+        )
+        sched_small._DEADLOCK_STALL_ITERS = 3
+        oversized_ctx = _init_lora_req(
+            make_ctx_request(1, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_small.kv_cache_map[1].is_active = False
+        peft_small.pause_request(oversized_ctx)
+        impl_small.device_cached.clear()
+
+        for _ in range(2):
+            out = sched_small.schedule_request([oversized_ctx], set())
+            assert out.context_requests == []
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched_small.schedule_request([oversized_ctx], set())
+
+    def test_reserved_paused_context_and_phase2b_share_inforward_snapshot_budget(self) -> None:
+        """Snapshot rows consumed by a reserved paused context in Phase 2a must
+        not be reset before Phase 2b schedules ordinary context requests."""
+        prompt = 4000
+        mgr = make_kv_cache_manager(tokens_per_block=32, can_evict=True)
+        mgr.inforward_snapshot_rows = 1
+        mgr.inforward_snapshot_max_tail = 16
+        mgr.inforward_snapshot_min_main = 3
+        peft, impl = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}})
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=3 * prompt,
+            peft_cache_manager=peft,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+
+        reserved_ctx = _init_lora_req(
+            make_ctx_request(0, prompt, is_first_context_chunk=False, lora_task_id=1)
+        )
+        reserved_ctx.context_current_position = 0
+        reserved_ctx.prompt_len = prompt
+        reserved_ctx.expect_snapshot_points = [prompt - 2]
+        reserved_ctx.py_multimodal_data = None
+        reserved_ctx.py_mamba_inforward_snapshot_point = None
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(reserved_ctx)
+        impl.device_cached.clear()
+
+        ordinary_ctx = make_ctx_request(1, prompt, is_first_context_chunk=True)
+        ordinary_ctx.context_current_position = 0
+        ordinary_ctx.prompt_len = prompt
+        ordinary_ctx.expect_snapshot_points = [prompt - 2]
+        ordinary_ctx.py_multimodal_data = None
+        ordinary_ctx.py_mamba_inforward_snapshot_point = None
+
+        out = sched.schedule_request([reserved_ctx, ordinary_ctx], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        # Only 1 staging row exists: Phase 2a takes it for req 0, so Phase 2b
+        # must leave req 1 split at the snapshot boundary.
+        assert reserved_ctx.py_mamba_inforward_snapshot_point == prompt - 2
+        assert ordinary_ctx.py_mamba_inforward_snapshot_point is None
+
+    def test_prioritize_first_token_retries_blocked_disagg_init_after_failed_ctx_reserve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN, if an older paused
+        started context holds paused_peft_barrier in Phase 1 and then fails KV
+        in Phase 2a, the blocked DISAGG_GENERATION_INIT behind it is retried
+        in Phase 1b with the failed context excluded from the barrier."""
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "1")
+        mgr = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 0,
+        )
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        impl.host_cached.add(2)
+        sched = make_scheduler(mgr, max_batch_size=2, peft_cache_manager=peft)
+
+        paused_ctx = _init_lora_req(
+            make_ctx_request(0, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_ctx)
+        impl.device_cached.clear()
+
+        disagg_init = _init_lora_req(make_disagg_request(1, lora_task_id=2))
+        disagg_init.is_generation_only_request = True
+        disagg_init.py_decoding_iter = 0
+
+        out = sched.schedule_request([paused_ctx, disagg_init], set())
+        assert out.context_requests == []
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_force_chunk_paused_context_reserves_minimum_legal_chunk(self) -> None:
+        """Under FORCE_CHUNK with a 16-token budget, an older paused context
+        needing a 16-token chunk must hold 16 tokens so a younger paused context
+        with a 1-token tail cannot steal 1 token and round the older chunk to 0.
+        When the next legal boundary is 1 token away, reserving 1 token still
+        allows both contexts to run within budget."""
+        mgr = make_kv_cache_manager(tokens_per_block=16, can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(
+            mgr,
+            max_batch_size=4,
+            max_num_tokens=16,
+            peft_cache_manager=peft,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 16),
+        )
+
+        older = _init_lora_req(
+            make_ctx_request(0, 32, is_first_context_chunk=False, lora_task_id=1)
+        )
+        older.context_current_position = 16
+        older.prompt_len = 48
+        older.expect_snapshot_points = []
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(older)
+
+        younger = _init_lora_req(
+            make_ctx_request(1, 1, is_first_context_chunk=False, lora_task_id=2)
+        )
+        younger.context_current_position = 31
+        younger.prompt_len = 32
+        younger.expect_snapshot_points = []
+        mgr.kv_cache_map[1].is_active = False
+        peft.pause_request(younger)
+        impl.device_cached.clear()
+
+        out = sched.schedule_request([older, younger], set())
+        assert ids(out.context_requests) == [0]
+        assert older.context_chunk_size == 16
+
+        # If the older context's next legal snapshot boundary is 1 token away,
+        # it reserves only 1 token, leaving room for a 1-token younger tail.
+        mgr2 = make_kv_cache_manager(tokens_per_block=16, can_evict=True)
+        peft2, impl2 = _make_peft_wrapper(max_device_pages=2, initial_active={1: {10}, 2: {11}})
+        sched2 = make_scheduler(
+            mgr2,
+            max_batch_size=4,
+            max_num_tokens=2,
+            peft_cache_manager=peft2,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 16),
+        )
+        snap_older = _init_lora_req(
+            make_ctx_request(10, 32, is_first_context_chunk=False, lora_task_id=1)
+        )
+        snap_older.context_current_position = 15
+        snap_older.prompt_len = 47
+        snap_older.expect_snapshot_points = [16]
+        mgr2.kv_cache_map[10].is_active = False
+        peft2.pause_request(snap_older)
+
+        tail_younger = _init_lora_req(
+            make_ctx_request(11, 1, is_first_context_chunk=False, lora_task_id=2)
+        )
+        tail_younger.context_current_position = 31
+        tail_younger.prompt_len = 32
+        tail_younger.expect_snapshot_points = []
+        mgr2.kv_cache_map[11].is_active = False
+        peft2.pause_request(tail_younger)
+        impl2.device_cached.clear()
+
+        out2 = sched2.schedule_request([snap_older, tail_younger], set())
+        assert ids(out2.context_requests) == [10, 11]
+        assert snap_older.context_chunk_size == 1
+        assert tail_younger.context_chunk_size == 1
+
+    @pytest.mark.parametrize("newer_kind", ["gen", "started_ctx"])
+    def test_newer_peft_paused_request_cannot_jump_older_multi_page_peft_waiter(
+        self, newer_kind: str
+    ) -> None:
+        """With 2 PEFT pages (1 held by resident adapter R), an older paused
+        waiter needing 2 pages must block a newer paused decode or started
+        context needing 1 page from claiming the free page ahead of it."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        page_costs = {1: 2, 2: 1, 3: 1}
+        peft, impl = _make_peft_wrapper(
+            max_device_pages=2,
+            pages_per_task=page_costs,
+            initial_active={1: {0}, 2: {1}, 3: {2}},
+        )
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        older_paused = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(older_paused)
+
+        if newer_kind == "gen":
+            newer_paused = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        else:
+            newer_paused = _init_lora_req(
+                make_ctx_request(1, 64, is_first_context_chunk=False, lora_task_id=2)
+            )
+        mgr.kv_cache_map[1].is_active = False
+        peft.pause_request(newer_paused)
+        impl.device_cached = {3}
+
+        resident = _init_lora_req(make_gen_request(2, lora_task_id=3))
+
+        # Adapter 1 (2 pages) cannot fit on device while resident adapter 3 holds 1 page.
+        with pytest.raises(RuntimeError, match="Cache is full"):
+            impl.ensure_batch_map_task_id([], [older_paused])
+        assert impl.device_cached == {3}
+
+        # Pass 1: resident holds 1 of 2 pages -> older_paused (2 pages) waits
+        # and holds newer_paused (1 page), while resident keeps running.
+        out1 = sched.schedule_request([older_paused, newer_paused, resident], set())
+        assert ids(out1.generation_requests) == [2]
+        assert out1.context_requests == []
+        peft.prepare_resources(out1)
+        assert impl.device_cached == {3}
+
+        # Pass 2: resident completes -> older_paused claims both pages and resumes
+        # ahead of newer_paused.
+        peft.free_resources(resident)
+        out2 = sched.schedule_request([older_paused, newer_paused], set())
+        assert ids(out2.generation_requests) == [0]
+        assert out2.context_requests == []
+        peft.prepare_resources(out2)
+        assert not peft.is_paused(older_paused)
+        assert peft.is_paused(newer_paused)
+        assert impl.device_cached == {1}
+
+    @pytest.mark.parametrize("prioritize_first_token", [False, True])
+    def test_disagg_gen_init_peft_miss_skips_instead_of_stalling_active_decode(
+        self, prioritize_first_token: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DISAGG_GENERATION_INIT waiting for PEFT must skip so active decodes
+        can drain, while holding newer LoRA gen-inits behind its arrival position."""
+        monkeypatch.setenv(
+            "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", str(int(prioritize_first_token))
+        )
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, _ = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        resident = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        resident.is_generation_only_request = True
+        resident.py_decoding_iter = 2
+        waiter_a2 = _init_lora_req(make_disagg_request(1, lora_task_id=2))
+        waiter_a2.is_generation_only_request = True
+        waiter_a2.py_decoding_iter = 0
+        newer_a1 = _init_lora_req(make_disagg_request(2, lora_task_id=1))
+        newer_a1.is_generation_only_request = True
+        newer_a1.py_decoding_iter = 0
+
+        # waiter_a2 sits ahead of resident (or is sorted ahead under first-token priority):
+        # resident must still run, and newer_a1 must wait behind waiter_a2.
+        reqs = (
+            [waiter_a2, newer_a1, resident]
+            if not prioritize_first_token
+            else [
+                resident,
+                waiter_a2,
+                newer_a1,
+            ]
+        )
+        out1 = sched.schedule_request(reqs, set())
+        assert ids(out1.generation_requests) == [0]
+        assert out1.fitting_disagg_gen_init_requests == []
+
+        # Once resident finishes, waiter_a2 is admitted ahead of newer_a1.
+        peft.free_resources(resident)
+        out2 = sched.schedule_request([waiter_a2, newer_a1], set())
+        assert ids(out2.fitting_disagg_gen_init_requests) == [1]
+
+    def test_prioritize_first_token_does_not_let_newer_arrival_jump_older_paused_waiter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN, a newer iter-0 request
+        moved ahead of an older PEFT-paused decode must not steal capacity while
+        the cache is full, when capacity frees up completely, or when capacity
+        is only partially free."""
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "1")
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        paused_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        paused_a.is_generation_only_request = True
+        paused_a.py_decoding_iter = 3
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_a)
+        impl.device_cached = {2}
+
+        active_b = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        active_b.is_generation_only_request = True
+        active_b.py_decoding_iter = 3
+
+        newer_init = _init_lora_req(make_disagg_request(2, lora_task_id=2))
+        newer_init.is_generation_only_request = True
+        newer_init.py_decoding_iter = 0
+
+        # Pass 1 (full cache): active_b runs and newer_init is held behind paused_a.
+        out1 = sched.schedule_request([paused_a, active_b, newer_init], set())
+        assert ids(out1.generation_requests) == [1]
+        assert out1.fitting_disagg_gen_init_requests == []
+
+        # Pass 2 (holder completes, claimed_peft_pages == 0): newer_init is sorted
+        # ahead of paused_a by first-token priority, yet paused_a must claim the
+        # freed page and resume instead of being starved by repeated arrivals.
+        peft.free_resources(active_b)
+        out2 = sched.schedule_request([paused_a, newer_init], set())
+        assert ids(out2.generation_requests) == [0]
+        assert out2.fitting_disagg_gen_init_requests == []
+        peft.prepare_resources(out2)
+        assert not peft.is_paused(paused_a)
+
+        # Partially free cache (2 pages total, 1 claimed by active_b, 1 free):
+        # older paused_a (adapter 1) must take the 1 free page before reordered
+        # newer iter-0 arrival newer_c (adapter 3) can consume it.
+        mgr2 = make_kv_cache_manager(can_evict=True)
+        peft2, impl2 = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}, 2: {1}})
+        sched2 = make_scheduler(mgr2, peft_cache_manager=peft2)
+
+        paused_a2 = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        paused_a2.is_generation_only_request = True
+        paused_a2.py_decoding_iter = 3
+        mgr2.kv_cache_map[0].is_active = False
+        peft2.pause_request(paused_a2)
+        impl2.device_cached = {2}
+
+        active_b2 = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        active_b2.is_generation_only_request = True
+        active_b2.py_decoding_iter = 3
+
+        newer_c = _init_lora_req(make_disagg_request(3, lora_task_id=3))
+        newer_c.is_generation_only_request = True
+        newer_c.py_decoding_iter = 0
+
+        out3 = sched2.schedule_request([paused_a2, active_b2, newer_c], set())
+        assert ids(out3.generation_requests) == [0, 1]
+        assert out3.fitting_disagg_gen_init_requests == []
+
+    def test_gen_preemption_held_peft_waiter_does_not_trip_deadlock_detector(self) -> None:
+        """While a resident holder is paused in place under GEN preemption, a
+        PEFT waiter holding newer arrivals must not increment _stalled_schedules."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, _ = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(frozenset({1}))
+
+        paused_a = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_a)
+        resident_b = _init_lora_req(make_gen_request(1, lora_task_id=2))
+        waiter_ctx = _init_lora_req(
+            make_ctx_request(2, 64, is_first_context_chunk=True, lora_task_id=2)
+        )
+
+        out = sched.schedule_request([paused_a, resident_b, waiter_ctx], set())
+        assert out.generation_requests == []
+        assert out.context_requests == []
+        assert sched._stalled_schedules == 0
+
+    def test_preclaim_fast_path_skips_base_and_seen_adapter_requests(self) -> None:
+        """Pre-claim short-circuits on lora_task_id=None and already-seen tasks
+        before calling peft_cache_manager.is_paused or determine_num_pages."""
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft = make_peft_cache_manager(max_device_pages=2, pages_per_task=1)
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+
+        base_reqs = [make_gen_request(i, lora_task_id=None) for i in range(4)]
+        lora_reqs = [make_gen_request(10 + i, lora_task_id=7) for i in range(5)]
+
+        out = sched.schedule_request(base_reqs + lora_reqs, set())
+        assert len(out.generation_requests) == 9
+        # Only the first request for task 7 needs is_paused / determine_num_pages.
+        assert peft.is_paused.call_count == 1
+        assert peft.determine_num_pages.call_count == 1
+
+    def test_overlap_executor_loop_defers_peft_pause_until_after_previous_batch_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drive real PyExecutor._executor_loop_overlap with an in-flight previous
+        batch and a suspended LoRA request: PEFT ownership must stay active until
+        _process_previous_batch finishes, and transition to paused right after."""
+        from contextlib import nullcontext
+        from threading import Event
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+        from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+
+        mgr = make_kv_cache_manager(can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        suspended = _init_lora_req(make_gen_request(0, lora_task_id=1))
+        mgr.kv_cache_map[0].is_active = False
+
+        exe = object.__new__(PyExecutor)
+        exe._is_kv_manager_v2 = True
+        exe.kv_cache_manager = mgr
+        exe.active_requests = [suspended]
+        exe._pending_peft_pause_requests = []
+        exe._pending_recompute_pause_ids = set()
+        exe._disagg_pp_termination_handler = None
+        exe.resource_manager = Mock()
+        exe.resource_manager.get_resource_manager.side_effect = lambda rtype: (
+            peft if rtype == ResourceManagerType.PEFT_CACHE_MANAGER else None
+        )
+        exe.device_id = 0
+        exe._profiler = lambda: nullcontext(lambda: None)
+        exe.hang_detector = Mock()
+        exe.hang_detector.__enter__ = Mock(return_value=None)
+        exe.hang_detector.__exit__ = Mock(return_value=False)
+        exe._intake_window = Event()
+        exe._execution_stream_loop_armed = False
+        exe._resource_governor_enabled = False
+        exe.is_benchmark_disagg = False
+        exe.enable_attention_dp = False
+        exe.enable_early_first_token_response = False
+        exe.enable_kv_cache_events = False
+        exe.enable_iter_perf_stats = False
+        exe.speculation_gate = None
+        exe.kv_cache_transceiver = None
+        exe.kv_connector_manager = None
+        exe.iter_counter = 0
+        exe.is_shutdown = False
+        exe._mm_encoder_item_scheduling_enabled = False
+        exe.perf_manager = Mock()
+        exe._disagg_coordinator = Mock()
+        exe._disagg_coordinator.handle_errors_synced.return_value = False
+        exe._can_pause_for_rebalance = Mock(return_value=False)
+        exe._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        exe._can_queue = Mock(return_value=(False, False))
+        exe._release_unused_connector_reservations = Mock()
+        exe._terminate_recompute_paused_requests = Mock()
+        exe._pause_recompute_paused_requests = Mock()
+        exe._revert_unexecuted_alloc = Mock()
+        exe._finalize_adp_dummy_allocation = Mock()
+        exe._send_kv_async = Mock()
+        exe._commit_kv_cache_stats = Mock()
+        exe._flush_iter_stats_synced = Mock()
+        exe._kv_connector_terminate_requests = Mock()
+        exe._wait_for_model_engine_input_copy = Mock()
+        exe._enqueue_responses = Mock()
+        exe._flush_pending_transfer_responses = Mock()
+        exe._handle_canceled_requests = Mock()
+        exe._stage_mark = Mock()
+        exe.previous_batch = Mock(scheduled_requests=ScheduledRequests())
+
+        events: list[str] = []
+
+        def update_prev(_sample_state) -> None:
+            # During previous-batch harvest, suspended req must still own PEFT.
+            assert not peft.is_paused(suspended)
+            assert 0 in impl.active_tasks.get(1, set())
+            events.append("update_requests")
+
+        def process_prev(_next_batch=None) -> None:
+            # Before previous batch finishes processing, suspended req must still own PEFT.
+            assert not peft.is_paused(suspended)
+            assert 0 in impl.active_tasks.get(1, set())
+            events.append("process_previous_batch")
+
+        orig_pause = peft.pause_request
+
+        def tracked_pause(req: Mock) -> None:
+            events.append(f"pause:{req.py_request_id}")
+            orig_pause(req)
+
+        exe._update_requests = Mock(side_effect=update_prev)
+        exe._process_previous_batch = Mock(side_effect=process_prev)
+        peft.pause_request = tracked_pause  # type: ignore[method-assign]
+
+        batch = ScheduledRequests()
+        batch.paused_requests = [suspended]
+        exe._prepare_and_schedule_batch = Mock(side_effect=[(batch, None), (None, None)])
+
+        for target in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+            monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
+
+        exe._executor_loop_overlap()
+
+        assert events == ["update_requests", "process_previous_batch", "pause:0"]
+        assert peft.is_paused(suspended)
+        assert exe._pending_peft_pause_requests == []
+        impl.mark_request_done.assert_called_once_with(suspended, pause=True)
 
 
 # ===========================================================================

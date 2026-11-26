@@ -42,6 +42,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -1181,7 +1182,6 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.enable_iter_perf_stats = False
     exe.iter_counter = 0
     exe._mm_encoder_item_scheduling_enabled = False
-    exe._pending_recompute_pause_ids = set()
     # The loop wraps forward+sample in ``_step_scope()``, which reads this to
     # decide whether to open a profiler range. False keeps it at nullcontext.
     exe._profile_controller = MagicMock(enabled=False)
@@ -1211,6 +1211,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # Empty: an idle iteration finds no deferred recompute pause, so it needs no
     # PP termination handler.
     exe._pending_recompute_pause_ids = set()
+    exe._pending_peft_pause_requests = []
     # An iteration that executes no batch flushes responses buffered outside a
     # batch and advances deferred PP terminations; none are pending here.
     exe._pending_transfer_responses = []
@@ -1408,6 +1409,405 @@ class TestPpLoopDrainWiring:
         # Once to start the drain, once on the iteration after it finished --
         # never on the three iterations in between.
         assert exe._agreed_need_adjustment.call_count == 2
+
+    @pytest.mark.parametrize(
+        ("rank", "is_first", "is_last"),
+        [(0, True, False), (1, False, False), (2, False, True)],
+        ids=["rank0", "middle_rank", "last_rank"],
+    )
+    def test_pp_ranks_flush_pending_peft_pauses_in_same_empty_iteration(
+        self, monkeypatch, rank: int, is_first: bool, is_last: bool
+    ) -> None:
+        """When an iteration queues nothing while a previous microbatch is still
+        recorded, non-last PP ranks (first and intermediate) must sync the
+        previous sampler event before pausing PEFT so every PP rank pauses in
+        the same iteration without racing an in-flight forward."""
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(False,))
+        exe.dist.pp_size = 3
+        exe.dist.rank = exe.dist.pp_rank = rank
+        exe.dist.is_first_pp_rank = is_first
+        exe.dist.is_last_pp_rank = is_last
+        exe.dist.prev_pp_rank = rank - 1
+        exe.dist.next_pp_rank = rank + 1
+        exe.dist.recv_object.return_value = 0
+        exe._can_pause_for_rebalance = MagicMock(return_value=False)
+        exe._can_queue = MagicMock(return_value=(False, False))
+        exe.scheduler = MagicMock()
+        exe.scheduler.schedule_request.return_value = MagicMock(fitting_disagg_gen_init_requests=[])
+        exe.inflight_req_ids = set()
+        exe._pp_retry_until_can_schedule = MagicMock()
+
+        suspended = MagicMock(
+            py_request_id=7,
+            lora_task_id=1,
+            is_finished=False,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            is_context_init_state=False,
+            is_first_context_chunk=False,
+            is_generation_in_progress_state=True,
+            is_generation_only_request=False,
+            py_decoding_iter=2,
+        )
+        exe.active_requests = [suspended]
+        exe.kv_cache_manager = MagicMock()
+        exe.kv_cache_manager.is_request_active.return_value = False
+
+        events: list[str] = []
+        peft_manager = MagicMock()
+        peft_manager.pause_request.side_effect = lambda req: events.append(
+            f"pause:{req.py_request_id}"
+        )
+        exe.resource_manager.get_resource_manager.return_value = peft_manager
+
+        prev_event = MagicMock()
+        prev_event.synchronize.side_effect = lambda: events.append("sync_prev")
+        exe.previous_batch = MagicMock(sample_state=MagicMock(sampler_event=prev_event))
+
+        scheduled_batch = MagicMock()
+        scheduled_batch.batch_size = 0
+        scheduled_batch.num_encoder_requests = 0
+        scheduled_batch.num_context_requests = 0
+        scheduled_batch.num_generation_requests = 0
+        scheduled_batch.encoder_requests = []
+        scheduled_batch.generation_requests = []
+        scheduled_batch.recompute_paused_requests = []
+        scheduled_batch.paused_requests = [suspended]
+        scheduled_batch.all_requests.return_value = []
+        exe._pp_schedule_and_propagate = MagicMock(return_value=(scheduled_batch, [], 0, False))
+
+        # Run exactly one iteration and stop on the second fetch.
+        fetch_calls = 0
+
+        def _one_iter_fetch():
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls > 1:
+                exe.is_shutdown = True
+                exe.active_requests = []
+            return []
+
+        exe._fetch_and_activate_new_requests = MagicMock(side_effect=_one_iter_fetch)
+
+        PyExecutor._executor_loop_pp(exe)
+
+        assert events == ["sync_prev", "pause:7"]
+        assert exe._pending_peft_pause_requests == []
+        peft_manager.pause_request.assert_called_once_with(suspended)
+
+    @pytest.mark.parametrize(
+        ("rank", "is_first"),
+        [(0, True), (1, False)],
+        ids=["rank0", "middle_rank"],
+    )
+    def test_pp_non_last_rank_skips_extra_sync_when_only_base_request_paused(
+        self, monkeypatch, rank: int, is_first: bool
+    ) -> None:
+        """On non-last PP ranks with an empty current batch (not can_queue), a
+        suspended base-model request with no adapter must not trigger the extra
+        sampler_event.synchronize() even when PEFT is configured."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(False,))
+        exe.dist.pp_size = 3
+        exe.dist.rank = exe.dist.pp_rank = rank
+        exe.dist.is_first_pp_rank = is_first
+        exe.dist.is_last_pp_rank = False
+        exe.dist.prev_pp_rank = rank - 1
+        exe.dist.next_pp_rank = rank + 1
+        exe.dist.recv_object.return_value = 0
+        exe._can_pause_for_rebalance = MagicMock(return_value=False)
+        exe._can_queue = MagicMock(return_value=(False, False))
+        exe.inflight_req_ids = set()
+        exe._pp_retry_until_can_schedule = MagicMock()
+        exe.scheduler = MagicMock()
+        exe.scheduler.schedule_request.return_value = MagicMock(
+            fitting_disagg_gen_init_requests=[]
+        )
+
+        suspended_base = MagicMock()
+        suspended_base.py_request_id = 7
+        suspended_base.lora_task_id = None
+        suspended_base.is_finished = False
+        suspended_base.state = LlmRequestState.GENERATION_IN_PROGRESS
+        suspended_base.is_context_init_state = False
+        suspended_base.is_first_context_chunk = False
+        suspended_base.is_generation_in_progress_state = True
+        suspended_base.is_generation_only_request = False
+        suspended_base.py_decoding_iter = 2
+        exe.active_requests = [suspended_base]
+
+        exe.kv_cache_manager = MagicMock()
+        exe.kv_cache_manager.is_request_active.return_value = False
+
+        events: list[str] = []
+        peft_manager = MagicMock()
+        peft_manager.is_paused.return_value = False
+        peft_manager.pause_request.side_effect = lambda req: events.append(
+            f"pause:{req.py_request_id}"
+        )
+        exe.resource_manager.get_resource_manager.side_effect = lambda rtype: (
+            peft_manager if rtype == ResourceManagerType.PEFT_CACHE_MANAGER else None
+        )
+
+        empty_batch = MagicMock()
+        empty_batch.batch_size = 0
+        empty_batch.num_encoder_requests = 0
+        empty_batch.num_context_requests = 0
+        empty_batch.num_generation_requests = 0
+        empty_batch.encoder_requests = []
+        empty_batch.context_requests = []
+        empty_batch.generation_requests = []
+        empty_batch.paused_requests = [suspended_base]
+        empty_batch.recompute_paused_requests = []
+        empty_batch.scheduled_mm_encoder_items = []
+        empty_batch.all_requests.return_value = []
+        exe._pp_schedule_and_propagate = MagicMock(return_value=(empty_batch, [], 0, False))
+
+        prev_event = MagicMock()
+        prev_event.synchronize.side_effect = lambda: events.append("sync_prev")
+        exe.previous_batch = MagicMock(sample_state=MagicMock(sampler_event=prev_event))
+
+        fetch_calls = 0
+
+        def _one_iter_fetch():
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls > 1:
+                exe.is_shutdown = True
+                exe.active_requests = []
+            return []
+
+        exe._fetch_and_activate_new_requests = MagicMock(side_effect=_one_iter_fetch)
+
+        PyExecutor._executor_loop_pp(exe)
+
+        assert events == []
+        assert exe._pending_peft_pause_requests == []
+        prev_event.synchronize.assert_not_called()
+        peft_manager.pause_request.assert_not_called()
+
+    def test_pp_pause_propagation_keeps_peft_ownership_and_admission_aligned_across_ranks(
+        self, monkeypatch
+    ) -> None:
+        """Drive real _pp_schedule_and_propagate (SerializableSchedulerOutput)
+        and _executor_loop_pp across a 3-stage pipeline (leader, intermediate,
+        last) on an empty iteration, then verify a subsequent scheduling pass
+        agrees on paused PEFT ownership and LoRA admission across all ranks."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import (
+            PeftCacheManager,
+            ResourceManagerType,
+        )
+        from tensorrt_llm._torch.pyexecutor.scheduler import KVCacheV2Scheduler, ScheduledRequests
+        from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+
+        def _make_rank_peft():
+            active_tasks: dict[int, set[int]] = {1: {7}}
+            device_cached: set[int] = {1}
+
+            impl = MagicMock()
+            impl.max_device_pages = 1
+            impl.determine_num_pages.side_effect = lambda req: (
+                1 if req.lora_task_id is not None else 0
+            )
+            impl.is_task_cached_in_device.side_effect = lambda tid: tid in device_cached
+            impl.mark_request_done.side_effect = lambda req, pause=False: active_tasks.get(
+                req.lora_task_id, set()
+            ).discard(req.py_request_id)
+
+            mgr = object.__new__(PeftCacheManager)
+            mgr.impl = impl
+            mgr._paused_request_ids = set()
+            return mgr, active_tasks
+
+        def _make_rank_req(req_id: int, state: LlmRequestState, lora_task_id: int):
+            req = MagicMock()
+            req.request_id = req_id
+            req.py_request_id = req_id
+            req.lora_task_id = lora_task_id
+            req.lora_config = None
+            req.state = state
+            req.state_value = state.value
+            req.is_finished = False
+            req.is_attention_dp_dummy = False
+            req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
+            req.is_first_context_chunk = state == LlmRequestState.CONTEXT_INIT
+            req.is_last_context_chunk = True
+            req.is_generation_in_progress_state = state == LlmRequestState.GENERATION_IN_PROGRESS
+            req.is_generation_only_request = False
+            req.py_decoding_iter = 2 if state == LlmRequestState.GENERATION_IN_PROGRESS else 0
+            req.context_remaining_length = 32 if state == LlmRequestState.CONTEXT_INIT else 0
+            req.context_chunk_size = 32 if state == LlmRequestState.CONTEXT_INIT else 0
+            req.py_prompt_len = 32
+            req.py_orig_prompt_len = 32
+            req.py_draft_tokens = []
+            req.num_draft_tokens = 0
+            req.beam_width = 1
+            req.get_beam_width_by_iter.return_value = 1
+            req.sampling_config = MagicMock(beam_width=1)
+            req.py_multimodal_data = None
+            req.encoder_output_len = None
+            req.py_csa2_remote_tail_mode = None
+            req.py_locality_domain_id = None
+            return req
+
+        # Wire simulating rank 0 -> rank 1 -> rank 2 PP schedule propagation.
+        wire: dict[tuple[int, object], object] = {}
+        rank_pefts = []
+        rank_schedulers = []
+        rank_suspended = []
+
+        for rank, is_first, is_last in ((0, True, False), (1, False, False), (2, False, True)):
+            exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(False,))
+            exe.dist.pp_size = 3
+            exe.dist.rank = exe.dist.pp_rank = rank
+            exe.dist.is_first_pp_rank = is_first
+            exe.dist.is_last_pp_rank = is_last
+            exe.dist.prev_pp_rank = rank - 1
+            exe.dist.next_pp_rank = rank + 1
+            exe.send_schedule_handles = [None, None]
+            exe._can_pause_for_rebalance = MagicMock(return_value=False)
+            exe._can_queue = MagicMock(return_value=(False, False))
+            exe.inflight_req_ids = set()
+            exe._pp_retry_until_can_schedule = MagicMock()
+
+            suspended = _make_rank_req(7, LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=1)
+            exe.active_requests = [suspended]
+            rank_suspended.append(suspended)
+
+            events: list[str] = []
+            kv_active = {7: True}
+            kv_entry = MagicMock(is_active=True)
+
+            kv_mgr = MagicMock()
+            kv_mgr.__class__ = KVCacheManagerV2
+            kv_mgr.is_request_active.side_effect = lambda rid, _active=kv_active: _active.get(
+                rid, False
+            )
+
+            def _suspend_kv(req, _active=kv_active, _entry=kv_entry, _ev=events):
+                _active[req.py_request_id] = False
+                if req.py_request_id == 7:
+                    _entry.is_active = False
+                _ev.append(f"suspend:{req.py_request_id}")
+
+            kv_mgr.suspend_request.side_effect = _suspend_kv
+            kv_mgr.can_evict = True
+            kv_mgr.tokens_per_block = 32
+            kv_mgr.kv_cache_map = {7: kv_entry}
+            kv_mgr.try_allocate_generation.return_value = False
+            kv_mgr.prepare_context.return_value = True
+            kv_mgr.resize_context.return_value = True
+            kv_mgr.context_replay_tokens.return_value = None
+            kv_mgr.estimate_context_reuse_tokens.return_value = 0
+            kv_mgr.is_first_chunk_context_reusable.return_value = False
+            kv_mgr.has_cache_tier_below_gpu = True
+            kv_mgr.inforward_snapshot_rows = 0
+            kv_mgr.max_seq_len = 256
+            kv_mgr.enable_block_reuse = False
+            kv_mgr.enable_partial_reuse = True
+            kv_mgr.is_helix_cp = False
+            kv_mgr.can_use_helix_transfer = False
+            kv_mgr._has_cp_helix = False
+            kv_mgr.kv_connector_manager = None
+            kv_mgr.flush_deferred_closes.return_value = False
+            exe.kv_cache_manager = kv_mgr
+
+            peft, active_tasks = _make_rank_peft()
+            rank_pefts.append((peft, active_tasks))
+            exe.resource_manager.get_resource_manager.side_effect = lambda rtype, p=peft: (
+                p if rtype == ResourceManagerType.PEFT_CACHE_MANAGER else None
+            )
+
+            sched = KVCacheV2Scheduler(
+                max_batch_size=8,
+                max_num_tokens=256,
+                kv_cache_manager=kv_mgr,
+                peft_cache_manager=peft,
+                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            )
+            exe.scheduler = sched
+            rank_schedulers.append(sched)
+
+            orig_pause = peft.pause_request
+
+            def _track_pause(req, _orig=orig_pause, _ev=events):
+                _ev.append(f"pause:{req.py_request_id}")
+                _orig(req)
+
+            peft.pause_request = _track_pause
+
+            prev_event = MagicMock()
+            prev_event.synchronize.side_effect = lambda _ev=events: _ev.append("sync_prev")
+            exe.previous_batch = MagicMock(sample_state=MagicMock(sampler_event=prev_event))
+
+            # Use real _pp_schedule_and_propagate instead of mocking it away.
+            exe._pp_schedule_and_propagate = MethodType(PyExecutor._pp_schedule_and_propagate, exe)
+            if is_first:
+
+                def _leader_schedule(_exe=exe, _sched=sched):
+                    out = _sched.schedule_request(_exe.active_requests, _exe.inflight_req_ids)
+                    batch = ScheduledRequests()
+                    batch.encoder_requests = out.encoder_requests
+                    batch.context_requests_last_chunk = out.context_requests
+                    batch.generation_requests = out.generation_requests
+                    batch.paused_requests = out.paused_requests
+                    batch.recompute_paused_requests = out.recompute_paused_requests
+                    return (
+                        batch,
+                        out.fitting_disagg_gen_init_requests,
+                        out.num_fitting_requests,
+                    )
+
+                exe._schedule = MagicMock(side_effect=_leader_schedule)
+                exe.disagg.admit = MagicMock(return_value=([], False))
+
+            def _isend(obj, dest, tag, _wire=wire):
+                _wire[(dest, tag)] = obj
+                return MagicMock()
+
+            def _recv(src, tag, _rank=rank, _wire=wire):
+                return _wire.get((_rank, tag), 0)
+
+            exe.dist.isend_object.side_effect = _isend
+            exe.dist.recv_object.side_effect = _recv
+
+            fetch_calls = 0
+
+            def _one_iter_fetch(_exe=exe):
+                nonlocal fetch_calls
+                fetch_calls += 1
+                if fetch_calls > 1:
+                    _exe.is_shutdown = True
+                    _exe.active_requests = []
+                return []
+
+            exe._fetch_and_activate_new_requests = MagicMock(side_effect=_one_iter_fetch)
+
+            PyExecutor._executor_loop_pp(exe)
+
+            assert not kv_mgr.is_request_active(7), f"rank {rank}: KV stayed active"
+            assert events == ["suspend:7", "sync_prev", "pause:7"], f"rank {rank}: {events}"
+            assert exe._pending_peft_pause_requests == []
+
+        # Subsequent scheduling pass: all 3 ranks must agree on paused PEFT state
+        # and make identical admission decisions for a new adapter-2 request.
+        admissions = []
+        for rank in range(3):
+            peft, active_tasks = rank_pefts[rank]
+            suspended = rank_suspended[rank]
+            assert peft.is_paused(suspended)
+            assert active_tasks[1] == set()
+
+            new_ctx = _make_rank_req(8, LlmRequestState.CONTEXT_INIT, lora_task_id=2)
+            out = rank_schedulers[rank].schedule_request([new_ctx, suspended], set())
+            admissions.append(
+                (
+                    [r.request_id for r in out.generation_requests],
+                    [r.request_id for r in out.context_requests],
+                )
+            )
+
+        assert admissions == [([], [8]), ([], [8]), ([], [8])]
 
 
 if __name__ == "__main__":
