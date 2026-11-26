@@ -1157,6 +1157,7 @@ async def test_coordinator_tcp_listener_uses_the_prebound_socket(monkeypatch, ud
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     with sock:
+        sock.bind(("127.0.0.1", 0))
         await server("fe80::ac31:4bff:fee6:2d43", 8332, uds=uds, sockets=[sock])
 
         tcp_server.serve.assert_awaited_once_with(sockets=[sock])
