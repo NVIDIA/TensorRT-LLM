@@ -40,7 +40,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import aiohttp
 import msgpack
@@ -75,9 +75,11 @@ from tensorrt_llm.serve.output_length_predictor import (
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
     ROUTING_CONTENT_REQUIRED,
+    ContextCancellationCapabilityError,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     Router,
+    ServerPreparationPending,
     build_disagg_routers,
 )
 
@@ -100,6 +102,13 @@ POOLED_RESERVATION_TIMEOUT_S = 6 * 3600.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 COORDINATOR_READINESS_TIMEOUT_S = 5.0
+
+
+class _Reservation(NamedTuple):
+    """Coordinator expiry and, for protected CTX, the admission actually granted."""
+
+    expiry: asyncio.Task
+    context_admission: str | None = None
 
 
 def coordinator_reservation_timeout() -> float:
@@ -126,6 +135,30 @@ def pooled_reservation_timeout(reservation_timeout_s: float) -> float:
     coordinator holds the seat.
     """
     return max(reservation_timeout_s, POOLED_RESERVATION_TIMEOUT_S)
+
+
+def context_cancellation_enabled(config: DisaggServerConfig) -> bool:
+    """Select protected context-first coordination with the existing policy flags.
+
+    Args:
+        config: Effective frontend or coordinator configuration.
+
+    Returns:
+        Whether this process must enforce independent context cancellation.
+
+    Raises:
+        ValueError: Protected coordination lacks no-retry or internal authentication.
+    """
+    enabled = (
+        config.schedule_style != "generation_first"
+        and os.getenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "0") == "1"
+    )
+    if enabled:
+        if os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
+            raise ValueError("Context cancellation requires TRTLLM_DISAGG_NO_RETRY=1")
+        if not config.internal_request_auth_key:
+            raise ValueError("Context cancellation requires internal_request_auth_key")
+    return enabled
 
 
 class DisaggCoordinator(ABC):
@@ -195,6 +228,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         request_timeout_secs: Optional[float] = None,
     ):
         self._config = config
+        self._context_cancellation_enabled = context_cancellation_enabled(config)
         self._client_factory = client_factory
         self._metadata_config = metadata_config
         if config.disagg_cluster_config:
@@ -207,15 +241,22 @@ class DisaggCoordinatorService(DisaggCoordinator):
         # delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(config.server_configs)
+        self._watch_context_registrations = bool(
+            self._context_cancellation_enabled
+            and config.disagg_cluster_config
+            and config.disagg_cluster_config.cluster_uri.startswith("etcd://")
+        )
         self._ctx_router, self._gen_router = build_disagg_routers(
             config.ctx_router_config,
             config.gen_router_config,
-            ctx_servers,
+            [] if self._watch_context_registrations else ctx_servers,
             gen_servers,
             metadata_config,
             self._metadata_server,
             server_preparation_func,
             disagg_node_id=config.node_id,
+            require_context_cancellation=self._context_cancellation_enabled,
+            context_auth_key=config.internal_request_auth_key,
         )
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
@@ -234,7 +275,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._reservation_timeout_secs = reservation_timeout(
             reservation_timeout_secs, request_timeout_secs
         )
-        self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
+        self._reservation_tasks: dict[tuple[str, int], _Reservation] = {}
+        self._context_worker_registrations: dict[str, str] = {}
+        self._context_admission_tasks: dict[str, asyncio.Task] = {}
+        self._retired_context_admissions: set[asyncio.Task] = set()
+        self._context_admission_closed = False
         self._reservation_locks = [
             asyncio.Lock() for _ in range(COORDINATOR_RESERVATION_LOCK_STRIPES)
         ]
@@ -322,16 +367,31 @@ class DisaggCoordinatorService(DisaggCoordinator):
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
-                previous.cancel()
+                previous.expiry.cancel()
                 await router.finish_request_by_id(req_id, False)
+            if (
+                reservation_key[0] == "context"
+                and self._context_cancellation_enabled
+                and not router.has_prepared_server
+            ):
+                raise ServerPreparationPending("No admitted CTX worker is available")
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
             )
             # A router that placed nothing asks for more routing input; the
             # worker repeats the select with it, so nothing is reserved.
             if server is not None:
-                self._reservation_tasks[reservation_key] = asyncio.create_task(
-                    self._expire_reservation(reservation_key, router)
+                admission = None
+                if reservation_key[0] == "context" and self._context_cancellation_enabled:
+                    # Use the metadata captured by the grant, not another lookup by URL.
+                    admission = info.get("server_info", {}).get("_ctx_admission")
+                    if not admission:
+                        await router.finish_request_by_id(req_id, False)
+                        raise ServerPreparationPending("Selected CTX has no verified admission")
+                    info["context_admission"] = admission
+                self._reservation_tasks[reservation_key] = _Reservation(
+                    asyncio.create_task(self._expire_reservation(reservation_key, router)),
+                    admission,
                 )
         return server, info, request_id
 
@@ -419,9 +479,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         previous = self._reservation_tasks.pop(reservation_key, None)
         if previous is not None:
-            previous.cancel()
-        self._reservation_tasks[reservation_key] = asyncio.create_task(
-            self._expire_reservation(reservation_key, router)
+            previous.expiry.cancel()
+        self._reservation_tasks[reservation_key] = _Reservation(
+            asyncio.create_task(self._expire_reservation(reservation_key, router))
         )
         self._api_lat(f"select[{role}]").record(time.monotonic() - t0)
         return server, self._compact_route_info(info), request_id
@@ -430,7 +490,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
     def _compact_route_info(info: dict) -> dict:
         compact = {
             key: info[key]
-            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED)
+            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED, "context_admission")
             if key in info
         }
         disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
@@ -458,7 +518,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         now = time.monotonic()
         return sum(predictor.record(conv, isl, out, key, now) for conv, isl, out, key in records)
 
-    async def finish(self, role: str, req_id, success: bool = True) -> None:
+    async def finish(
+        self, role: str, req_id, success: bool = True, *, context_admission: str | None = None
+    ) -> None:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         reservation_key = (normalized_role, req_id)
@@ -466,9 +528,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
             # Its frontend reports the reply (or the failure) by the key itself.
             self._prediction_keys.pop(req_id, None)
         async with self._reservation_lock(reservation_key):
-            reservation = self._reservation_tasks.pop(reservation_key, None)
+            reservation = self._reservation_tasks.get(reservation_key)
+            if context_admission is not None and (
+                reservation is None or reservation.context_admission != context_admission
+            ):
+                return
             if reservation is not None:
-                reservation.cancel()
+                self._reservation_tasks.pop(reservation_key)
+                reservation.expiry.cancel()
             await self._router_for_role(normalized_role).finish_request_by_id(req_id, success)
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
 
@@ -482,9 +549,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 raise ValueError(
                     f"No active coordinator reservation for role={normalized_role}, req_id={req_id}"
                 )
-            reservation.cancel()
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, self._router_for_role(normalized_role))
+            reservation.expiry.cancel()
+            self._reservation_tasks[reservation_key] = _Reservation(
+                asyncio.create_task(
+                    self._expire_reservation(
+                        reservation_key, self._router_for_role(normalized_role)
+                    )
+                ),
+                reservation.context_admission,
             )
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
@@ -494,7 +566,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         except asyncio.CancelledError:
             raise
         async with self._reservation_lock(key):
-            if self._reservation_tasks.get(key) is not asyncio.current_task():
+            reservation = self._reservation_tasks.get(key)
+            if reservation is None or reservation.expiry is not asyncio.current_task():
                 return
             self._reservation_tasks.pop(key, None)
             logger.warning(
@@ -521,8 +594,36 @@ class DisaggCoordinatorService(DisaggCoordinator):
             return self._ctx_router
         return self._gen_router
 
+    async def _prepare_context_servers(self) -> None:
+        """Wait for transport readiness, but reject an incompatible CTX immediately."""
+
+        async def prepare() -> None:
+            """Retry unavailable workers without downgrading an incompatible one."""
+            while True:
+                try:
+                    if self._metadata_server is not None and self._metadata_config is not None:
+                        await self._ctx_router.refresh_protected_context_servers(startup=True)
+                        if not self._ctx_router.servers:
+                            raise ServerPreparationPending("No capable CTX workers discovered")
+                    await self._ctx_router.prepare_servers()
+                    return
+                except ServerPreparationPending:
+                    await asyncio.sleep(self._health_check_interval_secs)
+
+        try:
+            await asyncio.wait_for(prepare(), timeout=self._server_start_timeout_secs)
+        except asyncio.TimeoutError as error:
+            pending = self._ctx_router.unverified_context_servers
+            raise RuntimeError(
+                "Timed out verifying logical context cancellation for CTX servers: "
+                f"{sorted(pending) if pending else 'no CTX registration admitted'}"
+            ) from error
+
     async def start(self) -> None:
-        await self._ctx_router.prepare_servers()
+        if self._context_cancellation_enabled and not self._watch_context_registrations:
+            await self._prepare_context_servers()
+        else:
+            await self._ctx_router.prepare_servers()
         await self._gen_router.prepare_servers()
         if self._ctx_client is None or self._gen_client is None:
             self._ctx_client = self._client_factory(
@@ -538,7 +639,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._config.disagg_cluster_config, self._cluster_storage
             )
             await self._disagg_cluster_manager.start()
-            await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
+            await self._disagg_cluster_manager.watch_workers(
+                on_event=self._on_worker_event,
+                on_context_registrations=(
+                    self._on_context_registrations if self._watch_context_registrations else None
+                ),
+            )
             logger.info("Disagg cluster manager started")
         else:
             if self._metadata_server and self._metadata_config:
@@ -564,8 +670,18 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
 
     async def stop(self) -> None:
+        self._context_admission_closed = True
+        if self._watch_context_registrations:
+            self._ctx_router.retire_context_registrations({})
+        admissions = [*self._context_admission_tasks.values(), *self._retired_context_admissions]
+        self._context_admission_tasks.clear()
+        self._context_worker_registrations.clear()
+        for admission in admissions:
+            admission.cancel()
+        if admissions:
+            await asyncio.gather(*admissions, return_exceptions=True)
         await self.fail_seat_waiters()
-        reservations = list(self._reservation_tasks.values())
+        reservations = [reservation.expiry for reservation in self._reservation_tasks.values()]
         self._reservation_tasks.clear()
         for reservation in reservations:
             reservation.cancel()
@@ -578,6 +694,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._gen_router.stop_server_monitoring()
 
     async def is_ready(self) -> bool:
+        if self._context_cancellation_enabled and not self._ctx_router.has_prepared_server:
+            return False
         if self._disagg_cluster_manager:
             return await self._disagg_cluster_manager.is_ready_with_router(
                 self._ctx_router.num_prepared_servers,
@@ -586,13 +704,21 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return True
 
     async def cluster_info(self) -> Dict[str, Any]:
+        cluster = (
+            await self._disagg_cluster_manager.cluster_info()
+            if self._disagg_cluster_manager
+            else {}
+        )
         info = {
             "is_ready": await self.is_ready(),
+            "context_cancellation_enabled": self._context_cancellation_enabled,
             "server_lists": {
                 "context": list(self._ctx_router.servers),
                 "generation": list(self._gen_router.servers),
             },
         }
+        if self._context_cancellation_enabled:
+            info["context_admissions"] = self._ctx_router.context_admissions()
         routing_key_configs = {}
         for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
             if isinstance(router, KvCacheAwareRouter):
@@ -601,8 +727,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     routing_key_configs[role] = config
         if routing_key_configs:
             info["routing_key_configs"] = routing_key_configs
-        # Frontends never fetch /server_info, so they cannot check that a worker renders like
-        # their own router; they use the fingerprints this coordinator already fetched.
+        # Delegated placement uses the coordinator's rendering fingerprints.
         info["render_fingerprints"] = {
             role: {
                 server: fingerprint_summary(server_info.get("render_fingerprint"))
@@ -610,8 +735,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             }
             for role, router in (("context", self._ctx_router), ("generation", self._gen_router))
         }
-        if self._disagg_cluster_manager:
-            info.update(await self._disagg_cluster_manager.cluster_info())
+        info.update(cluster)
         return info
 
     async def _wait_for_all_servers_ready(self) -> None:
@@ -620,15 +744,27 @@ class DisaggCoordinatorService(DisaggCoordinator):
         gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
         async def check_servers_ready():
-            elapsed_time = 0
             interval = self._health_check_interval_secs
-            while elapsed_time < self._server_start_timeout_secs:
-                if gen_only:
-                    unready_ctx_servers = []
-                else:
-                    _, unready_ctx_servers = await self._ctx_client.check_ready()
+            while True:
+                # A removal or same-address replacement publishes a new list.
+                # Its health cannot be inferred from a previous incarnation.
+                ctx_snapshot = self._ctx_router.servers
+                try:
+                    if gen_only:
+                        unready_ctx_servers = []
+                    else:
+                        _, unready_ctx_servers = await self._ctx_client.check_ready()
+                except ServerPreparationPending as error:
+                    logger.info(f"Waiting for context server preparation: {error}")
+                    await asyncio.sleep(interval)
+                    continue
                 _, unready_gen_servers = await self._gen_client.check_ready()
-                if len(unready_ctx_servers) == 0 and len(unready_gen_servers) == 0:
+                ctx_current = not self._context_cancellation_enabled or (
+                    bool(ctx_snapshot)
+                    and ctx_snapshot is self._ctx_router.servers
+                    and set(ctx_snapshot) <= self._ctx_router.prepared_servers
+                )
+                if ctx_current and not unready_ctx_servers and not unready_gen_servers:
                     logger.info(
                         "All servers are ready"
                         if not gen_only
@@ -636,16 +772,101 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     )
                     return
                 logger.info(
-                    f"Waiting for servers, context: {unready_ctx_servers}, "
+                    f"Waiting for servers, context: {unready_ctx_servers}, current: {ctx_current}, "
                     f"generation: {unready_gen_servers}"
                 )
                 await asyncio.sleep(interval)
-                elapsed_time += interval
 
         try:
             await asyncio.wait_for(check_servers_ready(), timeout=self._server_start_timeout_secs)
         except asyncio.TimeoutError:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+
+    def _on_context_registrations(self, registrations: dict[str, str]) -> None:
+        """Retire stale grants on the watch callback's turn, then probe new registrations."""
+        if self._context_admission_closed:
+            return
+        previous = self._context_worker_registrations
+        if previous == registrations:
+            return
+        self._context_worker_registrations = registrations
+        self._ctx_router.retire_context_registrations(registrations)
+        for address, task in list(self._context_admission_tasks.items()):
+            if previous.get(address) != registrations.get(address):
+                del self._context_admission_tasks[address]
+                self._retired_context_admissions.add(task)
+                task.add_done_callback(self._retired_context_admissions.discard)
+                task.cancel()
+        for address, registration in registrations.items():
+            if previous.get(address) != registration:
+                self._context_admission_tasks[address] = asyncio.create_task(
+                    self._retry_context_admission(address, registration, immediately=True)
+                )
+
+    async def _cancel_context_admission(self, address: str) -> None:
+        """Drain the old incarnation's probe before replacing or removing it.
+
+        Args:
+            address: Worker address whose owned admission task must stop.
+        """
+        task = self._context_admission_tasks.pop(address, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _try_context_admission(self, address: str, registration: str) -> bool:
+        """Attempt protected placement without retrying an incompatible worker.
+
+        Args:
+            address: Worker address to validate.
+            registration: Exact worker incarnation being admitted.
+
+        Returns:
+            True on admission or permanent rejection; False on transient failure.
+        """
+        try:
+            if self._watch_context_registrations:
+                return await self._ctx_router.admit_context_registration(
+                    address,
+                    registration,
+                    lambda: self._context_admission_tasks.get(address) is asyncio.current_task(),
+                )
+            return await self._ctx_router.add_server(
+                address, registration_id=registration, raise_on_capability_error=True
+            )
+        except ServerPreparationPending:
+            return False
+        except RuntimeError as error:
+            # Preparation rejects an incompatible registration before publication.
+            # The watch stream must still process other workers in this batch.
+            logger.warning(f"CTX registration {registration} at {address} was rejected: {error}")
+            return True
+
+    async def _retry_context_admission(
+        self, address: str, registration: str, *, immediately: bool = False
+    ) -> None:
+        """Retry transient preparation while this registration remains current.
+
+        Args:
+            address: Worker address whose first admission attempt failed.
+            registration: Incarnation that owns this task and its cleanup.
+            immediately: Whether this task owns the initial probe as well as retries.
+        """
+        try:
+            while not self._context_admission_closed:
+                if not immediately:
+                    await asyncio.sleep(max(0.01, self._health_check_interval_secs))
+                immediately = False
+                if self._context_worker_registrations.get(address) != registration:
+                    return
+                if await self._try_context_admission(address, registration):
+                    return
+        except Exception as error:
+            # Background admission errors must be observed, not lost with a task.
+            logger.error(f"CTX admission failed for {registration} at {address}: {error}")
+        finally:
+            if self._context_admission_tasks.get(address) is asyncio.current_task():
+                self._context_admission_tasks.pop(address, None)
 
     async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
         router_map = {
@@ -655,9 +876,51 @@ class DisaggCoordinatorService(DisaggCoordinator):
         worker_addr = f"{worker_info.host}:{worker_info.port}"
         try:
             router = router_map[worker_info.role]
+            protected_context = (
+                worker_info.role == ServerRole.CONTEXT and self._context_cancellation_enabled
+            )
+            # Protected etcd CTX consumes verified snapshots, never buffered
+            # ordinary events that may predate a lost stream.
+            if protected_context and (
+                self._context_admission_closed or self._watch_context_registrations
+            ):
+                return
             if event_type == WatchEventType.SET:
-                await router.add_server(worker_addr)
+                if protected_context:
+                    registration = worker_info.worker_id
+                    if (
+                        self._context_worker_registrations.get(worker_addr) == registration
+                        and worker_addr in self._context_admission_tasks
+                    ):
+                        return
+                    await self._cancel_context_admission(worker_addr)
+                    if self._context_admission_closed:
+                        return
+                    self._context_worker_registrations[worker_addr] = registration
+                    task = asyncio.create_task(
+                        self._try_context_admission(worker_addr, registration)
+                    )
+                    self._context_admission_tasks[worker_addr] = task
+                    try:
+                        finished = await task
+                    finally:
+                        if self._context_admission_tasks.get(worker_addr) is task:
+                            self._context_admission_tasks.pop(worker_addr, None)
+                    if not finished and not self._context_admission_closed:
+                        self._context_admission_tasks[worker_addr] = asyncio.create_task(
+                            self._retry_context_admission(worker_addr, registration)
+                        )
+                else:
+                    await router.add_server(worker_addr)
             elif event_type == WatchEventType.DELETE:
+                if protected_context:
+                    registration = self._context_worker_registrations.get(
+                        worker_addr, router.server_registration_id(worker_addr)
+                    )
+                    if registration not in (None, worker_info.worker_id):
+                        return
+                    self._context_worker_registrations.pop(worker_addr, None)
+                    await self._cancel_context_admission(worker_addr)
                 await router.remove_server(worker_addr)
             logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
         except KeyError:
@@ -749,6 +1012,7 @@ class CoordinatorClient(DisaggCoordinator):
         # remote_url may be a TCP URL or unix:/path. Resolve to a request base
         # URL now; the session (with the right connector) is created lazily so it
         # binds to the running event loop.
+        self._context_cancellation_enabled = context_cancellation_enabled(config)
         self._remote_url_raw = remote_url
         self._remote_url = coordinator_base_url(remote_url)
         self._request_timeout_s = request_timeout_s
@@ -780,6 +1044,8 @@ class CoordinatorClient(DisaggCoordinator):
             metadata_config,
             create_metadata_server(metadata_config),
             disagg_node_id=config.node_id,
+            require_context_cancellation=self._context_cancellation_enabled,
+            context_auth_key=config.internal_request_auth_key,
         )
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")
@@ -813,7 +1079,13 @@ class CoordinatorClient(DisaggCoordinator):
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
-        await self._apply_cluster_info(info)
+        try:
+            await self._apply_cluster_info(info)
+        except ServerPreparationPending:
+            # A reachable coordinator can precede its CTX backends. Keep this
+            # frontend unready; the shared refresh retries a transient probe.
+            if not self._context_cancellation_enabled:
+                raise
         self._sync_task = asyncio.create_task(
             self._sync_coordinator_state(self._state_sync_interval_s)
         )
@@ -837,7 +1109,7 @@ class CoordinatorClient(DisaggCoordinator):
         except Exception as error:  # noqa: BLE001
             self._is_ready = False
             logger.warning(f"CoordinatorClient state sync failed: {error}")
-        return self._is_ready
+        return self._can_serve()
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -931,26 +1203,42 @@ class CoordinatorClient(DisaggCoordinator):
         """Use cached readiness or await shared refresh work within the caller budget."""
         if self._stopping:
             return False
-        if not self._is_ready:
+        if not self._can_serve():
             # Another fleet worker may have passed /health before this worker's
             # next background poll. Refresh its local routing state before rejecting.
             try:
                 # Limit this caller's wait without interrupting shared preparation.
-                return await asyncio.wait_for(
+                await asyncio.wait_for(
                     asyncio.shield(self._get_refresh_task()),
                     timeout=COORDINATOR_READINESS_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                return False
-        return self._is_ready
+                pass
+        return self._can_serve()
+
+    def _can_serve(self) -> bool:
+        return self._is_ready and (
+            not self._context_cancellation_enabled or self._ctx_router.has_prepared_server
+        )
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
-        """Publish readiness only after local routing state is fully prepared."""
+        """Serve only through a ready coordinator and locally verified routes."""
         self._is_ready = False
+        if (
+            info.get("context_cancellation_enabled", False)
+            is not self._context_cancellation_enabled
+        ):
+            raise RuntimeError(
+                "Context cancellation mode differs between frontend and coordinator; "
+                "align TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT and schedule_style"
+            )
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
-        self._sync_render_fingerprints(info)
-        self._is_ready = info.get("is_ready", False)
+        if not self._context_cancellation_enabled:
+            self._sync_render_fingerprints(info)
+        self._is_ready = bool(info.get("is_ready")) and (
+            not self._context_cancellation_enabled or self._ctx_router.has_prepared_server
+        )
 
     def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
         published = info.get("render_fingerprints")
@@ -972,31 +1260,73 @@ class CoordinatorClient(DisaggCoordinator):
 
     async def _sync_router_server_lists(self, info: Dict[str, Any]) -> None:
         server_lists = info.get("server_lists")
+        if self._context_cancellation_enabled:
+            context_admissions = info.get("context_admissions")
+            if not isinstance(context_admissions, dict) or not isinstance(server_lists, dict):
+                raise ContextCancellationCapabilityError(
+                    "Protected coordinator did not publish CTX admissions"
+                )
+            desired_ctx = set(server_lists.get("context", []))
+            if (
+                set(context_admissions) != desired_ctx
+                or not all(
+                    isinstance(value, str) and value for value in context_admissions.values()
+                )
+                or (info.get("is_ready") and not desired_ctx)
+            ):
+                raise ServerPreparationPending("Waiting for the coordinator's admitted CTX pool")
+            # Revoke every stale route before GEN preparation or a joining CTX can yield.
+            ctx = self._ctx_router
+            local = ctx._local if isinstance(ctx, CoordinatorDelegatingRouter) else ctx
+            local.retire_context_registrations(context_admissions)
+            await self._sync_router_servers(self._gen_router, server_lists.get("generation", []))
+            self._sync_render_fingerprints(info)
+            # The request gate checks the independently published CTX pool as well.
+            self._is_ready = bool(info.get("is_ready"))
+            try:
+                # One slow join must not indefinitely delay the next coordinator snapshot.
+                await asyncio.wait_for(
+                    local.sync_context_grants(
+                        server_lists.get("context", []),
+                        context_admissions,
+                        self._request_timeout_s,
+                        mirror=isinstance(ctx, CoordinatorDelegatingRouter),
+                    ),
+                    timeout=self._request_timeout_s,
+                )
+            except asyncio.TimeoutError as error:
+                if not self._can_serve():
+                    self._is_ready = False
+                    raise ServerPreparationPending("Timed out verifying CTX grants") from error
+                logger.warning("CTX join timed out; retaining admitted peers")
+            except (ServerPreparationPending, ContextCancellationCapabilityError):
+                self._is_ready = False
+                raise
+            return
         if server_lists is None:
             return
-        router_servers = (
-            (self._ctx_router, server_lists.get("context", [])),
-            (self._gen_router, server_lists.get("generation", [])),
-        )
-        for router, servers in router_servers:
-            if isinstance(router, CoordinatorDelegatingRouter):
-                await router.sync_servers(servers)
-                continue
-            desired = set(servers)
-            for server in desired - set(router.servers):
-                if not await router.add_server(server):
-                    raise RuntimeError(
-                        f"Failed to prepare {server} before adding it to the "
-                        f"{router.server_role.name} router"
-                    )
-            await router.prepare_servers(list(desired))
-            unprepared = desired - router.prepared_servers
-            if unprepared:
+        await self._sync_router_servers(self._ctx_router, server_lists.get("context", []))
+        await self._sync_router_servers(self._gen_router, server_lists.get("generation", []))
+
+    @staticmethod
+    async def _sync_router_servers(router: Router, servers: list[str]) -> None:
+        if isinstance(router, CoordinatorDelegatingRouter):
+            await router.sync_servers(servers)
+            return
+        desired = set(servers)
+        for server in desired - set(router.servers):
+            if not await router.add_server(server):
                 raise RuntimeError(
-                    f"Servers are not prepared for {router.server_role.name}: {sorted(unprepared)}"
+                    f"Failed to prepare {server} before adding it to the {router.server_role.name} router"
                 )
-            for server in set(router.servers) - desired:
-                await router.remove_server(server)
+        await router.prepare_servers(list(desired))
+        unprepared = desired - router.prepared_servers
+        if unprepared:
+            raise RuntimeError(
+                f"Servers are not prepared for {router.server_role.name}: {sorted(unprepared)}"
+            )
+        for server in set(router.servers) - desired:
+            await router.remove_server(server)
 
     async def cluster_info(self) -> Dict[str, Any]:
         try:

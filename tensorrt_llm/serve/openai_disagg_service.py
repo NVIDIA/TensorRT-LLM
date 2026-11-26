@@ -16,8 +16,11 @@ import asyncio
 import json
 import os
 import re
-from typing import Callable, Optional
+from contextlib import AsyncExitStack, aclosing
+from typing import AsyncGenerator, Callable, Optional
 
+import aiohttp
+import anyio
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
@@ -32,7 +35,11 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
 )
-from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinator
+from tensorrt_llm.serve.disagg_coordinator import (
+    CoordinatorClient,
+    DisaggCoordinator,
+    context_cancellation_enabled,
+)
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -55,12 +62,18 @@ from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    guard_responses_stream,
     responses_done_generator,
+    stream_error_event,
 )
-from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
+from tensorrt_llm.serve.router import (
+    CoordinatorDelegatingRouter,
+    KvCacheAwareRouter,
+    Router,
+    ServerPreparationPending,
+)
 
-# Finish reasons for which a GEN handoff is still pending; any other reason means
-# the CTX request already completed and the disagg KV-cache handoff was never set up.
+# Public CTX finish reasons that require GEN even without a remote tail.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
@@ -109,12 +122,14 @@ class _SseErrorObserver:
     """Observe worker error events without changing the forwarded SSE bytes."""
 
     _EVENT_END = re.compile(rb"\r?\n\r?\n")
+    _RESPONSE_TERMINALS = (b"response.completed", b"response.incomplete", b"response.failed")
 
     def __init__(self, *, responses_api: bool = False) -> None:
         """Retain only the incomplete event between network chunks."""
         self._pending = bytearray()
         self._scan_from = 0
         self._responses_api = responses_api
+        self.completed = False
 
     def feed(self, chunk: str | bytes) -> bool:
         """Report a complete top-level error event in LF/CRLF worker SSE.
@@ -137,12 +152,27 @@ class _SseErrorObserver:
                 for line in event.splitlines()
                 if line.startswith(b"data:")
             )
+            if data == b"[DONE]" and not self._responses_api:
+                self.completed = True
+                continue
+            # Most events are ordinary deltas. Escaped JSON keys or values
+            # still need decoding, even if the marker is not present verbatim.
+            if b"\\" not in data and b'"error"' not in data:
+                if not self._responses_api or not any(
+                    tag in data for tag in self._RESPONSE_TERMINALS
+                ):
+                    continue
             try:
                 payload = json.loads(data)
             except ValueError:
                 continue
             if not isinstance(payload, dict):
                 continue
+            if self._responses_api and payload.get("type") in (
+                "response.completed",
+                "response.incomplete",
+            ):
+                self.completed = True
             found_error = isinstance(payload.get("error"), dict) or (
                 self._responses_api and payload.get("type") in ("error", "response.failed")
             )
@@ -154,6 +184,182 @@ class _SseErrorObserver:
         # delimiter needs revisiting; CRLF/CRLF has at most three prior bytes.
         self._scan_from = 0 if found_error else max(0, len(self._pending) - 3)
         return found_error
+
+
+class _ContextCancellation:
+    """Keep the CTX cancellation address across HTTP completion and GEN placement."""
+
+    _DELIVERY_BUDGET_SECONDS = 10.0
+    _ATTEMPT_TIMEOUT_SECONDS = 5.0
+
+    def __init__(self, client: OpenAIClient) -> None:
+        """Retain the control client without creating another resource owner.
+
+        Args:
+            client: Native HTTP context client with bounded control requests.
+        """
+        self._client = client
+        self._server: str | None = None
+        self._token: str | None = None
+        self._stream_cleanup = AsyncExitStack()
+        self._delivery: asyncio.Task[None] | None = None
+
+    def add_stream_cleanup(
+        self, source: AsyncGenerator[str | bytes, None], on_close: Callable[[], None]
+    ) -> None:
+        """Keep source cleanup active through wrappers that do not forward close.
+
+        Args:
+            source: Primed GEN stream that owns HTTP and router cleanup.
+            on_close: Idempotent bookkeeping for a completed or abandoned stream.
+        """
+        self._stream_cleanup.callback(on_close)
+        self._stream_cleanup.push_async_callback(source.aclose)
+
+    async def reserve(self, server: str, request_id: int) -> str:
+        """Obtain a submission identity, including a response racing with cancellation.
+
+        Args:
+            server: Selected context worker's shared HTTP address.
+            request_id: Immutable context-first pairing ID.
+
+        Returns:
+            Single-use admission token, retained here for later cancellation.
+        """
+        self._server = server
+        reservation = asyncio.create_task(
+            self._client.reserve_context_cancellation(server, request_id)
+        )
+        try:
+            self._token = await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            # Do not lose a late reservation response when cancellation wins the race.
+            settled = asyncio.gather(reservation, return_exceptions=True)
+            with anyio.CancelScope(shield=True):
+                while not settled.done():
+                    try:
+                        await asyncio.shield(settled)
+                    except asyncio.CancelledError:
+                        # Direct Task.cancel() is independent of AnyIO scopes.
+                        pass
+            if not reservation.cancelled() and reservation.exception() is None:
+                self._token = reservation.result()
+            raise
+        return self._token
+
+    def discard_if_no_handoff(self, response: UCompletionResponse) -> None:
+        """A verified CTX response without a published transfer needs no cancellation."""
+        if all(
+            slot.disaggregated_params.ctx_request_id is None
+            for slot in _ctx_handoff_slots(response)
+        ):
+            self._token = None
+
+    async def _deliver_cancellation(self) -> None:
+        """Try idempotent delivery twice within one fixed ten-second control budget.
+
+        A routing receipt does not confirm worker handling or physical retirement.
+        On failure, the transfer timeout remains responsible for the logical
+        transfer outcome; unresolved access remains owned through the quiescence
+        grace and fail-close policy. The reservation window is not that bound.
+        """
+        deadline = asyncio.get_running_loop().time() + self._DELIVERY_BUDGET_SECONDS
+        error: BaseException | None = None
+        for _ in range(2):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._client.cancel_context_cancellation(self._server, self._token),
+                    timeout=min(self._ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
+            except aiohttp.ClientResponseError as failure:
+                error = failure
+                if failure.status < 500:
+                    break
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+            ) as failure:
+                error = failure
+            except (aiohttp.ClientError, ValueError) as failure:
+                error = failure
+                break
+            else:
+                self._token = None
+                return
+        logger.warning(
+            f"Context cancellation delivery is unconfirmed ({type(error).__name__}); "
+            "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
+        )
+
+    def start_delivery(self) -> None:
+        """Start one bounded CTX cancellation without waiting for its receipt."""
+        if self._token is not None and self._delivery is None:
+            self._delivery = asyncio.create_task(self._deliver_cancellation())
+
+    async def cancel(self) -> None:
+        """Share bounded cancellation delivery without resetting its budget.
+
+        Delivery clears the token only after a routing receipt. Repeated caller
+        cancellation cannot cancel delivery, reopen admission, or extend the
+        worker's transfer or quiescence deadlines.
+        """
+        self.start_delivery()
+        if self._delivery is None:
+            return
+        settled = asyncio.gather(self._delivery, return_exceptions=True)
+        interrupted = False
+        with anyio.CancelScope(shield=True):
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    # Direct Task.cancel() must not cancel shared delivery.
+                    interrupted = True
+        error = settled.result()[0]
+        if isinstance(error, BaseException):
+            logger.warning(
+                f"Context cancellation delivery is unconfirmed ({type(error).__name__}); "
+                "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
+            )
+        if interrupted:
+            raise asyncio.CancelledError
+
+    async def stream(
+        self,
+        response: AsyncGenerator[str | bytes, None],
+        responses_api: bool,
+    ) -> AsyncGenerator[str | bytes | None, None]:
+        """Own CTX cancellation until a returned stream completes or closes.
+
+        Args:
+            response: Existing GEN stream, which may not yet have sent its POST.
+            responses_api: Whether to preserve Responses terminal-error framing.
+
+        Yields:
+            An initial private sentinel, then unchanged response frames.
+        """
+        observer = _SseErrorObserver(responses_api=responses_api)
+        failed = False
+        try:
+            async with self._stream_cleanup, aclosing(response):
+                # Prime cleanup before returning even when GEN has not sent its POST.
+                yield None
+                guarded = (
+                    guard_responses_stream(response, stream_error_event)
+                    if responses_api
+                    else response
+                )
+                async with aclosing(guarded):
+                    async for chunk in guarded:
+                        failed = observer.feed(chunk) or failed
+                        yield chunk
+        finally:
+            if failed or not observer.completed:
+                await self.cancel()
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -200,6 +406,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self.context_cancellation_enabled = context_cancellation_enabled(config)
         # Token counting is stateless and cheap, so it is spread over the
         # context workers round-robin rather than going through the router,
         # which would charge the pick against KV-cache-aware load accounting.
@@ -222,8 +429,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
         if not isinstance(request.prompt, str):
             # Reject empty prompt lists explicitly so the router does not
             # index prompt[0] on an empty list.
@@ -244,8 +450,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_chat_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
         return await self._send_disagg_request(request, hooks)
 
     async def _next_ctx_server(self) -> str:
@@ -284,8 +489,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def openai_responses(
         self, request: ResponsesRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
-        if not await self.is_ready():
-            raise RuntimeError("Cluster is not ready")
+        await self._require_ready()
 
         # Stored responses are per worker and unreachable through this proxy.
         if request.previous_response_id is not None:
@@ -314,6 +518,37 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        cancellation = (
+            _ContextCancellation(self._ctx_client) if self.context_cancellation_enabled else None
+        )
+        success = False
+        try:
+            response = await self._send_disagg_request_ctx_first_impl(request, hooks, cancellation)
+            if cancellation is not None and request.stream:
+                response = cancellation.stream(response, isinstance(request, ResponsesRequest))
+                await response.__anext__()
+            success = True
+            return response
+        finally:
+            if not success and cancellation is not None:
+                await cancellation.cancel()
+
+    async def _send_disagg_request_ctx_first_impl(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        cancellation: "_ContextCancellation | None",
+    ) -> UCompletionResponseOrGenerator:
+        """Run the existing context-first path with optional cancellation routing.
+
+        Args:
+            request: Original client request.
+            hooks: Optional request timing/response callbacks.
+            cancellation: Protected CTX control identity, or None for legacy behavior.
+
+        Returns:
+            Original CTX completion or existing GEN response/stream.
+        """
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
         arrival_time = self._get_arrival_time(hooks)
@@ -343,9 +578,22 @@ class OpenAIDisaggregatedService(OpenAIService):
                     hooks.on_ctx_dispatch(request)
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
                 # ctx generator is empty
+                if cancellation is not None and not self._ctx_router.has_prepared_server:
+                    raise ServerPreparationPending("No admitted CTX worker is available")
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
+                if cancellation is not None:
+                    try:
+                        ctx_req.disaggregated_params.context_cancellation_token = (
+                            await cancellation.reserve(ctx_server, disagg_request_id)
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        # The HTTP client owns router cleanup only once send_request starts.
+                        await self._ctx_router.finish_request(
+                            ctx_req, success=False, req_id=disagg_request_id
+                        )
+                        raise
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
@@ -353,6 +601,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
                     0
                 ].disaggregated_params
+                if cancellation is not None:
+                    # Detokenization can report stop after the native CTX handoff was published.
+                    cancellation.discard_if_no_handoff(ctx_response)
                 if ctx_response_disagg_params.disagg_request_id is not None:
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                     if hooks:
@@ -364,7 +615,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     length_ticket = await self._output_length_priority.assign(
                         gen_req, placed_later=not gen_server
                     )
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
@@ -389,9 +640,19 @@ class OpenAIDisaggregatedService(OpenAIService):
                         # bounds its wait by the context servers' KV transfer timeout, which
                         # runs from here. Stamped again below to include this wait.
                         self._stamp_orig_elapsed(gen_req, arrival_time)
-                    gen_server, gen_route_info = await self._gen_router.get_next_server(
-                        gen_req, exclude_server=ctx_server, req_id=disagg_request_id
-                    )
+                    if cancellation is not None and isinstance(
+                        self._gen_router, CoordinatorDelegatingRouter
+                    ):
+                        gen_server, gen_route_info = await self._gen_router.get_next_server(
+                            gen_req,
+                            exclude_server=ctx_server,
+                            req_id=disagg_request_id,
+                            on_cancel=cancellation.start_delivery,
+                        )
+                    else:
+                        gen_server, gen_route_info = await self._gen_router.get_next_server(
+                            gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                        )
                     gen_reservation_id = disagg_request_id
                     if length_ticket is not None:
                         self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
@@ -405,6 +666,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                     self._output_length_priority.abandon(length_ticket)
                 raise
             if length_ticket is not None:
+                if cancellation is not None and request.stream:
+                    cancellation.add_stream_cleanup(
+                        gen_response,
+                        lambda: self._output_length_priority.abandon(length_ticket),
+                    )
                 gen_response = self._output_length_priority.track(gen_response, length_ticket)
             return gen_response
         else:
@@ -412,6 +678,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 self._output_length_priority.track(ctx_response, length_ticket)
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            if cancellation is not None:
+                # No generation worker will fetch a handoff published by CTX.
+                await cancellation.cancel()
             if hooks:
                 hooks.on_resp_done("", request, ctx_response)
             if request.stream:
@@ -484,7 +753,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
         if ctx_response:
-            request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
+            params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params.model_copy()
+            # The token belongs to CTX. GEN must not receive even a null token:
+            # older workers reject unknown fields, and the client sends fields set by CTX.
+            params.context_cancellation_token = None
+            params.model_fields_set.discard("context_cancellation_token")
+            request.disaggregated_params = params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
@@ -585,6 +859,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             return True
         return False
 
+    async def _require_ready(self) -> None:
+        if not await self.is_ready():
+            if self.context_cancellation_enabled and not self._ctx_router.has_prepared_server:
+                raise ServerPreparationPending("No admitted CTX worker is available")
+            raise RuntimeError("Cluster is not ready")
+
     async def is_ready(self) -> bool:
         # Per-request readiness gate for the /v1/ handlers (the server's /health
         # and /cluster_info hook the coordinator directly). Cluster topology
@@ -621,10 +901,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                         f"Context server choice {idx} did not return disaggregated params."
                         f" finish_reason={choice.finish_reason!r}"
                     )
-                # A CTX request that finished early (e.g. EOS during prefill) never
-                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
-                # stay None. Only enforce them when a GEN handoff is still pending --
-                # mirroring _need_gen, which skips the handoff for these responses.
+                # Native EOS can finish without publishing a handoff. Require its
+                # identifiers only when GEN will consume it.
                 remote_tail = choice.disaggregated_params.remote_tail_start is not None
                 if choice.finish_reason in _GEN_PENDING_FINISH_REASONS or remote_tail:
                     if choice.disaggregated_params.ctx_request_id is None:

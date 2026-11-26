@@ -271,6 +271,7 @@ def test_etcd_dictionary_lists_only_the_trtllm_prefix():
     client.get_prefix.return_value = [
         (b"", SimpleNamespace(key=b"trtllm/a")),
         (b"", SimpleNamespace(key=b"trtllm/a/extra")),
+        (b"", SimpleNamespace(key=b"trtllm/\xff")),
         (b"", SimpleNamespace(key=b"trtllm/b")),
     ]
     with mock.patch.object(metadata_server_module.etcd3, "client", return_value=client):

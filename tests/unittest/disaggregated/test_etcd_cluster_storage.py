@@ -488,6 +488,137 @@ class _OnWatch(FakeEtcdClient):
 
 
 @pytest.mark.asyncio
+async def test_observer_receives_verified_snapshots_but_recovery_does_not_requeue_workers():
+    a, b = f"{PREFIX}/a", f"{PREFIX}/b"
+    client, storage = _storage()
+    assert await storage.set(a, "one")
+    handle = await storage.watch(PREFIX)
+    snapshots = []
+    handle.set_availability_callback(snapshots.append)
+    assert snapshots == [None]
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert snapshots == [None, {a: "one"}]
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [("SET", a, "one")]
+
+    expired = client.callbacks[PREFIX]
+    expired(None)
+    await asyncio.sleep(0)
+    assert snapshots == [None, {a: "one"}, None]
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert snapshots[-1] == {a: "one"}
+    assert handle.events.empty()  # same worker needs a fresh probe, not another SET
+
+    assert await storage.set(b, "two")
+    expired(None)
+    expired(SimpleNamespace(events=[DeleteEvent(a, "")]))
+    client.send(PREFIX, PutEvent(a, client.data[a]), PutEvent(b, "unsigned"))
+    await asyncio.sleep(0)
+    assert snapshots == [None, {a: "one"}, None, {a: "one"}]
+    client.send(PREFIX, DeleteEvent(a, ""), PutEvent(b, client.data[b]))
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("DELETE", a, ""),
+        ("SET", b, "two"),
+    ]
+    assert snapshots == [None, {a: "one"}, None, {a: "one"}, {b: "two"}]
+    await storage.unwatch(PREFIX)
+    assert snapshots[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_observer_stays_unavailable_if_stream_ends_during_token_check(monkeypatch):
+    monkeypatch.setattr(cluster_storage, "_WATCH_RETRY_MIN_SEC", 0)
+    client, storage = _storage()
+    assert await storage.set(f"{PREFIX}/a", "provisional")
+    handle = await storage.watch(PREFIX)
+    get = client.get
+
+    def end_during_check(key):
+        del client.data[f"{PREFIX}/a"]
+        client.callbacks[PREFIX](None)
+        client.get = get
+        return get(key)
+
+    client.get = end_during_check
+    snapshots = []
+    handle.set_availability_callback(snapshots.append)
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert len(client.start_revisions) == 3
+    assert snapshots == [None, {}]
+    await storage.unwatch(PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_observed_prefix_read_does_not_block_the_loop_or_publish_from_a_replaced_client():
+    stale, fresh = FakeEtcdClient(), FakeEtcdClient()
+    a = f"{PREFIX}/a"
+    stale.put(a, "old")
+    fresh.put(a, "current")
+    read = stale.get_prefix_response
+    loop, loop_thread = asyncio.get_running_loop(), threading.get_ident()
+
+    async def reconnect():
+        storage.reconnect()
+        await storage.connect()
+
+    def replace_client_during_read(prefix):
+        assert threading.get_ident() != loop_thread
+        response = read(prefix)
+        asyncio.run_coroutine_threadsafe(reconnect(), loop).result(1)
+        return response
+
+    stale.get_prefix_response = replace_client_during_read
+    with _connect(stale, fresh):
+        storage = Etcd3ClusterStorage(ETCD_URI, "c")
+        handle = await storage.watch(PREFIX)
+        snapshots = []
+        handle.set_availability_callback(snapshots.append)
+        await asyncio.wait_for(handle.restart_task, 2)
+        assert snapshots == [None, {a: "current"}]
+        assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [("SET", a, "current")]
+        assert stale.start_revisions == [None] and fresh.start_revisions == [2]
+        await storage.unwatch(PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_invalid_replacement_only_withdraws_its_own_verified_registration():
+    a, peer = f"{PREFIX}/a", f"{PREFIX}/peer"
+
+    def invalidate(callback):
+        client.put(a, "unsigned")
+        callback(SimpleNamespace(events=[PutEvent(a, client.data[a])]))
+
+    client, storage = _storage(client=_OnWatch({2: invalidate}))
+    assert await storage.set(a, "one")
+    assert await storage.set(peer, "two")
+    valid_record = client.data[a]
+    handle = await storage.watch(PREFIX)
+    snapshots = []
+    handle.set_availability_callback(snapshots.append)
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert snapshots == [None, {peer: "two"}]
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("SET", a, "one"),
+        ("SET", peer, "two"),
+    ]
+
+    # A repair to the same signed value restores the snapshot even though
+    # neither the invalid PUT nor the repair changes the legacy event queue.
+    client.put(a, valid_record)
+    client.send(PREFIX, PutEvent(a, valid_record))
+    await asyncio.sleep(0)
+    assert snapshots[-1] == {a: "one", peer: "two"} and handle.events.empty()
+    invalidate(client.callbacks[PREFIX])
+    await asyncio.sleep(0)
+    assert snapshots[-1] == {peer: "two"}
+    client.callbacks[PREFIX](None)
+    client.put(a, valid_record)  # repaired during the outage, without a watch event
+    await asyncio.sleep(0)
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert snapshots[-2:] == [None, {a: "one", peer: "two"}] and handle.events.empty()
+    await storage.unwatch(PREFIX)
+
+
+@pytest.mark.asyncio
 async def test_watch_whose_stream_ends_before_watch_returns_is_watched_again():
     # The first stream ends while the watch is being created.
     client, storage = _storage(client=_OnWatch({1: lambda callback: callback(None)}))
@@ -515,13 +646,15 @@ async def test_watch_that_etcd_did_not_start_for_the_login_token_is_created_agai
         )
 
     stale, fresh = _OnWatch({2: reject_login}), FakeEtcdClient()
+    stale.data[f"{PREFIX}/removed"] = "provisional"
     with _connect(stale, fresh) as connect:
         storage = Etcd3ClusterStorage(ETCD_URI, "c", **LOGIN)
         handle = await storage.watch(PREFIX)
-        stale.callbacks[PREFIX](None)
-        await asyncio.sleep(0)
+        snapshots = []
+        handle.set_availability_callback(snapshots.append)
         await asyncio.wait_for(handle.restart_task, 1)
     assert connect.call_count == 2 and PREFIX in fresh.callbacks
+    assert snapshots == [None, {}]
 
 
 @pytest.mark.asyncio
@@ -570,10 +703,11 @@ async def test_stream_started_after_an_unwatch_is_cancelled():
     loop = asyncio.get_running_loop()
     client, storage = _storage(client=_OnWatch({2: unwatch}))
     handle = await storage.watch(PREFIX)
-    client.callbacks[PREFIX](None)
-    await asyncio.sleep(0)
+    snapshots = []
+    handle.set_availability_callback(snapshots.append)
     await asyncio.wait_for(handle.restart_task, 1)
     assert len(client.start_revisions) == 2 and client.callbacks == {}
+    assert snapshots == [None]
 
 
 @pytest.mark.asyncio

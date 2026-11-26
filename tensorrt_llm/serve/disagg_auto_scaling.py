@@ -24,8 +24,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.logger import logger
 
-from .cluster_storage import (ClusterStorage, StorageItem, WatchEvent,
-                              WatchEventType, key_time)
+from .cluster_storage import (ClusterStorage, Etcd3WatchEventQueue, StorageItem,
+                              WatchEvent, WatchEventType, key_time)
 
 
 @dataclass
@@ -124,7 +124,9 @@ class DisaggClusterManager:
         self,
         get_existing_first: bool = True,
         on_event: Optional[Callable[[WorkerInfo, WatchEventType],
-                                    Awaitable[Any]]] = None):
+                                    Awaitable[Any]]] = None,
+        on_context_registrations: Optional[Callable[[dict[str, str]],
+                                                    None]] = None):
         if self._watch_handle:
             logger.error("Watch handle is already initialized")
             return []
@@ -134,7 +136,16 @@ class DisaggClusterManager:
 
         assert self._watch_handle is not None, "failed to watch workers"
 
-        if get_existing_first:
+        if on_context_registrations is not None:
+            # A revision-bound watch supplies its own initial records. The ordinary
+            # event queue still supplies GEN and maintains worker counts.
+            if not isinstance(self._watch_handle, Etcd3WatchEventQueue):
+                raise RuntimeError(
+                    "Protected etcd discovery requires a recoverable watch")
+            self._watch_handle.set_availability_callback(
+                lambda records: on_context_registrations(
+                    self._context_registrations(records or {})))
+        elif get_existing_first:
             # There is a tiny gap between getting existing workers and watching the key,
             # which may cause we missing some workers registered in between.
             resp = await self._cluster_storage.get_prefix(
@@ -148,8 +159,9 @@ class DisaggClusterManager:
                 events.append(event)
             await self._watch_handle.add_events(events)
 
-        self._watch_handle = await self._cluster_storage.watch(
-            self.worker_key_prefix)
+        if on_context_registrations is None:
+            self._watch_handle = await self._cluster_storage.watch(
+                self.worker_key_prefix)
 
         async def worker_event_loop():
             logger.info(
@@ -174,6 +186,47 @@ class DisaggClusterManager:
         if on_event:
             self._watch_task = asyncio.create_task(worker_event_loop())
         return workers
+
+    @staticmethod
+    def _decode_worker(value: Optional[str],
+                       *,
+                       require_role: bool = False) -> WorkerInfo:
+        if value is None:
+            raise ValueError("Worker registration has no value")
+        fields = json.loads(value)
+        worker = WorkerInfo(**fields)
+        if require_role and type(fields.get("role")) is not int:
+            raise ValueError("Worker registration requires an explicit role")
+        worker.role = ServerRole(worker.role)
+        return worker
+
+    def _context_registrations(self, records: dict[str, str]) -> dict[str, str]:
+        """Map unambiguous CTX addresses in a verified watch snapshot to their incarnations."""
+        registrations: dict[str, Optional[str]] = {}
+        for key, value in records.items():
+            try:
+                worker = self._decode_worker(value, require_role=True)
+                if (not isinstance(worker.host, str) or not worker.host
+                        or type(worker.port) is not int
+                        or not 0 < worker.port <= 65535
+                        or not isinstance(worker.worker_id, str)
+                        or not worker.worker_id or key != get_worker_key(
+                            self._config.cluster_name, worker.role,
+                            worker.worker_id)):
+                    raise ValueError(
+                        "Worker registration lacks a valid identity or address")
+            except (TypeError, ValueError, RecursionError):
+                logger.warning(f"Ignoring invalid worker registration {key}")
+                continue
+            address = f"{worker.host}:{worker.port}"
+            registrations[address] = (
+                worker.worker_id if address not in registrations
+                and worker.role == ServerRole.CONTEXT else None)
+        return {
+            address: registration
+            for address, registration in registrations.items()
+            if registration is not None
+        }
 
     async def unwatch_workers(self) -> None:
         if self._watch_handle:
@@ -236,8 +289,7 @@ class DisaggClusterManager:
                 worker_info = workers.pop(event.storage_item.key)
         elif event.event_type == WatchEventType.SET:
             try:
-                worker_info = WorkerInfo(**json.loads(event.storage_item.value))
-                worker_info.role = ServerRole(worker_info.role)
+                worker_info = self._decode_worker(event.storage_item.value)
                 workers = self._get_workers(worker_info.role)
                 workers[event.storage_item.key] = worker_info
 

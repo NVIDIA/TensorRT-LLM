@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
@@ -26,6 +27,50 @@ pytestmark = pytest.mark.cpu_only
 
 
 _KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+@pytest.mark.parametrize("preexisting", [False, True], ids=["handoff-first", "deadline-first"])
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_ownership_handoff_failure_preserves_first_fatal_once(
+    preexisting: bool, callback_raises: bool
+) -> None:
+    """Immediate containment uses the same sticky outcome and once-only callback."""
+    clock = Mock(return_value=0.0)
+    callback = Mock(side_effect=RuntimeError("containment returned") if callback_raises else None)
+    watchdog = RetirementWatchdog(callback, clock=clock)
+
+    def clean_up_test_thread() -> None:
+        """Release only the controlled test's intentionally parked fatal thread."""
+        watchdog._stopped.set()
+        watchdog.wake.set()
+        if watchdog._thread is not None:
+            watchdog._thread.join(timeout=1)
+            assert not watchdog._thread.is_alive()
+
+    try:
+        if preexisting:
+            owner = watchdog.create_owner(4, "receive", 1.0)
+            owner.retain_unproven(object(), "original cancellation")
+            clock.return_value = 1.0
+            watchdog.progress()
+        previous = watchdog.fatal
+        watchdog.fail_closed(7, "receive", "unpublished CUDA ownership handoff refused")
+        first = watchdog.fatal
+        assert first is not None
+        if previous is not None:
+            assert first is previous
+            assert first.failure_kind == "deadline"
+        else:
+            assert first.failure_kind == "ownership_handoff"
+        clock.return_value = 100.0
+        watchdog.fail_closed(8, "send", "duplicate failure")
+        watchdog.progress()
+        assert watchdog.fatal is first
+        callback.assert_called_once_with(first)
+        with pytest.raises(RuntimeError, match="admission is closed"):
+            watchdog.create_owner(9, "receive", 1.0)
+    finally:
+        clean_up_test_thread()
 
 
 def _publish_report_tokens(session, ranks=range(16)):
@@ -661,6 +706,66 @@ def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBa
     assert session._sender._begin_task_operation(task, 7)
     assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     task.complete()
+
+
+def test_submitted_observer_sees_rooted_status_outside_ownership_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qualification cannot supply DONE, drop a root, or block deadline inspection."""
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
+    watchdog = RetirementWatchdog(Mock(), clock=Mock(return_value=10.0))
+    session = _tx_session(watchdog, need_aux=False)
+    session.send(Chunk([], [], TokenRange(0, 16), True))
+    sender, task = session._sender, session.kv_tasks[0]
+    sender._instance_rank = 0
+    request = _write_request()
+    status = sender._agent.submit_transfer_requests.return_value
+    acquired = threading.Event()
+    observed = []
+    records = []
+
+    def inspect_lock() -> None:
+        with watchdog.lock:
+            acquired.set()
+
+    def submitted(request_id: int, rank: int, peer_rank: int, piece_id: int | None) -> None:
+        operation = task._physical_operations[peer_rank]
+        observed.append((request_id, rank, peer_rank, piece_id))
+        assert operation.request is request and operation.status is status
+        assert operation.state is PhysicalOperationState.SUBMITTED
+        status.wait.assert_not_called()
+        thread = threading.Thread(target=inspect_lock)
+        thread.start()
+        try:
+            assert acquired.wait(1), "submitted observer held ownership lock"
+        finally:
+            thread.join(timeout=1)
+
+    diagnostics.install_qualification_observers(records.append, submitted)
+    try:
+        assert sender._begin_task_operation(task, 7)
+        assert sender._submit_transfer(task, 7, request) == (True, None)
+        diagnostics.emit_event("qualification_checkpoint", side="ctx", request_id=4)
+        assert records[-1]["capture_errors"] == 0
+        assert observed == [(4, 0, 7, 0)]
+        status.wait.assert_called_once()
+        assert task._physical_operations[7].state is PhysicalOperationState.BACKEND_DONE
+    finally:
+        diagnostics.install_qualification_observers(None)
+
+
+def test_retirement_diagnostic_snapshot_does_not_advance_an_expired_clock() -> None:
+    clock = Mock(return_value=10.0)
+    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    owner.request_drain("cancellation")
+    clock.return_value = 100.0
+    clock.reset_mock()
+    assert owner.diagnostic_snapshot() == (False, "cancellation", False)
+    clock.assert_not_called()
+    assert owner._claims == {id(claim): claim}
 
 
 def test_operation_snapshot_distinguishes_empty_and_retains_state_values() -> None:

@@ -829,10 +829,11 @@ MIN_GLOBAL_ID = 1 << 40
 # Consider GIL being removed in the future, use a lock to protect the counter
 _global_disagg_request_id_lock = threading.Lock()
 _global_disagg_request_id_counter = 0
+_global_disagg_request_id_timestamp_ms = -1
 
 
 def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
-    """A snowflake global disagg request id (does not guarantee monotonicity).
+    """Generate a snowflake identity without repeating it within this process.
 
     Layout: 0(1) | timestamp_ms(39) | node_id(8) | process_id(6) | counter(10).
     node_id identifies the node, process_id the fleet worker process on it -- the
@@ -840,6 +841,7 @@ def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
     """
     global _global_disagg_request_id_lock
     global _global_disagg_request_id_counter
+    global _global_disagg_request_id_timestamp_ms
 
     NODE_ID_SPACE = 1 << DISAGG_NODE_ID_BITS
     PROCESS_ID_SPACE = 1 << DISAGG_PROCESS_ID_BITS
@@ -852,9 +854,17 @@ def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
     if process_id not in range(0, PROCESS_ID_SPACE):
         raise ValueError(f"process_id must be in range [0, {PROCESS_ID_SPACE})")
 
-    timestamp_ms = int(time.monotonic() * 1000) & TIMESTAMP_MASK
     with _global_disagg_request_id_lock:
+        timestamp_ms = max(
+            int(time.monotonic() * 1000) & TIMESTAMP_MASK,
+            _global_disagg_request_id_timestamp_ms)
         counter = _global_disagg_request_id_counter & COUNTER_MASK
+        if counter == 0 and timestamp_ms == _global_disagg_request_id_timestamp_ms:
+            # Keep the identity clock moving even if more than one counter
+            # window is allocated in a physical millisecond. This clock is
+            # only an ID component, not an admission or retirement deadline.
+            timestamp_ms += 1
+        _global_disagg_request_id_timestamp_ms = timestamp_ms
         _global_disagg_request_id_counter += 1
 
     global_id = (
@@ -863,9 +873,10 @@ def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
         | (node_id << (DISAGG_PROCESS_ID_BITS + DISAGG_COUNTER_BITS))
         | (process_id << DISAGG_COUNTER_BITS)
         | counter)
-    # Rotate into [MIN_GLOBAL_ID, MAX_INT64); [0, MIN_GLOBAL_ID) is local-id space.
-    global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
-    return global_id_int64
+    # Keep local and global namespaces disjoint without wrapping onto an old ID.
+    if global_id >= MAX_INT64 - MIN_GLOBAL_ID:
+        raise RuntimeError("Disaggregated request identity space is exhausted")
+    return global_id + MIN_GLOBAL_ID
 
 
 def get_local_request_id(last_id: int) -> int:

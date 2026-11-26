@@ -66,7 +66,13 @@ class EtcdDictionary(RemoteDictionary):
         unique_keys = set()
         for _, metadata in self._client.get_prefix(METADATA_KEY_PREFIX,
                                                    keys_only=True):
-            key = metadata.key.decode('utf-8')
+            try:
+                key = metadata.key.decode('utf-8')
+            except UnicodeDecodeError:
+                # This entry cannot name a worker; other registrations remain usable.
+                logger.warning(
+                    "Ignoring a metadata registration key that is not UTF-8")
+                continue
             sub_keys = key.split('/')
             if len(sub_keys) >= 2:
                 top_prefix = "/".join(sub_keys[:2])

@@ -1134,6 +1134,70 @@ async def test_kv_cache_aware_server_state_cancel_poll_task():
     assert state._poll_pending is False
 
 
+@pytest.mark.asyncio
+async def test_kv_cache_aware_remove_stops_only_departed_poll(
+        mock_aiohttp_session: aiohttp.ClientSession) -> None:
+    """Removal cancels a real poll task without awaiting it under the router lock."""
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["removed", "retained"],
+                                tokens_per_block=32)
+    removed = router._server_state["removed"]
+    retained = router._server_state["retained"]
+    entered_removed, entered_retained = asyncio.Event(), asyncio.Event()
+    release, cancelled = asyncio.Event(), asyncio.Event()
+    tasks = []
+
+    async def removed_events(
+            _session: aiohttp.ClientSession) -> list[dict[str, object]]:
+        """Hold the real poll and acquire the router lock during its cancellation."""
+        entered_removed.set()
+        try:
+            await release.wait()
+            return [{"type": "stored", "blocks": [{"block_hash": 10}]}]
+        finally:
+            # Awaiting this task while holding the router lock would deadlock.
+            async with router._lock:
+                cancelled.set()
+
+    async def retained_events(
+            _session: aiohttp.ClientSession) -> list[dict[str, object]]:
+        """Keep the retained worker's poll pending until the test releases it."""
+        entered_retained.set()
+        await release.wait()
+        return [{"type": "stored", "blocks": [{"block_hash": 20}]}]
+
+    try:
+        with mock.patch.object(removed, "poll_events", side_effect=removed_events) as removed_poll, \
+                mock.patch.object(retained, "poll_events", side_effect=retained_events):
+            removed.schedule_poll_and_update(mock_aiohttp_session)
+            retained.schedule_poll_and_update(mock_aiohttp_session)
+            tasks = [removed._poll_task, retained._poll_task]
+            await asyncio.wait_for(asyncio.gather(entered_removed.wait(),
+                                                  entered_retained.wait()),
+                                   timeout=1)
+            # An already coalesced refresh must not restart the departed poll.
+            removed.schedule_poll_and_update(mock_aiohttp_session)
+            await asyncio.wait_for(router.remove_server("removed"), timeout=1)
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            done, _ = await asyncio.wait({tasks[0]}, timeout=1)
+            assert tasks[0] in done
+            assert tasks[0].cancelled()
+            assert removed._poll_pending is False
+            assert router._server_state == {"retained": retained}
+            assert retained._poll_task is tasks[1]
+            assert not tasks[1].done()
+            release.set()
+            await asyncio.wait_for(tasks[1], timeout=1)
+            assert removed_poll.await_count == 1
+            assert removed._block_table(KV_CACHE_HASH_ALGO_V1) == set()
+            assert retained._block_table(KV_CACHE_HASH_ALGO_V1) == {20}
+    finally:
+        release.set()
+        await removed.cancel_poll_task()
+        await router.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
     state = KvCacheAwareServerState("server-x", tokens_per_block=4)
     state.add_blocks([10, 20, 30], hash_algo=KV_CACHE_HASH_ALGO_V1)
