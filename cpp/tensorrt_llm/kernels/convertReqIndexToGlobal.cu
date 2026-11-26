@@ -16,13 +16,37 @@
 
 #include "convertReqIndexToGlobal.h"
 
-TRTLLM_NAMESPACE_BEGIN
+#include <cstdint>
 
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Each thread handles one element at (token_id, col).
-// Grid: (num_tokens, ceil(numTopkTokens / blockDim.x))
+// Maps a request-local token index to a global index into the layer-interleaved
+// KV pool: blockTable[req][tok / blockSize] * strideFactor + tok % blockSize + layerId * blockSize.
+// Negative tokens, out-of-range blocks and padding block-table entries map to -1.
+__device__ __forceinline__ int32_t convertOne(int32_t tok, int32_t const* __restrict__ btRow, int32_t maxNumBlocksPerReq,
+    int32_t blockSize, int32_t strideFactor, int64_t btStride1, int32_t layerOffset)
+{
+    if (tok < 0)
+    {
+        return -1;
+    }
+    int32_t const blockId = tok / blockSize;
+    if (blockId >= maxNumBlocksPerReq)
+    {
+        return -1;
+    }
+    int32_t const base = btRow[blockId * btStride1];
+    if (base < 0)
+    {
+        return -1;
+    }
+    return base * strideFactor + (tok - blockId * blockSize) + layerOffset;
+}
+
+// Generic (scalar) kernel: one element per thread. Grid: (num_tokens, ceil(numTopkTokens / blockDim.x)).
+// Used when the row layout is not 16-byte vectorizable.
 __global__ void convertReqIndexToGlobalKernel(int32_t const* __restrict__ reqId, int32_t const* __restrict__ blockTable,
     int32_t const* __restrict__ tokenIndices, int32_t* __restrict__ output, int32_t numTopkTokens,
     int32_t maxNumBlocksPerReq, int32_t blockSize, int32_t strideFactor, int32_t layerId, int64_t btStride0,
@@ -30,46 +54,80 @@ __global__ void convertReqIndexToGlobalKernel(int32_t const* __restrict__ reqId,
 {
     int32_t const tokenId = blockIdx.x;
     int32_t const col = blockIdx.y * blockDim.x + threadIdx.x;
-
     if (col >= numTopkTokens)
     {
         return;
     }
-
-    // Load request id for this token
     int32_t const req = reqId[tokenId];
-
-    // Load token index
+    int32_t const* btRow = blockTable + req * btStride0;
     int32_t const tok = tokenIndices[tokenId * tiStride0 + col * tiStride1];
+    output[tokenId * outStride0 + col * outStride1]
+        = convertOne(tok, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerId * blockSize);
+}
 
-    // Invalid token → output -1
-    if (tok < 0)
+// Vectorized kernels: each thread moves int4 (4 indices) per step.
+//  - Prefill shape (many rows, e.g. 16k x 2048): kRowsPerBlock rows per block, threads stride over
+//    the row -> few large blocks, reqId / block-table row hoisted per row.
+//  - Decode shape (a handful of rows): one row per block and the row split across gridDim.y blocks,
+//    so the ~2k indices of a single token still spread over several SMs. A 4-rows-per-block launch
+//    put a whole decode row on one block and cost +0.24 ms ITL (78 layers) on GLM 5.2 pareto01.
+// The op is pure data movement (16k x 2048 int32 = 134 MB read+write per call on GLM 5.2 16k prefill), and the
+// one-element-per-thread version above ran ~6x off DRAM bandwidth (130 us vs ~20 us) because every block only
+// moved 1 KB and every element paid a dependent reqId + block-table load. Here reqId and the block-table row
+// pointer are loaded once per row, and the indices stream through as 16-byte vectors.
+template <int kThreads, int kRowsPerBlock>
+__global__ __launch_bounds__(kThreads) void convertReqIndexToGlobalVecKernel(int32_t const* __restrict__ reqId,
+    int32_t const* __restrict__ blockTable, int4 const* __restrict__ tokenIndices, int4* __restrict__ output,
+    int32_t numTokens, int32_t numVecPerRow, int32_t maxNumBlocksPerReq, int32_t blockSize, int32_t strideFactor,
+    int32_t layerOffset, int64_t btStride0, int64_t btStride1)
+{
+    int32_t const rowBase = blockIdx.x * kRowsPerBlock;
+#pragma unroll 1
+    for (int32_t r = 0; r < kRowsPerBlock; ++r)
     {
-        output[tokenId * outStride0 + col * outStride1] = -1;
+        int32_t const row = rowBase + r;
+        if (row >= numTokens)
+        {
+            return;
+        }
+        int32_t const req = reqId[row];
+        int32_t const* btRow = blockTable + static_cast<int64_t>(req) * btStride0;
+        int4 const* src = tokenIndices + static_cast<int64_t>(row) * numVecPerRow;
+        int4* dst = output + static_cast<int64_t>(row) * numVecPerRow;
+        for (int32_t v = threadIdx.x; v < numVecPerRow; v += kThreads)
+        {
+            int4 const in = src[v];
+            int4 out;
+            out.x = convertOne(in.x, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+            out.y = convertOne(in.y, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+            out.z = convertOne(in.z, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+            out.w = convertOne(in.w, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+            dst[v] = out;
+        }
+    }
+}
+
+template <int kThreads>
+__global__ __launch_bounds__(kThreads) void convertReqIndexToGlobalVecRowSplitKernel(int32_t const* __restrict__ reqId,
+    int32_t const* __restrict__ blockTable, int4 const* __restrict__ tokenIndices, int4* __restrict__ output,
+    int32_t numVecPerRow, int32_t maxNumBlocksPerReq, int32_t blockSize, int32_t strideFactor, int32_t layerOffset,
+    int64_t btStride0, int64_t btStride1)
+{
+    int32_t const row = blockIdx.x;
+    int32_t const v = blockIdx.y * kThreads + threadIdx.x;
+    if (v >= numVecPerRow)
+    {
         return;
     }
-
-    // Compute block id and in-block offset
-    int32_t const blockId = tok / blockSize;
-    int32_t const inblockOff = tok % blockSize + layerId * blockSize;
-
-    // Guard block_table access
-    if (blockId >= maxNumBlocksPerReq)
-    {
-        output[tokenId * outStride0 + col * outStride1] = -1;
-        return;
-    }
-
-    int32_t const base = blockTable[req * btStride0 + blockId * btStride1];
-
-    // Padding entry in block table
-    if (base < 0)
-    {
-        output[tokenId * outStride0 + col * outStride1] = -1;
-        return;
-    }
-
-    output[tokenId * outStride0 + col * outStride1] = base * strideFactor + inblockOff;
+    int32_t const req = reqId[row];
+    int32_t const* btRow = blockTable + static_cast<int64_t>(req) * btStride0;
+    int4 const in = tokenIndices[static_cast<int64_t>(row) * numVecPerRow + v];
+    int4 out;
+    out.x = convertOne(in.x, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+    out.y = convertOne(in.y, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+    out.z = convertOne(in.z, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+    out.w = convertOne(in.w, btRow, maxNumBlocksPerReq, blockSize, strideFactor, btStride1, layerOffset);
+    output[static_cast<int64_t>(row) * numVecPerRow + v] = out;
 }
 
 void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTable, int32_t const* tokenIndices,
@@ -81,12 +139,37 @@ void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTab
     {
         return;
     }
-
+    bool const vectorizable = tiStride1 == 1 && outStride1 == 1 && tiStride0 == numTopkTokens
+        && outStride0 == numTopkTokens && (numTopkTokens % 4) == 0
+        && (reinterpret_cast<uintptr_t>(tokenIndices) % 16) == 0 && (reinterpret_cast<uintptr_t>(output) % 16) == 0;
+    if (vectorizable)
+    {
+        constexpr int32_t kThreads = 256;
+        constexpr int32_t kRowsPerBlock = 4;
+        // Below this many rows (decode / small batches) a 4-rows-per-block launch cannot fill the GPU:
+        // split each row across blocks instead. 132 SMs x 4 rows keeps the prefill path for >= 528 rows.
+        constexpr int32_t kMinRowsForRowBlocks = 512;
+        int32_t const numVecPerRow = numTopkTokens / 4;
+        if (numTokens >= kMinRowsForRowBlocks)
+        {
+            dim3 const grid((numTokens + kRowsPerBlock - 1) / kRowsPerBlock);
+            convertReqIndexToGlobalVecKernel<kThreads, kRowsPerBlock><<<grid, kThreads, 0, stream>>>(reqId, blockTable,
+                reinterpret_cast<int4 const*>(tokenIndices), reinterpret_cast<int4*>(output), numTokens, numVecPerRow,
+                maxNumBlocksPerReq, blockSize, strideFactor, layerId * blockSize, btStride0, btStride1);
+        }
+        else
+        {
+            dim3 const grid(numTokens, (numVecPerRow + kThreads - 1) / kThreads);
+            convertReqIndexToGlobalVecRowSplitKernel<kThreads><<<grid, kThreads, 0, stream>>>(reqId, blockTable,
+                reinterpret_cast<int4 const*>(tokenIndices), reinterpret_cast<int4*>(output), numVecPerRow,
+                maxNumBlocksPerReq, blockSize, strideFactor, layerId * blockSize, btStride0, btStride1);
+        }
+        return;
+    }
     constexpr int32_t kThreadsPerBlock = 256;
     int32_t const tilesPerRow = (numTopkTokens + kThreadsPerBlock - 1) / kThreadsPerBlock;
     dim3 const grid(numTokens, tilesPerRow);
     dim3 const block(kThreadsPerBlock);
-
     convertReqIndexToGlobalKernel<<<grid, block, 0, stream>>>(reqId, blockTable, tokenIndices, output, numTopkTokens,
         maxNumBlocksPerReq, blockSize, strideFactor, layerId, btStride0, btStride1, tiStride0, tiStride1, outStride0,
         outStride1);
@@ -173,5 +256,4 @@ void invokeConvertReqIndexToGlobalGrouped(int32_t const* reqId, int32_t const* b
 }
 
 } // namespace kernels
-
 TRTLLM_NAMESPACE_END
