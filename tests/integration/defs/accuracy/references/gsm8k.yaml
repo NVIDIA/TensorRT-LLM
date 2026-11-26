@@ -659,6 +659,11 @@ zai-org/GLM-5-FP8:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 78.0
+zai-org/GLM-5.3:
+  # B200 attention DP + EP8 with MTP, FP8 block-scale checkpoint.
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 93.14
 zai-org/GLM-5.2:
   # The non-speculative forward shares the MTP row's anchor: MTP holds the
   # emitted distribution, so it must not move the score.

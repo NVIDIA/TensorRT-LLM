@@ -257,6 +257,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py
+  - accuracy/test_glm52.py::TestGLM53FP8::test_dep_mtp[tp_size=8-ep_size=8] TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:

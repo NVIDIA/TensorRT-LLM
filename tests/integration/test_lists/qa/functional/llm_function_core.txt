@@ -59,6 +59,7 @@ accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8
 accuracy/test_glm52.py::TestGLM52NVFP4::test_runtime
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep_nvfp4kv[tp_size=8-ep_size=8]
+accuracy/test_glm52.py::TestGLM53FP8::test_dep_mtp[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv]
 accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4]
