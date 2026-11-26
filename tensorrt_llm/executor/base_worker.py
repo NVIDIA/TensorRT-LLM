@@ -650,12 +650,14 @@ class BaseWorker(GenerationExecutor):
         logprob_params = self._get_logprob_params(request)
 
         # With a result queue the proxy holds the caller's GenerationResult.
-        # This worker reads its own only to post-process responses or to
-        # compute prompt logprobs, so it skips building one otherwise.
+        # This worker reads its own only to post-process responses, to compute
+        # prompt logprobs or to report perf metrics, so it skips building one
+        # otherwise: a request stored without a result reports no perf metrics.
         result = None
         if (self.result_queue is None or self.postproc_queues is not None
                 or self.enable_postprocess_parallel
-                or logprob_params is not None):
+                or logprob_params is not None
+                or request.sampling_params.return_perf_metrics):
             result = GenerationResult(
                 request,
                 background_error_handler=self._handle_background_error,
@@ -1692,14 +1694,16 @@ class AwaitResponseHelper:
         # here — consumers of result_queue under RPC/Ray expect lists, and a
         # bare ErrorResponse (a NamedTuple) would be splatted by extend().
         rsp_batch = []
+        # Packed finals go after the rest of the drain. The engine hands its
+        # responses over grouped by key and every packed batch has the same
+        # key, so a batch can come before an earlier response of one of its
+        # requests, which the proxy drops once it has seen the final.
+        packed = []
 
         for response in responses:
 
             if isinstance(response, PackedResponses):
-                # Already in the proxy's form: see pack_final_responses.
-                rsp_batch.append(response)
-                for client_id in response.client_ids:
-                    self.worker._pop_result(client_id)
+                packed.append(response)
                 continue
 
             if isinstance(response, ErrorResponse):
@@ -1722,6 +1726,12 @@ class AwaitResponseHelper:
                       postproc_batches=postproc_batches,
                       rsp_batch=rsp_batch)
 
+        for response in packed:
+            # Already in the proxy's form: see pack_final_responses.
+            rsp_batch.append(response)
+            for client_id in response.client_ids:
+                self.worker._pop_result(client_id)
+
         if postproc_batches:
             for wid, batch in enumerate(postproc_batches):
                 if batch:
@@ -1743,14 +1753,16 @@ def pack_final_responses(
 
     The leader then forwards them without loading them. Responses it has to
     finish itself stay as they are: those that are not final, carry an error,
-    or hold the context logits that prompt logprobs are computed from.
+    or hold what prompt logprobs are computed from, which is the context
+    logits or the rows the executor reduced them to.
     """
     kept, packed, client_ids = [], [], []
     for item in responses:
         response = item[1]
         result = getattr(response, "result", None)
         if (result is None or not result.is_final
-                or result.context_logits is not None):
+                or result.context_logits is not None
+                or result.context_prompt_logprob_rows is not None):
             kept.append(item)
             continue
         metrics = get_metrics_dict(response)
@@ -1963,6 +1975,11 @@ def _drop_refused_response(worker, response: LlmResponse) -> bool:
     return True
 
 
+# What a lookup in ``BaseWorker._results`` yields for a request that is not
+# stored there; a request stored without a result yields None.
+_UNTRACKED = object()
+
+
 def _maybe_wrap_response(
     worker, response: LlmResponse
 ) -> Union[LlmResponse, ResponseWrapper, ErrorResponse]:
@@ -1978,11 +1995,13 @@ def _maybe_wrap_response(
         return ErrorResponse(response.client_id, str(error),
                              response.request_id)
     # Reading perf metrics deserializes the whole result, and the executor fills
-    # them only for requests that asked; an untracked request is always read.
-    generation_result = worker._results.get(response.client_id)
+    # them only for requests that asked. A request stored without a result did
+    # not ask (see BaseWorker.submit); an untracked request is always read.
+    generation_result = worker._results.get(response.client_id, _UNTRACKED)
     req_perf_metrics = None
-    if (generation_result is None
-            or generation_result.sampling_params.return_perf_metrics):
+    if (generation_result is _UNTRACKED
+            or (generation_result is not None
+                and generation_result.sampling_params.return_perf_metrics)):
         req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
