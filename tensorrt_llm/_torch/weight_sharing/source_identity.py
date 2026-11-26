@@ -83,7 +83,7 @@ if TYPE_CHECKING:
 # Bump when the fingerprint projection changes in a way that makes previously
 # stored identities incomparable. Two identities with different format versions
 # never match.
-SOURCE_IDENTITY_FORMAT_VERSION = 3
+SOURCE_IDENTITY_FORMAT_VERSION = 4
 
 _PRETRAINED_METADATA_FIELDS = frozenset(
     {
@@ -143,6 +143,15 @@ def _pretrained_config_payload(pretrained: Any) -> Any:
     return payload
 
 
+def _canonical_moe_tactic(tactic: str) -> str:
+    """``tactic`` in one spelling. Segment order and case do not change which
+    implementations a tactic names, so they must not change the fingerprint."""
+    # Importing resolution registers every implementation, and with them the segment values.
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MOE_IMPL_REGISTRY
+
+    return MOE_IMPL_REGISTRY.parse_query(tactic).compact()
+
+
 def _canonical_hash(obj: Any) -> str:
     """Compute a stable SHA-256 hash of an arbitrary JSON-able object.
 
@@ -180,6 +189,33 @@ def _quant_to_dict(quant_config: Any) -> Any:
     if callable(to_dict):
         return to_dict()
     return str(quant_config)
+
+
+def _quant_fingerprint_projection(quant_config: Any) -> Any:
+    """Project a quantization config for the quant fingerprint.
+
+    A module is excluded when any `exclude_modules` pattern matches it, so the
+    patterns are hashed as a set: two configs that exclude the same modules
+    hash the same whatever order or repeats their producer wrote. The config's
+    own list is left in checkpoint order.
+
+    Args:
+        quant_config: A `QuantConfig` (pydantic model), an object exposing
+            `to_dict`, or `None`.
+
+    Returns:
+        The `_quant_to_dict` projection, with `exclude_modules` replaced by its
+        sorted unique patterns when it is a list or tuple.
+    """
+    projection = _quant_to_dict(quant_config)
+    if isinstance(projection, dict) and isinstance(
+        projection.get("exclude_modules"), (list, tuple)
+    ):
+        projection = {
+            **projection,
+            "exclude_modules": sorted(set(projection["exclude_modules"]), key=str),
+        }
+    return projection
 
 
 @dataclass(frozen=True)
@@ -353,12 +389,15 @@ class SourceIdentity:
 
         Returns:
             A hex digest covering `quant_config`, `quant_config_dict`, and
-            the dynamic-quantization flag.
+            the dynamic-quantization flag. Exclusion patterns are hashed as a
+            set.
         """
         payload = {
-            "quant_config": _quant_to_dict(getattr(model_config, "quant_config", None)),
+            "quant_config": _quant_fingerprint_projection(
+                getattr(model_config, "quant_config", None)
+            ),
             "quant_config_dict": {
-                name: _quant_to_dict(qc)
+                name: _quant_fingerprint_projection(qc)
                 for name, qc in (getattr(model_config, "quant_config_dict", None) or {}).items()
             },
             "force_dynamic_quantization": getattr(
@@ -376,7 +415,10 @@ class SourceIdentity:
 
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
-            backends, fusion flags, and the all-reduce strategy.
+            backends, fusion flags, the all-reduce strategy, and -- only when
+            one is configured -- the MoE load-balancer config, the MoE
+            tactics of the target and of its draft, which pin implementations
+            within the ``moe_backend`` family, and the draft's ``moe_backend``.
         """
         payload = {
             "attn_backend": getattr(model_config, "attn_backend", None),
@@ -401,6 +443,19 @@ class SourceIdentity:
             "use_cute_dsl_bf16_bmm": getattr(model_config, "use_cute_dsl_bf16_bmm", False),
             "use_cute_dsl_bf16_gemm": getattr(model_config, "use_cute_dsl_bf16_gemm", False),
         }
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        if load_balancer is not None:
+            payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
+        moe_tactic = getattr(model_config, "moe_tactic", None)
+        if moe_tactic is not None:
+            payload["moe_tactic"] = _canonical_moe_tactic(moe_tactic)
+        spec_config = getattr(model_config, "spec_config", None)
+        draft_moe_tactic = getattr(spec_config, "moe_tactic", None)
+        if draft_moe_tactic is not None:
+            payload["draft_moe_tactic"] = _canonical_moe_tactic(draft_moe_tactic)
+        draft_moe_backend = getattr(spec_config, "moe_backend", None)
+        if draft_moe_backend is not None:
+            payload["draft_moe_backend"] = draft_moe_backend
         return _canonical_hash(payload)
 
     @staticmethod

@@ -77,6 +77,14 @@ parser.add_argument("--moe-backend", type=str)
 parser.add_argument("--moe-backend-for-prefill", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
 parser.add_argument(
+    "--moe-load-balancer",
+    type=str,
+    help="MoeConfig.load_balancer: a YAML file path, or a mapping when set in the config"
+    " file, e.g. {mode: per_layer_dynamic, num_slots: 408}. Supports per_layer_dynamic"
+    " without CUDA graphs, and static standard EPLB (layer_updates_per_iter 0)."
+    " Default: no load balancer.",
+)
+parser.add_argument(
     "--spec-max-draft-len",
     type=int,
     help="Draft tokens per generation step. Required by models whose multi-token verify"
@@ -168,7 +176,9 @@ if args.load_format is None:
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 if args.moe_backend_for_prefill is None:
-    args.moe_backend_for_prefill = "CUTLASS"
+    # Prefill only fills the KV cache for the GEN measurement, so it just needs a backend
+    # that can serve this checkpoint on this GPU, which AUTO resolves.
+    args.moe_backend_for_prefill = "AUTO"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
@@ -177,6 +187,11 @@ if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
     parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
+if args.replay_file_path and os.environ.get("ENABLE_PERFECT_ROUTER") == "expert_ids":
+    parser.error(
+        "--replay-file-path replays the recorded expert IDs over the ones that"
+        " ENABLE_PERFECT_ROUTER=expert_ids substitutes; run the perfect-router arm without it"
+    )
 if args.replay_verify_metadata is None:
     args.replay_verify_metadata = True
 if args.spec_max_draft_len is not None:
@@ -250,6 +265,7 @@ runner = Runner(
     use_cuda_graph=args.use_cuda_graph,
     spec_config=spec_config,
     vision_config=args.vision_config,
+    moe_load_balancer=args.moe_load_balancer,
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
@@ -418,10 +434,15 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
     with runner.replace_routing_method_ctx(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
     ):
-        capture_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(capture_stream):
+        if args.use_cuda_graph:
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                run_pack(check=True)
+            torch.cuda.current_stream().wait_stream(capture_stream)
+        else:
+            # Eager runs warm up on the stream they are timed on: per-layer
+            # dynamic EPLB binds its submission stream on first use.
             run_pack(check=True)
-        torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 logger.info("Layer-wise benchmarks: Warmup  ... Done")
 
@@ -507,3 +528,4 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         f"  (us)"
     )
 torch.cuda.cudart().cudaProfilerStop()
+runner.shutdown_moe_load_balancer()

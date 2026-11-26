@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -78,12 +79,14 @@ TEST(DigestPoolTest, DigestValueEqualityAcrossDistinctSlots)
     size_t const baseline = detail::digestPoolLiveCount();
     Digest const bytes = makeDigest(std::byte{0x42});
 
-    TokenIdExt const tokA(bytes);
-    TokenIdExt const tokB(bytes);
+    TokenIdExt const tokA(bytes, "frontend-a");
+    TokenIdExt const tokB(bytes, "frontend-b");
     EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 2); // two distinct slots
     ASSERT_TRUE(tokA.isDigest());
     EXPECT_EQ(tokA, tokB);                                  // by-value (pooled) equality
-    EXPECT_NE(tokA, TokenIdExt(TokenId{5}));                // digest != normal
+    EXPECT_EQ(tokA.mmItemContext().uuid, "frontend-a");
+    EXPECT_EQ(tokB.mmItemContext().uuid, "frontend-b");
+    EXPECT_NE(tokA, TokenIdExt(TokenId{5})); // digest != normal
 
     // Hashing the two distinct-slot digests yields the same contribution.
     Hasher hashA;
@@ -98,13 +101,16 @@ TEST(DigestPoolTest, CopyDigestTokenClonesSlot)
 {
     size_t const baseline = detail::digestPoolLiveCount();
     Digest const bytes = makeDigest(std::byte{0x5A});
+    std::string const uuid(4096, 'u');
     {
-        TokenIdExt const original(bytes);
+        TokenIdExt const original(bytes, uuid);
         EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
         TokenIdExt const copy = original; // clone → second slot
         EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 2);
         EXPECT_EQ(original, copy);
         EXPECT_EQ(copy.digest(), bytes);
+        EXPECT_EQ(copy.mmItemContext().uuid, uuid);
+        EXPECT_EQ(&original.mmItemContext(), &copy.mmItemContext());
     }
     EXPECT_EQ(detail::digestPoolLiveCount(), baseline); // both slots freed
 }
@@ -116,13 +122,14 @@ TEST(DigestPoolTest, MoveTransfersSlotWithoutCloning)
     Digest const bytes = makeDigest(std::byte{0x33});
     Digest const other = makeDigest(std::byte{0x77});
     {
-        TokenIdExt source(bytes);
+        TokenIdExt source(bytes, "routing-identity");
         EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
 
         TokenIdExt moved(std::move(source));
         EXPECT_EQ(detail::digestPoolLiveCount(), baseline + 1);
         EXPECT_EQ(source.raw(), TokenIdExt::kBadToken);
         EXPECT_EQ(moved.digest(), bytes);
+        EXPECT_EQ(moved.mmItemContext().uuid, "routing-identity");
         EXPECT_THROW((void) (source == moved), std::out_of_range);
 
         TokenIdExt target(other);
@@ -247,5 +254,27 @@ TEST(DigestPoolTest, MixedBlockHashesDeterministically)
     Hasher hb;
     hb.update(b.data(), b.size());
     EXPECT_EQ(ha.digest(), hb.digest());
+}
+
+TEST(DigestPoolTest, UuidMetadataDoesNotChangeTokenIdentityOrBlockHash)
+{
+    Digest const digest = makeDigest(std::byte{0x2A});
+    std::vector<uint8_t> digestBytes(kDIGEST_LEN);
+    std::memcpy(digestBytes.data(), digest.data(), kDIGEST_LEN);
+    auto const withoutUuid = genMultimodalCacheKeyTokens(1000, digestBytes, 3);
+    auto const withUuid
+        = genMultimodalCacheKeyTokens(1000, digestBytes, 3, /*tokenOffset=*/0, "frontend-routing-identity");
+
+    ASSERT_EQ(withUuid.size(), withoutUuid.size());
+    EXPECT_EQ(withUuid, withoutUuid);
+    ASSERT_TRUE(withUuid.front().isDigest());
+    EXPECT_EQ(withUuid.front().digest(), digest);
+    EXPECT_EQ(withUuid.front().mmItemContext().uuid, "frontend-routing-identity");
+
+    Hasher withoutUuidHash;
+    withoutUuidHash.update(withoutUuid.data(), withoutUuid.size());
+    Hasher withUuidHash;
+    withUuidHash.update(withUuid.data(), withUuid.size());
+    EXPECT_EQ(withUuidHash.digest(), withoutUuidHash.digest());
 }
 } // namespace

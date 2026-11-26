@@ -1,5 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,26 +15,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def pytest_addoption(parser):
-    parser.addoption(
-        "--run-live-backends",
-        action="store_true",
-        help="Run integration checks that launch installed agent CLIs and use local account config.",
+def pytest_configure() -> None:
+    """Forget the repository the caller's environment names, before the suite runs git.
+
+    In a linked worktree git exports ``GIT_DIR`` to what it starts (``git rebase --exec``,
+    a commit hook): the fixtures' ``git init`` and ``git config`` would go there.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"], capture_output=True, text=True, check=True
     )
-
-
-def pytest_configure(config):
-    config.addinivalue_line("markers", "live_backend: requires a configured local agent CLI")
-
-
-def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--run-live-backends"):
-        skip = pytest.mark.skip(
-            reason="requires --run-live-backends and configured local agent CLIs"
-        )
-        for item in items:
-            if "live_backend" in item.keywords:
-                item.add_marker(skip)
+    for name in local.stdout.split():
+        os.environ.pop(name, None)
 
 
 def _git(repo: Path, *args: str) -> None:

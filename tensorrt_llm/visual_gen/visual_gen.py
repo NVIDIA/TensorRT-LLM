@@ -438,8 +438,8 @@ class VisualGen:
             resolved_params.seed = secrets.randbits(63)
 
         # Resolve references to bytes here, on the coordinator, before the
-        # request is broadcast — the single choke point shared by serve and the
-        # standalone Python API. Runs synchronously so bad-media ``ValueError``
+        # request is broadcast. Serve has already read ``path`` references to
+        # bytes. Runs synchronously so bad-media ``ValueError``
         # reaches the caller before dispatch (serve keeps its 400).
         prepare_reference_slots(resolved_params)
 

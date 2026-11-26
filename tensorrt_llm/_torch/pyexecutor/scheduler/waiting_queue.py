@@ -15,15 +15,100 @@
 
 import heapq
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from typing import Optional
 
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 
 from ..executor_request_queue import RequestQueueItem
+
+
+class QueuedLoadTracker:
+    """Incremental (requests, tokens) totals for the requests in a waiting queue.
+
+    Queue-depth statistics are read on every sampled iteration, so the totals
+    are maintained on insert/remove instead of rescanning the queue. Entries
+    are keyed by request id and an id counts once however many queued items
+    share it (its tokens are those of the first one added); it stops counting
+    when the last of them leaves. Removing an absent id is ignored, so the
+    put-back path (pop, then prepend) stays consistent. Items without a
+    readable ``num_input_tokens`` are not counted.
+    """
+
+    def __init__(self) -> None:
+        # request id -> [is_generation_only, tokens, queued items with this id]
+        self._entries: dict[int, list] = {}
+        self.num_ctx_requests = 0
+        self.num_ctx_tokens = 0
+        self.num_gen_requests = 0
+        self.num_gen_kv_tokens = 0
+
+    def __contains__(self, request_id: int) -> bool:
+        return request_id in self._entries
+
+    def add(self, item: RequestQueueItem) -> None:
+        if not item.is_normal_request or item.request is None:
+            return
+        entry = self._entries.get(item.id)
+        if entry is not None:
+            entry[2] += 1
+            return
+        try:
+            # The prompt length, with the ids a prompt-tail transport left out.
+            tokens = int(item.request.num_input_tokens + item.request.py_prompt_trimmed_prefix)
+            is_gen = item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY
+        except (AttributeError, TypeError) as e:
+            logger.warning(
+                f"Excluding queued item {item.id} from queued counters: "
+                f"num_input_tokens not readable ({type(e).__name__})"
+            )
+            return
+        self._entries[item.id] = [is_gen, tokens, 1]
+        self._apply(is_gen, tokens, 1)
+
+    def discard(self, request_id: int, *, all_items: bool = False) -> None:
+        """Account for one queued item with this id leaving, or all of them."""
+        entry = self._entries.get(request_id)
+        if entry is None:
+            return
+        entry[2] -= 1
+        if all_items or entry[2] <= 0:
+            del self._entries[request_id]
+            self._apply(entry[0], entry[1], -1)
+
+    def _apply(self, is_gen: bool, tokens: int, sign: int) -> None:
+        if is_gen:
+            self.num_gen_requests += sign
+            self.num_gen_kv_tokens += sign * tokens
+        else:
+            self.num_ctx_requests += sign
+            self.num_ctx_tokens += sign * tokens
+
+    def totals(self, excluded_ids: Iterable[int] = ()) -> tuple[int, int, int, int]:
+        """Return (ctx_requests, ctx_tokens, gen_requests, gen_kv_tokens).
+
+        ``excluded_ids`` (e.g. cancelled requests) are subtracted without
+        mutating the tracker; the cost is O(len(excluded_ids)), not O(queue).
+        """
+        ctx_req, ctx_tok = self.num_ctx_requests, self.num_ctx_tokens
+        gen_req, gen_tok = self.num_gen_requests, self.num_gen_kv_tokens
+        for request_id in set(excluded_ids):
+            entry = self._entries.get(request_id)
+            if entry is None:
+                continue
+            if entry[0]:
+                gen_req -= 1
+                gen_tok -= entry[1]
+            else:
+                ctx_req -= 1
+                ctx_tok -= entry[1]
+        return ctx_req, ctx_tok, gen_req, gen_tok
 
 
 class WaitingQueue(ABC):
@@ -48,6 +133,22 @@ class WaitingQueue(ABC):
     def peek_request(self) -> RequestQueueItem:
         """Peek at the request at the front of the queue without removing it."""
         pass
+
+    @abstractmethod
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in pop order without removing them.
+
+        Implementations must not copy or sort the whole queue for a small ``k``.
+        """
+        pass
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """Admission group of each request from ``peek_requests``, numbered in pop order.
+
+        Out-of-order admission must finish a group before the next one. Default:
+        one group.
+        """
+        return [0] * len(requests)
 
     @abstractmethod
     def prepend_request(self, request: RequestQueueItem) -> None:
@@ -80,6 +181,8 @@ class WaitingQueue(ABC):
         """Remove requests with the given IDs."""
         pass
 
+    queued_load: QueuedLoadTracker
+
     @abstractmethod
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
@@ -96,43 +199,61 @@ class WaitingQueue(ABC):
         pass
 
 
-class FCFSWaitingQueue(deque, WaitingQueue):
-    """A first-come-first-served queue that supports deque operations."""
+class FCFSWaitingQueue(WaitingQueue):
+    """A first-come-first-served queue."""
+
+    def __init__(self, requests: Iterable[RequestQueueItem] = ()) -> None:
+        self._queue: deque[RequestQueueItem] = deque(requests)
+        self.queued_load = QueuedLoadTracker()
+        for request in self._queue:
+            self.queued_load.add(request)
 
     @staticmethod
     def _warn_if_priority_set(request: RequestQueueItem) -> None:
         if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
-            logger.warning(
+            # Once per process: with output_length_prediction every request has one.
+            logger.warning_once(
                 "A request has a non-default priority but the FCFS waiting "
                 "queue is in use; the priority value will be ignored. "
-                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling."
+                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
+                key="fcfs_waiting_queue_ignores_priority",
             )
 
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue according to FCFS policy."""
         self._warn_if_priority_set(request)
-        self.append(request)
+        self._queue.append(request)
+        self.queued_load.add(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Add multiple requests to the queue according to FCFS policy."""
         requests = list(requests)
         for request in requests:
             self._warn_if_priority_set(request)
-        self.extend(requests)
+        self._queue.extend(requests)
+        for request in requests:
+            self.queued_load.add(request)
 
     def pop_request(self) -> RequestQueueItem:
         """Pop a request from the queue according to FCFS policy."""
-        return self.popleft()
+        request = self._queue.popleft()
+        self.queued_load.discard(request.id)
+        return request
 
     def peek_request(self) -> RequestQueueItem:
         """Peek at the next request in the queue without removing it."""
-        if not self:
+        if not self._queue:
             raise IndexError("peek from an empty queue")
-        return self[0]
+        return self._queue[0]
+
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests from the front of the queue, O(k)."""
+        return list(itertools.islice(self._queue, max(k, 0)))
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
-        self.appendleft(request)
+        self._queue.appendleft(request)
+        self.queued_load.add(request)
 
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
         """Prepend all requests from another iterable to the front of this queue.
@@ -140,25 +261,28 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         Requests are inserted in input order: the first item in ``requests``
         ends up at the front of the queue.
         """
-        self.extendleft(reversed(list(requests)))
+        requests = list(requests)
+        self._queue.extendleft(reversed(requests))
+        for request in requests:
+            self.queued_load.add(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
-        filtered_requests = [req for req in self if req.id not in request_ids]
-        self.clear()
-        self.extend(filtered_requests)
+        self._queue = deque(req for req in self._queue if req.id not in request_ids)
+        for request_id in request_ids:
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
-        return len(self) > 0
+        return len(self._queue) > 0
 
     def __len__(self) -> int:
         """Get number of requests in queue."""
-        return super().__len__()
+        return len(self._queue)
 
     def __iter__(self) -> Iterator[RequestQueueItem]:
         """Iterate over the queue according to FCFS policy."""
-        return super().__iter__()
+        return iter(self._queue)
 
 
 class PriorityWaitingQueue(WaitingQueue):
@@ -175,6 +299,7 @@ class PriorityWaitingQueue(WaitingQueue):
     Complexity:
         - add_request / add_requests: O(log n)
         - pop_request / peek_request: O(log n) / O(1)
+        - peek_requests(k): O(k log k), without copying or sorting the heap
         - remove_by_ids: O(n) rebuild + O(n) heapify
         - __iter__: O(n log n) over a sorted copy (priority order)
     """
@@ -189,6 +314,7 @@ class PriorityWaitingQueue(WaitingQueue):
         # request of the same priority.
         self._counter = itertools.count()
         self._prepend_counter = itertools.count(-1, -1)
+        self.queued_load = QueuedLoadTracker()
 
     def _get_priority(self, item: RequestQueueItem) -> float:
         if item.request is not None:
@@ -198,10 +324,12 @@ class PriorityWaitingQueue(WaitingQueue):
     def _push(self, item: RequestQueueItem) -> None:
         entry = (-self._get_priority(item), next(self._counter), item)
         heapq.heappush(self._heap, entry)
+        self.queued_load.add(item)
 
     def _push_front(self, item: RequestQueueItem) -> None:
         entry = (-self._get_priority(item), next(self._prepend_counter), item)
         heapq.heappush(self._heap, entry)
+        self.queued_load.add(item)
 
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue in priority order."""
@@ -217,6 +345,7 @@ class PriorityWaitingQueue(WaitingQueue):
         if not self._heap:
             raise IndexError("pop from an empty queue")
         _, _, item = heapq.heappop(self._heap)
+        self.queued_load.discard(item.id)
         return item
 
     def peek_request(self) -> RequestQueueItem:
@@ -224,6 +353,33 @@ class PriorityWaitingQueue(WaitingQueue):
         if not self._heap:
             raise IndexError("peek from an empty queue")
         return self._heap[0][2]
+
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in priority order without removing them.
+
+        Best-first over the heap's tree: an entry's children are its only successors, so the walk reads O(k) entries
+        and the whole heap is never scanned.
+        """
+        heap = self._heap
+        frontier = [(heap[0], 0)] if heap and k > 0 else []
+        result = []
+        while frontier and len(result) < k:
+            entry, index = heapq.heappop(frontier)
+            result.append(entry[2])
+            for child in (2 * index + 1, 2 * index + 2):
+                if child < len(heap):
+                    heapq.heappush(frontier, (heap[child], child))
+        return result
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """One group per priority."""
+        groups = []
+        group = 0
+        for i, request in enumerate(requests):
+            if i and self._get_priority(request) != self._get_priority(requests[i - 1]):
+                group += 1
+            groups.append(group)
+        return groups
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert a request ahead of all normally-added requests of the same priority.
@@ -250,6 +406,8 @@ class PriorityWaitingQueue(WaitingQueue):
         """Remove requests with the given IDs."""
         self._heap = [e for e in self._heap if e[2].id not in request_ids]
         heapq.heapify(self._heap)
+        for request_id in request_ids:
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         return len(self._heap) > 0
@@ -266,19 +424,234 @@ class PriorityWaitingQueue(WaitingQueue):
         return (e[2] for e in sorted(self._heap))
 
 
+def _heap_smallest(heap: list, k: int, keep: Callable[[tuple], bool]) -> list:
+    """Up to ``k`` smallest entries of ``heap`` that ``keep`` accepts, in order.
+
+    Walks the heap best-first, visiting O(k + skipped) entries instead of the whole heap.
+    """
+    out = []
+    frontier = [(heap[0], 0)] if heap and k > 0 else []
+    while frontier and len(out) < k:
+        entry, idx = heapq.heappop(frontier)
+        if keep(entry):
+            out.append(entry)
+        for child in (2 * idx + 1, 2 * idx + 2):
+            if child < len(heap):
+                heapq.heappush(frontier, (heap[child], child))
+    return out
+
+
+class AgingPriorityWaitingQueue(WaitingQueue):
+    """``PriorityWaitingQueue`` with a wait cap.
+
+    Serves the highest ``request.priority`` first; ties go in arrival order. A request
+    that has waited ``max_wait_s`` since it reached the server (``admit_orig_arrival`` in
+    disaggregated serving, else ``admit_arrival``) goes ahead of every request that has
+    not, oldest first.
+
+    Every rank pops the same order: the keys are the broadcast request's priority, the
+    arrival order and rank 0's arrival stamps against rank 0's clock (``set_now``). A
+    request put back keeps its arrival sequence.
+
+    Waiting requests sit in a ``(-priority, seq)`` heap and an ``(arrival, seq)`` heap;
+    ``set_now`` moves the newly aged ones into an aged ``(arrival, seq)`` heap that is
+    served first. Entries an aged or popped request leaves behind in the first two heaps
+    are skipped when reached.
+    """
+
+    def __init__(self, max_wait_s: float) -> None:
+        if not (math.isfinite(max_wait_s) and max_wait_s > 0.0):
+            raise ValueError(f"max_wait_s={max_wait_s!r} must be a positive number")
+        self.max_wait_s = max_wait_s
+        self._now: Optional[float] = None
+        # Arrival sequence -> queued request.
+        self._items: dict[int, RequestQueueItem] = {}
+        # Arrival sequences of the queued requests in _aged_heap.
+        self._aged: set[int] = set()
+        self._priority_heap: list[tuple[float, int]] = []
+        self._arrival_heap: list[tuple[float, int]] = []
+        self._aged_heap: list[tuple[float, int]] = []
+        # Arrival sequences with an entry in _arrival_heap. A pop from _priority_heap leaves the
+        # arrival entry in place, so a request put back reuses it rather than adding another.
+        self._in_arrival_heap: set[int] = set()
+        self._counter = itertools.count()
+        # For a request put back that was never added.
+        self._prepend_counter = itertools.count(-1, -1)
+        # Request id -> arrival sequence, while queued or popped and not yet admitted.
+        self._seq: dict[int, int] = {}
+        self.queued_load = QueuedLoadTracker()
+
+    def set_now(self, now: Optional[float]) -> None:
+        """Rank 0's clock, set once per iteration before the pops; None keeps the last value."""
+        if now is None:
+            return
+        self._now = now
+        heap = self._arrival_heap
+        while heap and now - heap[0][0] >= self.max_wait_s:
+            arrival, seq = heapq.heappop(heap)
+            self._in_arrival_heap.discard(seq)
+            if self._waiting((arrival, seq)):
+                self._aged.add(seq)
+                heapq.heappush(self._aged_heap, (arrival, seq))
+
+    @staticmethod
+    def _arrival_of(item: RequestQueueItem) -> Optional[float]:
+        if item.admit_orig_arrival is not None:
+            return item.admit_orig_arrival
+        return item.admit_arrival
+
+    @staticmethod
+    def _priority_of(item: RequestQueueItem) -> float:
+        if item.request is not None:
+            return item.request.priority
+        return DEFAULT_REQUEST_PRIORITY
+
+    def _waiting(self, entry: tuple) -> bool:
+        """Whether a heap entry ``(key, seq)`` is a queued request that has not aged."""
+        seq = entry[1]
+        return seq in self._items and seq not in self._aged
+
+    def _push(self, item: RequestQueueItem, seq: int) -> None:
+        self._items[seq] = item
+        self._seq[item.id] = seq
+        self.queued_load.add(item)
+        arrival = self._arrival_of(item)
+        if arrival is not None and self._now is not None and self._now - arrival >= self.max_wait_s:
+            self._aged.add(seq)
+            heapq.heappush(self._aged_heap, (arrival, seq))
+            return
+        heapq.heappush(self._priority_heap, (-self._priority_of(item), seq))
+        if arrival is not None and seq not in self._in_arrival_heap:
+            self._in_arrival_heap.add(seq)
+            heapq.heappush(self._arrival_heap, (arrival, seq))
+        if len(self._priority_heap) + len(self._arrival_heap) > 4 * len(self._items) + 64:
+            self._compact()
+
+    def _compact(self) -> None:
+        """Drop the entries of requests that aged or left the queue."""
+        self._priority_heap = [e for e in self._priority_heap if self._waiting(e)]
+        self._arrival_heap = [e for e in self._arrival_heap if self._waiting(e)]
+        self._in_arrival_heap = {seq for _, seq in self._arrival_heap}
+        self._aged_heap = [e for e in self._aged_heap if e[1] in self._items]
+        for heap in (self._priority_heap, self._arrival_heap, self._aged_heap):
+            heapq.heapify(heap)
+
+    def _priority_head(self) -> tuple[float, int]:
+        heap = self._priority_heap
+        while not self._waiting(heap[0]):
+            heapq.heappop(heap)
+        return heap[0]
+
+    def add_request(self, request: RequestQueueItem) -> None:
+        self._push(request, next(self._counter))
+
+    def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        for request in requests:
+            self.add_request(request)
+
+    def pop_request(self) -> RequestQueueItem:
+        if not self._items:
+            raise IndexError("pop from an empty queue")
+        # Unreachable from the executor: requests enter the queue only in
+        # _fetch_and_enqueue_requests, after set_now(rank0_now) on every rank, and the
+        # broadcaster's sync_clock (on with this queue) sets rank0_now on each broadcast.
+        if self._now is None:
+            raise RuntimeError("AgingPriorityWaitingQueue needs set_now() before the first pop")
+        if self._aged_heap:
+            _, seq = heapq.heappop(self._aged_heap)
+            self._aged.discard(seq)
+        else:
+            _, seq = self._priority_head()
+            heapq.heappop(self._priority_heap)
+        item = self._items.pop(seq)
+        self.queued_load.discard(item.id)
+        return item
+
+    def peek_request(self) -> RequestQueueItem:
+        if not self._items:
+            raise IndexError("peek from an empty queue")
+        if self._aged_heap:
+            return self._items[self._aged_heap[0][1]]
+        return self._items[self._priority_head()[1]]
+
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Up to ``k`` requests in pop order, O(k log k) plus skipped entries."""
+        aged = _heap_smallest(self._aged_heap, k, lambda entry: True)
+        rest = _heap_smallest(self._priority_heap, k - len(aged), self._waiting)
+        return [self._items[entry[1]] for entry in aged + rest]
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """One group per aged request, in pop order, then one per priority (as ``PriorityWaitingQueue``)."""
+        groups = []
+        group = -1
+        num_aged = 0
+        for i, request in enumerate(requests):
+            if num_aged == i and self._seq.get(request.id) in self._aged:
+                num_aged += 1
+                group += 1
+            elif i == num_aged or self._priority_of(request) != self._priority_of(requests[i - 1]):
+                group += 1
+            groups.append(group)
+        return groups
+
+    def prepend_request(self, request: RequestQueueItem) -> None:
+        seq = self._seq.get(request.id)
+        self._push(request, seq if seq is not None else next(self._prepend_counter))
+
+    def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
+        # Reversed, so that among requests without an arrival sequence the first gets the lowest one.
+        for request in reversed(list(requests)):
+            self.prepend_request(request)
+
+    def mark_admitted(self, requests: Iterable[RequestQueueItem]) -> None:
+        for request in requests:
+            self._seq.pop(request.id, None)
+
+    def remove_by_ids(self, request_ids: set[int]) -> None:
+        self._items = {s: item for s, item in self._items.items() if item.id not in request_ids}
+        self._aged &= self._items.keys()
+        for request_id in request_ids:
+            self._seq.pop(request_id, None)
+            self.queued_load.discard(request_id, all_items=True)
+        self._compact()
+
+    def __bool__(self) -> bool:
+        return len(self._items) > 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[RequestQueueItem]:
+        """Requests in pop order, over a snapshot taken at call time (O(n log n))."""
+        aged = sorted(self._aged_heap)
+        rest = sorted(e for e in self._priority_heap if self._waiting(e))
+        return iter([self._items[entry[1]] for entry in aged + rest])
+
+
 def create_waiting_queue(
     policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
     gen_admission=None,
+    max_wait_s: Optional[float] = None,
 ) -> WaitingQueue:
     """Create a waiting queue based on the specified policy.
 
     Args:
         policy: The scheduling policy to use.
         gen_admission: Optional ``GenAdmissionConfig``; overrides ``policy`` when enabled.
+        max_wait_s: The wait cap of ``WaitingQueuePolicy.PRIORITY``; None: no cap.
 
     Returns:
         A WaitingQueue instance.
     """
+    if max_wait_s is not None:
+        if policy != WaitingQueuePolicy.PRIORITY:
+            raise ValueError(f"max_wait_s needs waiting_queue_policy=priority, not {policy}")
+        if gen_admission is not None and gen_admission.enabled:
+            raise ValueError(
+                f"waiting_queue_max_wait_s cannot be combined with GEN admission by original "
+                f"arrival ({gen_admission.describe()})"
+            )
+        return AgingPriorityWaitingQueue(max_wait_s)
     if gen_admission is not None and gen_admission.enabled:
         from .gen_admission_queue import GenAdmissionWaitingQueue
 

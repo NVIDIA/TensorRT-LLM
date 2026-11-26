@@ -501,6 +501,12 @@ class AnthropicMessageStopEvent(AnthropicBaseModel):
     type: Literal["message_stop"] = "message_stop"
 
 
+class AnthropicPingEvent(AnthropicBaseModel):
+    """A keepalive: the stream format allows any number of them after message_start."""
+
+    type: Literal["ping"] = "ping"
+
+
 class AnthropicErrorEvent(AnthropicBaseModel):
     type: Literal["error"] = "error"
     error: AnthropicError

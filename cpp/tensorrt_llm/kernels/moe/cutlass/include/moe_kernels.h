@@ -1015,6 +1015,8 @@ private:
     ScaleBiasType* lora_fc1_result_{};
     ScaleBiasType* lora_add_bias_{};
     ScaleBiasType* lora_fc2_result_{};
+    size_t mLoraFc1ResultBytes{};
+    size_t mLoraFc2ResultBytes{};
     void* smoothed_act_{};
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm1_input_;

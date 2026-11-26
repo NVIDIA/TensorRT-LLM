@@ -213,6 +213,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
     allreduce.checkpoint_prepare()
     allreduce.checkpoint_prepare()
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         allreduce.checkpoint_restore()
     allreduce.checkpoint_restore(comm)
     allreduce.checkpoint_restore(redundant_comm)

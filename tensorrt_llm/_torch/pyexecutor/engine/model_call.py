@@ -33,6 +33,8 @@ class ModelCaller:
         aux_streams: The backend's mutable stream container, retained by reference.
         prefill_compile_only: Whether torch.compile covers only eligible prefill
             batches, so each call must scope ``is_torch_compiling()`` to that decision.
+        nccl_window_scopes_enabled: Whether this forward can allocate NCCL window
+            leases through communication with peers.
 
     Encoder stacks and multimodal encoders with different invocation contracts
     call their models directly.
@@ -45,6 +47,7 @@ class ModelCaller:
         compile_backend: Backend | None = None,
         aux_streams: Backend.Streams | None = None,
         prefill_compile_only: bool = False,
+        nccl_window_scopes_enabled: bool = True,
     ) -> None:
         if compile_backend is not None and aux_streams is None:
             raise ValueError("A compile backend requires its auxiliary stream container.")
@@ -52,6 +55,7 @@ class ModelCaller:
         self._compile_backend = compile_backend
         self._aux_streams = aux_streams
         self._prefill_compile_only = prefill_compile_only
+        self._nccl_window_scopes_enabled = nccl_window_scopes_enabled
 
     def __call__(self, **kwargs: Any) -> Any:
         attrs = get_model_extra_attrs()
@@ -75,12 +79,14 @@ class ModelCaller:
             if self._prefill_compile_only
             else contextlib.nullcontext()
         )
-        with compile_scope:
-            # This boundary stays outside torch.compile, so one lease scope covers
-            # eager, compiled, and CUDA-graph model execution.
-            with nccl_window_tensor_scope(kwargs) as scope:
-                if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-                    outputs = trace_func(self._model.forward)(**kwargs)
-                else:
-                    outputs = self._model.forward(**kwargs)
-                return scope.escape(outputs)
+        # This boundary stays outside torch.compile, so one lease scope covers
+        # eager, compiled, and CUDA-graph model execution.
+        window_scope = (
+            nccl_window_tensor_scope(kwargs) if self._nccl_window_scopes_enabled else None
+        )
+        with compile_scope, window_scope if window_scope is not None else contextlib.nullcontext():
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                outputs = trace_func(self._model.forward)(**kwargs)
+            else:
+                outputs = self._model.forward(**kwargs)
+            return window_scope.escape(outputs) if window_scope is not None else outputs

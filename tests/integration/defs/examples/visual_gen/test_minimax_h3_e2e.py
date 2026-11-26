@@ -27,11 +27,11 @@ import diffusers
 import lpips as lpips_package
 import pytest
 import torch
-import torch.nn.functional as F
 from defs.examples.visual_gen.visual_gen_test_utils import (
     _cleanup_cuda,
     _disable_inductor_compile_worker_quiesce,
     _llm_models_root,
+    _multi_resolution_log_stft_distance,
 )
 from diffusers import ModularPipeline
 from PIL import Image
@@ -92,7 +92,7 @@ MINIMAX_H3_QUALITY_HEIGHT = 128
 MINIMAX_H3_QUALITY_WIDTH = 128
 MINIMAX_H3_SMOKE_NUM_FRAMES = 124
 MINIMAX_H3_QUALITY_NUM_FRAMES = 124
-MINIMAX_H3_NUM_INFERENCE_STEPS = 28
+MINIMAX_H3_NUM_INFERENCE_STEPS = 50
 MINIMAX_H3_SEED = 0
 # Keep explicit quality bounds; report measured distances for every run.
 MINIMAX_H3_LPIPS_THRESHOLD = 0.15
@@ -128,39 +128,6 @@ def _minimax_h3_checkpoint_path() -> str:
     if not os.path.isdir(path):
         pytest.fail(f"MiniMax-H3 checkpoint not found: {path}")
     return path
-
-
-def _multi_resolution_log_stft_distance(
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-) -> float:
-    if actual.shape != expected.shape:
-        raise AssertionError(
-            f"Audio shape mismatch: generated {tuple(actual.shape)}, "
-            f"golden {tuple(expected.shape)}."
-        )
-    actual = actual.float().reshape(-1, actual.shape[-1])
-    expected = expected.float().reshape(-1, expected.shape[-1])
-    distances: list[torch.Tensor] = []
-    for n_fft in (512, 1024, 2048):
-        hop_length = n_fft // 4
-        window = torch.hann_window(n_fft)
-        actual_stft = torch.stft(
-            actual,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-            return_complex=True,
-        ).abs()
-        expected_stft = torch.stft(
-            expected,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-            return_complex=True,
-        ).abs()
-        distances.append(F.l1_loss(torch.log1p(actual_stft), torch.log1p(expected_stft)))
-    return float(torch.stack(distances).mean())
 
 
 def _generate_diffusers_reference(
@@ -274,6 +241,9 @@ def test_minimax_h3_released_transformer_loads_and_runs() -> None:
             [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 0, 1], [3, 0, 0]],
             device="cuda",
         )
+        # Clear code cached by earlier tests so this forward records its own
+        # newly compiled frames.
+        torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
         with torch.inference_mode():
             output = transformer(

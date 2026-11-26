@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="1000" height="600" role="img" aria-label="End-to-end Pareto: output tokens per second per GPU against tokens per second per user">
+<defs><marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#4f5d75"/></marker><marker id="ahg" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#3f6600"/></marker></defs>
+<rect width="1000" height="600" fill="#f5f5f5"/>
+<line x1="90.0" y1="496.7" x2="960.0" y2="496.7" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="500.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">10</text>
+<line x1="90.0" y1="424.5" x2="960.0" y2="424.5" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="428.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">20</text>
+<line x1="90.0" y1="329.0" x2="960.0" y2="329.0" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="333.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">50</text>
+<line x1="90.0" y1="256.7" x2="960.0" y2="256.7" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="260.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">100</text>
+<line x1="90.0" y1="184.5" x2="960.0" y2="184.5" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="188.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">200</text>
+<line x1="90.0" y1="89.0" x2="960.0" y2="89.0" stroke="#d6d6d6" stroke-width="1"/>
+<text x="82.0" y="93.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="end">500</text>
+<line x1="90.0" y1="520.0" x2="90.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="90.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">50</text>
+<line x1="240.0" y1="520.0" x2="240.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="240.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">100</text>
+<line x1="390.0" y1="520.0" x2="390.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="390.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">150</text>
+<line x1="540.0" y1="520.0" x2="540.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="540.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">200</text>
+<line x1="690.0" y1="520.0" x2="690.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="690.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">250</text>
+<line x1="840.0" y1="520.0" x2="840.0" y2="525.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="840.0" y="540.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">300</text>
+<line x1="90.0" y1="520.0" x2="960.0" y2="520.0" stroke="#bfc0c0" stroke-width="1"/>
+<line x1="90.0" y1="40.0" x2="90.0" y2="520.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="525.0" y="564.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="middle">Tokens/s per user (1000 / p90 inter-token latency)</text>
+<text transform="translate(26,280) rotate(-90)" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" fill="#4f5d75" text-anchor="middle">Output tokens/s per GPU (log scale)</text>
+<path d="M840.9,487.1 L780.3,435.0 L680.7,348.7 L605.2,282.8 L490.5,232.6 L365.5,192.7 L214.2,122.5 L158.7,102.2" fill="none" stroke="#4f5d75" stroke-width="2" stroke-dasharray="6,4"/>
+<path d="M838.2,474.5 L780.3,418.7 L680.7,335.6 L600.8,276.6 L490.5,225.8 L367.3,185.2 L215.2,110.5 L163.2,83.9" fill="none" stroke="#3f6600" stroke-width="2"/>
+<rect x="835.9" y="482.1" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="838.2" cy="474.5" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="847.2" y="450.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+12.9%</text>
+<text x="847.2" y="464.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">64 → 56 GPUs</text>
+<text x="831.9" y="504.1" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c24</text>
+<rect x="775.3" y="430.0" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="780.3" cy="418.7" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="789.3" y="394.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+16.9%</text>
+<text x="789.3" y="408.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">64 → 56 GPUs</text>
+<text x="771.3" y="452.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c42</text>
+<rect x="675.7" y="343.7" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="680.7" cy="335.6" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="689.7" y="311.6" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+13.4%</text>
+<text x="689.7" y="325.6" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">64 → 56 GPUs</text>
+<text x="671.7" y="365.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c75</text>
+<rect x="600.2" y="277.8" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="600.8" cy="276.6" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="609.8" y="252.6" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+6.1%</text>
+<text x="609.8" y="266.6" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">64 → 60 GPUs</text>
+<text x="596.2" y="299.8" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c174</text>
+<rect x="485.5" y="227.6" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="490.5" cy="225.8" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="499.5" y="201.8" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+6.7%</text>
+<text x="499.5" y="215.8" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">64 → 60 GPUs</text>
+<text x="481.5" y="249.6" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c240</text>
+<rect x="360.5" y="187.7" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="367.3" cy="185.2" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="376.3" y="161.2" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+7.5%</text>
+<text x="376.3" y="175.2" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">56 → 52 GPUs</text>
+<text x="356.5" y="209.7" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c330</text>
+<rect x="209.2" y="117.5" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="215.2" cy="110.5" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="224.2" y="86.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+12.2%</text>
+<text x="224.2" y="100.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">32 → 28 GPUs</text>
+<text x="205.2" y="139.5" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c383</text>
+<rect x="153.7" y="97.2" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<circle cx="163.2" cy="83.9" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="172.2" y="59.9" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13.5" font-weight="700" fill="#3f6600" text-anchor="start">+19.1%</text>
+<text x="172.2" y="73.9" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">40 → 32 GPUs</text>
+<text x="149.7" y="119.2" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="end">c623</text>
+<rect x="678.0" y="42.0" width="282.0" height="62.0" rx="4" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<circle cx="698.0" cy="62.0" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<line x1="686.0" y1="62.0" x2="710.0" y2="62.0" stroke="#3f6600" stroke-width="2"/>
+<circle cx="698.0" cy="62.0" r="6" fill="#76b900" stroke="#3f6600" stroke-width="1.5"/>
+<text x="720.0" y="66.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#2d3142" text-anchor="start">Dense DWDP context tier</text>
+<line x1="686.0" y1="86.0" x2="710.0" y2="86.0" stroke="#4f5d75" stroke-width="2" stroke-dasharray="6,4"/>
+<rect x="693.0" y="81.0" width="10.0" height="10.0" rx="0" fill="#4f5d75" stroke="#ffffff" stroke-width="1.5"/>
+<text x="720.0" y="90.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#2d3142" text-anchor="start">Base context tier (recipe)</text>
+</svg>

@@ -21,8 +21,11 @@
 
 #include <cuda.h>
 
+#include "tensorrt_llm/common/assert.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -173,17 +176,21 @@ private:
     KernelConfig mOnboard{};
 };
 
-namespace detail
-{
-
-//! Copies ephemeral host page indices into device memory while leaving the destination update
-//! asynchronous.
+//! Stages a host array into device memory, reading the source during the call.
 //!
-//! Companion to BatchedPageCopier: it exists only because pageIndexLocation() may require the
-//! index array to live in device memory, so callers on that path must stage it there first. This
-//! moves the array that *describes* the copy, not the pages themselves.
-void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream);
+//! The source is read before this returns, so it need not be pinned, need not outlive the
+//! call, and is left unchanged. The destination update stays asynchronous. That asymmetry is
+//! why callers issue this on a helper stream: on a stream busy replaying the previous step,
+//! the call could not complete until the stream reached it.
+void copyBytesToDeviceSyncSource(CUdeviceptr dst, void const* src, size_t numBytes, CUstream stream);
 
-} // namespace detail
+//! `count` values of `T`, on the terms above.
+template <typename T>
+void copyToDeviceSyncSource(CUdeviceptr dst, T const* src, size_t count, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(
+        count <= std::numeric_limits<size_t>::max() / sizeof(T), "Host-to-device staging array is too large");
+    copyBytesToDeviceSyncSource(dst, src, count * sizeof(T), stream);
+}
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

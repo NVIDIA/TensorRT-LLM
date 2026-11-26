@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
 import shlex
 import warnings
 from subprocess import CalledProcessError
-from typing import NoReturn
+from typing import NoReturn, Optional
 
 from defs.conftest import tests_path
 
@@ -65,6 +66,35 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
     os.remove(extra_file)
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
+
+
+def _junit_all_tests_skipped(xml_path: str) -> bool:
+    """Whether every named testcase in a JUnit report was skipped.
+
+    The inner pytest exits 0 in that case, so ``test_unittests_v2`` would
+    otherwise be recorded as PASSED. A missing, empty, malformed, or mixed
+    report returns False.
+
+    Counts ``skipped`` elements on the testcases. pytest's ``LogXML`` records
+    a non-strict xfail as ``<skipped type="pytest.xfail">`` and includes it in
+    the suite ``skipped`` attribute, but those tests ran. ``PeriodicJUnitXML``
+    always writes the suite counts, so this does not read them.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return False
+    cases = [case for case in root.iter("testcase") if case.get("name")]
+    skipped = 0
+    for case in cases:
+        if case.find("failure") is not None or case.find("error") is not None:
+            return False
+        skipped_node = case.find("skipped")
+        if (skipped_node is not None
+                and skipped_node.get("type") != "pytest.xfail"):
+            skipped += 1
+    return len(cases) > 0 and skipped == len(cases)
 
 
 def _junit_culprits(xml_path: str) -> list[str]:
@@ -115,22 +145,27 @@ def _nodeid_matches_case(nodeid: str, case_selector: str) -> bool:
             or node_selection.startswith(case_selection + "["))
 
 
-def _fail_unittests(reason: str, output_xml: str, output_dir: str,
-                    case: str) -> NoReturn:
+def _fail_unittests(reason: str,
+                    output_xml: str,
+                    output_dir: str,
+                    case: str,
+                    unfinished_test_path: Optional[str] = None) -> NoReturn:
     """Raise a unittest failure naming the specific culprit test(s).
 
     Culprits are failed/errored tests from the JUnit report, plus tests from
     this case that were still in flight when a fatal OOM/timeout killed the run
     (nodeids left by --periodic-save-unfinished-test).
 
-    unfinished_test.txt is shared per node and only cleared on teardown, so it
-    may retain stale entries from other cases; it is filtered to this case's
-    test path(s). Reading it is best-effort and never masks the original
-    failure.
+    unfinished_test_path is where the run recorded its unfinished tests; it
+    defaults to the shared unfinished_test.txt in output_dir. That default is
+    shared per node and only cleared on teardown, so it may retain stale
+    entries from other cases; it is filtered to this case's test path(s).
+    Reading it is best-effort and never masks the original failure.
     """
     junit_culprits = _junit_culprits(output_xml)
     in_flight_culprits = []
-    unfinished = os.path.join(output_dir, "unfinished_test.txt")
+    unfinished = unfinished_test_path or os.path.join(output_dir,
+                                                      "unfinished_test.txt")
     case_selectors = []
     for arg in shlex.split(case):
         selector = arg.rstrip("/")
@@ -160,6 +195,24 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
             displayed_culprits += f" (+{omitted_culprits} more)"
         reason += "; culprit test(s): " + displayed_culprits
     raise AssertionError(reason)
+
+
+def _parallel_config_key(case: str) -> str:
+    """The agg_unit_mem_df.csv lookup key for a unittest case.
+
+    ``--ignore=<path>`` arguments only drop tests from a case, so they do not
+    change its parallel factor. Stripping them keeps a CSV row matching when a
+    test list adds or removes ignored paths. Other arguments, such as quoted
+    ``-k`` expressions, are kept as they are.
+    """
+    return re.sub(r'\s+--ignore=\S+', '', case).strip()
+
+
+def _unittest_case_filename(case: str) -> str:
+    """Keep artifacts readable and distinguish full entries with a shared prefix."""
+    prefix = re.sub(r'[/\s"\']+', '-', case)[:63]
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
@@ -204,12 +257,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     parallel_dict = {}
     for _, row in agg_unit_mem_df.iterrows():
-        key = (row['gpu'], row['unittest_case_name'])
+        key = (row['gpu'], _parallel_config_key(row['unittest_case_name']))
         parallel_dict[key] = row['parallel_factor']
 
     print(parallel_dict)
 
-    cur_key = (gpu_name, case)
+    cur_key = (gpu_name, _parallel_config_key(case))
     print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]
@@ -238,18 +291,23 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 f"({case_markexpr}) and ({unittest_markexpr})")
         else:
             arg_list += ["-m", unittest_markexpr]
-    case_fn = re.sub(r'[/\s"\']+', '-', case)
-    if len(case_fn) > 80:
-        case_fn = case_fn[:80]
+    case_fn = _unittest_case_filename(case)
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
-    # with "results" for JUnit reporting).
+    # with "results" for JUnit reporting). Their unfinished tests go to a
+    # separate file too, so the stage does not report them as terminated
+    # unexpectedly from the shared unfinished_test.txt. Otherwise, MoE sub-test
+    # history can contain only terminated unexpectedly errors without corresponding
+    # passing results, skewing the test quality metrics.
     case_path = case.rstrip("/")
+    unfinished_test_path = None
     if case_path == "unittest/_torch/moe" or case_path.startswith(
             "unittest/_torch/moe/"):
         output_xml = os.path.join(output_dir,
                                   f'moe-results-sub-unittests-{case_fn}.xml')
+        unfinished_test_path = os.path.join(
+            output_dir, f'moe-unfinished-sub-unittests-{case_fn}.txt')
     else:
         output_xml = os.path.join(output_dir,
                                   f'results-sub-unittests-{case_fn}.xml')
@@ -268,6 +326,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-save-unfinished-test",
         "--periodic-hang-traceback",
     ]
+    if unfinished_test_path:
+        command += [f"--periodic-unfinished-test-path={unfinished_test_path}"]
+
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
 
@@ -411,7 +472,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         if not os.path.exists(parallel_output_xml):
             _fail_unittests(
                 "no report generated, fatal failure in unittests (parallel phase)",
-                parallel_output_xml, output_dir, case)
+                parallel_output_xml, output_dir, case, unfinished_test_path)
 
         if dry_run or passed:
             os.rename(parallel_output_xml, output_xml)
@@ -434,11 +495,14 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 os.rename(parallel_output_xml, output_xml)
                 _fail_unittests(
                     "no report generated, fatal failure in unittests (retry phase)",
-                    output_xml, output_dir, case)
+                    output_xml, output_dir, case, unfinished_test_path)
 
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
-                        case)
+                        case, unfinished_test_path)
+    if _junit_all_tests_skipped(output_xml):
+        import pytest
+        pytest.skip(f"{case}: all unittests skipped")
 
 
 def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):

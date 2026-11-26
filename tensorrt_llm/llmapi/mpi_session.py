@@ -36,8 +36,13 @@ T = TypeVar("T")
 
 # Environment that MpiPoolSession forwards from the parent to its workers.
 _FORWARDED_ENV_PREFIXES = ("TRTLLM", "TLLM")
-_FORWARDED_ENV_NAMES = (*_UNIFIED_CACHE_ENV_VARS, "FLASHINFER_CUBIN_DIR",
-                        "MASTER_ADDR", "MASTER_PORT")
+_FORWARDED_ENV_NAMES = (
+    *_UNIFIED_CACHE_ENV_VARS,
+    "FLASHINFER_CUBIN_DIR",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    # MPI may use an environment snapshot from MPI_Init.
+    "CUDA_SCALE_LAUNCH_QUEUES")
 
 
 def _is_forwarded_env(name: str) -> bool:
@@ -657,6 +662,18 @@ class MpiPoolSession(MpiSession):
                     return
                 time.sleep(0.05)
 
+    def check_worker_error(self) -> Optional[BaseException]:
+        """Detect a dead pool manager thread, e.g. after a failed spawn.
+
+        mpi4py leaves the futures pending forever in that case.
+        """
+        pool = self.mpi_pool
+        thread = getattr(getattr(pool, '_pool', None), 'thread', None)
+        if thread is None or thread.is_alive() or pool._shutdown:
+            return None
+        return RuntimeError(
+            "MPI pool manager thread died (worker spawn failed?)")
+
     def release_exit_joins(self):
         if self.mpi_pool is not None:
             _abandon_mpi_pool_threads(self.mpi_pool)
@@ -682,9 +699,10 @@ class MpiPoolSession(MpiSession):
                                           "flashinfer")
             workspace_managed |= env.get(
                 _FLASHINFER_WORKSPACE_ENV) == workspace_root
+        # Every pool is isolated, a single-worker one included, so concurrent
+        # instances on one node never share a FlashInfer workspace.
         isolate_workspace = (
-            (self.n_workers > 1 or workspace_managed)
-            and env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
+            env.get("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1") != "0"
             and (_FLASHINFER_WORKSPACE_ENV not in env or
                  (workspace_managed and not explicit_workspace_override)))
         python_args = ["-c", _WORKER_ENV_BOOTSTRAP + _WORKER_SERVER_MAIN]
@@ -953,8 +971,13 @@ class RemoteMpiCommSessionClient(MpiSession):
         logger_debug(
             f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] sending task {task} to {self.addr}\n",
             "yellow")
+        # Resolve relative entries (including "" for the cwd) against this
+        # client's working directory; the ranks only adopt absolute entries.
+        client_sys_path = tuple(
+            path if os.path.isabs(path) else os.path.abspath(path)
+            for path in sys.path)
         self.queue.put(
-            RemoteTask(task, args, kwargs, sync=sync, sys_path=tuple(sys.path)))
+            RemoteTask(task, args, kwargs, sync=sync, sys_path=client_sys_path))
         return []
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:

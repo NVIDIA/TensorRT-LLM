@@ -8,7 +8,7 @@ from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 import torch
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, BatchEncoding, PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
@@ -22,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_glm5_next import (
     Glm5NextDecoderLayer,
     Glm5NextForCausalLM,
     Glm5NextLinearAttention,
+    Glm5NextMoE,
     Glm5NextMTP,
     Glm5NextRuntimeContext,
     Glm5NextSparseAttention,
@@ -36,6 +37,144 @@ from tensorrt_llm._torch.pyexecutor.config_utils import get_glm5_next_layer_mask
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_cuda_graphs
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 10,
+    reason="requires Blackwell sparse MLA",
+)
+@torch.no_grad()
+def test_registered_vlm_text_forward():
+    from tensorrt_llm._torch.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+    text_fields = _config().text_config.to_dict()
+    text_fields.update(
+        vocab_size=32,
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
+        tie_word_embeddings=False,
+        num_hidden_layers=1,
+        layer_types=["deepseek_sparse_attention"],
+        mlp_layer_types=["dense"],
+        first_k_dense_replace=1,
+        intermediate_size=512,
+        max_position_embeddings=32,
+    )
+    config = Glm5NextConfig(
+        text_config=Glm5NextTextConfig(**text_fields),
+        vision_config=_config().vision_config,
+        architectures=["Glm5NextForConditionalGeneration"],
+        image_token_id=26,
+        video_token_id=27,
+        image_start_token_id=28,
+        image_end_token_id=29,
+        video_start_token_id=30,
+        video_end_token_id=31,
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
+    )
+    Glm5NextForConditionalGeneration = get_registered_model_class(
+        "Glm5NextForConditionalGeneration"
+    )
+    assert Glm5NextForConditionalGeneration is Glm5NextVLM
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(17)
+        model = Glm5NextForConditionalGeneration(
+            ModelConfig(
+                pretrained_config=config,
+                attn_backend="TRTLLM",
+                max_num_tokens=13,
+                disable_mm_encoder=True,
+            )
+        )
+        model.cuda().eval()
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1)
+            else:
+                parameter.normal_(0, 0.05)
+
+    assert isinstance(model.llm, Glm5NextForCausalLM)
+    assert len(model.llm.model.layers) == 1
+    layer = model.llm.model.layers[0].self_attn
+    assert isinstance(layer, Glm5NextSparseAttention)
+    input_ids = torch.arange(1, 14, device="cuda", dtype=torch.long)
+    position_ids = torch.arange(13, device="cuda", dtype=torch.long)
+    embeddings = model.text_embedding_layer(input_ids)
+
+    def make_metadata():
+        # Supply storage only; the real sparse backend populates both pools.
+        latent = torch.zeros(4, 8, 1, layer.kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+        index = torch.zeros(
+            4, 8, 1, layer.indexer.cache_state_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        def get_latent_state_buffer(layer_idx):
+            assert layer_idx == 0
+            return latent
+
+        def get_index_state_buffer(layer_idx):
+            assert layer_idx == 0
+            return index
+
+        tables = torch.zeros(1, 256, device="cuda", dtype=torch.long)
+        tables[0, :2] = torch.tensor([2, 0], device="cuda")
+        prepared = object.__new__(Glm5NextMamba2Metadata)
+        prepared.glm_block_tables = tables
+        prepared.glm_ctx_cu_seqlens = [0, 13]
+        prepared.glm_cached_lens_host = [0]
+        return SimpleNamespace(
+            kv_cache_manager=SimpleNamespace(
+                tokens_per_block=8,
+                get_latent_state_buffer=get_latent_state_buffer,
+                get_index_state_buffer=get_index_state_buffer,
+            ),
+            seq_lens=torch.tensor([13], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([13], device="cuda", dtype=torch.int32),
+            num_contexts=1,
+            num_ctx_tokens=13,
+            num_generations=0,
+            num_tokens=13,
+            padded_num_tokens=None,
+            all_rank_num_tokens=None,
+            kv_lens_cuda=torch.tensor([13], device="cuda", dtype=torch.int32),
+            mamba_metadata=prepared,
+        )
+
+    logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    embedded_logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=input_ids + 13,
+        position_ids=position_ids,
+        inputs_embeds=embeddings,
+        return_context_logits=True,
+    )
+    changed_ids = input_ids.clone()
+    changed_ids[:-1] += 13
+    changed_logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=changed_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+
+    for output in (logits, embedded_logits, changed_logits):
+        assert output.shape == (13, 32)
+        assert output.dtype == torch.float32
+        assert torch.isfinite(output).all()
+    torch.testing.assert_close(embedded_logits, logits, rtol=0.02, atol=1e-3)
+    assert not torch.allclose(changed_logits[-1], logits[-1], rtol=0.02, atol=1e-3)
+
+    bypass_logits = model.llm.lm_head(model.llm.model.norm(embeddings)).float()
+    assert not torch.allclose(logits, bypass_logits, rtol=0.02, atol=1e-3)
 
 
 @pytest.mark.cpu_only
@@ -113,7 +252,8 @@ def test_text_processing_without_native_processor(monkeypatch):
     from tensorrt_llm.llmapi import SamplingParams
 
     monkeypatch.delitem(PROCESSOR_MAPPING_NAMES, "glm5_next", raising=False)
-    tokenizer = Mock(return_value=SimpleNamespace(input_ids=torch.tensor([[1, 2, 3]])))
+    # A tokenizer called on one string without return_tensors returns a flat list.
+    tokenizer = Mock(return_value=SimpleNamespace(input_ids=[1, 2, 3]))
     with patch(
         "tensorrt_llm._torch.models.modeling_glm5_next_vision.AutoProcessor.from_pretrained"
     ) as load_processor:
@@ -121,9 +261,62 @@ def test_text_processing_without_native_processor(monkeypatch):
         tokens, extra = processor.call_with_text_prompt({"prompt": "hello"}, SamplingParams())
         assert tokens == [1, 2, 3]
         assert extra is None
+        assert "return_tensors" not in tokenizer.call_args.kwargs
         load_processor.assert_not_called()
         with pytest.raises(RuntimeError, match="transformers==5.17.0"):
             processor.get_mm_max_tokens_per_item()
+
+
+class _MergeTokenizer:
+    """A fast tokenizer stand-in: characters with two-character merges, so a prompt's tail
+    tokenizes differently from the same characters inside the whole prompt, as with BPE."""
+
+    is_fast = True
+    MERGES = frozenset({"ab", "cd", "th", "he", "in", "er"})
+
+    def __init__(self, special_tokens: int = 0):
+        self.special_tokens = special_tokens
+
+    def num_special_tokens_to_add(self) -> int:
+        return self.special_tokens
+
+    def __call__(self, text, **kwargs):
+        ids, offsets, i = [], [], 0
+        while i < len(text):
+            width = 2 if text[i : i + 2] in self.MERGES else 1
+            ids.append(sum(ord(c) << (8 * k) for k, c in enumerate(text[i : i + width])))
+            offsets.append((i, i + width))
+            i += width
+        return BatchEncoding({"input_ids": ids, "offset_mapping": offsets})
+
+
+@pytest.mark.cpu_only
+def test_text_processing_prefix_token_cache():
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.llmapi import SamplingParams
+
+    tokenizer = _MergeTokenizer()
+    cached = Glm5NextInputProcessor(
+        "unused", _config(), tokenizer=tokenizer, enable_tokenization_cache=True
+    )
+    plain = Glm5NextInputProcessor("unused", _config(), tokenizer=tokenizer)
+    chat = SamplingParams(add_special_tokens=False)  # the chat endpoint's default
+    prompt = "the cache in their header " * 400
+    for turn in range(4):
+        prompt += f"turn {turn}: abcd other " * 50
+        assert cached.call_with_text_prompt({"prompt": prompt}, chat) == (
+            plain.call_with_text_prompt({"prompt": prompt}, chat)
+        )
+    cache = cached._prefix_token_cache
+    assert (cache.hits, cache.misses) == (3, 1)
+    # special tokens requested (the completions endpoint's default): the whole prompt is tokenized
+    cached.call_with_text_prompt({"prompt": prompt + "abcd"}, SamplingParams())
+    assert (cache.hits, cache.misses) == (3, 1)
+    # a tokenizer that adds special tokens would give the cache other ids than the full tokenization
+    adds_bos = Glm5NextInputProcessor(
+        "unused", _config(), tokenizer=_MergeTokenizer(1), enable_tokenization_cache=True
+    )
+    assert adds_bos._prefix_token_cache is None
 
 
 @pytest.mark.cpu_only
@@ -373,6 +566,24 @@ def test_allreduce_defaults_honor_user_strategy(override):
         assert create.call_args_list[1].kwargs["strategy"] == AllReduceStrategy.NCCL
         reduction.small.assert_called_once()
         reduction.large.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+)
+@pytest.mark.parametrize("sm_100f, expected", [(True, "TRTLLM"), (False, "CUTLASS")])
+def test_moe_auto_backend_prefers_trtllm_gen_on_blackwell(
+    monkeypatch, architecture, sm_100f, expected
+):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.is_sm_100f", lambda: sm_100f)
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture) == expected
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture, quant_config=nvfp4) == expected
+    assert ModelConfig.resolve_moe_backend("CUTLASS", architecture, quant_config=nvfp4) == "CUTLASS"
 
 
 @pytest.mark.cpu_only
@@ -1189,6 +1400,7 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
                 create_autospec(implementation, side_effect=attend),
             )
         attention.forward = MethodType(Glm5NextSparseAttention.forward, attention)
+        attention._forward_phases = MethodType(Glm5NextSparseAttention._forward_phases, attention)
         connection = SimpleNamespace(
             pre_mapping=lambda streams: (None, None, streams.mean(dim=1)),
             post_mapping=lambda output, residual, post, comb: residual + output.unsqueeze(1),
@@ -1277,6 +1489,7 @@ def test_packed_attention_splits_phases_and_reduces_once(generation_phase, reduc
         forward_verify=Mock(return_value=gen),
         tp_all_reduce=reduction,
     )
+    attention._forward_phases = MethodType(Glm5NextSparseAttention._forward_phases, attention)
     metadata = SimpleNamespace()
     context = Glm5NextRuntimeContext(
         num_contexts=1,
@@ -1323,3 +1536,218 @@ def test_indexer_topk_without_cute_dsl(monkeypatch: pytest.MonkeyPatch) -> None:
         expected = torch.arange(max(0, count - indexer.select_k), count, dtype=torch.int32)
         assert torch.equal(valid, expected)
         assert int((selected[row] == -1).sum()) == indexer.select_k - min(count, indexer.select_k)
+
+
+@pytest.mark.cpu_only
+def test_breakable_graph_registry_keys_are_unique():
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+
+    model_config = SimpleNamespace(extra_attrs={})
+    first, second = torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)
+    keys = [
+        glm._register_graph_layer(model_config, "glm5_sparse_layers", 3, module)
+        for module in (first, second)
+    ]
+    layers = model_config.extra_attrs["glm5_sparse_layers"]
+    assert keys == ["3", "3_0"]
+    assert layers["3"]() is first and layers["3_0"]() is second
+
+
+@pytest.mark.cpu_only
+def test_sparse_attention_graph_op_fills_live_rows_and_zeros_padding(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    class _Layer:
+        def _forward_phases(self, hidden_states, ctx):
+            assert ctx == "ctx" and hidden_states.shape[0] == 3
+            return hidden_states * 2
+
+    layer = _Layer()
+    metadata = SimpleNamespace(num_tokens=3)
+    monkeypatch.setattr(glm, "build_glm5_next_runtime_context", lambda m: "ctx")
+    hidden = torch.arange(20, dtype=torch.float32).view(5, 4)
+    output = torch.full((5, 4), float("nan"))
+    attrs = {
+        "attention_metadata": lambda: metadata,
+        "glm5_sparse_layers": {"7": lambda: layer},
+    }
+    with model_extra_attrs(attrs):
+        glm.glm5_sparse_attention_inplace(hidden, "7", output)
+    torch.testing.assert_close(output[:3], hidden[:3] * 2)
+    assert torch.equal(output[3:], torch.zeros(2, 4))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [True, False], ids=["attention-dp", "tp"])
+@pytest.mark.parametrize("live_rows", [3, 0, 16], ids=["trimmed", "no-live-rows", "untrimmed"])
+def test_moe_dispatches_the_row_count_announced_to_attention_dp_peers(attention_dp, live_rows):
+    # An eager pass over a prefill-graph-padded batch runs only its live rows,
+    # while every attention-DP peer sizes the MoE dispatch from the padded
+    # count in all_rank_num_tokens. Rank 1 announced 16 rows.
+    all_rank_num_tokens = [32, 16, 32, 32]
+    hidden = torch.randn(live_rows, 8)
+    experts = Mock(side_effect=lambda flat, logits, all_rank_num_tokens: 2 * flat)
+    moe = SimpleNamespace(
+        hidden_size=8,
+        use_dp=attention_dp,
+        mapping=Mapping(world_size=4, tp_size=4, rank=1, enable_attention_dp=attention_dp),
+        gate=lambda flat: flat,
+        experts=experts,
+        shared_experts=lambda flat: flat,
+        shared_expert_start=None,
+        shared_expert_done=None,
+        shared_expert_stream=None,
+        moe_all_reduce=None,
+    )
+    out = Glm5NextMoE.forward(moe, hidden, all_rank_num_tokens)
+    dispatched = experts.call_args.args[0]
+    if attention_dp:
+        assert dispatched.shape == (16, 8)
+        assert experts.call_args.kwargs["all_rank_num_tokens"] is all_rank_num_tokens
+        assert not dispatched[live_rows:].any()
+    else:
+        assert dispatched.shape == (live_rows, 8)
+        assert experts.call_args.kwargs["all_rank_num_tokens"] is None
+    torch.testing.assert_close(dispatched[:live_rows], hidden)
+    torch.testing.assert_close(out, 3 * hidden)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kda_layers_resolve_through_the_shared_breakable_graph_registry(monkeypatch):
+    """GLM KDA layers register with the shared mixer's ``kda_layers`` registry,
+    and inside a breakable graph the mixer's eager core op finds them there."""
+    from tensorrt_llm._torch.attention.backends import AttentionMetadata
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    config = _config().text_config
+    model_config = SimpleNamespace(extra_attrs={})
+    with patch("tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer.AllReduce"):
+        # The second layer 0 stands for a draft layer reusing a target index.
+        layers = [
+            Glm5NextLinearAttention(config, idx, model_config=model_config) for idx in (0, 0, 1)
+        ]
+        unregistered = Glm5NextLinearAttention(config, 0)
+    registry = model_config.extra_attrs["kda_layers"]
+    assert [layer.layer_idx_str for layer in layers] == ["0", "0_0", "1"]
+    assert all(layer.register_to_config for layer in layers)
+    assert not unregistered.register_to_config
+    assert {key: ref() for key, ref in registry.items()} == {
+        layer.layer_idx_str: layer for layer in layers
+    }
+
+    metadata = Mock(spec=AttentionMetadata)
+    calls = []
+
+    def forward_impl(layer):
+        def run(hidden_states, attn_metadata, output=None, prequantized_input=None):
+            calls.append((layer, attn_metadata, output))
+            output.fill_(1)
+            return output
+
+        return run
+
+    for layer in layers:
+        monkeypatch.setattr(layer, "_forward_impl", forward_impl(layer))
+        monkeypatch.setattr(layer, "_project_output", lambda core: core)
+    hidden = torch.zeros(3, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+    attrs = {"attention_metadata": lambda: metadata, "kda_layers": registry}
+    with model_extra_attrs(attrs), enable_breakable_cuda_graph():
+        for layer in layers:
+            assert kimi_kda_mixer._extract_kda_extra_attrs(layer.layer_idx_str) == (
+                metadata,
+                layer,
+            )
+            # The forward's metadata argument is unused: the op reads the live one.
+            core = layer(hidden, None)
+            assert core.shape == (3, layer.num_heads, layer.head_dim)
+            assert torch.equal(core, torch.ones_like(core))
+    assert [(layer, meta) for layer, meta, _ in calls] == [(layer, metadata) for layer in layers]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sparse_attention_breakable_graph_replays_live_rows_of_padded_batches(monkeypatch):
+    """Capture the sparse-attention break in a padded bucket, then replay it for
+    other live row counts: the layer sees only the live rows of the current
+    metadata, its result reaches the next graph segment, and padding is zero."""
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+        enable_breakable_cuda_graph,
+    )
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    bucket, hidden_size = 16, 32
+    torch.manual_seed(0)
+    weight = torch.randn(hidden_size, hidden_size, device="cuda")
+
+    class _SparseLayer(torch.nn.Module):
+        """Glm5NextSparseAttention.forward over a stand-in for the phase split."""
+
+        forward = Glm5NextSparseAttention.forward
+
+        def __init__(self):
+            super().__init__()
+            self.hidden_size = hidden_size
+            self.tp_all_reduce = None
+            self.rows_seen = []
+
+        def _forward_phases(self, hidden_states, ctx):
+            assert hidden_states.shape[0] == ctx.num_tokens
+            self.rows_seen.append(hidden_states.clone())
+            # A metadata-dependent term: replays must read the current metadata.
+            return hidden_states @ weight + ctx.offset
+
+    model_config = SimpleNamespace(extra_attrs={})
+    layer = _SparseLayer()
+    layer._graph_key = glm._register_graph_layer(model_config, "glm5_sparse_layers", 5, layer)
+    monkeypatch.setattr(glm, "build_glm5_next_runtime_context", lambda metadata: metadata)
+    current = {}
+    attrs = {
+        "attention_metadata": lambda: current["metadata"],
+        "glm5_sparse_layers": model_config.extra_attrs["glm5_sparse_layers"],
+    }
+    graph_input = torch.zeros(bucket, hidden_size, device="cuda")
+    graph_output = torch.zeros(bucket, hidden_size, device="cuda")
+
+    def body():
+        # Graph segment, eager break (the layer), graph segment.
+        attention_input = graph_input * 2
+        graph_output.copy_(layer(attention_input, None) + 1)
+
+    def set_batch(num_tokens, seed):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        graph_input.copy_(torch.randn(graph_input.shape, generator=gen, device="cuda"))
+        graph_input[num_tokens:] = float("nan")  # padding rows hold garbage
+        current["metadata"] = SimpleNamespace(num_tokens=num_tokens, offset=float(seed))
+
+    graph = BreakableCUDAGraph()
+    stream = torch.cuda.Stream()
+    with model_extra_attrs(attrs):
+        set_batch(10, seed=1)
+        stream.wait_stream(torch.cuda.current_stream())
+        with enable_breakable_cuda_graph(), BreakableCUDAGraphCapture(graph, stream=stream):
+            body()
+        torch.cuda.synchronize()
+        assert graph.num_breaks == 1
+
+        for num_tokens, seed in ((7, 2), (13, 3), (bucket, 4)):
+            set_batch(num_tokens, seed)
+            live = graph_input[:num_tokens] * 2
+            expected = live @ weight + float(seed) + 1
+            graph_output.fill_(float("nan"))
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream), enable_breakable_cuda_graph():
+                graph.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            assert torch.equal(layer.rows_seen[-1], live)
+            torch.testing.assert_close(graph_output[:num_tokens], expected)
+            # Zeroed attention output plus the next segment's + 1.
+            assert torch.equal(
+                graph_output[num_tokens:], torch.ones_like(graph_output[num_tokens:])
+            )
+    assert [rows.shape[0] for rows in layer.rows_seen] == [10, 7, 13, bucket]

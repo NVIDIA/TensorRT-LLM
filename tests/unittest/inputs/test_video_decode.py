@@ -9,7 +9,7 @@ import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -24,7 +24,12 @@ from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
 from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
 from tensorrt_llm.inputs.multimodal_data import VideoData  # noqa: E402
-from tensorrt_llm.inputs.utils import async_load_video, load_base64_video, load_video  # noqa: E402
+from tensorrt_llm.inputs.utils import (  # noqa: E402
+    async_load_video,
+    default_multimodal_input_loader,
+    load_base64_video,
+    load_video,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -47,6 +52,25 @@ def test_np_format_returns_stacked_uint8_ndarray(sample_video_path: str) -> None
     assert video.frames.shape == (10, 64, 64, 3)
     assert video.frames.dtype == np.uint8
     assert video.frames.flags["C_CONTIGUOUS"]
+
+
+def test_offline_video_default_and_explicit_tensor(sample_video_path: str) -> None:
+    kwargs = dict(
+        tokenizer=None,
+        model_dir="",
+        model_type="llava_llama",
+        modality="video",
+        prompts=["Describe the video."],
+        media=[sample_video_path],
+        num_frames=2,
+    )
+    default = default_multimodal_input_loader(**kwargs)[0]["multi_modal_data"]["video"][0]
+    explicit = default_multimodal_input_loader(**kwargs, image_data_format="pt")[0][
+        "multi_modal_data"
+    ]["video"][0]
+    assert isinstance(default.frames, np.ndarray) and default.frames.shape == (2, 64, 64, 3)
+    assert default.frames.dtype == np.uint8
+    assert isinstance(explicit.frames[0], torch.Tensor) and explicit.frames[0].shape == (3, 64, 64)
 
 
 def test_pt_format_returns_list_of_chw_tensors(sample_video_path: str) -> None:
@@ -76,6 +100,119 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+@pytest.mark.parametrize(("format", "peak_bytes_per_value"), [("np", 2), ("pil", 2), ("pt", 9)])
+def test_decode_limit_is_checked_before_frame_stack_allocation(
+    sample_video_path: str, format: str, peak_bytes_per_value: int
+) -> None:
+    peak_bytes = 10 * 64 * 64 * 3 * peak_bytes_per_value
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty") as allocate:
+        with pytest.raises(ValueError, match=f"require {peak_bytes} bytes"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format=format,
+                max_decoded_frame_bytes=peak_bytes - 1,
+            )
+
+    allocate.assert_not_called()
+
+
+def test_pt_decode_reserves_peak_then_commits_retained_bytes(sample_video_path: str) -> None:
+    class _Reservation:
+        committed = None
+        released = False
+
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            self.committed = retained_bytes
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+    reserved = []
+
+    def reserve(peak_bytes: int, retained_bytes: int) -> _Reservation:
+        reserved.append((peak_bytes, retained_bytes))
+        return reservation
+
+    _load_video_by_cv2(
+        sample_video_path,
+        num_frames=10,
+        fps=-1,
+        format="pt",
+        decoded_memory_reserver=reserve,
+    )
+
+    assert reserved == [(10 * 64 * 64 * 3 * 9, 10 * 64 * 64 * 3 * 4)]
+    assert reservation.committed == 10 * 64 * 64 * 3 * 4
+    assert reservation.released is False
+
+
+def test_decode_releases_reservation_after_allocation_failure(sample_video_path: str) -> None:
+    class _Reservation:
+        released = False
+
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            raise AssertionError("failed decode must not commit")
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty", side_effect=MemoryError("allocation")):
+        with pytest.raises(MemoryError, match="allocation"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format="np",
+                decoded_memory_reserver=lambda _peak_bytes, _retained_bytes: reservation,
+            )
+
+    assert reservation.released is True
+
+
+def test_truncated_numpy_video_owns_only_the_counted_frames(sample_video_path: str) -> None:
+    capture = cv2.VideoCapture(sample_video_path)
+    get = capture.get
+    committed = []
+
+    class _Reservation:
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            committed.append(retained_bytes)
+
+        def release(self) -> None:
+            pass
+
+    # Container metadata overstates the number of frames that actually decode.
+    truncated = Mock(wraps=capture)
+    truncated.get.side_effect = lambda key: 50 if key == cv2.CAP_PROP_FRAME_COUNT else get(key)
+    with patch.object(cv2, "VideoCapture", return_value=truncated):
+        video = _load_video_by_cv2(
+            sample_video_path,
+            num_frames=10,
+            fps=-1,
+            format="np",
+            decoded_memory_reserver=lambda _peak, _retained: _Reservation(),
+        )
+
+    assert 0 < len(video.frames) < 10
+    assert video.frames.base is None
+    assert committed == [video.frames.nbytes]
 
 
 @pytest.mark.parametrize("input_kind", ["path", "file_uri", "data_uri"])
@@ -112,6 +249,12 @@ def test_offline_loaders_match_serve_video_hash(
     offline = load_video(source, num_frames=10)
     offline_async = asyncio.run(async_load_video(source, num_frames=10))
 
+    for video in (serve, offline, offline_async):
+        assert isinstance(video.frames, np.ndarray)
+        assert video.frames.dtype == np.uint8
+        assert video.frames.shape == (10, 64, 64, 3)
+        np.testing.assert_array_equal(video.frames, serve.frames)
+        assert video.metadata == serve.metadata
     assert serve.raw_bytes_hash == default_hasher(encoded).hexdigest()
     assert offline.raw_bytes_hash == serve.raw_bytes_hash
     assert offline_async.raw_bytes_hash == serve.raw_bytes_hash

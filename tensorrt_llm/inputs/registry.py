@@ -19,9 +19,11 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Mapping,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -30,8 +32,12 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
+from .._errors import ConfigInputError, UnsupportedError
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from . import multimodal
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
@@ -42,13 +48,18 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         get_multimodal_item_metadata, hexdigest_to_int32,
+                         attached_embedding_hasher, default_hasher,
+                         find_mm_token_lengths, get_multimodal_item_metadata,
+                         hexdigest_to_int32, split_multimodal_embedding_items,
                          validate_mm_inputs)
 # yapf: enable
-from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .multimodal_data import MEDIA_MODALITIES, _to_host, serialize_item
+from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
+                                 create_prefix_token_cache)
 from .tokenization import tokenize_prompt
+
+if TYPE_CHECKING:
+    from ..llmapi.llm_args import PromptTokenCacheConfig
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -100,6 +111,14 @@ class InputProcessor(Protocol):
         - Register the inherited class to the model class using @register_input_processor(...)
     """
 
+    supports_token_ids_input: bool = True
+    """Whether pre-tokenized prompts are accepted; encoder-driven processors may opt out."""
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Media accepted by this processor instance; text-only by default."""
+        return frozenset()
+
     model_path: any
     config: any
     tokenizer: any
@@ -127,6 +146,13 @@ class DefaultInputProcessor(InputProcessor):
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
 
+    def get_prefix_token_cache(
+            self) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+        """This processor's prefix-tokenization cache and the tokenizer it caches, if enabled."""
+        if self._prefix_token_cache is None:
+            return None
+        return self._prefix_token_cache, self.tokenizer
+
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -138,6 +164,18 @@ class DefaultInputProcessor(InputProcessor):
             truncate_prompt_tokens=sampling_params.truncate_prompt_tokens,
             prefix_token_cache=self._prefix_token_cache)
         return token_ids, None
+
+
+def prefix_token_cache_of(
+    input_processor: object
+) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+    """The prefix-tokenization cache of ``input_processor`` and its tokenizer.
+
+    None when the processor has no cache: it is disabled, or the processor
+    does not support one.
+    """
+    get_cache = getattr(input_processor, "get_prefix_token_cache", None)
+    return None if get_cache is None else get_cache()
 
 
 class BaseMultimodalInputProcessor(ABC):
@@ -155,6 +193,15 @@ class BaseMultimodalInputProcessor(ABC):
     If the flag is False, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Registered modalities, narrowed by checkpoint-specific overrides."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return frozenset()
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(
+            resolve_top_level_model_type(config))
 
     # Whether multimodal soft-token runs need bidirectional attention spanning
     # the full block. When True, the chunked-prefill scheduler must keep each
@@ -174,6 +221,69 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    # Whether the subclass takes `prompt_token_cache_config` in `__init__`.
+    supports_prompt_token_cache: ClassVar[bool] = False
+
+    # Whether the processor never needs a GPU, so attached serving frontends
+    # (num_serve_frontends > 1) start with no visible GPU.
+    runs_without_gpu: ClassVar[bool] = False
+
+    # Set by `_init_tokenization_cache`; None (no cache) for a processor that
+    # never calls it.
+    _prefix_token_cache: Optional[PrefixTokenCache] = None
+    _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
+
+    _decode_state_capture: ClassVar[ContextVar] = ContextVar(
+        "multimodal_decode_state_capture", default=None)
+
+    @contextmanager
+    def capture_decode_state(self) -> Iterator[Dict[str, Any]]:
+        """Collect portable decode metadata before tensor transport exports."""
+        capture = {}
+        token = self._decode_state_capture.set((self, capture))
+        try:
+            yield capture
+        finally:
+            self._decode_state_capture.reset(token)
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return portable model metadata, or None when preparation cannot be reused."""
+        return None
+
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        """Restore metadata, validating positions through max_length tokens if set."""
+        raise ValueError(
+            "This processor does not support prepared decode inputs")
+
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return sampling defaults, below server and per-request overrides."""
+        return {}
+
+    def get_disagg_prefill_inputs(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_params: multimodal.MultimodalParams,
+    ) -> Optional[multimodal.MultimodalInputLayout]:
+        """Export exact encoder-side prompt layout for models that preserve it.
+
+        Returning None keeps the model's existing prefill reconstruction path.
+        Models that return a layout accept it as ``encoder_inputs`` in their
+        ``build_disagg_prefill_multimodal_inputs`` method.
+
+        Args:
+            prompt_token_ids: Fully expanded prompt produced by preprocessing.
+            multimodal_params: Processed media and layout metadata for the prompt.
+
+        Returns:
+            Encoder layout to carry to prefill, or None to use reconstruction.
+        """
+        return None
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
@@ -192,6 +302,7 @@ class BaseMultimodalInputProcessor(ABC):
                  config,
                  tokenizer,
                  trust_remote_code: bool = True,
+                 vision_gpu_normalize: bool = False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._config = config
@@ -199,6 +310,7 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
+        self._vision_gpu_normalize = vision_gpu_normalize
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
@@ -212,11 +324,26 @@ class BaseMultimodalInputProcessor(ABC):
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
 
+    def get_prefix_token_cache(
+            self) -> Optional[Tuple[PrefixTokenCache, OffsetTokenizer]]:
+        """This processor's prefix-tokenization cache and the tokenizer it caches, if enabled."""
+        if self._prefix_token_cache is None:
+            return None
+        return self._prefix_token_cache, self._prefix_token_cache_tokenizer
+
     def _encode_with_tokenization_cache(
-            self, prompt: str,
-            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        self,
+        prompt: str,
+        sampling_params: Optional[SamplingParams],
+        adds_no_special_tokens: bool = False,
+    ) -> Optional[List[int]]:
+        """Cached ids of `prompt`, or None to tokenize it in full.
+
+        `adds_no_special_tokens`: the caller verified that its tokenizer adds no
+        special tokens, so `add_special_tokens=True` does not change the ids.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens and not adds_no_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(
@@ -236,14 +363,117 @@ class BaseMultimodalInputProcessor(ABC):
         Auto-detokenizes `prompt_token_ids` --> `prompt` for non-fast-path VLMs
         before delegating to `_attach_multimodal_embeddings_impl`. Subclasses
         override `_attach_multimodal_embeddings_impl` (not this wrapper).
+
+        The returned `multimodal_input` keys each attached item by the content
+        of its embedding rows and of any metadata passed with them, as
+        `apply_mm_hashes` keys media items, so KV-cache reuse matches only
+        identical embeddings.
         """
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("prompt") is None
                 and not self.supports_token_id_mm_expansion):
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self._attach_multimodal_embeddings_impl(inputs,
-                                                       multimodal_embedding,
-                                                       sampling_params)
+        prompt_token_ids, extra_processed_inputs = (
+            self._attach_multimodal_embeddings_impl(inputs,
+                                                    multimodal_embedding,
+                                                    sampling_params))
+        if extra_processed_inputs is not None:
+            extra_processed_inputs["multimodal_input"] = (
+                self._key_attached_embeddings(
+                    prompt_token_ids,
+                    extra_processed_inputs["multimodal_data"],
+                    inputs.get("multi_modal_uuids"),
+                    multimodal_embedding,
+                ))
+        return prompt_token_ids, extra_processed_inputs
+
+    def _key_attached_embeddings(
+        self,
+        prompt_token_ids: list[int],
+        multimodal_data: dict[str, Any],
+        multimodal_uuids: dict[str, list[str | None]] | None,
+        attached_items: dict[str, Any],
+    ) -> MultimodalInput:
+        """Hash each attached item and locate it in the prompt.
+
+        The rows of each item fill that item's embedding slots in prompt order,
+        so positions and runs come from the embedding mask that fusion uses.
+        Attached items are keyed on their embedding slots only: unlike media
+        items, `multimodal_lengths` holds each item's row count, and positions
+        and runs leave out framing tokens such as Llama 4's tile separators.
+        Metadata passed with an item, such as Qwen-VL's `image_grid_thw`, sets
+        the item's positions, so it is hashed together with the rows.
+        The mask's prefix sum is also cached in `multimodal_data`.
+
+        Args:
+            prompt_token_ids: Prompt token IDs with expanded placeholders.
+            multimodal_data: Processed data holding the item metadata record and
+                `multimodal_embedding`: one `[rows, hidden]` tensor per item, or
+                all items concatenated along rows.
+            multimodal_uuids: Optional user-provided UUIDs per modality.
+            attached_items: The caller's items per modality, as passed to
+                `attach_multimodal_embeddings`.
+
+        Returns:
+            Hashes, prompt positions, lengths and runs of the attached items.
+        """
+        item_metadata = get_multimodal_item_metadata(multimodal_data)
+        if (item_metadata is None
+                or item_metadata.output_embedding_lengths is None):
+            raise ValueError(
+                f"{type(self).__name__} must publish MultimodalItemMetadata "
+                "with output_embedding_lengths for attached embeddings")
+        item_refs = item_metadata.item_refs
+        item_lengths = list(item_metadata.output_embedding_lengths)
+        embeddings = multimodal_data["multimodal_embedding"]
+        if isinstance(embeddings, torch.Tensor):
+            # Copy packed rows to the host once rather than once per item.
+            embeddings = torch.split(_to_host(embeddings), item_lengths)
+
+        item_extras = {
+            modality: split_multimodal_embedding_items(items)[1]
+            for modality, items in attached_items.items()
+        }
+        # apply_mm_hashes takes each modality's items in modality-local order.
+        items_by_modality: dict[str, list[Any]] = {}
+        for (modality, index), rows in sorted(zip(item_refs,
+                                                  embeddings,
+                                                  strict=True),
+                                              key=lambda item: item[0]):
+            # A packed tensor holds several items and no metadata.
+            extras = item_extras.get(modality, [])
+            extra = extras[index] if index < len(extras) else {}
+            item = (rows, extra) if extra else rows
+            items_by_modality.setdefault(modality, []).append(item)
+        mm_hashes = apply_mm_hashes(items_by_modality,
+                                    multimodal_uuids,
+                                    hash_lib=attached_embedding_hasher)
+        hashes = [mm_hashes.hashes[m][i] for m, i in item_refs]
+        uuids = (None if mm_hashes.uuids is None else
+                 [mm_hashes.uuids[m][i] for m, i in item_refs])
+
+        _, embed_mask, _ = _compute_mm_masks(
+            _as_cpu_tensor(prompt_token_ids),
+            vocab_size=self.get_vocab_size(),
+            mm_token_ids=self.get_mm_token_ids(),
+            mm_special_token_ids=self.get_mm_special_token_ids(),
+        )
+        _cache_mm_embed_cumsum(multimodal_data, embed_mask)
+        start_positions, _ = _find_mm_token_start_pos_from_masks(
+            embed_mask, None, item_lengths)
+        item_run_cu_offsets, run_positions, run_lengths = (
+            _find_mm_token_runs_from_mask(embed_mask, item_lengths))
+        validate_mm_inputs(prompt_token_ids, hashes, start_positions,
+                           item_lengths)
+        return MultimodalInput(
+            multimodal_hashes=[hexdigest_to_int32(h) for h in hashes],
+            multimodal_positions=start_positions,
+            multimodal_lengths=item_lengths,
+            multimodal_uuids=uuids,
+            multimodal_item_run_cu_offsets=item_run_cu_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
+        )
 
     def _attach_multimodal_embeddings_impl(
         self,
@@ -254,7 +484,10 @@ class BaseMultimodalInputProcessor(ABC):
         """Subclass hook for `attach_multimodal_embeddings`.
 
         Subclasses that support `multi_modal_embeddings` override this method
-        rather than the wrapper `attach_multimodal_embeddings` itself.
+        rather than the wrapper `attach_multimodal_embeddings` itself. The
+        returned `multimodal_data` holds `multimodal_embedding` and a
+        `MultimodalItemMetadata` record whose `output_embedding_lengths` give
+        each item's embedding rows in prompt order.
         Default raises NotImplementedError.
         """
         raise NotImplementedError(
@@ -274,6 +507,9 @@ class BaseMultimodalInputProcessor(ABC):
         Also flips `sampling_params.add_special_tokens` to False so the
         subclass's re-tokenization doesn't double-add BOS/EOS on top of the
         ones already encoded in `prompt_token_ids`.
+
+        The rebuilt prompt keeps the multimodal data, UUIDs and processor
+        kwargs of `inputs`.
         """
         prompt = self.tokenizer.decode(inputs["prompt_token_ids"])
         if sampling_params is not None and sampling_params.add_special_tokens:
@@ -281,11 +517,14 @@ class BaseMultimodalInputProcessor(ABC):
                 "Setting add_special_tokens to False because prompt_token_ids "
                 "were provided to generate. VLMs will re-encode the prompt.")
             sampling_params.add_special_tokens = False
-        return TextPrompt(
+        text_prompt = TextPrompt(
             prompt=prompt,
             multi_modal_data=inputs.get("multi_modal_data"),
             mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
         )
+        if "multi_modal_uuids" in inputs:
+            text_prompt["multi_modal_uuids"] = inputs["multi_modal_uuids"]
+        return text_prompt
 
     @property
     @abstractmethod
@@ -327,11 +566,24 @@ class BaseMultimodalInputProcessor(ABC):
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
             if self.supports_token_id_mm_expansion:
-                return self.call_with_token_ids(inputs, sampling_params)
+                result = self.call_with_token_ids(inputs, sampling_params)
+                return self._capture_prepared_decode(result)
             # Fast path not supported by this VLM — detokenize and fall through
             # to the text-prompt path.
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self.call_with_text_prompt(inputs, sampling_params)
+        return self._capture_prepared_decode(
+            self.call_with_text_prompt(inputs, sampling_params))
+
+    def _capture_prepared_decode(
+        self, result: Tuple[List[int], Optional[ExtraProcessedInputs]]
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        capture = self._decode_state_capture.get()
+        if capture is not None and capture[0] is self and result[1] is not None:
+            state = self.export_decode_state(result[1].get(
+                "multimodal_data", {}))
+            if state is not None:
+                capture[1].update(prompt_token_ids=list(result[0]), state=state)
+        return result
 
     @abstractmethod
     def call_with_text_prompt(
@@ -714,12 +966,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return None
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        """Per-modality media-IO decode defaults for this model.
-
-        Applied under the server's ``--media_io_kwargs`` and any per-request
-        override, so a model can opt into a decode format it was tuned for
-        (e.g. ``{"video": {"format": "np"}}``) without operator config.
-        """
+        """Return sampling defaults, below server and per-request overrides."""
         return {}
 
     def get_dummy_mm_data(
@@ -894,6 +1141,13 @@ class MultimodalPlaceholderRegistry:
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(f"Model type '{model_type}' is not registered")
         del self._multimodal_placeholder_by_model_type[model_type]
+
+    def get_registered_modalities(self, model_type: str) -> frozenset[str]:
+        """Return registered media types, or an empty set for an unknown model."""
+        self._ensure_provider_imported(model_type)
+        metadata = self._multimodal_placeholder_by_model_type.get(model_type)
+        return frozenset(
+            metadata.placeholder_map) if metadata is not None else frozenset()
 
     def is_valid(self, model_type: str, modality: str) -> bool:
         self._ensure_provider_imported(model_type)
@@ -1070,12 +1324,20 @@ def register_input_processor(
     return wrapper
 
 
+def _warn_prompt_token_cache_ignored(processor_name: str) -> None:
+    logger.warning_once(
+        f"prompt_token_cache_config is ignored: {processor_name} does not "
+        "support the shared prompt token cache.",
+        key="prompt_token_cache_unsupported_processor")
+
+
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
-    checkpoint_format: Optional[str] = "HF",
+    checkpoint_format: CheckpointFormat | str | None = CheckpointFormat.HF,
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
+    prompt_token_cache_config: Optional["PromptTokenCacheConfig"] = None,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1083,14 +1345,18 @@ def create_input_processor(
     Args:
         model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
         tokenizer: Tokenizer instance.
-        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
-            config loading; any other value skips HF config loading. Default is "HF".
+        checkpoint_format: Checkpoint format identifier. "HF" and "MX" use Hugging
+            Face-style config loading, because MX loads Hugging Face-format
+            checkpoints; "mistral" and "mistral_large_3" use the native Mistral
+            config; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
             the tokenization of recent prompts. Ignored for model-specific
             (multimodal) input processors unless they set
             ``supports_tokenization_cache``.
+        prompt_token_cache_config: Node-shared prompt token cache, passed to
+            input processors that set ``supports_prompt_token_cache``.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -1103,7 +1369,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1112,7 +1378,8 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
+    elif checkpoint_format in (CheckpointFormat.MISTRAL,
+                               CheckpointFormat.MISTRAL_LARGE_3):
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
@@ -1120,6 +1387,9 @@ def create_input_processor(
             MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        if prompt_token_cache_config is not None:
+            _warn_prompt_token_cache_ignored(
+                MistralNativeInputProcessor.__name__)
         return MistralNativeInputProcessor(model_path_or_dir,
                                            config,
                                            tokenizer,
@@ -1134,13 +1404,35 @@ def create_input_processor(
             model_cls, _ = get_model_architecture(config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
-        except RuntimeError:  # unregistered model
+        except (RuntimeError, ConfigInputError,
+                UnsupportedError):  # unregistered model
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
+            if "vision_gpu_normalize" in kwargs:
+                kwargs["vision_gpu_normalize"] = kwargs[
+                    "vision_gpu_normalize"] and getattr(
+                        model_cls, "supports_vision_gpu_normalize", False)
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            elif enable_tokenization_cache:
+                logger.warning_once(
+                    f"enable_tokenization_cache is ignored: "
+                    f"{input_processor_cls.__name__} does not support the "
+                    "prefix tokenization cache.",
+                    key="tokenization_cache_unsupported_processor")
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and input_processor_cls.supports_prompt_token_cache):
+                kwargs["prompt_token_cache_config"] = prompt_token_cache_config
+                if (prompt_token_cache_config is not None
+                        and kwargs.pop("enable_tokenization_cache", False)):
+                    logger.warning(
+                        "prompt_token_cache_config takes precedence over "
+                        f"enable_tokenization_cache for {input_processor_cls.__name__}."
+                    )
+            elif prompt_token_cache_config is not None:
+                _warn_prompt_token_cache_ignored(input_processor_cls.__name__)
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
@@ -1154,6 +1446,8 @@ def create_input_processor(
                                            trust_remote_code=trust_remote_code,
                                            **kwargs)
 
+    if prompt_token_cache_config is not None:
+        _warn_prompt_token_cache_ignored(DefaultInputProcessor.__name__)
     return DefaultInputProcessor(
         None,
         None,
@@ -1275,13 +1569,49 @@ def maybe_compute_mm_embed_cumsum(
     _cache_mm_embed_cumsum(mm_data, embed_mask)
 
 
+class _InputProcessorCallable(Protocol):
+
+    def __call__(
+        self, inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> tuple[list[int], ExtraProcessedInputs | None]:
+        ...
+
+
+def _validate_media_representations(modality: str, items: list | tuple) -> None:
+    from .multimodal_data import VideoData
+
+    float_kind = None
+    byte_kind = None
+    for item in items:
+        if modality == "video":
+            if isinstance(item, VideoData):
+                item = item.frames
+            if isinstance(item, list) and item:
+                item = item[0]
+        if isinstance(item, Image.Image):
+            byte_kind = "PIL image"
+        elif isinstance(item, torch.Tensor):
+            if item.is_floating_point():
+                float_kind = "float tensor"
+            elif item.dtype == torch.uint8:
+                byte_kind = "uint8 tensor"
+        elif isinstance(item, np.ndarray):
+            if np.issubdtype(item.dtype, np.floating):
+                float_kind = "float array"
+            elif item.dtype == np.uint8:
+                byte_kind = "uint8 array"
+        if float_kind and byte_kind:
+            raise ValueError(
+                f"{modality} inputs in one request must use one representation; "
+                f"got {float_kind} and {byte_kind}")
+
+
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
     *,
     encoder_cache_enabled: bool = False,
-) -> Callable[[TextPrompt, SamplingParams], Tuple[
-        List[int], Optional[ExtraProcessedInputs]]]:
+) -> _InputProcessorCallable:
     """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
 
     Args:
@@ -1310,8 +1640,9 @@ def create_input_processor_with_hash(
         positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it will be used as the
-        cache identifier and returned in KV cache events instead of the content hash.
+        When a UUID is provided for a multimodal item, it contributes to the
+        derived cache digest and is preserved as the external identity in KV
+        cache events.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']
@@ -1448,13 +1779,15 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
+        mm_data = inputs.get("multi_modal_data", {})
+        for modality in ("image", "video"):
+            items = mm_data.get(modality)
+            if isinstance(items, (list, tuple)) and len(items) > 1:
+                _validate_media_representations(modality, items)
         # Any subset of the supported modalities is eligible for hashing.
         # ``None`` payloads are skipped so an empty bucket doesn't gate off
         # hashing for the modalities that are actually present.
-        modalities = [
-            m for m, d in inputs.get('multi_modal_data', {}).items()
-            if d is not None
-        ]
+        modalities = [m for m, d in mm_data.items() if d is not None]
         if modalities and all(m in MEDIA_MODALITIES for m in modalities):
             if input_processor.multimodal_hashing_supported is not None:
                 use_multimodal_hashing = input_processor.multimodal_hashing_supported

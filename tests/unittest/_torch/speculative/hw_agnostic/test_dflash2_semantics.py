@@ -24,7 +24,9 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     dflash2_grouped_conv,
     dflash2_score_edges,
     dflash2_walk_candidate_paths,
+    resolve_draft_logit_transform,
 )
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
 
@@ -60,6 +62,7 @@ def _conv_case(block_size, taps, num_groups=4, group_size=2, batch=3, seed=0):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("block_size", [5, 8])
 @pytest.mark.parametrize("taps", [1, 2, 3])
 def test_grouped_conv_matches_reference(block_size, taps):
@@ -70,6 +73,7 @@ def test_grouped_conv_matches_reference(block_size, taps):
     )
 
 
+@pytest.mark.cpu_only
 def test_grouped_conv_anchor_slot_has_no_predecessor():
     """Block slot 0 holds the anchor token, so only the tap-0 term applies."""
     block_size, taps, group_size = 4, 2, 2
@@ -79,6 +83,7 @@ def test_grouped_conv_anchor_slot_has_no_predecessor():
     torch.testing.assert_close(out[::block_size], (coefficients * hidden)[::block_size])
 
 
+@pytest.mark.cpu_only
 def test_grouped_conv_does_not_cross_request_boundary():
     """Requests are packed back to back; taps must not cross the boundary."""
     block_size, taps, group_size = 4, 2, 2
@@ -107,6 +112,7 @@ def _block_conv(hidden_size=8, taps=2, group_size=2, seed=3):
     )
 
 
+@pytest.mark.cpu_only
 def test_block_conv_both_sides_share_the_input_projection():
     """``finish`` must use the coefficients ``prepare`` handed back, not a
     reprojection of the sublayer output."""
@@ -140,6 +146,7 @@ def test_block_conv_both_sides_share_the_input_projection():
     )
 
 
+@pytest.mark.cpu_only
 def test_block_conv_rejects_mismatched_checkpoint_shapes():
     generator = torch.Generator().manual_seed(4)
     with pytest.raises(ValueError, match="base_kernel has shape"):
@@ -187,6 +194,7 @@ def _selector_inputs(seed=1):
     )
 
 
+@pytest.mark.cpu_only
 def test_score_edges_matches_sequential_reference():
     """S_t(a, b) = U_t(b) + <A(a) * H(h_t), B(b)>, anchored at position 0."""
     inputs = _selector_inputs()
@@ -214,6 +222,7 @@ def test_score_edges_matches_sequential_reference():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.cpu_only
 def test_score_edges_accumulates_in_fp32():
     """bf16 rounding moves candidate argmaxes, so scores must not inherit the
     draft dtype."""
@@ -229,6 +238,7 @@ def test_score_edges_accumulates_in_fp32():
     assert scores.dtype == torch.float32
 
 
+@pytest.mark.cpu_only
 def test_score_edges_step0_ignores_the_predecessor_axis():
     """All step-0 predecessor slots hold the anchor, so the walk's arbitrary
     entry row is well defined."""
@@ -245,6 +255,7 @@ def test_score_edges_step0_ignores_the_predecessor_axis():
         torch.testing.assert_close(first[:, predecessor], first[:, 0])
 
 
+@pytest.mark.cpu_only
 def test_walk_reads_the_row_of_its_own_previous_choice():
     generator = torch.Generator().manual_seed(5)
     candidate_ids = torch.randint(VOCAB, (B, K, TOP_K), generator=generator)
@@ -260,6 +271,7 @@ def test_walk_reads_the_row_of_its_own_previous_choice():
             predecessor = int(row.argmax())
 
 
+@pytest.mark.cpu_only
 def test_walk_recovers_a_coherent_chain_that_marginal_picks_miss():
     """A decoy scores well under every predecessor but slightly worse than the
     planted chain, so only conditioning on the walk's own choice separates
@@ -297,6 +309,7 @@ def _selector(seed=7):
     )
 
 
+@pytest.mark.cpu_only
 def test_selector_rejects_mismatched_checkpoint_shapes():
     generator = torch.Generator().manual_seed(8)
     with pytest.raises(ValueError, match="predecessor_codebook has shape"):
@@ -329,6 +342,7 @@ def _dflash2_wrapper(**attributes):
     return wrapper
 
 
+@pytest.mark.cpu_only
 def test_select_candidate_path_restricts_logits_to_the_walk():
     """The rewritten rows must reproduce the walk under argmax and carry its
     scores, so both acceptance paths read the proposal distribution."""
@@ -369,6 +383,7 @@ def _worker(mapping=None):
     return worker
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_full_vocab_rewrites_in_place():
     """The single-rank case must not allocate a second full-vocab tensor: a
     [num_gens, K, vocab] copy is hundreds of MB at real vocab sizes."""
@@ -386,6 +401,7 @@ def test_global_top_k_full_vocab_rewrites_in_place():
     torch.testing.assert_close(unary, expected_unary)
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_tp_shards_agree_with_the_full_vocab_result():
     """The selector indexes full-vocab codebooks, so every rank must end up
     with the global candidates the unsharded path would pick."""
@@ -427,6 +443,7 @@ def test_global_top_k_tp_shards_agree_with_the_full_vocab_result():
         torch.testing.assert_close(unary, expected_unary.float())
 
 
+@pytest.mark.cpu_only
 def test_global_top_k_rejects_a_width_it_cannot_interpret():
     worker = _worker(SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=False))
     with pytest.raises(NotImplementedError, match="plain TP column shard"):
@@ -451,6 +468,7 @@ def _bind_drafter(is_dflash2: bool, d2t):
     return worker
 
 
+@pytest.mark.cpu_only
 def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
     """The codebooks are indexed by draft-vocab id, so a d2t remap would score
     the wrong tokens. No DFlash 2 drafter ships one, so it is an invariant
@@ -459,6 +477,7 @@ def test_dflash2_drafter_with_a_remapped_draft_vocab_fails_at_bind():
         _bind_drafter(is_dflash2=True, d2t=torch.zeros(VOCAB, dtype=torch.long))
 
 
+@pytest.mark.cpu_only
 def test_d2t_binding_is_otherwise_unrestricted():
     """Plain DFlash keeps its d2t support, and a DFlash 2 drafter without d2t
     binds and caches the absent map."""
@@ -484,6 +503,7 @@ RELEASED_DFLASH_CONFIG = {
 }
 
 
+@pytest.mark.cpu_only
 def test_architecture_detection():
     """Matching on the "dflash2" stem picks up per-target label variants."""
     assert is_dflash2_checkpoint(["DFlash2DraftModel"], {})
@@ -494,6 +514,7 @@ def test_architecture_detection():
     assert not is_dflash2_checkpoint(None, {})
 
 
+@pytest.mark.cpu_only
 def test_settings_detection():
     """Either DFlash 2 feature's settings declare it without the label."""
     assert is_dflash2_checkpoint(["DFlashDraftModel"], {"conv_kernel_size": 2})
@@ -514,6 +535,7 @@ def _validation_wrapper(**overrides):
     return _dflash2_wrapper(**values)
 
 
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_accepts_the_released_recipe():
     _validation_wrapper()._validate_dflash2_config()
 
@@ -527,12 +549,14 @@ def test_validate_dflash2_config_accepts_the_released_recipe():
         "_dflash2_selector_top_k",
     ],
 )
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_rejects_a_partial_recipe(missing):
     """A partial recipe would silently degrade to DFlash 1 acceptance."""
     with pytest.raises(ValueError, match="missing required dflash_config"):
         _validation_wrapper(**{missing: 0})._validate_dflash2_config()
 
 
+@pytest.mark.cpu_only
 def test_validate_dflash2_config_rejects_a_degenerate_top_k():
     with pytest.raises(ValueError, match="no candidates to choose between"):
         _validation_wrapper(_dflash2_selector_top_k=1)._validate_dflash2_config()
@@ -568,6 +592,7 @@ def _all_sliding_config(sliding_window, num_layers=2, **overrides):
     return SimpleNamespace(**config)
 
 
+@pytest.mark.cpu_only
 def test_released_drafter_attention_is_non_causal_and_symmetrically_windowed():
     """The released config declares is_causal=false with all-sliding layers;
     read as causal it would mask the block's own future positions."""
@@ -586,6 +611,7 @@ def test_released_drafter_attention_is_non_causal_and_symmetrically_windowed():
         assert wrapper._get_attention_mask_args(layer_idx) == (False, (2047, 2047))
 
 
+@pytest.mark.cpu_only
 def test_explicit_is_causal_overrides_the_layer_type_default():
     """Without the flag a sliding layer reads as causal; the flag has to win in
     both directions."""
@@ -611,60 +637,188 @@ def test_explicit_is_causal_overrides_the_layer_type_default():
     assert causal._get_attention_mask_args(1) == (True, (-1, -1))
 
 
-def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
-    """No-regression: an older drafter that happens to carry is_causal must
-    keep resolving its windows the old way."""
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_causal", [None, False, True])
+@pytest.mark.parametrize("explicit_window", [False, True])
+def test_is_causal_is_ignored_for_a_plain_dflash_drafter(is_causal, explicit_window):
+    """No-regression: a plain DFlash drafter keeps the causal windowed decode
+    whatever causality metadata it carries, and whether the window is inferred
+    from the layer types or switched on explicitly; the DSpark override does
+    not reach it."""
     config = SimpleNamespace(
-        is_causal=False,
         num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=512,
-        use_sliding_window=True,
     )
+    if is_causal is not None:
+        config.is_causal = is_causal
+    if explicit_window:
+        config.use_sliding_window = True
     wrapper = _mask_wrapper(config, is_dflash2=False)
     assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM block-decode backend: no non-causal sliding window
+# TRTLLM block-decode backend: a non-causal sliding window is lowered to the
+# causal windowed decode plus the future-block merge
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_released_drafter_window_runs_on_two_sided_backends():
     """VANILLA and FA4 hand both window bounds to their kernels."""
     for backend in ("VANILLA", "FA4"):
-        _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows()
+        assert (
+            _mask_wrapper(
+                _all_sliding_config(2048), backend=backend
+            ).validate_block_attention_windows()
+            == []
+        )
 
 
-def test_trtllm_backend_rejects_the_released_drafter_window():
+@pytest.mark.cpu_only
+def test_trtllm_backend_lowers_the_released_drafter_window():
     """flashinfer's trtllm-gen context kernel refuses causal=False with any
-    finite window_left, so the released non-causal 2048 window cannot run."""
+    finite window_left, so the released non-causal 2048 window runs as the
+    causal windowed decode plus the future-block merge."""
     wrapper = _mask_wrapper(_all_sliding_config(2048), backend="TRTLLM")
-    with pytest.raises(ValueError, match="non-causally within a 2048-token sliding window"):
-        wrapper.validate_block_attention_windows()
+    assert wrapper.validate_block_attention_windows() == ["causal decode + future-block merge"] * 2
 
 
-def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
-    # A causal sliding window is supported by the kernel.
-    _mask_wrapper(
-        _all_sliding_config(4, is_causal=True), backend="TRTLLM"
-    ).validate_block_attention_windows()
-    # No window at all, either.
-    _mask_wrapper(
-        SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
-        backend="TRTLLM",
-    ).validate_block_attention_windows()
+@pytest.mark.cpu_only
+def test_trtllm_backend_keeps_causal_and_unwindowed_layers_on_their_kernels() -> None:
+    # A causal sliding window is supported by the decode kernel directly.
+    assert (
+        _mask_wrapper(
+            _all_sliding_config(4, is_causal=True), backend="TRTLLM"
+        ).validate_block_attention_windows()
+        == ["causal decode"] * 2
+    )
+    # Unwindowed blocks fold query positions into the non-causal decode heads.
+    assert (
+        _mask_wrapper(
+            SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
+            backend="TRTLLM",
+        ).validate_block_attention_windows()
+        == ["non-causal folded decode"] * 2
+    )
 
 
+@pytest.mark.cpu_only
 def test_trtllm_window_check_reads_the_use_swa_override():
     """A use_swa window replaces the checkpoint-inferred one in the block
     decode, so the check must resolve the same window the forward uses."""
     config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
     wrapper = _mask_wrapper(config, backend="TRTLLM", layer_windows=[(3, 3), (3, 3)])
     assert wrapper._resolve_block_attention(0) == (False, (3, 3))
-    with pytest.raises(ValueError, match="draft layer 0"):
-        wrapper.validate_block_attention_windows()
+    assert wrapper.validate_block_attention_windows() == ["causal decode + future-block merge"] * 2
+
+
+# ---------------------------------------------------------------------------
+# Drafter logit transform: dflash_config's output_multiplier, then
+# final_logit_softcapping, as the target applies to its own logits
+# ---------------------------------------------------------------------------
+
+# The transform of a target that scales and soft-caps its logits (Muse Spark
+# Open's), which its DFlash 2 drafters repeat in their dflash_config.
+DECLARED_LOGIT_TRANSFORM = {
+    "output_multiplier": 0.17677669529663687,
+    "final_logit_softcapping": 20.0,
+}
+
+
+def _transform_wrapper(dflash_config):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.logit_multiplier, wrapper.logit_softcap = resolve_draft_logit_transform(dflash_config)
+    return wrapper
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_is_off_unless_the_config_declares_it():
+    assert resolve_draft_logit_transform({}) == (1.0, None)
+    assert resolve_draft_logit_transform({"final_logit_softcapping": 0}) == (1.0, None)
+    logits = torch.randn(3, VOCAB)
+    assert _transform_wrapper({}).apply_draft_logit_transform(logits) is logits
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_scales_then_soft_caps_in_fp32():
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], dtype=torch.bfloat16)
+    transformed = _transform_wrapper(DECLARED_LOGIT_TRANSFORM).apply_draft_logit_transform(logits)
+    expected = 20.0 * torch.tanh(logits.float() * 0.17677669529663687 / 20.0)
+    assert transformed.dtype == torch.float32
+    torch.testing.assert_close(transformed, expected)
+    assert transformed.abs().max() < 20.0
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_decides_the_selector_walk():
+    """The transform keeps every position's argmax, but the selector adds the
+    drafter logits to its pairwise scores, so their scale picks the path."""
+    # One request, one position, two candidates. The unary logits prefer
+    # candidate 0 by 2.0; the pairwise term favors candidate 1 by 1.0.
+    candidate_ids = torch.tensor([[[0, 1]]])
+    anchor = torch.tensor([2])
+    predecessor = torch.zeros(VOCAB, 1)
+    predecessor[2] = 1.0
+    successor = torch.zeros(VOCAB, 1)
+    successor[1] = 1.0
+    gate = torch.ones(1, 1, 1)
+    raw_unary = torch.tensor([[[10.0, 8.0]]])
+
+    def walk(unary):
+        scores = dflash2_score_edges(predecessor, successor, candidate_ids, unary, gate, anchor)
+        return int(dflash2_walk_candidate_paths(candidate_ids, scores)[0, 0].argmax())
+
+    transformed = _transform_wrapper(DECLARED_LOGIT_TRANSFORM).apply_draft_logit_transform(
+        raw_unary.clone()
+    )
+    assert int(transformed[0, 0].argmax()) == int(raw_unary[0, 0].argmax()) == 0
+    assert walk(raw_unary) == 0
+    assert walk(transformed) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"output_multiplier": 0},
+        {"output_multiplier": -0.5},
+        {"output_multiplier": float("nan")},
+        {"final_logit_softcapping": -20.0},
+        {"final_logit_softcapping": float("inf")},
+    ],
+)
+def test_logit_transform_rejects_values_that_would_only_lower_acceptance(declared):
+    with pytest.raises(ValueError, match=f"dflash_config.{next(iter(declared))}"):
+        resolve_draft_logit_transform(declared)
+
+
+@pytest.mark.cpu_only
+def test_declared_transform_needs_the_plain_logits_processor():
+    """A processor that transforms the logits itself would get the transform twice."""
+
+    class TransformingProcessor(LogitsProcessor):
+        pass
+
+    worker = DFlashWorker.__new__(DFlashWorker)
+    worker._target_model_ref = None
+    worker._vocab_parallel = None
+    for dflash_config, processor, rejected in (
+        (DECLARED_LOGIT_TRANSFORM, LogitsProcessor(), False),
+        (DECLARED_LOGIT_TRANSFORM, TransformingProcessor(), True),
+        ({}, TransformingProcessor(), False),
+    ):
+        draft = _transform_wrapper(dflash_config)
+        draft.logits_processor = processor
+        worker._draft_model_ref = lambda draft=draft: draft
+        if rejected:
+            with pytest.raises(RuntimeError, match="plain LogitsProcessor"):
+                worker.setup_aliases()
+        else:
+            worker.setup_aliases()
 
 
 # ---------------------------------------------------------------------------
@@ -708,11 +862,11 @@ CTX_LEN = 24
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dflash2: bool):
+def _tiny_config(dflash2: bool, dflash_overrides=None):
     from transformers import Qwen3Config
 
     config = dict(TINY)
-    dflash_config = dict(RELEASED_DFLASH_CONFIG)
+    dflash_config = dict(RELEASED_DFLASH_CONFIG, **(dflash_overrides or {}))
     if not dflash2:
         for key in ("conv_group_size", "conv_kernel_size", "selector_rank", "selector_top_k"):
             del dflash_config[key]
@@ -767,10 +921,12 @@ def _tiny_weights(dflash2: bool, seed=7):
     return weights
 
 
-def _build_drafter(dflash2: bool, weights):
+def _build_drafter(dflash2: bool, weights, dflash_overrides=None):
     from tensorrt_llm._torch.model_config import ModelConfig
 
-    model_config = ModelConfig(pretrained_config=_tiny_config(dflash2), attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=_tiny_config(dflash2, dflash_overrides), attn_backend="TRTLLM"
+    )
     drafter = DFlashForCausalLM(model_config).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -863,13 +1019,14 @@ def _oracle_block_decode(weights, captured, noise_embedding, dflash2):
         hidden = hidden + delta
 
         normed = _rms(hidden, w[prefix + "post_attention_layernorm.weight"])
+        mlp_coefficients = None
         if dflash2:
             mlp_coefficients = _oracle_conv_coefficients(w, prefix + "mlp_conv", normed)
             normed = _oracle_conv(w, prefix + "mlp_conv", 0, normed, mlp_coefficients)
         gate = normed @ w[prefix + "mlp.gate_proj.weight"].T
         up = normed @ w[prefix + "mlp.up_proj.weight"].T
         delta = (F.silu(gate) * up) @ w[prefix + "mlp.down_proj.weight"].T
-        if dflash2:
+        if mlp_coefficients is not None:
             delta = _oracle_conv(w, prefix + "mlp_conv", 1, delta, mlp_coefficients)
         hidden = hidden + delta
 
@@ -946,6 +1103,21 @@ def test_dflash2_drafter_parses_config_and_loads_checkpoint_weights():
         weights["candidate_selector.successor_codebook"],
     )
     assert drafter.candidate_selector.top_k == TOP_K
+
+
+@needs_gpu
+def test_drafter_reads_its_logit_transform_from_dflash_config():
+    weights = _tiny_weights(True)
+    plain = _build_drafter(True, weights)
+    assert (plain.logit_multiplier, plain.logit_softcap) == (1.0, None)
+
+    declared = _build_drafter(True, weights, dflash_overrides=DECLARED_LOGIT_TRANSFORM)
+    assert (declared.logit_multiplier, declared.logit_softcap) == (0.17677669529663687, 20.0)
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], device="cuda")
+    torch.testing.assert_close(
+        declared.apply_draft_logit_transform(logits.clone()),
+        20.0 * torch.tanh(logits * 0.17677669529663687 / 20.0),
+    )
 
 
 @needs_gpu

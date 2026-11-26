@@ -39,7 +39,8 @@ import asyncio
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import aiohttp
 import msgpack
@@ -57,12 +58,23 @@ from tensorrt_llm.serve.cluster_storage import (
     ClusterStorage,
     WatchEventType,
     create_cluster_storage,
+    validate_http_cluster_storage_scope,
 )
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.output_length_predictor import (
+    MAX_PENDING_ROWS,
+    OUTPUT_LENGTH_KEY,
+    PRIOR_TOKENS,
+    OnlineLengthPredictor,
+    is_token_count,
+    priority_of,
+    throttled,
+)
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
+    ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     Router,
@@ -79,8 +91,15 @@ __all__ = [
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
+# A pooled generation seat is released by its /finish, which the fleet worker retries until
+# delivered; this expiry only reclaims the seat of a request whose frontend died without one,
+# so it must outlast the longest generation. The env timeout above, which expires non-pooled
+# reservations (``_reservation_timeout_for``), can lengthen it but not shorten it: a shorter
+# expiry would hand on a seat still streaming.
+POOLED_RESERVATION_TIMEOUT_S = 6 * 3600.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
+COORDINATOR_READINESS_TIMEOUT_S = 5.0
 
 
 def coordinator_reservation_timeout() -> float:
@@ -90,6 +109,23 @@ def coordinator_reservation_timeout() -> float:
             COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S,
         )
     )
+
+
+def reservation_timeout(
+    configured_s: Optional[float] = None, request_timeout_s: Optional[float] = None
+) -> float:
+    """A reservation's expiry: ``configured_s`` (else the env timeout), at least the request timeout."""
+    configured = coordinator_reservation_timeout() if configured_s is None else configured_s
+    return max(configured, request_timeout_s or 0)
+
+
+def pooled_reservation_timeout(reservation_timeout_s: float) -> float:
+    """A pooled seat's expiry, given :func:`reservation_timeout`.
+
+    The fleet worker's ``/finish`` retry window uses the same value, so it retries as long as the
+    coordinator holds the seat.
+    """
+    return max(reservation_timeout_s, POOLED_RESERVATION_TIMEOUT_S)
 
 
 class DisaggCoordinator(ABC):
@@ -121,6 +157,25 @@ class DisaggCoordinator(ABC):
     @abstractmethod
     async def get_disagg_request_id(self) -> int: ...
 
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        """Predict a generation request's output tokens (``output_length_prediction``).
+
+        Returns the prediction and a key that ``record_output_length`` passes back.
+        """
+        raise NotImplementedError("output_length_prediction is not configured")
+
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
+    ) -> int:
+        """Learn finished replies, each ``(conv_id, prompt_tokens, output_tokens, key)``.
+
+        ``output_tokens`` None reports a request that failed: its prediction row is dropped.
+        Returns how many were learned.
+        """
+        raise NotImplementedError("output_length_prediction is not configured")
+
 
 class DisaggCoordinatorService(DisaggCoordinator):
     """In-process coordinator owning the ctx/gen routers and all cluster state.
@@ -142,10 +197,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._config = config
         self._client_factory = client_factory
         self._metadata_config = metadata_config
-        # The coordinator owns routing state, so it builds the owner routers here
-        # (is_delegating_client=False): one shared namespace-aware core + a single
-        # ZMQ ingest server. Sole place owner routers are created (fleet workers
-        # hold only a CoordinatorClient's delegating surfaces).
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname
+            )
+        # The coordinator owns routing state, so it builds the owner routers here:
+        # one shared namespace-aware core + a single ZMQ ingest server. Sole place
+        # owner routers are created (fleet workers hold only a CoordinatorClient's
+        # delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router, self._gen_router = build_disagg_routers(
@@ -157,28 +216,23 @@ class DisaggCoordinatorService(DisaggCoordinator):
             self._metadata_server,
             server_preparation_func,
             disagg_node_id=config.node_id,
-            is_delegating_client=False,
         )
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
         # in-process HTTP server, its routes are mounted on the coordinator app.
         self._cluster_storage: Optional[ClusterStorage] = (
             create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name,
+                **config.disagg_cluster_config.cluster_storage_options(),
             )
             if config.disagg_cluster_config
             else None
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
-        configured_reservation_timeout = (
-            coordinator_reservation_timeout()
-            if reservation_timeout_secs is None
-            else reservation_timeout_secs
-        )
-        self._reservation_timeout_secs = max(
-            configured_reservation_timeout,
-            request_timeout_secs or 0,
+        self._reservation_timeout_secs = reservation_timeout(
+            reservation_timeout_secs, request_timeout_secs
         )
         self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
         self._reservation_locks = [
@@ -188,6 +242,16 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
         self._disagg_cluster_manager: Optional[DisaggClusterManager] = None
+        # One predictor for every frontend, so that it learns from all replies.
+        self._output_length_predictor: Optional[OnlineLengthPredictor] = None
+        self._output_length_errors = 0
+        # The prediction key of each generation request predicted in /select, until its /finish:
+        # a repeated select reuses it, and a failed one drops its row.
+        self._prediction_keys: OrderedDict[int, int] = OrderedDict()
+        if config.output_length_prediction is not None:
+            self._output_length_predictor = OnlineLengthPredictor(
+                config.output_length_prediction.predictor
+            )
 
     @property
     def ctx_router(self) -> Router:
@@ -222,12 +286,39 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return cache[name]
 
     async def select(
-        self, role: str, routing_key, req_id, exclude_server: Optional[str]
-    ) -> Tuple[str, dict, Optional[str]]:
+        self, role: str, routing_key: Any, req_id: int, exclude_server: Optional[str]
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
         reservation_key = (normalized_role, req_id)
+        prediction = self._predict_in_select(normalized_role, routing_key, req_id)
+        try:
+            if router.pooled:
+                server, info, request_id = await self._select_pooled(
+                    router, role, routing_key, req_id, exclude_server, _t0
+                )
+                return server, self._with_prediction(info, prediction), request_id
+            server, info, request_id = await self._select_reserved(
+                router, routing_key, req_id, exclude_server, reservation_key
+            )
+        except BaseException:
+            if prediction is not None:
+                # No placement (no seat, a disconnected client): the request will not report.
+                self._drop_prediction(req_id)
+            raise
+        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
+        return server, self._with_prediction(self._compact_route_info(info), prediction), request_id
+
+    async def _select_reserved(
+        self,
+        router: Router,
+        routing_key: Any,
+        req_id: int,
+        exclude_server: Optional[str],
+        reservation_key: Tuple[str, int],
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
+        """Select through a non-pooled router under the reservation lock, and reserve the server."""
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
@@ -236,15 +327,112 @@ class DisaggCoordinatorService(DisaggCoordinator):
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
             )
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, router)
+            # A router that placed nothing asks for more routing input; the
+            # worker repeats the select with it, so nothing is reserved.
+            if server is not None:
+                self._reservation_tasks[reservation_key] = asyncio.create_task(
+                    self._expire_reservation(reservation_key, router)
+                )
+        return server, info, request_id
+
+    def _drop_prediction(self, req_id: int) -> None:
+        key = self._prediction_keys.pop(req_id, None)
+        if key is not None and self._output_length_predictor is not None:
+            self._output_length_predictor.record(None, 0.0, None, key, time.monotonic())
+
+    def _predict_in_select(self, role: str, routing_key: Any, req_id: int) -> Optional[dict]:
+        """Predict a generation request's output length from its routing key's ``OUTPUT_LENGTH_KEY``.
+
+        The prediction's priority replaces the key's ``priority``, so a pooled router orders by it. A predictor
+        error gives the key the prior's priority and returns None (the frontend then uses the prior too).
+        """
+        if not isinstance(routing_key, dict):
+            return None
+        inputs = routing_key.pop(OUTPUT_LENGTH_KEY, None)
+        if (
+            inputs is None
+            or role != "generation"
+            or self._output_length_predictor is None
+            or not isinstance(inputs, dict)
+        ):
+            return None
+        conv, isl = inputs.get("conv"), inputs.get("isl")
+        if (conv is not None and not isinstance(conv, str)) or not is_token_count(isl):
+            return None
+        try:
+            tokens, key = self._output_length_predictor.predict(
+                conv, float(isl), time.monotonic(), self._prediction_keys.get(req_id)
             )
-        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
+        except Exception as e:  # noqa: BLE001  (an admission hint is never worth failing a placement)
+            self._output_length_errors += 1
+            if throttled(self._output_length_errors):
+                logger.warning(
+                    f"[output_length] prediction #{self._output_length_errors} in /select failed, "
+                    f"prior used: {type(e).__name__}: {e}"
+                )
+            routing_key["priority"] = priority_of(PRIOR_TOKENS)
+            return None
+        keys = self._prediction_keys
+        keys[req_id] = key
+        keys.move_to_end(req_id)
+        if len(keys) > MAX_PENDING_ROWS:
+            keys.popitem(last=False)
+        priority = priority_of(tokens)
+        routing_key["priority"] = priority
+        return {"tokens": tokens, "key": key, "priority": priority}
+
+    @staticmethod
+    def _with_prediction(info: dict, prediction: Optional[dict]) -> dict:
+        if prediction is not None:
+            info[OUTPUT_LENGTH_KEY] = prediction
+        return info
+
+    def _reservation_timeout_for(self, router: Router) -> float:
+        if router.pooled:
+            return pooled_reservation_timeout(self._reservation_timeout_secs)
+        return self._reservation_timeout_secs
+
+    async def _select_pooled(
+        self,
+        router: Router,
+        role: str,
+        routing_key: Any,
+        req_id: int,
+        exclude_server: Optional[str],
+        t0: float,
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
+        """Select through a pooled router, which may wait for a free seat.
+
+        The wait does not take the striped reservation lock: ``finish`` takes that lock to
+        free seats, so a waiter holding it could block the finish its seat depends on. A
+        repeated select for the same ``req_id`` gets the same seat from the router and only
+        renews the reservation's expiry, which is ``POOLED_RESERVATION_TIMEOUT_S``: the seat
+        must not be handed on while its generation still streams.
+
+        Nothing is awaited between the seat grant and its reservation, so a caller cancelled
+        while it waits (its client left) either gives its place or seat back in the router's
+        wait, or returns with the reservation armed.
+        """
+        reservation_key = (self._normalize_role(role), req_id)
+        server, info, request_id = await router.get_next_server_by_key(
+            routing_key, req_id=req_id, exclude_server=exclude_server
+        )
+        previous = self._reservation_tasks.pop(reservation_key, None)
+        if previous is not None:
+            previous.cancel()
+        self._reservation_tasks[reservation_key] = asyncio.create_task(
+            self._expire_reservation(reservation_key, router)
+        )
+        self._api_lat(f"select[{role}]").record(time.monotonic() - t0)
         return server, self._compact_route_info(info), request_id
 
     @staticmethod
     def _compact_route_info(info: dict) -> dict:
-        compact = {key: info[key] for key in ("match_length", "num_tokens") if key in info}
+        compact = {
+            key: info[key]
+            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED)
+            if key in info
+        }
         disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
         if disaggregated_params is not None:
             compact["server_info"] = {"disaggregated_params": disaggregated_params}
@@ -253,10 +441,30 @@ class DisaggCoordinatorService(DisaggCoordinator):
     async def get_disagg_request_id(self) -> int:
         return get_global_disagg_request_id(self._config.node_id)
 
+    def _length_predictor(self) -> OnlineLengthPredictor:
+        if self._output_length_predictor is None:
+            raise ValueError("output_length_prediction is not configured")
+        return self._output_length_predictor
+
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        return self._length_predictor().predict(conv_id, float(prompt_tokens), time.monotonic())
+
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
+    ) -> int:
+        predictor = self._length_predictor()
+        now = time.monotonic()
+        return sum(predictor.record(conv, isl, out, key, now) for conv, isl, out, key in records)
+
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         reservation_key = (normalized_role, req_id)
+        if normalized_role == "generation":
+            # Its frontend reports the reply (or the failure) by the key itself.
+            self._prediction_keys.pop(req_id, None)
         async with self._reservation_lock(reservation_key):
             reservation = self._reservation_tasks.pop(reservation_key, None)
             if reservation is not None:
@@ -280,8 +488,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
             )
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
+        timeout_s = self._reservation_timeout_for(router)
         try:
-            await asyncio.sleep(self._reservation_timeout_secs)
+            await asyncio.sleep(timeout_s)
         except asyncio.CancelledError:
             raise
         async with self._reservation_lock(key):
@@ -290,7 +499,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             self._reservation_tasks.pop(key, None)
             logger.warning(
                 f"Releasing stale coordinator reservation for role={key[0]}, "
-                f"req_id={key[1]} after {self._reservation_timeout_secs}s"
+                f"req_id={key[1]} after {timeout_s}s"
             )
             await router.finish_request_by_id(key[1], False)
 
@@ -342,7 +551,20 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 )
             await self._wait_for_all_servers_ready()
 
+    async def fail_seat_waiters(self) -> None:
+        """Fail the requests waiting for a generation seat and refuse new ones (shutdown).
+
+        They would otherwise hold their /select open until a seat frees or their KV transfer
+        deadline passes. Idempotent.
+        """
+        for router in (self._ctx_router, self._gen_router):
+            if router.pooled:
+                failed = await router.fail_waiters("the disaggregated coordinator is stopping")
+                if failed:
+                    logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
+
     async def stop(self) -> None:
+        await self.fail_seat_waiters()
         reservations = list(self._reservation_tasks.values())
         self._reservation_tasks.clear()
         for reservation in reservations:
@@ -533,6 +755,8 @@ class CoordinatorClient(DisaggCoordinator):
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
         self._sync_task: Optional[asyncio.Task] = None
+        self._refresh_task: Optional[asyncio.Task[bool]] = None
+        self._stopping = False
         self._is_ready = False
         if config.disagg_cluster_config is not None:
             self._state_sync_interval_s = config.disagg_cluster_config.heartbeat_interval_sec
@@ -556,7 +780,6 @@ class CoordinatorClient(DisaggCoordinator):
             metadata_config,
             create_metadata_server(metadata_config),
             disagg_node_id=config.node_id,
-            is_delegating_client=True,
         )
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")
@@ -586,6 +809,7 @@ class CoordinatorClient(DisaggCoordinator):
         return self._session
 
     async def start(self) -> None:
+        self._stopping = False
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
@@ -595,15 +819,25 @@ class CoordinatorClient(DisaggCoordinator):
         )
 
     async def _sync_coordinator_state(self, interval_s: float) -> None:
+        """Periodically join or start the client's shared state refresh."""
         while True:
-            try:
-                await asyncio.sleep(interval_s)
-                await self._apply_cluster_info(await self.cluster_info())
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                self._is_ready = False
-                logger.warning(f"CoordinatorClient state sync failed: {error}")
+            await asyncio.sleep(interval_s)
+            await asyncio.shield(self._get_refresh_task())
+
+    def _get_refresh_task(self) -> asyncio.Task[bool]:
+        """Keep one refresh in flight, owned by this client rather than a request."""
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_coordinator_state())
+        return self._refresh_task
+
+    async def _refresh_coordinator_state(self) -> bool:
+        """Apply a coordinator snapshot, leaving readiness false on failure."""
+        try:
+            await self._apply_cluster_info(await self.cluster_info())
+        except Exception as error:  # noqa: BLE001
+            self._is_ready = False
+            logger.warning(f"CoordinatorClient state sync failed: {error}")
+        return self._is_ready
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -649,14 +883,74 @@ class CoordinatorClient(DisaggCoordinator):
         # hop. See disagg_utils.get_global_disagg_request_id.
         return get_global_disagg_request_id(self._node_id, self._process_id)
 
+    async def _output_length_call(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        async with self.session.post(
+            f"{self._remote_url}/output_length",
+            data=msgpack.packb(body, use_bin_type=True),
+            headers={"Content-Type": "application/msgpack"},
+            timeout=self._request_timeout_s,
+        ) as resp:
+            reply = msgpack.unpackb(await resp.read(), raw=False)
+            if resp.status != 200:
+                raise RuntimeError(f"coordinator /output_length returned {resp.status}: {reply}")
+            return reply
+
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        reply = await self._output_length_call(
+            {"op": "predict", "conv": conv_id, "isl": float(prompt_tokens)}
+        )
+        return float(reply["tokens"]), int(reply["key"])
+
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
+    ) -> int:
+        reply = await self._output_length_call(
+            {
+                "op": "record",
+                "records": [
+                    [conv, float(isl), None if out is None else float(out), key]
+                    for conv, isl, out, key in records
+                ],
+            }
+        )
+        return int(reply["learned"])
+
+    def enable_output_length_prediction_in_select(self) -> bool:
+        """Have ``/select`` predict the output length of delegated generation placements.
+
+        Returns whether the generation router is delegated (else the frontend asks
+        ``/output_length``).
+        """
+        if isinstance(self._gen_router, CoordinatorDelegatingRouter):
+            return self._gen_router.enable_output_length_prediction()
+        return False
+
     async def is_ready(self) -> bool:
+        """Use cached readiness or await shared refresh work within the caller budget."""
+        if self._stopping:
+            return False
+        if not self._is_ready:
+            # Another fleet worker may have passed /health before this worker's
+            # next background poll. Refresh its local routing state before rejecting.
+            try:
+                # Limit this caller's wait without interrupting shared preparation.
+                return await asyncio.wait_for(
+                    asyncio.shield(self._get_refresh_task()),
+                    timeout=COORDINATOR_READINESS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                return False
         return self._is_ready
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
-        self._is_ready = info.get("is_ready", False)
+        """Publish readiness only after local routing state is fully prepared."""
+        self._is_ready = False
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
         self._sync_render_fingerprints(info)
+        self._is_ready = info.get("is_ready", False)
 
     def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
         published = info.get("render_fingerprints")
@@ -736,10 +1030,15 @@ class CoordinatorClient(DisaggCoordinator):
             return await resp.read(), resp.status, resp.headers.get("Content-Type")
 
     async def stop(self) -> None:
-        if self._sync_task is not None:
-            self._sync_task.cancel()
-            await asyncio.gather(self._sync_task, return_exceptions=True)
-            self._sync_task = None
+        """Stop owned refresh work before closing its sessions and routers."""
+        self._stopping = True
+        tasks = [task for task in (self._sync_task, self._refresh_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._sync_task = None
+        self._refresh_task = None
+        self._is_ready = False
         if self._session is not None:
             await self._session.close()
             self._session = None

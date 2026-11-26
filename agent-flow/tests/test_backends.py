@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import sys
@@ -126,6 +129,9 @@ class TestClaudeBackend:
             yield SystemMessage(
                 subtype="init",
                 data={
+                    "model": "resolved-claude-model",
+                    "effort": "high",
+                    "session_id": "session-123",
                     "skills": [
                         "update-config",
                         "trtllm-agent-toolkit:perf-analysis",
@@ -163,6 +169,10 @@ class TestClaudeBackend:
         ]
         assert events[0].agents == ["Explore", "Plan"]
         assert events[0].plugins == ["code-review", "trtllm-agent-toolkit"]
+        assert events[0].backend == "claude-code"
+        assert events[0].model == "resolved-claude-model"
+        assert events[0].reasoning_effort == "high"
+        assert events[0].session_id == "session-123"
         # Subsequent events are unchanged.
         assert isinstance(events[1], ToolCallEvent)
         assert isinstance(events[-1], ResultEvent)
@@ -844,21 +854,23 @@ class TestClaudeBackendCreateClient:
         )
         assert options.disallowed_tools == ["Skill(perf-optimization-casebook)"]
 
-    async def test_create_client_disables_bash_sandbox(self, monkeypatch):
-        # ``danger_full_access`` analogue for Claude Code: the bash
-        # sandbox is fully off so commands can touch anything on disk
-        # or the network without restrictions.
+    async def test_create_client_preserves_native_sandbox(self, monkeypatch):
         options = await self._capture_options(monkeypatch)
-        assert options.sandbox == {"enabled": False}
+        assert options.sandbox is None
 
-    async def test_create_client_uses_bypass_permission_mode(self, monkeypatch):
-        # ``bypassPermissions`` is the SDK setting that suppresses every
-        # permission prompt the CLI would otherwise raise.
+    async def test_create_client_forwards_the_clis_stderr(self, monkeypatch):
+        # Printed, and handed to the listener of the context the CLI started in.
+        from agent_flow.backends import claude_code
+
         options = await self._capture_options(monkeypatch)
-        assert options.permission_mode == "bypassPermissions"
+        assert options.stderr is claude_code._forward_stderr
+
+    async def test_create_client_preserves_native_permission_mode(self, monkeypatch):
+        options = await self._capture_options(monkeypatch)
+        assert options.permission_mode is None
 
     async def test_create_client_omits_shadowed_permission_callback(self, monkeypatch):
-        # The pinned SDK bypasses this callback in bypassPermissions mode.
+        # No tool-permission callback is installed to auto-approve native requests.
         options = await self._capture_options(monkeypatch)
         assert options.can_use_tool is None
 
@@ -956,6 +968,21 @@ class TestResolveCodexBin:
         monkeypatch.setattr(codex_mod.shutil, "which", lambda _: "/some/system/codex")
 
         assert codex_mod._resolve_codex_bin() == str(bundled)
+
+    def test_path_cli_never_replaces_the_pinned_runtime_implicitly(self, monkeypatch):
+        monkeypatch.delenv("CODEX_BIN", raising=False)
+        monkeypatch.setitem(
+            sys.modules,
+            "codex_cli_bin",
+            SimpleNamespace(bundled_codex_path=lambda: Path("/pinned/codex")),
+        )
+
+        def unexpected_probe(*args, **kwargs):
+            pytest.fail("runtime resolution must not probe or compare CLI versions")
+
+        monkeypatch.setattr(codex_mod.subprocess, "run", unexpected_probe)
+        monkeypatch.setattr(codex_mod.shutil, "which", lambda _: "/newer/codex")
+        assert codex_mod._resolve_codex_bin() == "/pinned/codex"
 
     def test_falls_back_to_path_when_bundle_missing(self, monkeypatch):
         monkeypatch.delenv("CODEX_BIN", raising=False)
@@ -1137,3 +1164,68 @@ class TestSystemPromptSpill:
         cc_mod.spill_system_prompt(prompt, tmp_path, threshold=1024)
         cc_mod.spill_system_prompt(prompt + "y", tmp_path, threshold=1024)
         assert len(list((tmp_path / ".agent-flow").glob("system-prompt-*.md"))) == 2
+
+
+def test_a_named_claude_cli_is_the_one_every_layer_launches(monkeypatch):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.setenv(claude_code.CLI_PATH_ENV, "/opt/claude/bin/claude")
+    assert claude_code._cli_override() == "/opt/claude/bin/claude"
+    assert claude_code._find_claude_cli() == "/opt/claude/bin/claude"
+
+
+def test_claude_runtime_resolution_defaults_to_sdk_without_version_comparison(monkeypatch):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.delenv(claude_code.CLI_PATH_ENV, raising=False)
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("runtime resolution must not compare CLI versions")
+
+    monkeypatch.setattr(claude_code.subprocess, "run", unexpected_probe)
+    monkeypatch.setattr(claude_code.shutil, "which", lambda _: "/newer/claude")
+    assert claude_code._cli_override() is None
+
+
+def test_cli_stderr_reaches_the_listeners_of_the_context_it_started_in(capsys):
+    from agent_flow.backends import claude_code
+
+    outer: list[str] = []
+    inner: list[str] = []
+    with claude_code.cli_stderr_to(outer.append):
+        claude_code._forward_stderr("one")
+        with claude_code.cli_stderr_to(inner.append):
+            claude_code._forward_stderr("two")
+    claude_code._forward_stderr("three")
+    assert outer == ["one", "two"] and inner == ["two"]
+    err = capsys.readouterr().err
+    assert "[claude-cli stderr] one" in err and "[claude-cli stderr] three" in err
+
+
+def test_a_cli_stderr_listener_is_its_own_threads_and_cannot_fail_the_reader():
+    import threading
+
+    from agent_flow.backends import claude_code
+
+    mine: list[str] = []
+
+    def broken(line: str) -> None:
+        raise OSError("disk full")
+
+    def elsewhere() -> None:
+        claude_code._forward_stderr("from another turn")
+
+    with claude_code.cli_stderr_to(mine.append), claude_code.cli_stderr_to(broken):
+        thread = threading.Thread(target=elsewhere)
+        thread.start()
+        thread.join()
+        claude_code._forward_stderr("mine")
+    assert mine == ["mine"]
+
+
+def test_the_launched_cli_is_the_override_with_its_version(monkeypatch):
+    from agent_flow.backends import claude_code
+
+    monkeypatch.setenv(claude_code.CLI_PATH_ENV, "/opt/claude/bin/claude")
+    monkeypatch.setattr(claude_code, "_claude_cli_version", lambda: "2.1.296")
+    assert claude_code.launched_cli() == ("/opt/claude/bin/claude", "2.1.296")

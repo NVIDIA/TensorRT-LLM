@@ -37,7 +37,7 @@ environment:
   trtllm_wheel_path: ""
   # 2) Else if build_wheel is true: build from trtllm_repo then `pip install -e .[devel]`.
   build_wheel: false
-  # Optional CUDA arch filter for build_wheel (e.g. "90-real;100-real"). Empty = all.
+  # Optional CUDA arch filter for build_wheel (e.g. "90;100"). Empty = all.
   cuda_architectures: ""
   # 3) If neither is set: use the TensorRT-LLM already installed in the container.
 

@@ -40,9 +40,19 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class StaticHostMem
 {
 public:
+    //! Holds nothing. Move-assign an allocated one over it to fill it.
+    StaticHostMem() = default;
+
+    //! A size of zero holds nothing, as the default constructor does.
+    //!
     //! Throws CuError when the allocation fails, which is also how an oversized
     //! request is reported -- there is no internal chunking to fall back on.
     explicit StaticHostMem(size_t size);
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return mSize == 0;
+    }
 
     [[nodiscard]] MemAddress address() const noexcept
     {

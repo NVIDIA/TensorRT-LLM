@@ -25,25 +25,29 @@ def get_sparse_attn_kv_cache_manager(
     sparse_attention_config: "SparseAttentionConfig",
     use_kv_cache_manager_v2: bool = False,
 ) -> type:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from .rocket import RocketKVCacheManager
+    from .rocket import RocketKVCacheManager, RocketKVCacheManagerV2
 
+    if getattr(sparse_attention_config, "uses_dense_kv_cache", False):
+        # The algorithm keeps the dense KV cache. get_kv_cache_manager_cls
+        # routes such models through the dense manager selection; this maps an
+        # already chosen version to its class.
+        return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
     if sparse_attention_config.algorithm == "csa2":
         from .csa2.cache_manager import CSA2CacheManager
 
         return CSA2CacheManager
     if sparse_attention_config.algorithm == "rocket":
-        return RocketKVCacheManager
+        return RocketKVCacheManagerV2 if use_kv_cache_manager_v2 else RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
-    elif sparse_attention_config.algorithm == "skip_softmax":
-        return KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
     elif sparse_attention_config.algorithm == "qsa":
@@ -83,6 +87,10 @@ def get_vanilla_sparse_attn_attention_backend(
 
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
+    elif sparse_params.algorithm == "dsa":
+        from .dsa import DSAVanillaAttention
+
+        return DSAVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
     else:

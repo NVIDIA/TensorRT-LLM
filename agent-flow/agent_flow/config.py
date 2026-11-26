@@ -16,10 +16,14 @@ CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-astra")
 class BackendConfig:
     kind: BackendKind
     model: str
-    # Provider reasoning tier. ``None`` retains the backend's historical
-    # maximum-effort default.
+    # Provider reasoning tier. ``None`` leaves it to the backend: Claude
+    # Code's maximum, or the effort Codex's own configuration sets.
     reasoning_effort: str | None = None
     disabled_skills: tuple[str, ...] = ()
+    # ``False`` runs Codex without the plugins and apps its user installed
+    # (Slack, mail, drives...): an unattended session gets only the tools it
+    # is configured with here. Claude Code takes plugins from its settings.
+    plugins: bool = True
     tools: list[Any] | None = None
     # Native SDK hook configuration. Claude accepts HookMatcher callbacks.
     # Codex requires hooks to be configured and trusted in its native config;
@@ -39,11 +43,18 @@ class BackendConfig:
     # diff the session cwd's git HEAD and must target the task's repo,
     # not the framework repo.
     cwd: Path | None = None
+    # Directories besides ``cwd`` the agent writes. A Codex session the site
+    # runs in a workspace-write sandbox may write them within the native policy;
+    # they do not select a sandbox or grant approval. Claude Code ignores them.
+    writable_roots: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class SessionConfig:
     mode: SessionMode = "stateless"
+    # Start as a fork of this earlier session (its backend id): with its
+    # history, under a new id. Only backends that can fork accept it.
+    fork_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,13 +93,9 @@ class AgentLayerConfig:
     # Tool names this layer must not be able to call, on top of whatever
     # the layer bans for its own reasons.
     #
-    # Needed because the Claude Code backend runs with
-    # ``permission_mode="bypassPermissions"`` and the sandbox off — the
-    # right default for a layer whose whole job is to edit a checkout and
-    # run benchmarks, and the wrong one for a layer whose INPUT is
-    # untrusted. A layer that reads text a stranger pasted into a web form
-    # and only has to produce YAML should not also be able to run ``Bash``
-    # on the host: the paste would be a path to arbitrary execution.
+    # Tool scope is independent of native CLI filesystem permissions. A layer
+    # that only produces structured output can exclude Bash/Write even when
+    # the launching CLI configuration permits them.
     #
     # Names are the tool names the model sees (``Bash``, ``Write``,
     # ``WebFetch``, ...). Empty means "no extra bans", which is the

@@ -27,25 +27,32 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // makeLifeCycle — factory dispatching on LayerConfig variant.
 // ---------------------------------------------------------------------------
 
-LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
+LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock)
 {
     return std::visit(
         [&](auto const& cfg) -> LifeCycle
         {
-            cfg.validate();
+            auto const policy = buffer.effectiveReusePolicy(cfg.reusePolicy);
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, SsmLayerConfig>)
             {
-                return SsmLifeCycle{};
+                return SsmLifeCycle{policy};
             }
             else
             {
-                bool const isSparse = !cfg.buffers.empty() && cfg.buffers.front().isSparse;
-                return AttnLifeCycle::make(
-                    cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse, cfg.reusePolicy);
+                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, policy);
             }
         },
         layer);
+}
+
+LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex)
+{
+    // RegionConfig::validate() admits request regions only; a token-block region would map
+    // to an AttnLifeCycle with the region's own window.
+    TLLM_CHECK_WITH_INFO(region.allocationUnit == RegionAllocationUnit::kRequest,
+        "Region '%s': only request regions are supported", region.name.c_str());
+    return SsmLifeCycle{region.reusePolicy, regionIndex};
 }
 
 // ---------------------------------------------------------------------------
@@ -54,9 +61,8 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
 
 LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
 {
-    for (auto const& layer : config.layers)
+    auto const registerLifeCycle = [this](LifeCycle const& lc)
     {
-        LifeCycle lc = makeLifeCycle(layer, config.tokensPerBlock);
         if (mLifeCycleIdMap.find(lc) == mLifeCycleIdMap.end())
         {
             check();
@@ -64,10 +70,41 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
             mLifeCycleList.push_back(lc);
             mLifeCycleIdMap[lc] = id;
             if (std::holds_alternative<SsmLifeCycle>(lc))
-                mSsmLifeCycleId = id;
+                mSsmLifeCycleIds.push_back(id);
+        }
+    };
+    for (auto const& layer : config.layers)
+    {
+        std::visit([](auto const& cfg) { cfg.validate(); }, layer);
+        for (auto const& buffer : layerBuffers(layer))
+        {
+            registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
         }
     }
+    // The region index is part of a region's lifecycle, so each region registers a new one.
+    mRegionLifeCycleIds.reserve(config.regions.size());
+    for (size_t regionIndex = 0; regionIndex < config.regions.size(); ++regionIndex)
+    {
+        auto const& region = config.regions[regionIndex];
+        region.validate();
+        auto const lc = makeLifeCycle(region, static_cast<int>(regionIndex));
+        registerLifeCycle(lc);
+        auto const id = getId(lc);
+        mRegionLifeCycleIds.push_back(id);
+        TLLM_CHECK_WITH_INFO(mRegionLifeCycleIdByName.emplace(region.name, id).second,
+            "Region name '%s' is declared twice", region.name.c_str());
+    }
     check();
+}
+
+LifeCycleId LifeCycleRegistry::regionLifeCycleId(std::string const& name) const
+{
+    auto const it = mRegionLifeCycleIdByName.find(name);
+    if (it == mRegionLifeCycleIdByName.end())
+    {
+        throw std::out_of_range("LifeCycleRegistry: no region named '" + name + "'");
+    }
+    return it->second;
 }
 
 LifeCycle const& LifeCycleRegistry::operator[](LifeCycleId id) const
@@ -88,18 +125,6 @@ LifeCycleId LifeCycleRegistry::getId(LifeCycle const& lc) const
         throw std::out_of_range("LifeCycleRegistry::getId: life cycle not found");
     }
     return it->second;
-}
-
-LifeCycleId LifeCycleRegistry::size() const noexcept
-{
-    check();
-    return mLifeCycleList.size();
-}
-
-inline void LifeCycleRegistry::check() const
-{
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/utils/math.h"
 
 #include <cuda_runtime_api.h>
 
@@ -25,6 +26,8 @@
 #include <cstdint>
 #include <memory>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -35,6 +38,13 @@ struct PoolDesc
     PoolIndex poolIndex{0};
     MemAddress baseAddress = 0;
     size_t slotBytes = 0;
+
+    //! What this pool's pages actually are, which is its group's tier except for a sparse
+    //! pool of the GPU tier: those are host-backed, and the group still reports GPU_MEM
+    //! because its other pools are not.
+    CacheTier storageMedium = CacheTier::GPU_MEM;
+    // Mapped byte ranges [begin, end) relative to baseAddress; a localized pool has holes between them.
+    std::vector<HalfOpenRange<size_t>> mappedRanges;
 };
 
 //! Describes one hot pool group and the lifecycles that share its physical layout.

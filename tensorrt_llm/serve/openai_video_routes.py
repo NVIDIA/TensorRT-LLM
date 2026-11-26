@@ -30,12 +30,13 @@ from pydantic import ValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
+from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings,
     build_visual_gen_timing_headers,
 )
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
@@ -57,7 +58,8 @@ def _video_content_type(suffix: str) -> str:
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
 
-# Reference fields whose multipart text form is a JSON object, not a scalar.
+# The reference fields of a video request. Their multipart text form is a JSON
+# object, not a scalar.
 _REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
 
 
@@ -129,13 +131,23 @@ def _path_json_video_response(
     return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
+def _release_references(params: VisualGenParams) -> None:
+    """Drop the route's reference payloads once the engine holds its own copy.
+
+    ``generate_async`` snapshots ``params`` before it returns, so a job that
+    runs for minutes does not also keep the route's copy of its media.
+    """
+    for field in _REFERENCE_FIELDS:
+        setattr(params, field, None)
+
+
 class _VideoRoutesMixin:
     """Mixin providing the eight video-generation endpoints.
 
     Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
     ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
-    their own initializer.
+    ``self._adjusted_steady_clock``, ``self._parse_visual_gen_params``, and
+    ``self.create_error_response``.
     """
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
@@ -146,7 +158,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files (``{video_id}_{i}``).
@@ -160,7 +172,7 @@ class _VideoRoutesMixin:
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 request_format = _resolve_tensor_only_format(
                     request.format, params.extra_params, self.generator.extra_param_specs
                 )
@@ -174,9 +186,10 @@ class _VideoRoutesMixin:
                 handle = await asyncio.to_thread(
                     self.generator.generate_async, request.prompt, params
                 )
+                _release_references(params)
                 output = await handle.aresult()
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
@@ -270,7 +283,7 @@ class _VideoRoutesMixin:
             )
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(
@@ -307,10 +320,35 @@ class _VideoRoutesMixin:
             form = await raw_request.form()
             data = {}
             for key in form:
+                if key in _REFERENCE_FIELDS:
+                    # Preserve repeated uploads and JSON objects/lists in their
+                    # per-slot wire order. FormData[key] keeps only the last part.
+                    references = []
+                    for value in form.getlist(key):
+                        if hasattr(value, "file"):
+                            references.append(value)
+                            continue
+                        if value == "":
+                            continue
+                        try:
+                            reference = json.loads(value)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"'{key}' must be an uploaded file or a JSON object/list string "
+                                f'like {{"content": ..., "format": "url"}}; {exc}'
+                            ) from exc
+                        references.append(reference)
+                    if len(references) == 1:
+                        data[key] = references[0]
+                    elif references:
+                        data[key] = [
+                            item
+                            for reference in references
+                            for item in (reference if isinstance(reference, list) else [reference])
+                        ]
+                    continue
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded reference file (image_reference / video_reference)
-                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -323,19 +361,6 @@ class _VideoRoutesMixin:
                             f"'extra_params' must be a JSON object string; {exc}"
                         ) from exc
                     continue
-                if key in _REFERENCE_FIELDS:
-                    # A reference sent as a text part is the object form; a file
-                    # part was already routed above and carries its own format.
-                    if value == "":
-                        continue
-                    try:
-                        data[key] = json.loads(value)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(
-                            f"'{key}' must be an uploaded file or a JSON object string "
-                            f'like {{"content": ..., "format": "url"}}; {exc}'
-                        ) from exc
-                    continue
                 if value == "":
                     continue
                 data[key] = value
@@ -343,35 +368,6 @@ class _VideoRoutesMixin:
 
         raise ValueError(
             f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
-        )
-
-    def _render_pydantic_validation_error(self, exc: ValidationError) -> Response:
-        """Render a multipart Pydantic ``ValidationError`` as the LLM envelope.
-
-        The visual-gen-scoped 422 envelope is the same shape JSON requests
-        get from the FastAPI ``RequestValidationError`` handler, so JSON
-        and multipart clients see indistinguishable bodies on bad
-        payloads.
-        """
-        parts: list[str] = []
-        for err in exc.errors():
-            loc = ".".join(str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead."
-                )
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
     async def openai_video_generation_async(
@@ -386,7 +382,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files and keys its VIDEO_STORE entry.
@@ -398,7 +394,7 @@ class _VideoRoutesMixin:
             if path_error is not None:
                 return path_error
 
-            params = parse_visual_gen_params(request, self.generator)
+            params = await self._parse_visual_gen_params(request)
             # Synchronously validate the resolved params against the
             # loaded pipeline's extra-param specs / declared defaults
             # so unknown ``extra_params`` keys and similar engine-side
@@ -423,6 +419,7 @@ class _VideoRoutesMixin:
             # Awaited before the 202, so bad media / unknown extra_params are a
             # 400 rather than a queued job that later fails.
             handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
+            _release_references(params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.
@@ -456,7 +453,7 @@ class _VideoRoutesMixin:
             return JSONResponse(content=video_job.model_dump(), status_code=202)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(exc, self.create_error_response)
         except ValueError as e:
             logger.error(f"Async video request error: {e}")
             return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)

@@ -394,28 +394,22 @@ class TestSafeAiohttpGet:
             try:
                 assert isinstance(session.connector._resolver, _ValidatingResolver)
             finally:
-                await session.close()
-                media_io_module._global_aiohttp_session = None
-                media_io_module._global_aiohttp_session_loop = None
+                await media_io_module._close_aiohttp_session()
 
         self._run(check())
 
-    def test_shared_session_is_recreated_for_a_new_event_loop(self):
+    def test_each_event_loop_closes_its_own_session(self):
         async def get_session():
-            return await media_io_module._get_aiohttp_session()
+            session = await media_io_module._get_aiohttp_session()
+            await media_io_module._close_aiohttp_session()
+            return session
 
         first = self._run(get_session())
-        second = None
-        try:
-            second = self._run(get_session())
-            assert second is not first
-            assert first.closed
-        finally:
-            session = second or first
-            if not session.closed:
-                self._run(session.close())
-            media_io_module._global_aiohttp_session = None
-            media_io_module._global_aiohttp_session_loop = None
+        second = self._run(get_session())
+
+        assert second is not first
+        assert first.closed
+        assert second.closed
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_maps_timeout_to_fetch_error(self, _):

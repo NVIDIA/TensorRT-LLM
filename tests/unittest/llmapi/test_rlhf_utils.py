@@ -16,10 +16,13 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from torch import nn
 
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
+
+pytestmark = pytest.mark.cpu_only
 
 
 @torch.no_grad()

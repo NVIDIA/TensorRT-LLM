@@ -17,8 +17,10 @@
 import importlib.util
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 
@@ -110,6 +112,44 @@ def test_fork_with_old_datasets_is_not_usable(client: ModuleType, monkeypatch, t
     usable, log = _probe(client, monkeypatch, tmp_path)
     assert not usable
     assert "datasets 3.1.0" in log
+
+
+@pytest.mark.parametrize("recovered_after_install", [True, False])
+def test_probe_timeout_attempts_one_recovery(
+    client: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    recovered_after_install: bool,
+) -> None:
+    """A timed-out probe allows one install and still rejects an unusable stack."""
+    timeout = subprocess.TimeoutExpired([sys.executable, "-c", "probe"], timeout=120)
+    after_install = subprocess.CompletedProcess([], 0) if recovered_after_install else timeout
+    run = Mock(side_effect=[timeout, after_install])
+    install = Mock()
+    heartbeat = Mock(return_value=nullcontext())
+    monkeypatch.delenv("AGENTX_FORCE_REINSTALL", raising=False)
+    monkeypatch.delenv("AGENTX_AIPERF_REF", raising=False)
+    monkeypatch.setattr(client.subprocess, "run", run)
+    monkeypatch.setattr(client, "_pip", install)
+    monkeypatch.setattr(client, "_Heartbeat", heartbeat)
+
+    if recovered_after_install:
+        client.ensure_aiperf("http://h:1", "test-model")
+    else:
+        with pytest.raises(RuntimeError, match="still not importable after install"):
+            client.ensure_aiperf("http://h:1", "test-model")
+
+    assert run.call_count == 2
+    assert all(call.kwargs["timeout"] == 120 for call in run.call_args_list)
+    heartbeat.assert_called_once_with("http://h:1", "test-model")
+    aiperf_installs = [
+        call
+        for call in install.call_args_list
+        if f"aiperf @ {client.DEFAULT_AIPERF_REF}" in call.args
+    ]
+    assert len(aiperf_installs) == 1
+    expected_timeouts = 1 if recovered_after_install else 2
+    assert capfd.readouterr().out.count("import probe timed out after 120s") == expected_timeouts
 
 
 def _default_cmd(client: ModuleType, monkeypatch) -> list[str]:

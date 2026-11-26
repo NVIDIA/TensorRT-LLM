@@ -27,6 +27,8 @@ from .modeling_utils import get_model_architecture
 
 __all__ = [
     "AfmoeForCausalLM",
+    "Apertus1p5ForConditionalGeneration",
+    "ApertusForCausalLM",
     "AutoModelForCausalLM",
     "BartForConditionalGeneration",
     "BertForSequenceClassification",
@@ -69,12 +71,14 @@ __all__ = [
     "MistralForCausalLM",
     "MixtralForCausalLM",
     "MllamaForConditionalGeneration",
+    "MuseSparkForConditionalGeneration",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
     "NemotronHMultimodalModel",
     "NemotronNASForCausalLM",
     "Phi3ForCausalLM",
     "Phi4MMForCausalLM",
+    "PplxDeciderForDecision",
     "Qwen2ForCausalLM",
     "Qwen2ForProcessRewardModel",
     "Qwen2ForRewardModel",

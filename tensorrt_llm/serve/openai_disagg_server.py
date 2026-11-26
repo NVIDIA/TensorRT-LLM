@@ -16,12 +16,13 @@
 # yapf: disable
 import asyncio
 import json
+import os
 import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -54,9 +55,12 @@ from tensorrt_llm.serve.cluster_storage import (
     validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
+from tensorrt_llm.serve.coordinator_server import SHUTDOWN_POLL_S
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
@@ -72,6 +76,7 @@ from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 guard_responses_stream,
                                                 stream_error_event)
 from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -108,6 +113,16 @@ _CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
 # strictly better than applying it.
 _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
 
+# nginx's "client closed request" status, for a request whose client left
+# before its response started. No client reads it; it only labels the request
+# for middleware.
+_CLIENT_CLOSED_REQUEST_STATUS = 499
+
+
+class _ClientDisconnected(Exception):
+    """The client closed its connection before the response started."""
+
+
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
                  collect_perf_metrics: bool):
@@ -136,6 +151,9 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_disagg_request_id(self, disagg_request_id: int):
         self.disagg_request_id = disagg_request_id
         self.request_id = str(disagg_request_id)
+        # A route that names its reply after the request (Anthropic Messages)
+        # reads it here, the id the perf metrics record.
+        self.raw_req.state.disagg_request_id = disagg_request_id
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
@@ -212,6 +230,13 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class OpenAIDisaggServer:
+    # Per-request hooks class instantiated by the entry-point wrapper.
+    # Subclasses may substitute a ResponseHooks implementation with the same
+    # constructor signature to observe the request lifecycle (e.g. relay
+    # context-leg fields onto the final response) without overriding the
+    # wrapper itself.
+    response_hooks_cls = RawRequestResponseHooks
+
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -244,9 +269,13 @@ class OpenAIDisaggServer:
         if config.disagg_cluster_config:
             validate_http_cluster_storage_scope(
                 config.disagg_cluster_config.cluster_uri, config.hostname)
-            self._disagg_cluster_storage = create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri,
-                config.disagg_cluster_config.cluster_name)
+            # This app serves only an HTTP cluster storage; an etcd one is used
+            # by the coordinator alone.
+            if not config.disagg_cluster_config.cluster_uri.startswith(
+                    "etcd://"):
+                self._disagg_cluster_storage = create_cluster_storage(
+                    config.disagg_cluster_config.cluster_uri,
+                    config.disagg_cluster_config.cluster_name)
         # The server doesn't build routers -- the coordinator object does:
         # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
         # server just reads .ctx_router / .gen_router off whichever it holds.
@@ -290,6 +319,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
@@ -336,7 +367,8 @@ class OpenAIDisaggServer:
             disagg_id_generator=disagg_id_generator,
             request_perf_metrics=self._collect_perf_metrics,
             internal_disagg_auth_key=self._config.internal_request_auth_key,
-            bounded_replay_on_generation=self._config.bounded_replay_on_generation)
+            bounded_replay_on_generation=self._config.bounded_replay_on_generation,
+            frontend_affinity=self._config.ctx_frontend_affinity)
         return client
 
     def register_routes(self):
@@ -410,15 +442,20 @@ class OpenAIDisaggServer:
 
         # Give parent-only requests an independent conversation identity.
         if req.conversation_params is None:
-            req.conversation_params = ConversationParams(
-                conversation_id=f"subagent:{uuid.uuid4()}")
+            req.conversation_params = ConversationParams.for_one_request(
+                f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
-    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+    def _wrap_entry_point(self,
+                          entry_point: Callable,
+                          request_type: type = UCompletionRequest,
+                          hold_headers_until_first_chunk: bool = True) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
         # CompletionRequest first and 400 every chat body, so override the wrapper's
         # annotation with request_type (as openai_server.py does).
+        # hold_headers_until_first_chunk=False returns a stream at once, for a
+        # caller that keeps it alive until the first chunk (/v1/messages pings).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
@@ -435,29 +472,109 @@ class OpenAIDisaggServer:
                 self._extract_conversation_id(
                     req, raw_req,
                     self._config.conversation_affinity_header_for_subagents)
-                hooks = RawRequestResponseHooks(
+                hooks = self.response_hooks_cls(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
-                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
                     if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
+                        # A relayed Responses stream that fails ends with an
+                        # `error` event, even before its first frame.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
+                    # Hold the headers until the first chunk: a chat or
+                    # completion stream that fails before it (e.g. a generation
+                    # server's KV-cache transfer error) becomes an HTTP error,
+                    # not a 200 whose body is cut off.
+                    if hold_headers_until_first_chunk:
+                        stream = await self._start_stream(stream, raw_req)
+                    self._perf_metrics_collector.total_responses.inc()
                     return StreamingResponse(
                         content=stream,
                         media_type="text/event-stream")
+                self._perf_metrics_collector.total_responses.inc()
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
                     content=response_or_generator.model_dump(by_alias=True))
+            except _ClientDisconnected:
+                # The upstream stream is already closed; end the request
+                # quietly instead of raising into the ASGI server.
+                return Response(status_code=_CLIENT_CLOSED_REQUEST_STATUS)
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _start_stream(
+            stream: AsyncGenerator[str | bytes, None],
+            raw_request: Request) -> AsyncGenerator[str | bytes, None]:
+        """Pull a relayed stream's first chunk before the response headers go out.
+
+        A worker that fails before its first chunk then raises here and becomes an
+        HTTP error response instead of a 200 whose body is cut off. The returned
+        relay is already started, so closing it before its first chunk still closes
+        `stream` and releases the request's routing state.
+
+        Args:
+            stream: The relayed response stream from the disaggregated service.
+            raw_request: The client request whose disconnect cancels the wait.
+
+        Returns:
+            `stream` itself when it is already exhausted; otherwise a started
+            relay that yields the first chunk and then the rest of `stream`.
+
+        Raises:
+            _ClientDisconnected: The client left before the first chunk;
+                `stream` is closed.
+        """
+        async def wait_for_disconnect() -> None:
+            while True:
+                message = await raw_request.receive()
+                if message["type"] == "http.disconnect":
+                    return
+
+        first_chunk_task = asyncio.ensure_future(anext(stream))
+        disconnect_task = asyncio.create_task(wait_for_disconnect())
+        handed_off = False
+        try:
+            done, _ = await asyncio.wait(
+                (first_chunk_task, disconnect_task),
+                return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done:
+                disconnect_task.result()
+                raise _ClientDisconnected()
+            try:
+                first_chunk = first_chunk_task.result()
+            except StopAsyncIteration:
+                return stream
+
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+
+            async def relay() -> AsyncGenerator[str | bytes, None]:
+                async with aclosing(stream):
+                    yield b""  # Consumed below to enter the cleanup scope.
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+
+            relayed = relay()
+            await anext(relayed)
+            handed_off = True
+            return relayed
+        finally:
+            if not handed_off:
+                for task in (first_chunk_task, disconnect_task):
+                    if not task.done():
+                        task.cancel()
+                # A generator cannot be closed while its first anext is running.
+                await asyncio.gather(first_chunk_task,
+                                     disconnect_task,
+                                     return_exceptions=True)
+                await stream.aclose()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -469,18 +586,27 @@ class OpenAIDisaggServer:
                                             400)
 
         try:
+            # The reframed stream pings until the first chunk, so its headers go
+            # out at once; a failure before that chunk ends in an error event.
             openai_response = await self._wrap_entry_point(
-                self._service.openai_chat_completion)(chat_request, raw_request)
+                self._service.openai_chat_completion,
+                hold_headers_until_first_chunk=False)(chat_request,
+                                                      raw_request)
         except HTTPException as e:
             error_type = ("invalid_request_error"
                           if 400 <= e.status_code < 500 else "api_error")
             return anthropic_error_response(str(e.detail), error_type,
                                             e.status_code)
 
+        # The reply is named after the disaggregated request rather than the
+        # worker's own id for it (see anthropic_message_id).
+        disagg_request_id = getattr(raw_request.state, "disagg_request_id",
+                                    None)
         if isinstance(openai_response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
+                                              model=request.model,
+                                              request_id=disagg_request_id),
                 media_type="text/event-stream",
             )
 
@@ -499,7 +625,8 @@ class OpenAIDisaggServer:
         try:
             chat_response = ChatCompletionResponse(
                 **json.loads(openai_response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=disagg_request_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
@@ -589,6 +716,12 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif isinstance(exception, NoGenerationSeatError):
+            # Overload (no generation seat in time, or shutdown): the client
+            # should retry, so 503 without a traceback.
+            self._perf_metrics_collector.http_exceptions.inc()
+            logger.warning(f"Generation request rejected: {exception}")
+            raise HTTPException(status_code=503, detail=str(exception)) from exception
         elif isinstance(exception, UnusedChatTemplateKwargsError):
             # Raised while this server tokenizes a chat request for routing.
             # It is a client mistake (a chat_template_kwargs key the template
@@ -620,7 +753,29 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        await create_uvicorn_server(config).serve(sockets=sockets)
+        server = create_uvicorn_server(config)
+        if not isinstance(self._coordinator, DisaggCoordinatorService):
+            await server.serve(sockets=sockets)
+            return
+        watcher = asyncio.create_task(
+            self._fail_seat_waiters_at_shutdown(server))
+        try:
+            await server.serve(sockets=sockets)
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _fail_seat_waiters_at_shutdown(self,
+                                             server: uvicorn.Server) -> None:
+        """Fail the requests waiting for a generation seat once shutdown begins.
+
+        uvicorn's graceful shutdown waits for every request in flight, so the
+        lifespan teardown that also fails them would run only after they got a
+        seat or their KV transfer deadline (as in ``CoordinatorServer``).
+        """
+        while not server.should_exit:
+            await asyncio.sleep(SHUTDOWN_POLL_S)
+        await self._coordinator.fail_seat_waiters()
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).
@@ -713,8 +868,7 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        server_scheme = "http://" if not server.startswith("http://") else ""
-        server_url = f"{server_scheme}{server}/steady_clock_offset"
+        server_url = f"{_server_base_url(server)}/steady_clock_offset"
 
         try:
             async with aiohttp.ClientSession(

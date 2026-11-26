@@ -11,10 +11,11 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "NemotronHPuzzleForCausalLM")
-@register_mapper("HF", "NemotronHForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHPuzzleForCausalLM")
+@register_mapper(CheckpointFormat.HF, "NemotronHForCausalLM")
 class NemotronHHfWeightMapper(HfWeightMapper):
 
     @staticmethod
@@ -74,9 +75,9 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             if "backbone" in key:
                 key = key.replace("backbone", "model")
 
-            # change embedding layer to embed_token
-            if "embeddings" in key:
-                key = key.replace("embeddings", "embed_tokens")
+            # change embedding layer to embed_token. Shipped checkpoints name it
+            # `embeddings`; transformers 5.x save_pretrained writes `embedding`.
+            key = re.sub(r"(^|\.)embeddings?\.", r"\1embed_tokens.", key)
 
             # MTP layers are stored as mtp.layers.0.xxx (sublayer 0, Attention) and mtp.layers.1.xxx (sublayer 1, MoE)
             if "mtp.layers." in key:

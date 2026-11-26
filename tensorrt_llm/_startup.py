@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+from tensorrt_llm._startup_errors import mark_startup_stage
 from tensorrt_llm.logger import logger
 
 
@@ -33,6 +34,7 @@ class _StartupTimer:
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Log the complete or failed interval without suppressing exceptions."""
+        mark_startup_stage(exc_value, self.name)
         total = time.perf_counter() - self.started
         measured = sum(self.timings.values())
         parts = ", ".join(f"{name}={seconds:.3f}s" for name, seconds in self.timings.items())
@@ -58,8 +60,9 @@ class _StartupTimer:
     ) -> Iterator[None]:
         """Record outermost elapsed time, including failures, and log status.
 
-        Failed work still contributes to startup time; its exception propagates
-        and its completion marker is explicitly labelled ``failed``.
+        Failed work still contributes to startup time; its exception propagates,
+        records this phase as its startup stage unless an inner phase already
+        did, and its completion marker is explicitly labelled ``failed``.
         When ``metrics`` is provided, accumulate the same elapsed value under
         ``metric_name`` (or ``name``), including nested phases.
         """
@@ -71,6 +74,9 @@ class _StartupTimer:
         try:
             yield
             completed = True
+        except BaseException as exc:
+            mark_startup_stage(exc, f"{self.name}/{name}")
+            raise
         finally:
             elapsed = time.perf_counter() - start
             self.depth -= 1

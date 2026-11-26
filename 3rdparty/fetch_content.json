@@ -48,7 +48,10 @@
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
       "patch_file": [
         "patches/deepgemm_configurable_barrier_timeout.patch",
-        "patches/deepgemm_sm10x_family_target.patch"
+        "patches/deepgemm_sm10x_family_target.patch",
+        "patches/deepgemm_paged_mqa_logits_page_mask.patch",
+        "patches/deepgemm_mqa_logits_relu_fmax.patch",
+        "patches/deepgemm_mega_mhc_tiled_sf.patch"
       ]
     },
     {
@@ -62,7 +65,9 @@
       "git_repository": "https://github.com/deepseek-ai/FlashMLA.git",
       "git_tag": "15f13e5030374295491c5ce31b02d7e63a7772c6",
       "git_submodules_recurse": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/flashmla_release_gil.patch",
+      "_comment": "When changing git_tag, check the conditions for releasing the GIL that the comment in patches/flashmla_release_gil.patch lists against the new sources; the patch still applying does not show that they hold."
     },
     {
       "name": "fmt",
@@ -95,7 +100,15 @@
       "git_tag": "e2ebe7656649f619af0ad1d457b534283034655e",
       "git_submodules": "",
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/msa_strided_paged_kv.patch"
+      "patch_file": "patches/msa_minimax_m3.patch"
+    },
+    {
+      "name": "msa_vllm",
+      "git_repository": "https://github.com/vllm-project/MSA.git",
+      "git_tag": "25c144700f727b638067e98066a60507081b63ad",
+      "git_submodules": "",
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/msa_vllm_minimax_m31.patch"
     },
     {
       "name": "nanobind",
@@ -124,10 +137,9 @@
     {
       "name": "xgrammar",
       "git_repository": "https://github.com/mlc-ai/xgrammar",
-      "git_tag": "v0.1.32",
+      "git_tag": "v0.2.8",
       "git_shallow": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/xgrammar_cxx20.patch"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
     }
   ]
 }

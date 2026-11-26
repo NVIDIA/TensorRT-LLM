@@ -84,6 +84,85 @@ def gather_fp8_kv_rows(
     return selected, local_indices
 
 
+#: FlashInfer's GLM53_NOPE sparse-MLA row: 512 FP8 latent values, then four
+#: FP32 scales, one per 128-wide group.
+GLM53_NOPE_ROW_BYTES = 528
+GLM53_NOPE_PAGE_ROWS = 64
+
+
+@triton.jit
+def _pack_glm53_kv_rows_kernel(
+    rows,
+    indices,
+    scale,
+    packed,
+    packed_scales,
+    local_indices,
+    row_stride,
+    index_stride,
+    column_stride,
+    NUM_ROWS: tl.constexpr,
+    DIM: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    NUM_SCALES: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    index = tl.load(indices + (token // TOPK) * index_stride + (token % TOPK) * column_stride)
+    valid = (index >= 0) & (index < NUM_ROWS)
+    dim = tl.arange(0, DIM)
+    payload = tl.load(rows + index.to(tl.int64) * row_stride + dim, mask=valid, other=0)
+    tl.store(packed + token.to(tl.int64) * ROW_BYTES + dim, payload)
+    group_scales = tl.load(scale) + tl.zeros([NUM_SCALES], dtype=tl.float32)
+    scale_offset = token.to(tl.int64) * (ROW_BYTES // 4) + DIM // 4
+    tl.store(packed_scales + scale_offset + tl.arange(0, NUM_SCALES), group_scales)
+    tl.store(local_indices + token, tl.where(valid, token, -1))
+
+
+def pack_glm53_kv_rows(
+    rows: torch.Tensor, indices: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack selected FP8 rows into FlashInfer GLM53_NOPE pages and remap indices.
+
+    ``rows`` is ``[N, 1, 512]`` FP8 with contiguous features, ``indices`` is
+    ``[queries, topk]`` with ``topk`` a multiple of 64 and ``scale`` is the
+    cache's device FP32 dequantization scalar. Each packed row keeps the cached
+    FP8 bytes and repeats ``scale`` for all four groups, so it dequantizes to
+    the cached values. Returns uint8 pages ``[queries * topk / 64, 64, 528]``
+    and int32 local row ids; invalid indices remain -1.
+    """
+    dim = rows.shape[-1]
+    num_scales = (GLM53_NOPE_ROW_BYTES - dim) // 4
+    if rows.dtype != torch.float8_e4m3fn or num_scales * 128 != dim:
+        raise ValueError(
+            f"GLM53_NOPE packing needs FP8 rows of width 512, got {rows.dtype} width {dim}"
+        )
+    if indices.shape[1] % GLM53_NOPE_PAGE_ROWS:
+        raise ValueError(f"GLM53_NOPE packing needs topk % 64 == 0, got {indices.shape[1]}")
+    packed = torch.empty(
+        (indices.numel(), GLM53_NOPE_ROW_BYTES), dtype=torch.uint8, device=rows.device
+    )
+    local_indices = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
+    if indices.numel():
+        _pack_glm53_kv_rows_kernel[(indices.numel(),)](
+            rows.view(torch.uint8),
+            indices,
+            scale,
+            packed,
+            packed.view(torch.float32),
+            local_indices,
+            rows.stride(0),
+            indices.stride(0),
+            indices.stride(1),
+            NUM_ROWS=rows.shape[0],
+            DIM=dim,
+            ROW_BYTES=GLM53_NOPE_ROW_BYTES,
+            NUM_SCALES=num_scales,
+            TOPK=indices.shape[1],
+        )
+    return packed.view(-1, GLM53_NOPE_PAGE_ROWS, GLM53_NOPE_ROW_BYTES), local_indices
+
+
 _FP32_MIN = torch.finfo(torch.float32).min
 
 
@@ -512,6 +591,71 @@ def kpool_score(
     return out
 
 
+def kpool_score_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tokens_per_block: int,
+    *,
+    head_dim: int,
+    kpool: int,
+    q_scale: float,
+    w_scale: float,
+    request_ids: torch.Tensor,
+    max_kv_len: int,
+) -> torch.Tensor | None:
+    """FP8 :func:`kpool_score` for packed context rows, via DeepGEMM ``fp8_mqa_logits``.
+
+    The pool keys of every block table are gathered into ``[tables * pools, head_dim]``
+    and quantized per row; queries are quantized per (row, head), with their scales
+    folded into the head weights, so each score is ``sum_h w * relu(q . key)`` as in
+    :func:`kpool_score`. ``max_kv_len`` bounds every row's ``kv_lens``. Row ``r``
+    scores only the first ``kv_lens[r] // kpool`` pools of table ``request_ids[r]``;
+    later columns are not meaningful, so readers must stop there. The result may be
+    a strided view with an aligned row stride. Returns ``None`` when there are no
+    rows or no complete pools.
+    """
+    from tensorrt_llm.deep_gemm import fp8_mqa_logits
+
+    n = q.shape[0]
+    pools = max(0, int(max_kv_len)) // kpool
+    tables = block_tables.shape[0]
+    if n == 0 or pools == 0:
+        return None
+    positions = torch.arange(pools, device=q.device) * kpool
+    page = positions // tokens_per_block
+    offset = positions - page * tokens_per_block
+    slots = block_tables[:, page].long()  # [tables, pools]
+    keys = index_pool[slots, offset, 2 * head_dim : 3 * head_dim].reshape(-1, head_dim)
+    half = head_dim // 2
+    keys_fp8, key_scale = torch.ops.trtllm.fused_cat_fp8(keys[:, :half], keys[:, half:], False)
+    q_rows = q.reshape(-1, head_dim)
+    q_fp8, q_row_scale = torch.ops.trtllm.fused_cat_fp8(q_rows[:, :half], q_rows[:, half:], False)
+    head_weights = weights.float() * q_row_scale.view(n, -1) * (w_scale * q_scale)
+    start = request_ids.to(torch.int32) * pools
+    end = start + (kv_lens // kpool).to(torch.int32)
+    logits = fp8_mqa_logits(
+        q_fp8.view(q.shape),
+        (keys_fp8, key_scale.view(-1)),
+        head_weights,
+        start,
+        end,
+        clean_logits=False,
+    )
+    if tables == 1:
+        # DeepGEMM pads the logits rows to an aligned stride, as the pool top-k needs.
+        return logits[:, :pools]
+    # Keep the copy's rows aligned and wider than the selection, like the logits arena.
+    out = torch.empty(
+        n, max(1024, triton.cdiv(pools, 64) * 64), dtype=torch.float32, device=q.device
+    )
+    rows = torch.arange(n, device=q.device)
+    out[:, :pools] = logits[:, : tables * pools].view(n, tables, pools)[rows, request_ids.long()]
+    return out
+
+
 @triton.jit
 def _kpool_expand_kernel(
     SEL,
@@ -683,3 +827,66 @@ def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         triton.next_power_of_2(width),
     )
     return packed, lengths, nonempty
+
+
+@triton.jit
+def _merge_split_attention_kernel(
+    OUT,
+    LSE,
+    DST,
+    stride_out_row,
+    stride_out_head,
+    stride_lse_row,
+    stride_dst_tok,
+    stride_dst_head,
+    SPLITS: tl.constexpr,
+    DIM: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+    cols = tl.arange(0, DIM)
+    max_lse = float("-inf")
+    for s in range(SPLITS):
+        lse = tl.load(LSE + (tok * SPLITS + s) * stride_lse_row + head)
+        # A chunk without valid rows reports +inf (and a zero output).
+        lse = tl.where(lse == float("inf"), float("-inf"), lse)
+        max_lse = tl.maximum(max_lse, lse)
+    total = 0.0
+    acc = tl.zeros([DIM], dtype=tl.float32)
+    for s in range(SPLITS):
+        row = tok * SPLITS + s
+        lse = tl.load(LSE + row * stride_lse_row + head)
+        lse = tl.where(lse == float("inf"), float("-inf"), lse)
+        w = tl.where(max_lse == float("-inf"), 0.0, tl.exp(lse - max_lse))
+        part = tl.load(OUT + row * stride_out_row + head * stride_out_head + cols).to(tl.float32)
+        acc += w * part
+        total += w
+    acc = tl.where(total > 0.0, acc / total, 0.0)
+    tl.store(
+        DST + tok * stride_dst_tok + head * stride_dst_head + cols, acc.to(DST.dtype.element_ty)
+    )
+
+
+def merge_split_attention(
+    out: torch.Tensor, lse: torch.Tensor, num_tokens: int, splits: int, heads: int
+) -> torch.Tensor:
+    """Merge per-chunk attention ``[tokens * splits, H, D]`` by LSE into ``[tokens, heads, D]``.
+
+    ``lse`` is ``[tokens * splits, H]``; chunks without valid rows (LSE ``+inf``)
+    contribute nothing. Only the first ``heads`` query heads are merged.
+    """
+    dst = torch.empty((num_tokens, heads, out.shape[-1]), dtype=out.dtype, device=out.device)
+    if num_tokens:
+        _merge_split_attention_kernel[(num_tokens, heads)](
+            out,
+            lse,
+            dst,
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            dst.stride(0),
+            dst.stride(1),
+            SPLITS=splits,
+            DIM=out.shape[-1],
+        )
+    return dst

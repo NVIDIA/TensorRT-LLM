@@ -42,32 +42,90 @@ exchange runs:
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
-from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
-from .impl_contract import MoECommPlan, MoERunContext
+from .impl_contract import (
+    MoECommPlan,
+    MoEFusedRouteQuant,
+    MoERoutingTables,
+    MoERunContext,
+    MoESortTables,
+    PreroutedRouting,
+)
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
+from .routing import DeepSeekV4MoeRoutingMethod
 
 __all__ = [
     "MoEScheduler",
     "ExternalCommMoEScheduler",
     "FusedCommMoEScheduler",
     "create_moe_scheduler",
+    "routes_padding_nowhere",
 ]
 
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
+
+
+def _num_rows(t: Union[torch.Tensor, RouterLogitPartials]) -> int:
+    """Rows of ``t``; ``RouterLogitPartials`` hold theirs in dim 1 of ``[S, M, N]``."""
+    return t.parts.shape[1] if isinstance(t, RouterLogitPartials) else t.shape[0]
+
+
+def _leading_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """Return ``t[:rows]``, or ``t`` itself when it already has ``rows`` rows."""
+    return t if _num_rows(t) == rows else t[:rows]
+
+
+def _split_rows(t: torch.Tensor, sizes: List[int]) -> List[torch.Tensor]:
+    """Return ``list(t.split(sizes))``; one chunk covering ``t`` is ``t`` itself."""
+    if len(sizes) == 1 and sizes[0] == _num_rows(t):
+        return [t]
+    return list(t.split(sizes))
+
+
+def _record_routes(
+    moe: "ConfigurableMoE", routes: Optional[torch.Tensor], num_slots: int
+) -> Optional[torch.Tensor]:
+    """Record ``routes``, IDs in ``[0, num_slots)``, for expert statistics and
+    the layer-wise calibrator.
+
+    Returns ``routes``, or the routes the calibrator replays in their place.
+    """
+    if routes is not None:
+        ExpertStatistic.set_layer(moe.layer_idx)
+        ExpertStatistic.maybe_add_info(num_slots, routes)
+    return get_calibrator().maybe_collect_or_replay_slots(num_slots, routes)
+
+
+def _record_backend_slots(moe: "ConfigurableMoE", expert_ids: torch.Tensor) -> torch.Tensor:
+    """Record the slots of a backend that maps ``expert_ids`` to slots itself (``maps_expert_slots``).
+
+    Returns the expert IDs the backend runs: ``expert_ids``, or the experts of replayed slots.
+    """
+    if ExpertStatistic.get() is None and get_calibrator().mode not in (
+        CalibratorMode.COLLECT,
+        CalibratorMode.REPLAY,
+    ):
+        return expert_ids
+    slots = moe.backend.slots_of_experts(expert_ids)
+    recorded = _record_routes(moe, slots, moe.num_slots)
+    return expert_ids if recorded is slots else moe.backend.experts_of_slots(recorded)
 
 
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
@@ -80,6 +138,37 @@ def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
     return None
 
 
+@dataclasses.dataclass
+class MoEForwardHooks:
+    """What the caller of one ``ConfigurableMoE`` forward hands its scheduler: work to start right
+    after this forward's routing (the caller's forked shared expert), and an addend (the shared
+    expert's output) the combine may add itself once ``addend_ready`` fires. The scheduler sets
+    ``addend_fused`` when the combine took it."""
+
+    post_routing: Optional[Callable[[], None]] = None
+    addend: Optional[torch.Tensor] = None
+    addend_ready: Optional[torch.cuda.Event] = None
+    addend_fused: bool = False
+
+    def run_post_routing(self) -> None:
+        """Run ``post_routing`` once: the first chunk of a chunked forward that routes runs it."""
+        callback, self.post_routing = self.post_routing, None
+        if callback is not None:
+            callback()
+
+
+def routes_padding_nowhere(moe) -> bool:
+    """Whether ``moe`` routes the rows its forward's ``unrouted_rows`` mask sets to no expert."""
+    from .configurable_moe import ConfigurableMoE
+
+    return (
+        isinstance(moe, ConfigurableMoE)
+        and isinstance(moe.scheduler, ExternalCommMoEScheduler)
+        and moe.comm is not None
+        and moe.comm.carries_unrouted_rows()
+    )
+
+
 class MoEScheduler(ABC):
     """Forward-execution strategy for ConfigurableMoE.
 
@@ -90,6 +179,40 @@ class MoEScheduler(ABC):
 
     def __init__(self, moe: "ConfigurableMoE") -> None:
         self.moe = moe
+
+    def _try_fused_route_quant(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        routing_aux: Optional[torch.Tensor],
+        route_counters=None,
+    ) -> Optional[MoEFusedRouteQuant]:
+        """The backend's one-launch routing and input quantization (only the routing for an input
+        that arrives quantized), unless a routing aux, a router weight on the input, a dynamic
+        balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
+        that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
+        moe = self.moe
+        if (
+            routing_aux is not None
+            or moe.apply_router_weight_on_input
+            or moe._using_dynamic_load_balancer()
+            or not moe.backend.fused_route_quant_enabled
+        ):
+            return None
+        if isinstance(x, Fp4QuantizedTensor):
+            if route_counters is not None:
+                return None
+            return moe.backend.try_fused_route(x, router_logits)
+        if route_counters is not None and getattr(moe.backend, "counts_routes", False):
+            return moe.backend.try_fused_route_quant(
+                x, router_logits, route_counters=route_counters
+            )
+        return moe.backend.try_fused_route_quant(x, router_logits)
+
+    def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor]) -> bool:
+        """Whether this forward routes only in the backend's fused route+quant launch, so the router
+        logits may come as ``RouterLogitPartials``. A separately routed forward reads them whole."""
+        return False
 
     @abstractmethod
     def forward(
@@ -105,7 +228,13 @@ class MoEScheduler(ABC):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
-    ) -> torch.Tensor: ...
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``unrouted_rows`` (bool ``[rows, 1]``) marks filler rows to route to no expert, where
+        ``routes_padding_nowhere`` holds; elsewhere they route like the others."""
 
 
 # ============================================================================
@@ -135,6 +264,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
     artifacts when analyzing traces.
     """
 
+    def __init__(self, moe: "ConfigurableMoE") -> None:
+        super().__init__(moe)
+        # The EP2 pull combine, which also adds the shared expert's output, is measured on the
+        # DeepSeek-V4 MoE only. Every rank builds the same layers, so the collective setup lines up.
+        comm = getattr(moe, "comm", None)
+        if isinstance(comm, NVLinkOneSided) and isinstance(
+            getattr(moe, "routing_method", None), DeepSeekV4MoeRoutingMethod
+        ):
+            comm.enable_pull_combine()
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -148,9 +287,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``input_ready_event``: ``x`` is written on another stream. The join
         is deferred to the first kernel that reads ``x`` so routing overlaps it.
+        ``prerouted``: the routing of ``x`` (single chunk, no communication).
+        ``lamport_fc2_out``: see ``MoERunContext`` (single chunk).
         """
         moe = self.moe
 
@@ -175,17 +320,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         ):
             raise_moe_lora_multichunk_unsupported(num_chunks)
 
-        # ========== 0-token rank deadlock fix ==========
-        # When some ranks have 0 tokens in single-chunk forward with collective comm,
-        # those ranks hang in CUDA kernels (e.g. NVFP4 quantize_input with 0-row tensor)
-        # before reaching moe.comm.dispatch(), causing NCCL AllGather deadlock on
-        # non-zero ranks. Fix: activate DP padding uniformly across all ranks so every
-        # rank uses sizes=None (uniform allgather) and pads x/router_logits to max_tokens.
-        # Mirrors the empty-chunk substitution in _forward_multiple_chunks (line ~597-620).
-        # Existing truncation at Step 4 discards dummy-token outputs automatically.
-        # NOTE: kept after the multi-chunk rejection above so unit tests that stub `moe`
-        # with a minimal namespace (no `.comm`/`.use_dp`) still exercise that path; only
-        # relevant to single-chunk collective comm anyway.
+        # Quantization and dispatch need a nonempty local input on every peer.
+        # Give empty ranks one dummy row and keep variable-size collectives;
+        # padding every rank to the maximum would route and compute unused tokens.
+        # Multi-chunk execution reuses this row for subsequent empty chunks.
+        # Step 4 removes the dummy outputs using the original token counts.
         if (
             moe.comm is not None
             and moe.use_dp
@@ -193,26 +332,35 @@ class ExternalCommMoEScheduler(MoEScheduler):
             and not use_dp_padding
             and any(t == 0 for t in all_rank_num_tokens_padded)
         ):
-            use_dp_padding = True
-            all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
-            local_n = x.shape[0]
-            if local_n < all_rank_max_num_tokens:
-                input_ready_event = _wait_input_ready(input_ready_event)
-                pad = all_rank_max_num_tokens - local_n
-                x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
-                router_logits = torch.cat(
-                    [router_logits, router_logits.new_zeros((pad, router_logits.shape[1]))], dim=0
-                )
+            all_rank_num_tokens_padded = [max(1, n) for n in all_rank_num_tokens]
+            if x.shape[0] == 0:
+                x = x.new_zeros((1, x.shape[1]))
+                router_logits = router_logits.new_zeros((1, router_logits.shape[1]))
+                if input_ids is not None:
+                    input_ids = input_ids.new_zeros((1,) + input_ids.shape[1:])
                 if routing_aux is not None:
-                    routing_aux = torch.cat(
-                        [routing_aux, routing_aux.new_zeros((pad,) + routing_aux.shape[1:])]
-                    )
+                    routing_aux = routing_aux.new_zeros((1,) + routing_aux.shape[1:])
+                if unrouted_rows is not None:
+                    unrouted_rows = unrouted_rows.new_zeros((1,) + unrouted_rows.shape[1:])
 
         # May fall back AllToAll -> AllGather; this is the only sanctioned
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
 
         # ========== Step 3: Execute MoE computation ==========
+        if prerouted is not None and (num_chunks > 1 or moe.comm is not None or use_dp_padding):
+            raise ValueError("prerouted routing needs one chunk without communication or padding")
+        if lamport_fc2_out is not None and (
+            num_chunks > 1
+            or moe.comm is not None
+            or use_dp_padding
+            or do_finalize
+            or not moe.backend.takes_lamport_fc2_out
+        ):
+            raise ValueError(
+                "a Lamport FC2 output takes one un-finalized chunk without communication or padding, "
+                "of a backend that writes it"
+            )
         if num_chunks == 1:
             outputs = self._forward_single_chunk(
                 x,
@@ -225,6 +373,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 lora_params=lora_params,
                 routing_aux=routing_aux,
                 input_ready_event=input_ready_event,
+                moe_hooks=moe_hooks,
+                unrouted_rows=unrouted_rows,
+                prerouted=prerouted,
+                lamport_fc2_out=lamport_fc2_out,
             )
         else:
             input_ready_event = _wait_input_ready(input_ready_event)
@@ -239,6 +391,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 input_ids,
                 lora_params=lora_params,
                 routing_aux=routing_aux,
+                moe_hooks=moe_hooks,
+                unrouted_rows=unrouted_rows,
             )
 
         # ========== Step 4: Truncate DP padding ==========
@@ -252,7 +406,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # NVLink-specific EPLB stat-gather paths)
     # ------------------------------------------------------------------
     def _is_using_nvlink_two_sided(self) -> bool:
-        return isinstance(self.moe.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer))
+        return isinstance(self.moe.comm, NVLinkTwoSided)
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
@@ -376,6 +530,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -397,6 +555,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_hooks=moe_hooks,
+            unrouted_rows=unrouted_rows,
+            prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
         )
 
     def _forward_chunk_impl(
@@ -415,6 +577,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         row_offset: Optional[int] = 0,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -460,24 +626,38 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
         supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
+        fused_result = None
+        sort_tables = None
+        sorted_ids = None
         if requires_separated_routing:
-            # ``MoEImplBase`` declines a fused route+quant path by default. The
-            # conditions are the scheduler's: a fused result skips the separate
-            # dispatch and carries no per-token scale to fold a router weight or
-            # an EPLB layout into.
-            if (
-                supports_post_quant
-                and not moe._using_load_balancer()
-                and not moe.apply_router_weight_on_input
-                and routing_aux is None
-            ):
-                # A fused route+quant reads x.
-                input_ready_event = _wait_input_ready(input_ready_event)
-                fused_result = moe.backend.try_fused_route_quant(x, router_logits)
-            else:
-                fused_result = None
+            # A fused result is already quantized, so it needs post-quant dispatch.
+            if supports_post_quant:
+                if (
+                    isinstance(x, torch.Tensor)
+                    and routing_aux is None
+                    and not moe.apply_router_weight_on_input
+                    and not moe._using_dynamic_load_balancer()
+                ):
+                    # A fused route+quant reads an unquantized x; a quantized one is only routed.
+                    input_ready_event = _wait_input_ready(input_ready_event)
+                fused_result = self._try_fused_route_quant(
+                    x,
+                    router_logits,
+                    routing_aux,
+                    moe._warmup_placement_route_counters(row_offset),
+                )
+            # A routing kernel that also sorts writes tables for the ids it
+            # produced, so they hold only if those ids reach this rank as is.
+            sorted_result = None
+            if fused_result is None and routing_aux is None and moe.sort_routing_applies:
+                sorted_result = moe.backend.try_route_with_sort(router_logits)
 
-            if fused_result is None:
+            if sorted_result is not None:
+                token_selected_experts, token_final_scales, sort_tables = sorted_result
+                # The tables describe exactly these ids; hold on to them past the
+                # perfect-router hook below, which may rebind token_selected_experts.
+                sorted_ids = token_selected_experts
+            elif fused_result is None:
                 # Separated routing: ConfigurableMoE calls routing_method.
                 if routing_aux is None:
                     token_selected_experts, token_final_scales = moe.routing_method.apply(
@@ -488,10 +668,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         router_logits, input_ids, routing_aux
                     )
             else:
-                token_selected_experts, token_final_scales, x, x_sf = fused_result
+                token_selected_experts = fused_result.token_selected_experts
+                token_final_scales = fused_result.token_final_scales
+                x, x_sf = fused_result.x, fused_result.x_sf
                 used_fused_route_quant = True
+            if moe_hooks is not None:
+                moe_hooks.run_post_routing()
 
-            token_selected_experts = token_selected_experts.to(torch.int32)
+            token_selected_experts = moe._maybe_get_perfect_router_expert_ids(
+                token_selected_experts.to(torch.int32)
+            )
             if row_offset is not None:
                 route_capture = get_active_route_capture()
                 if route_capture is not None:  # R3: in-graph device-buffer capture
@@ -541,11 +727,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 f"EPLB is enabled but backend {moe.backend.__class__.__name__} "
                 f"has fused routing (does not support routing separation)"
             )
+            if moe._enable_perfect_router_expert_ids:
+                logger.warning_once(
+                    "ENABLE_PERFECT_ROUTER=expert_ids has no effect on "
+                    f"{moe.backend.__class__.__name__} here: it routes inside its "
+                    "kernel, so there are no routed expert ids to replace. Use "
+                    "ENABLE_PERFECT_ROUTER=1 instead; for TRTLLM, setting "
+                    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1 in every compared run "
+                    "also works.",
+                    key="perfect_router_expert_ids_fused_routing",
+                )
             token_selected_experts = None
             token_final_scales = None
 
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
+            # Only a fused-comm backend's routing launch counts its own picks (routes_counted).
+            moe._load_balancer_count_warmup(token_selected_experts, router_logits, row_offset)
             moe._load_balancer_done_wait_gpu_stage(is_first_call)
 
             # NVLink two-sided / one-sided gather EPLB stats themselves; skip the
@@ -570,6 +768,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
         token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
             moe.num_slots, token_selected_slots
         )
+        if (
+            unrouted_rows is not None
+            and token_selected_slots is not None
+            and moe.comm is not None
+            and moe.comm.carries_unrouted_rows()
+        ):
+            token_selected_slots = token_selected_slots.masked_fill(unrouted_rows, -1)
+        if sort_tables is not None and token_selected_slots is not sorted_ids:
+            # Replaced (perfect-router), replayed (calibrator) or masked ids: the
+            # routing kernel's tables describe other ids.
+            sort_tables = None
 
         # ========== Step 4: Communication prepare phase (NVLINK two-sided only) ==========
         local_statistic_tensor_for_dispatch = None
@@ -675,6 +884,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
+            # The tables index the fused launch's own expert ids: not after a remap or dispatch.
+            routing_tables=(
+                fused_result.routing_tables
+                if fused_result is not None
+                and token_selected_slots is fused_result.token_selected_experts
+                else None
+            ),
+            prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
+            sort_tables=sort_tables,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -714,9 +933,21 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
             all_rank_max_num_tokens = max(all_rank_num_tokens)
+            # The caller's addend (the shared expert's output) when the combine adds it itself.
+            addend_kwargs = {}
+            if (
+                moe_hooks is not None
+                and moe_hooks.addend is not None
+                and moe.comm.combine_fuses_addend(
+                    all_rank_max_num_tokens, moe_hooks.addend.shape[0]
+                )
+            ):
+                addend_kwargs = {"addend": moe_hooks.addend, "addend_ready": moe_hooks.addend_ready}
+                moe_hooks.addend_fused = True
             final_hidden_states = moe.comm.combine(
                 final_hidden_states,
                 all_rank_max_num_tokens=all_rank_max_num_tokens,
+                **addend_kwargs,
             )
         else:
             # Non-comm path: attention TP or single rank; only AllReduce if reduce_results
@@ -815,6 +1046,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Multiple-chunk path with optional aux-stream overlap."""
         moe = self.moe
@@ -851,8 +1084,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if routing_aux is not None
             else [None] * num_chunks
         )
+        unrouted_rows_list = (
+            list(unrouted_rows.split(chunk_size_list))
+            if unrouted_rows is not None
+            else [None] * num_chunks
+        )
 
-        use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
+        # A backend that reuses its buffers across calls can have only one chunk
+        # in flight, and each chunk's output is gone once the next one runs.
+        # A backend whose grid must be co-resident cannot overlap two chunks.
+        input_requirement = moe.backend.input_requirement
+        reuses_buffers = input_requirement.run_moe_reuses_buffers
+        use_multi_stream = (
+            not moe.enable_alltoall
+            and moe.aux_stream is not None
+            and not reuses_buffers
+            and not input_requirement.run_moe_requires_coresident_grid
+        )
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -890,6 +1138,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     router_logits_list[idx_chunk] = router_logits_list[0]
                     input_ids_list[idx_chunk] = input_ids_list[0]
                     routing_aux_list[idx_chunk] = routing_aux_list[0]
+                    unrouted_rows_list[idx_chunk] = unrouted_rows_list[0]
             # Mirror the empty-chunk substitution above into the work list:
             # all_rank_num_tokens_list feeds the varsize collectives, so every
             # rank must patch EVERY empty entry, not just its own -- the size
@@ -915,7 +1164,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             router_logits_chunk,
             input_ids_chunk,
             routing_aux_chunk,
-        ) in enumerate(zip(x_list, router_logits_list, input_ids_list, routing_aux_list)):
+            unrouted_rows_chunk,
+        ) in enumerate(
+            zip(x_list, router_logits_list, input_ids_list, routing_aux_list, unrouted_rows_list)
+        ):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
             chunk_row_offset = row_offset if chunked_used[idx_chunk] else None
@@ -939,6 +1191,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             lora_params=lora_params,
                             row_offset=chunk_row_offset,
                             routing_aux=routing_aux_chunk,
+                            moe_hooks=moe_hooks,
+                            unrouted_rows=unrouted_rows_chunk,
                         )
                 else:
                     outputs = self._forward_chunk_impl(
@@ -955,6 +1209,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         lora_params=lora_params,
                         row_offset=chunk_row_offset,
                         routing_aux=routing_aux_chunk,
+                        moe_hooks=moe_hooks,
+                        unrouted_rows=unrouted_rows_chunk,
                     )
             else:
                 outputs = self._forward_chunk_impl(
@@ -971,11 +1227,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     lora_params=lora_params,
                     row_offset=chunk_row_offset,
                     routing_aux=routing_aux_chunk,
+                    moe_hooks=moe_hooks,
+                    unrouted_rows=unrouted_rows_chunk,
                 )
 
             row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
-                outputs_list.append(outputs)
+                # The last chunk needs no copy: no further ``run_moe`` runs
+                # before the ``torch.cat`` below, which copies it anyway.
+                needs_copy = reuses_buffers and idx_chunk != num_chunks - 1
+                outputs_list.append(outputs.clone() if needs_copy else outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
         if use_multi_stream:
@@ -1048,6 +1309,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
+        routing_tables: Optional[MoERoutingTables] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+        sort_tables: Optional[MoESortTables] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -1067,12 +1332,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
             router_logits=router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
+            routing_tables=routing_tables,
             comm_plan=self._build_comm_plan(
                 all_rank_num_tokens,
                 output_dtype,
                 do_finalize,
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             ),
+            prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
+            sort_tables=sort_tables,
         )
 
     def _build_comm_plan(
@@ -1142,11 +1411,27 @@ class FusedCommMoEScheduler(MoEScheduler):
        so peers can cross the in-kernel NVLink barrier.
     8. No external Communication.dispatch / Communication.combine.
     9. No multi-stream chunk overlap.
+    10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
+        chunk outputs are kept, never copied, so such a backend would alias.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate
     ``moe.repeat_idx``.
     """
+
+    def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor]) -> bool:
+        """The fused launch routes this forward whenever ``_try_fused_route_quant`` admits it: no
+        routing aux, router weight on the input, dynamic balancer or per-layer dynamic replica
+        plan, and a backend that fuses."""
+        moe = self.moe
+        return (
+            routing_aux is None
+            and not moe.apply_router_weight_on_input
+            and not moe._using_dynamic_load_balancer()
+            and not moe._load_balancer_uses_replica_plan()
+            and moe.backend.fused_route_quant_enabled
+            and moe.backend.takes_router_logit_partials()
+        )
 
     def forward(
         self,
@@ -1161,6 +1446,10 @@ class FusedCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -1171,6 +1460,11 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        del unrouted_rows  # Filler rows route like the others here.
+        if prerouted is not None:
+            raise ValueError("fused-comm MoE backends route in-kernel")
+        if lamport_fc2_out is not None:
+            raise ValueError("fused-comm MoE backends finalize in-kernel")
         _wait_input_ready(input_ready_event)
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert
@@ -1188,6 +1482,19 @@ class FusedCommMoEScheduler(MoEScheduler):
                 "quantization happens in backend.quantize_input."
             )
 
+        # ``run_moe_reuses_buffers`` is an external-comm promise today: this
+        # scheduler already runs its chunks on one stream, but ``_run_chunks``
+        # keeps the tensor each chunk returned, so a backend whose next call
+        # overwrites it would hand ``torch.cat`` the same storage num_chunks
+        # times -- the last chunk's rows, silently, for every chunk. Refuse the
+        # combination rather than honour half of it.
+        if self.moe.backend.input_requirement.run_moe_reuses_buffers:
+            raise NotImplementedError(
+                f"{type(self.moe.backend).__name__} declares "
+                "run_moe_reuses_buffers; the fused-comm (MegaMoE) scheduler "
+                "does not copy chunk outputs and cannot drive it."
+            )
+
         x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta = (
             self._strip_adp_padding(x, router_logits, input_ids, all_rank_num_tokens)
         )
@@ -1198,12 +1505,12 @@ class FusedCommMoEScheduler(MoEScheduler):
         if input_ids_real is not None:
             chunk_size_list = all_rank_chunk_size_list[ep_rank]
             input_ids_chunks = (
-                list(input_ids_real.split(chunk_size_list)) if input_ids_real.numel() > 0 else []
+                _split_rows(input_ids_real, chunk_size_list) if input_ids_real.numel() > 0 else []
             )
         routing_aux_chunks = []
         if routing_aux is not None and x_real.shape[0] > 0:
-            routing_aux_chunks = list(
-                routing_aux[: x_real.shape[0]].split(all_rank_chunk_size_list[ep_rank])
+            routing_aux_chunks = _split_rows(
+                _leading_rows(routing_aux, x_real.shape[0]), all_rank_chunk_size_list[ep_rank]
             )
         outputs = self._run_chunks(
             x_chunks,
@@ -1290,9 +1597,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
         # ADP padding stripped before split, else trailing rows silently
         # drift into chunk-0 or torch.split shape-errors.
-        x_real = x[:real_local]
-        rl_real = router_logits[:real_local]
-        input_ids_real = input_ids[:real_local] if input_ids is not None else None
+        x_real = _leading_rows(x, real_local)
+        rl_real = _leading_rows(router_logits, real_local)
+        input_ids_real = _leading_rows(input_ids, real_local) if input_ids is not None else None
         return x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta
 
     def _compute_chunk_layout(
@@ -1332,8 +1639,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ``else []`` shortcut for real_local == 0: equivalent to
         # x_real.split([0]*num_chunks) but skips the no-op torch call. The
         # zero-token fallback in ``_run_chunks`` then fires for every chunk.
-        x_chunks = list(x_real.split(chunk_size_list)) if real_local > 0 else []
-        rl_chunks = list(rl_real.split(chunk_size_list)) if real_local > 0 else []
+        x_chunks = _split_rows(x_real, chunk_size_list) if real_local > 0 else []
+        rl_chunks = _split_rows(rl_real, chunk_size_list) if real_local > 0 else []
         return num_chunks, x_chunks, rl_chunks, all_rank_chunk_size_list
 
     def _run_chunks(
@@ -1353,8 +1660,10 @@ class FusedCommMoEScheduler(MoEScheduler):
     ) -> List[torch.Tensor]:
         """Drive the per-chunk kernel launches, padding zero-token chunks.
 
-        Stage hooks + AllReduce only fire at the (first|last) chunk of the
-        (first|last) repeat, matching the external-comm path. The
+        Standard EPLB stage hooks and statistics AllReduce only fire at the
+        (first|last) chunk of the (first|last) repeat, matching the
+        external-comm path. A per-layer dynamic EPLB layer instead plans every
+        chunk and releases that chunk's replica plan after its kernel. The
         ``idx_chunk >= len(x_chunks)`` branch only triggers when
         ``real_local == 0`` (this rank has no tokens but peers do): class
         invariant 7 says launch every chunk on every EP rank so the in-kernel
@@ -1377,7 +1686,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 # intact so routing / quantize / run_moe execute as no-ops
                 # without shape errors before reaching the barrier.
                 x_chunk = x_real.new_empty((0, x_real.shape[1]))
-                rl_chunk = rl_real.new_empty((0, rl_real.shape[1]))
+                rl_chunk = rl_real[0:0]
                 input_ids_chunk = None
                 routing_aux_chunk = None
 
@@ -1385,6 +1694,10 @@ class FusedCommMoEScheduler(MoEScheduler):
                 [lst[idx_chunk] for lst in all_rank_chunk_size_list] if had_meta else None
             )
 
+            # Bracket the whole chunk, not ``run_moe``: overrides of ``_forward_chunk`` (e.g. the
+            # GLM Rubin direct stage) launch the kernel themselves on some ranks only.
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             out_chunk = self._forward_chunk(
                 x_chunk,
                 rl_chunk,
@@ -1397,6 +1710,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 row_offset=row_offset,
                 routing_aux=routing_aux_chunk,
             )
+            if moe.enable_dummy_allreduce:
+                moe.dummy_allreduce()
             row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
         return outputs
@@ -1431,7 +1746,10 @@ class FusedCommMoEScheduler(MoEScheduler):
         quantize -> ``run_moe`` -> ``start_set_cpu_stage`` ->
         ``done_set_cpu_stage``. ``start/done_set_cpu_stage`` are placed
         AFTER ``run_moe``; otherwise dynamic-EPLB weight migration would
-        race with the fused kernel using those weights.
+        race with the fused kernel using those weights. A per-layer dynamic
+        EPLB layer has no CPU stage and no host statistics: it only gets
+        ``route`` and the post-``run_moe`` ``start_set_cpu_stage``, which
+        releases its replica plan.
         """
         moe = self.moe
         assert not moe.apply_router_weight_on_input, (
@@ -1454,32 +1772,76 @@ class FusedCommMoEScheduler(MoEScheduler):
             num_tokens = x.shape[0]
         assert num_tokens <= x.shape[0], f"num_tokens ({num_tokens}) > x.shape[0] ({x.shape[0]})"
 
-        x_chunk_real = x[:num_tokens]
-        router_logits_chunk_real = router_logits[:num_tokens]
-        input_ids_chunk_real = input_ids[:num_tokens] if input_ids is not None else None
+        x_chunk_real = _leading_rows(x, num_tokens)
+        router_logits_chunk_real = _leading_rows(router_logits, num_tokens)
+        input_ids_chunk_real = (
+            _leading_rows(input_ids, num_tokens) if input_ids is not None else None
+        )
+
+        # Per-layer dynamic EPLB plans on the GPU; the CPU-stage and
+        # statistics hooks below are no-ops for it, so it skips them.
+        uses_replica_plan = moe._load_balancer_uses_replica_plan()
 
         # ----- EPLB: drain previous CPU rebalance -----
         # Static EPLB early-returns inside the helper; only the dynamic
         # balancer actually waits.
-        moe._load_balancer_start_wait_gpu_stage(is_first_call)
+        if not uses_replica_plan:
+            moe._load_balancer_start_wait_gpu_stage(is_first_call)
+
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier. Set before routing so
+        # a fused route+quant launch can write straight into that bucket.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
-        # path; the fused-comm backend casts to int64 internally.
+        # path; the fused-comm backend casts to int64 internally. A replica plan
+        # remaps the routes after routing, so its layers route separately.
+        fused_result = (
+            self._try_fused_route_quant(
+                x_chunk_real,
+                router_logits_chunk_real,
+                routing_aux,
+                moe._warmup_placement_route_counters(row_offset),
+            )
+            if num_tokens > 0 and not uses_replica_plan
+            else None
+        )
+        if (
+            num_tokens > 0
+            and fused_result is None
+            and isinstance(router_logits_chunk_real, RouterLogitPartials)
+        ):
+            raise RuntimeError(
+                "router logit partials reached a routing path that does not sum them"
+            )
         if num_tokens > 0:
-            if routing_aux is None:
+            if fused_result is not None:
+                token_selected_experts = fused_result.token_selected_experts
+                token_final_scales = fused_result.token_final_scales
+            elif routing_aux is None:
                 token_selected_experts, token_final_scales = moe.routing_method.apply(
                     router_logits_chunk_real, input_ids_chunk_real
                 )
             else:
                 token_selected_experts, token_final_scales = moe.routing_method.apply_with_aux(
-                    router_logits_chunk_real, input_ids_chunk_real, routing_aux[:num_tokens]
+                    router_logits_chunk_real,
+                    input_ids_chunk_real,
+                    _leading_rows(routing_aux, num_tokens),
                 )
-            token_selected_experts = token_selected_experts.to(torch.int32)
+            if token_selected_experts.dtype != torch.int32:
+                token_selected_experts = token_selected_experts.to(torch.int32)
+            token_selected_experts = moe._maybe_get_perfect_router_expert_ids(
+                token_selected_experts
+            )
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
-            token_final_scales = token_final_scales.to(torch.float32)
+            if token_final_scales.dtype != torch.float32:
+                token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device
             token_selected_experts = torch.empty(
@@ -1494,48 +1856,63 @@ class FusedCommMoEScheduler(MoEScheduler):
             )
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
-        if moe.layer_load_balancer:
-            moe._load_balancer_done_wait_gpu_stage(is_first_call)
-            # ignore_allreduce=False: the fused kernel has no side channel
-            # for an external stats gather. The base helper runs its own
-            # EP-wide AllReduce, gated to is_last_call=True.
-            moe._load_balancer_update_statistic(
-                token_selected_experts,
-                is_first_call,
-                is_last_call,
-                ignore_allreduce=False,
-            )
+        # Per-layer dynamic EPLB plans from the routes that the layer-wise
+        # calibrator records or replays, so they are recorded before the route,
+        # as expert IDs; otherwise the recorded routes are the slots routed to.
+        # With the load balancer off, slots are expert IDs, so one recording
+        # drives both arms.
+        if uses_replica_plan:
+            token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            replica_plan = moe.layer_load_balancer.require_replica_plan()
         else:
-            token_selected_slots = token_selected_experts
-
-        if token_selected_slots is not None:
-            ExpertStatistic.set_layer(moe.layer_idx)
-            ExpertStatistic.maybe_add_info(moe.num_slots, token_selected_slots)
-        token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
-            moe.num_slots, token_selected_slots
-        )
+            if moe.layer_load_balancer and num_tokens > 0:
+                if fused_result is None or not fused_result.routes_counted:
+                    moe._load_balancer_count_warmup(
+                        token_selected_experts, router_logits_chunk_real, row_offset
+                    )
+            maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
+            if moe.layer_load_balancer and not maps_expert_slots:
+                moe._load_balancer_done_wait_gpu_stage(is_first_call)
+                # ignore_allreduce=False: the fused kernel has no side channel
+                # for an external stats gather. The base helper runs its own
+                # EP-wide AllReduce, gated to is_last_call=True.
+                moe._load_balancer_update_statistic(
+                    token_selected_experts,
+                    is_first_call,
+                    is_last_call,
+                    ignore_allreduce=False,
+                )
+                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
+            elif maps_expert_slots:
+                # A static placement the backend applies itself (into the launch bucket when the
+                # routing launch wrote it): it takes expert IDs, recorded as the slots they go to.
+                token_selected_slots = _record_backend_slots(moe, token_selected_experts)
+            else:
+                token_selected_slots = _record_routes(moe, token_selected_experts, moe.num_slots)
+            replica_plan = None
 
         # ----- quantize / prepare -----
-        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
+        if fused_result is not None:
+            moe_input, x_sf = fused_result.x, fused_result.x_sf
+        elif getattr(moe.backend, "supports_fused_prepare", lambda: False)():
             # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
             # topk copies, so keep the original activations and let run_moe
             # prepare its workspace.
             moe_input = x_chunk_real
             x_sf = None
-        else:
+        elif replica_plan is None:
             # Delegate to ``backend.quantize_input`` so each fused-comm backend
             # owns its own empty-tensor layout. Both MegaMoEDeepGemm and
             # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
             # quantize_input contracts.
             moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
-
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+        else:
+            # Leave the plan's SMs to its concurrent HALO-Q/TMA kernel.
+            moe_input, x_sf = moe.backend.quantize_input(
+                x_chunk_real, reserved_sms=replica_plan.reserved_sms
+            )
 
         # ----- MoE compute -----
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
@@ -1550,6 +1927,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x=moe_input,
                 x_sf=x_sf,
                 output_dtype=output_dtype,
+                replica_plan=replica_plan,
             )
         )
 
@@ -1560,7 +1938,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # start_set before run_moe would let dynamic-EPLB migration race the
         # kernel.
         moe._load_balancer_start_set_cpu_stage(is_last_call)
-        moe._load_balancer_done_set_cpu_stage(is_last_call)
+        if not uses_replica_plan:
+            moe._load_balancer_done_set_cpu_stage(is_last_call)
 
         return out
 

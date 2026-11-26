@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
@@ -38,7 +39,13 @@ pytestmark = skip_pre_blackwell
 
 
 def _managers(
-    tp: int, pp: int, enable_dp: bool, layout: CSA2Layout, *, reuse: bool = False
+    tp: int,
+    pp: int,
+    enable_dp: bool,
+    layout: CSA2Layout,
+    *,
+    reuse: bool = False,
+    remote_tail: bool = False,
 ) -> list[CSA2CacheManager]:
     assert pp == 1  # CSA2 PP remains explicitly unsupported.
     return [
@@ -55,6 +62,7 @@ def _managers(
             mapping=Mapping(world_size=tp, rank=rank, tp_size=tp, enable_attention_dp=enable_dp),
             layout=layout,
             is_disagg=True,
+            bounded_replay_on_generation=remote_tail,
         )
         for rank in range(tp)
     ]
@@ -86,6 +94,8 @@ def _verify(
     gen_enable_dp,
     ctx_request_ids,
     gen_request_ids,
+    *,
+    remote_tail_split=None,
 ) -> None:
     assert ctx_pp == gen_pp == 1
     for request, length in enumerate(request_lengths):
@@ -104,6 +114,17 @@ def _verify(
                 if spec.kv_source == layer and spec.compress_ratio == 2:
                     roles.extend((CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE))
                 for role in roles:
+                    if (
+                        role == CSA2CacheRole.SWA
+                        and remote_tail_split is not None
+                        and layer >= remote_tail_split
+                    ):
+                        pages = target.get_cache_indices(gen_request_ids[request], layer, role)
+                        data = target.get_buffers(layer, role)
+                        assert all(
+                            torch.count_nonzero(data[page]) == 0 for page in pages if page >= 0
+                        )
+                        continue
                     window = None
                     if role == CSA2CacheRole.SWA:
                         window = target._swa_retention(layer)
@@ -119,7 +140,11 @@ def _verify(
                     dst = target.get_buffers(layer, role)
                     assert src.shape[1:] == dst.shape[1:]
                     for logical in range(first, end):
-                        assert source_pages[logical] >= 0 and target_pages[logical] >= 0
+                        assert source_pages[logical] >= 0 and target_pages[logical] >= 0, (
+                            f"request={request}, layer={layer}, role={role.name}, "
+                            f"logical={logical}, source_page={source_pages[logical]}, "
+                            f"target_page={target_pages[logical]}"
+                        )
                         # Compare all bytes, including packed main/index scales
                         # and both FP32 compressor state buffers.
                         torch.testing.assert_close(
@@ -169,21 +194,48 @@ def test_csa2_shared_owner_kv_transfer(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (2, 1), (1, 2)])
-@pytest.mark.parametrize("policy", ["required", "hit", "partial-eviction", "evicted"])
-def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen_tp, policy):
+@pytest.mark.parametrize(
+    "policy,remote_tail",
+    [(policy, False) for policy in ("required", "hit", "partial-eviction", "evicted")]
+    + [
+        (policy, True)
+        for policy in (
+            "required",
+            "required-miss",
+            "required-no-reuse",
+            "hit",
+            "partial-eviction",
+            "evicted",
+            "miss",
+        )
+    ],
+)
+def test_csa2_ced_transfer_with_generation_prefix_reuse(
+    monkeypatch, ctx_tp, gen_tp, policy, remote_tail
+):
     """A Global hit cannot suppress missing Encoder or private Decoder transfers."""
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
-    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "0" if policy == "required" else "1")
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "0" if policy.startswith("required") else "1")
+    monkeypatch.delenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", raising=False)
+    replay_window = 140
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
-    ctx_managers = _managers(ctx_tp, 1, False, layout, reuse=True)
-    gen_managers = _managers(gen_tp, 1, False, layout, reuse=True)
+    reuse = policy != "required-no-reuse"
+    ctx_managers = _managers(ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
+    gen_managers = _managers(gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
     ctx_tcs, gen_tcs = [], []
+    cached_tokens = 256
+    prompt_len = cached_tokens + 1 + (replay_window if remote_tail else 0)
+    cache_miss = policy in ("miss", "required-miss", "required-no-reuse")
+    handoff = prompt_len - replay_window
+    source_end = handoff if remote_tail else prompt_len
 
     def request(req_id, kind):
         return LlmRequest(
             request_id=req_id,
             max_new_tokens=2,
-            input_tokens=list(range(257)),
+            input_tokens=[
+                token + (1000 if req_id == 2 and cache_miss else 0) for token in range(prompt_len)
+            ],
             sampling_config=SamplingConfig(),
             is_streaming=False,
             llm_request_type=kind,
@@ -202,41 +254,55 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
     try:
         ctx_req = request(0, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
         gen_req = request(1, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+        if remote_tail:
+            for req, mode in ((ctx_req, "source"), (gen_req, "destination")):
+                req.py_csa2_remote_tail_mode = mode
+                req.py_csa2_remote_tail_start = handoff
+                req.py_csa2_remote_tail_split = 3
         for manager in ctx_managers:
-            assert manager._decoder_replay_window == layout.window_size
+            assert manager._decoder_replay_window == replay_window
             assert manager.prepare_context(ctx_req)
-            assert manager.resize_context(ctx_req, 257)
-            fill_pages(manager, 0, 3)
+            assert manager.resize_context(ctx_req, source_end)
+            fill_pages(manager, 0, (source_end + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK)
         for manager in gen_managers:
             _init_pool_data([manager], 1, fill_random=False)
-            warm = request(2, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
-            assert manager.prepare_context(warm)
-            assert manager.resize_context(warm, 256)
-            fill_pages(manager, 2, 2)
-            cache = manager.kv_cache_map[2]
-            cache.commit(list(range(256)))
-            missing = (
-                list(manager._encoder_optional_groups[:1])
-                if policy == "partial-eviction"
-                else list(manager._encoder_optional_groups)
-                if policy == "evicted"
-                else []
-            )
-            if missing:
-                _introspection.drop_optional_pages(cache, 256, missing)
-            manager.free_resources(warm)
+            missing = []
+            if reuse:
+                # An unrelated warm prefix exercises a real cache miss.
+                warm = request(2, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+                assert manager.prepare_context(warm)
+                assert manager.resize_context(warm, cached_tokens)
+                fill_pages(manager, 2, cached_tokens // TOKENS_PER_BLOCK)
+                cache = manager.kv_cache_map[2]
+                cache.commit(warm.get_tokens(0)[:cached_tokens])
+                missing = (
+                    list(manager._encoder_optional_groups[:1])
+                    if policy == "partial-eviction"
+                    else list(manager._encoder_optional_groups)
+                    if policy == "evicted"
+                    else []
+                )
+                if missing:
+                    _introspection.drop_optional_pages(cache, cached_tokens, missing)
+                manager.free_resources(warm)
             assert manager.prepare_disagg_gen_init(gen_req)
             cache = manager.kv_cache_map[1]
-            assert cache.num_committed_tokens == 256
+            assert cache.num_committed_tokens == (0 if cache_miss else cached_tokens)
             assert gen_req.py_ced_replay is None
-            for group in manager._encoder_optional_groups:
-                assert cache.reuse_status[group].complete == (group not in missing)
+            if not cache_miss:
+                for group in manager._encoder_optional_groups:
+                    assert cache.reuse_status[group].complete == (group not in missing)
             for (layer, _, role), virtual_layer in manager._layer_roles.items():
                 group = manager.impl.get_layer_group_id(virtual_layer)
                 restored = cache.reuse_status[group].complete
                 data = manager.get_buffers(layer, role)
                 for logical, page in enumerate(manager.get_cache_indices(1, layer, role)):
-                    if page >= 0 and (not restored or logical >= 2):
+                    if page >= 0 and (
+                        cache_miss
+                        or not restored
+                        or logical >= cached_tokens // TOKENS_PER_BLOCK
+                        or (remote_tail and role == CSA2CacheRole.SWA and layer >= 3)
+                    ):
                         data[page].zero_()
 
         config = CacheTransceiverConfig(
@@ -252,9 +318,32 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
             ctx_info_endpoint=get_ctx_info_endpoint(ctx_tcs[0]),
             disagg_request_id=transfer_id,
         )
+        ctx_req.context_current_position = source_end
+        gen_req.context_current_position = prompt_len
+        assert ctx_req.context_remaining_length == 0
         for req in (ctx_req, gen_req):
-            req.context_current_position = req.prompt_len
             req.add_new_token(req.prompt_len, 0)
+        if not reuse:
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk = [ctx_req]
+            for manager in ctx_managers:
+                manager.update_context_resources(batch)
+                assert manager.kv_cache_map[0].history_length == source_end
+        if remote_tail:
+            first = max(0, handoff - layout.window_size) // TOKENS_PER_BLOCK
+            for tc, manager in zip(gen_tcs, gen_managers):
+                description = tc._describe_local(gen_req)
+                assert description.token_range.end == handoff
+                cache = manager.kv_cache_map[1]
+                for layer in range(3):
+                    group = manager.impl.get_layer_group_id(
+                        manager._layer_roles[layer, 1, CSA2CacheRole.SWA]
+                    )
+                    holds_prefix = not cache_miss and cache.reuse_status[group].complete
+                    # Missing optional groups must be requested even with a Global hit.
+                    assert (description.block_ids_per_layer_groups[group][first] == -1) == (
+                        holds_prefix
+                    )
         for tc in gen_tcs:
             tc.request_and_receive_async(gen_req)
         for tc in ctx_tcs:
@@ -263,7 +352,20 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(monkeypatch, ctx_tp, gen
             ctx_tcs, lambda tc: tc.check_context_transfer_status(None, mark_complete=True)
         )
         run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
-        _verify([257], ctx_managers, gen_managers, ctx_tp, 1, gen_tp, 1, False, False, [0], [1])
+        _verify(
+            [handoff if remote_tail else prompt_len],
+            ctx_managers,
+            gen_managers,
+            ctx_tp,
+            1,
+            gen_tp,
+            1,
+            False,
+            False,
+            [0],
+            [1],
+            remote_tail_split=3 if remote_tail else None,
+        )
     finally:
         for tc in ctx_tcs + gen_tcs:
             tc.shutdown()

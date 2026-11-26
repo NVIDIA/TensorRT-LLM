@@ -70,6 +70,8 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
         self._recv_started: set = set()
         # Chronological record of contract calls, for call-order assertions.
         self.call_log: List[str] = []
+        # Counts passed to set_gen_deferred_receives, in call order.
+        self.deferred_receive_reports: List[int] = []
         self._is_shut_down = False
 
     # -- test scripting API (not part of the contract) ----------------------
@@ -130,6 +132,9 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
         else:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+    def set_gen_deferred_receives(self, count: int) -> None:
+        self.deferred_receive_reports.append(count)
 
     def request_and_receive_async(self, req: LlmRequest) -> None:
         self._assert_alive("request_and_receive_async")

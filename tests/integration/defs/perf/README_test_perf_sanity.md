@@ -26,9 +26,17 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 
 | List | Count | Contents |
 |------|-------|----------|
-| `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 14 + 108 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
+| `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
+| `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+
+TPOT is time per output token, so lower values are better. Its reported delta is
+negative when latency exceeds the selected baseline. A stored `d_baseline_*`
+override takes precedence; otherwise, the baseline is recalculated as P5 of the
+smoothed history, as for the other latency metrics. Calculated baselines are not
+automatically stored as overrides. Historical TPOT measurements remain valid
+when the comparison direction changes. TPOT is not in `REGRESSION_METRICS`, so
+these statistics are diagnostic and do not determine the default pass/fail verdict.
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 
@@ -69,6 +77,12 @@ The device value reported at iter `N` is the device step time of iter `N-1` (dev
    Downstream `parse_metrics_from_output` picks them up via `DEVICE_STEP_TIME_LOG_QUERIES`. It breaks out of its regex loop on the first match per line, so each statistic must stay on its own line with a distinct leading word.
 
 If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded. Other modes omit the five columns instead of failing: there the family is diagnostic and throughput still gates, so hard-failing would make every `e2e` case on every cluster red on log-scrape plumbing rather than on performance.
+
+#### `d_warmup_time`, `d_{ctx,gen}_<i>_warmup_time`
+
+Seconds from a server's launch until its `/health` first returns 200, so weight loading and the executor warmup are included; the client warmup requests are not. An aggregated row (also `ctx_only`) has one `d_warmup_time`; a disaggregated row has one field per worker (`d_ctx_0_warmup_time`, ..., `d_gen_0_warmup_time`, ...). They are uploaded only: not in `MINIMIZE_METRICS`, so they get no baseline and never gate.
+
+`test_e2e` uploads them for multi-node cases only (disaggregated, or a server with more GPUs than a node), which CI runs alone in their stage. A single-node stage runs several cases in one process, and each reuses the compile and tuning caches of the cases before it, so `test_warmup[<aggregated, ctx_only or gen_only_no_context id>]` measures single-node servers instead: it drops the checkpoint's page cache, starts the server with empty cache directories (`HOME`, `XDG_CACHE_HOME`, `TMPDIR` and every cache path the job sets, such as `TLLM_AUTOTUNER_CACHE_PATH`), records the same field and stops the server without running a client. Its rows are named `<server>-warmup` and carry `b_warmup_only`. CI runs it for the GB300 key models every 4th post-merge build (`l0_gb300_multi_gpus_perf_sanity_warmup`).
 
 ### Match Keys
 
@@ -214,6 +228,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 **File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen). The suffix indicates the GPU target:
 - B200 configs: `xxx_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_blackwell.yaml`)
 - GB200 configs: `xxx_grace_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_grace_blackwell.yaml`)
+- GR100 (Rubin) configs: `xxx_rubin.yaml` (e.g., `qwen3_8_flash_next_fp4_rubin.yaml`)
 - Multi-node: add `_2_nodes` before the GPU suffix (e.g., `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml`)
 
 **Server Config Rules**:
@@ -230,7 +245,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
+**Example**: `gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
 
@@ -338,6 +353,17 @@ queue (nvbugs/6564113). Notes:
   connection-warmup iterations; start the range later to profile only measured
   iterations.
 
+### Warmup pass
+
+Before each measured client of a normal aggregated, `ctx_only` or disaggregated `e2e`
+test, the harness sends one un-measured wave (`concurrency` requests) of the client's
+own `benchmark_serving` command with `--seed` + 1, so JIT kernels for the real prefill
+shapes compile outside the measured window. `gen_only` modes, AgentX and accuracy-only
+clients get none. Its log (`trtllm-benchmark-warmup-pass.*.log`) is not parsed, and its
+records stay out of `d_tb_*` and the device step time; with the time breakdown on, only
+the first measured client gets one. `TRTLLM_PERF_WARMUP_PASS=0` turns it off (locally,
+via `EXTRA_CONTAINER_EXPORTS`).
+
 ### The optional instrumentation modifier
 
 The three shapes that read a disaggregated config (2, 3 and 4 above) take one
@@ -399,8 +425,9 @@ to run after the writers are done. Only the **gen** workers announce that
 workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
 polls the discovered set until its total size holds still for
 `PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
-anything is read, and then compares the largest file's complete-record count against
-the client's `--num-prompts`. Both a still-growing set at the timeout and a census
+anything is read, and then compares the census (the complete records of one server
+role, summed over its files) against the client's `--num-prompts`. Both a
+still-growing set at the timeout and a census
 shortfall are logged as warnings, not failures — a nearly-complete file still yields
 usable statistics, and the numbers are not regression-gated. This matters because a
 truncated read is otherwise **invisible**: all 108 fields are still populated and the
@@ -409,13 +436,14 @@ mid-record) costs only that line, never the whole file: dropping the disagg serv
 file would silently reroute the per-request groups to same-role worker fallbacks,
 which produce plausible values for the wrong phase.
 
-The servers also append records of the e2e connection warmup's requests to these
-files. The harness therefore waits until the largest file holds a record for every
-successful warmup request and the files hold still, then notes each file's line count; the aggregation skips those leading lines and leaves
+The servers also append records of the e2e connection warmup's and the warmup pass's
+requests to these files. The harness therefore waits until the census holds a record
+for every successful warmup request and the files hold still, then notes each
+file's line count; the aggregation skips those leading lines and leaves
 them out of the census. Unlike the measured run's census, this one is a failure: if
 the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
 than mixing late warmup records into the breakdown. The log line
-`Time breakdown: excluded connection-warmup records from {...}` prints the counts as
+`Time breakdown: excluded warmup records from {...}` prints the counts as
 JSON. To reproduce the uploaded numbers offline, run
 `time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
 --drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
@@ -424,13 +452,18 @@ JSON. To reproduce the uploaded numbers offline, run
 
 Test lists are defined in `tests/integration/test_lists/test-db/`.
 
-### YAML File Naming Convention
+### Test List Naming Convention
 
-| Test Type | File Pattern | Example |
-|-----------|--------------|---------|
-| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
-| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+A test list is a top-level key of a test-db YAML file, and a Jenkins stage names its list (`trt-test-db --context`). One file can hold several lists: the perf-sanity lists of a GPU type share one file for single-node and one for multi-node stages, so CODEOWNERS (`*multi_gpu*`, `*multi_node*`) still routes their reviews.
+
+| Test Type | File | Test list | Example list |
+|-----------|------|-----------|--------------|
+| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_key_models]` | `l0_gb300_multi_gpus_perf_sanity_key_models` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node4_gpu16` |
+| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_key_models` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8` |
+
+The optional `_key_models` suffix holds the key-model cases of a topology that other cases share, because the two run at different post-merge frequencies (see below).
 
 ### Jenkins Pipeline Configuration
 
@@ -456,6 +489,21 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 | Disaggregated e2e test | Any | 1 | Always one test per stage |
 
 **Important**: Pre-merge and post-merge tests must be in separate stages.
+
+### Post-merge Run Frequency
+
+The official post-merge pipeline runs every perf-sanity stage once every N builds:
+
+| Cases | N |
+|-------|---|
+| Key models: DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash and Mistral Large 4 (all modes) | 2 |
+| Every other perf-sanity case | 4 |
+
+The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_4` runs at remainder 1, `-2_of_4` at remainder 2, and `-4_of_4` at remainder 0. Stages without this suffix are not filtered by build number.
+
+`buildStageConfigs()` accepts a name template such as `Stage-{split}_of_4`. With three actual pytest splits, it generates only `-1_of_4`, `-2_of_4`, and `-3_of_4`; the fourth slot launches no stage of that list. Shard IDs larger than N wrap modulo N, so `-3_of_2` runs with `-1_of_2`. A stage with a single split is a literal stage entry that names its slot `k`, chosen so that every build carries a similar GPU load; each DeepSeek-V4-Pro `e2e` stage takes the slot of the `gen_only_no_context` stage of the same config. A test list holds cases of one frequency: where key-model and other cases share a topology, the key-model cases are in a `_key_models` list with a `-KeyModels-` stage.
+
+Post-merge perf-sanity stages (stages whose names contain both `PerfSanity` and `Post-Merge`) run automatically only in the official post-merge pipeline. In any other pipeline, including a PR's `/bot run --post-merge`, such a stage runs only when `--stage-list` or `--extra-stage` names it. A PR's `/bot run --post-merge` still runs the pre-merge perf-sanity stages, as a plain `/bot run` does.
 
 ### Pre-merge vs Post-merge Perf-Regression Gating
 
@@ -495,7 +543,7 @@ rule and how to force gating back on.
 
 Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
 
-**No stage currently sets this flag.** Pre-merge perf-sanity is single-node `ctx_only` only, and every `ctx_only` case gates on perf; the multi-node disagg cases that used it are post-merge only. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
+**No stage currently sets this flag**, and no perf-sanity stage currently runs in pre-merge. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
 
 Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
 
@@ -649,25 +697,28 @@ Each disagg test line in the test-db file follows one of these formats:
 Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
 
 ```groovy
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeCount,
+                      runWithSbatch=false, useClusterDurations=false)
 ```
 
 | Parameter | Description |
 |-----------|-------------|
-| `stageName` | CI stage name prefix (see naming convention below) |
+| `stageName` | CI name template with a `{split}` placeholder and `_of_N` cadence suffix (see below) |
 | `platform` | Hardware platform, e.g., `"auto:gb200-flex"` |
-| `testlist` | Test-db filename **without** `.yml`, e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
-| `testCount` | Number of **active (uncommented)** tests in the test-db file. Each disagg test gets its own stage, so `testCount` must equal the number of active tests. |
+| `testlist` | Test-db context (top-level key), e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
+| `splitCount` | Number of **active (uncommented)** tests in the test-db context. Each disagg test gets its own stage, so `splitCount` must equal the number of active tests. |
 | `gpuCount` | Total GPUs from Step 2 (= `total_nodes * gpus_per_node`) |
 | `nodeCount` | Total nodes from Step 2 |
 
 **Stage naming convention:**
 
 ```
-GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge
+GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge-{split}_of_{N}
 ```
 
-**If a `buildStageConfigs` entry already exists** for the test-db file: update `testCount` to match the new total number of active tests.
+Use N = 2 for a key model and N = 4 otherwise (see Post-merge Run Frequency); keep `{split}` literal for the generator. A context with a single test can instead be a literal entry that names its build slot, e.g. `"<stage name>-3_of_4": ["auto:gb300-flex", "<testlist>", 1, 1, <gpuCount>, <nodeCount>]`.
+
+**If a `buildStageConfigs` entry already exists** for the test-db file: update `splitCount` to match the new total number of active tests.
 
 **If no entry exists** for the test-db file: add a new `buildStageConfigs` block. Insert it in the correct section sorted by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
@@ -685,5 +736,5 @@ Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_c
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
 5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
 6. Recount the active tests after any edits.
-7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `splitCount` to that count, preserving it if unchanged.
 8. Check `waives.txt` for the exact test ID before enabling the test.
