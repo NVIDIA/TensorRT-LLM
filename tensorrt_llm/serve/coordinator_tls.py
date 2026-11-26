@@ -13,6 +13,7 @@
 # limitations under the License.
 """TLS configuration shared by the coordinator listener and fleet clients."""
 
+import ipaddress
 import os
 import ssl
 from dataclasses import dataclass
@@ -54,6 +55,15 @@ class CoordinatorTLS:
         context = ssl.create_default_context(cafile=self.ca)
         context.load_cert_chain(self.cert, self.key)
         return context
+
+
+def is_wildcard_host(host: str) -> bool:
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
 
 
 def coordinator_client_ssl(url: str) -> Union[bool, ssl.SSLContext]:

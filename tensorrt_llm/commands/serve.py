@@ -2931,7 +2931,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     public port delegates to it.
     """
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
-    from tensorrt_llm.serve.coordinator_tls import CoordinatorTLS
+    from tensorrt_llm.serve.coordinator_tls import CoordinatorTLS, is_wildcard_host
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
@@ -2946,7 +2946,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
-    if tls is not None and not use_uds and public_host in ("", "0.0.0.0", "::"):
+    if tls is not None and not use_uds and is_wildcard_host(public_host):
         raise ValueError("Configure a hostname covered by the coordinator TLS "
                          "certificate, or enable the local fleet Unix socket")
     # Set before the try so that its finally also cleans up after a failed
