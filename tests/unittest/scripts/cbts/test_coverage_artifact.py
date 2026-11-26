@@ -276,6 +276,13 @@ status = json.loads(os.environ["HELPER_STUB_STATUSES"]).get(
     read, int(os.environ["HELPER_STUB_STATUS"])
 )
 if exists:
+    if (
+        status == 0
+        and args[1].endswith("/cbts_pystart_report.tar.gz")
+        and read not in json.loads(os.environ["HELPER_STUB_STATUSES"])
+        and args[1] not in json.loads(os.environ["HELPER_STUB_FILES"])
+    ):
+        status = 2
     if status == 0:
         print(f"{os.environ['HELPER_STUB_URL_BASE']}/{args[1]}", "0" * 40)
 else:
@@ -625,6 +632,7 @@ def test_select_build_resolves_explicit_pinned_build(
     assert selected["url"] == selected["urls"][0]
     assert "paths" not in selected
     assert helper_stub.reads == [
+        _exists_read(_BUILD, artifact.FULL_TARBALL_NAME),
         _exists_read(_BUILD, _X86_ARCHIVE),
         _exists_read(_BUILD, _SBSA_ARCHIVE),
         _build_info_read(_BUILD),
@@ -655,6 +663,7 @@ def test_select_build_declines_when_an_archive_of_the_pinned_build_cannot_be_rea
 
     # The pinned build has no older candidate, and its build_info.txt is not read.
     assert helper_stub.reads == [
+        _exists_read(_BUILD, artifact.FULL_TARBALL_NAME),
         _exists_read(_BUILD, _X86_ARCHIVE),
         _exists_read(_BUILD, _SBSA_ARCHIVE),
     ]
@@ -701,6 +710,7 @@ def test_probe_selection_keeps_the_urls_that_exists_printed(
     assert selected["url"] == selected["urls"][0]
     assert "paths" not in selected
     assert helper_stub.reads == [
+        _exists_read(_BUILD, artifact.FULL_TARBALL_NAME),
         _exists_read(_BUILD, _X86_ARCHIVE),
         _exists_read(_BUILD, _SBSA_ARCHIVE),
         _build_info_read(_BUILD),
@@ -711,8 +721,18 @@ def test_probe_selection_keeps_the_urls_that_exists_printed(
 @pytest.mark.parametrize(
     ("absent", "reads_of_build_3"),
     (
-        (_X86_ARCHIVE, [_exists_read(3, _X86_ARCHIVE)]),
-        (_SBSA_ARCHIVE, [_exists_read(3, _X86_ARCHIVE), _exists_read(3, _SBSA_ARCHIVE)]),
+        (
+            _X86_ARCHIVE,
+            [_exists_read(3, artifact.FULL_TARBALL_NAME), _exists_read(3, _X86_ARCHIVE)],
+        ),
+        (
+            _SBSA_ARCHIVE,
+            [
+                _exists_read(3, artifact.FULL_TARBALL_NAME),
+                _exists_read(3, _X86_ARCHIVE),
+                _exists_read(3, _SBSA_ARCHIVE),
+            ],
+        ),
     ),
     ids=("x86", "sbsa"),
 )
@@ -734,6 +754,7 @@ def test_probe_moves_to_an_older_build_when_an_archive_is_absent(
     # Build 3 is incomplete: no other archive of it and not its build_info.txt is read.
     assert helper_stub.reads == [
         *reads_of_build_3,
+        _exists_read(2, artifact.FULL_TARBALL_NAME),
         _exists_read(2, _X86_ARCHIVE),
         _exists_read(2, _SBSA_ARCHIVE),
         _build_info_read(2),
@@ -754,8 +775,10 @@ def test_probe_selects_an_older_build_when_an_archive_read_fails(
     assert selected["build"] == 2
     assert selected["commit"] == _COMMIT
     assert helper_stub.reads == [
+        _exists_read(3, artifact.FULL_TARBALL_NAME),
         _exists_read(3, _X86_ARCHIVE),
         _exists_read(3, _SBSA_ARCHIVE),
+        _exists_read(2, artifact.FULL_TARBALL_NAME),
         _exists_read(2, _X86_ARCHIVE),
         _exists_read(2, _SBSA_ARCHIVE),
         _build_info_read(2),
@@ -781,7 +804,9 @@ def test_probe_reads_each_build_once_and_declines_while_every_transfer_fails(
     assert artifact.select_tarball("c" * 40, max_probe=3) is None
 
     # A build is skipped once its first coverage archive cannot be read.
-    assert helper_stub.reads == [_exists_read(build, _X86_ARCHIVE) for build in (3, 2, 1)]
+    assert helper_stub.reads == [
+        _exists_read(build, artifact.FULL_TARBALL_NAME) for build in (3, 2, 1)
+    ]
     errors = capfd.readouterr().err
     for build in (3, 2, 1):
         assert f"[artifact] build {build}: coverage archive unreadable; skipped" in errors
@@ -803,12 +828,16 @@ def test_probe_reports_how_many_builds_it_skipped_for_each_reason(
     assert artifact.select_tarball("c" * 40, max_probe=4) is None
 
     assert helper_stub.reads == [
+        _exists_read(4, artifact.FULL_TARBALL_NAME),
         _exists_read(4, _X86_ARCHIVE),
+        _exists_read(3, artifact.FULL_TARBALL_NAME),
         _exists_read(3, _X86_ARCHIVE),
         _exists_read(3, _SBSA_ARCHIVE),
         _build_info_read(3),
+        _exists_read(2, artifact.FULL_TARBALL_NAME),
         _exists_read(2, _X86_ARCHIVE),
         _exists_read(2, _SBSA_ARCHIVE),
+        _exists_read(1, artifact.FULL_TARBALL_NAME),
         _exists_read(1, _X86_ARCHIVE),
         _exists_read(1, _SBSA_ARCHIVE),
         _build_info_read(1),
@@ -841,10 +870,18 @@ def test_probe_selects_an_older_build_when_one_transfer_fails(
 @pytest.mark.parametrize(
     ("rejected", "reads"),
     (
-        (_exists_read(3, _X86_ARCHIVE), [_exists_read(3, _X86_ARCHIVE)]),
+        (
+            _exists_read(3, artifact.FULL_TARBALL_NAME),
+            [_exists_read(3, artifact.FULL_TARBALL_NAME)],
+        ),
         (
             _build_info_read(3),
-            [_exists_read(3, _X86_ARCHIVE), _exists_read(3, _SBSA_ARCHIVE), _build_info_read(3)],
+            [
+                _exists_read(3, artifact.FULL_TARBALL_NAME),
+                _exists_read(3, _X86_ARCHIVE),
+                _exists_read(3, _SBSA_ARCHIVE),
+                _build_info_read(3),
+            ],
         ),
     ),
     ids=("coverage-archive", "build-info"),
@@ -1064,7 +1101,7 @@ def _resolve_pin_on_the_command_line(pin_path: Path) -> Result:
     ("pin_status", "reads"),
     (
         (3, [_PIN_READ]),
-        (2, [_PIN_READ, _exists_read(3, _X86_ARCHIVE)]),
+        (2, [_PIN_READ, _exists_read(3, artifact.FULL_TARBALL_NAME)]),
     ),
     ids=("pin", "coverage-archive"),
 )
@@ -1100,7 +1137,7 @@ def test_resolve_pin_exits_1_when_the_primary_location_rejects_a_read(
         (4, [_PIN_READ], "coverage DB pin query failed"),
         (
             2,
-            [_PIN_READ, *(_exists_read(build, _X86_ARCHIVE) for build in (3, 2, 1))],
+            [_PIN_READ, *(_exists_read(build, artifact.FULL_TARBALL_NAME) for build in (3, 2, 1))],
             "coverage DB could not be resolved",
         ),
     ),
@@ -1164,6 +1201,38 @@ def _tests_in(db: str) -> set[str]:
         return {row[0] for row in connection.execute("SELECT DISTINCT test FROM touch_rows")}
     finally:
         connection.close()
+
+
+def test_prepare_prefers_final_report_with_multi_gpu_coverage(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / artifact.DB_NAME
+    stage = "H100-4_GPUs-PyTorch-1"
+    test = f"{stage}/test_multi.py::test_one"
+    write_leaf_database(
+        source,
+        stage=stage,
+        process_uid=f"{stage}/coordinator",
+        touches={test: {("tensorrt_llm/example.py", "run")}},
+        outcomes={test: "passed"},
+    )
+    archive = tmp_path / artifact.FULL_TARBALL_NAME
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(source, arcname=artifact.DB_NAME)
+    helper_stub.serves(_archive_path(_BUILD, artifact.FULL_TARBALL_NAME), archive)
+    _set_newest_build(monkeypatch, _BUILD)
+    _measure_topology_offline(monkeypatch)
+    _check_compatibility_offline(monkeypatch)
+    ready = artifact.prepare(str(tmp_path / "out"), _PR_HEAD, ["tensorrt_llm/example.py"])
+    assert ready is not None
+    assert _tests_in(ready["path"]) == {test}
+    assert helper_stub.reads == [
+        _exists_read(_BUILD, artifact.FULL_TARBALL_NAME),
+        _build_info_read(_BUILD),
+        _archive_read(_BUILD, artifact.FULL_TARBALL_NAME),
+    ]
+    meta = json.loads(Path(ready["meta"]).read_text())
+    assert meta["urls"] == [helper_stub.url(_archive_path(_BUILD, artifact.FULL_TARBALL_NAME))]
 
 
 def test_prepare_merges_x86_and_sbsa_databases(helper_stub: _HelperStub, tmp_path: Path) -> None:
@@ -1237,6 +1306,7 @@ def test_prepare_declines_when_a_probed_download_fails(
     assert ready is None
     # Build 3 is selected, and nothing is asked about build 2, though it is complete.
     assert helper_stub.reads == [
+        _exists_read(3, artifact.FULL_TARBALL_NAME),
         _exists_read(3, _X86_ARCHIVE),
         _exists_read(3, _SBSA_ARCHIVE),
         _build_info_read(3),
@@ -1299,7 +1369,8 @@ def test_prepare_of_the_pinned_build_exits_1_when_its_transfer_fails(
     assert len(helper_stub.calls) == 1
     errors = result.stderr.splitlines()
     assert any(
-        _archive_path(_BUILD, _X86_ARCHIVE) in line and "exit status 4" in line for line in errors
+        _archive_path(_BUILD, artifact.FULL_TARBALL_NAME) in line and "exit status 4" in line
+        for line in errors
     )
     assert f"[artifact] pinned build {_BUILD}: coverage archive unreadable" in errors
     assert not (prepare_dir / artifact.META_NAME).exists()
@@ -1322,6 +1393,7 @@ def test_prepare_of_the_pinned_build_exits_1_when_its_download_fails(
     assert result.exit_code == 1
     assert result.stdout == ""
     assert helper_stub.reads == [
+        _exists_read(_BUILD, artifact.FULL_TARBALL_NAME),
         _exists_read(_BUILD, _X86_ARCHIVE),
         _exists_read(_BUILD, _SBSA_ARCHIVE),
         _build_info_read(_BUILD),

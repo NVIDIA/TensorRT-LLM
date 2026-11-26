@@ -13,14 +13,14 @@
 # limitations under the License.
 """Resolve which post-merge CBTS touch DBs to use.
 
-Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
-coverage tarballs. The newest complete pair wins. A squashed PR commit must
+Candidates are recent builds of `<ARTIFACT_BASE>` with a final coverage report
+or both early x86 and SBSA tarballs. The newest complete build wins. A squashed PR commit must
 cherry-pick cleanly for Tier 2's residual paths at that DB's revision;
 otherwise Tier 2 declines. Revision
 metadata comes from the forge compare API and needs `GITHUB_API_TOKEN`, the
 anonymous quota being per-IP and exhausted by shared CI egress.
 
-The selected architecture DBs are merged locally through the compact coverage
+The selected DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `cbts.command main`.
 
 Four entry points. `--resolve-pin FILE` reuses or creates the stable build pin
@@ -57,6 +57,7 @@ ARCH_TARBALL_NAMES = (
     "cbts_pystart_report_x86_64.tar.gz",
     "cbts_pystart_report_SBSA.tar.gz",
 )
+FULL_TARBALL_NAME = "cbts_pystart_report.tar.gz"
 # sqlite at the tar root, and the selection JSON `prepare` drops beside it.
 DB_NAME = "cbts_touchmap.sqlite"
 META_NAME = "cbts_coverage_db.json"
@@ -270,13 +271,16 @@ def _coverage_archive_location(
 
 
 def _coverage_archive_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[list[str]]:
-    """URLs of a build's coverage archives, or None when one is absent and the pair incomplete.
+    """Prefer final coverage, or the complete early architecture pair when it is absent.
 
     An archive that is absent or cannot be read ends the check, so the ones after it are not read.
 
     Raises:
         ArtifactError: As `_coverage_archive_location` raises it.
     """
+    full = _coverage_archive_location(build, FULL_TARBALL_NAME, artifact_base)
+    if full is not None:
+        return [full]
     urls = []
     for name in ARCH_TARBALL_NAMES:
         url = _coverage_archive_location(build, name, artifact_base)
@@ -646,7 +650,7 @@ def select_tarball(
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[dict]:
-    """Newest complete architecture pair with measurable PR-base topology.
+    """Newest final report or complete early pair with measurable PR-base topology.
 
     A build is skipped when one of its coverage archives is absent, or when reading one fails in
     transfer, as it is when reading its `build_info.txt` fails.
@@ -815,7 +819,7 @@ def prepare(
     build: Optional[int] = None,
     expected_commit: Optional[str] = None,
 ) -> Optional[dict]:
-    """Resolve, download, and merge the DB pair; `{path, meta}` or None on failure.
+    """Resolve, download, and merge selected DBs; `{path, meta}` or None on failure.
 
     `meta` is the selection JSON on disk, which `cbts.command main --coverage-db-meta` reads.
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
@@ -857,7 +861,8 @@ def prepare(
     with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
         temp = Path(temp_dir)
         source_dbs = []
-        for index, name in enumerate(ARCH_TARBALL_NAMES):
+        for index, url in enumerate(sel["urls"]):
+            name = url.rsplit("/", 1)[-1]
             try:
                 tarball = _download_coverage_archive(sel["build"], name, temp)
             except ArtifactTransferError as e:

@@ -275,19 +275,23 @@ Trailing `ISOLATION` directives are removed from the lookup identity, like `TIME
 annotations. Kept entries retain their original directives so Jenkins still runs them in isolation.
 Matching the normalized identity does not bypass impact or capture-completeness checks.
 
-A block is left untouched unless every stage family it serves is instrumented — coverage is
-collected on single-GPU post-merge stages only, so blocks belonging to multi-GPU or
-Post-Merge-only stages are never pruned.
+A block is left untouched unless every stage family it serves has coverage. Single-node
+single-GPU and multi-GPU stages can both be narrowed, including Post-Merge-only stages when
+scheduled. Blocks shared with multi-node stages are never pruned.
 
-Single-GPU stages left with nothing go into `coverage_dropped_stages`. Multi-GPU stages are
-omitted here and re-added by Groovy under the `MULTI_GPU_FILE_CHANGED` gate.
+Single-node stages left with nothing go into `coverage_dropped_stages`. Remaining multi-GPU
+stages are included in `affected_stages` and can have their splits resized. Groovy intersects
+the selection with the baseline-eligible stages, preserving the multi-GPU scheduling gates.
+Missing or untrusted coverage keeps cases running; empty stages are not re-added at baseline.
 
 ## 8. Where the DB comes from
 
-Only one producer exists: the `LLM/main/L0_PostMerge` job. After each architecture's single-GPU
-stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
-`cbts_pystart_report_SBSA.tar.gz`. Every pair therefore describes one revision of `main`
-(`artifact.COVERAGE_BRANCH`). The later full-report tarball is not used for test selection.
+Only one producer exists: the `LLM/main/L0_PostMerge` job. Selection prefers the final
+`cbts_pystart_report.tar.gz`, which includes single-node multi-GPU coverage. While that report
+is absent, it accepts the complete early pair `cbts_pystart_report_x86_64.tar.gz` and
+`cbts_pystart_report_SBSA.tar.gz` uploaded after single-GPU stages finish. Missing multi-GPU
+families in an early pair stay at baseline. Each candidate describes one revision of `main`
+(`artifact.COVERAGE_BRANCH`).
 
 ### 8.1 Resolution
 
@@ -301,7 +305,7 @@ read helper, pin at <PR number>/<PR head>:
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
-      read helper --exists, both tarballs         → skip b unless both exist,
+      read helper --exists, final else early pair → skip b unless one source is complete,
                                                     or when a read fails in transfer
       GET build_info.txt, parse `commit=`         → sha; skip when absent
       first complete pair with a known sha        → latest coverage DB
@@ -329,7 +333,7 @@ cannot be read or written. Preparation also verifies that the pinned build's `bu
 still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently
 change a repeated run.
 
-Requiring the architecture pair prevents the selector from narrowing only one CPU architecture.
+The final report covers both architectures; the early source requires a complete architecture pair.
 For an unpinned head, builds are probed newest first and the first complete pair with commit
 metadata is the only DB considered. The selector does not substitute an older DB merely because
 it is closer to the PR base or because the selected DB conflicts with the PR diff.
