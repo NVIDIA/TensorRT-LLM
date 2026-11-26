@@ -212,7 +212,7 @@ This helps agents in three ways:
 
 ### Overview
 
-Modeling V2 now serves 8 model families through 36 ModelCores, across Blackwell, Blackwell Ultra and Rubin GPUs.
+Modeling V2 now serves 8 model families through 36 ModelCores, across Blackwell, Blackwell Ultra and Rubin GPUs. **Every new model now starts on Modeling V2 by default**, so this number will keep growing.
 
 The way models split into ModelCores shows what Modeling V2 enables. In [disaggregated serving](blog05_Disaggregated_Serving_in_TensorRT-LLM.md), the same model runs in very different roles, and each role is limited by something different:
 
@@ -310,7 +310,7 @@ Figure 4 compares the Modeling V2 ModelCores with the Modeling V1 implementation
 
 ## Future Work
 
-We will keep pushing Modeling V2 forward in the three directions below. Some of this work is already under way, and parts of it have produced early results.
+**Since Modeling V2 is now the default workflow for new models**, the directions below matter for every model we add. Some of this work is already under way, and parts of it have produced early results.
 
 ### Keep the architecture lean
 
