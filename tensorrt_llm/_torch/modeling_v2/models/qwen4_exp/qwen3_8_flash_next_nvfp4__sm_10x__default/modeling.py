@@ -588,7 +588,7 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import QsaRuntimePolicy, RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.vocab_parallel import vocab_parallel_argmax_enabled
 from tensorrt_llm._torch.utils import (
@@ -2121,6 +2121,9 @@ def _decode_forms(core) -> str:
             "out-proj attn rows": rows(out["attn_o"] if out else None),
             "grouped gqa from requests": core.dp_gqa_min_requests,
             "cluster top-k up to rows": core.dp_topk_cluster_rows,
+            "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
+            "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
+            "replay gap": getattr(core, "host_step_forms", {}).get("qsa_replay_gap", False),
         }
     else:
         forms = {
@@ -2131,6 +2134,7 @@ def _decode_forms(core) -> str:
             "draft layer": core.tep_draft_layer,
             "proj split-k": getattr(core, "tep_proj", False),
             "attn inplace": getattr(core, "tep_attn_inplace", False),
+            "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
         }
     return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
 
@@ -10324,12 +10328,83 @@ class SpeculativeRollback:
 # -------------------------------------------------------------------- shell ---
 
 
-def _runtime_hooks(spec_config=None) -> RuntimeHooks:
+#: Switch, on by default (bitwise; a row table): at a dep4 / dep8 rank on SM103
+#: (`_dp_decode_rank`) the engine keeps its opted-in steady one-model MTP decode prepare at each
+#: attention-DP rank (`RuntimeHooks.steady_decode_prepare`): a decode-only graph step whose rank
+#: batch is the previous step's -- the same requests on the same slots, verifying the previous
+#: step's device drafts, and the same CUDA-graph padding rows -- or whose requests all join on
+#: that batch's metadata, writes its decoder inputs, the graph's static inputs and the KV lengths
+#: in one launch between the two replays, and still makes the full pass's padding and count
+#: exchange (so ranks that stage and ranks that do not keep their collectives paired). The QSA
+#: metadata advances by its steady decode step (`RuntimeHooks.qsa.steady_decode`): no prompt /
+#: KV-length uploads, the block offsets copied and unscaled only when the KV manager's block-table
+#: key changed. The world-8 group is the same rule (one attention-DP group of the row table's
+#: size), not a separate switch. Measured as dpstepedge, on an earlier attention-DP form of the
+#: engine's prepare: dep4 -0.022..-0.050 ms a step (gen_d37), dep8 graph 12 -0.006 (856505),
+#: 98.7% of decode-only graph steps staged at dep8. `0`: the full pass on every step.
+DP_STEPEDGE_ENV = "TRTLLM_QWEN4_EXP_DP_STEPEDGE"
+#: Switch, on by default where `DP_STEPEDGE_ENV` engages (bitwise): the replay-gap cuts of the
+#: steady step (`RuntimeHooks.qsa.steady_replay_gap`). The eager QSA row mapping is not launched
+#: (the replayed forward rewrites all four of its outputs before any reader: the overlap
+#: scheduler's KV-length correction and `on_update_kv_lens`, or the decode prologue), and a
+#: changed block table is copied and unscaled in one Triton launch (`triton_qsa_copy_block_offsets`,
+#: the native copy's stores) where the KV manager's copy is the plain one. Measured as rgap on
+#: dpse: dep4 -0.013..-0.021 ms at graphs 5-7 (856480), dep8 about -0.011 at graphs 8-10 and
+#: -0.013 at 12 (856505). `0`: the steady step launches the mapping and the native copy.
+DP_RGAP_ENV = "TRTLLM_QWEN4_EXP_DP_RGAP"
+#: Switch, on by default (bitwise; a row table): at a tep4 rank on SM103 (`_tep4_layout`) the QSA
+#: metadata of the engine's steady one-model MTP decode prepare advances by its steady decode
+#: step (`RuntimeHooks.qsa.steady_decode`) instead of its full `prepare()`: no prompt / KV-length
+#: uploads, the block offsets copied and unscaled only when the block-table key changed. That is
+#: the QSA half of the measured TEP stepedge (gen_d28: window 82.5 -> 26.1 us, host p50
+#: -0.039..-0.050 ms at 1-4 requests, E2E x 571.4 -> 578.0 and 657.9 -> 662.3); its other half,
+#: the one-launch input stager, is the engine's at every one-group layout already. `0`: the
+#: metadata's full prepare() on staged steps.
+TEP_STEPEDGE_ENV = "TRTLLM_QWEN4_EXP_TEP_STEPEDGE"
+
+
+def _is_sm103(device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) == archs.SM_103
+
+
+def _host_step_forms(core, device=None) -> dict:
+    """The decode-step host forms of this core's layout (`DP_STEPEDGE_ENV`, `DP_RGAP_ENV`,
+    `TEP_STEPEDGE_ENV`), read once when the shell declares its runtime hooks: `dp_steady` (the
+    steady prepare at an attention-DP rank), `qsa_steady` (the QSA steady decode step) and
+    `qsa_replay_gap`. A switch set to 1 where its row table does not reach warns once. Decided
+    from the layout and the GPU only, so every rank of a group decides alike."""
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    dp = _dp_decode_rank(core, device)
+    tep = _tep4_layout(core) and _is_sm103(device)
+    dp_steady = dp and _switch(DP_STEPEDGE_ENV, default=True)
+    replay_gap = dp_steady and _switch(DP_RGAP_ENV, default=True)
+    tep_steady = tep and _switch(TEP_STEPEDGE_ENV, default=True)
+    for env, serves, why in (
+        (DP_STEPEDGE_ENV, dp, "a dep4 / dep8 rank on SM103"),
+        (DP_RGAP_ENV, dp_steady, f"a dep4 / dep8 rank on SM103 with {DP_STEPEDGE_ENV} on"),
+        (TEP_STEPEDGE_ENV, tep, "a tep4 rank on SM103"),
+    ):
+        if not serves and os.environ.get(env, "").strip() and _switch(env):
+            logger.warning(f"{env} is set but ignored: it serves {why}")
+    return {
+        "dp_steady": dp_steady,
+        "qsa_steady": dp_steady or tep_steady,
+        "qsa_replay_gap": replay_gap,
+    }
+
+
+def _runtime_hooks(spec_config=None, core=None) -> RuntimeHooks:
     """The engine hooks of a speculative shell, as the FP8 target's: the spec loop on the
     execution stream, and the decode prologue -- a generation-only verify step's position and
     KV-length corrections and the QSA row mapping in one launch during input preparation
     (`qsa_spec_step_metadata`), bitwise what it replaces; the decode forward reads the corrected
-    positions it leaves (`take_step_positions`). Under `CTX_COLDIDX_ENV`, the cold index codec."""
+    positions it leaves (`take_step_positions`). Under `CTX_COLDIDX_ENV`, the cold index codec.
+    With `core`, the decode-step host forms of its layout (`_host_step_forms`), recorded on the
+    core as `host_step_forms` for its decode-forms line."""
+    forms = _host_step_forms(core) if core is not None else {}
+    if core is not None:
+        core.host_step_forms = forms
     cold_page_codec = None
     if _switch(CTX_COLDIDX_ENV):
         draft_len = getattr(spec_config, "max_draft_len", None)
@@ -10346,6 +10421,11 @@ def _runtime_hooks(spec_config=None) -> RuntimeHooks:
         loop_on_execution_stream=True,
         decode_prologue=SpecStepMetadataPrologue(),
         cold_page_codec=cold_page_codec,
+        steady_decode_prepare=forms.get("dp_steady", False),
+        qsa=QsaRuntimePolicy(
+            steady_decode=forms.get("qsa_steady", False),
+            steady_replay_gap=forms.get("qsa_replay_gap", False),
+        ),
     )
 
 
@@ -10764,7 +10844,7 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             # default, the draft step would be handed a manager that maps no draft layer.
             self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(self.spec_config)
             self.spec_decode_fast_paths = True
-            self.runtime_hooks = _runtime_hooks(self.spec_config)
+            self.runtime_hooks = _runtime_hooks(self.spec_config, self.model)
             # Under attention TP the TP group's key exchange, as the FP8 target builds it: the
             # worker then takes the target tokens of greedy and temperature-only batches, and
             # the greedy draft tokens, from this rank's vocabulary shard (argmax or Gumbel-max
