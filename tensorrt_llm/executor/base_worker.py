@@ -632,7 +632,8 @@ class BaseWorker(GenerationExecutor):
     def submit(self, request: GenerationRequest) -> Optional[GenerationResult]:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited.
 
-        Returns None when the reader of the result queue holds the result.
+        Returns None for a prefill-only request (max_tokens == 1) whose
+        result only the reader of the result queue uses.
         """
         self.start()
 
@@ -649,12 +650,16 @@ class BaseWorker(GenerationExecutor):
 
         logprob_params = self._get_logprob_params(request)
 
-        # With a result queue the proxy holds the caller's GenerationResult.
-        # This worker reads its own only to post-process responses, to compute
-        # prompt logprobs or to report perf metrics, so it skips building one
-        # otherwise: a request stored without a result reports no perf metrics.
+        # A prefill-only request ends after its context pass, so with many of
+        # them every batch finishes as many requests as it holds. With a result
+        # queue the proxy holds the caller's GenerationResult, and this worker
+        # reads its own only to post-process responses, to compute prompt
+        # logprobs or to report perf metrics, so it skips building one for such
+        # a request otherwise: a request stored without a result reports no
+        # perf metrics. Every other request gets its result.
         result = None
-        if (self.result_queue is None or self.postproc_queues is not None
+        if (request.sampling_params.max_tokens != 1 or self.result_queue is None
+                or self.postproc_queues is not None
                 or self.enable_postprocess_parallel
                 or logprob_params is not None
                 or request.sampling_params.return_perf_metrics):
@@ -1749,18 +1754,20 @@ class AwaitResponseHelper:
 
 def pack_final_responses(
         responses: Iterable[Tuple[int, Any]]) -> List[Tuple[int, Any]]:
-    """Pickle a rank's final responses in the form the leader sends to the proxy.
+    """Pickle a rank's prefill-only final responses in the form the leader sends to the proxy.
 
-    The leader then forwards them without loading them. Responses it has to
-    finish itself stay as they are: those that are not final, carry an error,
-    or hold what prompt logprobs are computed from, which is the context
-    logits or the rows the executor reduced them to.
+    The leader then forwards them without loading them. Only the final response
+    of a request that ended after its context pass is packed. Every other
+    response stays as it is, and so do those the leader has to finish itself:
+    one that carries an error or holds what prompt logprobs are computed from,
+    which is the context logits or the rows the executor reduced them to.
     """
     kept, packed, client_ids = [], [], []
     for item in responses:
         response = item[1]
         result = getattr(response, "result", None)
         if (result is None or not result.is_final
+                or not result.ends_after_context
                 or result.context_logits is not None
                 or result.context_prompt_logprob_rows is not None):
             kept.append(item)

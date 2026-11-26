@@ -638,7 +638,8 @@ def worker_main(
         return
 
     # The leader sends responses straight to the proxy unless it post-processes
-    # them or routes them to frontends, so the other ranks can pack theirs.
+    # them or routes them to frontends, so the other ranks can pack the final
+    # responses of their prefill-only requests.
     if not postproc_worker_config.enabled and multi_frontend_addrs is None:
         worker.engine.peer_response_packer = pack_final_responses
 

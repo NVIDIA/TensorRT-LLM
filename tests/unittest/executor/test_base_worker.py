@@ -1049,13 +1049,15 @@ def test_worker_enqueues_serializable_python_input_envelope(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "keeps_result",
-    [None, "prompt_logprobs", "perf_metrics", "postproc", "no_queue"])
+@pytest.mark.parametrize("keeps_result", [
+    None, "generation", "prompt_logprobs", "perf_metrics", "postproc",
+    "no_queue"
+])
 def test_worker_builds_a_result_only_when_it_reads_one(
         keeps_result: str | None) -> None:
+    """A worker skips the result of a prefill-only request that only the proxy reads."""
     sampling = SamplingParams(
-        max_tokens=1,
+        max_tokens=4 if keeps_result == "generation" else 1,
         prompt_logprobs=1 if keeps_result == "prompt_logprobs" else None,
         return_perf_metrics=keeps_result == "perf_metrics")
     request = GenerationRequest(prompt_token_ids=[10, 11],
@@ -1093,10 +1095,10 @@ def test_worker_builds_a_result_only_when_it_reads_one(
                          ids=["opt_out", "opt_in"])
 def test_submitted_request_is_deserialized_only_for_requested_metrics(
         monkeypatch: pytest.MonkeyPatch, return_metrics: bool) -> None:
-    """An update of a request whose result the proxy holds honors its opt-in."""
+    """A response of a request whose result the proxy holds honors its opt-in."""
     request = GenerationRequest(prompt_token_ids=[10, 11],
                                 sampling_params=SamplingParams(
-                                    max_tokens=4,
+                                    max_tokens=1,
                                     return_perf_metrics=return_metrics),
                                 streaming=True)
     request.set_id(7)
@@ -1136,6 +1138,7 @@ def test_submitted_request_is_deserialized_only_for_requested_metrics(
 def _llm_response(client_id: int,
                   *,
                   final: bool = True,
+                  prefill_only: bool = True,
                   error: str | None = None,
                   context_logits: object = None,
                   prompt_rows: list[torch.Tensor] | None = None,
@@ -1147,6 +1150,7 @@ def _llm_response(client_id: int,
             context_prompt_logprob_rows=prompt_rows,
             context_prompt_last_logprobs=prompt_last_row)
         result = LlmResult(b"serialized", py_result, is_final=final)
+        result.ends_after_context = final and prefill_only
     return LlmResponse(request_id=100 + client_id,
                        error_msg=error,
                        result=result,
@@ -1160,16 +1164,18 @@ def test_other_ranks_pack_final_responses_and_the_leader_forwards_them(
     monkeypatch.setattr(
         base_worker, "get_metrics_dict", lambda response: {}
         if response.client_id == 3 else metrics)
-    # The leader finishes these three itself.
+    # The leader finishes these itself: only the final response of a request
+    # that ended after its context pass is packed.
     kept = [(104, _llm_response(4, final=False)),
             (105, _llm_response(5, error="boom")),
-            (106, _llm_response(6, context_logits="logits"))]
+            (106, _llm_response(6, context_logits="logits")),
+            (107, _llm_response(7, prefill_only=False))]
 
     pairs = base_worker.pack_final_responses([(101, _llm_response(1)), *kept,
                                               (103, _llm_response(3))])
 
-    assert pairs[:3] == kept
-    (_, packed), = pairs[3:]
+    assert pairs[:4] == kept
+    (_, packed), = pairs[4:]
     assert packed.client_ids == [1, 3]
     measured, plain = pickle.loads(packed.payload)
     assert isinstance(measured, ResponseWrapper)
