@@ -14,10 +14,8 @@
 # the License.
 include(FetchContent)
 
-set(SRCS
-    bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
-    mcastDeviceMemory.cpp moeLoadBalancer/moeLoadBalancer.cpp
-    ncclCommunicator.cpp)
+set(SRCS bufferManagerNvls.cpp utils/debugUtils.cu mcastDeviceMemory.cpp
+         ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -92,6 +90,18 @@ if(ENABLE_NVSHMEM)
                                                     nvshmem::nvshmem_device)
 endif()
 
+add_library(tllm_runtime_ipc STATIC ipcUtils.cpp)
+add_library(tllm::runtime_ipc ALIAS tllm_runtime_ipc)
+target_link_libraries(
+  tllm_runtime_ipc
+  PUBLIC tllm::runtime_buffers tllm::runtime_distributed
+  PRIVATE tllm::common_environment)
+if(ENABLE_MULTI_DEVICE)
+  target_link_libraries(tllm_runtime_ipc PUBLIC tllm::kernel_custom_all_reduce)
+endif()
+target_compile_features(tllm_runtime_ipc PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_ipc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(tllm_runtime_worker_pool STATIC workerPool.cpp)
 add_library(tllm::runtime_worker_pool ALIAS tllm_runtime_worker_pool)
 target_link_libraries(
@@ -129,6 +139,17 @@ if(NOT WIN32)
 endif()
 target_compile_features(tllm_runtime_host_accessible_memory PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_host_accessible_memory
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_moe_load_balance STATIC
+            moeLoadBalancer/moeLoadBalancer.cpp)
+add_library(tllm::runtime_moe_load_balance ALIAS tllm_runtime_moe_load_balance)
+target_link_libraries(
+  tllm_runtime_moe_load_balance
+  PUBLIC tllm::common_cuda Threads::Threads
+  PRIVATE tllm::runtime_host_accessible_memory tllm::kernel_moe_load_balance)
+target_compile_features(tllm_runtime_moe_load_balance PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_moe_load_balance
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_runtime_locality STATIC
@@ -178,9 +199,7 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
-target_link_libraries(
-  runtime_src PUBLIC ipc_nvls_memory_src tllm::runtime_topology
-                     tllm::runtime_host_accessible_memory)
+target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 

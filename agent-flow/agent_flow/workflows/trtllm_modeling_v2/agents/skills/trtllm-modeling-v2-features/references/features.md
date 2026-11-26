@@ -227,19 +227,37 @@ two nodes in `accuracy/test_disaggregated_multinode.py`) runs it. A target's
 disaggregation work is the state the transceiver moves. To start one by hand
 while debugging, `examples/disaggregated/README.md`.
 
-**Flow proof.** The `disagg` unit owes only its disaggregated-serving test
-(`checks/disagg.py`; `gate disagg --unit disagg --member <m>`): a test the run
+**Flow proof.** The `disagg` unit owes only its `disagg` check
+(`checks/disagg.py`; `gate disagg --unit disagg --member <m>`), and the run's
+`task.yaml` says which of two it is. Read `accuracy.disagg` before writing
+anything.
+
+*It states `config`, `context` and `generation`:* the three files the tree's
+own disaggregated examples use, and the flow serves that deployment itself. You
+write no test, launcher or server. Each side is one `trtllm-serve` per instance
+with `--server_role` and its side's file as `--config`, as it is but for the
+gate's `modeling_v2: require` (`gates/disagg/disagg.<unit>.<member>/options.<ctx|gen>.yaml`
+is what it ran; nothing of the unit's options is in it), behind
+`trtllm-serve disaggregated -c` with the stated `config`. The gate passes when
+every server and the proxy came up and the unit's benchmark through the proxy is at or
+above the unit's floor. Its verdict names the server that did not come up and
+its log, in the same directory. `gate disagg` submits the job, across nodes too.
+
+*It states `test`:* the proof is a test the run
 writes beside the tree's own in `accuracy/test_disaggregated_serving.py`
 (`launch_disaggregated_llm` starts both workers and `trtllm-serve
 disaggregated`), named by `accuracy.disagg.test`. The gate runs it from its
-pytest root as CI does, once, at the member the request validates fully, on one
-node: `launch_disaggregated_llm` starts every worker on one host. It gets two
-engines' devices at the member's width, at most a node's (`dep4` on a 4-GPU
-node: write the test for two engines of two; `accuracy.disagg.devices`
-overrides, never past a node), and passes only when every test the node id
-selects passed: a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
+pytest root as CI does, once, at the member the request validates fully. By
+default that is one pytest on one node, with two engines' devices at the
+member's width, at most a node's (`dep4` on a 4-GPU node: write the test for two
+engines of two; `accuracy.disagg.devices` overrides it, per node). When two
+engines do not fit a node, `accuracy.disagg.nodes: N` runs one pytest on each of
+N nodes of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), one
+engine's devices per node by default, so the gates session must hold N nodes.
+The gate passes only when every test the node id selects passed on every node:
+a skip (too few devices, no `LLM_MODELS_ROOT`) fails it.
 
-**Blind spots.** Boot and accuracy never cross the hop; only the test does, and
+**Blind spots.** Boot and accuracy never cross the hop; only the `disagg` check does, and
 it judges a benchmark score, not token identity with an aggregated engine. A
 hop that loses part of the state can still score within the floor on short
 answers. The transceiver backend and runtime the workers actually ran are not
@@ -501,3 +519,76 @@ a number the run declares: without one, a drafter that accepts little passes.
 - **Blind spots.** The reuse probe covers attention-DP rank 0 only. With
   `benchmark_members: <member>` the benchmark runs at that member alone; the
   other members rest on their boots (`task.example.yaml`).
+
+## 9. Expert-parallel load balancing (EPLB)
+
+**What.** A MoE layer's experts sit in slots split evenly over the EP ranks,
+with spare slots holding more copies of hot experts, so each rank's load
+follows its share of the slots (`examples/wide_ep/ep_load_balancer/README.md`).
+`moe_config.load_balancer` sets `num_slots`, and either a fixed placement
+(static EPLB, `layer_updates_per_iter: 0`, `initial_global_assignments`) or
+one that the engine updates while serving (online EPLB).
+
+**Engine owns.** Creating the load balancer around the model when the
+deployment runs EPLB (`maybe_create_moe_load_balancer`,
+`moe_load_balancer_mode`), registering weight slots and finalizing it after
+loading (`_torch/pyexecutor/model_loader.py`), a balancer iteration around
+every forward with statistics and updates off in warmup (`model_engine.py`,
+`MoeLoadBalancerIterContext`), and shutdown. The resolver builds a target for
+an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
+
+**Target must honour.**
+- Implement the modes it lists in `EPLB_MODES`, through
+  `catalog/moe/eplb.py`: `eplb_slots` for each routed layer's slots,
+  `EplbLayer.register` for each routed layer at construction in run order
+  (a one-model draft layer with `repeat_count=max_draft_len`), expert weights
+  and per-expert scales sized and loaded by slot, and each expert call run
+  inside `eplb_call(eplb, topk_ids)`, which yields the slot ids (and the
+  call's plan, None for static) after the router's top-k. The expert kernel
+  then takes `num_slots` as its expert count and this rank's slot window.
+- `route` admits EPLB only at the layouts it was measured at
+  (`moe_eplb_mode`). EPLB needs attention DP over ranks that hold whole
+  experts (moe_tp 1), as the built-in MoE does.
+- A target that gathers tokens before routing routes on every rank and must
+  get the same slots on every rank: `eplb_call` does
+  (`offset_by_ep_rank=False`).
+
+**Grep.** `EPLB_MODES`, `moe_eplb_mode`, `eplb_slots`, `EplbLayer`,
+`eplb_call`, `eplb_route`, `moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
+`MoeLoadBalancerConfig`, `initial_global_assignments`, `num_slots`.
+
+**Tests to imitate.**
+- `tests/unittest/_torch/modeling_v2/moe/ops/test_modeling_v2_eplb.py`: the slots,
+  registration and each expert call's routing (`eplb_call`) on the CPU; the
+  route op's cells, where every EP rank must
+  route the same ids to the same slots; and a slot-routed layer whose windows
+  sum to the layer without EPLB.
+- `tests/unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py`
+  (`test_eplb_*`): slots and `load` under a placement drawn per layer, with
+  copies of an expert across ranks and twice on one rank, against the
+  world-size-1 table without EPLB.
+- `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py`
+  (`test_eplb_*`, `test_r1_*eplb*`): the resolver's decisions per mode and
+  layout.
+- `accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_static_eplb`.
+
+**Fast check.** quickstart or `trtllm-serve` at a dep layout with
+`moe_config.load_balancer` set and `modeling_v2: require`: the engine must
+build the target (a mode it does not implement fails with the reason), and the
+load log shows the balancer created before the model and finalized after the
+weights load.
+
+**Flow proof.** The flow has no `eplb` feature yet. Prove it as a variant that
+sets `llm_api_options.moe_config.load_balancer` at a `dep` member, with
+`modeling_v2: require`, and read the accuracy gate. The engine read-back does
+not report the registered layers, so the target's own tests carry that.
+
+**Blind spots.**
+- A slot loaded with the wrong expert, or an id routed to a slot that holds
+  another expert, still produces fluent text. Use a placement that differs
+  from the default in every layer, with an expert held twice on one rank.
+- Padding rows and attention-DP dummy requests count in the routing like
+  real tokens.
+- A layer that is registered but never runs, for example after the loader
+  builds the model twice, changes nothing under static EPLB. Under online
+  EPLB the balancer waits for it.

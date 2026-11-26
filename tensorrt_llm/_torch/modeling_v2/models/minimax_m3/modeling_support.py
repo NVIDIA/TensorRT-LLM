@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Callable, List, Protocol
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
 
@@ -115,8 +117,11 @@ def _pinned_mxfp8_quantize(state: PinnedModelingSupport, /, x: Any) -> Any:
 
 
 def _split_chunk(state: ModelingSupport, /, rows: int, num_chunks: int) -> List[int]:
-    """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row."""
-    base, extra = divmod(rows, num_chunks)
+    """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row.
+
+    Floor division and modulo (rather than ``divmod``) keep the split traceable on a symbolic row count.
+    """
+    base, extra = rows // num_chunks, rows % num_chunks
     return [base + 1] * extra + [base] * (num_chunks - extra)
 
 
@@ -192,6 +197,39 @@ def _fp8_index_qk_norm_rope(
         core.rope_theta,
         position_ids.reshape(-1).contiguous().to(torch.int32),
     ).flatten(1)
+
+
+def _prepare_prefill_eagle3_capture(spec_metadata) -> Callable[..., None]:
+    """Check live rows before the core traces a fixed-size capture copy."""
+    if spec_metadata.layers_to_capture:
+        destination = spec_metadata.hidden_states
+        assert destination is not None
+        live_rows = spec_metadata.num_capture_tokens
+        if live_rows > destination.shape[0]:
+            raise RuntimeError(
+                f"EAGLE3 hidden-state capture needs {live_rows} rows, got "
+                f"buffer capacity {destination.shape[0]}"
+            )
+    return _capture_prefill_eagle3_hidden_states
+
+
+def _capture_prefill_eagle3_hidden_states(spec_metadata, layer_id, hidden_states, residual):
+    if not torch.compiler.is_compiling():
+        spec_metadata.maybe_capture_hidden_states(layer_id, hidden_states, residual)
+        return
+
+    destination = spec_metadata.hidden_states
+    assert destination is not None
+    for index, capture_layer in enumerate(spec_metadata.layers_to_capture):
+        if capture_layer == layer_id:
+            # The draft reads only the live prefix. Copy the bucket up to buffer capacity.
+            rows = destination.shape[0]
+            source = hidden_states[:rows]
+            if residual is not None:
+                source = source + residual[:rows]
+            width = spec_metadata.hidden_size
+            inplace_slice_copy(destination, source, index * width, (index + 1) * width)
+            return
 
 
 def _eagle3_capture(

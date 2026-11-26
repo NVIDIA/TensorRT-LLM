@@ -68,10 +68,10 @@ from .sampler_common import (
 )
 from .sampler_features import (
     AsyncWorkerMixin,
+    EmbeddingBiasCache,
     SamplerEvent,
     _PackedStepIndexer,
     _UnpackedStepIndexer,
-    apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
     meet_stop_token_criteria,
@@ -484,6 +484,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Owns max_topk_logprobs / batch_max_topk_logprobs / TOPK_LOGPROBS_SHAPE;
         # constructed before _create_store, which reads the shape.
         self._log_probs = LogProbsHandler(self)
+
+        self._embedding_bias_cache: EmbeddingBiasCache | None = None
 
         # The Torch sampler hard-depends on flashinfer. Enforce it once here, at
         # construction, so the check stays out of the CUDA-graph-captured
@@ -2647,8 +2649,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
-        apply_embedding_bias(
-            logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+        if self._embedding_bias_cache is None:
+            # Always initializing to ensure correct KV cache sizing
+            self._embedding_bias_cache = EmbeddingBiasCache(
+                logit_dtype=logits_cuda.dtype,
+                vocab_size=logits_cuda.size(-1),
+                max_seq_slots=self.max_num_sequences,
+                device=logits_cuda.device,
+            )
+        self._embedding_bias_cache.apply_bias(
+            logits_cuda,
+            sampling_requests,
+            sampling_requests_metadata.req_num_steps,
         )
 
         # Apply repetition/presence/frequency penalties in place, before the greedy fast

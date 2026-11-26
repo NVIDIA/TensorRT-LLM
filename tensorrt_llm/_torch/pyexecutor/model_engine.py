@@ -70,23 +70,36 @@ from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoder
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader
+from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
-def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
-    """``spec_decode_fast_paths`` of the language model (the model itself, or a
-    multimodal model's language model): the one-engine speculative language
-    model's, or that of a model that builds its own speculative branch, such as
-    a Modeling V2 target; False for a model that does not set it."""
+def _language_model_flag(model: torch.nn.Module, name: str) -> bool:
+    """Boolean attribute ``name`` of the language model (the model itself, or a
+    multimodal model's language model); False for a model that does not set it."""
     if isinstance(model, MultimodalModelMixin):
         try:
             model = model.language_model
         except NotImplementedError:
             return False
-    return bool(getattr(model, "spec_decode_fast_paths", False))
+    return bool(getattr(model, name, False))
+
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the language model: the one-engine
+    speculative language model's, or that of a model that builds its own
+    speculative branch, such as a Modeling V2 target."""
+    return _language_model_flag(model, "spec_decode_fast_paths")
+
+
+def _spec_samples_sharded_temperature(model: torch.nn.Module) -> bool:
+    """Whether the language model's one-engine spec worker draws temperature-only
+    target tokens on the LM head's vocab shard
+    (``SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature``)."""
+    return _language_model_flag(model, "spec_samples_sharded_temperature")
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -286,6 +299,7 @@ class ModelEngine:
         else:
             self.model = model
         self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
+        self.spec_samples_sharded_temperature = _spec_samples_sharded_temperature(self.model)
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
@@ -576,9 +590,12 @@ class ModelEngine:
                 and self.model.samples_from_vocab_shards
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            spec_samples_sharded_temperature=self.spec_samples_sharded_temperature,
+            guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg,
             is_disagg_context=is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context",
+            steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )
 
@@ -649,6 +666,11 @@ class ModelEngine:
     def cuda_graph_padding_enabled(self) -> bool:
         """Return whether decode graph batches are padded to capture sizes."""
         return self._cuda_graph_padding_enabled
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
@@ -973,6 +995,8 @@ class ModelEngine:
         self._mm_item_scheduler = None
         self._lora_model = None
         self._lora_owner = None
+        if self.model is not None:
+            release_localized_moe_weights(self.model)
         self.model = None
         self.input_processor = None
         release_gc()
