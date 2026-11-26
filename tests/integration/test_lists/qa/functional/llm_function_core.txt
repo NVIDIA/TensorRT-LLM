@@ -815,6 +815,10 @@ accuracy/modeling_v2/nemotron_shortcut/bf16__sm_103__default/test_accuracy.py::T
 accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::TestShortcutNvfp4::test_gsm8k
 accuracy/modeling_v2/nemotron_shortcut/nvfp4__sm_103__default/test_accuracy.py::test_mtp_greedy_matches_ordinary_decode
 accuracy/modeling_v2/nemotron_shortcut/mxfp8__sm_103__default/test_accuracy.py::TestShortcutMxfp8::test_gsm8k
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[plain-nvfp4]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[mtp2-bf16]
+accuracy/modeling_v2/nemotron_shortcut/test_prefix_cache.py::test_chunked_prefix_resume[mtp2-nvfp4]
 # Qwen3.8-Flash-Next-NVFP4, modeling_v2 qwen4_exp target (sm_103 only): every accuracy test of
 # the target, the CI ones included, and those that run only here (tp1 without speculation,
 # tp1's breakable prefill graph against eager, mmmu at tep4).
