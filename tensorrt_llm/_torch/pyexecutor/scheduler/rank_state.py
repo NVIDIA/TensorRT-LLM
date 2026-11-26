@@ -121,11 +121,15 @@ class RankSpecDecodingStats(NamedTuple):
 
 
 class RankMoeLoadBalancerStats(NamedTuple):
-    """Cumulative adaptive-MoE counters captured by the owning rank."""
+    """Adaptive-MoE counters captured by the owning rank: cumulative windows, installs, installed
+    layers and copied bytes, the latest window's imbalance and whether the balancer runs."""
 
     windows: int
     installs: int
     installed_layers: int
+    copied_bytes: int = 0
+    imbalance: float = 0.0
+    enabled: int = 0
 
     @classmethod
     def wire_size(cls) -> int:
@@ -136,11 +140,28 @@ class RankMoeLoadBalancerStats(NamedTuple):
         """Restore an immutable counter snapshot, rejecting an incorrect field count."""
         if len(data) != cls.wire_size():
             raise ValueError(f"MoE snapshot requires {cls.wire_size()} fields")
-        return cls(*(int(value) for value in data))
+        return cls(*_typed_fields(cls, data, ("imbalance",)))
 
-    def as_dict(self) -> dict[str, int]:
+    @classmethod
+    def of(cls, counters: dict[str, int | float]) -> RankMoeLoadBalancerStats:
+        """From the balancer's counters (``AdaptiveRuntime.counters``)."""
+        return cls(
+            counters["windows"],
+            counters["installs"],
+            counters["installedLayers"],
+            counters["copiedBytes"],
+            counters["imbalance"],
+            counters["enabled"],
+        )
+
+    def as_dict(self) -> dict[str, int | float]:
         return dict(
-            windows=self.windows, installs=self.installs, installedLayers=self.installed_layers
+            windows=self.windows,
+            installs=self.installs,
+            installedLayers=self.installed_layers,
+            copiedBytes=self.copied_bytes,
+            imbalance=self.imbalance,
+            enabled=self.enabled,
         )
 
 

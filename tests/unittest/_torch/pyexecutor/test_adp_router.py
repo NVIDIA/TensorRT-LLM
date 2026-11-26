@@ -2673,7 +2673,9 @@ def test_moe_snapshot_rank_state_roundtrip_and_legacy_frame():
         payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=11)
         legacy = payload.serialize()
         assert legacy == [1, 11, 0, 0, 0, 0, 0, 0, 0]
-        payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(rank + 1, rank * 2, rank * 3)
+        payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(
+            rank + 1, rank * 2, rank * 3, rank * 4096, 1.25 + rank, 1
+        )
         state = RankState(
             rank=rank, iter_stats=payload, num_context_requests=7, num_generation_requests=5
         )
@@ -2682,7 +2684,12 @@ def test_moe_snapshot_rank_state_roundtrip_and_legacy_frame():
             restored = RankState.deserialize(encoded)
             assert restored == state
             assert restored.iter_stats.moe_load_balancer_stats.as_dict() == dict(
-                windows=rank + 1, installs=rank * 2, installedLayers=rank * 3
+                windows=rank + 1,
+                installs=rank * 2,
+                installedLayers=rank * 3,
+                copiedBytes=rank * 4096,
+                imbalance=1.25 + rank,
+                enabled=1,
             )
             with pytest.raises(ValueError):
                 RankState.deserialize(encoded[:-1])

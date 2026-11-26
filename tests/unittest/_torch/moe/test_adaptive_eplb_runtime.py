@@ -38,6 +38,7 @@ HOME = GEOMETRY.home_layout()
 TABLE = 2 * (E + R * LOCAL)
 ROWS = 512  # rows a window collects per expert: rows_per_expert's default
 FORWARDS = 8  # forwards of the windows after the first: the scripted decisions' and the spy's
+EXPERT_BYTES = 4096  # one expert's weights in a slot, as the transport reports them
 
 
 def fake_event(enable_timing: bool = False, blocking: bool = False) -> SimpleNamespace:
@@ -78,6 +79,9 @@ class FakeTransport:
         self.clock, self.delay, self.batches, self.due = clock, delay, [], []
         self.waiting = lambda: sum(due > self.clock[0] for due in self.due)
         self.runtime = None  # the runtime it serves (make_ranks)
+
+    def expert_bytes(self, layer: int) -> int:
+        return EXPERT_BYTES
 
     def copy(self, experts, stream, start, end) -> None:
         due = self.runtime.call + self.delay
@@ -195,7 +199,7 @@ def make_ranks(decisions, clock, copy_delays=(1, 1)):
         gather = group.gather(rank)
         tables = torch.zeros(L, TABLE, dtype=torch.int32)
         runtime = rt.AdaptiveRuntime(
-            layers, transport, STREAM, decision, gather, "cpu", tables, buffers
+            layers, transport, STREAM, decision, gather, "cpu", tables, buffers, None, rank == 0
         )
         runtime._event = Events(rank)
         transport.runtime = runtime
@@ -538,7 +542,7 @@ def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
     before = runtime.tables.clone()
     runtime.worker.failure = RuntimeError("adaptive EPLB decision process exited (1)")
     runtime.boundary()
-    assert isinstance(runtime.failure, RuntimeError)
+    assert isinstance(runtime.failure, RuntimeError) and runtime.counters()["enabled"] == 0
     assert torch.equal(runtime.tables, before) and not runtime.wants_request_progress
     runtime.worker.inbox.append(("copied", script(0)(0), np.zeros((R, 4))))
     runtime.boundary()
@@ -547,7 +551,13 @@ def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
 
 @closes_runtimes
 def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
-    """Two real deciders agree on tables and digests, with rank-specific copy items."""
+    """Two real deciders agree on tables and digests, with rank-specific copy items. EP rank 0 logs
+    every decision with all its fields, and the counters the iteration statistics report read the
+    installs, the bytes copied, the imbalance and that the balancer runs."""
+    from tensorrt_llm.logger import logger
+
+    logged = []
+    monkeypatch.setattr(logger, "info", lambda msg, *args: logged.append(msg))
     _, clock, decisions, ranks = spied_ranks(monkeypatch, timed=True)
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
     for runtime in ranks:
@@ -566,7 +576,22 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
         assert runtime.applied_window.tolist() == [1, 1]
         counters = runtime.counters()  # what the executor reports in its iteration statistics
         assert counters["installs"] == 1 and counters["installedLayers"] == 2
-        assert counters["windows"] >= 1
+        assert counters["windows"] >= 1 and counters["enabled"] == 1
+        assert counters["copiedBytes"] == 4 * EXPERT_BYTES and counters["imbalance"] > 1.0
+    fields = ("install", "window", "predicted_gain_ms_per_step", "always_on_overhead_ms_per_step")
+    fields += ("layers", "moved_layers", "copy_bytes", "imbalance", "state", "reason")
+    lines = [line for line in logged if line.startswith("adaptive EPLB decision: ")]
+    decided = [dict(kv.split("=") for kv in line.split(": ", 1)[1].split(", ")) for line in lines]
+    assert decided and all(tuple(d) == fields for d in decided)
+    assert [d["window"] for d in decided] == [str(w) for w in range(len(decided))]
+    assert all(d["reason"] in rt.REASONS for d in decided)
+    install = decided[1]
+    assert (install["install"], install["layers"], install["moved_layers"]) == ("yes", "2", "2")
+    assert install["copy_bytes"] == str(4 * EXPERT_BYTES) and install["reason"] == "install"
+    assert decided[0]["state"] == "home" and install["state"] == "enabled"
+    assert install["always_on_overhead_ms_per_step"] == "unknown"
+    assert float(install["predicted_gain_ms_per_step"]) > 0.0
+    assert float(install["imbalance"]) > 1.0
     for _ in range(2):  # two more windows, gathered after the install
         for runtime in ranks:
             set_statistics(runtime, hot, FORWARDS)
@@ -724,7 +749,8 @@ def test_decision_process_answers_and_reports_its_failure():
         window_stats(process.stats.numpy())
         # The first window holds fewer rows than a window collects: it only sizes the next ones,
         # to collect them at its 2 x (2 x 400 + 6) / 8 rows per forward.
-        assert process.ask(("window", 0)) == ("update", rt.LayoutUpdate(0))
+        kind, update = process.ask(("window", 0))
+        assert (kind, update.window, update.empty, update.reason) == ("update", 0, True, "sizing")
         rows = np.array([[10, 0, 0.0, 0], [12, 0, 0.0, 0]])  # ROW of both ranks
         kind, window, open_call, apply_call, plan, forwards = process.ask(("copied", 0, rows))
         assert (kind, window, apply_call, open_call) == ("schedule", 1, 13, 13 + plan.open_after)

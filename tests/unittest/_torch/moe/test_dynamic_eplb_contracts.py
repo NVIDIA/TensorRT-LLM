@@ -3046,7 +3046,7 @@ def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
         states = [module.RankState(rank=rank) for rank in range(4)]
         for state in states[:3]:
             state.iter_stats.moe_load_balancer_stats = module.RankMoeLoadBalancerStats(
-                state.rank + 1, state.rank * 2, state.rank * 3
+                state.rank + 1, state.rank * 2, state.rank * 3, state.rank * 4096, 1.5, 1
             )
         rows = [
             json.loads(row)
@@ -3056,7 +3056,12 @@ def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
         ]
         for rank in range(3):
             assert rows[rank]["moeLoadBalancerStats"] == dict(
-                windows=rank + 1, installs=rank * 2, installedLayers=rank * 3
+                windows=rank + 1,
+                installs=rank * 2,
+                installedLayers=rank * 3,
+                copiedBytes=rank * 4096,
+                imbalance=1.5,
+                enabled=1,
             )
         assert "moeLoadBalancerStats" not in rows[3]
     finally:

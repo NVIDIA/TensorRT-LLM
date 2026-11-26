@@ -45,6 +45,7 @@ from .policy import (
     choose_layers_to_install,
     evaluate_gains,
     plan_layout,
+    slot_rows,
     solve_shares,
 )
 
@@ -78,6 +79,10 @@ copying the statistics; ``applied``, ``applied_layers`` and ``applied_ms`` are t
 count and GPU time of the last route tables applied.
 """
 ROW = ("copied_call", "moved", "copy_ms", "digest")
+# Why a window installs or not: a rank counted no forward of some layer, the window only sized the
+# next one, no calibrated time model at this batch, no layer repays its copy, new shares on the
+# installed layouts (no copy), new layouts.
+REASONS = ("no_rows", "sizing", "untrusted_calibration", "no_payback", "shares_only", "install")
 """tuple: The float64 values a rank all-gathers after its copies of an update ran: the call they
 finished in, the layers it moved, their copy time and the update's digest."""
 
@@ -114,6 +119,13 @@ class LayoutUpdate:
     It holds the new route tables of the chosen layers, the layers whose layout changes
     (``moved``, copied as one timed batch) and the expert copies this rank makes for them
     (``copy_items``). ``digest`` lets the ranks check that they all decided the same.
+
+    What the decision log and the iteration statistics report of it: ``reason`` (one of
+    :data:`REASONS`), the predicted gain of the chosen layers in ms per decode step, the replicas
+    every rank together copies per moved layer, the window's imbalance (the mean over the layers
+    of the busiest GPU's rows over the mean GPU's, at the layouts in use; ``None`` without rows),
+    and the ``state`` the decision leaves: ``enabled`` while a layer holds replicas, else ``home``
+    (every layer back on its original layout, which ``reason`` explains).
     """
 
     window: int
@@ -121,6 +133,11 @@ class LayoutUpdate:
     tables: dict[int, np.ndarray] = field(default_factory=dict)
     moved: list[int] = field(default_factory=list)
     digest: int = 0
+    reason: str = "no_rows"
+    gain_ms: float = 0.0
+    replicas: dict[int, int] = field(default_factory=dict)
+    imbalance: float | None = None
+    state: str = "home"
 
     @property
     def empty(self) -> bool:
@@ -181,7 +198,9 @@ class _Decider:
 
     def handle(self, message: tuple) -> tuple:
         if message[0] == "window":
-            return ("update", self.decide(message[1]))
+            update = self.decide(message[1])
+            update.state = "enabled" if (self.layout != self.config.home_layouts).any() else "home"
+            return ("update", update)
         return self.schedule(*message[1:])
 
     def schedule(self, window: int, rows: np.ndarray) -> tuple:
@@ -233,7 +252,13 @@ class _Decider:
         sizing = self.next_forwards is None and counted < self.config.rows_per_expert * experts
         if per_forward > 0.0:
             self.next_forwards = window_forwards(per_forward, experts, self.config.rows_per_expert)
+        gpu_rows = slot_rows(rows, self.layout, self.shares).reshape(layers, geometry.ep_size, -1)
+        gpu_rows = gpu_rows.sum(2)
+        busy = gpu_rows.mean(1) > 0.0
+        if busy.any():
+            update.imbalance = float((gpu_rows.max(1)[busy] / gpu_rows.mean(1)[busy]).mean())
         if sizing:
+            update.reason = "sizing"
             return update
         total = {name: float(values.astype(np.float64).sum()) for name, values in tail.items()}
         steps_left = None
@@ -257,6 +282,7 @@ class _Decider:
         # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
         if not model.trusted:  # a bucket without a calibrated model: no decision, the layouts stay
+            update.reason = "untrusted_calibration"
             return update
         self.evaluations.model = model
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
@@ -322,12 +348,15 @@ class _Decider:
                 if not refresh[i]:
                     continue
                 new_layout[i], new_shares[i] = installed[i], current[2][i]
+            else:
+                update.gain_ms += float(gains[i])
             tables = build_route_tables(new_layout[i], new_shares[i], experts, slots).packed()
             update.tables[layer] = np.array(tables, dtype=np.int32)
             fresh = (new_layout[i] >= 0) & (new_layout[i] != self.layout[layer])
             if fresh.any():
                 moved.append(layer)
                 received += copied[i]
+                update.replicas[layer] = int(copied[i].sum())
                 update.copy_items[layer] = copy_items(
                     self.layout[layer], new_layout[i], geometry, cfg.ep_rank, cfg.ranks_per_node
                 )
@@ -335,6 +364,7 @@ class _Decider:
             self.shares[layer] = new_shares[i]
             self.committed[layer] = window
         update.moved = sorted(moved)
+        update.reason = "install" if moved else "shares_only" if update.tables else "no_payback"
         self.awaiting_copy[window] = (close, growth, steps_left, int(received.max()))
         update.digest = update.fingerprint()
         return update
@@ -479,9 +509,13 @@ class AdaptiveRuntime:
         tables: torch.Tensor,
         statistics: dict[str, torch.Tensor],
         on_window: Callable[[bool], None] | None = None,
+        log_decisions: bool = False,
     ) -> None:
         # Imported here: the decision process imports this module without the rest of the package.
         from tensorrt_llm._utils import prefer_pinned
+
+        # Whether this rank logs every decision (one EP rank does: they all decide the same).
+        self.log_decisions = log_decisions
 
         self.layers = layers
         # Told when a window opens (True) and closes (False): the statistics count only inside one.
@@ -513,6 +547,10 @@ class AdaptiveRuntime:
         self.closed_windows = 0
         self.installs = 0
         self.installed_layers = 0
+        # Written by the worker thread, read with the counters: the bytes every rank together copied
+        # for the installs, and the imbalance of the latest window with rows (0.0 before one).
+        self.copied_bytes = 0
+        self.imbalance = 0.0
         self.failure: BaseException | None = None
         # Timing event pairs of the publishes: one comes back here once the worker read its time
         # (creating two CUDA events costs the main thread more than the rest of a publish).
@@ -567,13 +605,18 @@ class AdaptiveRuntime:
         finally:
             self.decision.close()
 
-    def counters(self) -> dict[str, int]:
-        """The windows closed, the installs applied (updates with new route tables) and the layers
-        they installed, since the runtime started."""
+    def counters(self) -> dict[str, int | float]:
+        """The windows closed, the installs applied (updates with new route tables), the layers they
+        installed and the bytes every rank together copied for them, since the runtime started; the
+        imbalance of the latest window with rows (:class:`LayoutUpdate`, 0.0 before one); and
+        whether the runtime still runs (1) or stopped after a failure or its close (0)."""
         return dict(
             windows=self.closed_windows,
             installs=self.installs,
             installedLayers=self.installed_layers,
+            copiedBytes=self.copied_bytes,
+            imbalance=self.imbalance,
+            enabled=int(self.failure is None and not self._closed),
         )
 
     def add_request_progress(self, num_requests: int, progress: GenerationProgress) -> None:
@@ -714,7 +757,29 @@ class AdaptiveRuntime:
             open_call=self.window_opened_call,
             stats=self.decision.stats.numpy(),
         )
-        return self.decision.ask(("window", window))
+        message = self.decision.ask(("window", window))
+        self._decided(message[1])
+        return message
+
+    def _decided(self, update: LayoutUpdate) -> None:
+        """Worker thread: keep the window's imbalance and log the decision at info level."""
+        from tensorrt_llm.logger import logger
+
+        if update.imbalance is not None:
+            self.imbalance = update.imbalance
+        if not self.log_decisions:
+            return
+        copy_bytes = sum(
+            n * self.transport.expert_bytes(layer) for layer, n in update.replicas.items()
+        )
+        imbalance = "unknown" if update.imbalance is None else f"{update.imbalance:.3f}"
+        logger.info(
+            f"adaptive EPLB decision: install={'yes' if update.tables else 'no'}, "
+            f"window={update.window}, predicted_gain_ms_per_step={update.gain_ms:.4f}, "
+            f"always_on_overhead_ms_per_step=unknown, layers={len(update.tables)}, "
+            f"moved_layers={len(update.moved)}, copy_bytes={copy_bytes}, imbalance={imbalance}, "
+            f"state={update.state}, reason={update.reason}"
+        )
 
     def _copies_done(self, update: LayoutUpdate, rows: np.ndarray) -> None:
         """Every rank's copies of ``update`` ran: check that all ranks decided alike."""
@@ -741,6 +806,9 @@ class AdaptiveRuntime:
             self.transport.copy(experts, self.copy_stream, self._copy_begin, self._copy_end)
             self._copy_end.synchronize()
             ms = self._copy_begin.elapsed_time(self._copy_end)
+            self.copied_bytes += sum(
+                n * self.transport.expert_bytes(layer) for layer, n in update.replicas.items()
+            )
         row = (self.call, len(update.moved), ms, update.digest)
         rows = torch.zeros(len(self._gathered), len(ROW), dtype=torch.float64)
         self.gather(torch.tensor(row, dtype=torch.float64), list(rows), self.leave)

@@ -737,6 +737,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             self.route_tables(device),
             self.statistics(device),
             on_window=self._set_window_open,
+            log_decisions=self.ep_rank == 0,
         )
 
     def statistics(self, device: torch.device | str) -> dict[str, torch.Tensor]:
@@ -815,7 +816,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             if self._recording_flag is not None:
                 self._recording_flag.fill_(value)
 
-    def iteration_stats(self) -> dict[str, int] | None:
+    def iteration_stats(self) -> dict[str, int | float] | None:
         """The runtime's counters (:meth:`~.runtime.AdaptiveRuntime.counters`) once it runs."""
         return None if self.runtime is None else self.runtime.counters()
 

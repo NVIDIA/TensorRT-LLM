@@ -325,7 +325,7 @@ class ADPIterStatsBuffer:
         gpu_forward_time_ms: Optional[float] = None,
         is_queue_snapshot: bool = False,
         idle_heartbeat: bool = False,
-        moe_load_balancer_stats: Optional[dict[str, int]] = None,
+        moe_load_balancer_stats: Optional[dict[str, int | float]] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout.
 
@@ -343,11 +343,7 @@ class ADPIterStatsBuffer:
         is_queue_snapshot = is_queue_snapshot or idle_heartbeat
         payload = self.make_payload(stats)
         if moe_load_balancer_stats is not None:
-            payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(
-                moe_load_balancer_stats["windows"],
-                moe_load_balancer_stats["installs"],
-                moe_load_balancer_stats["installedLayers"],
-            )
+            payload.moe_load_balancer_stats = RankMoeLoadBalancerStats.of(moe_load_balancer_stats)
         iter_id = payload.iter_stats_iter
         if idle_heartbeat:
             for pending_iter in list(self._idle_heartbeat_iters):
