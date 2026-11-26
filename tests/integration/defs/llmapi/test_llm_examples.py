@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,10 +50,36 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
 
     run_command = [str(examples_script)] + list(args)
 
+    tinyllama_model = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    llama31_model = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+    jet_artifacts_root = os.environ.get("JET_ARTIFACTS_ROOT")
+    example_env = None
+    if jet_artifacts_root:
+        tinyllama_model = str(
+            Path(jet_artifacts_root) / "model/tinyllama_1.1b_chat_v1.0" /
+            "safetensors_mode-instruct/hf-fe8a4ea_orig")
+        llama31_model = str(
+            Path(jet_artifacts_root) /
+            "model/meta-llama_llama-3.1-8b-instruct" / "hf/hf-0e9e39f_orig")
+        hf_home = Path(llm_venv.get_working_directory()) / ".jet-hf-home"
+        example_env = {
+            "HF_HOME": str(hf_home),
+            "HF_HUB_CACHE": str(hf_home / "hub"),
+            "HF_TOKEN_PATH": str(hf_home / "token"),
+            "HF_TOKEN": "",
+            "HUGGING_FACE_HUB_TOKEN": "",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+        }
+        print(
+            f"JET trial: Hugging Face offline mode with isolated cache {hf_home}"
+        )
+
     # Create llm models softlink to avoid duplicated downloading for llm api example
     src_dst_dict = {
         # TinyLlama-1.1B-Chat-v1.0 (requested by the llm-api example scripts)
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
+        tinyllama_model:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         # Qwen3-0.6B
         f"{llm_models_root()}/Qwen3/Qwen3-0.6B":
@@ -65,7 +91,7 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
         f"{llm_models_root()}/medusa-vicuna-7b-v1.3":
         f"{llm_venv.get_working_directory()}/FasterDecoding/medusa-vicuna-7b-v1.3",
         # Llama-3.1-8B-Instruct
-        f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct":
+        llama31_model:
         f"{llm_venv.get_working_directory()}/meta-llama/Llama-3.1-8B-Instruct",
         # DeepSeek-V3-Lite/bf16
         f"{llm_models_root()}/DeepSeek-V3-Lite/bf16":
@@ -76,6 +102,12 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
     }
 
     for src, dst in src_dst_dict.items():
+        if jet_artifacts_root and src in (tinyllama_model, llama31_model):
+            if not (Path(src) / "config.json").is_file():
+                raise FileNotFoundError(f"JET model not available: {src}")
+            print(f"Using JET model: {src}")
+            if os.path.islink(dst):
+                os.unlink(dst)
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
@@ -87,7 +119,7 @@ def _run_llmapi_example(llm_root, engine_dir, llm_venv, script_name: str,
                    cnn_dailymail_dst,
                    target_is_directory=True)
 
-    venv_check_call(llm_venv, run_command)
+    venv_check_call(llm_venv, run_command, env=example_env)
 
 
 def test_llmapi_quickstart(llm_root, engine_dir, llm_venv):
