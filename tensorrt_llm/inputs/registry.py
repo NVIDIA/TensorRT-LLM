@@ -17,6 +17,7 @@
 
 import enum
 import importlib
+import threading
 import traceback
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -64,6 +65,10 @@ if TYPE_CHECKING:
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
+
+# Serializes the first-time hashing probes, which run on preprocessing thread
+# pools and share an input processor's multimodal_hashing_supported latch.
+_HASHING_PROBE_LOCK = threading.Lock()
 
 
 def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
@@ -1776,7 +1781,8 @@ def create_input_processor_with_hash(
                     inputs, sampling_params)
                 if try_multimodal_hashing:
                     # if trying for first time, set the flag to True
-                    input_processor.multimodal_hashing_supported = True
+                    with _HASHING_PROBE_LOCK:
+                        input_processor.multimodal_hashing_supported = True
             except Exception as e:
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
@@ -1792,7 +1798,11 @@ def create_input_processor_with_hash(
                         logger.warning(f"Basic input processor failed: {e}.")
                         logger.debug(traceback.format_exc())
                         raise e2
-                    input_processor.multimodal_hashing_supported = False
+                    # A concurrent probe that succeeded meanwhile showed
+                    # hashing works; its True stands.
+                    with _HASHING_PROBE_LOCK:
+                        if input_processor.multimodal_hashing_supported is None:
+                            input_processor.multimodal_hashing_supported = False
                 else:
                     raise e
         else:

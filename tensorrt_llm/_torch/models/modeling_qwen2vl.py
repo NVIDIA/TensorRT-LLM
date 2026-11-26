@@ -1415,15 +1415,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
 
-        # Bound the expanded prompt before building it: every row is a prompt
-        # token.
-        total_rows = sum(item.num_rows for items in items_by_modality.values()
-                         for item in items)
-        max_positions = self.config.text_config.max_position_embeddings
-        if total_rows > max_positions:
-            raise ValueError(
-                f"Attached embeddings have {total_rows} rows in total, more "
-                f"than the model's {max_positions} positions")
         width = self._external_embedding_width()
         grids: Dict[str, List[Tuple[int, int, int]]] = {}
         video_metadata: List[Dict[str, Any]] = []
@@ -2531,7 +2522,7 @@ def _mrope_delta(deltas: torch.Tensor) -> int:
         return int(deltas.max())
     stream = private_stream(deltas.device.index, "mrope_delta_read")
     with torch.cuda.stream(stream):
-        return int(deltas.max().to("cpu"))
+        return int(deltas.to("cpu").max())
 
 
 def cap_mrope_decode_tokens(request: "LlmRequest",
@@ -2562,7 +2553,13 @@ def cap_mrope_decode_tokens(request: "LlmRequest",
     deltas = mrope_config.get("mrope_position_deltas")
     if not isinstance(deltas, torch.Tensor) or not deltas.numel():
         return
-    delta = _mrope_delta(deltas)
+    delta = request.py_mrope_delta
+    if delta is None:
+        delta = _mrope_delta(deltas)
+        # Children deep-copy the parent's tensors on the current stream, behind
+        # the step in flight, so the private-stream read would race the copy.
+        for child in request.child_requests:
+            child.py_mrope_delta = delta
     if delta <= 0:
         return
     prompt_len = request.orig_prompt_len

@@ -506,14 +506,15 @@ def test_float64_and_integer_timestamp_tensors_are_accepted() -> None:
         assert tokens[0] == _FakeTokenizer.piece_id(f"<{float(timestamps[0]):.1f} seconds>")
 
 
-def test_rows_past_the_rotary_table_are_rejected_before_expansion() -> None:
+def test_rows_past_the_processor_rotary_table_pass_preprocessing() -> None:
+    # The engine bounds tokens and positions with its own config at admission.
     processor = _make_processor(Qwen3VLInputProcessorBase)
     processor.config.text_config.max_position_embeddings = 6
     image = {"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
-    with pytest.raises(ValueError, match="8 rows in total, more than the model's 6 positions"):
-        _attach(
-            processor, "<|vision_start|><|image_pad|><|vision_end|>" * 2, {"image": [image] * 2}
-        )
+    token_ids, _ = _attach(
+        processor, "<|vision_start|><|image_pad|><|vision_end|>" * 2, {"image": [image] * 2}
+    )
+    assert token_ids.count(_IMAGE_PAD) == 8
 
 
 def test_embeddings_without_a_local_encoder_or_handoff_are_rejected_at_admission() -> None:
