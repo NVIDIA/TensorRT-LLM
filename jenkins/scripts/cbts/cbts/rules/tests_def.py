@@ -753,6 +753,12 @@ class TestsDefRule(Rule):
                     else []
                 )
                 whole_file = anchors == [yaml_path]
+                if git_path in {
+                    "tests/unittest/_torch/distributed/test_nccl_profiler.py",
+                    "tests/unittest/bindings/test_nanobind_profiler.py",
+                }:
+                    # The contract runs both files under each native build mode.
+                    anchors.append("test_unittests.py::test_nccl_profiler_build_contract")
                 # Package-file anchors keep directory scopes at their own level.
                 group_anchors = [
                     path if path.endswith(".py") else f"{path}/__init__.py"
@@ -760,6 +766,9 @@ class TestsDefRule(Rule):
                 ]
                 if whole_file:
                     anchors = list(dict.fromkeys([*anchors, *group_anchors]))
+                if git_path == "tests/unittest/_torch/distributed/test_communicator_profiler.py":
+                    # The two-rank smoke test only runs inside the MPI wrapper.
+                    anchors.append("test_unittests.py::test_mpi_profiler")
                 file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
                 if group_anchors and not whole_file:
                     group_bf, _ = lookup_paths_into_block_filters(self.yaml_index, group_anchors)

@@ -773,6 +773,9 @@ class TestTransceiverContextManager:
     def _tc():
         # Bypass the heavy __init__ (cuda device, TransferWorker, dist broadcasts).
         tc = object.__new__(KvCacheTransceiverV2)
+        tc._profile_send_outcomes = {}
+        tc._profile_send_observers = set()
+        tc._profile_send_failures = set()
         tc._send_sessions = {}
         tc._recv_sessions = {}
         tc._send_reqs = {}
