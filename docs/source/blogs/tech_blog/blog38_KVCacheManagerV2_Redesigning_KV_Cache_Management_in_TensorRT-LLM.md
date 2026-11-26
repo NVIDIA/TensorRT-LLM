@@ -47,7 +47,7 @@ Why a new manager rather than an extension of the existing one? We tried the ext
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_v1_vs_v2_architecture.png" width="900">
+  <img src="../media/tech_blog38_v1_vs_v2_architecture.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: V1 and V2 KV cache manager architectures.</em></sub></p>
@@ -108,7 +108,7 @@ V1 coalesces across layers too, but on a proxy: every layer sharing a window siz
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_lifecycle_coalescing.png" width="900">
+  <img src="../media/tech_blog38_lifecycle_coalescing.png" width="900">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Lifecycles group buffers into big pages, and why the grouping must be by lifecycle.</em></sub></p>
@@ -125,7 +125,7 @@ Multi-turn conversations show what this buys. Under the `per_conversation` reuse
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_one_tree_many_lifecycles.png" width="800">
+  <img src="../media/tech_blog38_one_tree_many_lifecycles.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: A radix-tree block holds one page slot per lifecycle.</em></sub></p>
@@ -140,7 +140,7 @@ A page need not keep the same representation on every tier. A pluggable **cold-p
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_page_states_and_tiers.png" width="800">
+  <img src="../media/tech_blog38_page_states_and_tiers.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Page status and tier migration.</em></sub></p>
@@ -161,7 +161,7 @@ Within each level, lifecycles map to pool groups with a per-group quota and prio
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_elastic_pools_vmm.png" width="800">
+  <img src="../media/tech_blog38_elastic_pools_vmm.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Elastic pools over CUDA virtual memory.</em></sub></p>
