@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed text decoder with wide residual connections, GDP and shortcut MoE."""
 
+import os
 from functools import partial
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.distributed.allreduce_helper import force_all_reduce_deterministic
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
@@ -118,6 +120,10 @@ class ShortcutDecoder(DecoderModel):
         self.tp_size = tp
         self.dp_size = mapping.tp_size if self.attn_dp else 1
         self.tp_group = list(mapping.tp_group)
+        self.deterministic_allreduce = force_all_reduce_deterministic()
+        # A request's output is independent of the requests batched with it only under
+        # FORCE_DETERMINISTIC=1. The fixed launch shapes this takes cost throughput.
+        self.batch_invariant = os.getenv("FORCE_DETERMINISTIC", "0") == "1"
         self.allreduce_args = (
             allreduce_group_args(mapping, strategy=int(AllReduceStrategy.NCCL))
             if mapping.tp_size > 1
@@ -182,6 +188,7 @@ class ShortcutDecoder(DecoderModel):
                 attention_layers,
                 self.num_sms,
                 index_dim=self.index_dim,
+                batch_invariant=self.batch_invariant,
                 nvfp4_kv=self.nvfp4_kv,
             )
             if self.index_topk is not None
@@ -355,11 +362,25 @@ class ShortcutDecoder(DecoderModel):
             return x.new_empty((0, weight.shape[1]), dtype=out_dtype or x.dtype)
         return cublas_mm(x, weight, out_dtype=out_dtype)
 
+    def _apply_rows(self, op, x, *args, **kwargs):
+        if not self.batch_invariant or x.shape[0] == 0:
+            return op(x, *args, **kwargs)
+        # GEMM and RMS reductions both change their reduction tree with M.
+        # Keep their launch shape identical for single and co-batched tokens.
+        rows_per_launch = 128
+        outputs = []
+        for chunk in x.split(rows_per_launch):
+            count = chunk.shape[0]
+            if count < rows_per_launch:
+                chunk = nn.functional.pad(chunk, (0, 0, 0, rows_per_launch - count))
+            outputs.append(op(chunk.contiguous(), *args, **kwargs)[:count])
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
     def mm(self, x, weight, *, out_dtype=None):
-        return self._project(x, weight, out_dtype=out_dtype)
+        return self._apply_rows(self._project, x, weight, out_dtype=out_dtype)
 
     def _norm(self, x, weight):
-        return rms_norm(x, weight, self.eps)
+        return self._apply_rows(rms_norm, x, weight, self.eps)
 
     _grouped_experts = staticmethod(grouped_experts)
 
@@ -367,6 +388,15 @@ class ShortcutDecoder(DecoderModel):
         if self.tp_size == 1:
             return x
         x = x.contiguous()
+        if self.deterministic_allreduce:
+            # NCCL can change the reduction tree with the packed token count.
+            # Gather in rank order and use the same FP32 additions for every row.
+            gathered = allgather(x, None, self.tp_group, self.process_group)
+            ranks = gathered.view(self.tp_size, *x.shape)
+            total = ranks[0].float()
+            for contribution in ranks[1:]:
+                total = total + contribution.float()
+            return total.to(x.dtype)
         return allreduce(
             x,
             residual=None,
@@ -504,7 +534,7 @@ class ShortcutDecoder(DecoderModel):
             # reduction order with row count. Match ordinary decode before KV quantization.
             per_candidate = partial(_apply_candidate_rows, step["num_ctx_tokens"], width)
             read_streams = partial(per_candidate, read_streams)
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not self.deterministic_allreduce:
                 tp_reduce = partial(per_candidate, tp_reduce)
         streams = embedding.float()[:, None, :].expand(-1, self.streams, -1)
         plan = None
