@@ -678,6 +678,9 @@ class ShortcutForCausalLM(DecoderModelForCausalLM):
                 use_separate_draft_kv_cache=should_use_separate_draft_kv_cache(spec),
             )
 
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        return self.spec_worker is not None and self.spec_worker.set_guided_decoder(guided_decoder)
+
     def forward(
         self,
         attn_metadata,

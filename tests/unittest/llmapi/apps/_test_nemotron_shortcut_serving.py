@@ -17,6 +17,7 @@ from tensorrt_llm._utils import get_sm_version
 from .openai_server import RemoteOpenAIServer
 
 PRECISIONS = ("nvfp4",)
+LABEL_PROMPT = 'Return the label "violet" as a compact JSON object with the key "label".'
 
 
 @pytest.fixture(scope="class")
@@ -65,8 +66,37 @@ def _image_uri(image_path):
     return "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii")
 
 
+class _StructuredOutput:
+    @pytest.mark.parametrize("thinking", [False, True], ids=["direct", "thinking"])
+    def test_json_schema(self, server, thinking):
+        client, model = server
+        schema = {
+            "type": "object",
+            "properties": {"label": {"enum": ["violet"]}},
+            "required": ["label"],
+            "additionalProperties": False,
+        }
+        # The grammar constrains the answer after </think>. Give the reasoning
+        # phase its input explicitly, while direct mode must infer it from the schema.
+        prompt = LABEL_PROMPT if thinking else "Reply with the label in JSON."
+        result = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            max_completion_tokens=384 if thinking else 64,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "label", "schema": schema},
+            },
+            extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
+        )
+        choice = result.choices[0]
+        assert choice.finish_reason == "stop", result.usage
+        assert json.loads(choice.message.content) == {"label": "violet"}
+
+
 @pytest.mark.parametrize("server", PRECISIONS, indirect=True)
-class TestServing:
+class TestServing(_StructuredOutput):
 
 
     def test_image_tool_roundtrip(self, server):
@@ -123,3 +153,8 @@ class TestServing:
         )
         answer = client.chat.completions.create(messages=messages, tool_choice="none", **options)
         assert "GARNET-418" in answer.choices[0].message.content
+
+
+@pytest.mark.parametrize("server", [f"{p}-mtp2" for p in PRECISIONS], indirect=True)
+class TestMtpServing(_StructuredOutput):
+    """Structured output with two MTP draft tokens."""

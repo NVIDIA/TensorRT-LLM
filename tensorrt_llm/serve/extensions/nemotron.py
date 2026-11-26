@@ -21,9 +21,27 @@ from tensorrt_llm.serve.serving_extensions import (
 )
 
 
-@register_serving_extension(model_types=("nemotron_h", "nemotron_h_omni", "nemotron4"))
+@register_serving_extension(
+    model_types=("nemotron_h", "nemotron_h_omni", "nemotron4"),
+    reasoning_parsers=("nemotron-v3", "nano-v3"),
+)
 class NemotronServingExtension(ServingExtension):
     """Use mandatory tool-call grammars for native Nemotron chat requests."""
 
     def required_tool_choice_mode(self) -> RequiredToolChoiceMode:
         return "grammar"
+
+    def structured_output_format(self, content: dict, chat_template_kwargs: dict | None):
+        """Place the constraint after the reasoning the chat template has opened.
+
+        The template already emits <think> (enabled) or <think></think> (disabled).
+        """
+        if not (chat_template_kwargs or {}).get("enable_thinking", True):
+            return None
+        return {
+            "type": "sequence",
+            "elements": [
+                {"type": "tag", "begin": "", "content": {"type": "any_text"}, "end": "</think>"},
+                content,
+            ],
+        }
