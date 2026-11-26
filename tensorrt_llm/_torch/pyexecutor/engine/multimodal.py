@@ -664,9 +664,10 @@ class MultimodalItemScheduler:
     ) -> dict[str, Any] | None:
         """Attach only this forward's rows of precomputed embeddings.
 
-        The request keeps the full attachment on the host, so the device holds
-        at most one forward's rows of it, as with encoder outputs. Without
-        runtime row placement, prefill is one-shot and uses every row.
+        The request keeps the full attachment, so a host attachment puts at
+        most one forward's rows on the device, as with encoder outputs; a
+        device attachment stays resident with its producer until prefill ends.
+        Without runtime row placement, prefill is one-shot and uses every row.
         """
         multimodal_data = request.py_multimodal_data
         embedding = (

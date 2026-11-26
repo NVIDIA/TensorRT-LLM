@@ -837,8 +837,7 @@ def test_failed_sequence_group_gets_one_error_response(child_first: bool) -> Non
     PyExecutor._handle_errors(executor, "over budget", requests=failed, charge_budget=False)
 
     ((responses,), _) = executor._enqueue_responses.call_args
-    first = failed[0].py_request_id
-    assert [(req_id, response.request_id) for req_id, response in responses] == [(first, 1)]
+    assert [(req_id, response.request_id) for req_id, response in responses] == [(1, 1)]
     assert executor.active_requests == []
     assert [call.args[0] for call in executor._terminate_request.call_args_list] == failed
 

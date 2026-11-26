@@ -967,8 +967,8 @@ def _attached_request(
 @pytest.mark.parametrize("as_list", [False, True], ids=["tensor", "list"])
 @pytest.mark.parametrize(
     ("window", "rows"),
-    [((0, 8), (0, 5)), ((0, 3), (0, 2)), ((3, 8), (2, 5)), ((3, 5), (2, 2))],
-    ids=["whole", "first_chunk", "reused_prefix", "text_only_chunk"],
+    [((0, 8), (0, 5)), ((0, 3), (0, 2)), ((3, 8), (2, 5)), ((3, 5), (2, 2)), ((2, 7), (1, 4))],
+    ids=["whole", "first_chunk", "reused_prefix", "text_only_chunk", "inside_both_items"],
 )
 def test_attached_embedding_is_sliced_to_the_forward_rows(
     as_list: bool, window: tuple[int, int], rows: tuple[int, int]
@@ -995,6 +995,26 @@ def test_attached_embedding_is_sliced_to_the_forward_rows(
     # The request keeps the whole attachment for later chunks.
     assert request.py_multimodal_data["multimodal_embedding"] is embedding
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_attached_items_on_different_devices_are_joined() -> None:
+    mm_item_scheduler = bare_mm_item_scheduler(_FloatModel())
+    mm_item_scheduler.bytes_per_embedding = 8
+    attachment = torch.arange(10, dtype=torch.float16).reshape(5, 2)
+    request = _attached_request([attachment[:2], attachment[2:].cuda()], [0, 1, 2, 2, 2, 3, 4, 5])
+    initialize_multimodal_encoder_request(request, max_num_tokens=8)
+    runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
+        past_seen_token_num=2,
+        chunk_end_pos=7,
+    )
+
+    multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+
+    torch.testing.assert_close(
+        multimodal_data["multimodal_embedding"].cpu(), attachment[1:4].float()
+    )
 
 
 def test_attached_embedding_without_row_placement_is_attached_whole() -> None:
