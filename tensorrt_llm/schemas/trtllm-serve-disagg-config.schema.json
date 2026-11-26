@@ -6192,6 +6192,14 @@
           "title": "Disk Protected Copy Fraction",
           "type": "number"
         },
+        "disk_write_behind_mib": {
+          "default": 0,
+          "description": "Host memory, in MiB, for write-behind of host-to-disk KV cache writes (0: off). A block's write completes once its bytes are copied there, so the host memory it came from can be reused without waiting for the disk; a disk I/O thread writes the file afterwards, and reads of the block are served from that memory until then. Writes that do not fit run as before. Requires `disk_io_threads` > 0. Process-wide, like the disk I/O pool. Only used by KV cache manager v2 with a disk cache.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Disk Write Behind Mib",
+          "type": "integer"
+        },
         "disk_write_through": {
           "default": false,
           "description": "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its later host-to-disk eviction writes nothing. Copies use free disk space only and are written after restores and evictions. Requires `disk_io_threads` > 0. Only used by KV cache manager v2 with a disk cache.",

@@ -792,6 +792,11 @@
       "path": "kv_cache_config.disk_protected_copy_fraction"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.disk_write_behind_mib"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.disk_write_through"
