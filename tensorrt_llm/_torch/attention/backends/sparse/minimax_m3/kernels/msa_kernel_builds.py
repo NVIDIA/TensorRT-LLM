@@ -15,8 +15,8 @@ it. The variants found build on the rank's worker processes (:func:`build_varian
 directory and under the file lock the package's own lookup uses, and the run goes on once they
 are built: its lookups load them. The plan, split-KV reduction and sparse top-k modules, and the
 k2q CSR extension the sparse prefill loads, need nothing from a call: they build with the
-variants of the first run in build mode. A variant or module the package loads built ahead of
-time (``BUILD_MSA_AOT``, its ``_prebuilt``) is not built.
+variants of the first run in build mode. A variant, module or extension the package loads built
+ahead of time (``BUILD_MSA_AOT``, its ``_prebuilt``) is not built.
 """
 
 from __future__ import annotations
@@ -55,6 +55,19 @@ def _cache_scope() -> str:
     return f"{os.uname().nodename}:{os.path.realpath(str(_package.jit._jit_base()))}"
 
 
+def _k2q_csr_directory() -> str:
+    """The directory PyTorch builds the k2q CSR extension in, and loads it from."""
+    from torch.utils.cpp_extension import _get_build_directory
+
+    return _get_build_directory(_K2Q_CSR_EXTENSION, verbose=False)
+
+
+def _k2q_csr_scope() -> str:
+    """Where the k2q CSR extension builds: the ranks whose imports read the same directory on
+    this host split its build."""
+    return f"{os.uname().nodename}:{os.path.realpath(_k2q_csr_directory())}"
+
+
 _QUERY_LEN = DynamicSpec("qo_len", _query_len_buckets)
 # A variant or module takes 35-60 s to compile on GB300, which repays a worker.
 _SHARED = dict(
@@ -65,8 +78,11 @@ _CONFIG = BuildConfig((_QUERY_LEN,), **_SHARED)
 # The MSA indexer's maximum-score pass also chooses whether to split KV, per batch
 # (msa_indexer._proxy_kv_splits); a variant depends only on whether it splits.
 _PROXY_CONFIG = BuildConfig((_QUERY_LEN, DynamicSpec("num_kv_splits", (1, 2))), **_SHARED)
-# The k2q CSR extension builds into PyTorch's extension directory, under PyTorch's own lock.
-_K2Q_CONFIG = BuildConfig(use_build_pool_in_warmup=True)
+# The k2q CSR extension builds into PyTorch's extension directory: the ranks that share it
+# split the build.
+_K2Q_CONFIG = BuildConfig(
+    strategy=BuildStrategy.SHARED, share_scope=_k2q_csr_scope, use_build_pool_in_warmup=True
+)
 # Plan options a replay does not pass through: it plans its own lengths and offsets, and a
 # swept split count.
 _PLAN_SKIP = ("qo_offset", "device", "stream", "num_kv_splits")
@@ -82,8 +98,10 @@ _MODULES = (
     ("reduction", "fmha_sm100_reduction.so", "_do_compile_reduction"),
     ("sparse_topk", "sparse_topk_select.so", "_do_compile_sparse_topk"),
 )
-# The package module that compiles the sparse prefill's k2q CSR extension on import.
+# The package module that compiles the sparse prefill's k2q CSR extension on import, with
+# PyTorch's cpp_extension.load, and the extension's name.
 _K2Q_CSR_MODULE = "fmha_sm100.cute.src.sm100.build_k2q_csr"
+_K2Q_CSR_EXTENSION = "sparse_build_k2q_csr_m31_ext"
 
 # Where the worker processes find the build functions below.
 _HERE = __name__
@@ -157,7 +175,8 @@ class _Package:
             for name, library, compile_fn in _MODULES
             if self.jit._prebuilt(f"{name}/{library}") is None
         ]
-        builds.append((_K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG))
+        if self.jit._prebuilt(f"k2q/{_K2Q_CSR_EXTENSION}.so") is None:
+            builds.append((_K2Q_CSR_MODULE, BuildTask(f"{_HERE}:import_k2q_csr"), _K2Q_CONFIG))
         return builds
 
     def run(self, q, k, v, plan_info, *args, **kwargs):
@@ -320,15 +339,29 @@ def build_module(name: str, library: str, compile_fn: str) -> bool:
 
 
 def import_k2q_csr() -> bool:
-    """In a worker process: the k2q CSR extension compiles when its module is first imported,
-    into PyTorch's extension directory, where this rank's import finds it built."""
+    """In a worker process: import the module that compiles the k2q CSR extension on first
+    import, into PyTorch's extension directory, where this rank's import finds it built; False
+    when it was built already.
+
+    The worker that claimed the build imports it while the other ranks wait (``_K2Q_CONFIG``),
+    so the import compiled the extension when the extension's library changed during it.
+    """
     import importlib
 
     _require_package()
-    t0 = time.perf_counter()
+    library = os.path.join(_k2q_csr_directory(), f"{_K2Q_CSR_EXTENSION}.so")
+    before = _file_state(library)
     importlib.import_module(_K2Q_CSR_MODULE)
-    # Loading a built extension takes milliseconds.
-    return time.perf_counter() - t0 >= 1.0
+    return _file_state(library) != before
+
+
+def _file_state(path: str) -> Optional[Tuple[int, int]]:
+    """A file's inode and modification time; None when it does not exist."""
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_mtime_ns
 
 
 def _route(module: Any, api: Any, package: _Package) -> None:

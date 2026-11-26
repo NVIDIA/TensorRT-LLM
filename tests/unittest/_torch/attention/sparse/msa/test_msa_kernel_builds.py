@@ -8,14 +8,17 @@ compiled and no build reaches a worker process.
 
 import importlib.util
 import os
+import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
+import torch.utils.cpp_extension as cpp_extension
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_kernel_builds
 from tensorrt_llm._torch.build_pool import BuildPool
-from tensorrt_llm._torch.kernel_builder import KernelBuilder
+from tensorrt_llm._torch.kernel_builder import BuildStrategy, KernelBuilder
 
 _OP = msa_kernel_builds._OP
 # The stand-in's variants: a 64-row query tile up to 64 rows, a 128-row one above.
@@ -108,10 +111,14 @@ def test_a_run_in_build_mode_builds_the_variants_of_the_query_lengths_it_sweeps(
     assert _variants(build_mode) == {_SHORT, _LONG}
     modules = {key for key, task, _ in build_mode if task.function.endswith(":build_module")}
     assert modules == {"plan", "reduction", "sparse_topk"}
-    # The ranks split the variants and modules; each builds the k2q CSR extension.
+    # The ranks split the variants, the modules and the k2q CSR extension: the variants and
+    # modules over the package's build directory, the extension over PyTorch's.
     configs = {key: config for key, _, config in build_mode}
     assert configs[_SHORT] is configs["plan"] is msa_kernel_builds._CONFIG
-    assert configs[msa_kernel_builds._K2Q_CSR_MODULE] is msa_kernel_builds._K2Q_CONFIG
+    k2q = configs[msa_kernel_builds._K2Q_CSR_MODULE]
+    assert k2q is msa_kernel_builds._K2Q_CONFIG
+    assert k2q.strategy is BuildStrategy.SHARED
+    assert k2q.share_scope is msa_kernel_builds._k2q_csr_scope
     # The replays looked nothing up; the call's own lookup is the package's.
     assert package.events == [("lookup", (128, False))]
 
@@ -122,13 +129,20 @@ def test_a_run_in_build_mode_builds_the_variants_of_the_query_lengths_it_sweeps(
 
 
 def test_a_run_in_build_mode_skips_what_the_package_has_built_ahead_of_time(package, build_mode):
-    """A variant or module the package loads from its ahead-of-time build (BUILD_MSA_AOT) is not
-    built in the warmup."""
-    package.prebuilt.update({f"{_SHORT}/{_SHORT}.so", "plan/fmha_sm100_plan.so"})
+    """A variant, module or extension the package loads from its ahead-of-time build
+    (BUILD_MSA_AOT) is not built in the warmup."""
+    package.prebuilt.update(
+        {
+            f"{_SHORT}/{_SHORT}.so",
+            "plan/fmha_sm100_plan.so",
+            f"k2q/{msa_kernel_builds._K2Q_CSR_EXTENSION}.so",
+        }
+    )
     _call(package.module, 100)
     assert _variants(build_mode) == {_LONG}
     modules = {key for key, task, _ in build_mode if task.function.endswith(":build_module")}
     assert modules == {"reduction", "sparse_topk"}
+    assert msa_kernel_builds._K2Q_CSR_MODULE not in {key for key, _, _ in build_mode}
 
 
 def test_a_replay_that_raises_leaves_the_kernels_to_their_first_use(package, build_mode):
@@ -148,24 +162,62 @@ def test_in_inference_mode_a_run_builds_nothing(package, monkeypatch):
     assert package.events == [("lookup", (64, False)), ("lookup", (64, False))]
 
 
-def test_ranks_split_variant_builds_only_over_one_cache_directory_of_one_host(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("builds", ["variants", "k2q_csr"])
+def test_ranks_split_builds_only_over_one_cache_directory_of_one_host(
+    monkeypatch, tmp_path, builds
 ):
+    """The variants and modules land in the package's build directory, the k2q CSR extension in
+    PyTorch's: the ranks that read one such directory on one host split those builds."""
     cache, elsewhere = tmp_path / "cache", tmp_path / "elsewhere"
     cache.mkdir()
     elsewhere.mkdir()
     (tmp_path / "link").symlink_to(cache)
 
     def scope(base, host="node-0"):
+        monkeypatch.setattr(os, "uname", lambda: types.SimpleNamespace(nodename=host))
+        if builds == "k2q_csr":
+            monkeypatch.setattr(
+                cpp_extension, "_get_build_directory", lambda name, verbose: str(base)
+            )
+            return msa_kernel_builds._k2q_csr_scope()
         jit = types.SimpleNamespace(_jit_base=lambda: base)
         monkeypatch.setattr(msa_kernel_builds, "_package", types.SimpleNamespace(jit=jit))
-        monkeypatch.setattr(os, "uname", lambda: types.SimpleNamespace(nodename=host))
         return msa_kernel_builds._cache_scope()
 
     # One directory, however a rank names it.
     assert scope(cache) == scope(tmp_path / "link")
     assert scope(cache) != scope(elsewhere)
     assert scope(cache) != scope(cache, host="node-1")
+
+
+def test_a_worker_reports_the_k2q_csr_extension_built_only_when_its_import_compiled_it(
+    monkeypatch, tmp_path
+):
+    """The worker that claimed the extension's build imports its module, which compiles the
+    extension or loads it built: the build is reported built only when the extension's library
+    changed during the import, not by how long the import took."""
+    directory = tmp_path / "torch_extensions" / msa_kernel_builds._K2Q_CSR_EXTENSION
+    directory.mkdir(parents=True)
+    library = directory / f"{msa_kernel_builds._K2Q_CSR_EXTENSION}.so"
+    monkeypatch.setattr(cpp_extension, "_get_build_directory", lambda name, verbose: str(directory))
+    monkeypatch.setattr(msa_kernel_builds, "_require_package", lambda: None)
+    # The package's module: its import compiles the extension unless it is built.
+    (tmp_path / "k2q_csr_module.py").write_text(
+        "import os\n"
+        f"if not os.path.exists({str(library)!r}):\n"
+        f"    open({str(library)!r}, 'w').close()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(msa_kernel_builds, "_K2Q_CSR_MODULE", "k2q_csr_module")
+
+    def import_in_a_worker():
+        # Each worker process imports the module anew.
+        monkeypatch.delitem(sys.modules, "k2q_csr_module", raising=False)
+        return msa_kernel_builds.import_k2q_csr()
+
+    assert import_in_a_worker() is True and library.exists()
+    # A later worker, of this launch or another, loads it.
+    assert import_in_a_worker() is False
 
 
 def test_the_packaged_fmha_sm100_has_what_the_builds_ahead_use() -> None:
@@ -185,5 +237,9 @@ def test_the_packaged_fmha_sm100_has_what_the_builds_ahead_use() -> None:
 
     msa_kernel_builds._Package(fmha_sm100, api, jit)
     # A worker imports the k2q CSR extension's module by this name: found without importing it,
-    # which would compile the extension.
-    assert importlib.util.find_spec(msa_kernel_builds._K2Q_CSR_MODULE) is not None
+    # which would compile the extension. The module builds the extension of this name, in the
+    # directory PyTorch's cpp_extension.load builds it in.
+    spec = importlib.util.find_spec(msa_kernel_builds._K2Q_CSR_MODULE)
+    assert spec is not None
+    assert f'"{msa_kernel_builds._K2Q_CSR_EXTENSION}"' in Path(spec.origin).read_text()
+    assert os.path.isdir(msa_kernel_builds._k2q_csr_directory())
