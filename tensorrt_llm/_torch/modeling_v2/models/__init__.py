@@ -18,3 +18,4 @@ from .gpt_oss import routing as gpt_oss_routing  # noqa: F401
 from .kimi_k3_vl import routing as kimi_k3_vl_routing  # noqa: F401
 from .minimax_m3 import routing as minimax_m3_routing  # noqa: F401
 from .qwen4_exp import routing as qwen4_exp_routing  # noqa: F401
+from .spark2_5 import routing as spark2_5_routing  # noqa: F401

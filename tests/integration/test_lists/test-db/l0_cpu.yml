@@ -190,6 +190,10 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_eplb_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_weight_table.py
+  # Spark2_5 family routing and target weight table (cpu_only; the family's op
+  # tests carry no cpu_only marker and are skipped by this stage's -m cpu_only).
+  - unittest/_torch/modeling_v2/models/spark2_5/test_modeling_v2_spark_routing.py
+  - unittest/_torch/modeling_v2/models/spark2_5/spark2_5_dense__sm_10x__default/test_modeling_v2_weight_table.py
   - unittest/_torch/modeling_v2/models/inkling2/test_config.py
   - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_cache.py
   - unittest/_torch/modeling_v2/models/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_modeling.py

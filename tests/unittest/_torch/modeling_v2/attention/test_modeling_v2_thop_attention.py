@@ -8062,6 +8062,34 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=_qwen4_prefill_chunk(QWEN4_DENSE),
         ),
     ),
+    "spark2_5/spark2_5_dense__sm_10x__default": (
+        Cell(
+            why="spark sliding layer: GQA 8q/2kv d256, no sinks, window 512",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=2,
+                head_size=256,
+                v_head_dim=256,
+                sinks=False,
+                window=512,
+                quant_mode=0,
+            ),
+        ),
+        Cell(
+            why="spark full layer: the same heads with no window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=2,
+                head_size=256,
+                v_head_dim=256,
+                sinks=False,
+                window=None,
+                quant_mode=0,
+            ),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
