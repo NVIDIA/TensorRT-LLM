@@ -1943,9 +1943,8 @@ def test_real_checkpoint_float_media_match_uint8_pixels(side: int):
     """Float [0, 1] media (media_io's ``pt`` format) yield the uint8 picture's pixels.
 
     The same picture goes through the checkpoint's processor as a uint8 HWC
-    array (the preferred media_io format, rescaled by the processor) and as
-    the ``ToTensor`` float tensor the LLM API default delivers (handed over
-    with the processor's rescale turned off). Ids and grids must be identical
+    array with rescaling enabled and as a float tensor from an explicit
+    ``pt`` decode with the processor's rescaling disabled. Ids and grids must be identical
     and the pixels must agree to within the float-vs-uint8 rounding of the
     processor's resize plus the model dtype's, a few hundredths after
     normalization and far from the near-black result of rescaling twice. 224
@@ -2480,25 +2479,6 @@ def test_video_token_count_is_one_bracket_per_temporal_patch():
 
 
 @pytest.mark.cpu_only
-def test_preferred_media_io_format_is_uint8_numpy():
-    """The registered processor asks media_io for uint8 HWC arrays.
-
-    The HF processors rescale by 1/255 themselves, so float tensors (the
-    media_io default) would be rescaled twice; ``OpenAIServer`` seeds its
-    media_io defaults from this method for ``BaseMultimodalInputProcessor``
-    instances.
-    """
-    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-
-    proc = _make_minimax_m3_vl_fast_path_processor()
-    assert isinstance(proc, BaseMultimodalInputProcessor)
-    assert proc.get_preferred_media_io_kwargs() == {
-        "image": {"format": "np"},
-        "video": {"format": "np"},
-    }
-
-
-@pytest.mark.cpu_only
 def test_fast_path_expand_rejects_mixed_image_and_video():
     """Single-modality only: the registry's ``_get_single_mm_token_lengths``
     returns only one modality's counts, so mixing image + video in one
@@ -2860,9 +2840,9 @@ def test_marker_and_media_count_mismatch_is_rejected(monkeypatch):
 def test_image_token_count_accepts_every_media_io_format(monkeypatch):
     """``get_num_tokens_per_image`` reads the size of PIL, CHW tensor and HWC array input.
 
-    The hashing path (``find_mm_token_lengths``) hands over whatever
-    media_io decoded; with the preferred "np" format that is a uint8 HWC
-    array. 56x84 is a 4x6 patch grid: 24 patches / 4 + 2 framing = 8.
+    The hashing path (``find_mm_token_lengths``) accepts the default PIL image
+    and explicit tensor or array input. A 56x84 image has a 4x6 patch grid
+    and produces 24 patches / 4 + 2 framing = 8 tokens.
     """
     proc, _ = _tokenizer_only_processor(monkeypatch, _ValidImageProcessor())
     pil = Image.new("RGB", (84, 56))

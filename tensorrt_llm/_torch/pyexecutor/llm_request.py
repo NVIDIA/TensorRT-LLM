@@ -388,6 +388,7 @@ class PyResult:
             extra_token_for_overlap_scheduler=False,
             use_chunked_generation_logits=False
         ) if return_context_logits else None
+        self._context_logits_copy_event: torch.cuda.Event | None = None
         self._generation_logits = LogitsStorage(
             seq_length=max_new_tokens,
             use_device_memory=use_device_memory,
@@ -426,6 +427,7 @@ class PyResult:
         the entire stream even after the request is released. Reads and
         serialized state still include only the captured prefixes.
         """
+        self._wait_for_context_logits_copy()
         result = copy(self)
         if self.context_prompt_logprob_rows is not None:
             result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
@@ -498,6 +500,7 @@ class PyResult:
         self.diff = PyResult.Diff()
 
     def get_diff(self) -> Diff:
+        self._wait_for_context_logits_copy()
         if self._context_logits is not None and self._context_logits._storage is not None:
             self.diff.context_logits_on_cpu = self.context_logits_on_cpu
         for i, context_logits in enumerate(self.diff.context_logits_list):
@@ -606,14 +609,36 @@ class PyResult:
     def append_context_logits(self,
                               context_logits: torch.Tensor,
                               *,
-                              reusable: bool = False):
+                              reusable: bool = False,
+                              retain_owned: bool = False) -> None:
+        """Store context logits and record the current chunk for rank updates.
+
+        Args:
+            context_logits: Logits with shape [tokens, vocab] or
+                [tokens, beam_width, vocab].
+            reusable: The source can be overwritten immediately after this
+                call, so a host copy must complete before returning.
+            retain_owned: Keep the stored destination view in the rank diff.
+                A pending host copy completes before context_logits is read or
+                snapshot, get_diff, or drop_context_logits returns.
+        """
         if self._context_logits:
             self._context_logits.append(context_logits, reusable=reusable)
-            if reusable:
-                # Retain the owned destination view, never the next chunk's scratch.
-                begin, end = self._context_logits._logits_indices[-1]
-                context_logits = self._context_logits._storage[begin:end, 0]
+            if reusable or retain_owned:
+                stored = self._context_logits.get(all_logits=False,
+                                                  exclude_last=False)
+                assert stored is not None
+                if not reusable and context_logits.is_cuda and not stored.is_cuda:
+                    # Later chunks on the same stream finish after earlier copies.
+                    self._context_logits_copy_event = torch.cuda.Event()
+                    self._context_logits_copy_event.record()
+                context_logits = stored[:, 0]
             self.diff.context_logits_list.append(context_logits)
+
+    def _wait_for_context_logits_copy(self) -> None:
+        if self._context_logits_copy_event is not None:
+            self._context_logits_copy_event.synchronize()
+            self._context_logits_copy_event = None
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
@@ -684,6 +709,7 @@ class PyResult:
 
     def drop_context_logits(self) -> None:
         """Drop the stored context logits; no response will deliver them."""
+        self._wait_for_context_logits_copy()
         self._context_logits = None
         self.diff.context_logits_list = []
 
@@ -730,6 +756,7 @@ class PyResult:
         if self._context_logits is None or (storage := self._context_logits.get(
                 all_logits=True, exclude_last=False)) is None:
             return None
+        self._wait_for_context_logits_copy()
         return storage[:, 0]  # remove beam_width axis for context
 
     @property

@@ -529,6 +529,45 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
     }
 
 
+@pytest.mark.parametrize("failing_step", [None, "synchronize", "release"])
+def test_a_failed_construction_releases_host_resident_weights(monkeypatch, failing_step) -> None:
+    steps, errors = [], []
+
+    def _step(name):
+        def run():
+            steps.append(name)
+            if name == failing_step:
+                raise RuntimeError(f"{name} failed")
+
+        return run
+
+    module = SimpleNamespace(release_host_resident_weights=_step("release"))
+    construction_error = RuntimeError("warmup failed")
+
+    def _fail_after_building(*, model_engine_slot, **kwargs):
+        model_engine_slot[0] = SimpleNamespace(model=SimpleNamespace(modules=lambda: [module]))
+        raise construction_error
+
+    monkeypatch.setattr(py_executor_creator, "_create_py_executor", _fail_after_building)
+    cuda = SimpleNamespace(is_available=lambda: True, synchronize=_step("synchronize"))
+    monkeypatch.setattr(py_executor_creator, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(py_executor_creator.logger, "error", errors.append)
+    llm_args = SimpleNamespace(
+        memory_monitor_config=None, parallel_config=SimpleNamespace(world_size=1)
+    )
+    with pytest.raises(RuntimeError) as raised:
+        py_executor_creator.create_py_executor(llm_args)
+    assert raised.value is construction_error
+    # Without a completed sync the device may still read the table: no release.
+    expected = ["synchronize"] if failing_step == "synchronize" else ["synchronize", "release"]
+    assert steps == expected
+    if failing_step is None:
+        assert errors == []
+    else:
+        (error,) = errors
+        assert f"RuntimeError: {failing_step} failed" in error
+
+
 def _dense_fp4_mla_model_config() -> SimpleNamespace:
     return SimpleNamespace(
         pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
