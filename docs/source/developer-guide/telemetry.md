@@ -201,6 +201,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_util_for_resume` | `float` | `value` |  |
 | `kv_cache_config.mixed_precision_first_n` | `int` | `value` |  |
 | `kv_cache_config.mixed_precision_last_n` | `int` | `value` |  |
+| `kv_cache_config.page_staging_depth` | `int` | `value` |  |
+| `kv_cache_config.page_staging_mib` | `int` | `value` |  |
 | `kv_cache_config.pool_ratio` | `list[float]\|none` | `value` |  |
 | `kv_cache_config.sink_token_length` | `int\|none` | `value` |  |
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |

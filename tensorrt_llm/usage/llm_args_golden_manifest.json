@@ -1020,6 +1020,16 @@
       "path": "kv_cache_config.mixed_precision_reuse"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.page_staging_depth"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.page_staging_mib"
+    },
+    {
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"

@@ -4276,6 +4276,24 @@
           "title": "Mixed Precision Reuse",
           "type": "string"
         },
+        "page_staging_depth": {
+          "default": 1,
+          "description": "Stretches of the page staging buffer (`page_staging_mib`) that one move of KV cache blocks between GPU and the disk cache keeps in flight. 1 copies one stretch after another, each as large as the buffer allows. N > 1 cuts the move into stretches of at most 1/N of the buffer, issued round-robin on N CUDA streams, so up to N of its disk reads or writes run at once and other moves still find room in the buffer. Requires a disk cache. Per KV cache manager. Only used by KV cache manager v2.",
+          "exclusiveMinimum": 0,
+          "maximum": 16,
+          "status": "prototype",
+          "title": "Page Staging Depth",
+          "type": "integer"
+        },
+        "page_staging_mib": {
+          "default": 64,
+          "description": "Size in MiB of the pinned host buffer that KV cache blocks moving between GPU and the disk cache (or a remote cache level) pass through. A move takes one stretch of the buffer at a time and waits for the earlier move that used the same stretch, so a burst of restores from disk larger than the buffer runs one buffer-full at a time. The buffer is never smaller than three of the largest cold blocks. Per KV cache manager. Only used by KV cache manager v2.",
+          "exclusiveMinimum": 0,
+          "maximum": 65536,
+          "status": "prototype",
+          "title": "Page Staging Mib",
+          "type": "integer"
+        },
         "pool_ratio": {
           "anyOf": [
             {
