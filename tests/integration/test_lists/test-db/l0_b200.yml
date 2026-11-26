@@ -140,6 +140,7 @@ l0_b200:
   - unittest/_torch/debugger
   - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
+  - unittest/disaggregated/test_nixl_vmm_preflight.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
   # Locality domains via mock localization: per-domain KV pools on one GPU.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_locality_domains

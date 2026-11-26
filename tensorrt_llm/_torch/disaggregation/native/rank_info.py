@@ -27,10 +27,9 @@ from tensorrt_llm._utils import get_size_in_bytes
 
 # Native transfer wire-protocol version. Bumped whenever the control-plane
 # frames change so a mismatched peer is rejected at registration instead of
-# failing or hanging per request. Value 3 on main: the request and KV-result
-# frames carry a per-writer report token, and main's frame set already differs
-# from release branches, so the two must not be treated as compatible.
-NATIVE_TRANSFER_PROTOCOL_VERSION = 3
+# failing or hanging per request. Version 4 recognizes failure-driven
+# cancellation and retains the destination until its writers settle.
+NATIVE_TRANSFER_PROTOCOL_VERSION = 4
 # A peer whose RankInfo carries no version field predates the versioned frames.
 _LEGACY_PROTOCOL_VERSION = 1
 
