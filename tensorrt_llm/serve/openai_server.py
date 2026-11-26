@@ -1132,6 +1132,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 return int(vocab_size)
         return int(self.tokenizer.tokenizer.vocab_size)
 
+    @staticmethod
+    def _is_loopback_listener(host: str, sockets: Optional[list[socket.socket]]) -> bool:
+        if sockets:
+            return all(
+                isinstance(address := sock.getsockname(), tuple)
+                and is_loopback_host(address[0]) for sock in sockets)
+        return is_loopback_host(host)
+
     def _validate_internal_disagg_request(
             self, request, raw_request: Optional[Request]) -> None:
         protected = request_requires_internal_disagg_auth(request)
@@ -1140,12 +1148,15 @@ class OpenAIServer(_VideoRoutesMixin):
                              "cache_transceiver_config to be configured")
         key = getattr(self, "_internal_disagg_auth_key", None)
         if protected and not key:
-            host = getattr(self, "host", None)
-            if host is None and raw_request is not None:
-                # ASGI's bound address also covers apps served outside our own launcher.
-                bound = raw_request.scope.get("server")
-                host = bound[0] if bound else ""
-            if host is not None and not is_loopback_host(host):
+            local_listener = getattr(self, "_internal_listener_is_loopback", None)
+            if local_listener is None:
+                host = getattr(self, "host", None)
+                if raw_request is not None:
+                    # ASGI supplies the actual listener address for an embedded app.
+                    bound = raw_request.scope.get("server")
+                    host = bound[0] if bound else ""
+                local_listener = host is None or is_loopback_host(host)
+            if not local_listener:
                 raise ValueError(
                     "Protected disaggregated request fields on a network "
                     "listener require internal_request_auth_key")
@@ -4618,6 +4629,7 @@ class OpenAIServer(_VideoRoutesMixin):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
+        self._internal_listener_is_loopback = self._is_loopback_listener(host, sockets)
         self.port = port
         # Without graceful_shutdown_timeout, uvicorn keeps its default and
         # waits for every request handler during graceful shutdown.

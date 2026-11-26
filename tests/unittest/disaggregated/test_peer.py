@@ -919,6 +919,14 @@ def test_peer_registrar_caches_and_invalidates_aux_transfer_layout():
     assert replacement_layout is not layout
     np.testing.assert_array_equal(replacement_layout.dst_base_ptrs, [0x9000, 0xB000, 0xC000])
 
+    # A plan which captured the old registration can finish its geometry
+    # calculations without overwriting cache entries for the new registration.
+    extractor = reg.peer_extractor("peer", 1, expected_info=peer_ri)
+    assert extractor.page_table is peer_ri.page_table
+    reg.cache_aux_transfer_layout("peer", 1, layout, expected_info=peer_ri)
+    assert reg.get_aux_transfer_layout("peer", 1, expected_info=replacement_peer_ri) is replacement_layout
+    assert reg.get_aux_transfer_layout("peer", 1, expected_info=peer_ri) is None
+
     reg.unregister("peer", 1)
     assert reg.get_aux_transfer_layout("peer", 1) is None
 

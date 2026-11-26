@@ -78,11 +78,11 @@ class PeerRegistrar:
         self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
         self._registered: dict[tuple[str, int], _RegisteredPeer] = {}
         self._kv_map_cache: Dict[
-            tuple, RegionMapperBase
+            tuple, tuple[RankInfo, RegionMapperBase]
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
-        self._overlap_cache: dict[tuple[str, int, int], PeerOverlap] = {}
-        self._aux_transfer_layout_cache: dict[tuple[str, int], AuxTransferLayout] = {}
+        self._overlap_cache: dict[tuple[str, int, int], tuple[RankInfo, PeerOverlap]] = {}
+        self._aux_transfer_layout_cache: dict[tuple[str, int], tuple[Optional[RankInfo], AuxTransferLayout]] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
@@ -125,8 +125,17 @@ class PeerRegistrar:
         self._invalidate_derived(peer_name, peer_rank)
         self._registered[key] = _RegisteredPeer(peer_ri, extractor, mapping)
 
-    def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
-        return self._registered[self._unique_key(peer_name, peer_rank)].extractor
+    def peer_extractor(
+        self, peer_name: str, peer_rank: int, expected_info: Optional[RankInfo] = None
+    ) -> KVRegionExtractorV1:
+        key = self._unique_key(peer_name, peer_rank)
+        if expected_info is None:
+            return self._registered[key].extractor
+        current = self._registered.get(key)
+        if current is not None and current.info is expected_info:
+            return current.extractor
+        # A writer already holds the old RankInfo. Complete its plan against that same page table.
+        return KVRegionExtractorV1(expected_info.page_table)
 
     @property
     def self_extractor(self) -> KVRegionExtractorV1:
@@ -142,24 +151,32 @@ class PeerRegistrar:
         key = self._unique_key(peer_name, peer_rank)
         self._aux_transfer_layout_cache.pop(key, None)
         # Clean up kv_map_cache entries for this peer
-        keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
+        keys_to_remove = [k for k in self._kv_map_cache.copy() if k[0] == key]
         for k in keys_to_remove:
-            del self._kv_map_cache[k]
-        for overlap_key in [item for item in self._overlap_cache if item[:2] == key]:
-            del self._overlap_cache[overlap_key]
+            self._kv_map_cache.pop(k, None)
+        for overlap_key in [item for item in self._overlap_cache.copy() if item[:2] == key]:
+            self._overlap_cache.pop(overlap_key, None)
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._registered[self._unique_key(peer_name, peer_rank)].info
 
     def get_aux_transfer_layout(
-        self, peer_name: str, peer_rank: int
+        self, peer_name: str, peer_rank: int, expected_info: Optional[RankInfo] = None
     ) -> Optional[AuxTransferLayout]:
-        return self._aux_transfer_layout_cache.get(self._unique_key(peer_name, peer_rank))
+        key = self._unique_key(peer_name, peer_rank)
+        if expected_info is None and (current := self._registered.get(key)) is not None:
+            expected_info = current.info
+        cached = self._aux_transfer_layout_cache.get(key)
+        return cached[1] if cached is not None and cached[0] is expected_info else None
 
     def cache_aux_transfer_layout(
-        self, peer_name: str, peer_rank: int, layout: AuxTransferLayout
+        self, peer_name: str, peer_rank: int, layout: AuxTransferLayout, expected_info: Optional[RankInfo] = None
     ) -> None:
-        self._aux_transfer_layout_cache[self._unique_key(peer_name, peer_rank)] = layout
+        key = self._unique_key(peer_name, peer_rank)
+        current = self._registered.get(key)
+        if expected_info is not None and (current is None or current.info is not expected_info):
+            return
+        self._aux_transfer_layout_cache[key] = (current.info if current is not None else None, layout)
 
     @property
     def self_rank_info(self) -> RankInfo:
@@ -479,8 +496,9 @@ class PeerRegistrar:
         """
         peer_key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         cache_key = (peer_key, self_pool_key, peer_pool_key)
-        if cache_key in self._kv_map_cache:
-            return self._kv_map_cache[cache_key]
+        cached = self._kv_map_cache.get(cache_key)
+        if cached is not None and cached[0] is peer_ri:
+            return cached[1]
 
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
@@ -578,7 +596,7 @@ class PeerRegistrar:
             **extra_kwargs,
         )
 
-        self._kv_map_cache[cache_key] = mapper
+        self._kv_map_cache[cache_key] = (peer_ri, mapper)
         return mapper
 
     @staticmethod
@@ -628,8 +646,9 @@ class PeerRegistrar:
         peer_ri = peer_rank_info
         # Per-view duplication factors depend on the specific peer rank's page table.
         key = (peer_ri.instance_name, peer_ri.instance_rank, peer_dp_rank)
-        if key in self._overlap_cache:
-            return self._overlap_cache[key]
+        cached = self._overlap_cache.get(key)
+        if cached is not None and cached[0] is peer_ri:
+            return cached[1]
 
         # compute pp overlap and target layers
         self_start_layer = sum(self._ri.layer_num_per_pp[: self._ri.pp_rank])
@@ -646,7 +665,7 @@ class PeerRegistrar:
 
         if tgt_pp_ranks == []:
             targets = PeerOverlap()
-            self._overlap_cache[key] = targets
+            self._overlap_cache[key] = (peer_ri, targets)
             return targets
 
         peer_start_pp = tgt_pp_ranks[0]
@@ -687,7 +706,7 @@ class PeerRegistrar:
             ranks=ranks,
             view_duplicate_head_factors=view_dup_factors,
         )
-        self._overlap_cache[key] = targets
+        self._overlap_cache[key] = (peer_ri, targets)
         return targets
 
     def _view_duplicate_head_factors(

@@ -1717,7 +1717,7 @@ class Sender(SenderBase):
         dst_device_id = peer_ri.device_id
         extractor = self._registrar.self_extractor
         peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
+            peer_ri.instance_name, peer_ri.instance_rank, expected_info=peer_ri
         )
         pool_mapping = self._registrar.get_pool_mapping(peer_ri)
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
@@ -1873,12 +1873,12 @@ class Sender(SenderBase):
             assert peer_slot is not None, f"aux_slot is None for request {req_info.unique_rid}"
             assert task._slot is not None
             layout = self._registrar.get_aux_transfer_layout(
-                peer_ri.instance_name, peer_ri.instance_rank
+                peer_ri.instance_name, peer_ri.instance_rank, expected_info=peer_ri
             )
             if layout is None:
                 layout = build_aux_transfer_layout(src_aux_meta, peer_aux_meta)
                 self._registrar.cache_aux_transfer_layout(
-                    peer_ri.instance_name, peer_ri.instance_rank, layout
+                    peer_ri.instance_name, peer_ri.instance_rank, layout, expected_info=peer_ri
                 )
             src_ptrs = layout.src_base_ptrs + layout.src_item_sizes * task._slot
             dst_ptrs = layout.dst_base_ptrs + layout.dst_item_sizes * peer_slot

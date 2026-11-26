@@ -234,6 +234,31 @@ def test_network_worker_admits_signed_internal_requests():
     server._validate_internal_disagg_request(request, SimpleNamespace(headers=headers))
 
 
+def test_worker_uses_the_actual_prebound_socket():
+    import socket
+
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        assert OpenAIServer._is_loopback_listener("worker.example", [listener])
+    assert not OpenAIServer._is_loopback_listener("worker.example", None)
+
+
+def test_worker_admission_uses_bound_listener_scope():
+    from types import SimpleNamespace
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = object.__new__(OpenAIServer)
+    server.host = "localhost"
+    server._internal_disagg_auth_key = None
+    server._has_cache_transceiver_config = lambda: True
+    request = _make_request(ctx_info_endpoint="tcp://context.example:5000")
+    bound = SimpleNamespace(scope={"server": ("192.0.2.1", 8080)}, headers={})
+    with pytest.raises(ValueError, match="internal_request_auth_key"):
+        server._validate_internal_disagg_request(request, bound)
+
+
 def _make_affinity_request(
     role: ServerRole, completion: bool = False
 ) -> ChatCompletionRequest | CompletionRequest:
