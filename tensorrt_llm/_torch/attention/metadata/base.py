@@ -194,6 +194,26 @@ class Metadata:
         """The concrete types attached alongside this metadata, in prepare order."""
         return [type(metadata) for metadata in self._registry.ordered]
 
+    @staticmethod
+    def get_empty(
+        buffers,
+        tensor_shape: Sequence[int],
+        dtype: torch.dtype,
+        cache_name: str,
+        capture_graph: bool = False,
+    ) -> torch.Tensor:
+        """An uninitialized device buffer from the CUDA graph buffer pool, or a new one without a pool."""
+        # Imported here: the backend interface imports the sparse parameter modules.
+        from ..backends.interface import AttentionMetadata
+
+        return AttentionMetadata.get_empty(
+            buffers,
+            list(tensor_shape),
+            dtype=dtype,
+            cache_name=cache_name,
+            capture_graph=capture_graph,
+        )
+
     def get_buffer(self, shape: Sequence[int], dtype: torch.dtype, name: str) -> torch.Tensor:
         """A zero-filled device buffer whose address a CUDA graph may capture."""
         # Imported here: the backend interface imports the sparse parameter modules.

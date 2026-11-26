@@ -86,8 +86,6 @@ class DecoderMetadata:
         self._attention_runtime_features = attention_runtime_features
         # Uploads the per-step metadata between decode replays.
         self._host_uploader = host_uploader
-        # TRTLLM_ATTENTION_METADATA, read once when the engine is built.
-        self._attention_metadata_mode = attention_metadata_mode()
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
         # 1) The attention metadata depends on the KV cache manager.
@@ -111,7 +109,7 @@ class DecoderMetadata:
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        if self._attention_metadata_mode == "new":
+        if attention_metadata_mode() == "new":
             self.attn_metadata = build_feature_attention_metadata(
                 self.model.model_config,
                 max_batch_size=self._config.max_batch_size,

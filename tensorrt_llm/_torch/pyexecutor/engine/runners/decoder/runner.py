@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.metadata.base import Metadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
@@ -717,7 +718,9 @@ class DecoderRunner(ScheduledModelRunner):
         attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
-        self._inputs.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
+        elif isinstance(attn_metadata, Metadata):
+            # The feature-split metadata read the flag from the step's BatchInputs.
+            self._inputs.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
             spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
             spec_metadata = self._metadata.setup_speculative(spec_resource_manager)
