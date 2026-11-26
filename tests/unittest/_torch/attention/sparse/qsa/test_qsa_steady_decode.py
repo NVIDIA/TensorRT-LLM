@@ -286,3 +286,19 @@ def test_plain_copy_detection(monkeypatch, change, plain):
     block_offsets = torch.zeros((2, 4, 2, width), dtype=torch.int32)
     assert sys.modules[QSAAttentionMetadata.__module__] is qsa_metadata
     assert qsa_metadata._plain_block_offsets_copy(manager, block_offsets) is plain
+
+
+def test_on_update_kv_lens_rewrites_the_mapping(monkeypatch):
+    """What steady_replay_gap relies on when the decode prologue declines: preprocess_inputs calls
+    on_update_kv_lens on every other step (tests/unittest/_torch/pyexecutor/test_kv_lens_update_once.py),
+    and QSA's rewrites the row mapping there."""
+    md = _metadata(QsaRuntimePolicy(steady_decode=True, steady_replay_gap=True), draft=False)
+    calls = []
+    monkeypatch.setattr(
+        TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: calls.append("parent")
+    )
+    monkeypatch.setattr(
+        md, "_refresh_qsa_token_mapping", lambda: calls.append("mapping"), raising=False
+    )
+    md.on_update_kv_lens()
+    assert calls == ["parent", "mapping"]
