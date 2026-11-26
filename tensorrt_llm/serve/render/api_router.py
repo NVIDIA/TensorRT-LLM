@@ -30,10 +30,6 @@ from .serving import RenderRequestError, ServingRender
 CHAT_RENDER_PATH = "/v1/chat/completions/render"
 COMPLETION_RENDER_PATH = "/v1/completions/render"
 
-# The render routes are a separate exposed surface; a normal ``trtllm-serve``
-# worker mounts them only when this is set.
-ENABLE_ENV = "TRTLLM_ENABLE_RENDER_ENDPOINTS"
-
 
 def render_endpoints_enabled() -> bool:
     """Whether a serving worker mounts the render routes."""

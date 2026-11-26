@@ -15,7 +15,7 @@
 """Environment variables read by trtllm-serve.
 
 Every variable that ``tensorrt_llm/serve/`` and the trtllm-serve CLI
-(``tensorrt_llm/commands/serve.py``, ``tensorrt_llm/commands/serve_cli/``) read
+(``tensorrt_llm/commands/serve.py``) read
 is declared here once, with its type, its default and what it does. Exceptions
 are the published ``scripts/`` client package and the ``render/trtllm-render``
 bootstrap, which reads ``CUDA_HOME`` before it can import ``tensorrt_llm``.
@@ -48,7 +48,7 @@ that still reads ``os.environ`` for the same variable.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 if TYPE_CHECKING:
@@ -106,7 +106,6 @@ if TYPE_CHECKING:
     TLLM_FRONTEND_READY_FD: Optional[str]
     TLLM_FRONTEND_AFFINITY_FD: Optional[str]
     TLLM_SERVE_LAUNCHER_UDS: Optional[str]
-    TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR: str
     TRTLLM_DISAGG_ROLE: Optional[str]
     TRTLLM_DISAGG_DEPLOYMENT_ID: Optional[str]
     # External variables.
@@ -129,6 +128,9 @@ class EnvVar:
     description: str
     secret: bool = False  # never logged and never echoed by any listing
     also_read_by: tuple[str, ...] = ()  # files outside the linted directories reading os.environ
+    consumable: bool = field(
+        default=False, kw_only=True
+    )  # one-shot internal variable removed on consume()
 
 
 def _flag(name: str, unset: Optional[str]) -> Callable[[], bool]:
@@ -353,10 +355,7 @@ _DEPLOY: tuple[EnvVar, ...] = (
         "deploy",
         _flag("TRTLLM_RESPONSES_DEBUG", None),
         default="unset",
-        description=(
-            "Set to 1 to log Responses API debugging messages; read once when the Responses "
-            "module is imported."
-        ),
+        description="Set to 1 to log Responses API debugging messages.",
     ),
     EnvVar(
         "TRTLLM_ENABLE_RENDER_ENDPOINTS",
@@ -634,6 +633,7 @@ _INTERNAL: tuple[EnvVar, ...] = (
             "File descriptor an attached frontend writes its READY byte to; read once with "
             "consume() and removed."
         ),
+        consumable=True,
     ),
     EnvVar(
         "TLLM_FRONTEND_AFFINITY_FD",
@@ -644,6 +644,7 @@ _INTERNAL: tuple[EnvVar, ...] = (
             "File descriptor of the listening socket the launcher bound for an attached "
             "frontend; read once with consume() and removed."
         ),
+        consumable=True,
     ),
     EnvVar(
         "TLLM_SERVE_LAUNCHER_UDS",
@@ -654,14 +655,7 @@ _INTERNAL: tuple[EnvVar, ...] = (
             "Unix domain socket of the launcher, passed to each attached frontend; read once "
             "with consume() and removed."
         ),
-    ),
-    EnvVar(
-        "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR",
-        "internal",
-        _required("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"),
-        default="required: KeyError when missing",
-        description="IPC address of the LLM API proxy process, set by the disaggregated MPI leader.",
-        also_read_by=("tensorrt_llm/executor/utils.py", "tensorrt_llm/llmapi/_llmapi_mpi_stop.py"),
+        consumable=True,
     ),
     EnvVar(
         "TRTLLM_DISAGG_ROLE",
@@ -731,15 +725,17 @@ environment_variables: dict[str, EnvVar] = {
 }
 
 
-def __getattr__(name: str) -> Any:
-    var = environment_variables.get(name)
-    if var is None:
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r}. Declare the environment "
-            "variable in tensorrt_llm/serve/envs.py before reading it."
-        )
-    # Outside any try: a required variable's KeyError propagates as KeyError.
-    return var.read()
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> Any:
+        var = environment_variables.get(name)
+        if var is None:
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}. Declare the environment "
+                "variable in tensorrt_llm/serve/envs.py before reading it."
+            )
+        # Outside any try: a required variable's KeyError propagates as KeyError.
+        return var.read()
 
 
 def __dir__() -> list[str]:
@@ -750,9 +746,10 @@ def __dir__() -> list[str]:
 def consume(name: str) -> Optional[str]:
     """Read an internal variable meant for exactly one reader and remove it from the environment."""
     var = environment_variables.get(name)
-    if var is None or var.kind != "internal":
+    if var is None or var.kind != "internal" or not var.consumable:
         raise KeyError(
-            f"{name} is not a declared internal variable; consume() removes a variable a launcher "
-            "passed to this process. Declare it in the internal block of tensorrt_llm/serve/envs.py."
+            f"{name} is not a declared consumable internal variable; consume() removes a "
+            "one-shot variable a launcher passed to this process. Declare it with "
+            "consumable=True in the internal block of tensorrt_llm/serve/envs.py."
         )
     return os.environ.pop(name, None)

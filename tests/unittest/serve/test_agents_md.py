@@ -130,3 +130,11 @@ def test_sibling_claude_md(doc):
         f"{sibling.relative_to(REPO_ROOT)} must hold exactly the repo's two-line pointer "
         "form: `# In ./CLAUDE.md` and `@AGENTS.md`."
     )
+
+
+def test_serve_agents_md_states_env_var_rule():
+    text = (REPO_ROOT / "tensorrt_llm/serve/AGENTS.md").read_text()
+    assert "`serve/envs.py`" in text and "`tests/unittest/serve/test_envs.py`" in text, (
+        "tensorrt_llm/serve/AGENTS.md must tell contributors to read environment variables through "
+        "serve/envs.py and name tests/unittest/serve/test_envs.py as the check"
+    )

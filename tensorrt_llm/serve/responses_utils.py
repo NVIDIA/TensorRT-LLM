@@ -118,12 +118,6 @@ REASONING_EFFORT = {
     "low": ReasoningEffort.LOW,
 }
 
-# Set TRTLLM_RESPONSES_DEBUG=1 to log each parsed input item and the full
-# prompt handed to the model. Off by default: it prints whole
-# conversations, so it is a debugging aid rather than something to leave
-# enabled on a shared server.
-ENABLE_RESPONSES_DEBUG_MSG = envs.TRTLLM_RESPONSES_DEBUG
-
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
@@ -145,8 +139,12 @@ class StreamedItem:
     text: str = ""
 
 
+# Set TRTLLM_RESPONSES_DEBUG=1 to log each parsed input item and the full
+# prompt handed to the model. Off by default: it prints whole
+# conversations, so it is a debugging aid rather than something to leave
+# enabled on a shared server.
 def _responses_debug_log(msg):
-    if ENABLE_RESPONSES_DEBUG_MSG:
+    if envs.TRTLLM_RESPONSES_DEBUG:
         logger.info(msg)
 
 
@@ -301,7 +299,7 @@ class ConversationHistoryStore:
         resp_id = resp.id
         _responses_debug_log(
             f"ConversationHistoryStore storing resp: {resp_id}")
-        if ENABLE_RESPONSES_DEBUG_MSG:
+        if envs.TRTLLM_RESPONSES_DEBUG:
             _responses_debug_log(f" -> resp_msgs:")
             for msg in resp_msgs:
                 _responses_debug_log(f" -> {msg}")
@@ -358,7 +356,7 @@ class ConversationHistoryStore:
             None
         """
         _responses_debug_log(f"ConversationHistoryStore storing msg:")
-        if ENABLE_RESPONSES_DEBUG_MSG:
+        if envs.TRTLLM_RESPONSES_DEBUG:
             for msg in msgs:
                 _responses_debug_log(f" -> {msg}")
 
@@ -610,7 +608,7 @@ def _construct_harmony_messages(
 
 def _render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
-    if ENABLE_RESPONSES_DEBUG_MSG:
+    if envs.TRTLLM_RESPONSES_DEBUG:
         _responses_debug_log("Rendering conversation:")
         _responses_debug_log(conversation.to_json())
     token_ids = _get_encoding().render_conversation_for_completion(
@@ -1778,7 +1776,7 @@ async def request_preprocess(
             chat_template=chat_template,
         )
 
-    if ENABLE_RESPONSES_DEBUG_MSG:  # decoding is not free; skip it otherwise
+    if envs.TRTLLM_RESPONSES_DEBUG:  # decoding is not free; skip it otherwise
         # A multimodal prompt is submitted as text; token ids are decoded.
         prompt_text = (input_tokens.get("prompt") if isinstance(
             input_tokens, dict) else _decode_tokens(input_tokens, tokenizer))
@@ -2194,7 +2192,7 @@ def _create_output_content_harmony(
     output_messages = _parse_output_tokens(final_res.outputs[0].token_ids)
     output_content = []
 
-    if ENABLE_RESPONSES_DEBUG_MSG:
+    if envs.TRTLLM_RESPONSES_DEBUG:
         _responses_debug_log(f"output messages: {len(output_messages)}")
         for msg in output_messages:
             _responses_debug_log(f" -> {msg.to_json()}")

@@ -51,7 +51,6 @@ from .resources import RenderResources
 # Top-level request fields that a Dynamo gateway adds for its own routing and
 # that the inference request models do not define. They never change the prompt.
 DYNAMO_ONLY_FIELDS = ("nvext", "cache_namespace")
-_EXTRA_IGNORED_ENV = "TRTLLM_RENDER_IGNORED_FIELDS"
 
 
 class RenderRequestError(Exception):

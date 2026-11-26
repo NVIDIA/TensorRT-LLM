@@ -3078,7 +3078,8 @@ def _init_fleet_worker_process():
 def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
     """Build one delegating disagg server from the env the launcher exported.
 
-    Fully stateless -- reads config + coordinator URL from ``DisaggWorkerEnvs``;
+    Fully stateless -- reads config + coordinator URL via ``tensorrt_llm.serve.envs``
+    (exported by the launcher via ``DisaggWorkerEnvs``);
     the server holds a remote ``CoordinatorClient`` so routing/readiness are
     delegated to the coordinator. The worker's process index (for the snowflake
     disagg-id) is read from ``TLLM_DISAGG_WORKER_PROCESS_ID``, which the launcher
@@ -3497,8 +3498,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
 
-    logger.debug(
-        f"proxy controller address: {envs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR}")
+    logger.debug(f"proxy controller address: {free_ipc_addr}")
 
     # The MPI-related environment variables will invoke duplicate MPI_Init in
     # the forked process, so we need to remove them before launching the server

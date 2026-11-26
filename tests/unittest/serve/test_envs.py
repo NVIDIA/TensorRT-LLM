@@ -37,6 +37,7 @@ import pytest
 from test_common.serve.env_lint import (
     ENVS_IMPORTABLE_NAMES,
     Finding,
+    declared_env_names,
     find_direct_env_reads,
     scope_files,
 )
@@ -46,8 +47,6 @@ from tensorrt_llm.serve import envs
 pytestmark = pytest.mark.cpu_only
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-ENVS_PATH = REPO_ROOT / "tensorrt_llm" / "serve" / "envs.py"
-AGENTS_MD = REPO_ROOT / "tensorrt_llm" / "serve" / "AGENTS.md"
 
 # ---------------------------------------------------------------------------
 # The lint over the serve tree and the CLI.
@@ -67,39 +66,22 @@ def test_scope_files_cover_the_serve_tree_and_the_cli() -> None:
     }
     assert "tensorrt_llm/commands/serve.py" in relative
     assert "tensorrt_llm/serve/openai_server.py" in relative
-    cli_package = REPO_ROOT / "tensorrt_llm/commands/serve_cli"
-    assert {
-        path.relative_to(REPO_ROOT).as_posix() for path in cli_package.rglob("*.py")
-    } <= relative
     assert "tensorrt_llm/serve/envs.py" not in relative, (
         "the module reading os.environ for everyone is not linted"
     )
     assert not any(name.startswith("tensorrt_llm/serve/scripts/") for name in relative), (
         "serve/scripts/ is a published client package and stays outside the lint"
     )
-    assert not any(name.startswith("tensorrt_llm/serve/api/visual_gen/") for name in relative), (
-        "the VisualGen package is checked by tests/unittest/serve/api/visual_gen/test_envs_lint_visual_gen.py"
-    )
-
-
-@pytest.mark.parametrize("cli_package_exists", [False, True])
-def test_scope_files_checks_present_and_future_cli_layouts(
-    tmp_path: Path, cli_package_exists: bool
-) -> None:
-    included = ["tensorrt_llm/commands/serve.py", "tensorrt_llm/serve/openai_server.py"]
-    if cli_package_exists:
-        included.append("tensorrt_llm/commands/serve_cli/disaggregated.py")
-    excluded = ["tensorrt_llm/serve/envs.py", "tensorrt_llm/serve/scripts/client.py"]
-    for name in included + excluded:
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('import os\nx = os.getenv("A")\n')
-    files = scope_files(tmp_path, visual_gen=False)
-    assert {path.relative_to(tmp_path).as_posix() for path in files} == set(included)
-    findings = find_direct_env_reads(files, root=tmp_path)
-    assert {(finding.path.as_posix(), finding.line) for finding in findings} == {
-        (name, 2) for name in included
+    visual_gen_relative = {
+        path.relative_to(REPO_ROOT).as_posix() for path in scope_files(REPO_ROOT, visual_gen=True)
     }
+    assert visual_gen_relative == {
+        "tensorrt_llm/serve/openai_video_routes.py",
+        "tensorrt_llm/serve/visual_gen_utils.py",
+        "tensorrt_llm/serve/visual_gen_metrics.py",
+        "tensorrt_llm/serve/_visual_gen_errors.py",
+    }
+    assert visual_gen_relative <= relative
 
 
 def _findings(tmp_path: Path, source: str) -> list[Finding]:
@@ -125,6 +107,10 @@ def _findings(tmp_path: Path, source: str) -> list[Finding]:
         ('import os\nx = os.environ.setdefault("A", "1")\n', 2, 'os.environ.setdefault("A", "1")'),
         ('from os import environ\nx = environ.get("A")\n', 2, 'environ.get("A")'),
         ('from os import environ as env\nx = env["A"]\n', 2, 'env["A"]'),
+        ('import os\nenv = os.environ\nx = env.get("A")\n', 3, 'env.get("A")'),
+        ('import os\nenv = os.environ.copy()\nx = env["A"]\n', 3, 'env["A"]'),
+        ('import os\nx = os.environ.copy().get("A")\n', 2, 'os.environ.copy().get("A")'),
+        ('import os\nx = dict(os.environ).get("A")\n', 2, 'dict(os.environ).get("A")'),
         ('import os as _os\nx = _os.getenv("A")\n', 2, '_os.getenv("A")'),
         ('import os.path\nx = os.getenv("A")\n', 2, 'os.getenv("A")'),
         ('import os.path\nx = os.environ["A"]\n', 2, 'os.environ["A"]'),
@@ -146,6 +132,433 @@ def _findings(tmp_path: Path, source: str) -> list[Finding]:
             "from .envs import TRTLLM_SERVER_DISABLE_GC",
         ),
         ("from ..serve.envs import SLURM_PROCID\n", 1, "from ..serve.envs import SLURM_PROCID"),
+        (
+            "from tensorrt_llm.serve import envs\nx = envs.TRTLLM_SERVER_DISABLE_GC\n",
+            2,
+            "envs.TRTLLM_SERVER_DISABLE_GC",
+        ),
+        (
+            "from . import envs\nx = envs.SLURM_PROCID\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            "from tensorrt_llm.serve import envs\n\nclass C:\n    X = envs.TRTLLM_SERVER_DISABLE_GC\n",
+            4,
+            "envs.TRTLLM_SERVER_DISABLE_GC",
+        ),
+        (
+            "from tensorrt_llm.serve import envs\n\ndef f(x=envs.TRTLLM_SERVER_DISABLE_GC):\n    return x\n",
+            3,
+            "envs.TRTLLM_SERVER_DISABLE_GC",
+        ),
+        (
+            'from tensorrt_llm.serve import envs\nx = envs.consume("TLLM_FRONTEND_READY_FD")\n',
+            2,
+            'envs.consume("TLLM_FRONTEND_READY_FD")',
+        ),
+        (
+            'from tensorrt_llm.serve import envs\ncb = envs.consume\nx = cb("TLLM_FRONTEND_READY_FD")\n',
+            3,
+            'cb("TLLM_FRONTEND_READY_FD")',
+        ),
+        (
+            'from tensorrt_llm.serve.envs import consume\nx = consume("TLLM_FRONTEND_READY_FD")\n',
+            2,
+            'consume("TLLM_FRONTEND_READY_FD")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\n\ndef f():\n    return envs.TRTLLM_NOT_DECLARED\n",
+            4,
+            "envs.TRTLLM_NOT_DECLARED",
+        ),
+        (
+            'import os\nenv = os.environ\nif cond:\n    env = {}\nx = env.get("A")\n',
+            5,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "from typing import TYPE_CHECKING\n"
+                "env = os.environ\n"
+                "if TYPE_CHECKING:\n"
+                "    env = {}\n"
+                'x = env.get("A")\n'
+            ),
+            6,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\ndef f():\n    return env.get("A")\n\nenv = os.environ\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\ndef f(x: os.getenv("A")):\n    return x\n',
+            3,
+            'os.getenv("A")',
+        ),
+        (
+            'import os\nx: os.getenv("A") = 1\n',
+            2,
+            'os.getenv("A")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nxs = [envs.SLURM_PROCID for _ in rows]\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nxs = (x for x in envs.TRTLLM_RENDER_IGNORED_FIELDS)\n",
+            2,
+            "envs.TRTLLM_RENDER_IGNORED_FIELDS",
+        ),
+        (
+            'import os\n\nclass C:\n    os = None\n    def f(self):\n        return os.getenv("A")\n',
+            6,
+            'os.getenv("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "\n"
+                "def outer():\n"
+                "    def inner():\n"
+                '        return env.get("A")\n'
+                "    env = os.environ\n"
+                "    return inner()\n"
+            ),
+            5,
+            'env.get("A")',
+        ),
+        (
+            'import os\nenv = {}\nfor _ in range(2):\n    x = env.get("A")\n    env = os.environ\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "try:\n"
+                "    env = os.environ\n"
+                "    might_fail()\n"
+                "    env = {}\n"
+                "except ValueError:\n"
+                '    x = env.get("A")\n'
+            ),
+            8,
+            'env.get("A")',
+        ),
+        (
+            'import os\nenv = os.environ if cond else {}\nx = env.get("A")\n',
+            3,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "try:\n"
+                "    env = os.environ\n"
+                "    might_fail()\n"
+                "    env = {}\n"
+                "finally:\n"
+                '    x = env.get("A")\n'
+            ),
+            8,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "a = b = c = d = e = {}\n"
+                "for _ in range(6):\n"
+                '    x = a.get("A")\n'
+                "    a = b\n"
+                "    b = c\n"
+                "    c = d\n"
+                "    d = e\n"
+                "    e = os.environ\n"
+            ),
+            4,
+            'a.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "for _ in range(1):\n"
+                "    env = os.environ\n"
+                "    break\n"
+                "else:\n"
+                "    env = {}\n"
+                'x = env.get("A")\n'
+            ),
+            8,
+            'env.get("A")',
+        ),
+        (
+            (
+                "def outer():\n"
+                "    def inner():\n"
+                '        return os.getenv("A")\n'
+                "    import os\n"
+                "    res = inner()\n"
+                "    os = None\n"
+                "    return res\n"
+            ),
+            3,
+            'os.getenv("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "try:\n"
+                "    if enabled:\n"
+                "        env = os.environ\n"
+                "        risky()\n"
+                "        env = {}\n"
+                "finally:\n"
+                '    x = env.get("A")\n'
+            ),
+            9,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "for i in range(2):\n"
+                '    x = env.get("A")\n'
+                "    if i == 0:\n"
+                "        env = os.environ\n"
+                "        continue\n"
+                "    env = {}\n"
+            ),
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\ndef f():\n    return env.get("A")\n\nif (env := os.environ) is not None:\n    f()\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\nenv, other = os.environ, {}\nx = env.get("A")\n',
+            3,
+            'env.get("A")',
+        ),
+        (
+            'import os as Config\n\nclass Config:\n    value = Config.getenv("A")\n',
+            4,
+            'Config.getenv("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "for _ in [1]:\n"
+                "    try:\n"
+                "        break\n"
+                "    finally:\n"
+                "        env = os.environ\n"
+                'x = env.get("A")\n'
+            ),
+            8,
+            'env.get("A")',
+        ),
+        (
+            'import os\nenv = {}\nwhile not (env := os.environ):\n    break\nelse:\n    x = env.get("A")\n',
+            6,
+            'env.get("A")',
+        ),
+        (
+            'import os\na, b = os.environ, {}\na, b = b, a\nx = b.get("A")\n',
+            4,
+            'b.get("A")',
+        ),
+        (
+            'import os\nenv = os.environ\nflag and (env := {})\nx = env.get("A")\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\nenv = {}\n[(env := os.environ) for _ in [1]]\nx = env.get("A")\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "env = {}\n"
+                "match mode:\n"
+                "    case 1:\n"
+                "        env = os.environ\n"
+                "    case _:\n"
+                "        env = {}\n"
+                'x = env.get("A")\n'
+            ),
+            8,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\nclass C:\n    x = os.getenv("A")\n    os = None\n',
+            4,
+            'os.getenv("A")',
+        ),
+        (
+            (
+                "import os\n"
+                "\n"
+                "def outer():\n"
+                "    env = {}\n"
+                "    def mid():\n"
+                "        nonlocal env\n"
+                "        env = {}\n"
+                "        def inner():\n"
+                "            nonlocal env\n"
+                "            env = os.environ\n"
+                "        inner()\n"
+                "    mid()\n"
+                '    return env.get("A")\n'
+            ),
+            13,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\ndef read(env=os.environ):\n    return env.get("A")\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\n\ndef read(*, env=os.environ):\n    return env.get("A")\n',
+            4,
+            'env.get("A")',
+        ),
+        (
+            'import os\nread = lambda env=os.environ: env.get("A")\n',
+            2,
+            'env.get("A")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nxs = list(envs.SLURM_PROCID for _ in range(1))\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            'import os\nsnapshot = dict(**os.environ)\nx = snapshot.get("A")\n',
+            3,
+            'snapshot.get("A")',
+        ),
+        (
+            'from os import getenv\nTYPE_CHECKING = True\nif TYPE_CHECKING:\n    x = getenv("A")\n',
+            4,
+            'getenv("A")',
+        ),
+        (
+            'from os import getenv\nif config.TYPE_CHECKING:\n    x = getenv("A")\n',
+            3,
+            'getenv("A")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nrank = next((envs.SLURM_PROCID for _ in range(1)), None)\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nfor rank in (envs.SLURM_PROCID for _ in range(1)):\n    pass\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            'import os\n\ndef read(get=os.environ.get):\n    return get("A")\n',
+            4,
+            'get("A")',
+        ),
+        (
+            'import os\nget = os.environ.get\nx = get("A")\n',
+            3,
+            'get("A")',
+        ),
+        (
+            (
+                "import os as cfg\n"
+                "\n"
+                "def make(cfg):\n"
+                "    class C:\n"
+                '        value = cfg.getenv("A")\n'
+                "        cfg = None\n"
+                "    return C\n"
+            ),
+            5,
+            'cfg.getenv("A")',
+        ),
+        (
+            'import os\nchild_env = {}\nchild_env |= os.environ\nx = child_env.get("A")\n',
+            4,
+            'child_env.get("A")',
+        ),
+        (
+            'import os\nchild = {}\n\ndef fill():\n    child.update(os.environ)\n\nfill()\nx = child.get("A")\n',
+            8,
+            'child.get("A")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nranks = [v for v in (envs.SLURM_PROCID for _ in range(1))]\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            (
+                "import os\n"
+                "\n"
+                "def outer():\n"
+                "    from typing import TYPE_CHECKING as TC\n"
+                "    def mid():\n"
+                "        def inner():\n"
+                "            nonlocal TC\n"
+                "            TC = True\n"
+                "        inner()\n"
+                "    mid()\n"
+                "    if TC:\n"
+                '        return os.getenv("A")\n'
+                "    return None\n"
+            ),
+            12,
+            'os.getenv("A")',
+        ),
+        (
+            'import os\nchild = {}\nalias = child\nalias.update(os.environ)\nx = child.get("A")\n',
+            5,
+            'child.get("A")',
+        ),
+        (
+            'import os\nx = dict(os.environ.items()).get("A")\n',
+            2,
+            'dict(os.environ.items()).get("A")',
+        ),
+        (
+            "from tensorrt_llm.serve import envs\nfound = 0 in (envs.SLURM_PROCID for _ in range(1))\n",
+            2,
+            "envs.SLURM_PROCID",
+        ),
+        (
+            (
+                "import os\n"
+                "from typing import TYPE_CHECKING as TC\n"
+                "\n"
+                "def f():\n"
+                "    import typing as TC\n"
+                "    if TC:\n"
+                '        return os.getenv("A")\n'
+                "    return None\n"
+            ),
+            7,
+            'os.getenv("A")',
+        ),
     ],
 )
 def test_lint_flags_every_read_form(tmp_path: Path, source: str, line: int, text: str) -> None:
@@ -165,23 +578,67 @@ def test_lint_flags_every_read_form(tmp_path: Path, source: str, line: int, text
         'import os\nos.environ.setdefault("A", "1")\n',
         'import os\nos.environ.update({"A": "1"})\n',
         "import os\nenv = os.environ.copy()\n",
+        'import os\nenv = os.environ.copy()\nenv["A"] = "1"\nenv.pop("B", None)\n',
         "import os\nenv = dict(os.environ)\n",
         'import os\nenv = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}\n',
         "import os\nfor name in os.environ:\n    pass\n",
+        'import os\nenv = os.environ\nxs = [env.get("A") for env in rows]\n',
+        (
+            "import os\n"
+            "env = {}\n"
+            "try:\n"
+            "    cb = lambda: (env := os.environ)\n"
+            "    raise ValueError\n"
+            "except ValueError:\n"
+            '    x = env.get("A")\n'
+        ),
+        (
+            "import os\n"
+            "from typing import TYPE_CHECKING as TC\n"
+            "def helper(TC):\n"
+            "    return TC\n"
+            "if TC:\n"
+            '    x = os.getenv("A")\n'
+        ),
+        "import os\nchild_env = {}\nchild_env |= os.environ\n",
         'import os\nx = os.path.join("a", "b")\n',
         'import os.path\nx = os.path.join("a", "b")\n',
         'import os.path as osp\nx = osp.join("a", "b")\n',
-        "from tensorrt_llm.serve import envs\nx = envs.TRTLLM_SERVER_DISABLE_GC\n",
-        'from tensorrt_llm.serve import envs\nx = envs.consume("TLLM_FRONTEND_READY_FD")\n',
-        'from tensorrt_llm.serve.envs import consume\nx = consume("TLLM_FRONTEND_READY_FD")\n',
+        "from tensorrt_llm.serve import envs\n\ndef f():\n    return envs.TRTLLM_SERVER_DISABLE_GC\n",
+        "from tensorrt_llm.serve import envs\n\ndef f(envs):\n    return envs.value\n",
+        "from tensorrt_llm.serve import envs\ncallback = envs.consume\n",
+        "from tensorrt_llm.serve import envs\nxs = (envs.SLURM_PROCID for _ in rows)\n",
+        "from tensorrt_llm.serve import envs\nxs = next(iter(()), (envs.SLURM_PROCID for _ in range(1)))\n",
+        "from tensorrt_llm.serve import envs\nxs = Builder().join(envs.SLURM_PROCID for _ in range(1))\n",
+        'from tensorrt_llm.serve import envs\n\ndef f():\n    return envs.consume("TLLM_FRONTEND_READY_FD")\n',
+        'from tensorrt_llm.serve.envs import consume\n\ndef f():\n    return consume("TLLM_FRONTEND_READY_FD")\n',
         "from tensorrt_llm.serve.envs import EnvVar, environment_variables\n",
-        "from . import envs\nx = envs.SLURM_PROCID\n",
+        "from tensorrt_llm.serve import envs\nX = envs.environment_variables\n",
+        "from . import envs\n\ndef f():\n    return envs.SLURM_PROCID\n",
         'def getenv(name):\n    return name\n\nx = getenv("A")\n',
         'environ = {}\nx = environ.get("A")\n',
     ],
 )
 def test_lint_allows_writes_and_copies(tmp_path: Path, source: str) -> None:
     assert _findings(tmp_path, source) == []
+
+
+def test_lint_resolves_relative_imports_against_package_path(tmp_path: Path) -> None:
+    # Include an outer tensorrt_llm segment (like a worktree under /code/tensorrt_llm/.worktrees/)
+    # to verify both root-relative and absolute path invocations resolve the inner package.
+    outer = tmp_path / "tensorrt_llm" / "worktree"
+    sub = outer / "tensorrt_llm" / "serve" / "render" / "foo.py"
+    sub.parent.mkdir(parents=True)
+    # `from . import envs` in serve/render/foo.py points to serve.render.envs, not serve.envs.
+    sub.write_text("from . import envs\n\ndef f():\n    return envs.ANY_ATTR\n")
+    assert find_direct_env_reads([sub], root=outer) == []
+    assert find_direct_env_reads([sub]) == []
+    # `from .. import envs` in serve/render/foo.py resolves to tensorrt_llm.serve.envs.
+    sub.write_text("from .. import envs\n\ndef f():\n    return envs.TRTLLM_NOT_DECLARED\n")
+    for findings in (find_direct_env_reads([sub], root=outer), find_direct_env_reads([sub])):
+        assert [(f.line, f.source, f.kind) for f in findings] == [
+            (4, "envs.TRTLLM_NOT_DECLARED", "unknown")
+        ]
 
 
 def test_lint_allows_exactly_the_module_api() -> None:
@@ -288,7 +745,6 @@ EXPECTED = {
     "TLLM_FRONTEND_READY_FD": RAW,
     "TLLM_FRONTEND_AFFINITY_FD": RAW,
     "TLLM_SERVE_LAUNCHER_UDS": RAW,
-    "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR": REQUIRED,
     "TRTLLM_DISAGG_ROLE": RAW,
     "TRTLLM_DISAGG_DEPLOYMENT_ID": RAW,
     # External variables.
@@ -308,6 +764,13 @@ def _describe(state: str) -> str:
     return "unset" if state == "unset" else f"set to {state!r}"
 
 
+def test_declared_names_are_unique() -> None:
+    declared = [var.name for var in (*envs._DEPLOY, *envs._INTERNAL, *envs._EXTERNAL)]
+    assert len(declared) == len(set(declared)) == len(envs.environment_variables), (
+        "duplicate environment variable names in tensorrt_llm/serve/envs.py would silently shadow"
+    )
+
+
 def test_parsing_table_covers_every_declaration() -> None:
     assert set(EXPECTED) == set(envs.environment_variables), (
         "every declared variable has a row in EXPECTED (and every row a declaration): add the "
@@ -315,41 +778,33 @@ def test_parsing_table_covers_every_declaration() -> None:
     )
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED))
+@pytest.mark.parametrize(
+    ("name", "state", "expected"),
+    [
+        (name, state, expected)
+        for name in sorted(EXPECTED)
+        for state, expected in zip(STATES, EXPECTED[name], strict=True)
+    ],
+    ids=lambda val: str(val) if not isinstance(val, type) else val.__name__,
+)
 def test_readers_follow_declared_parsing_contract(
-    monkeypatch: pytest.MonkeyPatch, name: str
+    monkeypatch: pytest.MonkeyPatch, name: str, state: str, expected: object
 ) -> None:
-    for state, expected in zip(STATES, EXPECTED[name]):
-        _set_state(monkeypatch, name, state)
-        if isinstance(expected, type) and issubclass(expected, BaseException):
-            with pytest.raises(expected):
-                getattr(envs, name)
-            continue
-        actual = getattr(envs, name)
-        assert actual == expected and type(actual) is type(expected), (
-            f"envs.{name} {_describe(state)} gave {actual!r}; its declared contract is "
-            f"{expected!r}. Changing the reader or default is a behavior change."
-        )
+    _set_state(monkeypatch, name, state)
+    if isinstance(expected, type) and issubclass(expected, BaseException):
+        with pytest.raises(expected):
+            getattr(envs, name)
+        return
+    actual = getattr(envs, name)
+    assert actual == expected and type(actual) is type(expected), (
+        f"envs.{name} {_describe(state)} gave {actual!r}; its declared contract is "
+        f"{expected!r}. Changing the reader or default is a behavior change."
+    )
 
 
 def test_render_ignored_fields_are_split_and_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_RENDER_IGNORED_FIELDS", " a ,b,, c ,")
     assert envs.TRTLLM_RENDER_IGNORED_FIELDS == ("a", "b", "c")
-
-
-def test_disable_store_is_any_non_empty_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Not a boolean: TRTLLM_RESPONSES_API_DISABLE_STORE=0 disables the store too.
-    monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "0")
-    assert envs.TRTLLM_RESPONSES_API_DISABLE_STORE is True
-    monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "")
-    assert envs.TRTLLM_RESPONSES_API_DISABLE_STORE is False
-
-
-def test_unset_and_empty_use_distinct_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", raising=False)
-    assert envs.TRTLLM_DISAGG_SERVER_DISABLE_GC is True
-    monkeypatch.setenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "")
-    assert envs.TRTLLM_DISAGG_SERVER_DISABLE_GC is False
 
 
 def test_values_are_read_at_access_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -366,6 +821,21 @@ def test_values_are_read_at_access_time(monkeypatch: pytest.MonkeyPatch) -> None
 # ---------------------------------------------------------------------------
 
 
+def test_consumable_variables_are_explicitly_marked() -> None:
+    consumable = {name for name, var in envs.environment_variables.items() if var.consumable}
+    assert consumable == {
+        "TLLM_FRONTEND_READY_FD",
+        "TLLM_FRONTEND_AFFINITY_FD",
+        "TLLM_SERVE_LAUNCHER_UDS",
+    }
+    assert all(envs.environment_variables[name].kind == "internal" for name in consumable)
+    positional = envs.EnvVar("X", "internal", lambda: None, "unset", "desc", False, ("a.py",))
+    assert positional.also_read_by == ("a.py",)
+    assert positional.consumable is False
+    with pytest.raises(TypeError):
+        envs.EnvVar("X", "internal", lambda: None, "unset", "desc", False, ("a.py",), True)  # type: ignore[misc]
+
+
 def test_consume_reads_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TLLM_FRONTEND_READY_FD", "7")
     assert envs.consume("TLLM_FRONTEND_READY_FD") == "7"
@@ -373,14 +843,22 @@ def test_consume_reads_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert envs.consume("TLLM_FRONTEND_READY_FD") is None
 
 
-def test_consume_rejects_names_that_are_not_internal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_consume_rejects_non_consumable_and_undeclared_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", "1")
-    with pytest.raises(KeyError, match="not a declared internal variable"):
+    with pytest.raises(KeyError, match="not a declared consumable internal variable"):
         envs.consume("TRTLLM_SERVER_DISABLE_GC")
     assert os.environ["TRTLLM_SERVER_DISABLE_GC"] == "1", (
         "a rejected consume() must not remove the variable"
     )
-    with pytest.raises(KeyError, match="not a declared internal variable"):
+    monkeypatch.setenv("TLLM_EXECUTOR_FRONTEND_ID", "2")
+    with pytest.raises(KeyError, match="not a declared consumable internal variable"):
+        envs.consume("TLLM_EXECUTOR_FRONTEND_ID")
+    assert os.environ["TLLM_EXECUTOR_FRONTEND_ID"] == "2", (
+        "consume() must not remove non-consumable internal variables"
+    )
+    with pytest.raises(KeyError, match="not a declared consumable internal variable"):
         envs.consume("TRTLLM_NOT_DECLARED")
 
 
@@ -388,12 +866,6 @@ def test_undeclared_name_raises_attribute_error() -> None:
     with pytest.raises(AttributeError, match=r"tensorrt_llm/serve/envs\.py"):
         envs.TRTLLM_NOT_DECLARED
     assert not hasattr(envs, "TRTLLM_NOT_DECLARED")
-
-
-def test_required_internal_variable_raises_key_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TRTLLM_DISAGG_CONFIG_FILE", raising=False)
-    with pytest.raises(KeyError):
-        envs.TRTLLM_DISAGG_CONFIG_FILE
 
 
 def test_introspection_does_not_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -504,17 +976,7 @@ def test_secrets_are_marked() -> None:
 
 
 def test_type_declarations_match_the_declared_names() -> None:
-    tree = ast.parse(ENVS_PATH.read_text())
-    annotated = set()
-    for node in tree.body:
-        if (
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "TYPE_CHECKING"
-        ):
-            for statement in node.body:
-                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                    annotated.add(statement.target.id)
+    annotated = declared_env_names(REPO_ROOT)
     assert annotated == set(envs.environment_variables), (
         "the TYPE_CHECKING block of tensorrt_llm/serve/envs.py declares the type of every variable "
         f"and nothing else; missing {sorted(set(envs.environment_variables) - annotated)}, "
@@ -571,9 +1033,6 @@ def test_launcher_enums_are_declared() -> None:
         if value not in envs.environment_variables
     ]
     assert not undeclared, "\n".join(undeclared)
-    # The one LlmLauncherEnvs member the serve CLI reads.
-    launcher = _envs_enums(REPO_ROOT / "tensorrt_llm/executor/utils.py")["LlmLauncherEnvs"]
-    assert launcher["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] in envs.environment_variables
 
 
 def test_env_name_constants_are_declared() -> None:
@@ -589,11 +1048,3 @@ def test_env_name_constants_are_declared() -> None:
         if value not in envs.environment_variables
     ]
     assert not undeclared, "\n".join(undeclared)
-
-
-def test_agents_md_states_the_rule() -> None:
-    text = AGENTS_MD.read_text()
-    assert "`serve/envs.py`" in text and "`tests/unittest/serve/test_envs.py`" in text, (
-        "tensorrt_llm/serve/AGENTS.md must tell contributors to read environment variables through "
-        "serve/envs.py and name this test as the check"
-    )
