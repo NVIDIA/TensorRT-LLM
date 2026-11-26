@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransferPlan.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceWriteWindow.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
@@ -166,6 +167,7 @@ public:
     NixlTransferAgent& agent;  // data plane: postXferRequest (per-chunk RDMA writes)
     BounceArena* arena{};      // ONE shared data buffer: receiver grants + local gather both carve regions from it
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
+    BounceWriteWindows windows;
     CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
 };
@@ -185,8 +187,10 @@ public:
     /// Join the scatter workers (call during shutdown after wake()).
     void joinWorkers();
 
-    void onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
-    void onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
+    void onWant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob,
+        std::shared_ptr<BounceWriteWindow> const& window);
+    void onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob,
+        std::shared_ptr<BounceWriteWindow> const& window);
     /// Drain scatter bookkeeping completions posted by workers, release regions, and re-grant newly
     /// available space. Successful workers have already sent ACK. Returns true if any were drained.
     bool drainScatterDone();
@@ -210,6 +214,7 @@ public:
 private:
     struct ScatterJob
     {
+        std::shared_ptr<BounceWriteWindow> window;
         std::string key; // "peer\x1f rid"
         std::string peer;
         std::uint64_t rid{};
@@ -278,9 +283,10 @@ public:
     /// Chunks are cut to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility
     /// before calling this; direct users of BounceTransport must establish the same invariant
     /// themselves.
-    [[nodiscard]] std::shared_future<BounceResult> submit(
-        TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer);
+    [[nodiscard]] std::shared_future<BounceResult> submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
+        std::string const& peer, std::string const& windowKey);
 
+    [[nodiscard]] bool verifyReply(std::string const& peer, std::uint64_t rid, std::string const& frame);
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
     void onAck(std::string const& peer, BounceMsgHeader const& h);
     /// The receiver reported it cannot complete a chunk/request: fail the request now (kPeerNack)
@@ -362,6 +368,7 @@ private:
 
     struct Request
     {
+        std::string windowKey;
         std::string peer;
         std::uint32_t numChunks{};
         BounceTransferPlan plan;
@@ -464,7 +471,7 @@ private:
     // receiver reclaim + re-grant those regions under the in-flight write -> cross-node corruption.
     // drainOrphanLocal() sends the cancel once the flow's last in-flight write reaches terminal.
     // rid -> peer. IO-thread-only.
-    std::unordered_map<std::uint64_t, std::string> mPendingCancel;
+    std::unordered_map<std::uint64_t, std::pair<std::string, std::string>> mPendingCancel;
 };
 
 /// The thin reactor: owns the shared context, the sender + receiver, and the IO thread. Routes each
@@ -516,10 +523,15 @@ public:
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
     /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
-    [[nodiscard]] std::shared_future<BounceResult> submit(
-        TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
+    [[nodiscard]] std::shared_future<BounceResult> submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
+        std::string const& peer, std::string const& windowKey)
     {
-        return mSender.submit(srcDescs, dstDescs, peer);
+        return mSender.submit(srcDescs, dstDescs, peer, windowKey);
+    }
+
+    BounceWriteWindows& receiveWindows() noexcept
+    {
+        return mCtx.windows;
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to

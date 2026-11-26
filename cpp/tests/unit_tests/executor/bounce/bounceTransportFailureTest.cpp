@@ -232,7 +232,7 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     t->tx->addPeer("ghostPeer", ghost.localEndpoint());
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer");
+    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer", bounce_test::testWindowKey());
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "request hung with no grant";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
@@ -259,7 +259,7 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
     B->tx->addPeer("feA", A->ch->localEndpoint());
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "feB");
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "write failure hung";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
@@ -294,7 +294,7 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/8192, /*seed=*/12);
     auto const execBaseline = A->exec->freeCount(); // every gather ctx idle before submit
     auto const start = std::chrono::steady_clock::now();
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "nackB");
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     // Hang guard = the full request timeout, so a slow NACK fails the timing bound below, not this.
     ASSERT_EQ(fut.wait_for(std::chrono::milliseconds(kTimeoutMs)), std::future_status::ready) << "NACKed request hung";
     auto const elapsed = std::chrono::steady_clock::now() - start;
@@ -615,7 +615,7 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     ASSERT_TRUE(attacker.addPeer("validateSender", sender->ch->localEndpoint()));
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/4);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate");
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate", bounce_test::testWindowKey());
     b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/77};
 
     attacker.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
@@ -674,7 +674,7 @@ TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants
 
     // One 256-byte chunk (packedBytes = 256).
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/6);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "mispairPeer");
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "mispairPeer", bounce_test::testWindowKey());
 
     // Undersized credit (128 < 256) -> mispair -> abandon; then a well-formed one that pre-fix
     // would attach and post. FIFO ordering to the single reactor consumer guarantees the mispair
@@ -705,7 +705,8 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody"); // stuck (no grant, no timeout)
+    auto fut = t->tx->submit(
+        bufs.srcDescs, bufs.dstDescs, "nobody", bounce_test::testWindowKey()); // stuck (no grant, no timeout)
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
     t->tx->shutdown();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
@@ -735,7 +736,7 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer", bounce_test::testWindowKey());
     b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
     peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
 
@@ -771,8 +772,9 @@ TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer");                   // stuck: never granted
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
+    auto fut
+        = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer", bounce_test::testWindowKey()); // stuck: never granted
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);        // still pending
     t->tx->forgetPeer("gonePeer");
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "forgetPeer left request hanging";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
@@ -802,7 +804,7 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/1);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB");
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     A->tx->forgetPeer("fpB"); // drop the peer (queued; applied on A's IO thread)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "request hung after forgetPeer";
     auto const res = fut.get();
@@ -825,7 +827,7 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     {
         auto rb
             = bounce_test::makeXferBufs(/*nDescs=*/20, /*descBytes=*/600, /*seed=*/static_cast<std::uint32_t>(50 + k));
-        auto rf = A->tx->submit(rb.srcDescs, rb.dstDescs, "fpB");
+        auto rf = bounce_test::submitTransfer(*A, *B, rb);
         ASSERT_EQ(rf.wait_for(std::chrono::seconds(30)), std::future_status::ready)
             << "post-forget transfer hung k=" << k;
         EXPECT_EQ(rf.get().state, kvc::TransferState::kSUCCESS) << "post-forget transfer failed k=" << k;
@@ -951,7 +953,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
     threads.emplace_back(
         [&]
         {
-            auto fut = A->tx->submit(toB.srcDescs, toB.dstDescs, B->name);
+            auto fut = bounce_test::submitTransfer(*A, *B, toB);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
                 && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
@@ -959,7 +961,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
     threads.emplace_back(
         [&]
         {
-            auto fut = A->tx->submit(toC.srcDescs, toC.dstDescs, C->name);
+            auto fut = bounce_test::submitTransfer(*A, *C, toC);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
                 && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
@@ -1005,7 +1007,7 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
         threads.emplace_back(
             [&, i]
             {
-                auto fut = A->tx->submit(bufs[i].srcDescs, bufs[i].dstDescs, B->name);
+                auto fut = bounce_test::submitTransfer(*A, *B, bufs[i]);
                 if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready
                     && fut.get().state == kvc::TransferState::kSUCCESS)
                 {

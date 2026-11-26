@@ -327,13 +327,17 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     return std::nullopt;
 }
 
-bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
+bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request, bool hasWindow) const
 {
     if (!mBounce)
     {
         return false; // disabled, not a rejection
     }
-    auto const reason = bounceRejectReason(request);
+    auto reason = bounceRejectReason(request);
+    if (!reason && !hasWindow)
+    {
+        reason = bounce::BounceRejectReason::kNoReceiveWindow;
+    }
     if (!reason.has_value())
     {
         return true;
@@ -428,7 +432,7 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     return std::nullopt;
 }
 
-bool NixlTransferAgent::shouldUseBounce(TransferRequest const&) const
+bool NixlTransferAgent::shouldUseBounce(TransferRequest const&, bool) const
 {
     return false;
 }
@@ -443,6 +447,7 @@ char const* NixlTransferAgent::bounceRejectReasonName(bounce::BounceRejectReason
     case BounceRejectReason::kNotVram: return "not_vram";
     case BounceRejectReason::kSyncMessage: return "sync_message";
     case BounceRejectReason::kNoPeerHandshake: return "no_peer_handshake";
+    case BounceRejectReason::kNoReceiveWindow: return "no_receive_window";
     case BounceRejectReason::kDescriptorCount: return "descriptor_count";
     case BounceRejectReason::kSourceDevice: return "source_device";
     case BounceRejectReason::kDescriptorShape: return "descriptor_shape";
@@ -898,6 +903,48 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     maybeInitBounce(config.agentBufferSizeMb, config.bounceParams);
 }
 
+std::string NixlTransferAgent::getBounceEndpoint() const
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock lock(mLock);
+    if (mBounce)
+    {
+        return mBounce->channel->localEndpoint();
+    }
+#endif
+    return {};
+}
+
+void NixlTransferAgent::registerBounceWindow(
+    std::string const& peer, std::string const& endpoint, std::string const& key, MemoryDescs const& destinations)
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock lock(mLock);
+    TLLM_CHECK_WITH_INFO(mBounce && !mShutdown.load(), "Bounce receiver is not active");
+    TLLM_CHECK_WITH_INFO(destinations.getType() == MemoryType::kVRAM, "Bounce destinations must be in VRAM");
+    std::vector<bounce::BounceWriteWindow::Range> ranges;
+    ranges.reserve(destinations.getDescs().size());
+    for (auto const& desc : destinations.getDescs())
+    {
+        ranges.emplace_back(desc.getAddr(), desc.getLen());
+    }
+    mBounce->transport->receiveWindows().add(peer, endpoint, key, std::move(ranges));
+#else
+    TLLM_THROW("Bounce receiver is not available in this build");
+#endif
+}
+
+void NixlTransferAgent::revokeBounceWindow(std::string const& key)
+{
+#ifdef TLLM_BOUNCE_V2
+    std::shared_lock lock(mLock);
+    if (mBounce)
+    {
+        mBounce->transport->receiveWindows().remove(bounce::bounceWindowId(key));
+    }
+#endif
+}
+
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
@@ -909,11 +956,21 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 
     // Record per-desc VMM chunk info for use in deregisterMemory / submitTransferRequests
     auto detectedRegionMap = VmmDescSplitter::detectVramRegionMap(descs);
-    mLocalVramRegionInfo.merge(detectedRegionMap);
 
     nixl_status_t status;
     status = mRawAgent->registerMem(NixlHelper::convertRegDlist(splitDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
+    mLocalVramRegionInfo.merge(detectedRegionMap);
+#ifdef TLLM_BOUNCE_V2
+    if (descs.getType() == MemoryType::kVRAM)
+    {
+        std::unique_lock regionLock(mLocalRegionMutex);
+        for (auto const& desc : descs.getDescs())
+        {
+            mScatterDestinations[desc.getAddr()] = {desc.getLen(), desc.getDeviceId()};
+        }
+    }
+#endif
 
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
@@ -924,6 +981,7 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::deregisterMemory called after shutdown");
+    std::unique_lock regionLock(mLocalRegionMutex);
     // Split using per-region registry info to match what was registered
     auto splitDescs = VmmDescSplitter::splitDescsWithRegionMap(descs, mLocalVramRegionInfo);
 
@@ -937,6 +995,12 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
         for (auto const& desc : descs.getDescs())
         {
             mLocalVramRegionInfo.erase(desc.getAddr());
+#ifdef TLLM_BOUNCE_V2
+            if (mScatterDestinations.erase(desc.getAddr()) && mBounce)
+            {
+                mBounce->transport->receiveWindows().removeIntersecting(desc.getAddr(), desc.getLen());
+            }
+#endif
         }
     }
 }
@@ -1028,6 +1092,12 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
 {
+    return submitTransferWithWindow(request, {});
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferWithWindow(
+    TransferRequest const& request, std::string const& windowKey)
+{
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::submitTransferRequests called after shutdown");
 
@@ -1039,7 +1109,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // fallback to the standard path — the dominant failure causes (dead peer, partition) would fail
     // there too, and silent fallback would mask bounce-layer faults. Fallbacks happen only at
     // admission time (this gate, unhandshaked peer, disabled/failed arena setup).
-    if (shouldUseBounce(request))
+    if (shouldUseBounce(request, !windowKey.empty()))
     {
         mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);
         // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
@@ -1047,7 +1117,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.
         TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
             request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
-        auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
+        auto fut = mBounce->transport->submit(
+            request.getSrcDescs(), request.getDstDescs(), request.getRemoteName(), windowKey);
         return std::make_unique<BounceTransferStatus>(std::move(fut));
     }
 #endif
@@ -1300,6 +1371,7 @@ void NixlTransferAgent::shutdown() noexcept
         TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw unknown exception");
     }
     mLocalVramRegionInfo.clear();
+    mScatterDestinations.clear();
     mRemoteVramRegionInfo.clear();
 }
 

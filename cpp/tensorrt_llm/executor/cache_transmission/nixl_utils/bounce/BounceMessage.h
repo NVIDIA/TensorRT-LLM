@@ -100,7 +100,7 @@ inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
 // v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
 // handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
 // control message defensively.
-inline constexpr std::uint16_t kBounceVersion = 2U;
+inline constexpr std::uint16_t kBounceVersion = 3U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of

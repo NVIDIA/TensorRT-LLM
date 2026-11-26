@@ -26,7 +26,7 @@ import time
 import weakref
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -188,6 +188,7 @@ class RecvReqInfo:
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
+    bounce_window_key: bytes = field(default=b"", repr=False, compare=False)
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -216,6 +217,7 @@ class RecvReqInfo:
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
         # The report token comes only from its own checked REQUEST_DATA frame.
         d.pop("kv_result_report_token", None)
+        d.pop("bounce_window_key", None)
         info = cls(**d)
         if from_older_release:
             raise OlderReleaseRequestError(info)
@@ -295,7 +297,8 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     transfer_groups: tuple[_TransferGroup, ...] = ()
-    kv_result_report_token: bytes = b""
+    kv_result_report_token: bytes = field(default=b"", repr=False)
+    bounce_window_key: bytes = field(default=b"", repr=False)
     # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
     transfer_bytes: Optional[int] = None
 
@@ -482,6 +485,8 @@ class AgentResult(Enum):
 _KV_RESULT_FRAME = struct.Struct("<qqq?Bq")
 # Per-writer KV result report token length.
 _KV_RESULT_REPORT_TOKEN_BYTES = 16
+
+
 _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
@@ -500,6 +505,20 @@ def _check_kv_result_report_token(token: bytes) -> bytes:
     if not isinstance(token, bytes) or len(token) != _KV_RESULT_REPORT_TOKEN_BYTES:
         raise ValueError(f"KV result report token must be {_KV_RESULT_REPORT_TOKEN_BYTES} bytes")
     return token
+
+
+def _request_data_credentials(message: list[bytes]) -> tuple[bytes, bytes]:
+    if len(message) not in (3, 4):
+        raise ValueError(
+            "REQUEST_DATA must carry a KV result report token and an optional receive window"
+        )
+    result_token = _check_kv_result_report_token(message[2])
+    if len(message) == 3:
+        return result_token, b""
+    window = message[3]
+    if not isinstance(window, bytes) or len(window) != 16:
+        raise ValueError("Invalid receive window key")
+    return result_token, window
 
 
 def _make_kv_result_msg(
@@ -1041,8 +1060,15 @@ class Sender(SenderBase):
         peer_rank: int,
         request: TransferRequest | _TransferRequestGroup,
         on_submitted: Optional[Callable[[], None]] = None,
+        bounce_window_key: bytes = b"",
     ) -> tuple[bool, Optional[str]]:
         requests = request.requests if isinstance(request, _TransferRequestGroup) else (request,)
+
+        def submit_member(member):
+            if bounce_window_key:
+                return self._agent.submit_bounce_transfer(member, bounce_window_key)
+            return self._agent.submit_transfer_requests(member)
+
         owned = self._owns_task(task)
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
@@ -1061,7 +1087,7 @@ class Sender(SenderBase):
             # Finish each group before submitting the next so a later submission
             # failure cannot abandon an earlier group's in-flight handle.
             for index, member in enumerate(requests):
-                status = self._agent.submit_transfer_requests(member)
+                status = submit_member(member)
                 if index == 0 and on_submitted is not None:
                     with disagg_diagnostics.suppress_diagnostic_errors():
                         on_submitted()
@@ -1075,9 +1101,9 @@ class Sender(SenderBase):
 
         def submit() -> TransferStatus | _TransferGroupStatus:
             if group_status is None:
-                return self._agent.submit_transfer_requests(request)
+                return submit_member(request)
             for member in request.requests:
-                group_status.statuses.append(self._agent.submit_transfer_requests(member))
+                group_status.statuses.append(submit_member(member))
             group_status.submission_complete = True
             return group_status
 
@@ -1413,11 +1439,19 @@ class Sender(SenderBase):
                         "ctx_backend_submit_start", write_meta, include_transfer_entries=True
                     )
 
+                bounce_args = {}
+                if (
+                    getattr(self._agent, "bounce_enabled", False) is True
+                    and write_meta.meta_type == WriteMetaType.KV
+                    and write_meta.bounce_window_key
+                ):
+                    bounce_args["bounce_window_key"] = write_meta.bounce_window_key
                 transfer_finished, last_status = self._submit_transfer(
                     task,
                     write_meta.peer_rank,
                     request,
                     on_submitted=submission_callback,
+                    **bounce_args,
                 )
                 if transfer_finished:
                     submitted_and_completed = True
@@ -1851,6 +1885,7 @@ class Sender(SenderBase):
             is_last_slice=task._chunk.is_last,
             transfer_groups=tuple(transfer_groups),
             kv_result_report_token=req_info.kv_result_report_token,
+            bounce_window_key=req_info.bounce_window_key,
             transfer_bytes=transfer_bytes,
         )
 
@@ -2105,9 +2140,7 @@ class Sender(SenderBase):
             logger.debug(str(error))
             self._send_failed_result_to_receiver(info)
             return
-        if len(message) != 3:
-            raise ValueError("REQUEST_DATA must carry a KV result report token")
-        info.kv_result_report_token = _check_kv_result_report_token(message[2])
+        info.kv_result_report_token, info.bounce_window_key = _request_data_credentials(message)
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
         received_timestamp = None
@@ -3026,6 +3059,17 @@ class KVRecvTask(_LogicalTask):
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
         # Per-writer report tokens this receiver published for the task.
         self._kv_result_report_tokens: dict[int, bytes] = {}
+        self._bounce_windows: dict[int, tuple[BaseTransferAgent, bytes]] = {}
+
+    def release_bounce_writer(self, rank: int) -> None:
+        window = self._bounce_windows.pop(rank, None)
+        if window is not None:
+            agent, key = window
+            agent.revoke_bounce_window(key)
+
+    def release_bounce_windows(self) -> None:
+        for rank in list(self._bounce_windows):
+            self.release_bounce_writer(rank)
 
     def fail(self, exc: Exception) -> None:
         """Mark the task ERROR.
@@ -3033,6 +3077,7 @@ class KVRecvTask(_LogicalTask):
         Callers hold the owning RxSession.lock, unless that session is already closed and
         unregistered (then no other thread can reach the task).
         """
+        self.release_bounce_windows()
         self._logical_outcomes.fail(exc)
         self._exception = exc
         self.status = TaskStatus.ERROR
@@ -3047,6 +3092,7 @@ class KVRecvTask(_LogicalTask):
         """
         if self.status == TaskStatus.ERROR:
             return
+        self.release_bounce_windows()
         self._logical_outcomes.complete(self._logical_index)
         self.status = TaskStatus.TRANSFERRED
         self._event.set()
@@ -3155,6 +3201,127 @@ class KVRecvTask(_LogicalTask):
         )
 
 
+class _BounceWriterProjection:
+    """Receiver-side destination geometry for a single registered writer rank."""
+
+    def __init__(
+        self,
+        writer: PeerRegistrar,
+        local: RankInfo,
+        destination: KVRegionExtractorV1,
+        endpoint: str,
+    ):
+        self.endpoint = endpoint
+        self.writer = writer
+        self.local = local
+        self.destination = destination
+        self.templates = {}
+        self.rings = {}
+        src = writer.self_extractor
+        writer_info = writer.self_rank_info
+        targets = writer.get_peer_overlap(local, local.dp_rank)
+        slot_zero = np.zeros(1, dtype=np.int64)
+        for source_view, dst_view in writer.get_pool_mapping(local).items():
+            source_group, source_idx = source_view
+            group, view = dst_view
+            if not writer.should_send_pool(targets, local, source_group, source_idx):
+                continue
+            src_group = src.page_table.layer_groups[source_group]
+            src_pool = get_physical_pool(
+                src.page_table, source_group, src_group.pool_views[source_idx].pool_idx
+            )
+            dst_group = destination.page_table.layer_groups[group]
+            pool = get_physical_pool(
+                destination.page_table, group, dst_group.pool_views[view].pool_idx
+            )
+            if src_pool.memory_type != "VRAM" or pool.memory_type != "VRAM":
+                continue
+            mapper = writer.get_kv_map(local, source_view, dst_view)
+            if isinstance(mapper, RingMapper):
+                self.rings[dst_view] = (mapper, pool)
+                continue
+            if src_group.kind == CacheKind.STATE:
+                if not MambaPolicy.is_paired(writer_info, local):
+                    continue
+                source_sample = src.extract_slot(0, source_group, source_idx)
+                dst_sample = destination.extract_slot(0, group, view)
+            else:
+                source_sample = src.extract(slot_zero, source_group, source_idx)
+                dst_sample = destination.extract(slot_zero, group, view)
+            mapped = mapper.map(source_sample, dst_sample)
+            parts = mapped if isinstance(mapped, list) else [mapped]
+            self.templates[dst_view] = (
+                pool,
+                [
+                    (part.dst.memory.ptrs - pool.base_address, part.dst.memory.bytes_per_region)
+                    for part in parts
+                    if part.dst.memory.ptrs.size
+                ],
+            )
+
+    def destinations(self, chunk: Chunk) -> MemoryDescs:
+        addresses = []
+        lengths = []
+        tpb = self.destination.page_table.tokens_per_block
+        if len(chunk.block_ids_per_layer_groups) != len(self.destination.page_table.layer_groups):
+            raise ValueError("Receive slice does not match the local layer groups")
+        for view_key in self.templates.keys() | self.rings.keys():
+            if view_key in chunk.excluded_pool_views:
+                continue
+            group, view = view_key
+            slots = chunk.block_ids_per_layer_groups[group]
+            ordinals = np.flatnonzero(slots >= 0)
+            if not ordinals.size:
+                continue
+            if self.destination.page_table.layer_groups[group].kind != CacheKind.STATE:
+                global_ordinals = ordinals
+                if self.local.cp_size > 1 and self.writer.self_rank_info.cp_size == 1:
+                    global_ordinals = ordinals * self.local.cp_size + self.local.cp_rank
+                keep = ((global_ordinals + 1) * tpb > chunk.token_range.start) & (
+                    global_ordinals * tpb < chunk.token_range.end
+                )
+                ordinals = ordinals[keep]
+                global_ordinals = global_ordinals[keep]
+            selected = slots[ordinals].astype(np.int64, copy=False)
+            if not selected.size:
+                continue
+            if view_key in self.rings:
+                mapper, pool = self.rings[view_key]
+                if selected.max() >= pool.num_slots:
+                    raise ValueError("Receive slot exceeds the local pool")
+                dst_ptrs = self.destination.extract(selected, group, view).memory.ptrs
+                mapped = mapper.map_positions(
+                    np.zeros_like(dst_ptrs),
+                    dst_ptrs,
+                    Sender._ring_position_ranges(
+                        global_ordinals, tpb, int(chunk.token_range.end), mapper.retained_positions
+                    ),
+                )
+                for part in mapped if isinstance(mapped, list) else [mapped]:
+                    ptrs = part.dst.memory.ptrs
+                    if ptrs.size:
+                        addresses.append(ptrs)
+                        lengths.append(
+                            np.full(ptrs.size, part.dst.memory.bytes_per_region, dtype=np.int64)
+                        )
+                continue
+            pool, pieces = self.templates[view_key]
+            if selected.max() >= pool.num_slots:
+                raise ValueError("Receive slot exceeds the local pool")
+            bases = pool.base_address + selected * pool.slot_stride_bytes
+            for offsets, width in pieces:
+                ptrs = (bases[:, None] + offsets).ravel()
+                addresses.append(ptrs)
+                lengths.append(np.full(ptrs.size, width, dtype=np.int64))
+        empty = np.empty(0, dtype=np.int64)
+        return MemoryDescs.from_arrays_uniform_device(
+            MemoryType.VRAM,
+            np.concatenate(addresses) if addresses else empty,
+            np.concatenate(lengths) if lengths else empty,
+            self.local.device_id,
+        )
+
+
 class Receiver(ReceiverBase):
     def __init__(
         self,
@@ -3174,6 +3341,7 @@ class Receiver(ReceiverBase):
         self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
         self._rank_info_timeout_s = rank_info_timeout_s
         self._dealers = {}
+        self._bounce_writer_projections: dict[str, dict[int, _BounceWriterProjection]] = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
         # compatibility check. Requests targeting such a peer fail fast
@@ -3438,6 +3606,43 @@ class Receiver(ReceiverBase):
         task._kv_result_report_tokens = {
             rank: secrets.token_bytes(_KV_RESULT_REPORT_TOKEN_BYTES) for rank in peer_overlap.ranks
         }
+        published_window_keys: dict[int, bytes] = {}
+        if getattr(self._agent, "bounce_enabled", False) is True:
+            with session.lock:
+                if session._closed or task.is_done:
+                    return
+                try:
+                    endpoint = self._extract_info_endpoint(params)
+                    projections = self._bounce_writer_projections[endpoint]
+                    for rank in task._kv_result_report_tokens:
+                        projection = projections.get(rank)
+                        if projection is None:
+                            continue  # This writer did not advertise the bounce transport.
+                        destinations = projection.destinations(task._chunk)
+                        key = secrets.token_bytes(16)
+                        self._agent.register_bounce_window(
+                            peer_infos.instance_name + str(rank),
+                            projection.endpoint,
+                            key,
+                            destinations,
+                        )
+                        task._bounce_windows[rank] = (self._agent, key)
+                        published_window_keys[rank] = key
+                except (ValueError, RuntimeError) as error:
+                    if session._enforce_physical_ownership:
+                        session.cancel_unpublished_task(task)
+                    task.fail(error)
+                    return
+
+        def publish_to_writer(rank: int) -> None:
+            endpoint = peer_infos.sender_endpoints[rank]
+            token = task._kv_result_report_tokens[rank]
+            window_key = published_window_keys.get(rank)
+            if window_key is None:
+                self._request_sender_data(endpoint, receiver_req_bytes, token)
+            else:
+                self._request_sender_data(endpoint, receiver_req_bytes, token, window_key)
+
         if not session._enforce_physical_ownership:
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
@@ -3449,11 +3654,7 @@ class Receiver(ReceiverBase):
                 if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                     with disagg_diagnostics.suppress_diagnostic_errors():
                         send_timestamp = disagg_diagnostics.capture_timestamp()
-                self._request_sender_data(
-                    peer_infos.sender_endpoints[rank],
-                    receiver_req_bytes,
-                    task._kv_result_report_tokens[rank],
-                )
+                publish_to_writer(rank)
                 if send_timestamp is not None:
                     with disagg_diagnostics.suppress_diagnostic_errors():
                         disagg_diagnostics.emit_event(
@@ -3484,11 +3685,7 @@ class Receiver(ReceiverBase):
                         send_timestamp = disagg_diagnostics.capture_timestamp()
                 published_writers.add(rank)
                 try:
-                    self._request_sender_data(
-                        peer_infos.sender_endpoints[rank],
-                        receiver_req_bytes,
-                        task._kv_result_report_tokens[rank],
-                    )
+                    publish_to_writer(rank)
                 except Exception:
                     published_writers.discard(rank)
                     raise
@@ -3546,6 +3743,76 @@ class Receiver(ReceiverBase):
         if endpoint not in self._dealers:
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
+
+    def _cache_bounce_writer_layouts(self, endpoint: str, instance: RankInfo) -> None:
+        data = self._agent.get_bounce_writer_layouts(instance.transfer_engine_info)
+        writers: dict[int, _BounceWriterProjection] = {}
+        if data:
+            layouts = msgpack.unpackb(
+                data,
+                raw=False,
+                max_array_len=max(2, len(instance.sender_endpoints)),
+                max_map_len=0,
+                max_str_len=4096,
+                max_bin_len=2 << 20,
+            )
+            if not isinstance(layouts, list) or len(layouts) != len(instance.sender_endpoints):
+                raise ValueError("Bounce writer roster does not match the registered instance")
+            tp, pp, cp = instance.tp_size, instance.pp_size, instance.cp_size
+            if (
+                min(tp, pp, cp, instance.dp_size) < 1
+                or tp * pp * cp != len(layouts)
+                or len(instance.layer_num_per_pp) != pp
+                or any(count < 0 for count in instance.layer_num_per_pp)
+                or sum(instance.layer_num_per_pp) == 0
+            ):
+                raise ValueError("Invalid topology for bounce writer roster")
+            attention_dp = instance.attention is not None and instance.attention.enable_attention_dp
+            if attention_dp and instance.dp_size != tp:
+                raise ValueError("Inconsistent attention DP size for bounce writer roster")
+            local = self._registrar.self_rank_info
+            eligible = {
+                rank
+                for dp in range(instance.dp_size if attention_dp else 1)
+                for rank in self._registrar.get_peer_overlap(instance, dp).ranks
+            }
+            for rank, raw in enumerate(layouts):
+                if raw is None:
+                    continue
+                if (
+                    not isinstance(raw, (tuple, list))
+                    or len(raw) != 2
+                    or not isinstance(raw[1], str)
+                    or not raw[1]
+                ):
+                    raise ValueError("Invalid bounce writer endpoint")
+                metadata, control_endpoint = raw
+                if not isinstance(metadata, bytes):
+                    raise ValueError("Invalid bounce writer layout")
+                writer = RankInfo.from_bytes(metadata)
+                pp_rank, within_stage = divmod(rank, tp * cp)
+                tp_rank, cp_rank = divmod(within_stage, cp)
+                if (
+                    writer.instance_rank != rank
+                    or writer.instance_name != instance.instance_name
+                    or (writer.tp_size, writer.pp_size, writer.cp_size, writer.dp_size)
+                    != (tp, pp, cp, instance.dp_size)
+                    or (writer.pp_rank, writer.tp_rank, writer.cp_rank, writer.dp_rank)
+                    != (pp_rank, tp_rank, cp_rank, tp_rank if attention_dp else 0)
+                    or (writer.attention is not None and writer.attention.enable_attention_dp)
+                    != attention_dp
+                    or writer.page_table is None
+                ):
+                    raise ValueError("Inconsistent rank in bounce writer roster")
+                if rank not in eligible:
+                    continue
+                writer.layer_num_per_pp = instance.layer_num_per_pp
+                planner = PeerRegistrar(writer, KVRegionExtractorV1(writer.page_table))
+                planner.register(local.instance_name, local.instance_rank, local)
+                writers[rank] = _BounceWriterProjection(
+                    planner, local, self._registrar.self_extractor, control_endpoint
+                )
+        self._bounce_writer_projections[endpoint] = writers
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
@@ -3635,6 +3902,19 @@ class Receiver(ReceiverBase):
                 )
                 self._registrar.validate_draft_layers_compatible(sender_info)
                 self._registrar.validate_view_head_geometry(sender_info)
+                if getattr(self._agent, "bounce_enabled", False) is True:
+                    try:
+                        self._cache_bounce_writer_layouts(info_endpoint, sender_info)
+                    except (
+                        KeyError,
+                        IndexError,
+                        TypeError,
+                        AttributeError,
+                        ArithmeticError,
+                        RuntimeError,
+                        msgpack.exceptions.UnpackException,
+                    ) as error:
+                        raise ValueError("Invalid bounce writer metadata") from error
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -3797,13 +4077,20 @@ class Receiver(ReceiverBase):
         session.process_aux_agent_result(peer_rank, AgentResult(status))
 
     def _request_sender_data(
-        self, endpoint: str, receiver_info_bytes: bytes, kv_result_report_token: bytes
+        self,
+        endpoint: str,
+        receiver_info_bytes: bytes,
+        kv_result_report_token: bytes,
+        bounce_window_key: bytes = b"",
     ):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         # The report token is per-writer, so it travels as its own frame.
         logger.debug("Sending data request to endpoint '%s'", endpoint)
         messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes, kv_result_report_token])
+        frames = [MessageType.REQUEST_DATA, receiver_info_bytes, kv_result_report_token]
+        if bounce_window_key:
+            frames.append(bounce_window_key)
+        messenger.send(frames)
 
     def __del__(self):
         try:
@@ -4288,6 +4575,8 @@ class RxSession(RxSessionBase):
                     )
                     if not accepted:
                         return
+            if is_last_slice or status == AgentResult.FAILED:
+                task.release_bounce_writer(peer_rank)
             self.kv_cache_size_bytes += transfer_size
             if status == AgentResult.SUCCESS:
                 # Verified-range accounting: transfer_size is the sender's
@@ -4678,6 +4967,8 @@ class RxSession(RxSessionBase):
             if getattr(self, "_closed", False):
                 return True
             self._closed = True
+        for task in self._kv_tasks:
+            task.release_bounce_windows()
         if self._aux_buffer is not None and self.aux_slot is not None:
             self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
@@ -4713,8 +5004,9 @@ class RankInfoServer:
         addr: Optional[str] = None,
         port: Optional[int] = None,
         rank_info_auth_key: Optional[bytes] = None,
+        defer_publish: bool = False,
     ):
-        self._rank_info = rank_info
+        self._rank_info = None if defer_publish else rank_info
         self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
         self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
@@ -4729,6 +5021,9 @@ class RankInfoServer:
                 "configured, so REQUEST_INSTANCE_INFO returns transfer metadata without authentication"
             )
         self._start_listener()
+
+    def publish_rank_info(self, info: RankInfo) -> None:
+        self._rank_info = info
 
     @property
     def endpoint(self) -> str:
@@ -4760,6 +5055,9 @@ class RankInfoServer:
         self._messenger.start_listener(handle_message)
 
     def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+        if self._rank_info is None:
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+            return
         if self._rank_info_auth_key is None:
             response = (
                 self._rank_info.to_bytes()
@@ -4943,10 +5241,29 @@ class TransferWorker:
         if watchdog is not None:
             watchdog.request_shutdown()
 
-    def populate_instance_and_rank_info(self, endpoints: list[str], layer_num_per_pp: list[int]):
+    def bounce_writer_geometry(self) -> Optional[tuple[bytes, str]]:
+        if getattr(self._agent, "bounce_enabled", False) is True:
+            return self._rank_info.bounce_writer_geometry(), self._agent.bounce_endpoint
+        return None
+
+    def populate_instance_and_rank_info(
+        self,
+        endpoints: list[str],
+        layer_num_per_pp: list[int],
+        writer_layouts: Optional[list[Optional[tuple[bytes, str]]]] = None,
+    ):
         assert self._rank_info is not None
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
+        if self._rank_info_server is not None:
+            published = self._rank_info
+            if writer_layouts and any(writer_layouts):
+                descriptor = self._agent.with_bounce_writer_layouts(
+                    self._rank_info.transfer_engine_info,
+                    msgpack.packb(writer_layouts, use_bin_type=True),
+                )
+                published = replace(published, transfer_engine_info=descriptor)
+            self._rank_info_server.publish_rank_info(published)
 
     def create_tx_session(self, request: LlmRequest) -> TxSession:
         params = request.py_disaggregated_params
@@ -5008,7 +5325,9 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = (
-            RankInfoServer(self._rank_info, rank_info_auth_key=self._rank_info_auth_key)
+            RankInfoServer(
+                self._rank_info, rank_info_auth_key=self._rank_info_auth_key, defer_publish=True
+            )
             if kvm.mapping.rank == 0
             else None
         )

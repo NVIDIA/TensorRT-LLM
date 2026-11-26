@@ -64,7 +64,7 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(nDescs, descBytes, seed);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
+    auto fut = bounce_test::submitTransfer(*A, *B, bufs);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
     EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
@@ -95,6 +95,46 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
     runTransfer(tag, nDescs, descBytes, cfg, cfg, /*seed=*/1);
 }
 } // namespace
+
+TEST(BounceReceiveWindow, ScopeIsRetiredBeforeLocalMemoryCanBeReused)
+{
+    b::BounceWriteWindows windows;
+    auto const key = bounce_test::testWindowKey();
+    auto const id = b::bounceWindowId(key);
+    auto window = windows.add("writer", "local-test-endpoint", key, {{64, 8}, {72, 8}, {120, 8}});
+    EXPECT_EQ(windows.find(id, "writer"), window);
+    EXPECT_EQ(windows.find(id, "another-writer"), nullptr);
+    EXPECT_TRUE(window->contains(68, 12));
+    EXPECT_FALSE(window->contains(79, 2));
+
+    auto copy = window->acquire();
+    ASSERT_TRUE(copy.owns_lock());
+    std::promise<void> entered;
+    auto retired = std::async(std::launch::async,
+        [&]
+        {
+            entered.set_value();
+            windows.removeIntersecting(64, 16);
+        });
+    entered.get_future().wait();
+    EXPECT_EQ(retired.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+    copy.unlock();
+    retired.get();
+    EXPECT_EQ(windows.find(id, "writer"), nullptr);
+    EXPECT_FALSE(window->acquire().owns_lock());
+}
+
+TEST(BounceReceiveWindow, SignedMessageUsesTheIssuedWindow)
+{
+    auto const key = bounce_test::testWindowKey();
+    std::string const message = "completed";
+    auto const envelope = b::signBounceFrame(message, key);
+    std::string id;
+    ASSERT_TRUE(b::readBounceWindowId(envelope, message.size(), id));
+    EXPECT_EQ(id, b::bounceWindowId(key));
+    EXPECT_TRUE(b::verifyBounceFrame(envelope, key));
+    EXPECT_FALSE(b::verifyBounceFrame(envelope, bounce_test::testWindowKey()));
+}
 
 TEST(BounceTransport, SmallTransferFitsInflightLimit)
 {
@@ -141,8 +181,8 @@ TEST(BounceTransport, ConcurrentRequestsToSameReceiver)
     // Seed-distinct payloads so any cross-talk between the two in-flight flows fails verification.
     auto bufs1 = bounce_test::makeXferBufs(/*nDescs=*/8, /*descBytes=*/1024, /*seed=*/1);
     auto bufs2 = bounce_test::makeXferBufs(/*nDescs=*/8, /*descBytes=*/1024, /*seed=*/2);
-    auto fut1 = A->tx->submit(bufs1.srcDescs, bufs1.dstDescs, B->name);
-    auto fut2 = A->tx->submit(bufs2.srcDescs, bufs2.dstDescs, B->name);
+    auto fut1 = bounce_test::submitTransfer(*A, *B, bufs1);
+    auto fut2 = bounce_test::submitTransfer(*A, *B, bufs2);
     ASSERT_EQ(fut1.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "first transfer hung";
     ASSERT_EQ(fut2.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "second transfer hung";
     EXPECT_EQ(fut1.get().state, kvc::TransferState::kSUCCESS);
@@ -377,7 +417,7 @@ TEST_P(BounceStreamDependencies, RoundTripSettlesWhileUnrelatedLegacyWorkIsPendi
     ASSERT_NE(receiver, nullptr) << "NIXL agent/backend unavailable";
     bounce_test::wirePair(*sender, *receiver);
 
-    auto warmupDone = sender->tx->submit(warmup->srcDescs, warmup->dstDescs, receiver->name);
+    auto warmupDone = bounce_test::submitTransfer(*sender, *receiver, *warmup);
     ASSERT_EQ(warmupDone.wait_for(std::chrono::seconds(30)), std::future_status::ready);
     ASSERT_EQ(warmupDone.get().state, kvc::TransferState::kSUCCESS);
     ASSERT_EQ(
@@ -388,7 +428,7 @@ TEST_P(BounceStreamDependencies, RoundTripSettlesWhileUnrelatedLegacyWorkIsPendi
     LegacyDefaultGate gate;
     gate.hold();
     ASSERT_FALSE(::testing::Test::HasFatalFailure());
-    auto done = sender->tx->submit(payload->srcDescs, payload->dstDescs, receiver->name);
+    auto done = bounce_test::submitTransfer(*sender, *receiver, *payload);
     ASSERT_EQ(done.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "bounce transfer hung";
     ASSERT_EQ(done.get().state, kvc::TransferState::kSUCCESS);
     gate.expectPending();

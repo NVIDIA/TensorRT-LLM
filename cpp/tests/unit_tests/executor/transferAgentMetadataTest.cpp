@@ -103,6 +103,29 @@ TEST(AgentDescTest, SerializeDeserializeUnalignedBase)
     EXPECT_NE(wrongOffset, offsetInChunk);
 }
 
+TEST(AgentDescTest, WriterRosterIsOptionalAndSeparateFromBackendMetadata)
+{
+    AgentDesc descriptor{"backend", {{0x1000, 256, 64}}, "handshake"};
+    auto plain = descriptor.serialize();
+    EXPECT_TRUE(AgentDesc::readWriterLayouts(plain).empty());
+    EXPECT_TRUE(AgentDesc::readWriterLayouts("opaque backend metadata").empty());
+    auto extended = descriptor.serializeWithWriterLayouts("writer geometry");
+    EXPECT_EQ(AgentDesc::readWriterLayouts(extended), "writer geometry");
+    auto restored = AgentDesc::deserialize(extended);
+    EXPECT_EQ(restored.getBackendAgentDesc(), descriptor.getBackendAgentDesc());
+    EXPECT_EQ(restored.serialize(), plain);
+}
+
+TEST(AgentDescTest, RegionTableRequiresAllDeclaredEntries)
+{
+    AgentDesc descriptor{"", {{0x1000, 256, 64}, {0x2000, 256, 64}}};
+    auto wire = descriptor.serialize();
+    constexpr auto kHeaderSize = 2 * sizeof(std::size_t);
+    constexpr auto kEntrySize = sizeof(uintptr_t) + 2 * sizeof(std::size_t);
+    wire.resize(kHeaderSize + kEntrySize);
+    EXPECT_THROW(AgentDesc::deserialize(wire), std::exception);
+}
+
 TEST(AgentDescTest, DeserializeTruncatedData)
 {
     // Serialize a valid AgentDesc, then truncate the data

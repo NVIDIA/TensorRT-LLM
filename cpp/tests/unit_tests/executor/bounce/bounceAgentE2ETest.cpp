@@ -70,10 +70,31 @@ kvc::TransferState waitTerminal(StatusPtr& status, int seconds)
     return st;
 }
 
+struct TestRoute
+{
+    kvc::NixlTransferAgent* sender;
+    kvc::NixlTransferAgent* receiver;
+    std::string senderName;
+    std::string receiverName;
+};
+
+kvc::TransferState transferWithWindow(TestRoute const& route, XferBufs const& buffers, int timeout)
+{
+    auto const key = bounce_test::testWindowKey();
+    auto request = makeReq(buffers, route.receiverName.c_str());
+    auto const& ranges = request.getDstDescs();
+    route.receiver->registerMemory(ranges);
+    route.receiver->registerBounceWindow(route.senderName, route.sender->getBounceEndpoint(), key, ranges);
+    auto result = route.sender->submitTransferWithWindow(request, key);
+    auto const state = result ? waitTerminal(result, timeout) : kvc::TransferState::kFAILURE;
+    route.receiver->revokeBounceWindow(key);
+    route.receiver->deregisterMemory(ranges);
+    return state;
+}
+
 // Fan out one transfer per (sender agent, dst peer) route, each on its own thread, and return how
 // many completed SUCCESS. bufs[i] backs routes[i].
-int runConcurrentFlows(
-    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> const& routes, std::vector<XferBufs> const& bufs)
+int runConcurrentFlows(std::vector<TestRoute> const& routes, std::vector<XferBufs> const& bufs)
 {
     std::atomic<int> ok{0};
     std::vector<std::thread> threads;
@@ -83,13 +104,7 @@ int runConcurrentFlows(
         threads.emplace_back(
             [&, i]
             {
-                auto req = makeReq(bufs[i], routes[i].second);
-                auto status = routes[i].first->submitTransferRequests(req);
-                if (status == nullptr)
-                {
-                    return;
-                }
-                if (waitTerminal(status, 60) == kvc::TransferState::kSUCCESS)
+                if (transferWithWindow(routes[i], bufs[i], 60) == kvc::TransferState::kSUCCESS)
                 {
                     ok.fetch_add(1);
                 }
@@ -187,11 +202,8 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
 
     auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/7);
-    auto req = makeReq(bufs, "bAgentB");
-    auto status = a->submitTransferRequests(req);
-    ASSERT_NE(status, nullptr);
-    EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
-        << "bounce transfer via submitTransferRequests did not succeed";
+    EXPECT_EQ(transferWithWindow({a.get(), b.get(), "bAgentA", "bAgentB"}, bufs, 30), kvc::TransferState::kSUCCESS);
+    EXPECT_GT(a->getBounceSubmitCount(), 0U);
     EXPECT_TRUE(verifyXferBufs(bufs));
 
     a->shutdown();
@@ -282,13 +294,13 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
 
     constexpr int kThreads = 8;
     std::vector<XferBufs> bufs;
-    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
+    std::vector<TestRoute> routes;
     bufs.reserve(kThreads);
     routes.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i)
     {
         bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
-        routes.emplace_back(a.get(), "cAgentB");
+        routes.push_back({a.get(), b.get(), "cAgentA", "cAgentB"});
     }
 
     EXPECT_EQ(runConcurrentFlows(routes, bufs), kThreads) << "not all concurrent submitTransferRequests completed";
@@ -332,7 +344,7 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
 
     constexpr int kThreads = 8; // 4 flows A->B + 4 flows B->A, all concurrent
     std::vector<XferBufs> bufs;
-    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
+    std::vector<TestRoute> routes;
     bufs.reserve(kThreads);
     routes.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i)
@@ -340,7 +352,8 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
         bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
         // Even threads send A->B; odd threads send B->A (both arenas act as both roles).
         bool const a2b = (i % 2 == 0);
-        routes.emplace_back(a2b ? a.get() : b.get(), a2b ? "biAgentB" : "biAgentA");
+        routes.push_back({a2b ? a.get() : b.get(), a2b ? b.get() : a.get(), a2b ? "biAgentA" : "biAgentB",
+            a2b ? "biAgentB" : "biAgentA"});
     }
 
     EXPECT_EQ(runConcurrentFlows(routes, bufs), kThreads) << "not all bidirectional submitTransferRequests completed";
@@ -397,13 +410,13 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     }
 
     std::vector<XferBufs> bufs;
-    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
+    std::vector<TestRoute> routes;
     bufs.reserve(kSenders);
     routes.reserve(kSenders);
     for (int i = 0; i < kSenders; ++i)
     {
         bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(100 + i)));
-        routes.emplace_back(senders[i].get(), recvName.c_str());
+        routes.push_back({senders[i].get(), recv.get(), "mnAgentS" + std::to_string(i), recvName});
     }
 
     EXPECT_EQ(runConcurrentFlows(routes, bufs), kSenders) << "not all senders completed to the shared receiver";

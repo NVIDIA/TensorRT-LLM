@@ -2054,3 +2054,50 @@ def test_peer_registrar_accepts_hosted_draft_layers_across_tp_and_attention_dp(
         return
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+def test_bounce_receive_windows_partition_a_shared_slot_by_writer(mapper_kind):
+    from tensorrt_llm._torch.disaggregation.native.extent import Chunk, TokenRange
+    from tensorrt_llm._torch.disaggregation.native.transfer import _BounceWriterProjection
+
+    local = make_rankinfo(
+        instance_name="gen",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], mapper_kind),
+    )
+    extent = Chunk(
+        block_ids_per_layer_groups=[np.array([-1, 3], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(2, 4),
+        is_last=True,
+        excluded_pool_views={(0, 1)},
+    )
+    destination = KVRegionExtractorV1(local.page_table)
+    all_bytes = set()
+    for rank in range(4):
+        writer = make_rankinfo(
+            instance_name="ctx",
+            instance_rank=rank,
+            tp_size=4,
+            tp_rank=rank,
+            kv_heads_per_rank=2,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2, 1], mapper_kind),
+        )
+        layout = RankInfo.from_bytes(writer.bounce_writer_geometry())
+        registrar = PeerRegistrar(layout, KVRegionExtractorV1(layout.page_table))
+        registrar.register(local.instance_name, local.instance_rank, local)
+        projection = _BounceWriterProjection(registrar, local, destination, "writer-endpoint")
+        descs = projection.destinations(extent).descs
+        writer_bytes = {byte for desc in descs for byte in range(desc.addr, desc.addr + desc.len)}
+        assert len(writer_bytes) == 32
+        assert not (all_bytes & writer_bytes)
+        all_bytes.update(writer_bytes)
+    pool = local.page_table.pool_groups[0].pools[0]
+    base = pool.base_address + 3 * pool.slot_stride_bytes
+    assert all_bytes == set(range(base, base + pool.slot_bytes))

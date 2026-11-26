@@ -40,6 +40,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -56,9 +57,10 @@ inline unsigned char patSeed(std::uint32_t seed, std::size_t d, std::size_t i)
 }
 
 // One transfer's src (gather source) + dst (scatter target) device buffers + descriptor lists.
-// These KV buffers are NOT NIXL-registered — only the bounce arena traverses RDMA.
+// The destination registration is held through completion of the submitted transfer.
 struct XferBufs
 {
+    std::function<void()> releaseDestination;
     void* src{nullptr};
     void* dst{nullptr};
     std::uint32_t nDescs{};
@@ -131,6 +133,11 @@ inline bool verifyXferBufs(XferBufs const& x)
 
 inline void freeXferBufs(XferBufs& x)
 {
+    if (x.releaseDestination)
+    {
+        x.releaseDestination();
+        x.releaseDestination = {};
+    }
     if (x.src)
     {
         cudaFree(x.src);
@@ -149,11 +156,11 @@ inline void freeXferBufs(XferBufs& x)
 struct Node
 {
     std::string name;
-    std::unique_ptr<kvc::NixlTransferAgent> agent;
+    std::shared_ptr<kvc::NixlTransferAgent> agent;
     std::unique_ptr<b::BounceArena> arena;
     std::unique_ptr<b::ExecPool> exec;
     std::unique_ptr<b::ZmqControlChannel> ch;
-    std::unique_ptr<b::BounceTransport> tx;
+    std::shared_ptr<b::BounceTransport> tx;
 
     ~Node()
     {
@@ -164,6 +171,38 @@ struct Node
         }
     }
 };
+
+inline std::string testWindowKey()
+{
+    std::random_device random;
+    std::string key(16, '\0');
+    std::generate(key.begin(), key.end(), [&] { return static_cast<char>(random()); });
+    return key;
+}
+
+inline std::shared_future<b::BounceResult> submitTransfer(Node& source, Node& destination, XferBufs& buffers)
+{
+    auto key = testWindowKey();
+    kvc::MemoryDescs region{
+        kvc::MemoryType::kVRAM, {kvc::MemoryDesc{buffers.dst, static_cast<std::size_t>(buffers.total), 0}}};
+    destination.agent->registerMemory(region);
+    std::vector<b::BounceWriteWindow::Range> ranges;
+    for (auto const& desc : buffers.dstDescs.getDescs())
+    {
+        ranges.emplace_back(desc.getAddr(), desc.getLen());
+    }
+    destination.tx->receiveWindows().add(source.name, source.ch->localEndpoint(), key, std::move(ranges));
+    buffers.releaseDestination
+        = [transport = std::weak_ptr(destination.tx), id = b::bounceWindowId(key), agent = destination.agent, region]()
+    {
+        if (auto owner = transport.lock())
+        {
+            owner->receiveWindows().remove(id);
+        }
+        agent->deregisterMemory(region);
+    };
+    return source.tx->submit(buffers.srcDescs, buffers.dstDescs, destination.name, key);
+}
 
 // Build one full bounce node (agent+arena+exec+channel+transport). Returns nullptr if the NIXL
 // agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies

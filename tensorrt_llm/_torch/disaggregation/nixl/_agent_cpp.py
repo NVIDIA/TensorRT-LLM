@@ -188,6 +188,31 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         """Load a remote agent by connection info."""
         self._cpp_agent.load_remote_agent_by_connection(name, connection_info)
 
+    @staticmethod
+    def with_bounce_writer_layouts(descriptor: bytes, layouts: bytes) -> bytes:
+        desc = AgentDesc.deserialize(descriptor)
+        return desc.serialize_with_writer_layouts(layouts)
+
+    @staticmethod
+    def get_bounce_writer_layouts(descriptor: bytes) -> bytes:
+        return AgentDesc.read_writer_layouts(descriptor)
+
+    def submit_bounce_transfer(self, request: TransferRequest, key: bytes) -> TransferStatus:
+        cpp_status = self._cpp_agent.submit_bounce_transfer(request, key)
+        return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
+
+    @property
+    def bounce_endpoint(self) -> str:
+        return self._cpp_agent.bounce_endpoint
+
+    def register_bounce_window(
+        self, peer: str, endpoint: str, key: bytes, destinations: MemoryDescs
+    ) -> None:
+        self._cpp_agent.register_bounce_window(peer, endpoint, key, destinations)
+
+    def revoke_bounce_window(self, key: bytes) -> None:
+        self._cpp_agent.revoke_bounce_window(key)
+
     @property
     def bounce_enabled(self) -> bool:
         """Whether the NIXL bounce v2 fast path is active on this agent."""
