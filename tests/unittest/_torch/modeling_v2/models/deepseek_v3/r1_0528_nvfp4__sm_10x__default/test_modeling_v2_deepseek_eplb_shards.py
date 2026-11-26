@@ -34,6 +34,9 @@ from tensorrt_llm._torch.modeling_v2.models.deepseek_v3 import routing
 from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as D,
 )
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling import (  # noqa: E501
+    ModelingV2DeepseekR10528Nvfp4Sm10xDefault,
+)
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -224,3 +227,47 @@ def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch
                 for name in names:
                     want = _ws1_expert(oracle, cfg, i, name, e)
                     assert torch.equal(hosting.copies[(name, e)], want), (rank, i, e, name)
+
+
+class _Core:
+    """The shell's core, recording the trunk forward and the MTP layer's hand-back."""
+
+    def __init__(self, events: list):
+        self.events = events
+
+    def __call__(self, **kwargs) -> torch.Tensor:
+        self.events.append("trunk")
+        return torch.zeros(4, 8)
+
+    def close_draft_eplb(self) -> None:
+        self.events.append("close")
+
+
+@pytest.mark.parametrize("draft_steps", [0, 3], ids=["no_draft", "three_drafts"])
+def test_the_shell_hands_the_mtp_layer_back_once_after_the_worker(draft_steps):
+    """With a spec worker the shell's forward closes the MTP layer's EPLB once per forward,
+    after the worker returns: also when the worker drafts nothing, and never between draft
+    steps. A layer left open stalls the balancer and the next forward under online EPLB."""
+    events: list = []
+
+    def worker(**kwargs):
+        for _ in range(draft_steps):
+            events.append("draft")
+        return "outputs"
+
+    shell = SimpleNamespace(
+        spec_worker=worker,
+        model=_Core(events),
+        logits_processor=SimpleNamespace(forward=lambda *a: events.append("logits")),
+        lm_head=object(),
+        draft_model=object(),
+    )
+    out = ModelingV2DeepseekR10528Nvfp4Sm10xDefault.forward(
+        shell,
+        attn_metadata=None,
+        input_ids=torch.zeros(4, dtype=torch.int32),
+        position_ids=torch.zeros(1, 4, dtype=torch.int32),
+        spec_metadata=SimpleNamespace(gather_ids=torch.tensor([3])),
+    )
+    assert out == "outputs"
+    assert events == ["trunk", "logits", *["draft"] * draft_steps, "close"]

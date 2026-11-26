@@ -1173,7 +1173,9 @@ def moe_load_balancer_mode(model_config,
         return None
     mode = getattr(config, "mode", "standard")
     if mode == "standard":
-        return "online" if config.layer_updates_per_iter > 0 else "static"
+        # The balancer runs a static layer exactly when no layer updates
+        # (``MoeLoadBalancer.is_static_routing``); any other count is online.
+        return "static" if config.layer_updates_per_iter == 0 else "online"
     return mode
 
 

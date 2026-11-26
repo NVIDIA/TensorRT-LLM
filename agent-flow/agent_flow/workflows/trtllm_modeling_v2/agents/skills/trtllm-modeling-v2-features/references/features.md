@@ -579,7 +579,7 @@ an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
   cells, where every EP rank must route the same ids to the same slots; a
   slot-routed layer whose windows sum to the layer without EPLB; and a real
   online balancer moving experts into bound slots.
-- `tests/unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py`
+- `tests/unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_eplb_shards.py`
   (`test_eplb_*`, `test_online_eplb_*`): slots and `load` under a placement
   drawn per layer, with copies of an expert across ranks and twice on one
   rank, and the host copies online EPLB hands over, against the world-size-1
@@ -606,7 +606,7 @@ not report the registered layers, so the target's own tests carry that.
   another expert, still produces fluent text. Use a placement that differs
   from the default in every layer, with an expert held twice on one rank.
 - Attention-DP dummy requests count in the statistic like real tokens;
-  only the padding rows a target names in `route` are left out.
+  only the padding rows a target names with `eplb_call(..., rows=...)` are left out.
 - A layer that is registered but never runs, for example after the loader
   builds the model twice, changes nothing under static EPLB. Under online
   EPLB the balancer waits for it, and so does every later forward: a missed

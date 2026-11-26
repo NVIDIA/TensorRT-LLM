@@ -467,14 +467,16 @@ target does three more, and lists `"online"` in `EPLB_MODES`:
    from the balancer on its first call of a forward and records the router's
    expert ids; its plan stays None, since the slots change only between
    forwards. `rows` names the rows that are tokens when the rest are padding,
-   such as the rows an attention-DP gather pads, and `last` marks the
-   forward's last call of the layer. `EplbLayer.close()` hands the layer
-   back after its last expert kernel of the forward. The balancer takes the
-   layers in their registration order every forward and waits for each to
-   come back, so call `close` once per forward per layer, before the next
-   layer routes. A layer the forward did not run is closed as well, such as a
-   draft layer when the worker drafts nothing. A layer that runs once per
-   draft step is closed after the last draft step.
+   such as the rows an attention-DP gather pads, and `last` marks the last
+   call of a pass over the layer: the forward's last call of a layer that
+   runs once. Without `last`, `close` completes the statistic.
+   `EplbLayer.close()` hands the layer back after its last expert kernel of
+   the forward. The balancer takes the layers in their registration order
+   every forward and waits for each to come back, so call `close` once per
+   forward per layer, before the next layer routes. A layer the forward did
+   not run is closed as well, such as a draft layer when the worker drafts
+   nothing. A layer that runs once per draft step is closed after the last
+   draft step.
 
 ### Testing EPLB
 
