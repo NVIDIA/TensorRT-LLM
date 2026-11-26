@@ -830,7 +830,8 @@ __device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const&
     __syncthreads();
     if (sharedPlan)
     {
-        // Balanced issuers do not use the legacy plan channel. Its first two words publish the descriptors.
+        // The balanced route does not write the plan channel (slot modes and outgoing records) to this scratch, so
+        // its first two words publish the descriptors: CTA 0 stores the route target and the other CTAs wait for it.
         auto* descriptorEpoch = reinterpret_cast<unsigned long long*>(direct.scratch);
         if (threadIdx.x == 0)
         {
@@ -1270,8 +1271,7 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
     if (c.owner_stride != megamoe_tma_gpu_plan_stride(c.helper_count) || c.plan_words != 4 + 7 * c.owner_stride)
         return cudaErrorInvalidValue;
     int expected_targets = 0;
-    // Below level 0 groups hold 4+ ranks, or 2 for a power-of-two world up to 16 (pair ladder).
-    int const min_group = (c.world & (c.world - 1)) == 0 && c.world <= 16 ? 2 : 4;
+    int const min_group = megamoe_tma_gpu_plan_min_group(c.world);
     for (int level = 0; level < c.level_count; ++level)
     {
         int group = c.group_sizes[level];

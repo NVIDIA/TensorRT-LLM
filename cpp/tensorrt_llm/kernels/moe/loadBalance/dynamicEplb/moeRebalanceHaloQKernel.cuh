@@ -155,6 +155,22 @@ __host__ __device__ __forceinline__ int hierarchy_depth(int ep)
     return depth;
 }
 
+/* log2 of a power of two, at compile time. */
+__host__ __device__ constexpr int log2_pow2(int x)
+{
+    return x > 1 ? 1 + log2_pow2(x >> 1) : 0;
+}
+
+/* log2 of a power of two, at run time. */
+__host__ __device__ __forceinline__ int log2_pow2_runtime(int x)
+{
+#ifdef __CUDA_ARCH__
+    return __ffs(x) - 1;
+#else
+    return __builtin_ctz(static_cast<unsigned>(x));
+#endif
+}
+
 /* The planner's levels: the multicast ladder, then, for EP >= 4, aligned rank
  * pairs (pair_level_of; -1 without one). */
 __host__ __device__ __forceinline__ int pair_level_of(int ep)
@@ -166,20 +182,8 @@ __host__ __device__ __forceinline__ int planner_depth(int ep)
 {
     // A power of two from 2 up: the ladder ep .. 4 and pairs, log2(ep) levels.
     if (ep >= 2 && !(ep & (ep - 1)))
-    {
-#ifdef __CUDA_ARCH__
-        return __ffs(ep) - 1;
-#else
-        return __builtin_ctz(static_cast<unsigned>(ep));
-#endif
-    }
+        return log2_pow2_runtime(ep);
     return hierarchy_depth(ep) + (ep >= 4 ? 1 : 0);
-}
-
-/* log2 of a power of two, at compile time. */
-__host__ __device__ constexpr int log2_pow2(int x)
-{
-    return x > 1 ? 1 + log2_pow2(x >> 1) : 0;
 }
 
 /* Planner levels of any EP up to kMaxEp: group sizes 32, 16, 8, 4 and pairs. */
@@ -191,11 +195,7 @@ __host__ __device__ __forceinline__ int div_by_ep(int x, int ep)
 {
     if (ep & (ep - 1))
         return x / ep;
-#ifdef __CUDA_ARCH__
-    return x >> (__ffs(ep) - 1);
-#else
-    return x >> __builtin_ctz(static_cast<unsigned>(ep));
-#endif
+    return x >> log2_pow2_runtime(ep);
 }
 
 /* Exports per owner: its heaviest S experts, at most a warp of them, so a rank
@@ -238,6 +238,12 @@ __host__ __device__ constexpr int dense_target_count(int denseInts)
 __host__ __device__ __forceinline__ int planner_dense_ints(int ep, int experts, int helpers)
 {
     return (5 + ep) * broadcast_capacity(ep, experts, helpers);
+}
+
+/* planner_dense_ints() of a compile-time shape, whose capacity is ep * helpers broadcasts (experts >= ep * helpers). */
+__host__ __device__ constexpr int shape_dense_ints(int ep, int helpers)
+{
+    return (5 + ep) * ep * helpers;
 }
 
 /* Dense plans when every target's fits in kPlannerScratchInts, else compact
@@ -703,6 +709,23 @@ __device__ void prepare_halo_m(
 /* Candidates per owner the planner keeps in registers: S <= 4 needs no read. */
 constexpr int kHeldCandidates = 4;
 
+/* Broadcast b's receivers into a compact plan, by the whole warp, lane = rank: where the next broadcast's entries
+ * start, then (rank, tokens) per receiver in rank order.  Returns the entry count after them. */
+__device__ __forceinline__ int append_compact_receivers(
+    int* p_start, int* p_entries, int b, int entries, int owner, bool is_rank, int lane, int lane_quota)
+{
+    unsigned const receivers = __ballot_sync(0xffffffffu, is_rank && lane != owner && lane_quota > 0);
+    if (lane == 0)
+        p_start[b + 1] = entries + __popc(receivers);
+    if ((receivers >> lane) & 1u)
+    {
+        int const entry = entries + __popc(receivers & ((1u << lane) - 1u));
+        p_entries[2 * entry] = lane;
+        p_entries[2 * entry + 1] = lane_quota;
+    }
+    return entries + __popc(receivers);
+}
+
 /* HALO-Q placement toward one target by one warp, lane = rank, all state in
  * registers.  Levels: the multicast ladder (hierarchy_depth(ep)) and, for
  * EP >= 4, aligned rank pairs (planner_depth).  A pair is a multicast group:
@@ -770,7 +793,7 @@ __device__ __forceinline__ int plan_halo_q_impl(int const* histogram, int lane_l
         {
             int const size = group_size(level);
             int index;
-            if (size & (size - 1)) // Warp-uniform: only EP 6, 12, 24 have other sizes.
+            if (size & (size - 1)) // Warp-uniform: with 384 experts only EP 6, 12, 24 have other sizes.
                 index = lane / size;
             else
                 index = lane >> (__ffs(size) - 1);
@@ -1003,16 +1026,7 @@ __device__ __forceinline__ int plan_halo_q_impl(int const* histogram, int lane_l
         }
         else
         {
-            unsigned const receivers = __ballot_sync(mask, is_rank && lane != owner && lane_quota > 0);
-            if (lane == 0)
-                p_start[b + 1] = entries + __popc(receivers);
-            if ((receivers >> lane) & 1u)
-            {
-                int const entry = entries + __popc(receivers & ((1u << lane) - 1u));
-                p_entries[2 * entry] = lane;
-                p_entries[2 * entry + 1] = lane_quota;
-            }
-            entries += __popc(receivers);
+            entries = append_compact_receivers(p_start, p_entries, b, entries, owner, is_rank, lane, lane_quota);
         }
         lane_recv += is_rank && in_group ? 1 : 0;
         stale = true;
@@ -1057,8 +1071,8 @@ __device__ __forceinline__ int plan_halo_q_group_lanes(int const* histogram, int
     int const ep = kEp > 0 ? kEp : ep_arg;
     int const helpers = kS > 0 ? kS : helpers_arg;
     constexpr int kHeld = kS > 0 ? kS : kHeldCandidates;
-    // Specialized shapes always have four targets and a direct warp 0: dense iff three dense plans fit.
-    bool const dense = kS > 0 ? (kPlannerWarps - 1) * (5 + kEp) * kEp * kS <= kPlannerScratchInts : dense_arg;
+    // Specialized shapes have a direct warp 0 and four or five targets: dense iff three dense plans fit.
+    bool const dense = kS > 0 ? (kPlannerWarps - 1) * shape_dense_ints(kEp, kS) <= kPlannerScratchInts : dense_arg;
     constexpr unsigned mask = 0xffffffffu;
     constexpr unsigned kNoKey = 0xffffffffu;
     int const lane = threadIdx.x & 31;
@@ -1353,16 +1367,7 @@ __device__ __forceinline__ int plan_halo_q_group_lanes(int const* histogram, int
         }
         else
         {
-            unsigned const receivers = __ballot_sync(mask, is_rank && lane != owner && lane_quota > 0);
-            if (lane == 0)
-                p_start[b + 1] = entries + __popc(receivers);
-            if ((receivers >> lane) & 1u)
-            {
-                int const entry = entries + __popc(receivers & ((1u << lane) - 1u));
-                p_entries[2 * entry] = lane;
-                p_entries[2 * entry + 1] = lane_quota;
-            }
-            entries += __popc(receivers);
+            entries = append_compact_receivers(p_start, p_entries, b, entries, owner, is_rank, lane, lane_quota);
         }
         lane_recv += is_rank && in_group ? 1 : 0;
         bool const is_owner = lane == owner;
@@ -1414,7 +1419,7 @@ __device__ int plan_halo_q(int const* histogram, int const* load, int const* can
     int* quota, int* plan, int ep_arg, int experts, int helpers_arg, int targets)
 {
     constexpr int kShapeDepth = log2_pow2(kEp);
-    constexpr bool kDense4 = kEp > 0 && kPlannerWarps * (5 + kEp) * kEp * kS <= kPlannerScratchInts;
+    constexpr bool kDense4 = kEp > 0 && kPlannerWarps * shape_dense_ints(kEp, kS) <= kPlannerScratchInts;
     int const ep = kEp > 0 ? kEp : ep_arg;
     int const helpers = kS > 0 ? kS : helpers_arg;
     int const warp = threadIdx.x >> 5;
@@ -1462,7 +1467,7 @@ __device__ int plan_halo_q(int const* histogram, int const* load, int const* can
             ? static_cast<int>((static_cast<unsigned>(total) * margin + divisor - 1) / divisor)
             : static_cast<int>((static_cast<long long>(total) * margin + divisor - 1) / divisor);
     int const target = imax(floor_load, share);
-    int const dense_ints = kEp > 0 ? (5 + kEp) * kEp * kS : planner_dense_ints(ep, experts, helpers);
+    int const dense_ints = kEp > 0 ? shape_dense_ints(kEp, kS) : planner_dense_ints(ep, experts, helpers);
     int* out = scratch + warp * (kDense4 ? dense_ints : planner_warp_ints(ep, experts, helpers));
     bool dense = kEp > 0 ? kDense4 : planner_dense(ep, experts, helpers);
     int layout = dense ? kLayoutDense : kLayoutCompact;
@@ -1568,7 +1573,7 @@ __device__ int adopt_best_plan(int const* histogram, int const* scratch, int con
             // Dense slots of dense_ints: slot best, or best - 1 behind a direct warp 0.
             int const* out = scratch
                 + (best - (layout == kLayoutSpare ? 1 : 0))
-                    * (kEp > 0 ? (5 + kEp) * kEp * kS : planner_dense_ints(ep, experts, helpers));
+                    * (kEp > 0 ? shape_dense_ints(kEp, kS) : planner_dense_ints(ep, experts, helpers));
             int const* rows = out + 5 * plan_capacity;
             for (int index = threadIdx.x; index < broadcasts * ep; index += threads)
                 quota[index] = rows[index];
@@ -1624,15 +1629,15 @@ __device__ int place_halo_q_shape(int const* histogram, int const* load, int* qu
     int* running, int* plan, int ep_arg, int experts, int helpers_arg)
 {
     // Four dense plans, or three behind a direct warp 0 (planner_dense_spare).
-    static_assert(kEp == 0 || (kPlannerWarps - 1) * (5 + kEp) * kEp * kS <= kPlannerScratchInts, "dense plans");
-    constexpr bool kDense4 = kEp > 0 && kPlannerWarps * (5 + kEp) * kEp * kS <= kPlannerScratchInts;
+    static_assert(kEp == 0 || (kPlannerWarps - 1) * shape_dense_ints(kEp, kS) <= kPlannerScratchInts, "dense plans");
+    constexpr bool kDense4 = kEp > 0 && kPlannerWarps * shape_dense_ints(kEp, kS) <= kPlannerScratchInts;
     int const ep = kEp > 0 ? kEp : ep_arg;
     int const helpers = kS > 0 ? kS : helpers_arg;
     int* const results = running + 2;
     int* const scratch = results + 2 * kMaxPlannerWarps;
     /* Prepare ends at a block barrier, or at the owner warps' named barrier,
      * which every planner warp joins when EP >= the target count. */
-    int const targets = kEp > 0 ? dense_target_count((5 + kEp) * kEp * kS) : planner_targets(ep, experts, helpers);
+    int const targets = kEp > 0 ? dense_target_count(shape_dense_ints(kEp, kS)) : planner_targets(ep, experts, helpers);
     if (uses_register_prepare(ep, experts) && ep < targets)
         __syncthreads();
     /* Dense plans: the planner warps adopt the best one among themselves while
@@ -2007,6 +2012,7 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
                     int const partner_key = __shfl_sync(0xffffffffu, key, partner);
                     bool const ready = pending && partner_key == key;
                     unsigned const pairs = __ballot_sync(0xffffffffu, ready && left);
+                    // Terminates: warp 0, always a worker, advances *consumed after each step it runs.
                     while (step - *consumed >= kScheduleSlots)
                         __nanosleep(32);
                     int* const slot = slots + (step % kScheduleSlots) * (kMaxEp / 2 + 1);
@@ -2033,6 +2039,7 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
             {
                 for (int step = 0;; ++step)
                 {
+                    // Terminates: the scheduler publishes every step and ends with an empty one.
                     while (*published <= step)
                         __nanosleep(32);
                     __threadfence_block();
@@ -2060,8 +2067,6 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
     if (tid < ep - 1)
         ring[tid] = tid + 1;
     __syncthreads();
-    if (broadcasts < 2)
-        return;
 
     for (int round = 0; round < 2; ++round)
     {
@@ -2102,8 +2107,10 @@ constexpr int kResidentSlots = 16;
 /* Helper slots by level, coarse first, then broadcast: a slot free on the whole
  * group where every member already holds the expert (`resident`, the layer's
  * [ep][helpers] residency table; null without one), else the lowest slot free
- * on the whole group.  Every coarser group holds both ranks of a pair or
- * neither, so a pair's ranks have the same slots taken when its turn comes.
+ * on the whole group.  When the multicast groups have even sizes, every coarser
+ * group holds both ranks of a pair or neither, so a pair's ranks have the same
+ * slots taken when its turn comes; a pair that spans two groups of odd size
+ * (EP10: groups of five) takes a slot free on both ranks.
  * Every rank keeps the same residency table, so every rank picks the same
  * slots.  Warp 8 calls it; up to 32 broadcasts and helpers, lane b holds
  * broadcast b and lane r rank r's taken slots, otherwise lane 0 scans alone,
@@ -2601,12 +2608,13 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
         offset += experts;
         int* load = shared + offset;
         offset += ep;
-        // Reuse the exact capacity already validated/computed by launch().
+        // megamoe_tma_copy_submit_fused() passes capacity = broadcast_capacity(ep, experts, helpers), the value
+        // halo_q_shared_ints() sizes this memory with.
         int* quota = shared + offset;
         offset += capacity * ep;
         int* selected_flags = shared + offset;
         offset += experts;
-        int* recv_used = shared + offset;
+        int* slot_masks = shared + offset;
         offset += ep * kHelperMaskWords;
         int* ring = shared + offset;
         offset += ep;
@@ -2638,7 +2646,7 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
         /* Repair of <= 32 broadcasts excludes warp8 and can overlap coloring. Generic
          * repair first meets the coloring warp at its full-block barrier. */
         if (threadIdx.x >> 5 == 8)
-            color_and_publish_local(plan, broadcasts, ep, helpers, local_rank, recv_used, out_ids, out_levels,
+            color_and_publish_local(plan, broadcasts, ep, helpers, local_rank, slot_masks, out_ids, out_levels,
                 out_owners, status, epoch, resident);
         run_halo_q(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask, schedule);
         if (ctas > 1)

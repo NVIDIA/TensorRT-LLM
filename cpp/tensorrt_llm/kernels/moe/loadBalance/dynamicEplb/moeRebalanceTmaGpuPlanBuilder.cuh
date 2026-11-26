@@ -446,7 +446,7 @@ static MEGAMOE_GP_HD inline size_t build_descriptors(Builder* c, int* plan_error
     const volatile int32_t* plan = c->plan;
     int const slots = c->helper_count;
     int const stride = c->owner_stride;
-    // Records one owner may publish: HALO-Q's candidate count min(4 * S, H, 32).
+    // The most records one owner may publish: min(4 * S, H, 32).
     int const quota = megamoe_tma_gpu_plan_owner_records(slots, c->home_count);
     int* experts = c->slot_scratch;
     int* levels = experts + slots;
@@ -617,8 +617,7 @@ static MEGAMOE_GP_HD inline int megamoe_tma_build_gpu_plan(MegamoeTmaGpuPlanConf
         || ((g.route_features & MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST) && !g.uc_dst_table) || device_plan[0] != 0)
         return 1;
     int targets = 0;
-    // Below level 0 groups hold 4+ ranks, or 2 for a power-of-two world up to 16 (pair ladder).
-    int const min_group = (g.world & (g.world - 1)) == 0 && g.world <= 16 ? 2 : 4;
+    int const min_group = megamoe_tma_gpu_plan_min_group(g.world);
     for (int level = 0; level < g.level_count; ++level)
     {
         int group = g.group_sizes[level];
@@ -741,10 +740,10 @@ static __device__ __forceinline__ int balanced_issuer_of(BalancedCopy const& b, 
  * rank) starts at zero. balanced_loads_fit keeps every load and sum
  * below 2^32. */
 static __device__ __forceinline__ void balanced_split_warp(
-    BalancedCopy* copies, int n, uint32_t* load, uint32_t pull_cost, int passes, int lane)
+    BalancedCopy* copies, int n, uint32_t* load, uint32_t pull_cost, int lane)
 {
     unsigned const all_lanes = 0xffffffffu;
-    for (int pass = -1; pass < passes; ++pass)
+    for (int pass = -1; pass < kBalancedPasses; ++pass)
         for (int j = 0; j < n; ++j)
         {
             BalancedCopy& b = copies[j];
@@ -945,7 +944,7 @@ static __device__ inline int megamoe_tma_build_balanced_plan_warp(MegamoeTmaGpuP
     auto* load = reinterpret_cast<uint32_t*>(copies + n);
     load[lane] = 0;
     __syncwarp();
-    balanced_split_warp(copies, n, load, pull_cost, kBalancedPasses, lane);
+    balanced_split_warp(copies, n, load, pull_cost, lane);
     uint64_t segs = 0, nranges = 0, prefix = 0;
     int owned = 0, pulled = 0, error = 0;
     for (int j = 0; j < n && !error; ++j)

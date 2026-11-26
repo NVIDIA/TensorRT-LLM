@@ -66,7 +66,7 @@ __device__ __forceinline__ bool group_contains(int rank, int begin, int size)
  * at other EP they stay pair-level records after the ladder. */
 __host__ __device__ __forceinline__ int hierarchy_depth(int ep)
 {
-    int const min_group = (ep & (ep - 1)) == 0 && ep <= 16 ? 2 : kMinGroup;
+    int const min_group = megamoe_tma_gpu_plan_min_group(ep);
     int depth = 1;
     for (int level = 1; (1 << level) <= ep; ++level)
     {

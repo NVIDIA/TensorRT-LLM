@@ -27,18 +27,21 @@
 
 #define MEGAMOE_TMA_GPU_PLAN_MAX_WORLD 32
 #define MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS 4
-/* ABI7: pair-level owner-direct records and the wider channel stride. ABI8: a
+/* Version of the plan channel: pair-level records are owner-direct (slot mode
+ * 3), the channel stride holds an owner's outgoing records beside the helper
+ * rows (megamoe_tma_gpu_plan_stride), and under ROUTE_PAIR_MULTICAST a
  * pair-level record names a whole even-aligned pair, which may hold its owner. */
 #define MEGAMOE_TMA_GPU_PLAN_ABI_VERSION 8
 #define MEGAMOE_TMA_GPU_PLAN_MAX_OWNER_RECORDS 32
 
-/* Records one owner may publish per plan: HALO-Q's candidate count
- * min(4 * S, H, 32). Each becomes at most one outgoing record. */
+/* The most records one owner may publish per plan: min(4 * S, H, 32) for S
+ * helper slots and H home experts, the bound the publisher and the builder
+ * check. Each becomes at most one outgoing record. */
 static inline MEGAMOE_TMA_GPU_PLAN_HD int megamoe_tma_gpu_plan_owner_records(int helpers, int home)
 {
-    int const candidates
+    int const records
         = helpers < MEGAMOE_TMA_GPU_PLAN_MAX_OWNER_RECORDS / 4 ? 4 * helpers : MEGAMOE_TMA_GPU_PLAN_MAX_OWNER_RECORDS;
-    return candidates < home ? candidates : home;
+    return records < home ? records : home;
 }
 
 /* Plan channel stride (owner_stride): it holds the S helper rows and up to
@@ -50,6 +53,13 @@ static inline MEGAMOE_TMA_GPU_PLAN_HD int megamoe_tma_gpu_plan_stride(int helper
         = helpers < MEGAMOE_TMA_GPU_PLAN_MAX_OWNER_RECORDS / 4 ? 4 * helpers : MEGAMOE_TMA_GPU_PLAN_MAX_OWNER_RECORDS;
     int const rows = helpers > records ? helpers : records;
     return (rows + 3) & ~3;
+}
+
+/* Smallest group of a multicast level below level 0: a power-of-two world up to
+ * 16 ends its ladder in pairs, every other world in groups of four or more. */
+static inline MEGAMOE_TMA_GPU_PLAN_HD int megamoe_tma_gpu_plan_min_group(int world)
+{
+    return (world & (world - 1)) == 0 && world <= 16 ? 2 : 4;
 }
 
 /* route_features bits. EXTERNAL: an owner outside a proper multicast team writes
