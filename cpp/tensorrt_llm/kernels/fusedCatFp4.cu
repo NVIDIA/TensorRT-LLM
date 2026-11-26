@@ -154,7 +154,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp4Kernel(i
     uint8_t byte1 = static_cast<uint8_t>(c2 | (c3 << 4));
 
     // ---- Stage 6: Store packed bytes (2 bytes per lane) ----
-    int base_out = row * (HEAD_DIM / 2) + lane * 2;
+    int64_t const base_out = static_cast<int64_t>(row) * (HEAD_DIM / 2) + lane * 2;
     packed_out[base_out + 0] = static_cast<int8_t>(byte0);
     packed_out[base_out + 1] = static_cast<int8_t>(byte1);
 

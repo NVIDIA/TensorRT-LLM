@@ -1,0 +1,1177 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from collections import OrderedDict
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterator
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.checkpoints import base_checkpoint_loader, model_hooks
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import (
+    CheckpointCatalog,
+    CheckpointTensor,
+)
+from tensorrt_llm._torch.models.checkpoints.gms import model_loading as gms_loading
+from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead as read_ahead
+from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as weight_loader_module
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import (
+    HfCheckpointLoader,
+    checkpoint_io_policy_metadata,
+)
+from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
+from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading
+from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
+    WeightDemand,
+    WeightLoadOrderConfidence,
+    WeightLoadPlan,
+    WeightLoadPlanCoverage,
+)
+from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkForCausalLM
+from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    _checkpoint_startup_metadata,
+    _load_checkpoint_into_model,
+    _resolve_checkpoint_io_policy,
+    construct_checkpoint_loader,
+    load_model_from_auto_load_format,
+)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
+from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+
+def test_checkpoint_startup_metadata_describes_actual_loader() -> None:
+    checkpoint_loader = HfCheckpointLoader()
+
+    metadata = _checkpoint_startup_metadata(checkpoint_loader, LoadFormat.AUTO)
+
+    assert metadata == {
+        "checkpoint_loader_kind": "HfCheckpointLoader",
+        "checkpoint_weight_loader_kind": "HfWeightLoader",
+        "checkpoint_source_kind": "HF",
+        "load_format": "auto",
+        "checkpoint_io_policy": None,
+    }
+
+
+@pytest.mark.parametrize("outcome", ["native", "activated", "fallback", "degraded"])
+def test_model_loader_snapshots_final_policy_before_draft_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    requested = "native" if outcome == "native" else "auto"
+    checkpoint_loader = construct_checkpoint_loader(None, "HF", checkpoint_io_policy=requested)
+    weight_loader = checkpoint_loader.weight_loader
+    weights = {"model.weight": object()}
+    monkeypatch.setattr(weight_loader, "_load_weights_native", MagicMock(return_value=weights))
+    monkeypatch.setattr(weight_loader, "_active_communicator", lambda: None)
+    monkeypatch.setattr(checkpoint_loader, "get_initialized_weight_mapper", MagicMock())
+    monkeypatch.setattr(model_loader_module.torch.cuda, "is_available", lambda: False)
+    _record_weight_copies(monkeypatch, [])
+
+    startup_metadata = _checkpoint_startup_metadata(checkpoint_loader, LoadFormat.AUTO)
+    fallback_reason = "read-ahead failure" if outcome in ("fallback", "degraded") else None
+    activated = outcome in ("activated", "degraded")
+
+    def finish(_body_error: BaseException | None) -> RuntimeError | None:
+        assert startup_metadata["checkpoint_io_policy"] is None
+        return RuntimeError(fallback_reason) if fallback_reason else None
+
+    session = SimpleNamespace(finish=MagicMock(side_effect=finish))
+
+    def start_read_ahead(*_args: Any, **_kwargs: Any) -> tuple[dict[str, object], Any]:
+        status = weight_loader._last_checkpoint_io_status
+        if outcome == "fallback":
+            status.selected = "native"
+            status.effective = "native"
+            status.fallback_reason = fallback_reason
+            return weights, None
+        status.activated = True
+        return weights, session
+
+    monkeypatch.setattr(weight_loader, "_start_rank_striped_read_ahead", start_read_ahead)
+    expected = {
+        "requested": requested,
+        "selected": "rank_striped_read_ahead" if activated else "native",
+        "activated": activated,
+        "effective": "rank_striped_read_ahead" if outcome == "activated" else "native",
+        "fallback_reason": fallback_reason,
+    }
+
+    def get_draft_weight_mapper(*_args: Any) -> MagicMock:
+        # Called between the target and the draft read: the target policy is
+        # already recorded, and the draft read is made native.
+        assert startup_metadata["checkpoint_io_policy"] == expected
+        weight_loader._configure_checkpoint_io_policy("native")
+        return MagicMock()
+
+    monkeypatch.setattr(
+        checkpoint_loader, "get_initialized_draft_weight_mapper", get_draft_weight_mapper
+    )
+
+    load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/checkpoint",
+        model_config=object(),
+        model=SimpleNamespace(load_weights=object(), load_draft_weights=object()),
+        mapping=Mapping(),
+        llm_args=None,
+        spec_config=SimpleNamespace(needs_separate_draft_weights=True, speculative_model="/draft"),
+        source_identity=None,
+        qualification=None,
+        metrics={},
+        startup_metadata=startup_metadata,
+    )
+
+    assert session.finish.call_count == int(activated)
+    assert startup_metadata["checkpoint_io_policy"] == expected
+    assert startup_metadata["draft_checkpoint_io_policy"] == {
+        "requested": "native",
+        "selected": "native",
+        "activated": False,
+        "effective": "native",
+        "fallback_reason": None,
+    }
+
+
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "MX"])
+@pytest.mark.parametrize("requested", ["native", "auto", "rank_striped_read_ahead"])
+def test_hf_subclass_disk_loads_report_final_native_policy(
+    monkeypatch: pytest.MonkeyPatch, checkpoint_format: str, requested: str
+) -> None:
+    checkpoint_loader = construct_checkpoint_loader(
+        None, checkpoint_format, checkpoint_io_policy=requested
+    )
+    weight_loader = checkpoint_loader.weight_loader
+    native_load = MagicMock(return_value={})
+    assert checkpoint_io_policy_metadata(checkpoint_loader, weights_preloaded=False) is None
+    monkeypatch.setattr(weight_loader, "_load_weights_native", native_load)
+    _record_weight_copies(monkeypatch, [])
+    fallback_reason = weight_loader.last_checkpoint_io_status.fallback_reason
+
+    checkpoint_io_policy = _load_checkpoint_into_model(
+        checkpoint_loader,
+        "/checkpoint",
+        model=SimpleNamespace(load_weights=object()),
+        is_draft_model=False,
+        mapping=Mapping(),
+        weight_mapper=None,
+        extra_load_weights_kwargs=None,
+        metrics={},
+    )
+
+    native_load.assert_called_once()
+    assert checkpoint_io_policy == {
+        "requested": requested,
+        "selected": "native",
+        "activated": False,
+        "effective": "native",
+        "fallback_reason": fallback_reason,
+    }
+    if requested == "native":
+        assert fallback_reason is None
+    else:
+        assert "checkpoint_format='HF'" in fallback_reason
+
+
+@pytest.mark.parametrize("loader_kind", ["unfinalized", "custom", "mx", "preloaded"])
+def test_unobserved_checkpoint_policy_is_not_reported_as_native(loader_kind: str) -> None:
+    if loader_kind == "custom":
+        checkpoint_loader = HfCheckpointLoader(weight_loader=MagicMock())
+    elif loader_kind == "mx":
+        checkpoint_loader = MXCheckpointLoader()
+    else:
+        checkpoint_loader = HfCheckpointLoader()
+    weights_preloaded = loader_kind in ("mx", "preloaded")
+    if weights_preloaded:
+        checkpoint_loader.weight_loader._last_checkpoint_io_status.effective = "native"
+
+    assert (
+        checkpoint_io_policy_metadata(checkpoint_loader, weights_preloaded=weights_preloaded)
+        is None
+    )
+
+
+@pytest.mark.parametrize("loader_cls", [MistralCheckpointLoader, MXCheckpointLoader])
+def test_hf_subclasses_keep_polymorphic_load_weights(
+    monkeypatch: pytest.MonkeyPatch,
+    loader_cls: type[MistralCheckpointLoader] | type[MXCheckpointLoader],
+) -> None:
+    checkpoint_loader = loader_cls.__new__(loader_cls)
+    checkpoint_loader._weight_loader = HfWeightLoader(
+        checkpoint_io_policy="rank_striped_read_ahead"
+    )
+    weights = {"subclass.weight": object()}
+    checkpoint_loader.load_weights = MagicMock(return_value=weights)
+    if loader_cls is MXCheckpointLoader:
+        # `__new__` skips MXCheckpointLoader.__init__, which clears this flag.
+        checkpoint_loader._p2p_succeeded = False
+    reader_session = MagicMock(side_effect=AssertionError("subclasses must not read ahead"))
+    monkeypatch.setattr(checkpoint_loader.weight_loader, "open_weight_session", reader_session)
+    call_load_weights = _record_weight_copies(monkeypatch, [])
+    model = SimpleNamespace(load_weights=object())
+    mapping = object()
+    metrics = {}
+
+    _load_checkpoint_into_model(
+        checkpoint_loader,
+        "/checkpoint",
+        model=model,
+        is_draft_model=False,
+        mapping=mapping,
+        weight_mapper=None,
+        extra_load_weights_kwargs=None,
+        metrics=metrics,
+    )
+
+    checkpoint_loader.load_weights.assert_called_once_with(
+        "/checkpoint", mapping=mapping, model=model
+    )
+    assert call_load_weights.call_args.args[1] is weights
+    reader_session.assert_not_called()
+    # The read is timed as preparation, with nothing to finalize.
+    assert metrics["checkpoint_finalization_seconds"] == 0.0
+
+
+@pytest.mark.parametrize("policy", ["native", "rank_striped_read_ahead"])
+@pytest.mark.parametrize("via_model_loader", [False, True])
+def test_context_only_loading_keeps_unused_checkpoint_tensors_lazy(
+    monkeypatch: pytest.MonkeyPatch, policy: str, via_model_loader: bool
+) -> None:
+    loader = HfCheckpointLoader(weight_loader=HfWeightLoader(checkpoint_io_policy=policy))
+    lazy_weights = {"layers.0.weight": object(), "layers.39.weight": object()}
+    lazy_load = MagicMock(return_value=lazy_weights)
+    eager_load = MagicMock(side_effect=AssertionError("must not read unused decoder tensors"))
+    reader_session = MagicMock(side_effect=AssertionError("must not prefetch decoder tensors"))
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", eager_load)
+    monkeypatch.setattr(loader.weight_loader, "open_weight_session", reader_session)
+    model = SimpleNamespace(model=SimpleNamespace(disagg_context_only=True), load_weights=object())
+    options = dict(mapping=Mapping(), model=model, use_consolidated=True)
+
+    if via_model_loader:
+        # A context-only worker reads natively even when read-ahead is selected.
+        call_load_weights = _record_weight_copies(monkeypatch, [])
+        _load_checkpoint_into_model(
+            loader,
+            "/checkpoint",
+            model=model,
+            is_draft_model=False,
+            mapping=options["mapping"],
+            weight_mapper=None,
+            extra_load_weights_kwargs={"use_consolidated": True},
+            metrics={},
+        )
+        assert call_load_weights.call_args.args[1] is lazy_weights
+    else:
+        assert loader.load_weights("/checkpoint", **options) is lazy_weights
+
+    lazy_load.assert_called_once_with("/checkpoint", True)
+    eager_load.assert_not_called()
+    reader_session.assert_not_called()
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == policy
+    assert status.selected == status.effective == "native"
+    assert not status.activated
+    if policy != "native":
+        assert "context-only" in status.fallback_reason
+
+
+@pytest.mark.parametrize("context_only", [False, None])
+def test_full_model_loading_retains_existing_checkpoint_reader(
+    monkeypatch: pytest.MonkeyPatch, context_only: bool | None
+) -> None:
+    loader = HfCheckpointLoader()
+    expected = {"decoder.weight": object()}
+    eager_load = MagicMock(return_value=expected)
+    lazy_load = MagicMock(side_effect=AssertionError("must keep normal checkpoint loading"))
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", eager_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    body = SimpleNamespace()
+    if context_only is not None:
+        body.disagg_context_only = context_only
+    model = SimpleNamespace(model=body, load_weights=object())
+    mapping = Mapping()
+    call_load_weights = _record_weight_copies(monkeypatch, [])
+    metrics = {}
+
+    _load_checkpoint_into_model(
+        loader,
+        "/checkpoint",
+        model=model,
+        is_draft_model=False,
+        mapping=mapping,
+        weight_mapper=None,
+        extra_load_weights_kwargs=None,
+        metrics=metrics,
+    )
+
+    assert call_load_weights.call_args.args[1] is expected
+    eager_load.assert_called_once_with("/checkpoint", mapping, False, model=model)
+    lazy_load.assert_not_called()
+    # A native read is timed as preparation, with nothing to finalize.
+    assert metrics["checkpoint_preparation_seconds"] > 0
+    assert metrics["checkpoint_finalization_seconds"] == 0.0
+
+
+@pytest.mark.parametrize("custom_wrapper", [False, True])
+def test_context_only_flag_preserves_custom_checkpoint_loader(
+    monkeypatch: pytest.MonkeyPatch, custom_wrapper: bool
+) -> None:
+    class _CustomCheckpointLoader(HfCheckpointLoader):
+        pass
+
+    class _CustomWeightLoader(HfWeightLoader):
+        pass
+
+    loader = (
+        _CustomCheckpointLoader()
+        if custom_wrapper
+        else HfCheckpointLoader(weight_loader=_CustomWeightLoader())
+    )
+    expected = {"custom.weight": object()}
+    custom_load = MagicMock(return_value=expected)
+    lazy_load = MagicMock(side_effect=AssertionError("must not replace a custom loader"))
+    monkeypatch.setattr(loader.weight_loader, "load_weights", custom_load)
+    monkeypatch.setattr(loader.weight_loader, "_load_lazy_safetensors", lazy_load)
+    model = SimpleNamespace(model=SimpleNamespace(disagg_context_only=True), load_weights=object())
+    mapping = Mapping()
+    call_load_weights = _record_weight_copies(monkeypatch, [])
+
+    _load_checkpoint_into_model(
+        loader,
+        "/checkpoint",
+        model=model,
+        is_draft_model=False,
+        mapping=mapping,
+        weight_mapper=None,
+        extra_load_weights_kwargs=None,
+        metrics={},
+    )
+
+    assert call_load_weights.call_args.args[1] is expected
+    custom_load.assert_called_once_with("/checkpoint", mapping=mapping, model=model)
+    lazy_load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "requested", [CheckpointIOPolicy.AUTO, CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD]
+)
+def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
+    requested: CheckpointIOPolicy,
+) -> None:
+    loader = construct_checkpoint_loader(
+        None,
+        "HF",
+        checkpoint_io_policy=requested,
+    )
+
+    assert isinstance(loader.weight_loader, HfWeightLoader)
+    assert loader.weight_loader.checkpoint_io_policy == "rank_striped_read_ahead"
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == requested
+    assert status.selected == "rank_striped_read_ahead"
+
+
+@pytest.mark.parametrize("requested", list(CheckpointIOPolicy))
+def test_resolve_checkpoint_io_policy_returns_enum(requested: CheckpointIOPolicy) -> None:
+    selected, reason = _resolve_checkpoint_io_policy(None, "HF", LoadFormat.AUTO, requested, False)
+    expected = (
+        CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD
+        if requested is CheckpointIOPolicy.AUTO
+        else requested
+    )
+    assert selected is expected
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    "policy", [CheckpointIOPolicy.NATIVE, CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD]
+)
+def test_hf_reader_normalizes_policy_strings(policy: CheckpointIOPolicy) -> None:
+    loader = HfWeightLoader(
+        checkpoint_io_policy=policy.value, requested_checkpoint_io_policy="auto"
+    )
+    assert loader.checkpoint_io_policy is policy
+    assert loader.last_checkpoint_io_status.requested is CheckpointIOPolicy.AUTO
+    assert loader.last_checkpoint_io_status.selected is policy
+
+
+def test_hf_reader_policy_error_shows_plain_values() -> None:
+    with pytest.raises(
+        ValueError, match=r"one of \('native', 'rank_striped_read_ahead'\), got 'auto'$"
+    ):
+        HfWeightLoader(checkpoint_io_policy=CheckpointIOPolicy.AUTO)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        # An enum format shows its plain value 'MX' in the reason, not the enum repr.
+        ({"checkpoint_format": CheckpointFormat.MX}, "checkpoint_format='HF' (received 'MX')"),
+        ({"load_format": LoadFormat.DUMMY}, "load_format='auto' (received 'DUMMY')"),
+        ({"partial_model_loading": True}, "partial model loading"),
+    ],
+)
+def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, Any],
+    reason: str,
+) -> None:
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    options = dict(kwargs)
+    checkpoint_format = options.pop("checkpoint_format", "HF")
+
+    loader = construct_checkpoint_loader(
+        None,
+        checkpoint_format,
+        checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
+        **options,
+    )
+
+    assert loader.weight_loader.checkpoint_io_policy == "native"
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert reason in status.fallback_reason
+    warning.assert_called_once()
+    assert "selected=native" in warning.call_args.args[0]
+
+
+def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provided_loader = HfCheckpointLoader(
+        weight_loader=HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+
+    loader = construct_checkpoint_loader(
+        provided_loader,
+        "HF",
+        checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
+    )
+
+    assert loader is provided_loader
+    assert provided_loader.weight_loader.checkpoint_io_policy == "native"
+    status = provided_loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "rank_striped_read_ahead"
+    assert status.selected == "native"
+    assert "explicit checkpoint loader" in status.fallback_reason
+    warning.assert_called_once()
+    assert "explicit checkpoint loader" in warning.call_args.args[0]
+
+    native_weights = {"native": object()}
+    native_load = MagicMock(return_value=native_weights)
+    active_communicator = MagicMock(side_effect=AssertionError("rank-striped setup must not run"))
+    monkeypatch.setattr(provided_loader.weight_loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(provided_loader.weight_loader, "_active_communicator", active_communicator)
+    call_load_weights = _record_weight_copies(monkeypatch, [])
+    _load_checkpoint_into_model(
+        loader,
+        "/checkpoint",
+        model=SimpleNamespace(load_weights=object()),
+        is_draft_model=False,
+        mapping=Mapping(),
+        weight_mapper=None,
+        extra_load_weights_kwargs=None,
+        metrics={},
+    )
+    assert call_load_weights.call_args.args[1] is native_weights
+    active_communicator.assert_not_called()
+
+
+def test_auto_selects_native_for_incompatible_config_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning = MagicMock()
+    info = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    monkeypatch.setattr(model_loader_module.logger, "info", info)
+
+    loader = construct_checkpoint_loader(
+        None,
+        "MX",
+        checkpoint_io_policy=CheckpointIOPolicy.AUTO,
+    )
+
+    status = loader.weight_loader.last_checkpoint_io_status
+    assert status.requested == "auto"
+    assert status.selected == "native"
+    warning.assert_not_called()
+    assert any("selected=native" in call.args[0] for call in info.call_args_list)
+
+
+def test_static_native_selection_skips_rank_striped_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = construct_checkpoint_loader(
+        None,
+        "HF",
+        checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
+        partial_model_loading=True,
+    )
+    native_weights = {"native": object()}
+    native_load = MagicMock(return_value=native_weights)
+    active_communicator = MagicMock(side_effect=AssertionError("rank-striped setup must not run"))
+    monkeypatch.setattr(loader.weight_loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(loader.weight_loader, "_active_communicator", active_communicator)
+
+    weights = loader.weight_loader.load_weights("/checkpoint", mapping=Mapping())
+
+    assert weights is native_weights
+    native_load.assert_called_once()
+    active_communicator.assert_not_called()
+
+
+def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CustomWeightLoader:
+        def __init__(self) -> None:
+            self.load_weights = MagicMock(return_value={"custom.weight": object()})
+
+    monkeypatch.setattr(
+        modeling_utils, "get_checkpoint_weight_loader", lambda _format: _CustomWeightLoader
+    )
+
+    loader = construct_checkpoint_loader(None, "HF")
+    assert isinstance(loader.weight_loader, _CustomWeightLoader)
+    mapping = Mapping()
+    assert list(loader.load_weights("/checkpoint", mapping=mapping)) == ["custom.weight"]
+    loader.weight_loader.load_weights.assert_called_once_with("/checkpoint", mapping=mapping)
+
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    fallback_loader = construct_checkpoint_loader(
+        None,
+        "HF",
+        checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
+    )
+    assert isinstance(fallback_loader.weight_loader, _CustomWeightLoader)
+    warning.assert_called_once()
+    assert "selected=native" in warning.call_args.args[0]
+
+
+def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CustomCheckpointLoader(HfCheckpointLoader):
+        pass
+
+    monkeypatch.setitem(
+        modeling_utils.CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
+        "HF",
+        _CustomCheckpointLoader,
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+
+    loader = construct_checkpoint_loader(
+        None,
+        "HF",
+        checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
+    )
+
+    assert isinstance(loader, _CustomCheckpointLoader)
+    assert loader.weight_loader.checkpoint_io_policy == "native"
+    warning.assert_called_once()
+    assert "checkpoint loader is not the built-in" in warning.call_args.args[0]
+
+
+class _RecordingCheckpointLoader(HfCheckpointLoader):
+    """HF checkpoint loader that records its reads instead of reading files."""
+
+    def __init__(
+        self,
+        events: list[str],
+        weights: dict[str, object] | None = None,
+        *,
+        target_weight_mapper: object | None = None,
+    ) -> None:
+        super().__init__()
+        self.events = events
+        self.weights = {"model.weight": object()} if weights is None else weights
+        self.target_weight_mapper = (
+            object() if target_weight_mapper is None else target_weight_mapper
+        )
+        # keyword arguments of each read, by checkpoint directory
+        self.read_kwargs: dict[str, dict[str, Any]] = {}
+
+    def load_weights(self, checkpoint_dir: str, mapping: Any, **kwargs: Any) -> dict[str, object]:
+        self.read_kwargs[checkpoint_dir] = dict(kwargs, mapping=mapping)
+        self.events.append(f"read:{checkpoint_dir}")
+        return self.weights
+
+    def get_initialized_weight_mapper(self, model: object, config: object) -> object:
+        del model, config
+        self.events.append("mapper_init")
+        return self.target_weight_mapper
+
+
+def _record_weight_copies(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> MagicMock:
+    """Replace the copy of read weights into the model with a "materialize" event."""
+    call_load_weights = MagicMock(side_effect=lambda *_args: events.append("materialize"))
+    monkeypatch.setattr(model_hooks, "call_load_weights", call_load_weights)
+    return call_load_weights
+
+
+def test_sessionless_loader_times_its_read_as_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loaders without an HF weight session read once, with nothing to finalize."""
+    events = []
+    metrics = {}
+    weights = {"model.weight": object()}
+    checkpoint_loader = SimpleNamespace(
+        load_weights=MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append("read") or weights
+        )
+    )
+
+    @contextmanager
+    def record_timing(metric_name: str, metric_values: dict[str, float]) -> Iterator[None]:
+        events.append(f"{metric_name}_start")
+        try:
+            yield
+        finally:
+            metric_values[metric_name] = 1.0
+            events.append(f"{metric_name}_end")
+
+    monkeypatch.setattr(model_loader_module, "timing_metric", record_timing)
+    _record_weight_copies(monkeypatch, events)
+    model = SimpleNamespace(load_weights=object())
+    mapping = object()
+
+    _load_checkpoint_into_model(
+        checkpoint_loader,
+        "/checkpoint",
+        model=model,
+        is_draft_model=False,
+        mapping=mapping,
+        weight_mapper=object(),
+        extra_load_weights_kwargs={"source_identity": None},
+        metrics=metrics,
+    )
+
+    checkpoint_loader.load_weights.assert_called_once_with(
+        "/checkpoint", mapping=mapping, model=model, source_identity=None
+    )
+    assert events == [
+        "checkpoint_preparation_seconds_start",
+        "read",
+        "checkpoint_preparation_seconds_end",
+        "weight_population_seconds_start",
+        "materialize",
+        "weight_population_seconds_end",
+    ]
+    assert metrics == {
+        "checkpoint_preparation_seconds": 1.0,
+        "weight_population_seconds": 1.0,
+        "checkpoint_finalization_seconds": 0.0,
+    }
+
+
+def test_target_mapper_is_initialized_before_checkpoint_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    checkpoint_loader = _RecordingCheckpointLoader(events)
+    _record_weight_copies(monkeypatch, events)
+    model = SimpleNamespace(load_weights=object())
+    mapping, source_identity = object(), object()
+    metrics = {}
+
+    weight_mapper, loaded_weights_preloaded = load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/checkpoint",
+        model_config=object(),
+        model=model,
+        mapping=mapping,
+        llm_args=None,
+        spec_config=None,
+        source_identity=source_identity,
+        qualification=None,
+        metrics=metrics,
+        startup_metadata={},
+    )
+
+    assert weight_mapper is checkpoint_loader.target_weight_mapper
+    # Only an MX P2P load writes the weights into the model itself.
+    assert loaded_weights_preloaded is False
+    assert events == ["mapper_init", "read:/checkpoint", "materialize"]
+    # The target read gets the model, so a context-only worker reads lazily.
+    assert checkpoint_loader.read_kwargs == {
+        "/checkpoint": {
+            "mapping": mapping,
+            "model": model,
+            "source_identity": source_identity,
+        }
+    }
+    # The read is timed as preparation, with nothing to finalize.
+    assert "checkpoint_preparation_seconds" in metrics
+    assert metrics["checkpoint_finalization_seconds"] == 0.0
+    assert "weight_population_seconds" in metrics
+
+
+def test_read_ahead_copies_inside_weight_session_and_reports_its_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+    )
+    weight_loader = checkpoint_loader.weight_loader
+    weights = {"model.weight": object()}
+    session_kwargs = {}
+
+    @contextmanager
+    def open_weight_session(checkpoint_dir: str, **kwargs: Any) -> Iterator[dict[str, object]]:
+        session_kwargs[checkpoint_dir] = kwargs
+        events.append("session_enter")
+        weight_loader.record_session_timings(preparation_seconds=2.0)
+        try:
+            yield weights
+        finally:
+            weight_loader.record_session_timings(preparation_seconds=2.0, finalization_seconds=3.0)
+            events.append("session_exit")
+
+    monkeypatch.setattr(weight_loader, "open_weight_session", open_weight_session)
+    checkpoint_loader.load_weights = MagicMock(
+        side_effect=AssertionError("read-ahead must read in the weight session")
+    )
+    call_load_weights = _record_weight_copies(monkeypatch, events)
+    model = SimpleNamespace(load_weights=object())
+    mapping = object()
+    metrics = {}
+
+    _load_checkpoint_into_model(
+        checkpoint_loader,
+        "/checkpoint",
+        model=model,
+        is_draft_model=False,
+        mapping=mapping,
+        weight_mapper=None,
+        extra_load_weights_kwargs={"source_identity": None},
+        metrics=metrics,
+    )
+
+    # The weights are copied before the session finishes read-ahead.
+    assert events == ["session_enter", "materialize", "session_exit"]
+    assert call_load_weights.call_args.args[1] is weights
+    assert session_kwargs == {
+        "/checkpoint": {"mapping": mapping, "model": model, "source_identity": None}
+    }
+    # The model loader reports the timings the session recorded.
+    assert metrics["checkpoint_preparation_seconds"] == 2.0
+    assert metrics["checkpoint_finalization_seconds"] == 3.0
+
+
+def test_shadow_plan_disabled_does_not_call_inspection_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", raising=False)
+    checkpoint_loader = SimpleNamespace(build_checkpoint_catalog=MagicMock())
+    weight_mapper = SimpleNamespace(build_weight_load_plan=MagicMock())
+
+    result = model_loader_module._inspect_shadow_weight_load_plan(
+        checkpoint_loader, "/checkpoint", weight_mapper, mapping=object()
+    )
+
+    assert result is None
+    checkpoint_loader.build_checkpoint_catalog.assert_not_called()
+    weight_mapper.build_weight_load_plan.assert_not_called()
+
+
+def test_shadow_plan_is_advisory_and_preserves_materialization_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("model.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("model.weight",), (0,)),),
+    )
+    events = []
+    checkpoint_loader = _RecordingCheckpointLoader(events)
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
+    )
+    weight_mapper = SimpleNamespace(
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
+    )
+    call_load_weights = _record_weight_copies(monkeypatch, events)
+
+    _load_checkpoint_into_model(
+        checkpoint_loader,
+        "/checkpoint",
+        model=SimpleNamespace(load_weights=object()),
+        is_draft_model=False,
+        mapping=object(),
+        weight_mapper=weight_mapper,
+        extra_load_weights_kwargs=None,
+        metrics={},
+    )
+
+    # The plan is inspected after the copy.
+    assert events == [
+        "read:/checkpoint",
+        "materialize",
+        "catalog",
+        "plan",
+    ]
+    call_load_weights.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_site", ["catalog", "plan"])
+def test_shadow_plan_failure_warns_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "true")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("model.weight"),))
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    checkpoint_loader = SimpleNamespace(
+        build_checkpoint_catalog=(
+            MagicMock(side_effect=ValueError("catalog failure"))
+            if failure_site == "catalog"
+            else MagicMock(return_value=catalog)
+        )
+    )
+    weight_mapper = SimpleNamespace(
+        build_weight_load_plan=(
+            MagicMock(side_effect=ValueError("plan failure"))
+            if failure_site == "plan"
+            else MagicMock(side_effect=AssertionError("plan must not be called"))
+        )
+    )
+
+    result = model_loader_module._inspect_shadow_weight_load_plan(
+        checkpoint_loader, "/checkpoint", weight_mapper
+    )
+
+    assert result is None
+    warning.assert_called_once()
+    assert "continuing with the unchanged loader" in warning.call_args.args[0]
+    if failure_site == "catalog":
+        weight_mapper.build_weight_load_plan.assert_not_called()
+
+
+def test_draft_checkpoint_loads_after_target_with_its_own_mapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
+    events = []
+    checkpoint_loader = _RecordingCheckpointLoader(events)
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("draft.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("draft.weight",), (0,)),),
+    )
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda checkpoint_dir, **_kwargs: (
+            events.append(f"catalog:{checkpoint_dir}") or catalog
+        )
+    )
+    _record_weight_copies(monkeypatch, events)
+    draft_mapper = MagicMock()
+    draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append(
+        "draft_mapper_init"
+    )
+    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: events.append("plan") or plan
+    get_mapper = MagicMock(return_value=draft_mapper)
+    monkeypatch.setattr(base_checkpoint_loader.AutoCheckpointMapper, "get", get_mapper)
+    model = SimpleNamespace(
+        load_weights=object(),
+        load_draft_weights=object(),
+        draft_model=object(),
+        draft_config=SimpleNamespace(
+            pretrained_config=SimpleNamespace(architectures=["DraftForCausalLM"])
+        ),
+    )
+    mapping = object()
+    metrics = {}
+
+    load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/checkpoint",
+        model_config=object(),
+        model=model,
+        mapping=mapping,
+        llm_args=None,
+        spec_config=SimpleNamespace(needs_separate_draft_weights=True, speculative_model="/draft"),
+        source_identity=None,
+        qualification=None,
+        metrics=metrics,
+        startup_metadata={},
+    )
+
+    # The target mapper has no plan builder, so only the draft read is inspected.
+    assert events == [
+        "mapper_init",
+        "read:/checkpoint",
+        "materialize",
+        "draft_mapper_init",
+        "read:/draft",
+        "materialize",
+        "catalog:/draft",
+        "plan",
+    ]
+    get_mapper.assert_called_once_with("HF", "DraftForCausalLM")
+    draft_mapper.init_model_and_config.assert_called_once_with(
+        model.draft_model, model.draft_config
+    )
+    # The draft read does not get the model.
+    assert checkpoint_loader.read_kwargs["/draft"] == {"mapping": mapping}
+    assert "draft_checkpoint_preparation_seconds" in metrics
+    assert "draft_weight_population_seconds" in metrics
+    assert metrics["draft_checkpoint_finalization_seconds"] == 0.0
+
+
+@pytest.mark.parametrize("target_preloaded", [False, True])
+def test_mtp_draft_reuses_target_mapper(
+    monkeypatch: pytest.MonkeyPatch, target_preloaded: bool
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
+    events = []
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("draft.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("draft.weight",), (0,)),),
+    )
+    # The draft read reuses the target mapper, so that mapper also builds the
+    # draft's shadow plan.
+    target_mapper = SimpleNamespace(
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
+    )
+    # An MX P2P target read writes the weights into the model and returns none
+    # to copy. The draft read is still copied, even when it reads nothing, so
+    # the model's draft load can reject an empty draft checkpoint.
+    checkpoint_loader = _RecordingCheckpointLoader(
+        events, weights={} if target_preloaded else None, target_weight_mapper=target_mapper
+    )
+    # Only an MX loader reports preloaded weights; stand in for one.
+    monkeypatch.setattr(
+        mx_loading, "is_mx_weights_preloaded", lambda _checkpoint_loader: target_preloaded
+    )
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda checkpoint_dir, **_kwargs: (
+            events.append(f"catalog:{checkpoint_dir}") or catalog
+        )
+    )
+    call_load_weights = _record_weight_copies(monkeypatch, events)
+    model = SimpleNamespace(load_weights=object(), load_draft_weights=object(), draft_config=None)
+
+    weight_mapper, _ = load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/checkpoint",
+        model_config=object(),
+        model=model,
+        mapping=object(),
+        llm_args=None,
+        spec_config=SimpleNamespace(needs_separate_draft_weights=True, speculative_model="/draft"),
+        source_identity=None,
+        qualification=None,
+        metrics={},
+        startup_metadata={},
+    )
+
+    assert weight_mapper is target_mapper
+    draft_copy = call_load_weights.call_args
+    assert draft_copy.args[0] is model.load_draft_weights
+    assert draft_copy.args[2] is target_mapper
+    expected_events = ["mapper_init", "read:/checkpoint"]
+    if not target_preloaded:
+        expected_events.append("materialize")
+    expected_events += [
+        "catalog:/checkpoint",
+        "plan",
+        "read:/draft",
+        "materialize",
+        "catalog:/draft",
+        "plan",
+    ]
+    assert events == expected_events
+
+
+@pytest.mark.parametrize("headers", ["readable", "one_unreadable", "no_draft_keys"])
+@pytest.mark.parametrize(
+    "load_format, policy",
+    [("auto", "native"), ("auto", "rank_striped_read_ahead"), ("gms", "native")],
+)
+def test_draft_load_reads_only_the_shards_holding_draft_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_format: str, policy: str, headers: str
+) -> None:
+    # One CPU rank without MPI, as in the rank-striped read-ahead tests.
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", raising=False)
+    monkeypatch.delenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", raising=False)
+    monkeypatch.setattr(weight_loader_module, "_WEIGHT_CACHE", OrderedDict())
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", False)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_size", lambda: 1)
+    monkeypatch.setattr(weight_loader_module, "local_mpi_barrier", lambda: None)
+    monkeypatch.setattr(weight_loader_module, "effective_available_host_memory", lambda: 1 << 40)
+    monkeypatch.setattr(read_ahead, "effective_available_host_memory", lambda: 1 << 40)
+    read_files = []
+    load_file = HfWeightLoader._load_safetensors_file
+    monkeypatch.setattr(
+        HfWeightLoader,
+        "_load_safetensors_file",
+        staticmethod(lambda path: read_files.append(Path(path).name) or load_file(path)),
+    )
+    shards = {
+        "model-00001-of-00005.safetensors": {
+            "embed.weight": torch.randn(16, 8),
+            "layers.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.1.confidence_head.proj.weight": torch.randn(1, 8),
+        },
+        "model-00002-of-00005.safetensors": {
+            "layers.1.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
+        },
+        "model-00003-of-00005.safetensors": {
+            "layers.2.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.0.attn.wq.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "mtp.0.ffn.experts.0.w1.weight": torch.randint(0, 256, (8, 4), dtype=torch.uint8),
+        },
+        "model-00004-of-00005.safetensors": {
+            "mtp.1.norm.weight": torch.randn(8),
+            "mtp.1.ffn.experts.0.w1.scale": torch.randint(0, 256, (8, 1), dtype=torch.uint8),
+        },
+        "model-00005-of-00005.safetensors": {
+            "mtp.2.norm.weight": torch.randn(8),
+        },
+    }
+    if headers == "no_draft_keys":
+        shards = {
+            file_name: {key.replace("mtp.", "nextn."): value for key, value in tensors.items()}
+            for file_name, tensors in shards.items()
+        }
+    elif headers == "one_unreadable":
+        read_header = weight_loader_module._read_safetensors_header
+
+        def read_header_or_fail(path: str):
+            if Path(path).name == "model-00003-of-00005.safetensors":
+                raise ValueError("failed to read SafeTensors header")
+            return read_header(path)
+
+        monkeypatch.setattr(weight_loader_module, "_read_safetensors_header", read_header_or_fail)
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+    for file_name, tensors in shards.items():
+        save_file(tensors, str(checkpoint_dir / file_name))
+    # The index omits the first shard's draft key; selection reads the shards' own headers.
+    weight_map = {
+        key: file_name
+        for file_name, tensors in shards.items()
+        for key in tensors
+        if not key.startswith("mtp.1.confidence_head.")
+    }
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    dspark = object.__new__(DSv4DSparkForCausalLM)
+    torch.nn.Module.__init__(dspark)
+    dspark.num_stages = 2
+    holders = [
+        "model-00001-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+    ]
+
+    def load_draft(draft_model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor], str]:
+        received = {}
+        read_files.clear()
+        model = SimpleNamespace(
+            draft_config=None,
+            draft_model=draft_model,
+            # An auto load reads the target first; count only the draft's reads.
+            load_weights=lambda weights, weight_mapper=None: read_files.clear(),
+            load_draft_weights=lambda weights, weight_mapper=None: received.update(weights.items()),
+        )
+        weight_loader = HfWeightLoader(checkpoint_io_policy=policy)
+        checkpoint_loader = HfCheckpointLoader(weight_loader=weight_loader)
+        if load_format == "auto":
+            monkeypatch.setattr(checkpoint_loader, "get_initialized_weight_mapper", lambda *_: None)
+            load_model_from_auto_load_format(
+                checkpoint_loader,
+                str(checkpoint_dir),
+                model_config=object(),
+                model=model,
+                mapping=Mapping(),
+                llm_args=None,
+                spec_config=SimpleNamespace(
+                    needs_separate_draft_weights=True, speculative_model=str(checkpoint_dir)
+                ),
+                source_identity=None,
+                qualification=None,
+                metrics={},
+                startup_metadata={},
+            )
+        else:
+            gms_loading._load_gms_writer_draft_weights(
+                model,
+                checkpoint_loader,
+                speculative_model=str(checkpoint_dir),
+                mapping=Mapping(),
+                target_weight_mapper=None,
+                metrics={},
+            )
+        return received, weight_loader.last_checkpoint_io_status.effective
+
+    def assert_same_draft_tensors(
+        draft: dict[str, torch.Tensor], full: dict[str, torch.Tensor]
+    ) -> None:
+        # The two-stage draft gets exactly the stage 0 and 1 keys.
+        assert set(draft) == {key for key in full if key.startswith(("mtp.0.", "mtp.1."))}
+        for key in draft:
+            assert draft[key].dtype == full[key].dtype
+            assert draft[key].shape == full[key].shape
+            assert torch.equal(
+                draft[key].reshape(-1).view(torch.uint8), full[key].reshape(-1).view(torch.uint8)
+            )
+
+    full, effective = load_draft(None)
+    assert effective == policy
+    assert sorted(read_files) == sorted(shards)
+    assert set(full) == {key for tensors in shards.values() for key in tensors}
+    draft, effective = load_draft(dspark)
+    # An unreadable header sends the rank-striped preflight to the native fallback.
+    assert effective == ("native" if headers == "one_unreadable" else policy)
+    assert sorted(read_files) == (holders if headers == "readable" else sorted(shards))
+    assert_same_draft_tensors(draft, full)
+
+    # With the raw weight cache on, the draft keeps the full file set and reuses the cached entry.
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+    load_draft(None)
+    cached, effective = load_draft(dspark)
+    assert effective == "native"
+    assert read_files == []
+    assert_same_draft_tensors(cached, full)

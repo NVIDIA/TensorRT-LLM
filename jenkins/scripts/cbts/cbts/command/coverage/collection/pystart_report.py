@@ -47,10 +47,11 @@ def merge_to_sqlite(pattern: str, out_path: str) -> tuple[sqlite3.Connection, in
 
 
 def _collect_defs(node: ast.AST, prefix: str, rel: str, funcs: set[tuple[str, str]]) -> None:
-    """Record functions/methods reachable through class and control-flow nesting (matches PY_START co_qualname)."""
+    """Record functions/methods reachable through class, closure and control flow (matches PY_START co_qualname)."""
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.add((rel, prefix + child.name))
+            _collect_defs(child, f"{prefix}{child.name}.<locals>.", rel, funcs)
         elif isinstance(child, ast.ClassDef):
             _collect_defs(child, f"{prefix}{child.name}.", rel, funcs)
         else:
@@ -258,17 +259,15 @@ def main(glob_pattern, out_sqlite, out_dir, out_json, source_root):
         f"{n_tests} tests, {n_files} product files, {n_funcs} functions touched"
     )
 
-    # Completeness: a (test, stage) is safe to skip only if it passed, has no taint, and every
-    # expected process saved (saved_procs >= expected_workers + 1, +1 for the coordinator).
+    # Completeness: a (test, stage) is safe to skip only if it passed and is untainted.
     n_meta = con.execute("SELECT COUNT(*) FROM test_case_meta WHERE test != ''").fetchone()[0]
     n_unsafe = con.execute(
         "SELECT COUNT(*) FROM test_case_meta WHERE test != '' AND "
-        "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1 "
-        "OR tainted != 0)"
+        "(outcome IS NULL OR outcome != 'passed' OR tainted != 0)"
     ).fetchone()[0]
     print(
         f"CBTS completeness: {n_meta} (test, stage) rows, "
-        f"{n_unsafe} not safe to skip (non-passed, saved_procs < expected_workers + 1, or tainted)"
+        f"{n_unsafe} not safe to skip (non-passed or tainted)"
     )
 
     meta = {

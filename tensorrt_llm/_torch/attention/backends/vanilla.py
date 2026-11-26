@@ -804,6 +804,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 raise ValueError("Vanilla MLA requires a KV cache manager.")
             if forward_args.latent_cache is None:
                 raise ValueError("Vanilla MLA requires latent_cache.")
+            if self.sparse_params is not None:
+                raise NotImplementedError(
+                    f"{self.sparse_params.algorithm} requires its specialized "
+                    "Vanilla attention backend")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
                 return self._mla_forward_context(q, k, v, metadata,

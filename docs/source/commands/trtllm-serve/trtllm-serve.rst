@@ -23,10 +23,13 @@ The server also supports the following endpoints:
 - ``/start_profile`` (prototype)
 - ``/stop_profile`` (prototype)
 - ``/v1/chat/completions/render`` and ``/v1/completions/render`` (prototype, enabled with ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1``)
+- ``/memory_report`` (prototype; served in the memory monitor's full mode, ``TLLM_MEM_MONITOR=1`` or ``memory_monitor_config.mode: full``, when ``TRTLLM_RUNTIME_CONTROL_API_KEY`` is set and there is a single serving frontend, with requests signed like the runtime-control endpoints and without needing sleep mode; returns every rank's GPU memory report, see :doc:`../../features/memory-monitor` and :doc:`../../features/sleep-wakeup`)
 
 The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see :doc:`render-endpoints`.
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
+
+For reranker models, the ``trtllm-serve rerank`` subcommand exposes ``/rerank``, ``/v1/rerank``, and Cohere-compatible ``/v2/rerank`` endpoints. See :doc:`Reranking <../../features/reranking>` for details.
 
 Starting a Server
 -----------------
@@ -78,6 +81,31 @@ Ultra (``nemotron_h``), specify ``--tool_parser qwen3_coder`` explicitly.
 The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements this
 shared format. ``--reasoning_parser`` separately controls reasoning extraction;
 ``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
+
+Multiple HTTP Frontends
+-----------------------
+
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, beta). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+
+.. note::
+
+   * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
+   * The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``), ``enable_resource_governor`` or ``--enable_sleep_mode`` it falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead. ``--grpc`` also keeps one frontend unless ``--num_serve_frontends`` is given (only ``--grpc-protocol openengine`` supports more).
+   * Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward ``/metrics``, ``/kv_cache_events``, profiling and the Anthropic batches API to it, and ``/prometheus/metrics`` covers every frontend. Per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, ``/health`` describes the frontend that answered, and each frontend writes its own per-request perf metrics file.
+   * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
+   * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
+
+.. _bounding-the-graceful-stop:
+
+Bounding the Graceful Stop
+--------------------------
+
+A server can still have request handlers running when it is told to stop, for example when a benchmark client leaves while its last requests are in flight. By default the OpenAI HTTP server waits for every one of them. The prototype setting ``serve_graceful_shutdown_timeout_s: N`` in the ``--config`` YAML bounds that wait: after a shutdown signal, the server waits at most ``N`` seconds for running request handlers (uvicorn's ``timeout_graceful_shutdown``), then cancels them and shuts down as usual. It is off by default.
+
+.. note::
+
+   * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
+   * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
 
 Inference Endpoints
 -------------------
@@ -227,6 +255,17 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
      ]}
 
 .. note::
+   Media URLs may be ``http(s)`` URLs or base64 ``data:`` URLs. A ``file://``
+   URI or a bare filesystem path is read from the server's own filesystem, so it
+   is refused unless the server is started with
+   ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>``; then only regular files whose
+   resolved path is inside that directory are read. This applies to
+   ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
+   clients send local paths today must set the variable to the directory
+   that holds those files. VisualGen references sent with ``format='path'``
+   follow the same variable.
+
+.. note::
    To convert images to base64-encoded format, use the utility function
    :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
    `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
@@ -243,12 +282,17 @@ model.
 
      {"role": "user", "content": [
          {"type": "text", "text": "What's in this image?"},
-         {"type": "image_embeds", "image_embeds": {"data": "{image_embeddings_base64}"}}}
+         {"type": "image_embeds", "image_embeds": {"data": "{image_embeddings_base64}", "image_grid_thw": [1, 68, 120]}}
      ]}
 
 .. note::
    The contents of `image_embeddings_base64` can be generated by base64-encoding
    the result of serializing a tensor via `torch.save`.
+   `image_grid_thw` is the image's grid `[1, h, w]` from the model's image
+   processor (here a 1920x1080 image for Qwen3-VL). Models that use mRoPE, such as
+   Qwen2.5-VL and Qwen3-VL, need it; LLaVA-NeXT ignores it. For Qwen2.5-VL and
+   Qwen3-VL, an image handle from a TRT-LLM standalone encoder already has this
+   grid as `metadata["image_grid_thw"]`.
 
 **Video**
 
@@ -398,6 +442,99 @@ Example output:
         }
     ]
 
+Queue statistics
+~~~~~~~~~~~~~~~~
+
+``numQueuedRequests`` and the ``numQueued*`` fields of ``inflightBatchingStats``
+report the requests that the row's iteration did not schedule:
+
+- ``numQueuedContextRequests`` and ``numQueuedCtxTokens``: requests with prompt
+  tokens still to prefill, and the number of those tokens. A request that is not
+  admitted yet counts its whole prompt; an admitted request counts its remaining
+  context tokens.
+- ``numQueuedGenRequests`` and ``numQueuedGenKvTokens``: generation-only requests
+  of disaggregated serving that have not started generating, and their context
+  lengths in tokens.
+- ``numQueuedRequests``: ``numQueuedContextRequests + numQueuedGenRequests``.
+
+The counts cover the request queue, the waiting queue that holds requests until
+they are admitted, and admitted requests that are not scheduled yet. Each request
+is counted once. Cancelled requests and the requests that the iteration scheduled
+or paused are not counted.
+
+Records without a forward pass
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A row with ``"isQueueSnapshot": true`` belongs to a record that the engine took
+without running a forward pass. It reports the queues at that time; its
+``iterLatencyMS`` and step timings are ``0`` and are not measurements. Rows of
+measured iterations do not have the key. There are two kinds of such records:
+
+- Idle heartbeat: while the engine has no work, it exports one record per second.
+  A heartbeat that has not been retrieved is replaced by the next one.
+- Queue snapshot: when an iteration schedules nothing while requests are queued,
+  the engine exports the queued counts. An unchanged snapshot is exported at most
+  once per second.
+
+The record that the engine exports at startup, before any request, also has
+``iterLatencyMS`` ``0`` and is not marked.
+
+The Prometheus collector applies a marked row like any other row;
+``iteration_latency_seconds``, for example, becomes ``0``.
+
+Attention-DP statistics
+~~~~~~~~~~~~~~~~~~~~~~~
+
+With attention data parallelism enabled, ``attentionDpRank`` identifies the rank
+that produced each row's scheduled-work and KV-cache measurements. KV snapshots
+are captured with the corresponding iteration and include that rank's capacity,
+occupancy, allocation and reuse counters, and cache hit rate. An idle rank can
+retain cached blocks even when it schedules no requests. If a rank did not
+measure KV statistics for an iteration, its JSON row has ``kvCacheStats: null``;
+absence does not mean an empty cache. ``TLLM_METRICS_ALL_RANKS`` is not required for this
+attention-DP fanout.
+
+Each row's queued counts are those of its rank. Requests in the request queue and
+the waiting queue are not assigned to a rank yet; rank 0's row reports them
+together with rank 0's own admitted requests. The other rows report the requests
+assigned to their rank that are not scheduled yet. The rows of one record share
+``iter`` and ``timestamp``, and the sum of their queued counts is the backlog of
+the whole engine. An idle heartbeat has one row per rank. A queue snapshot has
+rows only for the ranks with scheduled or queued work. ``isQueueSnapshot`` and the
+timings are rank 0's and are the same on every row of a record.
+
+The shared Prometheus collector uses ``dp_rank`` on KV-cache and rank-local
+inflight-batching metrics. It takes the rank from ``attentionDpRank``, falls back
+to ``rank`` for all-rank statistics, and uses ``"0"`` for rows without either
+field. These metric families also have ``dp_rank="0"`` in single-rank serving.
+Request metrics and configuration-info metrics retain their existing labels.
+
+KV gauges retain each rank's last measurement until another measured snapshot
+arrives. Used-block counts, utilization, and cache-hit rate can remain stale
+throughout periods without fresh snapshots, including idle periods. Zero
+scheduled requests alone does not imply a missing KV measurement.
+
+Cumulative reused/missed-block counters keep independent baselines per rank
+across absent snapshots. Rows must arrive in producer order for each rank; interleaving
+different ranks is supported. A decrease in a rank's cumulative counter emits a
+warning and updates the baseline without incrementing the counter. This does not
+make stale or reordered rows safe. Repeated cumulative values add no work.
+Per-iteration delta counters are incremented directly and must be delivered once
+per iteration.
+
+Top-level request counts, queue, memory, iteration latency, batch configuration,
+average decoded tokens, and speculative-decoding measurements remain owned by
+rank 0 in the collector. They are not sums of rank-local measurements:
+``num_requests_waiting`` is rank 0's ``numQueuedRequests``, the requests not
+assigned to a rank yet plus rank 0's own backlog, without the backlog of the
+other ranks. The separate ``kvCacheIterationStats`` deltas retain their producer
+ownership and are attached only to rank 0 by attention-DP fanout.
+
+When updating dashboards, retain ``dp_rank`` to inspect individual ranks or
+aggregate it explicitly. Used/free block counts can be summed across ranks;
+the maximum utilization identifies the fullest rank. Do not sum utilization or
+cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
+
 .. _runtime-profiling-endpoints:
 
 Runtime Profiling Endpoints
@@ -423,7 +560,7 @@ Start a profile window. All fields in the JSON body are optional.
      - Description
    * - ``output_dir``
      - string
-     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise ``/tmp``. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
+     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise a temporary directory. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
    * - ``num_steps``
      - int
      - Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call ``/stop_profile``. When omitted, profiling runs until ``/stop_profile`` is called.

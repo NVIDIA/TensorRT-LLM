@@ -93,6 +93,8 @@ def test_dflash_worker_rolls_back_after_verification(monkeypatch):
     worker._ctx_len = torch.zeros(batch_size, dtype=torch.long, device="cuda")
     # _lazy_init_ctx_buffers (stubbed here) normally builds the host mirror.
     worker._ctx_len_host = [0] * batch_size
+    worker._ctx_base_pages = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    worker._ctx_base_host = [0] * batch_size
     accepted = torch.zeros(batch_size, K + 1, dtype=torch.int32, device="cuda")
     # Distinct per-row counts: one row accepts the whole draft, the other only
     # the golden token. Uniform values would let a broken forward that drops or

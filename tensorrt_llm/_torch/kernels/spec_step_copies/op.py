@@ -20,8 +20,9 @@ inputs (one launch for the engine's four). Each kernel takes every size and addr
 compiled once per process, on the first launch, which must happen outside CUDA-graph capture. The kernels are called
 through TVM-FFI: a launch costs a few microseconds of host time.
 
-Callers use them only where ``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches
-nothing and returns False; the caller then does that work itself.
+Callers use ``SlotScatter`` only where ``slot_scatter_supported()`` holds and ``StepInputGather`` only where
+``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches nothing and returns False;
+the caller then does that work itself.
 """
 
 from __future__ import annotations
@@ -30,22 +31,39 @@ from typing import Any, ClassVar
 
 import torch
 
-from ...._utils import get_sm_version
+from ...._utils import get_sm_version, is_blackwell_datacenter
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
 def is_supported() -> bool:
-    """Whether the kernels run on the current device: SM 100 (B200 / GB200) with the CuTe DSL installed.
+    """Whether the kernels run on the current device: SM 10.0 / 10.3 (B200 / GB200 / B300 / GB300) with the
+    CuTe DSL installed.
 
     The kernels are plain SIMT code (thread and block indices, global loads and stores), with nothing specific to an
-    architecture, but they are validated on SM 100 only; SM 103 and SM 107 keep the torch path.
+    architecture; other architectures keep the torch path.
     """
-    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 100
+    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and is_blackwell_datacenter()
+
+
+def slot_scatter_supported() -> bool:
+    """Whether ``SlotScatter`` runs on the current device: where ``is_supported()`` holds, and on SM 10.7.
+
+    On SM 10.7 the sampler's four ``index_copy_`` would otherwise launch every step; the engine's gathers
+    (``StepInputGather``) keep the ``is_supported()`` gating.
+    """
+    return is_supported() or (
+        IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 107
+    )
 
 
 def _is_i32(t: torch.Tensor) -> bool:
     """A contiguous CUDA int32 tensor."""
-    return t.is_cuda and t.dtype == torch.int32 and t.is_contiguous()
+    return _is_i32_view(t) and t.is_contiguous()
+
+
+def _is_i32_view(t: torch.Tensor) -> bool:
+    """A CUDA int32 tensor of any strides."""
+    return t.is_cuda and t.dtype == torch.int32
 
 
 def _compile(name: str, args: tuple):
@@ -113,7 +131,8 @@ class SlotScatter:
 
         Args:
             outputs: The forward's ``new_tokens`` [rows_total, a], ``next_new_tokens`` [rows_total, b],
-                ``new_tokens_lens`` [rows_total] and ``next_draft_tokens`` [rows_total, c], int32.
+                ``new_tokens_lens`` [rows_total] and ``next_draft_tokens`` [rows_total, c], int32; the 2-D ones of
+                any strides (e.g. transposed views of one token buffer).
             row_begin: The first row of ``outputs`` to move.
             rows: The number of rows to move.
             slots: The distinct slot of each moved row, int32 [>= rows] on the device.
@@ -123,8 +142,9 @@ class SlotScatter:
             store_next_draft: int32 [num_slots, width].
 
         Returns:
-            False, launching nothing, when an argument is outside what the kernel covers (a non-contiguous or
-            non-int32 tensor, a store of another layout, fewer output rows or slots than ``rows``); True otherwise.
+            False, launching nothing, when an argument is outside what the kernel covers (a non-int32 tensor, a
+            non-contiguous length, slot or store tensor, a store of another layout, fewer output rows or slots than
+            ``rows``); True otherwise.
         """
         if rows == 0:
             return True
@@ -134,10 +154,7 @@ class SlotScatter:
         next_draft = outputs["next_draft_tokens"]
         num_slots = store_lens.numel()
         tensors = (
-            new_tokens,
-            next_new_tokens,
             lens,
-            next_draft,
             slots,
             store_new_tokens,
             store_next_new_tokens,
@@ -146,6 +163,7 @@ class SlotScatter:
         )
         if not (
             all(_is_i32(t) for t in tensors)
+            and all(_is_i32_view(t) for t in (new_tokens, next_new_tokens, next_draft))
             and new_tokens.dim() == next_new_tokens.dim() == next_draft.dim() == 2
             and lens.dim() == store_lens.dim() == 1
             and min(t.shape[0] for t in (new_tokens, next_new_tokens, lens, next_draft))
@@ -182,6 +200,9 @@ class SlotScatter:
             next_new_tokens.shape[1],
             store_next_draft.shape[1],
             next_draft.shape[1],
+            *new_tokens.stride(),
+            *next_new_tokens.stride(),
+            *next_draft.stride(),
         )
         if SlotScatter._kernel is None:
             SlotScatter._kernel = _compile("scatter", args)

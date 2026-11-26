@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .helpers.constants import MAX_MLA_SPLITS_KV
 
 _TARGET_SPLITS_PER_RANK = 8
 _PARALLEL_REDUCER_MIN_SPLITS_PER_RANK = 32
@@ -75,8 +74,8 @@ def _next_power_of_two(value: int) -> int:
 def _validate_splits_kv(splits_kv: int) -> None:
     if isinstance(splits_kv, bool) or not isinstance(splits_kv, int):
         raise TypeError("splits_kv must be an integer")
-    if not 1 <= splits_kv <= MAX_MLA_SPLITS_KV:
-        raise ValueError(f"splits_kv must be in [1, {MAX_MLA_SPLITS_KV}]")
+    if splits_kv < 1:
+        raise ValueError("splits_kv must be positive")
 
 
 def _validate_positive_int(value: int, name: str) -> None:
@@ -145,7 +144,7 @@ def validate_parallel_reduction_workspace(
     _validate_splits_kv(splits_kv)
     _validate_positive_int(head_dim, "head_dim")
     if splits_kv == 1:
-        raise ValueError("parallel reduction requires splits_kv in [2, 128]")
+        raise ValueError("parallel reduction requires at least two splits")
 
     workspace_elements = batch_size * num_heads_q * seq_len_q * splits_kv * head_dim
     if workspace_elements > _MAX_PARTIAL_O_WORKSPACE_ELEMENTS:

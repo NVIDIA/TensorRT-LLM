@@ -816,6 +816,22 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             asyncio.run(main())
 
 
+def is_idle_heartbeat(stats: dict) -> bool:
+    """Whether a stats record is the queue snapshot of an idle engine.
+
+    With iteration stats enabled an idle engine keeps reporting such a
+    record, so a test that waits for the stats to run dry has to skip them.
+    """
+    ifb = stats.get("inflightBatchingStats") or {}
+    return (stats.get("isQueueSnapshot", False)
+            and not ifb.get("numScheduledRequests")
+            and not ifb.get("numQueuedContextRequests")
+            and not ifb.get("numQueuedGenRequests")
+            and not stats.get("numActiveRequests")
+            and not stats.get("numCompletedRequests")
+            and not stats.get("numNewActiveRequests"))
+
+
 def validate_stats(
     *,
     results,
@@ -1014,11 +1030,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                        enable_chunked_prefill=enable_chunked_prefill,
                        enable_iter_req_stats=enable_iter_req_stats)
 
-        assert not llm.get_stats(0.5)
+        assert not [r for r in llm.get_stats(0.5) if not is_idle_heartbeat(r)]
 
         # test that IterationResult()._done is properly set
         _ = llm.generate(prompts, sampling_params=sampling_params)
-        assert llm.get_stats(2)
+        assert [r for r in llm.get_stats(2) if not is_idle_heartbeat(r)]
 
 
 def test_llm_get_queued_stats():
@@ -1435,7 +1451,19 @@ class _FakeRawRequest:
         return True
 
 
-def test_startup_metrics_by_server_info() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("checkpoint_io_policy", [
+    None,
+    {
+        "requested": "auto",
+        "selected": "rank_striped_read_ahead",
+        "activated": True,
+        "effective": "native",
+        "fallback_reason": "reader failed after activation",
+    },
+])
+def test_startup_metrics_by_server_info(
+        checkpoint_io_policy: dict[str, str | bool | None] | None) -> None:
 
     class FakeExecutor:
 
@@ -1446,7 +1474,12 @@ def test_startup_metrics_by_server_info() -> None:
             self.calls += 1  # keep track of # calls to ensure the cache in the server works
             if self.calls == 1:
                 return None
-            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+            return {
+                "model_loader": {
+                    "total_model_loading_seconds": 1.5,
+                    "checkpoint_io_policy": checkpoint_io_policy,
+                }
+            }
 
     executor = FakeExecutor()
     generator = object.__new__(BaseLLM)
@@ -1460,7 +1493,18 @@ def test_startup_metrics_by_server_info() -> None:
     second_response = asyncio.run(server.get_server_info())
     third_response = asyncio.run(server.get_server_info())
 
-    assert json.loads(first_response.body) == {
+    first, second, third = (json.loads(response.body)
+                            for response in (first_response, second_response,
+                                             third_response))
+    # The render fingerprint is covered by its own tests; here it only has to be
+    # present and the same on every call.
+    fingerprints = [
+        body.pop("render_fingerprint") for body in (first, second, third)
+    ]
+    assert fingerprints[0]["digest"]
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+    assert first == {
         "disaggregated_params": {},
         "startup_metrics": {},
     }
@@ -1468,12 +1512,13 @@ def test_startup_metrics_by_server_info() -> None:
         "disaggregated_params": {},
         "startup_metrics": {
             "model_loader": {
-                "total_model_loading_seconds": 1.5
+                "total_model_loading_seconds": 1.5,
+                "checkpoint_io_policy": checkpoint_io_policy,
             }
         },
     }
-    assert json.loads(second_response.body) == expected_success
-    assert json.loads(third_response.body) == expected_success
+    assert second == expected_success
+    assert third == expected_success
     assert executor.calls == 2
 
 

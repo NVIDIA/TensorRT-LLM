@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 from queue import Queue
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -31,6 +31,10 @@ from tensorrt_llm.logger import logger
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
+
+# Linger applied by ZeroMqQueue.close() to a socket still at zmq's infinite
+# default, so closing never waits forever for a peer that has exited.
+CLOSE_LINGER_MS = 1000
 
 
 class ZeroMqQueue:
@@ -85,6 +89,8 @@ class ZeroMqQueue:
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
+        # Run on the receiving thread between receiving a message and parsing it.
+        self.parse_gate: Optional[Callable[[], None]] = None
 
         self._setup_lock = threading.Lock()
 
@@ -396,7 +402,17 @@ class ZeroMqQueue:
                 raise asyncio.TimeoutError()
 
     def close(self):
+        """Close the socket and terminate the queue's context.
+
+        ``context.term()`` blocks until every message queued on the socket has
+        been sent or the socket's linger expires. A socket left at zmq's
+        infinite default linger (-1) is given ``CLOSE_LINGER_MS`` first, so a
+        message addressed to a peer that has already exited cannot block
+        teardown forever. A linger set explicitly by the caller is kept.
+        """
         if self.socket:
+            if self.socket.getsockopt(zmq.LINGER) < 0:
+                self.socket.setsockopt(zmq.LINGER, CLOSE_LINGER_MS)
             self.socket.close()
             self.socket = None
         if self.context:
@@ -469,6 +485,7 @@ class ZeroMqQueue:
         if self.socket_type == zmq.ROUTER:
             identity, data = self.socket.recv_multipart()
             self._last_identity = identity  # Store for replies
+            self._wait_for_parse_gate()
             obj = self._parse_data(data)
             if return_identity:
                 return obj, identity
@@ -476,6 +493,7 @@ class ZeroMqQueue:
         else:
             if self.use_hmac_encryption:
                 data = self.socket.recv()
+                self._wait_for_parse_gate()
                 obj = self._parse_data(data)
             else:
                 obj = self.socket.recv_pyobj()
@@ -483,6 +501,10 @@ class ZeroMqQueue:
             if return_identity:
                 return obj, None
             return obj
+
+    def _wait_for_parse_gate(self):
+        if self.parse_gate is not None:
+            self.parse_gate()
 
     async def _recv_data_async(self, return_identity: bool = False) -> Any:
         """Async version of _recv_data."""

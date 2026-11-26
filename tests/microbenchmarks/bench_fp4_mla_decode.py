@@ -147,7 +147,7 @@ def _build_multi_seq_metadata(
         request_ids,
         layer_idx=layer_idx,
     )
-    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(layer_idx)
+    page_spec = kv_cache_manager.fp4_mla_layout.get_fp4_mla_page_table_spec(layer_idx)
     hp_block_ids_per_seq = kv_cache_manager._get_batch_cache_indices_by_pool_id(
         request_ids,
         pool_id=page_spec.hp_pool_id,
@@ -187,7 +187,7 @@ def _build_multi_seq_metadata(
         [torch.arange(seq_len, dtype=torch.int32, device=device) for seq_len in seq_lens]
     )
 
-    hp_pool = kv_cache_manager.get_fp4_mla_hp_pool()
+    hp_pool = kv_cache_manager.fp4_mla_layout.get_fp4_mla_hp_pool()
     kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cuda = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
@@ -205,6 +205,7 @@ def _build_multi_seq_metadata(
         request_ids=request_ids,
         runtime_features=SimpleNamespace(has_speculative_draft_tokens=False),
         is_cuda_graph=False,
+        forward_scratch_buffers=None,
         fp4_mla_state=Fp4MlaState(
             batch_indices=batch_indices,
             positions=positions,
@@ -215,12 +216,12 @@ def _build_multi_seq_metadata(
             device_page_table=True,
             device_page_table_valid=True,
             page_table_stride=max_blocks_per_seq,
+            generation_max_pages=max_blocks_per_seq,
             num_context_blocks=num_seqs * max_blocks_per_seq,
             num_generation_blocks=0,
             num_sequences=num_seqs,
-            num_blocks=None,
             hp_pool=hp_pool,
-            v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
+            v_scale_pool=kv_cache_manager.fp4_mla_layout.get_mla_v_scale_pool(),
             q_global_scale=q_global_scale,
             kv_global_scale=kv_global_scale,
         ),
@@ -230,7 +231,9 @@ def _build_multi_seq_metadata(
 def _materialize_reference_cache_storage(
     metadata: SimpleNamespace, layer_idx: int, head_dim: int
 ) -> torch.Tensor:
-    kv_cache, sf_cache = metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    kv_cache, sf_cache = metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(
+        layer_idx
+    )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     storage_head_dim = kv_cache.shape[-1] * 2
     static_global_scale = float(_get_fp4_mla_global_scale(metadata, kv_cache.device).item())
@@ -329,7 +332,9 @@ def _build_fp4_mla_attention_decode_case(
         FP4_MLA_K_RESIDUAL_DIM if _fp4_mla_attention_backend() in ("triton", "cutedsl") else 0
     )
     for current_layer in range(num_layers):
-        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(current_layer)
+        kv_cache, sf_cache = kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(
+            current_layer
+        )
         kv_cache.zero_()
         sf_cache.zero_()
         assert kv_cache.shape[-1] * 2 == expected_storage_head_dim
@@ -342,7 +347,7 @@ def _build_fp4_mla_attention_decode_case(
         layer_idx=layer_idx,
     )
     assert metadata.fp4_mla_state.v_scale_pool is not None
-    persistent_pool_base = kv_cache_manager.get_mla_v_packed_pool_base()
+    persistent_pool_base = kv_cache_manager.fp4_mla_layout.get_mla_v_packed_pool_base()
     if persistent_pool_base is not None:
         persistent_pool_base.zero_()
     metadata.fp4_mla_state.v_scale_pool.zero_()
@@ -657,12 +662,32 @@ _CUTEDSL_LAUNCHER_TENSOR_NAMES = (
 )
 
 
+def _launcher_call_operands(
+    args: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """Split a launcher call into its tensor operands, in launch order, and its other arguments.
+
+    The decode passes the operands by keyword; a positional call is accepted as well.
+    """
+    names = _CUTEDSL_LAUNCHER_TENSOR_NAMES
+    if len(args) > len(names):
+        raise RuntimeError(
+            f"CuTeDSL launcher takes {len(names)} tensor arguments, got {len(args)} positional ones"
+        )
+    options = dict(kwargs)
+    by_keyword = names[len(args) :]
+    missing = [name for name in by_keyword if name not in options]
+    if missing:
+        raise RuntimeError(f"CuTeDSL launcher call lacks the tensor arguments {missing}")
+    return tuple(args) + tuple(options.pop(name) for name in by_keyword), options
+
+
 def _launcher_tensor_pointers(tensors: tuple[object, ...]) -> dict[str, int | None]:
     """Record stable launch addresses, including fused-V's absent sidecar."""
     if len(tensors) != len(_CUTEDSL_LAUNCHER_TENSOR_NAMES):
         raise RuntimeError(
             f"CuTeDSL launcher requires {len(_CUTEDSL_LAUNCHER_TENSOR_NAMES)} "
-            f"positional tensor arguments, got {len(tensors)}"
+            f"tensor arguments, got {len(tensors)}"
         )
     pointers = {}
     for name, tensor in zip(_CUTEDSL_LAUNCHER_TENSOR_NAMES, tensors):
@@ -1381,12 +1406,12 @@ def run_one(
 
             def record_launcher(*args: object, **kwargs: object) -> object:
                 nonlocal launcher_kwargs, launcher_tensors, launcher_tensor_ptrs
-                current_tensors = tuple(args)
+                current_tensors, current_kwargs = _launcher_call_operands(args, kwargs)
                 current_ptrs = _launcher_tensor_pointers(current_tensors)
                 if launcher_tensor_ptrs is None:
                     launcher_tensors = current_tensors
                     launcher_tensor_ptrs = current_ptrs
-                    launcher_kwargs = dict(kwargs)
+                    launcher_kwargs = current_kwargs
                 elif current_ptrs != launcher_tensor_ptrs:
                     raise RuntimeError(
                         "CuTeDSL launcher tensor pointers changed within one benchmark run"

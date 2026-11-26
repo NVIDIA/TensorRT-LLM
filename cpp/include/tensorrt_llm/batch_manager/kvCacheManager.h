@@ -353,6 +353,9 @@ struct KvCacheIterationStats
     SizeType32 secondaryPeakFreeNumBlocks{0};
     SizeType32 secondaryPeakUsedNumBlocks{0};
     SizeType32 secondaryPeakEvictableNumBlocks{0};
+    // Disk copies retained while their block also lives in a hotter tier (KV cache manager V2 disk options). Not
+    // counted in secondaryEvictableNumBlocks; reclaimable, so counted in secondaryFreeNumBlocks.
+    SizeType32 secondaryRetainedCopyNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.modules.fla.replay_promotion import promote_conv_and_advance_replay_triton
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     ReplayStateUpdateMetadata,
@@ -63,6 +64,7 @@ from .common import (
     MambaHybridCacheManager,
     _get_local_mamba_cache_layout,
     _get_mamba_hybrid_pool_size,
+    _host_slots_to_device,
     _mamba_effective_tp_size,
     _promote_mamba_state_triton,
     get_tensor_size_bytes,
@@ -256,8 +258,17 @@ class PythonMambaCacheManager(BaseResourceManager):
             (the fused ``trtllm::kda_mtp_decode`` verify path)."""
             return self.kda_k_cache is not None
 
-        def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:
-            """Seed the KDA replay caches from the live ``W - 1`` conv pool."""
+        def commit_conv_window(
+            self,
+            slot_indices: torch.Tensor,
+            conv_pool: torch.Tensor,
+            replay_slot_indices: torch.Tensor | None = None,
+        ) -> None:
+            """Seed the KDA replay caches from the live ``W - 1`` conv pool.
+
+            The replay caches share the pool's slots, so ``replay_slot_indices``
+            name the same slots as ``slot_indices`` when given.
+            """
             from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
                 copy_kda_replay_conv_window,
             )
@@ -268,6 +279,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 self.kda_conv_k,
                 self.kda_conv_v,
                 slot_indices,
+                replay_slot_indices,
             )
 
     def __init__(
@@ -604,21 +616,23 @@ class PythonMambaCacheManager(BaseResourceManager):
                 isinstance(self.mamba_cache, self.SpeculativeState)
                 and self._use_replay_state_update
             ):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (
                 isinstance(self.mamba_cache, self.SpeculativeState) and self._use_kda_replay_update
             ):
                 # Fresh request: no drafts pending in the replay caches.
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
             if self._mamba_ssm_rand_seed is not None:
                 # Deterministic per-slot rotation on fresh assignment.
                 # `block` is pulled from mamba_cache_free_blocks, which
                 # excludes _padding_slot by construction (see __init__),
                 # so padding sentinels never reach this branch.
                 self._seed_request_counter += 1
-                self._mamba_ssm_rand_seed[block] = _compute_deterministic_mamba_seed(
-                    self._seed_request_counter, block, self._seed_rank_offset
+                self._mamba_ssm_rand_seed[block].fill_(
+                    _compute_deterministic_mamba_seed(
+                        self._seed_request_counter, block, self._seed_rank_offset
+                    )
                 )
 
     @torch.inference_mode()
@@ -649,7 +663,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         if not blocks:
             return
         conv = self.mamba_cache.conv  # [L, slots, 3D, W - 1]
-        idx = torch.tensor(sorted(set(blocks)), dtype=torch.long, device=conv.device)
+        idx = _host_slots_to_device(sorted(set(blocks)), conv.device)
         d = conv.shape[2] // 3
         committed = conv.shape[3]
         cs = conv.index_select(1, idx)
@@ -674,7 +688,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache.kda_beta_cache,
         ):
             buf.index_fill_(1, idx, 0)
-        self.mamba_cache.prev_num_accepted_tokens[idx] = 0
+        self.mamba_cache.prev_num_accepted_tokens.index_fill_(0, idx, 0)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         requests = scheduled_batch.context_requests + scheduled_batch.generation_requests
@@ -708,13 +722,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                     isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update
                 ):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                    self.mamba_cache.cache_buf_idx[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                    self.mamba_cache.cache_buf_idx[block].zero_()
                 elif (
                     isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_kda_replay_update
                 ):
-                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                    self.mamba_cache.prev_num_accepted_tokens[block].zero_()
                 continue
             if self._is_padding_sentinel(r):
                 block = self._padding_slot
@@ -729,12 +743,12 @@ class PythonMambaCacheManager(BaseResourceManager):
                 isinstance(self.mamba_cache, self.SpeculativeState)
                 and self._use_replay_state_update
             ):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
-                self.mamba_cache.cache_buf_idx[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
+                self.mamba_cache.cache_buf_idx[block].zero_()
             elif (
                 isinstance(self.mamba_cache, self.SpeculativeState) and self._use_kda_replay_update
             ):
-                self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                self.mamba_cache.prev_num_accepted_tokens[block].zero_()
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
@@ -1380,6 +1394,17 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
     # cache manager __init__ coerces a positive spec recompute tail to a full
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
+    # The GDN layers it serves verify drafts without the fused kernels.
+    gdn_fused_verify = False
+
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay; smaller batches commit inside each layer."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        )
+
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     def __init__(
         self,
@@ -1627,6 +1652,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         use_replay_state_update: bool | None = False,
         mamba_ssm_stochastic_rounding: bool = False,
         model_type: str = "nemotron_hybrid",
+        gdn_fused_verify: bool = False,
         **kwargs,
     ) -> None:
         # 3 kinds of layers:
@@ -1678,6 +1704,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
             and model_type == "qwen3_next"
             and self.local_num_mamba_layers > 0
         )
+        self.gdn_fused_verify = gdn_fused_verify
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update
@@ -1955,6 +1982,17 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         return self._use_gdn_cached_replay_all_layer_commit
 
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay and one all-layer checkpoint commit; other
+        batches commit inside each layer, as the fused target verify of the
+        model's GDN layers (gdn_fused_verify) does at every batch size."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        )
+
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
     def _commit_gdn_cached_replay_history_layers(
         self,
         attn_metadata: "AttentionMetadata",
@@ -1962,13 +2000,11 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
     ) -> None:
         """Synchronously advance every local GDN checkpoint in one launch."""
         from tensorrt_llm._torch.modules.fla.cached_replay import (
-            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
             commit_gdn_cached_replay_history_layers,
         )
 
-        if (
-            not self._use_gdn_cached_replay_all_layer_commit
-            or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+        if not self._use_gdn_cached_replay_all_layer_commit or not self.gdn_replay_partitioned(
+            num_decodes
         ):
             return
         if (
@@ -2151,25 +2187,30 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         # Conv: both paths save all intermediate conv windows, carry over the
         # accepted one. The replay path also advances PNAT and the active cache
         # buffer in this same launch.
-        replay_dummy_request_mask = None
         if self._use_replay_state_update:
-            replay_dummy_request_mask = self._dummy_request_mask[
-                num_contexts : num_contexts + num_gens
-            ]
-        _promote_mamba_state_triton(
-            self.all_conv_states,
-            self.intermediate_conv_states,
-            src_state_indices,
-            accepted_position_source,
-            state_indices_d,
-            num_accepted_tokens=accepted_tokens,
-            position_source_is_token_count=position_source_is_token_count,
-            replay_pnat=(self.prev_num_accepted_tokens if self._use_replay_state_update else None),
-            replay_cache_buf_idx=(self.cache_buf_idx if self._use_replay_state_update else None),
-            dummy_request_mask=replay_dummy_request_mask,
-            replay_step_width=(self.replay_step_width if self._use_replay_state_update else 0),
-            replay_history_size=(self.replay_history_size if self._use_replay_state_update else 0),
-        )
+            promote_conv_and_advance_replay_triton(
+                self.all_conv_states,
+                self.intermediate_conv_states,
+                src_state_indices,
+                accepted_position_source,
+                state_indices_d,
+                num_accepted_tokens=accepted_tokens,
+                replay_pnat=self.prev_num_accepted_tokens,
+                replay_cache_buf_idx=self.cache_buf_idx,
+                dummy_request_mask=self._dummy_request_mask[num_contexts : num_contexts + num_gens],
+                replay_step_width=self.replay_step_width,
+                replay_history_size=self.replay_history_size,
+                position_source_is_token_count=position_source_is_token_count,
+            )
+        else:
+            _promote_mamba_state_triton(
+                self.all_conv_states,
+                self.intermediate_conv_states,
+                src_state_indices,
+                accepted_position_source,
+                state_indices_d,
+                position_source_is_token_count=position_source_is_token_count,
+            )
 
     def get_num_available_tokens(
         self, token_num_upper_bound: int, max_num_draft_tokens: int = 0, **kwargs

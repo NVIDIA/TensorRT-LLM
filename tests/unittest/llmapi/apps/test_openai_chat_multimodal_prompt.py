@@ -105,7 +105,7 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
-        return SimpleNamespace(prompt_token_ids=[7, 11], finished=True)
+        return SimpleNamespace(request_id=1, prompt_token_ids=[7, 11], finished=True)
 
     tokenizer = _StubTokenizer()
     server = make_stub_openai_server(
@@ -146,3 +146,17 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
     (item,) = prompt["mm_item_order"]
     assert (item["modality"], item["index"]) == ("image", 0)
     assert item["placeholder"] in _StubTokenizer.RENDERED
+
+
+def test_chat_rejects_media_device_even_without_media(tmp_path):
+    server = make_stub_openai_server(tmp_path, "test-vlm", _StubModelConfig(), None)
+    response = TestClient(server.app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-vlm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "media_io_kwargs": {"audio": {"device": "cpu"}},
+        },
+    )
+    assert response.status_code == 400
+    assert "media_io_kwargs.audio.device" in response.text

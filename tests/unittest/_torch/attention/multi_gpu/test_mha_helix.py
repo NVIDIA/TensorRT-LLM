@@ -45,6 +45,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
@@ -209,8 +210,10 @@ def _run_attention_distributed(
         scenario.batch, ctx_len_per_gpu, kv_cache_manager, helix_is_inactive_rank, position_ids_gen
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with model_extra_attrs(extra_attrs):
-        output = attn(position_ids_gen, input_gen, attn_metadata)
+    # The o_proj all-reduce returns NCCL-window tensors, whose leases must be released by a
+    # scope rather than a tensor destructor. The clone outlives the scope for the accuracy check.
+    with model_extra_attrs(extra_attrs), nccl_window_tensor_scope(input_gen):
+        output = attn(position_ids_gen, input_gen, attn_metadata).clone()
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()

@@ -35,14 +35,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-using MemoryOwner = std::variant<StaticHostMem, CudaUniqPtr>;
-
-CudaUniqPtr allocateDeviceMemory(size_t size)
-{
-    CUdeviceptr ptr = 0;
-    cuCheck(cuMemAlloc(&ptr, size));
-    return CudaUniqPtr{reinterpret_cast<std::byte*>(ptr)};
-}
+using MemoryOwner = std::variant<StaticHostMem, CudaUniqPtr<std::byte>>;
 
 MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
 {
@@ -50,14 +43,15 @@ MemoryOwner makeMemoryOwner(size_t size, StagingBufferMemory memory)
     switch (memory)
     {
     case StagingBufferMemory::kPinnedHost: return MemoryOwner{std::in_place_type<StaticHostMem>, size};
-    case StagingBufferMemory::kDevice: return MemoryOwner{std::in_place_type<CudaUniqPtr>, allocateDeviceMemory(size)};
+    case StagingBufferMemory::kDevice:
+        return MemoryOwner{std::in_place_type<CudaUniqPtr<std::byte>>, allocateDeviceMemory<std::byte>(size)};
     default: throw std::invalid_argument("StagingBufferManager received an invalid memory kind");
     }
 }
 
 } // namespace
 
-void DeviceDeleter::operator()(std::byte* ptr) const noexcept
+void DeviceDeleter::operator()(void* ptr) const noexcept
 {
     if (ptr != nullptr)
     {
@@ -174,7 +168,7 @@ MemAddress StagingBufferManager::baseAddress() const noexcept
     {
         return host->address();
     }
-    return reinterpret_cast<MemAddress>(std::get<CudaUniqPtr>(mMemoryOwner).get());
+    return reinterpret_cast<MemAddress>(std::get<CudaUniqPtr<std::byte>>(mMemoryOwner).get());
 }
 
 StagingBufferMemory StagingBufferManager::memory() const noexcept

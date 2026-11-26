@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,7 +46,7 @@ class TestQuantMode(unittest.TestCase):
 
     def test_count(self):
         # Make sure the COUNT value is as expected - change that test if you add a new flag.
-        self.assertEqual(QuantMode.COUNT.value, 1 << 19)
+        self.assertEqual(QuantMode.COUNT.value, 1 << 20)
 
     def test_from_description(self):
         # Test weight only.

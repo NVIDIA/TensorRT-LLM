@@ -24,6 +24,7 @@ The adapter is a pure protocol layer: it never touches the tokenizer,
 chat templates, or the engine.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -31,7 +32,7 @@ import re
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from fastapi.responses import JSONResponse
 
@@ -52,6 +53,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicMessagesResponse,
     AnthropicMessageStartEvent,
     AnthropicMessageStopEvent,
+    AnthropicPingEvent,
     AnthropicSignatureDelta,
     AnthropicStopReason,
     AnthropicTextBlock,
@@ -455,6 +457,13 @@ def _thinking_retention_kwargs(
     return {}
 
 
+# Anthropic's output_config.format has no name, but OpenAI's response_format
+# json_schema requires one, and a consumer that holds requests to the OpenAI
+# shape (the kimi_k3 serving extension does) rejects a schema without it. Guided
+# decoding reads only the schema, so the name changes nothing that is generated.
+_OUTPUT_FORMAT_SCHEMA_NAME = "structured_output"
+
+
 def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompletionRequest:
     """Translate an Anthropic Messages request into a chat completion request."""
     messages = _convert_messages(request)
@@ -499,6 +508,9 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
             chat_request["thinking_token_budget"] = request.thinking.budget_tokens
 
     if request.output_config:
+        # Forwarded as-is here (this adapter is model-agnostic); the model's
+        # serving extension normalizes it later because it is listed in
+        # injected_chat_template_kwargs below (e.g. MuseSpark maps `max`).
         reasoning_effort = request.output_config.get("effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
             chat_template_kwargs["reasoning_effort"] = reasoning_effort
@@ -515,7 +527,7 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
                 raise AnthropicRequestError("output_config.format.schema must be an object")
             chat_request["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"schema": schema},
+                "json_schema": {"name": _OUTPUT_FORMAT_SCHEMA_NAME, "schema": schema},
             }
 
     chat_template_kwargs.update(_thinking_retention_kwargs(request.context_management))
@@ -615,6 +627,29 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
+def anthropic_message_id(request_id: Optional[int]) -> str:
+    """The Anthropic message id for a generation.
+
+    The message keeps the server's id for the request, ``msg_<request id>_<random
+    hex>``, so a reply can be matched with the server's records of the same
+    request; the random part keeps the id unique across server restarts, which
+    restart the count. Without ``request_id`` the message id is random.
+
+    A single server passes the executor client id (``RequestOutput.request_id``).
+    The perf metrics, the post-processor hook records and the disconnect log
+    name the request by it; PyExecutor numbers its requests on its own, so its
+    log lines carry a different id.
+
+    A disaggregated server passes its disaggregated request id: each worker
+    numbers its own requests, so a worker's id can name different requests on
+    different workers, while the disaggregated request id is unique across the
+    deployment and is the one its perf metrics record.
+    """
+    if request_id is not None:
+        return f"msg_{request_id}_{uuid.uuid4().hex[:16]}"
+    return f"msg_{uuid.uuid4().hex}"
+
+
 def thinking_signature(thinking: str) -> str:
     """The signature of a thinking block this server generated.
 
@@ -630,8 +665,14 @@ def thinking_signature(thinking: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
-def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:
-    """Translate a non-streaming chat completion into an Anthropic message."""
+def convert_chat_response(
+    chat_response: ChatCompletionResponse, request_id: Optional[int] = None
+) -> AnthropicMessagesResponse:
+    """Translate a non-streaming chat completion into an Anthropic message.
+
+    ``request_id`` is the server's id for the request, when the caller has it;
+    the message id carries it (see ``anthropic_message_id``).
+    """
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
     stop_sequence: Optional[str] = None
@@ -677,6 +718,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         content.append(AnthropicTextBlock(text=""))
 
     return AnthropicMessagesResponse(
+        id=anthropic_message_id(request_id),
         model=chat_response.model,
         content=content,
         stop_reason=stop_reason,
@@ -737,9 +779,9 @@ class AnthropicStreamReframer:
     ``partial_json`` is exactly what upstream sent for it.
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, request_id: Optional[int] = None):
         self.model = model
-        self.message_id = f"msg_{uuid.uuid4().hex}"
+        self.message_id = anthropic_message_id(request_id)
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -1073,9 +1115,11 @@ class AnthropicStreamReframer:
 
 
 async def _iter_openai_sse_lines(
-    openai_sse: AsyncIterator[Union[str, bytes]],
-) -> AsyncIterator[str]:
+    openai_sse: AsyncIterator[Optional[Union[str, bytes]]],
+) -> AsyncIterator[Optional[str]]:
     """Yield complete lines from string frames or arbitrarily chunked bytes.
+
+    A None item, a tick from ``_with_ticks``, is passed through as None.
 
     The in-process server produces complete SSE strings, while the
     disaggregated frontend relays raw ``aiohttp`` byte chunks.  Network chunks
@@ -1088,24 +1132,33 @@ async def _iter_openai_sse_lines(
     buffer = ""
     input_type: Optional[type] = None
 
-    async for payload in openai_sse:
-        if not isinstance(payload, (str, bytes)):
-            raise TypeError(f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}")
+    try:
+        async for payload in openai_sse:
+            if payload is None:
+                yield None
+                continue
+            if not isinstance(payload, (str, bytes)):
+                raise TypeError(f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}")
 
-        current_type = type(payload)
-        if input_type is None:
-            input_type = current_type
-        elif current_type is not input_type:
-            raise TypeError("OpenAI SSE stream cannot mix str and bytes payloads")
+            current_type = type(payload)
+            if input_type is None:
+                input_type = current_type
+            elif current_type is not input_type:
+                raise TypeError("OpenAI SSE stream cannot mix str and bytes payloads")
 
-        if isinstance(payload, bytes):
-            buffer += decoder.decode(payload)
-        else:
-            buffer += payload
+            if isinstance(payload, bytes):
+                buffer += decoder.decode(payload)
+            else:
+                buffer += payload
 
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            yield line.rstrip("\r")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                yield line.rstrip("\r")
+    finally:
+        # Leaving these lines early leaves the upstream too.
+        aclose = getattr(openai_sse, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     if input_type is bytes:
         buffer += decoder.decode(b"", final=True)
@@ -1113,17 +1166,107 @@ async def _iter_openai_sse_lines(
         yield buffer.rstrip("\r")
 
 
+# Seconds a stream may stay silent before it sends a ping. Clients and proxies
+# reset their timers on any event; without one the stream is silent until the
+# first token (queueing and prefill), and for as long as the model writes a tool
+# call, which is sent only once complete.
+STREAM_PING_INTERVAL_S = 10.0
+
+
+async def _with_ticks(
+    source: AsyncIterator[Any], timeout: Callable[[], Optional[float]]
+) -> AsyncIterator[Any]:
+    """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
+
+    ``timeout()`` is asked before every wait; None waits for the next item. One
+    task reads ``source`` to its end, so a tick never interrupts a read and the
+    source is never resumed from another task; that task is cancelled when the
+    consumer stops.
+    """
+    # One item at a time: the reader waits for the consumer, so a slow client
+    # holds back the source as reading it directly would.
+    items: asyncio.Queue = asyncio.Queue(maxsize=1)
+    end = object()
+    consumer_stopped = False
+
+    async def read_all() -> None:
+        try:
+            async for item in source:
+                await items.put(item)
+        except asyncio.CancelledError:
+            if not consumer_stopped:
+                # Raised inside the source, not by the consumer stopping: the
+                # consumer still waits, and the end marker ends its stream
+                # instead of leaving it to pings.
+                await items.put(end)
+            raise
+        except Exception:
+            await items.put(end)
+            raise
+        else:
+            await items.put(end)
+        finally:
+            # The reader closes the source in every case: stopped while handing
+            # over an item, it leaves the source suspended at its yield.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    reader = asyncio.create_task(read_all())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout())
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            if item is end:
+                # Raises what reading the source raised.
+                await reader
+                return
+            yield item
+    finally:
+        consumer_stopped = True
+        reader.cancel()
+        # Return only once the reader has stopped and closed the source.
+        await asyncio.gather(reader, return_exceptions=True)
+
+
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
 ) -> AsyncIterator[str]:
-    """Translate an OpenAI SSE stream into Anthropic SSE frames."""
-    reframer = AnthropicStreamReframer(model=model)
+    """Translate an OpenAI SSE stream into Anthropic SSE frames.
+
+    ``request_id`` names the message as in ``convert_chat_response``.
+
+    Until [DONE], a ping goes out whenever no other event has for
+    ``STREAM_PING_INTERVAL_S`` seconds, before ``message_start`` too: the message
+    starts at the first upstream chunk, which carries the prompt's usage, so a
+    slow first token would otherwise leave the stream silent. Clients skip
+    pings wherever they appear.
+    """
+    reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
     # The frames that close the message, held from [DONE] until the upstream
     # has been read to its end.
     closing_frames: List[str] = []
+    loop = asyncio.get_running_loop()
+    last_event = loop.time()
+
+    def until_ping() -> Optional[float]:
+        if done:
+            return None
+        return max(0.0, STREAM_PING_INTERVAL_S - (loop.time() - last_event))
+
+    # The ticks wrap the upstream's payloads, not the lines split from them:
+    # one hand-off between the reading task and this one per payload.
+    lines = _iter_openai_sse_lines(_with_ticks(openai_sse, until_ping))
     try:
-        async for line in _iter_openai_sse_lines(openai_sse):
+        async for line in lines:
+            if line is None:
+                yield anthropic_sse(AnthropicPingEvent())
+                last_event = loop.time()
+                continue
             if done:
                 # The upstream is read to its end before the message is closed:
                 # the chat stream records the request's metrics after its last
@@ -1148,6 +1291,7 @@ async def reframe_openai_stream(
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
+                last_event = loop.time()
         if done:
             for frame in closing_frames:
                 yield frame
@@ -1177,3 +1321,6 @@ async def reframe_openai_stream(
             return
         for frame in reframer.error("Internal server error"):
             yield frame
+    finally:
+        # Stops the task reading the upstream when this stream ends early.
+        await lines.aclose()

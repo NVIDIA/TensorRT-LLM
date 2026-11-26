@@ -31,9 +31,39 @@ This page explains how TensorRT‑LLM's CI is organized and how individual tests
 
 ## CI pipelines
 
-Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test-db YAML file.
+Pull requests do not start testing by themselves. Developers trigger the CI by commenting `/bot run` (optionally with arguments) on the pull request (see [Pull Request Template](source:.github/pull_request_template.md) for more details). That kicks off the **merge-request pipeline** (defined in `jenkins/L0_MergeRequest.groovy`), which runs unit tests and integration tests whose YAML entries specify `stage: pre_merge`. Once a pull request is merged, the **post-merge pipeline** runs the same `jenkins/L0_MergeRequest.groovy` as a separate Jenkins job. It runs the pre-merge stages plus the multi-GPU stages and every stage with `Post-Merge` in its name, except that a stage whose name ends in `-k_of_N` runs only on the post-merge builds whose `BUILD_NUMBER % N == k % N`. In both pipelines, the test stages run in child jobs defined by `jenkins/L0_Test.groovy`, which maps each stage name to a test list: a top-level key of a test-db YAML file (usually the file's own name; a file may hold several lists).
 
 `stage` tags live in the YAML files under `tests/integration/test_lists/test-db/`. Searching those files for `stage: pre_merge` shows exactly which tests the merge-request pipeline covers.
+
+### C++ license checks
+
+The **Release Checks** GitHub Actions workflow checks C++ license headers through
+the `check-cpp-licenses` pre-commit hook, within the **Pre-commit Check** job. The
+hook checks changed source files under `cpp/include` and `cpp/tensorrt_llm`,
+including Python helpers, subject to pre-commit's global exclusions. It checks
+full Apache license headers using the filters and exceptions in
+`jenkins/license_cpp.json`. Jenkins Release-Check retains its Go license checker;
+the hook shares its policy configuration. All currently tracked LFS sources in
+these directories are excluded by pre-commit, so the workflow does not fetch LFS
+objects. Manual workflow runs and PRs with at least 2500 reported changed files
+retain the existing pre-commit fallback to all files.
+
+Run the checker locally without installing dependencies after materializing any
+LFS source files. With no arguments, it scans both source trees in full, including
+files excluded by pre-commit. Use `--files` to check specific files instead:
+
+```bash
+python3 scripts/check_cpp_licenses.py
+python3 scripts/check_cpp_licenses.py --files cpp/include/tensorrt_llm/executor/types.h
+```
+
+The workflow runs on pull requests and supports manual runs against a specified
+ref. A license failure fails the same job as a pre-commit failure. Before replacing
+the Jenkins skip checks with GHA alone, make **Pre-commit Check** and **Check Test
+List** required checks in the repository ruleset, and ensure the Check Test List
+workflow has landed. The bot implementation in `trtllm-github-ci` must be updated
+separately to stop triggering Jenkins ReleaseCheck_PR; changing the Release Checks
+workflow does not change the bot's skip behavior.
 
 ## Test definitions
 
@@ -65,7 +95,7 @@ Unit tests live under `tests/unittest/`. They are listed in the same test-db YAM
     "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
 ```
 
-The array elements are: GPU type, YAML file (without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
+The array elements are: GPU type, test list (here the YAML file name without extension), shard index, and total number of shards. Only tests with `stage: post_merge` from that YAML file are selected when a `Post-Merge` stage runs.
 
 Stage names are unbracketed, with `Post-Merge` embedded directly in the name. Copy the name exactly as it appears in the Groovy map. Jenkins `stage_list` matches names without a `*` wildcard exactly, so a stale spelling such as `A100X-Triton-[Post-Merge]-1` silently selects nothing. The mapping script's `--stages` option is stricter: it reports unknown names and near-match suggestions on stderr.
 
@@ -108,22 +138,18 @@ This executes the same tests that run post-merge for this hardware/backend.
 
 ## Waiving tests
 
-Sometimes a test is known to fail due to a bug or unsupported feature. Instead
-of removing it from the YAML test lists, add the test name to
-`tests/integration/test_lists/waives.txt`. Every CI run passes this file to
-pytest via `--waives-file`, so the listed tests are skipped automatically.
+For failing tests that should be retained and fixed, add `<test> SKIP (reason)`
+to `tests/integration/test_lists/waives.txt` and keep their YAML registrations.
+Include a tracking bug or brief explanation and remove the waive after verifying
+the fix. Choose a scope appropriate to the failure; widespread issues can justify
+a temporary whole-entry or multi-platform waive. Tests deliberately retired for
+low value or redundant coverage should be removed with their registrations and
+obsolete waives, rather than waived indefinitely.
 
-Each line contains the fully qualified test name followed by an optional
-`SKIP (reason)` marker. A `full:GPU_TYPE/` prefix restricts the waive to a
-specific hardware family. Example:
-
-```text
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
-full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
-```
-
-Changes to `waives.txt` should include a bug link or brief explanation so other
-developers understand why the test is disabled.
+For matching rules, platform/SM prefixes, and troubleshooting, see
+[`tests/integration/test_lists/README.md`](source:tests/integration/test_lists/README.md)
+(routine edit rules live in
+[`tests/integration/test_lists/AGENTS.md`](source:tests/integration/test_lists/AGENTS.md)).
 
 ## Multi-GPU Tests
 
@@ -161,6 +187,11 @@ actor and normally removes invalid approvals. This is a best-effort resource
 governance guard, not a strict authorization boundary. The label remains in
 place when new commits are pushed and can be removed manually when the approval
 no longer applies.
+
+Post-merge perf-sanity stages (stage names containing both `PerfSanity` and
+`Post-Merge`) run automatically only in the official post-merge pipeline. In
+any other pipeline, including a `/bot run --post-merge` run, such a stage runs
+only when `--stage-list` or `--extra-stage` names it.
 
 When you only need to verify a handful of post-merge tests, specify exactly
 which stages to run:

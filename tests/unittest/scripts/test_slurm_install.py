@@ -14,8 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+import re
+import shlex
+import shutil
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -26,6 +32,60 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BASH_UTILS = REPO_ROOT / "jenkins" / "scripts" / "bash_utils.sh"
 SLURM_INSTALL = REPO_ROOT / "jenkins" / "scripts" / "slurm_install.sh"
 L0_TEST = REPO_ROOT / "jenkins" / "L0_Test.groovy"
+BUILD_GROOVY = REPO_ROOT / "jenkins" / "Build.groovy"
+# The pipelines that run the read helper against the aws location with a netrc they write.
+BUILD_ARTIFACT_READERS = (
+    L0_TEST,
+    REPO_ROOT / "jenkins" / "BuildDockerImage.groovy",
+    REPO_ROOT / "jenkins" / "BoltProfileGen.groovy",
+    REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy",
+)
+AWS_HOST = "artifactory.nvidia.com"
+
+# The launcher copies the scripts into the job workspace under this per-job prefix.
+JOB_PREFIX = "cluster-multi_node_test-0a1b2c-"
+ARTIFACT_PATH = (
+    "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_MergeRequest_PR/1234/TensorRT-LLM.tar.gz"
+)
+CREDENTIAL_ID = "test-reader-credential"
+NETRC_PASSWORD = "netrc-password-5d1e9c0a"
+PAYLOAD = "packaged build contents\n"
+# What the job script exports for the read helper.
+HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+
+# Stands in for fetch_build_artifact.sh. It records its arguments, the environment it sees, and
+# whether the netrc exists, and plays back the planned exit statuses, one per call; the last one
+# repeats. A successful call writes the packaged build to <dest-file>; a failed one leaves a partial
+# file there, which must never be moved into place.
+_FETCH_STUB = r"""
+import json
+import os
+import sys
+
+with open(os.environ["FETCH_STUB_LOG"], "a", encoding="utf-8") as log:
+    log.write(
+        json.dumps(
+            {
+                "args": sys.argv[1:],
+                "env": {name: os.environ.get(name) for name in json.loads(os.environ["FETCH_STUB_ENV"])},
+                "netrc_present": os.path.isfile(os.environ.get("ARTIFACTORY_NETRC", "")),
+            }
+        )
+        + "\n"
+    )
+with open(os.environ["FETCH_STUB_LOG"], encoding="utf-8") as log:
+    call_index = len(log.readlines()) - 1
+statuses = json.loads(os.environ["FETCH_STUB_STATUSES"])
+status = statuses[min(call_index, len(statuses) - 1)]
+with open(sys.argv[2], "w", encoding="utf-8") as dest:
+    dest.write(os.environ["FETCH_STUB_PAYLOAD"] if status == 0 else "partial")
+sys.exit(status)
+"""
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
 
 
 @pytest.mark.parametrize("with_timeout", (False, True))
@@ -75,14 +135,52 @@ fi
 
 
 @pytest.mark.parametrize(
-    "missing", ("tarName", "llmTarfile", "resourcePathNode", "stageName", "pytestCommand")
+    ("retry_on", "attempts"), (("23", 3), ("7,124", 1)), ids=("listed", "not-listed")
+)
+def test_retry_command_retries_only_the_listed_statuses(retry_on: str, attempts: int) -> None:
+    env = os.environ.copy()
+    env["BASH_UTILS"] = str(BASH_UTILS)
+    env["RETRY_ON"] = retry_on
+    env["ATTEMPTS"] = str(attempts)
+
+    command = r"""
+set -e
+source "$BASH_UTILS"
+attempt=0
+
+sleep() {
+    :
+}
+
+fail() {
+    attempt=$((attempt + 1))
+    return 23
+}
+
+if retry_command 3 0 --retry-on "$RETRY_ON" fail; then
+    exit 99
+else
+    rc=$?
+fi
+[[ "$rc" -eq 23 ]]
+[[ "$attempt" -eq "$ATTEMPTS" ]]
+"""
+    result = subprocess.run(
+        ["bash", "-c", command], env=env, capture_output=True, text=True, timeout=60
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.parametrize(
+    "missing", ("tarName", "llmTarArtifactPath", "resourcePathNode", "stageName", "pytestCommand")
 )
 def test_slurm_install_requires_artifact_inputs(missing: str) -> None:
     env = os.environ.copy()
     env.update(
         {
             "tarName": "/tmp/TensorRT-LLM.tar.gz",
-            "llmTarfile": "https://example.invalid/TensorRT-LLM.tar.gz",
+            "llmTarArtifactPath": ARTIFACT_PATH,
             "resourcePathNode": "/tmp",
             "stageName": "test-stage",
             "pytestCommand": "pytest",
@@ -102,12 +200,1053 @@ def test_slurm_install_requires_artifact_inputs(missing: str) -> None:
     assert f"{missing} is required" in result.stderr
 
 
-def test_l0_artifact_download_retries_overwrite_archive() -> None:
-    download_commands = [
+@dataclass
+class _Run:
+    """Outcome of running slurm_install.sh from a job workspace."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    fetch_calls: list[dict[str, object]]
+    archive: Path
+    netrc: Path
+    netrc_at_extraction: bool
+
+    @property
+    def output(self) -> str:
+        return self.stdout + self.stderr
+
+
+def _run_slurm_install(
+    tmp_path: Path,
+    statuses: list[int],
+    step_num_nodes: int = 1,
+    *,
+    cpp_bundle: bool = False,
+    fat: bool = False,
+) -> _Run:
+    """Run slurm_install.sh as a node of a Slurm job does, up to extracting the downloaded package.
+
+    The script, bash_utils.sh, and a stub read helper sit in a job workspace under one per-job
+    prefix, as the launcher copies them. A stub ``tar`` records its arguments and whether the
+    test's netrc still exists, and exits 42, which ends the setup right after the download; a stub
+    ``sleep`` makes the retry interval instant, and a stub ``timeout`` records each attempt's limit
+    before running the attempt. The node is one of the ``step_num_nodes`` nodes of the step;
+    SLURM_NODEID only names its temporary file.
+    """
+    workspace = tmp_path / "job-workspace"
+    workspace.mkdir()
+    install = workspace / f"{JOB_PREFIX}slurm_install.sh"
+    install.write_text(
+        SLURM_INSTALL.read_text().replace(
+            "resourcePathNode=/tmp", 'resourcePathNode="$TEST_RESOURCE_DIR"'
+        )
+    )
+    shutil.copy(BASH_UTILS, workspace / f"{JOB_PREFIX}bash_utils.sh")
+    stub_script = tmp_path / "fetch_stub.py"
+    stub_script.write_text(_FETCH_STUB, encoding="utf-8")
+    _write_executable(
+        workspace / f"{JOB_PREFIX}fetch_build_artifact.sh",
+        f'exec {shlex.quote(sys.executable)} -I -S {shlex.quote(str(stub_script))} "$@"\n',
+    )
+
+    bin_dir = tmp_path / "stub_bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "tar",
+        '#!/bin/bash\nprintf "%s\\n" "$@" > "$TAR_STUB_LOG"\n'
+        'if [ -e "$TAR_STUB_NETRC" ]; then touch "$TAR_STUB_NETRC_SEEN"; fi\n'
+        'if [[ "$TEST_CPP_BUNDLE" == 1 && "$2" == */TensorRT-LLM.tar.gz ]]; then\n'
+        '  mkdir -p "$TEST_RESOURCE_DIR/TensorRT-LLM/src"\n  exit 0\nfi\nexit 42\n',
+    )
+    for command in ("apt-get", "pip3"):
+        _write_executable(
+            bin_dir / command,
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$INSTALL_STUB_LOG"\nexit 0\n',
+        )
+    _write_executable(bin_dir / "sleep", '#!/bin/bash\necho "$@" >> "$SLEEP_STUB_LOG"\n')
+    _write_executable(
+        bin_dir / "timeout", '#!/bin/bash\necho "$1" >> "$TIMEOUT_STUB_LOG"\nshift\nexec "$@"\n'
+    )
+
+    netrc = workspace / "artifactory-netrc"
+    netrc.write_text(
+        f"machine artifactory.nvidia.com login ci-reader password {NETRC_PASSWORD}\n",
+        encoding="utf-8",
+    )
+    netrc.chmod(0o600)
+
+    resource_dir = tmp_path / "resource"
+    resource_dir.mkdir()
+    cpp_artifact_path = ARTIFACT_PATH.rsplit("/", 1)[0] + "/cpp-tests-TensorRT-LLM.tar.gz"
+    fetch_log = tmp_path / "fetch_calls.jsonl"
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in (*HELPER_ENVIRONMENT, "llmTarfile", "GITHUB_CLONE_TOKEN", "BASH_ENV")
+        and not name.startswith("SLURM_")
+    }
+    env.update(
+        {
+            "PATH": os.pathsep.join((str(bin_dir), env.get("PATH", os.defpath))),
+            "HOME": str(tmp_path),
+            "tarName": "TensorRT-LLM.tar.gz",
+            "llmTarArtifactPath": ARTIFACT_PATH,
+            "resourcePathNode": str(resource_dir),
+            "stageName": "RTX5090-CPP-1" if cpp_bundle else "test-stage",
+            "pytestCommand": "pytest",
+            "cppTestTarArtifactPath": cpp_artifact_path if cpp_bundle else "",
+            "SKIP_INSTALL": "1" if fat else "0",
+            "TEST_CPP_BUNDLE": "1" if cpp_bundle else "0",
+            "TEST_RESOURCE_DIR": str(resource_dir),
+            "INSTALL_STUB_LOG": str(tmp_path / "install_args.txt"),
+            "SLURM_LOCALID": "0",
+            "SLURM_JOB_ID": "4321",
+            "SLURM_STEP_ID": "0",
+            "SLURM_STEP_NUM_NODES": str(step_num_nodes),
+            "SLURM_NODEID": "2",
+            "LLM_ARTIFACTS_PRIMARY": "aws",
+            "ARTIFACTORY_NETRC": str(netrc),
+            "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
+            "FETCH_STUB_LOG": str(fetch_log),
+            "FETCH_STUB_ENV": json.dumps(HELPER_ENVIRONMENT),
+            "FETCH_STUB_STATUSES": json.dumps(statuses),
+            "FETCH_STUB_PAYLOAD": PAYLOAD,
+            "TAR_STUB_LOG": str(tmp_path / "tar_args.txt"),
+            "TAR_STUB_NETRC": str(netrc),
+            "TAR_STUB_NETRC_SEEN": str(tmp_path / "tar_saw_netrc"),
+            "SLEEP_STUB_LOG": str(tmp_path / "sleep_args.txt"),
+            "TIMEOUT_STUB_LOG": str(tmp_path / "timeout_args.txt"),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(install)], env=env, capture_output=True, text=True, timeout=60
+    )
+    fetch_calls = (
+        [json.loads(line) for line in fetch_log.read_text(encoding="utf-8").splitlines()]
+        if fetch_log.exists()
+        else []
+    )
+    run = _Run(
+        result.returncode,
+        result.stdout,
+        result.stderr,
+        fetch_calls,
+        resource_dir / "TensorRT-LLM.tar.gz",
+        netrc,
+        (tmp_path / "tar_saw_netrc").exists(),
+    )
+
+    # The job script traces its commands, and the netrc reaches the helper only by path.
+    assert any(line.startswith("+") for line in run.stderr.splitlines())
+    assert NETRC_PASSWORD not in run.output
+    for call in run.fetch_calls:
+        expected_destinations = {
+            ARTIFACT_PATH: f"{run.archive}.tmp.4321.2",
+            cpp_artifact_path: str(resource_dir / "cpp-tests-TensorRT-LLM.tar.gz"),
+        }
+        assert call["args"][1] == expected_destinations[call["args"][0]]
+        assert call["env"] == {
+            "LLM_ARTIFACTS_PRIMARY": "aws",
+            "ARTIFACTORY_NETRC": str(netrc),
+            "ARTIFACTORY_CREDENTIAL_ID": CREDENTIAL_ID,
+        }
+        # Every attempt, retries included, still finds the netrc.
+        assert call["netrc_present"]
+    assert list(resource_dir.glob("*.tmp.*")) == []
+    return run
+
+
+@pytest.mark.parametrize("fat", (False, True))
+def test_slurm_install_cpp_bundle_uses_existing_credentials(tmp_path: Path, fat: bool) -> None:
+    run = _run_slurm_install(tmp_path, [0], cpp_bundle=True, fat=fat)
+    assert run.returncode == 42, run.output
+    assert len(run.fetch_calls) == (1 if fat else 2)
+    cpp_archive = run.archive.parent / "cpp-tests-TensorRT-LLM.tar.gz"
+    assert cpp_archive.read_text() == PAYLOAD
+    assert (tmp_path / "tar_args.txt").read_text().splitlines() == [
+        "-zxf",
+        str(cpp_archive),
+        "-C",
+        str(run.archive.parent / "TensorRT-LLM/src"),
+    ]
+    assert not run.netrc_at_extraction
+    assert not run.netrc.exists()
+    if not fat:
+        assert "requirements-grpc-smg.txt" in (tmp_path / "install_args.txt").read_text()
+
+
+def test_slurm_install_missing_cpp_bundle_fails(tmp_path: Path) -> None:
+    run = _run_slurm_install(tmp_path, [0, 2], cpp_bundle=True)
+    assert run.returncode == 1, run.output
+    assert len(run.fetch_calls) == 2
+    assert "C++ test artifact download failed:" in run.stdout
+    assert not (tmp_path / "tar_args.txt").exists()
+    assert not run.netrc.exists()
+
+
+def test_slurm_install_setup_downloads_package_through_retries(tmp_path: Path) -> None:
+    run = _run_slurm_install(tmp_path, [4, 0])
+
+    assert run.returncode == 42, run.output
+    assert (tmp_path / "tar_args.txt").read_text(encoding="utf-8").split() == [
+        "-zxf",
+        str(run.archive),
+    ]
+    assert run.archive.read_text(encoding="utf-8") == PAYLOAD
+    assert len(run.fetch_calls) == 2
+    assert (tmp_path / "timeout_args.txt").read_text(encoding="utf-8").split() == ["1800", "1800"]
+    assert len((tmp_path / "sleep_args.txt").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_slurm_install_setup_deletes_the_netrc_before_extracting_the_package(
+    tmp_path: Path,
+) -> None:
+    run = _run_slurm_install(tmp_path, [4, 0])
+
+    assert run.returncode == 42, run.output
+    # On one node, the netrc is gone before the package is extracted.
+    assert not run.netrc_at_extraction
+    assert not run.netrc.exists()
+
+
+def test_slurm_install_setup_fails_after_retrying_a_failed_transfer(tmp_path: Path) -> None:
+    run = _run_slurm_install(tmp_path, [4])
+
+    assert run.returncode == 1, run.output
+    assert len(run.fetch_calls) == 3
+    assert f"Artifact download failed: {ARTIFACT_PATH}" in run.stdout
+    assert not run.archive.exists()
+    assert not (tmp_path / "tar_args.txt").exists()
+    assert not run.netrc.exists()
+
+
+@pytest.mark.parametrize("status", (2, 3, 64), ids=("absent", "rejected", "usage-error"))
+def test_slurm_install_setup_does_not_retry_a_final_failure(tmp_path: Path, status: int) -> None:
+    run = _run_slurm_install(tmp_path, [status])
+
+    assert run.returncode == 1, run.output
+    # The helper's other failures are final: one attempt, and no wait.
+    assert len(run.fetch_calls) == 1
+    assert not (tmp_path / "sleep_args.txt").exists()
+    assert f"Artifact download failed: {ARTIFACT_PATH}" in run.stdout
+    assert not run.archive.exists()
+    assert not (tmp_path / "tar_args.txt").exists()
+    assert not run.netrc.exists()
+
+
+def test_slurm_install_setup_retries_an_attempt_that_timed_out(tmp_path: Path) -> None:
+    run = _run_slurm_install(tmp_path, [124, 0])
+
+    assert run.returncode == 42, run.output
+    assert len(run.fetch_calls) == 2
+    assert "Command timed out after 1800s. Attempt 1/3." in run.stdout
+    assert run.archive.read_text(encoding="utf-8") == PAYLOAD
+
+
+def test_slurm_install_setup_leaves_a_shared_netrc_to_the_step_after_a_failure(
+    tmp_path: Path,
+) -> None:
+    run = _run_slurm_install(tmp_path, [2], step_num_nodes=2)
+
+    assert run.returncode == 1, run.output
+    # The step's other node may still be downloading with it.
+    assert run.netrc.exists()
+
+
+def _write_netrc(path: Path) -> Path:
+    path.write_text(
+        f"machine {AWS_HOST} login ci-reader password {NETRC_PASSWORD}\n", encoding="utf-8"
+    )
+    path.chmod(0o600)
+    return path
+
+
+def _remove_netrc_on_node(netrc: Path, **slurm: str) -> subprocess.CompletedProcess[str]:
+    """Run slurm_install.sh's netrc removal as a node of a Slurm step does after its download.
+
+    ``slurm`` sets Slurm variables over node 0 of step 0 of job 4321, the job's first run.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "BASH_ENV" and not name.startswith("SLURM_")
+    }
+    env.update(
+        {
+            "SLURM_INSTALL": str(SLURM_INSTALL),
+            "ARTIFACTORY_NETRC": str(netrc),
+            "SLURM_JOB_ID": "4321",
+            "SLURM_STEP_ID": "0",
+            "SLURM_NODEID": "0",
+            **slurm,
+        }
+    )
+    return subprocess.run(
+        ["bash", "-c", 'source "$SLURM_INSTALL" && remove_artifactory_netrc'],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_slurm_install_deletes_a_shared_netrc_once_every_node_has_downloaded(
+    tmp_path: Path,
+) -> None:
+    netrc = _write_netrc(tmp_path / "artifactory-netrc")
+
+    # The step runs on 2 of the job's 4 nodes.
+    first = _remove_netrc_on_node(
+        netrc, SLURM_NODEID="1", SLURM_STEP_NUM_NODES="2", SLURM_JOB_NUM_NODES="4"
+    )
+    assert first.returncode == 0, first.stderr
+    # The step's other node may still be downloading with it.
+    assert netrc.exists()
+
+    last = _remove_netrc_on_node(
+        netrc, SLURM_NODEID="0", SLURM_STEP_NUM_NODES="2", SLURM_JOB_NUM_NODES="4"
+    )
+    assert last.returncode == 0, last.stderr
+    assert not netrc.exists()
+
+
+@pytest.mark.parametrize(
+    ("earlier", "this"),
+    (
+        ({"SLURM_JOB_ID": "1234"}, {}),
+        ({"SLURM_STEP_ID": "1"}, {}),
+        ({}, {"SLURM_RESTART_COUNT": "1"}),
+    ),
+    ids=("other-job", "other-step", "requeued-run"),
+)
+def test_slurm_install_counts_only_the_nodes_of_its_own_run_of_the_step(
+    tmp_path: Path, earlier: dict[str, str], this: dict[str, str]
+) -> None:
+    netrc = _write_netrc(tmp_path / "artifactory-netrc")
+
+    other = _remove_netrc_on_node(netrc, SLURM_NODEID="1", SLURM_STEP_NUM_NODES="2", **earlier)
+    assert other.returncode == 0, other.stderr
+
+    this_node = _remove_netrc_on_node(netrc, SLURM_NODEID="0", SLURM_STEP_NUM_NODES="2", **this)
+    assert this_node.returncode == 0, this_node.stderr
+    # Node 1 of this run of the step has not finished its download yet.
+    assert netrc.exists()
+
+
+@pytest.mark.parametrize("step_num_nodes", ("two", "0"))
+def test_slurm_install_leaves_the_netrc_on_an_unexpected_node_count(
+    tmp_path: Path, step_num_nodes: str
+) -> None:
+    netrc = _write_netrc(tmp_path / "artifactory-netrc")
+
+    run = _remove_netrc_on_node(netrc, SLURM_STEP_NUM_NODES=step_num_nodes)
+
+    assert run.returncode == 0, run.stderr
+    assert netrc.exists()
+
+
+def _l0_test_code_lines() -> list[str]:
+    """Return the code lines of jenkins/L0_Test.groovy, as _groovy_code_lines does."""
+    return _groovy_code_lines(L0_TEST)
+
+
+def _groovy_code(path: Path) -> str:
+    """Return the code lines of a Groovy file, as _groovy_code_lines does, joined by newlines."""
+    return "\n".join(_groovy_code_lines(path))
+
+
+def _groovy_code_lines(path: Path) -> list[str]:
+    """Return the code lines of a Groovy file.
+
+    Whole-line and block comments are dropped, and backslash-continued lines are joined; a
+    statement that spans lines without a backslash stays split across them.
+    """
+    code = []
+    in_block_comment = False
+    continued = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if in_block_comment:
+            in_block_comment = "*/" not in stripped
+            continue
+        if stripped.startswith("/*"):
+            in_block_comment = "*/" not in stripped
+            continue
+        if stripped.startswith("//"):
+            continue
+        if line.rstrip().endswith("\\"):
+            continued += line.rstrip().rstrip("\\") + " "
+            continue
+        code.append(continued + line)
+        continued = ""
+    return code
+
+
+def _groovy_function_body(lines: list[str], name: str) -> str:
+    """Return the top-level Groovy function ``name``, up to the next top-level definition."""
+    starts = [index for index, line in enumerate(lines) if re.match(rf"(def|void) {name}\(", line)]
+    assert len(starts) == 1, f"expected one top-level definition of {name}"
+    start = starts[0]
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith(("def ", "void "))
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _enclosing_blocks(lines: list[str], index: int) -> list[str]:
+    """Return the openers of the blocks around ``lines[index]``, innermost first, by indentation."""
+    openers = []
+    indent = len(lines[index]) - len(lines[index].lstrip())
+    for line in reversed(lines[:index]):
+        stripped = line.strip()
+        line_indent = len(line) - len(stripped) if stripped else indent
+        if line_indent < indent and stripped.endswith("{"):
+            openers.append(stripped)
+            indent = line_indent
+    return openers
+
+
+def test_l0_reads_packaged_builds_through_fetch_helper() -> None:
+    lines = _l0_test_code_lines()
+    definitions = [line for line in lines if re.match(r"\s*def fetchBuildArtifact\(", line)]
+    assert len(definitions) == 1
+    body = _groovy_function_body(lines, "fetchBuildArtifact")
+    assert "llmExecStepWithRetry" in body
+    assert "readHelperPath(pipeline)" in body
+    helper_body = _groovy_function_body(lines, "readHelperPath")
+    assert "fetch_build_artifact.sh" in helper_body
+    assert "unstash(FETCH_BUILD_ARTIFACT_STASH)" in helper_body
+
+
+def _fetch_script(command: str, status_path: Path) -> str:
+    r"""Build the script that fetchBuildArtifact runs around the read helper, from the Groovy source.
+
+    The string is put together as Groovy does: its literals are joined, ``${name}`` takes the value
+    of the local variable or top-level constant, and ``\$`` and ``\"`` become ``$`` and ``"``.
+    """
+    body = _groovy_function_body(_l0_test_code_lines(), "fetchBuildArtifact")
+    start = body.index("def script = ")
+    literals = []
+    for line in body[start:].splitlines():
+        literals += re.findall(r'"((?:[^"\\]|\\.)*)"', line)
+        if not line.rstrip().endswith("+"):
+            break
+    values = {
+        "command": command,
+        "statusPath": str(status_path),
+        **dict(
+            re.findall(
+                r"^(FETCH_[A-Z_]+) = (\d+)$", L0_TEST.read_text(encoding="utf-8"), re.MULTILINE
+            )
+        ),
+    }
+    script = re.sub(r"(?<!\\)\$\{(\w+)\}", lambda match: values[match[1]], "".join(literals))
+    return script.replace('\\"', '"').replace("\\$", "$")
+
+
+@pytest.mark.parametrize("status", (0, 2, 3, 4, 5, 64))
+def test_l0_fetch_repeats_only_a_failed_transfer(tmp_path: Path, status: int) -> None:
+    status_path = tmp_path / "fetch-status"
+    script = _fetch_script(f"sh -c 'exit {status}'", status_path)
+
+    # Jenkins runs the script of an sh step with -xe.
+    result = subprocess.run(["sh", "-xe", "-c", script], capture_output=True, text=True, timeout=60)
+
+    if status == 4:
+        # The script fails, so llmExecStepWithRetry repeats the step.
+        assert result.returncode == 4, result.stderr
+        assert not status_path.exists()
+    else:
+        # The script succeeds, and fetchBuildArtifact fails the step on the recorded status.
+        assert result.returncode == 0, result.stderr
+        assert status_path.read_text(encoding="utf-8").strip() == str(status)
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "runLLMTestlistWithAgent",
+        "runLLMTestlistWithSbatch",
+        "runLLMDocBuild",
+        "runLLMTestlistOnPlatformImpl",
+    ],
+)
+def test_l0_packaged_build_reader_downloads_through_fetch_helper(reader: str) -> None:
+    body = _groovy_function_body(_l0_test_code_lines(), reader)
+
+    # A download whose destination names the packaged build; an --exists probe has none.
+    assert re.search(r"\bfetchBuildArtifact\(pipeline, [^,]+, [^,)]*tarName[^,)]*\)", body)
+
+
+def test_l0_has_no_direct_download_of_packaged_builds() -> None:
+    package_names = ("llmTarfile", "llmTarArtifactPath", "TARNAME", "tarName")
+    package_downloads = [
         line.strip()
-        for line in L0_TEST.read_text().splitlines()
-        if "wget -nv" in line and "llmTarfile" in line
+        for line in _l0_test_code_lines()
+        if re.search(r"\b(wget|curl)\b", line) and any(name in line for name in package_names)
     ]
 
-    assert len(download_commands) == 3
-    assert all("wget -nv -O" in command for command in download_commands)
+    assert package_downloads == []
+
+
+def test_fat_sqsh_builder_reads_the_package_through_fetch_helper() -> None:
+    scripts_dir = REPO_ROOT / "jenkins" / "scripts"
+    inline = (scripts_dir / "fat_build_inline.sh").read_text(encoding="utf-8")
+    body = (scripts_dir / "fat_build_sbatch_body.sh").read_text(encoding="utf-8")
+    prepare = (scripts_dir / "prepare_container.sh").read_text(encoding="utf-8")
+
+    code_lines = [
+        line for line in inline.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not [line for line in code_lines if re.search(r"\b(wget|curl)\b", line)]
+    assert re.search(
+        r'bash "\$FAT_FETCH_HELPER_PATH" "\$LLM_TAR_ARTIFACT_PATH" "\$WORK_DIR/\$TAR_NAME"',
+        inline,
+    )
+    # The builder and Prepare Container delete the builder's netrc.
+    assert "trap removeNetrc EXIT" in body
+    assert "trap removeUnusedNetrc EXIT" in prepare
+
+    # Every hash of the fat sqsh cache key is on the artifact path, not a location URL.
+    key = """printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|"""
+    assert key in body
+    assert key in prepare
+    l0_key = "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}'"
+    assert l0_key in L0_TEST.read_text(encoding="utf-8")
+
+
+def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:
+    lines = _l0_test_code_lines()
+    body = _groovy_function_body(lines, "runLLMTestlistWithSbatch")
+    body_lines = body.splitlines()
+
+    # The helper from the run's commit goes beside slurm_install.sh, which finds it by its own
+    # file name.
+    assert (
+        'def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"'
+        in body
+    )
+    assert "def scriptFetchHelperLocalPath = readHelperPath(pipeline)" in body
+    assert re.search(
+        r"Utils\.copyFileToRemoteHost\(\s*pipeline,\s*remote,\s*scriptFetchHelperLocalPath,"
+        r"\s*scriptFetchHelperPathNode,\s*true\s*\)",
+        body,
+    )
+
+    # Every job gets the helper's netrc, since the helper on the node contacts
+    # artifactory.nvidia.com whenever aws is the primary, wherever the package is.
+    netrc_writes = [
+        index
+        for index, line in enumerate(body_lines)
+        if "trtllm_utils.writeArtifactoryNetrc(artifactoryNetrcPathLocal)" in line
+    ]
+    assert len(netrc_writes) == 1
+    openers = _enclosing_blocks(body_lines, netrc_writes[0])
+    assert 'stage("Initialize Test") {' in openers
+    within_stage = openers[: openers.index('stage("Initialize Test") {')]
+    assert [opener for opener in within_stage if opener.startswith("if")] == []
+    assert re.search(
+        r"Utils\.copyFileToRemoteHost\(\s*pipeline,\s*remote,\s*artifactoryNetrcPathLocal,"
+        r"\s*artifactoryNetrcPathNode\s*\)",
+        body,
+    )
+
+    # Before the netrc reaches the job workspace, the attempt's job is registered for the off-pod
+    # cleanup under an entry of its own, whatever an earlier attempt left registered.
+    registrations = [
+        index
+        for index, line in enumerate(body_lines)
+        if "registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID,"
+        " usedSbatch: true])" in line
+    ]
+    assert len(registrations) == 1
+    assert registrations[0] < netrc_writes[0]
+    openers = _enclosing_blocks(body_lines, registrations[0])
+    within_stage = openers[: openers.index('stage("Initialize Test") {')]
+    assert [opener for opener in within_stage if opener.startswith("if")] == []
+    register = _groovy_function_body(lines, "registerSlurmResource")
+    assert 'id: "${stageName}/slurm/${fields.jobUID ?: fields.nodeName}"' in register
+
+    # The job script exports what the helper and slurm_install.sh read, with no condition.
+    # llmTarfile is the URL that --exists resolved on the agent, for the older slurm_install.sh
+    # inside a package built before the helper existed.
+    exports = [line.strip() for line in body_lines if re.search(r"\bexport \w+=", line)]
+    for name, value in (
+        ("llmTarArtifactPath", "$llmTarArtifactPath"),
+        ("LLM_ARTIFACTS_PRIMARY", "${llmArtifactsPrimary()}"),
+        ("ARTIFACTORY_NETRC", "$artifactoryNetrcPathNode"),
+        ("ARTIFACTORY_CREDENTIAL_ID", "$LLM_ARTIFACTS_CREDENTIALS_ID"),
+        ("llmTarfile", "$llmTarfile"),
+    ):
+        assert [line for line in exports if re.search(rf"\bexport {name}=", line)] == [
+            f"export {name}={value}"
+        ]
+    assert "llmTarfileSha1" not in body
+    assert "llmTarfileOnAws" not in body
+
+    # A retry that reuses the job workspace keeps both files.
+    keep_list = re.search(r"def filesToKeepWhenRetry = \[(?P<items>[^\]]*)\]", body)
+    assert keep_list
+    kept = {item.strip() for item in keep_list.group("items").split(",")}
+    assert {"scriptFetchHelperPathNode", "artifactoryNetrcPathNode"} <= kept
+
+    # The shared library writes the netrc, with one entry that names its host; a "default" entry
+    # would send the token to every host, including the CDN. The pipeline writes no netrc of its
+    # own for the helper.
+    assert _netrc_writers(lines) == []
+
+
+def test_l0_reads_build_artifacts_and_pulls_images_with_separate_credential_settings() -> None:
+    lines = _l0_test_code_lines()
+
+    # The helper's netrc and the credential name that the helper prints come from one setting:
+    # the aws location of the shared library, whose netrc writer binds that location's credential.
+    code = "\n".join(lines)
+    assert _netrc_writers(lines) == []
+    assert _assignments(code, "LLM_ARTIFACTS_CREDENTIALS_ID") == [
+        "LLM_ARTIFACTS_LOCATIONS.aws.credential"
+    ]
+    fetch = _groovy_function_body(lines, "fetchBuildArtifact")
+    assert '"ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",' in fetch
+    # fetchBuildArtifact gives the helper the netrc that the library writes for the aws location,
+    # as the Slurm launcher does.
+    assert "trtllm_utils.writeArtifactoryNetrc(netrcPath)" in fetch
+    assert '"ARTIFACTORY_NETRC=${netrcPath}",' in fetch
+
+    # The enroot credentials of Slurm jobs and the docker login before an image pull keep the
+    # image-pull setting.
+    logins = [
+        index
+        for index, line in enumerate(lines)
+        if "machine ${ARTIFACTORY_DOCKER_HOST} login" in line
+        or "docker login ${ARTIFACTORY_DOCKER_HOST}" in line
+    ]
+    assert logins
+    for index in logins:
+        credential = next(line for line in reversed(lines[:index]) if "credentialsId:" in line)
+        assert credential.strip() == "credentialsId: ARTIFACTORY_CREDENTIALS_ID,", lines[index]
+
+    # That setting holds the image-pull identity, not the credential that publishes build artifacts.
+    publishing = _artifact_location_field(_groovy_code(BUILD_GROOVY), "aws", "credential")
+    assert _groovy_string("\n".join(lines), "ARTIFACTORY_CREDENTIALS_ID") != publishing
+
+
+def test_l0_deletes_checkpoints_with_each_locations_publishing_credential() -> None:
+    """A checkpoint delete sends each location's publishing credential through a netrc."""
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # The shared library writes each entry of the delete's netrc: it names its location's host and
+    # holds the identity that publishes to that location. This pipeline and Build.groovy take the
+    # locations from the library, so each location has the one credential in both.
+    assert _netrc_writers(lines) == []
+    build = _groovy_code(BUILD_GROOVY)
+    for location in ("aws", "urm"):
+        assert _artifact_location_field(code, location, "credential") == _artifact_location_field(
+            build, location, "credential"
+        )
+
+    # The delete sends the credentials only through that netrc, never on a command line.
+    delete = _groovy_function_body(lines, "deleteProgressArtifact")
+    assert "trtllm_utils.writeArtifactoryNetrc(netrcPath, location)" in delete
+    request = _groovy_function_body(lines, "artifactoryRequestStatus")
+    assert '--netrc-file "$ARTIFACTORY_REQUEST_NETRC"' in request
+    assert not re.search(r"(?:^|\s)(?:-u|--user)\s", request)
+
+    # The pipeline does not record which locations received a checkpoint, so the delete goes to
+    # every target of the attempt.
+    assert "attemptTargets(stageName, postTag)" in delete
+
+
+# The command that runs a stage's tests in the step beside the checkpoint watcher, by the function
+# that holds that step.
+_TESTS_BESIDE_THE_WATCHER = {
+    "runLLMTestlistOnPlatformImpl": '${pytestCommand.join(" ")}',
+    "rerunFailedTests": '${newTestCmdLine.join(" ")}',
+    "runLLMTestlistWithSbatch": "${trackCmd}",
+}
+
+
+def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
+    """Test steps run the checkpoint watcher in their background; no test stage nests parallel."""
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # Blue Ocean cannot draw a parallel step nested in a test stage while the build runs, so the
+    # watcher runs in the background of the step that runs the tests.
+    assert not re.search(r"^(def|void) (runWithCheckpoints|uploadCheckpoint)\(", code, re.M)
+    assert "CHECKPOINT_UPLOADS" not in L0_TEST.read_text(encoding="utf-8")
+    for function, tests in _TESTS_BESIDE_THE_WATCHER.items():
+        body = _groovy_function_body(lines, function)
+        assert not re.search(r"\bparallel\s*\(", body), function
+        assert "def watcher = prepareCheckpointWatcher(pipeline, stageName, postTag)" in body
+        assert "removeCheckpointNetrc(pipeline, watcher.netrcDir)" in body, function
+        # The tests start only once the watcher has removed its netrc.
+        start = body.index("/jenkins/scripts/progress_upload_watcher.sh' &")
+        wait = body.index("${checkpointNetrcWait(watcher.netrcDir)}", start)
+        body.index(tests, wait)
+    netrc_wait = _groovy_function_body(lines, "checkpointNetrcWait")
+    assert "rm -rf '${netrcDir}'" in netrc_wait
+
+    # The watcher's netrc is written by the library as the delete's is, as one file to which each
+    # target adds its entry, and no credential is bound in the step that runs the tests.
+    prepare = _groovy_function_body(lines, "prepareCheckpointWatcher")
+    assert "attemptTargets(stageName, postTag)" in prepare
+    assert "trtllm_utils.writeArtifactoryNetrc(netrcPath, location, true)" in prepare
+    assert "withCredentials" not in prepare
+
+    # A batch stage copies the job's last results back only once the watcher has stopped taking
+    # checkpoints, and asks for the final snapshot after that copy.
+    batch = _groovy_function_body(lines, "runLLMTestlistWithSbatch")
+    stop = batch.index('touch "\\$PROGRESS_STOP_FILE"')
+    busy = batch.index('while [ -e "\\$PROGRESS_STOP_FILE.busy" ]', stop)
+    final_copy = batch.index("${scpXmlCmd} && break", busy)
+    batch.index('touch "\\$PROGRESS_DONE_FILE"', final_copy)
+    # Its checkpoints, like its final snapshot, wait for the job's results.xml, without which the
+    # copy brings nothing back.
+    for name in ("SNAPSHOT_REQUIRES", "FINAL_REQUIRES"):
+        assert f'"{name}=${{WORKSPACE}}/${{stageName}}/results.xml",' in batch
+
+
+def test_l0_checkpoint_netrc_entries_stand_on_their_own() -> None:
+    """A location whose netrc entry cannot be written does not stop the other's checkpoints."""
+    prepare = _groovy_function_body(_l0_test_code_lines(), "prepareCheckpointWatcher")
+
+    # Each entry is written in a try block of its own, whose handler for an ordinary failure goes
+    # on to the next location, and a location becomes one of the watcher's targets only after its
+    # entry is written.
+    loop = prepare.index("for (location in locations) {")
+    entry = prepare.index("trtllm_utils.writeArtifactoryNetrc(netrcPath, location, true)", loop)
+    assert prepare[loop:entry].split() == ["for", "(location", "in", "locations)", "{", "try", "{"]
+    interrupted = prepare.index("catch (InterruptedException e) {", entry)
+    ordinary = prepare.index("catch (Exception e) {", interrupted)
+    left_out = prepare.index("continue", ordinary)
+    target = prepare.index('targets << "${location}=', left_out)
+    # Of that try block's handlers, only the one for an interruption rethrows.
+    assert prepare[interrupted:left_out].count("throw") == 1
+
+    # The watcher gets the netrc only together with a target. Without one, the else branch removes
+    # the netrc itself, ahead of the handlers that also remove it.
+    with_targets = prepare.index("if (targets) {", target)
+    netrc = prepare.index('watcherEnv << "CHECKPOINT_NETRC_FILE=${netrcPath}"', with_targets)
+    assert prepare.count("CHECKPOINT_NETRC_FILE") == 1
+    without_targets = prepare.index("} else {", netrc)
+    removed = prepare.index("removeCheckpointNetrc(pipeline, netrcDir)", without_targets)
+    assert "catch" not in prepare[without_targets:removed]
+
+
+def test_l0_wheel_sanity_tests_get_no_checkpoint_netrc() -> None:
+    """The "Run LLMAPI Test" step's sanity tests run code from the wheel without a credential."""
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # The step names its attempt before it starts the sanity tests, and no other step does.
+    withheld = "CHECKPOINT_NETRC_WITHHELD << (toStageName(values[1], key) + sanityPostTag)"
+    assert code.count("CHECKPOINT_NETRC_WITHHELD <<") == 1
+    code.index(
+        'runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check"', code.index(withheld)
+    )
+
+    # For such an attempt, the watcher gets no netrc and no target, so it uploads no checkpoint.
+    prepare = _groovy_function_body(lines, "prepareCheckpointWatcher")
+    check = prepare.index("if ((stageName + postTag) in CHECKPOINT_NETRC_WITHHELD) {")
+    returned = prepare.index('return [netrcDir: "", env: watcherEnv]', check)
+    for later in (
+        "mktemp",
+        "writeArtifactoryNetrc(",
+        "CHECKPOINT_TARGETS",
+        "CHECKPOINT_NETRC_FILE",
+    ):
+        assert prepare.index(later) > returned, later
+
+
+# A netrc entry that a pipeline writes with printf, which keeps the secret off the command line.
+# The two arguments after the format are the login and password variables.
+_NETRC_ENTRY = re.compile(r"printf 'machine (?P<host>\S+) login %s password %s")
+_USERNAME_PASSWORD_BINDING = re.compile(
+    r"usernamePassword\(\s*credentialsId:\s*(?P<credential>[^,]+?),\s*"
+    r"usernameVariable:\s*'\w+',\s*passwordVariable:\s*'(?P<password>\w+)'\s*\)"
+)
+
+
+def _assignments(code: str, name: str) -> list[str]:
+    """Return the values that a pipeline assigns to a variable, with or without def."""
+    return re.findall(rf"^[ \t]*(?:def[ \t]+)?{name}[ \t]*=[ \t]*(.+?)[ \t]*$", code, re.M)
+
+
+# Each location's settings, as trtllm_utils.llmArtifactsLocations() of the shared library returns
+# them. The library's own tests hold them to the servers that its uploads use.
+_LIBRARY_LOCATIONS = {
+    "aws": {
+        "root": "https://artifactory.nvidia.com/artifactory",
+        "repo": "sw-tensorrt-llm-generic-local",
+        "browseRoot": "https://artifactory.nvidia.com/ui/native",
+        "localRepo": "sw-tensorrt-llm-generic-local",
+        "credential": "aws-artifactory-credentials",
+    },
+    "urm": {
+        "root": "https://urm.nvidia.com/artifactory",
+        "repo": "sw-tensorrt-generic",
+        "browseRoot": "https://urm.nvidia.com/artifactory",
+        "localRepo": "sw-tensorrt-generic-local",
+        "credential": "urm-artifactory-creds",
+    },
+}
+
+
+def _netrc_writers(lines: list[str]) -> list[str]:
+    """Return a pipeline's own definitions of the netrc writer that the shared library provides."""
+    return [line for line in lines if re.match(r"(def|void) writeArtifactoryNetrc\(", line)]
+
+
+# The helpers that the pipeline files take from the shared library. No pipeline file defines one,
+# and Groovy resolves a call only when it runs, so a use without the library's name would fail
+# only in the stage that reaches it.
+_LIBRARY_HELPERS = (
+    "llmArtifactsLocations",
+    "llmArtifactsLocation",
+    "llmArtifactsLayoutPath",
+    "llmArtifactsRepoPath",
+    "llmArtifactsLocalRepoPath",
+    "llmArtifactsUrl",
+    "llmArtifactsHost",
+    "llmArtifactsBrowseUrl",
+    "llmArtifactsTargets",
+    "uploadToTargets",
+    "writeArtifactoryNetrc",
+)
+
+
+@pytest.mark.parametrize(
+    "pipeline", sorted((REPO_ROOT / "jenkins").glob("*.groovy")), ids=lambda path: path.name
+)
+def test_pipelines_take_the_artifact_helpers_from_the_shared_library(pipeline: Path) -> None:
+    code = _groovy_code(pipeline)
+    for name in _LIBRARY_HELPERS:
+        assert set(re.findall(rf"([\w.]*)\b{name}\b", code)) <= {"trtllm_utils."}, name
+    # The library has no addArtifactoryNetrcEntry, and no pipeline defines one:
+    # writeArtifactoryNetrc adds an entry to a file when its last argument is true.
+    assert not re.search(r"\baddArtifactoryNetrcEntry\b", code), "addArtifactoryNetrcEntry"
+    # A pipeline that reads the locations' settings takes them from the library, once, and
+    # changes none.
+    if re.search(r"\bLLM_ARTIFACTS_LOCATIONS\b", code):
+        _check_library_locations(code)
+
+
+# A read of one setting of one location in a pipeline's LLM_ARTIFACTS_LOCATIONS map, which names
+# the location with an identifier or a string literal. An assignment to the setting is not a read.
+_LOCATION_SETTING_READ = re.compile(
+    r"""\bLLM_ARTIFACTS_LOCATIONS(?:\.\w+|\[(?:\w+|"\w+"|'\w+')\])"""
+    rf"""\.(?:{"|".join(_LIBRARY_LOCATIONS["aws"])})\b(?![ \t]*(?:[-+*/]|<<)?=(?![=~]))"""
+)
+
+
+def _check_library_locations(code: str) -> None:
+    """Check that a pipeline's LLM_ARTIFACTS_LOCATIONS map is the shared library's, unchanged.
+
+    The pipeline assigns the map once, from the library, in a statement that ends on its line.
+    Every other use reads one setting of one location, so none can change the map, and none hands
+    it to code that could.
+    """
+    message = "LLM_ARTIFACTS_LOCATIONS is not the shared library's map, unchanged"
+    assert _assignments(code, "LLM_ARTIFACTS_LOCATIONS") == [
+        "trtllm_utils.llmArtifactsLocations()"
+    ], message
+    # A next line that starts with a dot would continue the assignment with a call on the
+    # library's map.
+    assert not re.search(
+        r"^[ \t]*(?:def[ \t]+)?LLM_ARTIFACTS_LOCATIONS[ \t]*=[^\n]*\n\s*[?*]?\.", code, re.M
+    ), message
+    others = [
+        line.strip()
+        for line in code.splitlines()
+        for use in re.finditer(r"\bLLM_ARTIFACTS_LOCATIONS\b", line)
+        if not _LOCATION_SETTING_READ.match(line, use.start())
+    ]
+    assert len(others) == 1, (
+        f"{message}: apart from its assignment, every use must read one setting of one location, "
+        f"as LLM_ARTIFACTS_LOCATIONS[location].root does. Not such a read: {others}"
+    )
+
+
+def _artifact_location_field(code: str, location: str, field: str) -> str:
+    """Return a field of one location in a pipeline's LLM_ARTIFACTS_LOCATIONS map.
+
+    The pipeline takes the map from the shared library and never changes it.
+    """
+    _check_library_locations(code)
+    return _LIBRARY_LOCATIONS[location][field]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        'LLM_ARTIFACTS_LOCATIONS.aws.credential = "another-credential"',
+        'LLM_ARTIFACTS_LOCATIONS["aws"].credential = "another-credential"',
+        "LLM_ARTIFACTS_LOCATIONS[location].credential += suffix",
+        'LLM_ARTIFACTS_LOCATIONS.aws = [credential: "another-credential"]',
+        'LLM_ARTIFACTS_LOCATIONS.aws.put("credential", "another-credential")',
+        'LLM_ARTIFACTS_LOCATIONS = [aws: [credential: "another-credential"]]',
+        "def locations = LLM_ARTIFACTS_LOCATIONS",
+    ],
+)
+def test_a_changed_locations_map_is_not_taken_for_the_shared_librarys(change: str) -> None:
+    code = (
+        "LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()\n"
+        "def credential = LLM_ARTIFACTS_LOCATIONS.aws.credential\n"
+        'if (LLM_ARTIFACTS_LOCATIONS[primary].repo == "sw-tensorrt-generic") {\n'
+    )
+    assert _artifact_location_field(code, "aws", "credential") == "aws-artifactory-credentials"
+    with pytest.raises(AssertionError, match="not the shared library's map, unchanged"):
+        _artifact_location_field(code + change, "aws", "credential")
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    [
+        '    .collectEntries { name, settings -> [name, settings + [credential: "another"]] }\n',
+        '\n    .each { name, settings -> settings.credential = "another-credential" }\n',
+        "    ?.findAll { name, settings -> name != location }\n",
+    ],
+)
+def test_a_locations_map_changed_where_it_is_assigned_is_not_the_shared_librarys(
+    continuation: str,
+) -> None:
+    assignment = "LLM_ARTIFACTS_LOCATIONS = trtllm_utils.llmArtifactsLocations()\n"
+    read = "def credential = LLM_ARTIFACTS_LOCATIONS.aws.credential\n"
+    assert _artifact_location_field(assignment + read, "aws", "credential")
+    with pytest.raises(AssertionError, match="not the shared library's map, unchanged"):
+        _artifact_location_field(assignment + continuation + read, "aws", "credential")
+
+
+def _groovy_string(code: str, expression: str) -> str:
+    """Return the string that a Groovy expression in a pipeline holds.
+
+    The expression is a string literal, a field of LLM_ARTIFACTS_LOCATIONS or of a location that
+    the shared library returns, or a variable that the pipeline assigns once.
+    """
+    expression = expression.strip()
+    literal = re.fullmatch(r"""(["'])(?P<value>[^"'$]*)\1""", expression)
+    if literal:
+        return literal["value"]
+    library = re.fullmatch(
+        r"""trtllm_utils\.llmArtifactsLocation\((["'])(?P<location>\w+)\1\)\.(?P<field>\w+)""",
+        expression,
+    )
+    if library:
+        return _LIBRARY_LOCATIONS[library["location"]][library["field"]]
+    field = re.fullmatch(r"LLM_ARTIFACTS_LOCATIONS\.(?P<location>\w+)\.(?P<field>\w+)", expression)
+    if field:
+        return _artifact_location_field(code, field["location"], field["field"])
+    assert re.fullmatch(r"\w+", expression), f"cannot evaluate {expression!r}"
+    values = _assignments(code, expression)
+    assert len(values) == 1, f"expected one assignment of {expression}, found {values}"
+    return _groovy_string(code, values[0])
+
+
+def _names_aws_host(code: str, host: str) -> bool:
+    """Tell whether a netrc entry's host is the aws location's.
+
+    That is the literal artifactory.nvidia.com, or a variable whose every assignment derives from
+    LLM_ARTIFACTS_LOCATIONS.aws.root. ARTIFACTORY_DOCKER_HOST names the container registry instead.
+    """
+    variable = re.fullmatch(r"\$\{?(?P<name>\w+)\}?", host)
+    if variable is None:
+        return host == AWS_HOST
+    values = _assignments(code, variable["name"])
+    return bool(values) and all(
+        value.startswith("LLM_ARTIFACTS_LOCATIONS.aws.root") for value in values
+    )
+
+
+# The arguments of a call of the shared library's netrc writer, from its opening parenthesis: the
+# path alone, or the path and a location, or those and the flag that tells whether to keep the
+# entries that are there. The location is a variable or a string literal, never the flag.
+_WRITER_ARGUMENTS = re.compile(
+    r"""\s*\w+(?:\s*,\s*((?!(?:true|false)\b)\w+|"\w+"|'\w+')(?:\s*,\s*(?:true|false))?)?\s*\)"""
+)
+
+
+def _aws_netrc_credential(code: str) -> str:
+    """Return the credentialsId expression behind the one netrc entry for the aws host.
+
+    The entry prints its password from a variable, which the nearest usernamePassword binding of
+    that variable before the entry fills. A pipeline that leaves the netrc to the shared library
+    gets the credential of the library's aws location.
+    """
+    entries = [
+        entry for entry in _NETRC_ENTRY.finditer(code) if _names_aws_host(code, entry["host"])
+    ]
+    if not entries:
+        # The pipeline writes no entry itself: the shared library's writer does, for the aws
+        # location when a call names no other, with that location's credential. A call gives the
+        # path alone, or the path and a location, or those and the flag that keeps the entries
+        # that are there.
+        calls = list(re.finditer(r"\btrtllm_utils\.writeArtifactoryNetrc\(", code))
+        assert calls, f"no netrc entry for {AWS_HOST}"
+        named = []
+        for call in calls:
+            arguments = _WRITER_ARGUMENTS.match(code, call.end())
+            rest = code[call.end() :].split("\n", 1)[0]
+            assert arguments, f"cannot tell the location of writeArtifactoryNetrc({rest}"
+            named.append(arguments[1])
+        # No call names a location outright other than aws, and one writes the aws entry: a call
+        # that names no location, or one that names aws.
+        literals = {name.strip("\"'") for name in named if name and name[0] in "\"'"}
+        assert literals <= {"aws"}, literals
+        assert None in named or literals, f"no netrc entry for {AWS_HOST}"
+        return 'trtllm_utils.llmArtifactsLocation("aws").credential'
+    assert len(entries) == 1, f"expected one netrc entry for {AWS_HOST}, found {len(entries)}"
+    (entry,) = entries
+    arguments = code[entry.end() :].splitlines()[0]
+    _, password = re.findall(r"\$\{?(\w+)", arguments)[:2]
+    bindings = [
+        binding
+        for binding in _USERNAME_PASSWORD_BINDING.finditer(code, 0, entry.start())
+        if binding["password"] == password
+    ]
+    assert bindings, f"no usernamePassword binding of {password} before the netrc entry"
+    return bindings[-1]["credential"]
+
+
+def _helper_credential_ids(code: str) -> list[str]:
+    """Return the ARTIFACTORY_CREDENTIAL_ID values that a pipeline gives the read helper."""
+    names = []
+    for value in re.findall(r"ARTIFACTORY_CREDENTIAL_ID=([^\s\"]+)", code):
+        value = value.strip("'")
+        interpolation = re.fullmatch(r"\$\{?(?P<expression>[\w.]+)\}?", value)
+        names.append(_groovy_string(code, interpolation["expression"]) if interpolation else value)
+    return names
+
+
+def test_build_uploads_to_aws_with_the_credential_of_its_location_map() -> None:
+    code = _groovy_code(BUILD_GROOVY)
+
+    # Build.groovy uploads packaged builds through its ArtifactoryAws server, so the location map's
+    # aws credential, which the readers are compared with, is the one those uploads use.
+    servers = re.findall(
+        r"rtServer\s*\(\s*id:\s*'ArtifactoryAws',[^)]*?credentialsId:\s*'(?P<credential>[^']*)'",
+        code,
+    )
+    assert servers
+    assert set(servers) == {_artifact_location_field(code, "aws", "credential")}
+
+
+@pytest.mark.parametrize("pipeline", BUILD_ARTIFACT_READERS, ids=lambda path: path.name)
+def test_build_artifacts_are_read_with_the_publishing_credential(pipeline: Path) -> None:
+    publishing = _artifact_location_field(_groovy_code(BUILD_GROOVY), "aws", "credential")
+    code = _groovy_code(pipeline)
+
+    # The netrc that the read helper gets holds the credential that Build.groovy publishes with.
+    assert _groovy_string(code, _aws_netrc_credential(code)) == publishing
+
+    # When aws rejects it, the read helper names that credential.
+    named = _helper_credential_ids(code)
+    assert named
+    assert set(named) == {publishing}

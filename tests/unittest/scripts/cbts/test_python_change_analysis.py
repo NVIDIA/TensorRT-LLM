@@ -26,7 +26,11 @@ import pytest
 from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.coverage.selection.python_change_analysis import ImportTarget, analyze_python_changes
+from cbts.coverage.selection.python_change_analysis import (
+    ImportTarget,
+    analyze_python_changes,
+    qualnames_for_lines,
+)
 from cbts.rules._helpers import (
     iter_diff_deleted_post_lines,
     iter_diff_post_line_numbers,
@@ -197,7 +201,14 @@ def test_changed_condition_is_not_resolved_by_conditional_class_support() -> Non
     assert analysis.limitation == "effectful module statement"
 
 
-def test_changed_binding_with_ambiguous_consumer_remains_fail_closed() -> None:
+def test_changed_binding_with_ambiguous_consumer_resolves_to_the_shared_qualname() -> None:
+    """Only one branch of an ambiguously-named def reads the changed binding.
+
+    Both branches share one qualname in the collector too (same `co_qualname`),
+    so a DB lookup on it already returns the sound union of whichever branch a
+    test actually touched; no need to decline just because two source
+    definitions happen to share the name.
+    """
     source = (
         "VALUE = 2\nif AVAILABLE:\n    def helper():\n        return VALUE\n"
         "else:\n    def helper():\n        return 0\n"
@@ -205,7 +216,8 @@ def test_changed_binding_with_ambiguous_consumer_remains_fail_closed() -> None:
 
     analysis = _analyze(source, "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n")
 
-    assert analysis.limitation == "ambiguous class/function declaration"
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
 
 
 def test_unrelated_property_accessors_do_not_block_literal_binding_change() -> None:
@@ -229,7 +241,15 @@ def test_unrelated_property_accessors_do_not_block_literal_binding_change() -> N
 
 
 @pytest.mark.parametrize("consumer", ("getter", "setter"))
-def test_changed_binding_consumed_by_property_accessor_remains_fail_closed(consumer: str) -> None:
+def test_changed_binding_consumed_by_property_accessor_resolves_to_the_shared_qualname(
+    consumer: str,
+) -> None:
+    """A property's getter and setter share one qualname (`Class.state`) by construction.
+
+    Only one of the two reads the changed binding here, same shape as the
+    conditional-definition case above; the shared qualname's DB rows are
+    still a sound union over both.
+    """
     getter = "VALUE" if consumer == "getter" else "self._state"
     setter = "VALUE" if consumer == "setter" else "value"
     source = (
@@ -245,7 +265,8 @@ def test_changed_binding_consumed_by_property_accessor_remains_fail_closed(consu
 
     analysis = _analyze(source, "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n")
 
-    assert analysis.limitation == "ambiguous class/function declaration"
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.state"}
 
 
 def test_removed_ambiguous_definition_is_not_treated_as_a_new_declaration() -> None:
@@ -1297,7 +1318,17 @@ def test_literal_assignment_resolves_class_method_consumer() -> None:
     assert analysis.binding_consumers == {"Config.check"}
 
 
-def test_literal_assignment_attributes_closure_consumer_to_outer() -> None:
+def test_literal_assignment_resolves_closure_consumer_to_the_closure_itself() -> None:
+    """Binding-consumer resolution attributes a closure's own load to the closure.
+
+    ``_recorded_definition_groups`` records a nested def under its own qualname
+    (matching the collector -- see ``pystart.py``'s ``_SKIP_QUALNAMES``), so
+    ``_FunctionNames`` resolves its body as its own fact rather than rolling it
+    into the outer def. Only the outer def's genuinely own loads -- its direct
+    statements, plus the nested def's *signature* (decorators, defaults,
+    annotations), which runs in the outer scope at definition time -- count as
+    the outer def's own consumption.
+    """
     source = (
         "_VALUE = 521\n\ndef outer():\n    def inner():\n        return _VALUE\n    return inner\n"
     )
@@ -1305,7 +1336,51 @@ def test_literal_assignment_attributes_closure_consumer_to_outer() -> None:
     analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
 
     assert not analysis.limitation
+    assert analysis.binding_consumers == {"outer.<locals>.inner"}
+
+
+def test_literal_assignment_attributes_closure_signature_consumer_to_outer() -> None:
+    """A nested def's default-argument expression attributes to the outer def.
+
+    The default value is evaluated in the outer scope when the nested def is
+    defined, not when it is later called, so a changed binding it reads is a
+    consumer of the outer def, not of the nested def whose body never runs yet.
+    """
+    source = "_VALUE = 521\n\ndef outer():\n    def inner(x=_VALUE):\n        return x\n    return inner\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
+
+    assert not analysis.limitation
     assert analysis.binding_consumers == {"outer"}
+
+
+def test_qualnames_for_lines_resolves_closure_body_line_to_itself() -> None:
+    """A changed line inside a named closure attributes to the closure, not its outer def.
+
+    The closure is recorded under its own qualname (``pystart.py``), so a line
+    inside it resolves directly rather than falling back to an ancestor.
+    """
+    source = "def decorator(func):\n    def wrapper(*a, **kw):\n        return func(*a, **kw)\n    return wrapper\n"
+
+    qualnames, ok = qualnames_for_lines(source, {3})
+
+    assert ok
+    assert qualnames == {"decorator.<locals>.wrapper"}
+
+
+def test_qualnames_for_lines_still_attributes_lambda_body_to_enclosing_def() -> None:
+    """A lambda/genexpr never gets its own qualname.
+
+    A change inside one still resolves to the nearest enclosing named def, same as
+    before. See ``pystart.py``'s ``_SKIP_QUALNAMES`` for why: distinct lambdas in
+    one scope share an identical ``co_qualname`` and cannot be told apart.
+    """
+    source = "def outer():\n    callback = lambda x: x + 1\n    return callback\n"
+
+    qualnames, ok = qualnames_for_lines(source, {2})
+
+    assert ok
+    assert qualnames == {"outer"}
 
 
 def test_import_time_consumer_remains_fail_closed() -> None:

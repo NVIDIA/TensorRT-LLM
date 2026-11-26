@@ -283,6 +283,7 @@ def test_mamba2_chunk_scan_selective_state_update(
 
     # test data
     torch.random.manual_seed(0)
+    cu_seqlens = seq_idx = None
     if req_type == "context" and remove_padding:
         last_token_ids = torch.randint(
             1, seq_len + 1, (batch_size,), dtype=torch.int32, device=device
@@ -319,17 +320,16 @@ def test_mamba2_chunk_scan_selective_state_update(
     )
     C = torch.randn_like(B)
     D = torch.randn(nheads, device=device)
-    if has_z:
-        z = torch.randn_like(x)
-    if use_initial_states:
-        initial_states = state.clone()
+    z = torch.randn_like(x) if has_z else None
+    initial_states = state.clone() if use_initial_states else None
+    chunk_indices = chunk_offsets = None
 
     if req_type == "generation":
         # remove the seqlen dimension
         x = x.squeeze(1)
         B = B.squeeze(1)
         C = C.squeeze(1)
-        z = z.squeeze(1) if has_z else None
+        z = z.squeeze(1) if z is not None else None
         dt = dt.squeeze(1)
 
         # repeat for multiple heads
@@ -346,7 +346,7 @@ def test_mamba2_chunk_scan_selective_state_update(
     B_ref = B.detach().clone()
     C_ref = C.detach().clone()
     D_ref = D.detach().clone()
-    z_ref = z.detach().clone() if has_z else None
+    z_ref = z.detach().clone() if z is not None else None
     initial_states_ref = state_ref.clone() if use_initial_states else None
 
     if req_type == "context":
@@ -496,6 +496,8 @@ def test_mamba2_chunk_scan_selective_state_update(
             dt_bias=dt_bias_ref,
             dt_softplus=delta_softplus,
         )
+    else:
+        raise ValueError(f"Unsupported request type: {req_type}")
     state_ref = rearrange(state_ref, "... n p-> ... p n")
 
     atol = {"float16": 2e-2, "float32": 1e-2, "bfloat16": 1e-1}

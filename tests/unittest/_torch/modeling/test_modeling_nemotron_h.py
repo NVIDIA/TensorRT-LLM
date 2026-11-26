@@ -226,7 +226,7 @@ def test_nemotron_h_chunked_prefill():
 # Breakable prefill CUDA graphs (BCG) on the hybrid path. Under BCG the Mamba2
 # layers run through the eager_on_graph boundary op (mamba2_mixer.py), so this
 # covers the NemotronH-specific bridge rather than the generic BCG runner
-# (which unittest/_torch/executor/test_breakable_cuda_graph.py exercises).
+# (which unittest/_torch/pyexecutor/test_breakable_cuda_graph.py exercises).
 _BCG_MAX_NUM_TOKENS = 256
 _BCG_CAPTURE_NUM_TOKENS = [64, 128, 256]
 # Probability-ratio bound shared with ray_orchestrator/multi_gpu/

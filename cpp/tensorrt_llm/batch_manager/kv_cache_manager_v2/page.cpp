@@ -23,11 +23,18 @@
 
 #include "tensorrt_llm/common/assert.h"
 
-#include <algorithm>
-#include <unordered_map>
-
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace detail
+{
+std::atomic<size_t> gLiveSlabBytes{0};
+} // namespace detail
+
+size_t liveSlabBytes() noexcept
+{
+    return detail::gLiveSlabBytes.load(std::memory_order_relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Page
@@ -57,6 +64,7 @@ Page::~Page()
                 "Page destroyed while still held or scheduled for eviction");
             if (hasValidSlot())
             {
+                manager->onPageDestroyed(*this);
                 Slot s;
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);
@@ -64,6 +72,11 @@ Page::~Page()
                 manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
             }
         });
+}
+
+std::optional<LocalityDomainId> Page::localityDomainId() const
+{
+    return hasValidSlot() ? manager->localityDomainOf(cacheLevel, lifeCycle, slotId()) : std::nullopt;
 }
 
 PageStatus Page::status() const noexcept
@@ -76,7 +89,7 @@ PageStatus Page::status() const noexcept
     return PageStatus::LOCKED;
 }
 
-SharedPtr<PageHolder> Page::hold()
+SharedPtr<PageHolder> Page::hold(PageSlab* slab)
 {
     // Return existing holder if any.
     auto h = holder.lock();
@@ -84,7 +97,7 @@ SharedPtr<PageHolder> Page::hold()
         return h;
 
     auto self = sharedFromThis();
-    h = makeShared<PageHolder>(self);
+    h = slab ? slab->makeShared<PageHolder>(self) : makeShared<PageHolder>(self);
     holder = h;
 
     // If we were scheduled for eviction but are no longer evictable (just got held), remove.
@@ -128,24 +141,10 @@ FuncGuard<std::function<void()>> Page::borrowRetentionForCopy()
     return guard;
 }
 
-SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
+SharedPageLock Page::lock(
+    KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait, PageSlab* slab)
 {
-    return hold()->lock(kvCache, beamIndex, ordinal, lc, skipWait);
-}
-
-CacheLevel Page::queryLockLevel() const
-{
-    if (cacheLevel == kHotLevel)
-    {
-        return kHotLevel;
-    }
-    auto const* attention = std::get_if<AttnLifeCycle>(&manager->getLifeCycle(lifeCycle));
-    if (attention != nullptr && attention->isSparse && kSparseHistoryLevel < manager->numCacheLevels()
-        && manager->cacheTier(kSparseHistoryLevel) == CacheTier::HOST_MEM)
-    {
-        return kSparseHistoryLevel;
-    }
-    return kHotLevel;
+    return hold(slab)->lock(kvCache, beamIndex, ordinal, lc, skipWait, slab);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +208,7 @@ UncommittedPage::~UncommittedPage()
     // switching to monostate, so during destruction the slot still references this page.
     if (TLLM_UNLIKELY(gDebug))
     {
-        auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
-        bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
+        bool const isSsm = manager->lifeCycles().isSsm(lifeCycle);
         if (!isSsm)
         {
             bool blockRemoved = kvCache->blocks().size() <= ordinal;
@@ -239,7 +237,7 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, Page const* retentionSource)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
@@ -262,7 +260,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     }
     else
     {
-        committed->inheritRetention(*this);
+        committed->inheritRetention(retentionSource != nullptr ? *retentionSource : *this);
     }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
@@ -325,13 +323,14 @@ PageHolder::~PageHolder()
 }
 
 SharedPageLock PageHolder::lock(
-    KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
+    KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait, PageSlab* slab)
 {
     // Create or reuse UniqPageLock.
     auto ul = uniqLock.lock();
     if (!ul)
     {
-        ul = makeShared<UniqPageLock>(sharedFromThis());
+        auto self = sharedFromThis();
+        ul = slab ? slab->makeShared<UniqPageLock>(std::move(self)) : makeShared<UniqPageLock>(std::move(self));
         uniqLock = ul;
     }
 
@@ -352,12 +351,10 @@ SharedPageLock PageHolder::lock(
 UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
-    if (holder->page->cacheLevel != holder->page->queryLockLevel())
+    if (holder->page->cacheLevel != kHotLevel)
     {
-        throw LogicError("Pages can only be locked on GPU or, for sparse attention, in level-1 host memory");
+        throw LogicError("Pages can only be locked at the hot level");
     }
-    // Preserve readiness if the first shared lock fails before it can register an owner.
-    finishEvents.push_back(holder->page->readyEvent);
 }
 
 UniqPageLock::~UniqPageLock()
@@ -366,8 +363,7 @@ UniqPageLock::~UniqPageLock()
         [this]
         {
             Page& p = *page();
-            TLLM_CHECK_DEBUG(p.cacheLevel == p.queryLockLevel() && !p.scheduledForEviction());
-            TLLM_CHECK_DEBUG(mOwners.empty());
+            TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
             // pages, this means the next reader will wait for prior reads to complete, which is
             // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
@@ -393,6 +389,13 @@ UniqPageLock::~UniqPageLock()
 
 void UniqPageLock::notifyFinish(CachedCudaEvent event)
 {
+    // A lone retired event orders nothing; overwriting it keeps a closing request's pages from
+    // growing their lists.
+    if (finishEvents.size() == 1 && finishEvents.front().isClosed())
+    {
+        finishEvents.front() = std::move(event);
+        return;
+    }
     finishEvents.push_back(std::move(event));
     // Avoid unbounded growth for system prompt pages shared by all requests.
     if (finishEvents.size() > 32)
@@ -401,97 +404,6 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
         finishEvents.clear();
         finishEvents.push_back(std::move(merged));
     }
-}
-
-void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
-{
-    Page const& p = *page();
-    auto const* attn = std::get_if<AttnLifeCycle>(&p.manager->getLifeCycle(p.lifeCycle));
-    if (!attn || !attn->isSparse || !p.hasValidSlot()
-        || (p.cacheLevel != kHotLevel && p.cacheLevel != kSparseHistoryLevel)
-        || p.manager->numCacheLevels() <= kSparseHistoryLevel
-        || p.manager->cacheTier(kSparseHistoryLevel) != CacheTier::HOST_MEM)
-    {
-        throw LogicError("Offload requires a locked sparse attention page on GPU or in host history");
-    }
-    if (p.isCommitted() && static_cast<CommittedPage const&>(p).numTokensInBlock != requestingCache.tokensPerBlock())
-    {
-        throw LogicError("Cannot offload a partial committed page");
-    }
-    bool requestingOwner = false;
-    for (auto const& owner : mOwners)
-    {
-        if (!owner.kvCache->isActive() || owner.lifeCycle != p.lifeCycle || owner.ordinal < BlockOrdinal{0}
-            || owner.ordinal >= BlockOrdinal{owner.kvCache->historyLength() / owner.kvCache->tokensPerBlock()})
-        {
-            throw LogicError("Cannot offload a page outside an owner's complete history");
-        }
-        requestingOwner |= owner.kvCache == &requestingCache;
-    }
-    if (!requestingOwner)
-    {
-        throw LogicError("The offloading request must own a lock on the page");
-    }
-    finishEvents.reserve(1);
-}
-
-void UniqPageLock::prepareSparsePromotion()
-{
-    Page const& p = *page();
-    if (!p.hasValidSlot() || p.cacheLevel != kSparseHistoryLevel || p.queryLockLevel() != kSparseHistoryLevel
-        || mOwners.empty())
-    {
-        throw LogicError("Promotion requires a locked sparse host page");
-    }
-    for (auto const& owner : mOwners)
-    {
-        if (!owner.kvCache->isActive() || owner.lifeCycle != p.lifeCycle)
-        {
-            throw LogicError("Promotion requires active owners of the same sparse page");
-        }
-    }
-    finishEvents.reserve(1);
-}
-
-void UniqPageLock::recordMigrationEvent(CachedCudaEvent const& event)
-{
-    // The copy stream already waited for every event being replaced here.
-    page()->readyEvent = event;
-    finishEvents.clear();
-    finishEvents.push_back(event);
-    // A rejected copy can change readiness without changing the source slot.
-    for (auto const& owner : mOwners)
-        owner.kvCache->onPageStorageChanged();
-}
-
-Slot UniqPageLock::moveToCacheLevel(CacheLevel destination, Slot&& slot)
-{
-    Page& p = *page();
-    TLLM_CHECK_DEBUG(!p.scheduledForEviction());
-    TLLM_CHECK_DEBUG((p.cacheLevel == kHotLevel && destination == kSparseHistoryLevel)
-        || (p.cacheLevel == kSparseHistoryLevel && destination == kHotLevel));
-    Slot source = p.exchangeSlot(std::move(slot));
-    p.cacheLevel = destination;
-    for (auto const& owner : mOwners)
-    {
-        int const old = owner.kvCache->updateBasePageIndex(
-            owner.beamIndex, owner.ordinal, owner.lifeCycle, slotIdToPageIndexValue(p.slotId()));
-        TLLM_CHECK_DEBUG(old == slotIdToPageIndexValue(source.slotId()));
-        if (destination == kHotLevel && owner.kvCache->mIsDecoding)
-        {
-            // Retry even without history growth once the prefill owner releases its GPU requirement.
-            owner.kvCache->mHasDeferredSparseOffload = true;
-        }
-        owner.kvCache->onPageStorageChanged();
-    }
-    return source;
-}
-
-void UniqPageLock::removeOwner(LockOwner const& owner)
-{
-    auto const it = std::find(mOwners.begin(), mOwners.end(), owner);
-    TLLM_CHECK_DEBUG(it != mOwners.end());
-    mOwners.erase(it);
 }
 
 SharedPtr<Page> const& UniqPageLock::page() const
@@ -516,14 +428,9 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
     , mUser{&kvCache, beamIndex, ordinal, lc}
 {
     if (!skipWait)
-    {
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
-    }
 
-    mUniqLock->mOwners.push_back(mUser);
-    auto rollbackOwner = FuncGuard([this]() { mUniqLock->removeOwner(mUser); });
     acquirePageIndex();
-    rollbackOwner.cancel();
 }
 
 SharedPageLock::~SharedPageLock()
@@ -556,15 +463,17 @@ SharedPtr<Page> const& SharedPageLock::page() const
     return mUniqLock->page();
 }
 
-SharedPtr<Page> SharedPageLock::unlock()
+SharedPtr<Page> SharedPageLock::unlock(bool keepPageIndex)
 {
     TLLM_CHECK_DEBUG(mUniqLock);
 
     // Record finish event from the KvCache stream.
     mUniqLock->notifyFinish(mUser.kvCache->finishEvent());
 
-    releasePageIndex();
-    mUniqLock->removeOwner(mUser);
+    if (!keepPageIndex)
+    {
+        releasePageIndex();
+    }
     auto p = page(); // copy shared_ptr before reset
     mUniqLock.reset();
     return p;
@@ -590,7 +499,7 @@ void SharedPageLock::releasePageIndex()
         // entry. updateBasePageIndex deliberately returns BAD for this ordinal.
         auto const& lc = page()->manager->lifeCycles().getLifeCycle(mUser.lifeCycle);
         auto const* attention = std::get_if<AttnLifeCycle>(&lc);
-        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && attention->allowsCheckpoint()));
+        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && allowsCheckpoint(*attention)));
         return;
     }
     int oldBaseIndex
@@ -617,28 +526,22 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 
     // Shared prefixes and beams may name the same physical page more than once.
     // Reserve and migrate once per page, but issue one lock per owner below.
-    std::unordered_map<Page*, CacheLevel> destinations;
-    TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByLevel(storeMgr->numCacheLevels());
-    std::vector<SharedPtr<Page>> lockedHostPages;
+    //
+    // Every page is locked at the hot level, whatever its pool group is made of. A sparse
+    // life cycle's hot pages are host memory, but that is a property of the allocation
+    // rather than of the level, so locking does not see it.
+    uint64_t const visit = storeMgr->nextVisitStamp();
+    std::vector<SharedPtr<Page>> pages;
+    pages.reserve(targets.size());
     for (auto const& target : targets)
     {
         auto const& page = target.page;
-        CacheLevel const level = target.cacheLevel;
-        if ((level != kHotLevel && level != page->queryLockLevel()) || page->cacheLevel < level)
+        if (page->status() == PageStatus::LOCKED && page->cacheLevel != kHotLevel)
+            throw LogicError("Cannot migrate a page locked by another owner");
+        if (page->visitStamp != visit)
         {
-            throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
-        }
-        auto const [it, inserted] = destinations.emplace(page.get(), level);
-        if (!inserted && it->second != level)
-            throw LogicError("Conflicting lock levels for a shared page");
-        if (inserted)
-        {
-            pagesByLevel[level].push_back(page);
-            if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
-            {
-                TLLM_CHECK_DEBUG(level == kHotLevel && page->cacheLevel == kSparseHistoryLevel);
-                lockedHostPages.push_back(page);
-            }
+            page->visitStamp = visit;
+            pages.push_back(page);
         }
     }
 
@@ -647,36 +550,28 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     auto reschedule = FuncGuard(
         [&]()
         {
-            for (auto const& pages : pagesByLevel)
-                for (auto const& page : pages)
-                    if (!page->scheduledForEviction() && storeMgr->isEvictable(*page))
-                        storeMgr->scheduleForEviction(*page);
+            for (auto const& page : pages)
+                if (!page->scheduledForEviction() && storeMgr->isEvictable(*page))
+                    storeMgr->scheduleForEviction(*page);
         });
-    for (auto const& pages : pagesByLevel)
-        for (auto const& page : pages)
-            if (page->scheduledForEviction())
-                storeMgr->excludeFromEviction(*page);
+    for (auto const& page : pages)
+        if (page->scheduledForEviction())
+            storeMgr->excludeFromEviction(*page);
 
     MigrationRecorder const migrationRecorder
         = [&kvCache](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
               CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
     DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
     { kvCache._recordDroppedPages(pages, cacheLevel); };
-    for (CacheLevel level{0}; level < pagesByLevel.size(); ++level)
+    if (!pages.empty())
     {
-        auto const& pages = pagesByLevel[level];
-        if (pages.empty())
-            continue;
-        TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(level), 0);
+        TypedVec<PoolGroupIndex, SlotCount> requirements(storeMgr->numPoolGroups(kHotLevel), 0);
         for (auto const& page : pages)
-            if (page->cacheLevel != level)
-                ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
-        if (level == kHotLevel && !lockedHostPages.empty())
-        {
-            storeMgr->promoteSparsePages(kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder);
-        }
-        storeMgr->batchedMigrate(level, pages, migrationRecorder);
+            if (page->cacheLevel != kHotLevel)
+                ++requirements[storeMgr->getPoolGroupIndex(kHotLevel, page->lifeCycle)];
+        storeMgr->prepareFreeSlots(
+            kHotLevel, requirements, migrationRecorder, dropRecorder, kvCache.localityDomainId());
+        storeMgr->batchedMigrate(kHotLevel, pages, migrationRecorder, kvCache.localityDomainId());
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).

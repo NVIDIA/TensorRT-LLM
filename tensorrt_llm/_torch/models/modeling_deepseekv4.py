@@ -31,7 +31,8 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -47,8 +48,9 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -56,6 +58,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..attention.mla import MLA
+from ..custom_ops import router_logit_partials as router_partials
+from ..custom_ops.router_logit_partials import RouterLogitPartials
+from ..custom_ops.torch_custom_ops import router_gemm_autotuned
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -72,23 +77,34 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import (
+    do_multi_stream,
+    forks_now,
+    maybe_execute_in_parallel,
+    maybe_execute_in_parallel_and_combine,
+)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
     DeepSeekV4MoeRoutingMethod,
+    MoE,
     MoEWeightLoadingMode,
     SwigluActivation,
+    VanillaMoE,
     create_moe,
     is_moe_weight_owner,
 )
+from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
+from ..moe.fused_moe.moe_scheduler import FusedCommMoEScheduler, MoEForwardHooks
 from ..peft.lora.layer import LoraLayer
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
     AuxStreamType,
     EventType,
     Fp4QuantizedTensor,
     create_lm_head_tp_mapping,
+    decode_stream_priority,
     replace_parameter_and_save_metadata,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
@@ -1374,9 +1390,13 @@ class DeepseekV4LogitsProcessor(nn.Module):
         lm_head: Linear,
         attn_metadata: DeepseekV4TrtllmAttentionMetadata,
         return_context_logits: bool = False,
+        *,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
         if not self.model_config.mapping.is_last_pp_rank():
-            return lm_head(hidden_states).float()
+            logits = lm_head(hidden_states)
+            return logits if keep_lm_head_dtype else logits.float()
 
         if not return_context_logits:
             if attn_metadata is not None:
@@ -1387,8 +1407,11 @@ class DeepseekV4LogitsProcessor(nn.Module):
         if self._hc_head is not None:
             hidden_states = hidden_states.reshape(-1, self.hc_mult, self.hidden_dim)
             hidden_states = self._hc_head(hidden_states)
-        hidden_states = self._norm(hidden_states)
-        return lm_head(hidden_states).float()
+        # V4.1's fused stream close may already have applied the norm.
+        if not getattr(attn_metadata, "mhc_final_normalized", False):
+            hidden_states = self._norm(hidden_states)
+        logits = lm_head(hidden_states)
+        return logits if keep_lm_head_dtype else logits.float()
 
 
 class DeepseekV4Linear(Linear):
@@ -1436,7 +1459,7 @@ class DeepseekV4Linear(Linear):
         layer_idx: Optional[int] | None = None,
     ):
         num_tokens = input.shape[0]
-        if not self.has_any_quant and 1 <= num_tokens <= 16 and get_sm_version() not in [120, 121]:
+        if not self.has_any_quant and 1 <= num_tokens <= 16 and not is_sm_120f():
             output = torch.ops.trtllm.dsv3_fused_a_gemm_op(input, self.weight.t(), bias, None)
         else:
             output = super().apply_linear(input, bias, lora_params, layer_idx)
@@ -1521,11 +1544,14 @@ class DeepseekV4Gate(nn.Module):
         apply_routing: bool = False,
         moe_backend: str = "CUTLASS",
         has_vl_bias: bool = False,
+        small_m_logit_partials: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype), requires_grad=False
         )
+        # The model opted into partials from ``router_logit_partials.SMALL_M_MIN_ROWS`` rows.
+        self.small_m_logit_partials = small_m_logit_partials
         self.moe_backend = moe_backend
         bias_dtype = torch.float32
 
@@ -1583,14 +1609,20 @@ class DeepseekV4Gate(nn.Module):
             ),
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, partials: bool = False
+    ) -> Union[torch.Tensor, RouterLogitPartials]:
+        """FP32 router logits; with ``partials`` (the caller's MoE routes only in a launch that sums
+        them) mid-size token counts get K-chunk partials instead, without a split-K reduce launch."""
         if hidden_states.shape[0] == 0:
             # An empty attention-DP peer still joins expert communication, but
             # the router's cuBLAS fallback does not accept an empty GEMM.
             return hidden_states.new_empty((0, self.weight.shape[0]), dtype=torch.float32)
-        return torch.ops.trtllm.dsv3_router_gemm_op(
-            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
-        )
+        if partials and router_partials.applies(
+            hidden_states, self.weight, small_m=self.small_m_logit_partials
+        ):
+            return router_partials.router_logit_partials(hidden_states, self.weight)
+        return router_gemm_autotuned(hidden_states, self.weight)
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
@@ -1624,7 +1656,129 @@ class DeepseekV4Gate(nn.Module):
         return self.routing_method.top_k
 
 
+# Eager forwards from this many local tokens overlap the shared expert with the routed experts;
+# smaller ones lose to SM contention. Below a full 16K chunk so near-full packed chunks qualify,
+# above the 8K budgets of the other DeepSeek-V4 configs.
+_EAGER_SHARED_EXPERT_OVERLAP_MIN_TOKENS = 12288  # 12K
+
+# Where 128-row weight blocks shard the shared expert over fewer ranks than the TP group (2 of 8 for
+# an intermediate of 2304), forwards of up to this many rows run each rank's own 1/tp piece of it
+# instead of its replicated shard.
+_SHARED_EXPERT_FULL_TP_MAX_ROWS = 64
+
+
+def _block128_codes(block_scale: torch.Tensor) -> torch.Tensor:
+    """UE8M0 codes of FP32 power-of-two 128x128 block scales ``[N/128, K/128]``, one per 32
+    columns: ``[N/128, K/32]``."""
+    codes = (block_scale.contiguous().view(torch.int32) >> 23) & 0xFF
+    return codes.to(torch.uint8).repeat_interleave(4, dim=1)
+
+
+def full_tp_shared_expert_weights(shared_experts: GatedMLP, piece: int, pieces: int):
+    """FP8 weights with per-row UE8M0 scales of piece ``piece`` of ``pieces`` of this rank's
+    shared-expert shard: ``(w13 [2P, H], s13 [2P, H/32], w2 [H, P], s2 [H, P/32])``, the piece's
+    intermediate zero-padded to P, a multiple of the small-M kernel's 64-wide K step. None
+    without the projections' FP32 block scales or for a piece off the 32-column scale grid."""
+    gate_up, down = shared_experts.gate_up_proj, shared_experts.down_proj
+    gate_up_blocks = getattr(gate_up, "weight_scale_block128", None)
+    down_blocks = getattr(down, "weight_scale_block128", None)
+    inter = down.weight.shape[1]
+    size = inter // pieces
+    if gate_up_blocks is None or down_blocks is None or inter % pieces or size % 32:
+        return None
+    padded = (size + 63) // 64 * 64
+    start = piece * size
+    hidden = down.weight.shape[0]
+    device = down.weight.device
+    # Byte copies of the E4M3 weights; padding holds zeros, so its scale code (2^0) does not matter.
+    w13 = torch.zeros((2 * padded, hidden), dtype=torch.uint8, device=device)
+    s13 = torch.full((2 * padded, hidden // 32), 127, dtype=torch.uint8, device=device)
+    gate_up_bytes = gate_up.weight.view(torch.uint8)
+    gate_up_codes = _block128_codes(gate_up_blocks)
+    for half in range(2):  # gate rows, then up rows
+        rows = torch.arange(half * inter + start, half * inter + start + size, device=device)
+        w13[half * padded : half * padded + size] = gate_up_bytes[rows]
+        s13[half * padded : half * padded + size] = gate_up_codes[rows // 128]
+    w2 = torch.zeros((hidden, padded), dtype=torch.uint8, device=device)
+    w2[:, :size] = down.weight.view(torch.uint8)[:, start : start + size]
+    s2 = torch.full((hidden, padded // 32), 127, dtype=torch.uint8, device=device)
+    rows = torch.arange(hidden, device=device)
+    s2[:, : size // 32] = _block128_codes(down_blocks)[
+        rows // 128, start // 32 : (start + size) // 32
+    ]
+    return w13.view(torch.float8_e4m3fn), s13, w2.view(torch.float8_e4m3fn), s2
+
+
+def full_tp_shared_expert_forward(
+    x: torch.Tensor, weights, swiglu_limit: Optional[float]
+) -> torch.Tensor:
+    """One rank's piece of the shared expert: its unscaled share of the TP all-reduce's sum."""
+    from ..modules.low_m_gemm import mxfp8_lowm_linear, swiglu_out_supported
+    from ..modules.swiglu import swiglu
+
+    w13, s13, w2, s2 = weights
+    if is_blackwell_datacenter() and swiglu_out_supported(
+        x.shape[0], x.shape[1], w13, swiglu_limit
+    ):
+        # Releases the down GEMM only after x's producer completed (no SwiGLU launch in between).
+        hidden = mxfp8_lowm_linear(
+            x, w13, s13, swiglu_out_limit=swiglu_limit, release_after_wait=True
+        )
+        return mxfp8_lowm_linear(hidden, w2, s2)
+    gate_up = mxfp8_lowm_linear(x, w13, s13)
+    return mxfp8_lowm_linear(swiglu(gate_up, swiglu_limit=swiglu_limit), w2, s2)
+
+
+def fuse_megamoe_shared_experts(layers, *, required: Optional[bool] = None) -> Optional[bool]:
+    """Hand the layers' shared experts to their MegaMoE CuteDSL backends, all of them or none.
+
+    A launch bucket's workspace cannot switch between the fused and the unfused kernel inside a
+    CUDA graph, so pass every such MoE of a process (target, MTP and draft) before the Linear
+    transforms; ``required`` is an earlier call's decision for MoEs sharing those workspaces.
+    Returns the decision, or None when no layer asks for fusion.
+    """
+    mlps = []
+    for layer in layers:
+        # Other backends' fused shared experts need routing this model does not do.
+        mlp = getattr(layer, "mlp", None)
+        if (
+            getattr(mlp, "shared_experts", None) is not None
+            and isinstance(getattr(mlp.experts, "backend", None), MegaMoECuteDsl)
+            and mlp.experts.num_fused_shared_expert > 0
+        ):
+            mlps.append(mlp)
+    if not mlps:
+        return None
+    unfusable = [
+        mlp.experts.layer_idx
+        for mlp in mlps
+        if not mlp.experts.backend.can_fuse_shared_expert(mlp.shared_experts)
+    ]
+    if required and unfusable:
+        raise ValueError(
+            f"megamoe_fuse_shared_expert: the shared experts of MoE layers {unfusable} are not "
+            "fusable FP8 block-scale MLPs, but MegaMoE layers sharing their workspaces already "
+            "fused theirs; turn megamoe_fuse_shared_expert off."
+        )
+    if required is False or unfusable:
+        if unfusable:
+            logger.warning(
+                f"megamoe_fuse_shared_expert: the shared experts of MoE layers {unfusable} are not "
+                "fusable FP8 block-scale MLPs, so every layer keeps its shared expert separate."
+            )
+        for mlp in mlps:
+            mlp.experts.backend.decline_shared_expert()
+        return False
+    for mlp in mlps:
+        mlp.experts.fuse_shared_expert(mlp.shared_experts)
+        mlp.shared_experts = None
+    return True
+
+
 class DeepseekV4MoE(nn.Module):
+    # Set per instance in __init__; the default covers instances built without it.
+    _per_layer_dynamic_eplb_enabled = False
+
     def __init__(
         self,
         *,
@@ -1659,6 +1813,9 @@ class DeepseekV4MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             has_vl_bias=bool(getattr(config, "use_vision_bias", False)),
+            small_m_logit_partials=bool(
+                model_config.extra_attrs.get("moe_router_partials_small_m", False)
+            ),
         )
         experts_quant_config = self._get_experts_quant_config(model_config, layer_idx)
         if override_quant_config is not None and experts_quant_config is model_config.quant_config:
@@ -1697,25 +1854,87 @@ class DeepseekV4MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
-        block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        gate_up_quant_config, down_quant_config = self._get_shared_expert_projection_quant_configs(
+            model_config, layer_idx
+        )
+        shared_model_config = model_config
+        if (
+            gate_up_quant_config == down_quant_config
+            and gate_up_quant_config is not model_config.quant_config
+        ):
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = gate_up_quant_config
 
+        quantized_block_sizes = [
+            quant_config.group_size
+            for quant_config in (gate_up_quant_config, down_quant_config)
+            if (
+                quant_config is not None
+                and quant_config.quant_algo is not None
+                and quant_config.group_size is not None
+            )
+        ]
+        block_size = max(quantized_block_sizes, default=1)
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size
         )
+        # (piece, pieces) of this rank's shared-expert shard that its decode forwards run, and
+        # their weights once built; the shard's tp_size // shared_tp_size replicas take one each.
+        self._full_tp_shared_piece = None
+        self._full_tp_shared_weights = None
+        if self.shared_output_scale is not None:
+            from ..modules.low_m_gemm import lowm_fp8_supported
 
-        self.shared_experts = GatedMLP(
+            if lowm_fp8_supported():
+                self._full_tp_shared_piece = (
+                    self.mapping.tp_rank // shared_tp_size,
+                    self.mapping.tp_size // shared_tp_size,
+                )
+
+        load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+        self._per_layer_dynamic_eplb_enabled = (
+            getattr(load_balancer_config, "mode", None) == "per_layer_dynamic"
+        )
+        self._per_layer_dynamic_eplb_auxiliary_sms = (
+            int(load_balancer_config.auxiliary_sms) if self._per_layer_dynamic_eplb_enabled else 0
+        )
+        rebalance_backend = getattr(self.experts, "backend", self.experts)
+        # The fused shared FC1/activation/FC2 kernel comes with the routed MegaMoE
+        # backend; ask that backend for the capability instead of naming a concrete
+        # implementation here. Per-layer dynamic EPLB is not a condition, but the
+        # kernel runs only in eager mode, which that load balancer requires.
+        use_fused_fc12 = (
+            self._shared_fc12_backend_supported(rebalance_backend)
+            and is_sm_100f()
+            and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
+            and not model_config.use_cuda_graph
+        )
+
+        shared_mlp_cls = GatedMLP
+        if use_fused_fc12:
+            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
+
+            shared_mlp_cls = MegaMoESharedMLP
+
+        # Only fused FC12 accepts an SM budget; other shared MLP backends stay unrestricted.
+        shared_reserved_sms = (
+            self._per_layer_dynamic_eplb_auxiliary_sms
+            if use_fused_fc12 and self._per_layer_dynamic_eplb_enabled
+            else 0
+        )
+        shared_mlp_kwargs = {"fc12_reserved_sms": shared_reserved_sms} if use_fused_fc12 else {}
+
+        self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
+            **shared_mlp_kwargs,
         )
 
         self.allreduce = None
@@ -1729,6 +1948,13 @@ class DeepseekV4MoE(nn.Module):
             )
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+        # Recorded by the routed path where a forked shared expert starts (_fork_after_routing).
+        self._post_routing_event = torch.cuda.Event()
+        self.eager_overlap_min_tokens: int | None = (
+            _EAGER_SHARED_EXPERT_OVERLAP_MIN_TOKENS
+            if self._eager_overlap_eligible(self.experts)
+            else None
+        )
 
         # Store config values for perfect routing.
         self.model_config = model_config
@@ -1778,6 +2004,11 @@ class DeepseekV4MoE(nn.Module):
         return shared_tp_size, shared_output_scale
 
     @staticmethod
+    def _eager_overlap_eligible(experts: MoE | VanillaMoE) -> bool:
+        """Only layers with a communication strategy: dispatch and combine leave SMs idle."""
+        return isinstance(experts, MoE) and experts.has_comm_strategy
+
+    @staticmethod
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
@@ -1788,6 +2019,86 @@ class DeepseekV4MoE(nn.Module):
             return model_config.quant_config
         return experts_quant_config
 
+    @staticmethod
+    def _get_shared_expert_projection_quant_configs(
+        model_config, layer_idx: int
+    ) -> tuple[Optional[QuantConfig], Optional[QuantConfig]]:
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        quant_config_dict = getattr(model_config, "quant_config_dict", None) or {}
+        global_quant_config = model_config.quant_config
+
+        gate_up_name = f"{base_name}.gate_up_proj"
+        gate_name = f"{base_name}.gate_proj"
+        up_name = f"{base_name}.up_proj"
+        down_name = f"{base_name}.down_proj"
+
+        # Match apply_layerwise_quant_config exactly for the actual fused
+        # gate_up Linear: the first gate_proj/gate_up_proj entry wins, while an
+        # up-only entry does not independently reconfigure a fused weight.
+        gate_up_quant_config = global_quant_config
+        for name, candidate in quant_config_dict.items():
+            if gate_name in name or gate_up_name in name:
+                gate_up_quant_config = candidate
+                break
+        down_quant_config = quant_config_dict.get(down_name, global_quant_config)
+
+        # apply_quant_config_exclude_modules runs after layerwise overrides and
+        # excludes the fused gate_up Linear when any fused constituent matches.
+        if global_quant_config is not None:
+            unquantized = QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo,
+            )
+            if any(
+                global_quant_config.is_module_excluded_from_quantization(name)
+                for name in (gate_up_name, gate_name, up_name)
+            ):
+                gate_up_quant_config = unquantized
+            if global_quant_config.is_module_excluded_from_quantization(down_name):
+                down_quant_config = unquantized
+        return gate_up_quant_config, down_quant_config
+
+    @staticmethod
+    def _shared_fc12_backend_supported(backend) -> bool:
+        capabilities = getattr(backend, "capabilities", None)
+        return bool(getattr(capabilities, "supports_per_layer_dynamic_eplb", False))
+
+    @staticmethod
+    def _shared_fc12_quantization_supported(
+        gate_up_quant_config: Optional[QuantConfig],
+        down_quant_config: Optional[QuantConfig],
+    ) -> bool:
+        return (
+            gate_up_quant_config is not None
+            and gate_up_quant_config == down_quant_config
+            and gate_up_quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and gate_up_quant_config.group_size == 128
+        )
+
+    def _full_tp_shared(self, hidden_states: torch.Tensor):
+        """This rank's shared-expert piece for a decode-sized BF16 input (``full_tp_shared_expert_
+        weights``), built on its first use outside graph capture; None runs the replicated shard."""
+        if (
+            self._full_tp_shared_piece is None
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.dim() != 2
+            or not 0 < hidden_states.shape[0] <= _SHARED_EXPERT_FULL_TP_MAX_ROWS
+            or not hidden_states.is_contiguous()
+            or hidden_states.data_ptr() % 16
+        ):
+            return None
+        if self._full_tp_shared_weights is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            weights = full_tp_shared_expert_weights(
+                self.shared_experts, *self._full_tp_shared_piece
+            )
+            if weights is None:
+                self._full_tp_shared_piece = None
+                return None
+            self._full_tp_shared_weights = weights
+        return self._full_tp_shared_weights
+
     def compute_routed_output(
         self,
         hidden_states,
@@ -1796,12 +2107,14 @@ class DeepseekV4MoE(nn.Module):
         all_rank_num_tokens,
         do_finalize,
         image_mask: Optional[torch.Tensor] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
     ):
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
         # TODO: Move this model-agonostic part to MoE
-        if self.use_dp and self.mapping.tp_size > 1 and get_sm_version() == 120:
+        if self.use_dp and self.mapping.tp_size > 1 and is_sm_120f():
             use_dp_padding = True
             hidden_states = torch.nn.functional.pad(
                 hidden_states, (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0])
@@ -1815,8 +2128,25 @@ class DeepseekV4MoE(nn.Module):
                 image_mask = torch.nn.functional.pad(
                     image_mask, (0, max(all_rank_num_tokens) - image_mask.shape[0]), value=False
                 )
+            if unrouted_rows is not None:
+                unrouted_rows = torch.nn.functional.pad(
+                    unrouted_rows, (0, 0, 0, max(all_rank_num_tokens) - unrouted_rows.shape[0])
+                )
 
-        router_logits = self.gate(hidden_states)
+        takes_partials = getattr(self.experts, "routes_from_logit_partials", None)
+        if (
+            hidden_states_fp4 is None
+            and takes_partials is not None
+            and takes_partials(routing_aux=image_mask)
+        ):
+            router_logits = self.gate(hidden_states, partials=True)
+        else:
+            router_logits = self.gate(hidden_states)
+        if moe_hooks is not None and isinstance(
+            getattr(self.experts, "scheduler", None), FusedCommMoEScheduler
+        ):
+            # The fused MoE launch also routes: a forked shared expert starts here, ahead of it.
+            moe_hooks.run_post_routing()
 
         # When ENABLE_PERFECT_ROUTER=1, the FusedMoE backend swaps router_logits
         # for cached ideal logits inside its own forward (interface.py:
@@ -1833,6 +2163,8 @@ class DeepseekV4MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             routing_aux=image_mask,
+            **({"moe_hooks": moe_hooks} if moe_hooks is not None else {}),
+            **({"unrouted_rows": unrouted_rows} if unrouted_rows is not None else {}),
         )
 
         return routed_output
@@ -1846,22 +2178,50 @@ class DeepseekV4MoE(nn.Module):
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         image_mask: Optional[torch.Tensor] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``unrouted_rows`` (bool ``[rows, 1]``) marks filler rows the routed experts may skip."""
         if not do_finalize:
             assert not self.use_dp
+
+        if self.shared_experts is None:
+            # The routed experts' fused kernel also ran the shared expert and added its output.
+            if not do_finalize:
+                raise ValueError("A fused shared expert requires do_finalize.")
+            final_hidden_states = self.compute_routed_output(
+                hidden_states,
+                hidden_states_fp4,
+                input_ids,
+                all_rank_num_tokens,
+                do_finalize,
+                image_mask=image_mask,
+                unrouted_rows=unrouted_rows,
+            )
+            if not self.use_dp and self.mapping.tp_size > 1:
+                final_hidden_states = self.allreduce(
+                    final_hidden_states, all_reduce_params=final_all_reduce_params
+                )
+            return final_hidden_states
 
         def _compute_shared_output():
             if hidden_states.shape[0] == 0:
                 # Shared experts have no collectives and need no empty GEMMs.
                 return torch.empty_like(hidden_states)
+            fp8_1x128 = getattr(hidden_states_fp4, "fp8_1x128", None)
+            weights = None if fp8_1x128 is not None else self._full_tp_shared(hidden_states)
+            if weights is not None:
+                return full_tp_shared_expert_forward(
+                    hidden_states, weights, self.shared_experts.swiglu_limit
+                )
+            # The FP8 projection would quantize these same bytes itself.
             shared_output = self.shared_experts(
-                hidden_states_fp4 if hidden_states_fp4 is not None else hidden_states
+                fp8_1x128 if fp8_1x128 is not None else hidden_states
             )
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
 
-        def _compute_routed_output():
+        def _compute_routed_output(moe_hooks=None):
             routed_output = self.compute_routed_output(
                 hidden_states,
                 hidden_states_fp4,
@@ -1869,30 +2229,99 @@ class DeepseekV4MoE(nn.Module):
                 all_rank_num_tokens,
                 do_finalize,
                 image_mask=image_mask,
+                moe_hooks=moe_hooks,
+                unrouted_rows=unrouted_rows,
             )
             return routed_output
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output,
-            _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-        )
-
-        if not do_finalize:
-            return [shared_output, *routed_output]
-        else:
+        def _add_shared_output(
+            routed_output: torch.Tensor, shared_output: torch.Tensor
+        ) -> torch.Tensor:
+            # Must return a new tensor: the shared output may be in the aux stream's pool.
             if routed_output.dim() == 3:
                 assert shared_output.numel() * self.top_k == routed_output.numel(), (
                     "unmatched tensor shape"
                 )
-                final_hidden_states = moe_reduce_add_shared_output(routed_output, shared_output)
-            else:
-                assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
-                final_hidden_states = shared_output + routed_output
+                return moe_reduce_add_shared_output(routed_output, shared_output)
+            assert shared_output.size() == routed_output.size(), "unmatched tensor shape"
+            return shared_output + routed_output
+
+        # With per-layer dynamic EPLB, the route runs the shared experts after
+        # MAIN has enqueued both HALO-Q and the TMA copy on the high-priority
+        # copy stream, so they overlap planning and the helper-weight copy.
+        # Every rank installs the same function.
+        if (
+            self._per_layer_dynamic_eplb_enabled
+            and self.shared_experts is not None
+            and not do_multi_stream()
+        ):
+            _shared_box = {}
+
+            def _overlap_shared():
+                # Shared-expert scaling must run at most once per forward.
+                if "out" not in _shared_box:
+                    _shared_box["out"] = _compute_shared_output()
+
+            with self.experts.load_balancer_overlap(_overlap_shared):
+                routed_output = _compute_routed_output()
+            # Compute shared experts here if the routed path did not run them.
+            if "out" not in _shared_box:
+                _shared_box["out"] = _compute_shared_output()
+            shared_output = _shared_box["out"]
+            if not do_finalize:
+                return [shared_output, *routed_output]
+            final_hidden_states = _add_shared_output(routed_output, shared_output)
+            if not self.use_dp and self.mapping.tp_size > 1:
+                final_hidden_states = self.allreduce(
+                    final_hidden_states, all_reduce_params=final_all_reduce_params
+                )
+            return final_hidden_states
+
+        if not do_finalize:
+            routed_output, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                _compute_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+            )
+            return [shared_output, *routed_output]
+        else:
+            fork_in_eager = (
+                self.eager_overlap_min_tokens is not None
+                and hidden_states.shape[0] >= self.eager_overlap_min_tokens
+            )
+            comm = getattr(self.experts, "comm", None)
+            if (
+                self.use_dp
+                and hidden_states.shape[0] > 0
+                and all_rank_num_tokens is not None
+                and getattr(comm, "pull_combine_applies", lambda _: False)(max(all_rank_num_tokens))
+            ):
+                return self._forward_shared_into_combine(
+                    _compute_routed_output,
+                    _compute_shared_output,
+                    _add_shared_output,
+                    self.aux_stream is not None and forks_now(fork_in_eager),
+                )
+            routed_fn, shared_fn = _compute_routed_output, _compute_shared_output
+            if (
+                self.aux_stream is not None
+                and not torch.compiler.is_compiling()
+                and forks_now(fork_in_eager)
+            ):
+                routed_fn, shared_fn = self._fork_after_routing(routed_fn, shared_fn)
+            final_hidden_states = maybe_execute_in_parallel_and_combine(
+                routed_fn,
+                shared_fn,
+                _add_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                fork_in_eager=fork_in_eager,
+            )
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
@@ -1900,6 +2329,66 @@ class DeepseekV4MoE(nn.Module):
                 )
 
             return final_hidden_states
+
+    def _fork_after_routing(self, routed, shared):
+        """Wrap the routed and shared paths of a forking forward so that the shared expert, on the
+        aux stream, starts right after the routed path's routing (or its router gate, ahead of a
+        fused MoE launch that routes) instead of at the MoE entry: its first GEMM, which occupies
+        every SM, no longer stretches the routing kernels. Without that point it starts at entry."""
+        event = self._post_routing_event
+        recorded = []
+
+        def record():
+            event.record()
+            recorded.append(True)
+
+        def routed_from_entry():
+            return routed(MoEForwardHooks(post_routing=record))
+
+        def shared_after_routing():
+            if recorded:
+                torch.cuda.current_stream().wait_event(event)
+            return shared()
+
+        return routed_from_entry, shared_after_routing
+
+    def _forward_shared_into_combine(self, routed, shared, add, fork: bool) -> torch.Tensor:
+        """Let the routed path's combine add the shared expert's output; if the combine does not
+        take it, add it after. A forking shared expert is issued onto the aux stream right after
+        the routed path's routing (see ``_fork_after_routing``), else it runs first."""
+        main = torch.cuda.current_stream()
+        hooks = MoEForwardHooks()
+        issued = []
+
+        def issue():
+            ready = None
+            if fork:
+                self.event_dict[EventType.Main].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.event_dict[EventType.Main].wait()
+                    output = shared()
+                    self.event_dict[EventType.MoeShared].record()
+                ready = self.event_dict[EventType.MoeShared]
+            else:
+                output = shared()
+            issued.append((output, ready))
+            hooks.addend, hooks.addend_ready = output, ready
+
+        if fork:
+            hooks.post_routing = issue
+        else:
+            issue()
+        routed_output = routed(hooks)
+        if not issued:
+            # The routed path has no routing point: the shared expert runs after it.
+            issue()
+        shared_output, ready = issued[0]
+        if ready is not None:
+            main.wait_event(ready)
+            if not torch.cuda.is_current_stream_capturing():
+                # Allocated on the aux stream, last read on this one.
+                shared_output.record_stream(main)
+        return routed_output if hooks.addend_fused else add(routed_output, shared_output)
 
 
 class DeepseekV4DecoderLayer(DecoderLayer):
@@ -2301,9 +2790,20 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         *,
         hidden_states_normalized: bool = False,
         image_mask: Optional[torch.Tensor] = None,
+        unrouted_rows: Optional[torch.Tensor] = None,
+        skip_allreduce: bool = False,
+        trigger_allreduce_at_end: bool = True,
+        unfinalized: bool = False,
     ) -> torch.Tensor:
+        """``skip_allreduce`` / ``unfinalized``: the next mHC boundary all-reduces the partial
+        output, or also combines the un-finalized expert rows, itself."""
         if hidden_states_normalized and self.fusion_config.PRE_MOE_FUSION:
             raise ValueError("Pre-normalized MoE input cannot use pre-MoE allreduce fusion")
+        # A normalized input may also come quantized for the routed experts.
+        hidden_states_fp4 = None
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            hidden_states_fp4 = hidden_states
+            hidden_states = hidden_states.unquantized_hidden_states
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize, input_ids):
             return self.mlp(
@@ -2312,12 +2812,17 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
                 final_all_reduce_params=AllReduceParams(
                     enable_allreduce=not (
-                        self.fusion_config.POST_MOE_FUSION or self.mapping.tp_size == 1
-                    )
+                        self.fusion_config.POST_MOE_FUSION
+                        or self.mapping.tp_size == 1
+                        or skip_allreduce
+                    ),
+                    # A consumer that prefetches before its PDL wait may launch early.
+                    trigger_completion_at_end=trigger_allreduce_at_end,
                 ),
                 do_finalize=do_finalize,
                 input_ids=input_ids,
                 image_mask=image_mask,
+                unrouted_rows=unrouted_rows,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -2348,8 +2853,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             )
         )
 
+        if unfinalized:
+            do_finalize = False
         hidden_states = _run_MoE(
-            hidden_states, hidden_states_fp4=None, input_ids=input_ids, do_finalize=do_finalize
+            hidden_states,
+            hidden_states_fp4=hidden_states_fp4,
+            input_ids=input_ids,
+            do_finalize=do_finalize,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -2543,8 +3053,11 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
 class DeepseekV4Model(DecoderModel):
     # Subclass hooks. ``uses_hc_head`` is False for checkpoints that ship no
     # ``hc_head`` weights and collapse the mHC stream some other way (V4.1).
+    # ``splits_mhc_boundaries``: the layers compute their mHC coefficients on
+    # a stream of their own (V4.1's split boundaries).
     decoder_layer_cls = DeepseekV4DecoderLayer
     uses_hc_head = True
+    splits_mhc_boundaries = False
 
     def __init__(
         self, model_config: ModelConfig[PretrainedConfig], mapping_with_cp: Optional[Mapping] = None
@@ -2557,7 +3070,12 @@ class DeepseekV4Model(DecoderModel):
         # Attention-phase and MoE-phase lanes are sequential within a layer, so the
         # Mla* roles reuse the Moe* slots. Engram keeps its own: it precomputes
         # across the layer rather than inside the MoE phase.
-        aux_stream_list = [torch.cuda.Stream() for _ in range(5)]
+        # The shared expert's stream runs at the decode graphs' priority: the next boundary waits
+        # for its output, while the other auxiliary streams stay at or below it.
+        shared_priority = decode_stream_priority(model_config.max_num_tokens)
+        aux_stream_list = [torch.cuda.Stream(priority=shared_priority)] + [
+            torch.cuda.Stream() for _ in range(4)
+        ]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
@@ -2569,11 +3087,14 @@ class DeepseekV4Model(DecoderModel):
             AuxStreamType.MlaIndexer: aux_stream_list[2],
             AuxStreamType.MlaIndexerAux: aux_stream_list[3],
         }
+        if self.splits_mhc_boundaries:
+            self.aux_stream_dict[AuxStreamType.MhcCoefficients] = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            use_masked_embedding_kernel=True,
         )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None
@@ -2650,8 +3171,12 @@ class DeepseekV4Model(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
+        prologue = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            prologue = self._fork_prologue(input_ids)
+            inputs_embeds = (
+                prologue.inputs_embeds if prologue is not None else self.embed_tokens(input_ids)
+            )
 
         # Engram and token-dependent routing still need IDs after embedding fusion.
         if input_ids is None:
@@ -2694,7 +3219,17 @@ class DeepseekV4Model(DecoderModel):
                 **({"token_mask": ~image_mask} if image_mask is not None else {}),
             )
             engram_embeddings_cache = {}
+            engram_start_layers = {
+                layer_id: self._engram_precompute_start_layer(layer_id, attn_metadata)
+                for layer_id in self.engram_layer_ids
+            }
+
+        def launch_engram_precomputes(start_layer: int) -> None:
+            if engram_embeddings_cache is None:
+                return
             for layer_id in self.engram_layer_ids:
+                if engram_start_layers[layer_id] != start_layer:
+                    continue
                 engram_mod = self.layers[layer_id].engram
                 if engram_mod is not None:
                     # precompute() dispatches onto the engram stream internally and
@@ -2704,28 +3239,7 @@ class DeepseekV4Model(DecoderModel):
                     )
                     engram_events[layer_id] = engram_mod.sync_event
 
-        mapping = self.model_config.mapping
-        if mapping.has_pp() and not mapping.is_first_pp_rank():
-            hidden_states = torch.empty(
-                inputs_embeds.shape[0],
-                self.hc_mult,
-                inputs_embeds.shape[1],
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-            )
-        else:
-            hidden_states = inputs_embeds
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-
-        # ``hc_state`` carries the mHC pipeline state across layers. Layer 0
-        # receives the initial residual tensor and bootstraps via
-        # hc_attn.pre_mapping ("hc_pre"). Every later layer receives an
-        # ``HCState``. In fused mode the state is "deferred" (prior layer's
-        # hc_ffn.post_mapping is folded into this layer's hc_attn.fused_hc);
-        # in unfused mode the state is "resolved" (residual already
-        # post-mapped). After the last layer, a deferred state is closed with
-        # a standalone hc_post; a resolved state feeds hc_head directly.
-        hc_state = self._init_hc_state(hidden_states)
+        launch_engram_precomputes(0)
 
         replay_at, replay_plan = self._plan_bounded_replay(
             attn_metadata,
@@ -2735,9 +3249,57 @@ class DeepseekV4Model(DecoderModel):
             requests=kwargs.get("context_requests"),
         )
         remote_tail_at = self._remote_tail_boundary(attn_metadata)
+        if prologue is not None and (replay_at is not None or remote_tail_at is not None):
+            # A row-changing boundary reads the embedding on this stream.
+            prologue.join(None)
 
-        engram_kv_cache: dict[int, torch.Tensor] = {}
-        for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
+        # The layers before the replay boundary may run as one unit (a CUDA graph).
+        encoder = self._run_encoder_layers(
+            attn_metadata,
+            inputs_embeds,
+            position_ids,
+            input_ids,
+            replay_at=replay_at,
+            image_mask=image_mask,
+            engram=(
+                None
+                if engram_embeddings_cache is None
+                else (engram_embeddings_cache, engram_events, launch_engram_precomputes)
+            ),
+        )
+        first_layer = 0
+        if encoder is not None:
+            hc_state, first_layer = encoder
+        else:
+            mapping = self.model_config.mapping
+            if mapping.has_pp() and not mapping.is_first_pp_rank():
+                hidden_states = torch.empty(
+                    inputs_embeds.shape[0],
+                    self.hc_mult,
+                    inputs_embeds.shape[1],
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device,
+                )
+            elif prologue is not None:
+                hidden_states = prologue.join(engram_embeddings_cache)
+            else:
+                hidden_states = torch.stack([inputs_embeds] * self.hc_mult, dim=1)
+
+            # ``hc_state`` carries the mHC pipeline state across layers. Layer 0
+            # receives the initial residual tensor and bootstraps via
+            # hc_attn.pre_mapping ("hc_pre"). Every later layer receives an
+            # ``HCState``. In fused mode the state is "deferred" (prior layer's
+            # hc_ffn.post_mapping is folded into this layer's hc_attn.fused_hc);
+            # in unfused mode the state is "resolved" (residual already
+            # post-mapped). After the last layer, a deferred state is closed with
+            # a standalone hc_post; a resolved state feeds hc_head directly.
+            hc_state = self._init_hc_state(hidden_states)
+
+        engram_kv_cache: dict[int, Any] = {}
+        for idx in range(first_layer, self.num_hidden_layers):
+            decoder_layer = self.layers[idx]
+            if idx:
+                launch_engram_precomputes(idx)
             if idx == remote_tail_at:
                 boundary_output, hc_state = self._enter_remote_tail_boundary(
                     attn_metadata, hc_state
@@ -2750,12 +3312,22 @@ class DeepseekV4Model(DecoderModel):
                 )
                 if image_mask is not None and replay_plan.replays_local_tokens:
                     image_mask = image_mask.index_select(0, replay_plan.rows)
+                hc_state = self._run_replayed_layers(
+                    idx,
+                    attn_metadata,
+                    position_ids,
+                    input_ids,
+                    hc_state,
+                    spec_metadata=spec_metadata,
+                    **({"image_mask": image_mask} if image_mask is not None else {}),
+                )
+                break
 
-            if engram_embeddings_cache is not None and spec_metadata is None:
-                projected = self._precompute_engram_kv(idx, engram_embeddings_cache)
-                if projected is not None:
-                    layer_id, kv = projected
-                    engram_kv_cache[layer_id] = kv
+            # Speculative batches only without a row-changing boundary in this forward.
+            if engram_embeddings_cache is not None and (
+                spec_metadata is None or (replay_at is None and remote_tail_at is None)
+            ):
+                engram_kv_cache.update(self._precompute_engram_kv(idx, engram_embeddings_cache))
 
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
@@ -2768,6 +3340,12 @@ class DeepseekV4Model(DecoderModel):
                 engram_embeddings = engram_embeddings_cache[idx]
 
             engram_kwargs = {}
+            if engram_embeddings_cache is not None:
+                callback = self._engram_after_attention_callback(
+                    idx, engram_embeddings_cache, attn_metadata
+                )
+                if callback is not None:
+                    engram_kwargs["after_attention_callback"] = callback
             if idx in engram_kv_cache:
                 engram_kwargs["precomputed_engram_kv"] = engram_kv_cache.pop(idx)
             hc_state = decoder_layer(
@@ -2805,6 +3383,21 @@ class DeepseekV4Model(DecoderModel):
             **({"token_mask": token_mask} if token_mask is not None else {}),
         )
 
+    def _engram_precompute_start_layer(
+        self, layer_id: int, attn_metadata: DeepseekV4TrtllmAttentionMetadata
+    ) -> int:
+        """Return the layer before which ``layer_id``'s Engram lookup is launched."""
+        return 0
+
+    def _engram_after_attention_callback(
+        self,
+        layer_idx: int,
+        embeddings: dict[int, Any],
+        attn_metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> Callable[[], None] | None:
+        """Return work to run between layer ``layer_idx``'s attention and MoE, if any."""
+        return None
+
     def _precompute_engram(
         self,
         layer_id: int,
@@ -2817,9 +3410,9 @@ class DeepseekV4Model(DecoderModel):
 
     def _precompute_engram_kv(
         self, layer_idx: int, embeddings: dict[int, torch.Tensor]
-    ) -> tuple[int, torch.Tensor] | None:
-        """Optionally launch a later layer's Engram projection before this layer."""
-        return None
+    ) -> dict[int, Any]:
+        """Launch later layers' Engram projections before this layer, if any: ``{layer_id: kv}``."""
+        return {}
 
     # ------------------------------------------------------------------
     # Bounded-replay boundary hooks
@@ -2863,6 +3456,42 @@ class DeepseekV4Model(DecoderModel):
         """
         raise NotImplementedError
 
+    def _run_encoder_layers(
+        self,
+        attn_metadata,
+        inputs_embeds,
+        position_ids,
+        input_ids,
+        *,
+        replay_at,
+        image_mask=None,
+        engram=None,
+    ):
+        """Optionally run the layers before ``replay_at`` as one unit (e.g. a CUDA graph).
+
+        ``engram`` is the forward's ``(lookups, events, launcher)``. Returns the state after
+        those layers and the next layer's index, or ``None`` to run them in the layer loop.
+        V4 never replays a suffix, so it always declines.
+        """
+        return None
+
+    def _run_replayed_layers(
+        self, start, attn_metadata, position_ids, input_ids, hc_state, **layer_kwargs
+    ):
+        """Run layers ``start..`` on the replayed rows; ``layer_kwargs`` reach every layer.
+
+        Replay is refused when one of these layers has Engram, so none takes Engram inputs.
+        """
+        for layer in self.layers[start : self.num_hidden_layers]:
+            hc_state = layer(
+                position_ids=position_ids,
+                hc_state=hc_state,
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                **layer_kwargs,
+            )
+        return hc_state
+
     def _exit_bounded_replay(self, plan, attn_metadata, hidden_states):
         """Restore encoder-pass shape and metadata after a successful replayed suffix.
 
@@ -2878,6 +3507,11 @@ class DeepseekV4Model(DecoderModel):
     # in this method; everything between them (engram precompute + per-layer
     # event waits, the PP-rank branch, the layer loop) is identical. Factoring
     # them out keeps V4.1 from having to copy ~90 lines that would then drift.
+
+    def _fork_prologue(self, input_ids: torch.Tensor) -> Any:
+        """None, or the embedding and the stacked residual launched on a side stream: ``inputs_embeds``
+        and ``join(engram_embeddings)``, which returns the residual joined to the current stream."""
+        return None
 
     def _init_hc_state(self, hidden_states: torch.Tensor):
         """Seed the inter-layer mHC state from the ``[N, mult, hidden]`` stream.
@@ -2903,6 +3537,20 @@ class DeepseekV4Model(DecoderModel):
         return hc_state.residual.flatten(1)
 
 
+# The step-loop hooks validated on DeepSeek-V4 and V4.1.
+_DEEPSEEK_V4_RUNTIME_HOOKS = RuntimeHooks(
+    stage_decode_inputs=True, prioritize_decode_graphs=True, prompts_to_owners=True
+)
+_DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
+    stage_decode_inputs=True,
+    prioritize_decode_graphs=True,
+    loop_on_execution_stream=True,
+    prompts_to_owners=True,
+    skip_adp_count_gather=True,
+    skip_verify_row_gather=True,
+)
+
+
 @register_auto_model("DeepseekV4ForCausalLM")
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     # Subclass hooks, so a variant can swap the model / logits path without
@@ -2910,6 +3558,14 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     model_cls = DeepseekV4Model
     logits_processor_cls = DeepseekV4LogitsProcessor
     weight_loader_cls = DeepseekV4WeightLoader
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Staged decode inputs and priority decode graphs; speculative decoding also runs
+        the overlap loop on the execution stream."""
+        if self.spec_config is not None:
+            return _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS
+        return _DEEPSEEK_V4_RUNTIME_HOOKS
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -2981,6 +3637,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model=self.model_cls(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
+        # FP8 block-scale projections race the small-M kernel against the quantized GEMM; on SM107
+        # prefill-sized MXFP8 projections run on the CuTe DSL GEMM.
+        for module in self.modules():
+            if isinstance(module, Linear):
+                module.use_fp8_small_m_gemm = True
+                module.use_sm107_mxfp8_prefill_gemm = True
         self.logits_processor = self.logits_processor_cls(
             model_config, self.model.hc_head, self.model.norm
         )
@@ -3118,6 +3780,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         return self.model.layers[: self.config.num_hidden_layers]
 
     def post_load_weights(self):
+        super().post_load_weights()
         layers = self._post_load_decoder_layers()
         last_idx = len(layers) - 1
         for idx, layer in enumerate(layers):
@@ -3140,3 +3803,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
                     and next_layer.enable_fused_hc
                     and next_layer.engram is None
                 )
+        # The MTP and draft layers share the target's MegaMoE launch workspaces. A DSpark draft
+        # decided for its stages at its own load, which comes first; the target follows it.
+        draft = getattr(self, "draft_model", None)
+        draft_layers = getattr(draft, "mtp_layers", None) or []
+        dspark = getattr(draft, "dspark_model", None)
+        fuse_megamoe_shared_experts(
+            [*layers, *draft_layers],
+            required=getattr(dspark, "megamoe_shared_expert_fusion", None),
+        )

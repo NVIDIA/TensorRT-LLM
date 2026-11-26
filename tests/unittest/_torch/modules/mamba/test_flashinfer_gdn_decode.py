@@ -105,3 +105,85 @@ def test_fi_decode_misaligned_index_slice() -> None:
 
     torch.testing.assert_close(out_mis.float(), out_ref.float())
     torch.testing.assert_close(pool_mis.float(), pool_ref.float())
+
+
+@SKIP_UNSUPPORTED
+@pytest.mark.parametrize("N", [1, 3])
+def test_fi_decode_misaligned_ab_slices(N: int) -> None:
+    """Non-32B-aligned ``a``/``b`` column slices must be realigned.
+
+    ``gdn_mixer`` splits the fused ``in_proj_ba`` output into
+    ``b = ba[:, :num_v_heads_per_tp]`` and ``a = ba[:, num_v_heads_per_tp:]``,
+    so ``a`` starts ``num_v_heads_per_tp`` elements in. The FI kernel asserts
+    32-byte alignment, so any TP split whose per-rank v-head count is not a
+    multiple of 16 (e.g. Qwen3.6-35B-A3B TEP4: 32 / 4 = 8)
+    aborts unless ``_flashinfer_gdn_decode`` clones the slice first.
+    ``.contiguous()`` is not a fix: at decode the token dim is 1, so the
+    offset view already reports as contiguous.
+
+    Two fused buffers exercise each guard: the ordinary split misaligns ``a``;
+    shifting the fused buffer by 16 bytes misaligns ``b`` instead.
+    """
+    from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+        _flashinfer_gdn_decode,
+    )
+
+    torch.manual_seed(0)
+    dev = "cuda"
+    H, HV, K, V = 4, 8, 128, 128
+    q = (torch.randn(1, N, H, K, device=dev) * 0.1).to(torch.bfloat16)
+    k = (torch.randn(1, N, H, K, device=dev) * 0.1).to(torch.bfloat16)
+    v = (torch.randn(1, N, HV, V, device=dev) * 0.1).to(torch.bfloat16)
+    A_log = torch.empty(HV, device=dev).uniform_(1.0, 16.0).log()
+    dt_bias = torch.randn(HV, device=dev) * 0.1
+    state_pool = (torch.randn(N, HV, V, K, device=dev) * 0.1).to(torch.bfloat16)
+    idx = torch.arange(N, device=dev, dtype=torch.int32)
+    cu_seqlens = torch.arange(N + 1, device=dev, dtype=torch.long)
+
+    # bf16 gating inputs, as the model passes them: HV=8 elements -> 16-byte offset.
+    ba = (torch.randn(N, 2 * HV, device=dev) * 0.1).to(torch.bfloat16)
+    b_aligned = ba[:, :HV].view(1, N, HV)
+    a_misaligned = ba[:, HV:].view(1, N, HV)
+    assert b_aligned.data_ptr() % 32 == 0
+    assert a_misaligned.data_ptr() % 32 == 16
+
+    shifted_storage = (torch.randn(N * 2 * HV + HV, device=dev) * 0.1).to(torch.bfloat16)
+    shifted_ba = shifted_storage[HV:].view(N, 2 * HV)
+    b_misaligned = shifted_ba[:, :HV].view(1, N, HV)
+    a_aligned = shifted_ba[:, HV:].view(1, N, HV)
+    assert b_misaligned.data_ptr() % 32 == 16
+    assert a_aligned.data_ptr() % 32 == 0
+    if N == 1:
+        # Real decode shape: a size-1 token dim makes the offset view report as
+        # contiguous, so ``.contiguous()`` would keep the misaligned pointer.
+        assert a_misaligned.is_contiguous()
+        assert b_misaligned.is_contiguous()
+
+    def _run(a_in, b_in):
+        pool = state_pool.clone()
+        out = _flashinfer_gdn_decode(
+            A_log=A_log,
+            a=a_in,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b_in,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            scale=K**-0.5,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+        return out, pool
+
+    for a, b in [(a_misaligned, b_aligned), (a_aligned, b_misaligned)]:
+        out_mis, pool_mis = _run(a, b)
+        out_ref, pool_ref = _run(
+            a.clone(memory_format=torch.contiguous_format),
+            b.clone(memory_format=torch.contiguous_format),
+        )
+        torch.testing.assert_close(out_mis.float(), out_ref.float())
+        torch.testing.assert_close(pool_mis.float(), pool_ref.float())

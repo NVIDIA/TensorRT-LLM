@@ -23,7 +23,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
 from transformers import PreTrainedTokenizer
-from zmq import PUSH
+from zmq import IMMEDIATE, LINGER, PUSH
 from zmq.asyncio import Context
 
 from tensorrt_llm import LLM, SamplingParams
@@ -33,6 +33,12 @@ from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+
+_ITERATION_STATS_TIMEOUT_SEC = 2.0
+# Shutdown may finish one in-flight stats read and then perform a final read.
+# RPC-backed reads can spend the timeout in both fetch and iteration.
+_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 2 * 2 * _ITERATION_STATS_TIMEOUT_SEC + 1.0
+_ITERATION_LOG_LINGER_MS = 1000
 
 
 class LlmManager:
@@ -54,6 +60,9 @@ class LlmManager:
         self._outbox = outbox
 
         self._stop = asyncio.Event()
+        # Set whenever the idle worker has something to act on: a request was
+        # enqueued, a request failed, or a stop was requested.
+        self._worker_wakeup = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
         self._task_errors: List[BaseException] = []
@@ -75,6 +84,27 @@ class LlmManager:
         """Return whether the duration limit has elapsed since the first request."""
         return (self.duration is not None and self.start_time is not None
                 and time.perf_counter() - self.start_time >= self.duration)
+
+    async def _wait_for_worker_wakeup(self) -> None:
+        """Wait until the worker has something to act on.
+
+        Returns once a request is enqueued, a request fails, a stop is
+        requested or the duration limit elapses. Polling instead would keep
+        the event loop busy for the whole benchmark, competing for the GIL
+        with the LLM API thread that delivers the responses.
+        """
+        self._worker_wakeup.clear()
+        timeout = None
+        if self.duration is not None:
+            # Before the first request starts, the deadline is at least one
+            # full duration away.
+            start_time = (self.start_time if self.start_time is not None else
+                          time.perf_counter())
+            timeout = max(0.0, start_time + self.duration - time.perf_counter())
+        try:
+            await asyncio.wait_for(self._worker_wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -246,6 +276,7 @@ class LlmManager:
         error = task.exception()
         if error is not None:
             self._task_errors.append(error)
+            self._worker_wakeup.set()
 
     async def worker(self) -> None:
         """Worker task that pulls requests from inbox and processes them."""
@@ -274,7 +305,7 @@ class LlmManager:
                     request, sampling_params, post_proc_params = self._inbox.get_nowait(
                     )
                 except asyncio.QueueEmpty:
-                    await asyncio.sleep(0)  # yield to concurrent tasks
+                    await self._wait_for_worker_wakeup()
                     continue
                 task = asyncio.create_task(
                     self.process_request(request,
@@ -324,8 +355,12 @@ class LlmManager:
 
         try:
             # Create a ZMQ context and socket for sending data
-            context = Context.instance(io_threads=1)
+            context = Context(io_threads=1)
             socket = context.socket(PUSH)
+            socket.setsockopt(LINGER, _ITERATION_LOG_LINGER_MS)
+            # Do not queue records until the writer has finished binding. This
+            # prevents a fast producer from losing its tail during shutdown.
+            socket.setsockopt(IMMEDIATE, 1)
             socket.connect(iteration_addr)
 
             # Wait until a request is seen before proceeding
@@ -335,7 +370,8 @@ class LlmManager:
 
             # Continuously send statistics data while the stop signal is not set
             while not self._stop.is_set():
-                async for stats in self.llm.get_stats_async(2):
+                async for stats in self.llm.get_stats_async(
+                        _ITERATION_STATS_TIMEOUT_SEC):
                     await socket.send_json(stats)
                 # NOTE: This is a WAR to force this loop to relinquish control
                 # that was preventing other async tasks from holding the event
@@ -344,32 +380,33 @@ class LlmManager:
 
             # Wrap up by sending any remaining statistics data
             logger.debug("Iteration log worker wrapping up...")
-            async for stats in self.llm.get_stats_async(2):
+            async for stats in self.llm.get_stats_async(
+                    _ITERATION_STATS_TIMEOUT_SEC):
                 await socket.send_json(stats)
+            await socket.send_json({"end": True})
         except asyncio.CancelledError:
-            # Handle task cancellation
             logger.debug("Iteration log worker cancelled.")
-        except Exception as e:
-            # Raise any other exceptions encountered
-            raise e
+            raise
         finally:
-            # Ensure the socket sends a termination message and is properly closed
-            logger.debug("Iteration log worker sending None...")
-            socket.send_json({"end": True})
             if socket is not None:
-                logger.debug("Closing socket...")
                 socket.close()
             if context is not None:
-                logger.debug("Terminating context...")
-                context.term()
+                # Even finite linger can block; keep the event loop responsive.
+                await asyncio.to_thread(context.term)
 
         logger.info("Iteration log worker exiting.")
 
     async def stop(self) -> None:
         logger.info("Stopping LLM backend.")
         self._stop.set()
+        self._worker_wakeup.set()
         if self._iteration_log_task:
-            await self._iteration_log_task
+            try:
+                await asyncio.wait_for(self._iteration_log_task,
+                                       timeout=_ITERATION_LOG_DRAIN_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning("Iteration logging timed out; the iteration log "
+                               "may be incomplete.")
         assert self._backend_task is not None
         await self._backend_task
         logger.info("LLM Backend stopped.")
@@ -389,6 +426,7 @@ class LlmManager:
                       sampling_params: SamplingParams,
                       post_proc_params: PostprocParams) -> None:
         await self._inbox.put((request, sampling_params, post_proc_params))
+        self._worker_wakeup.set()
 
 
 @asynccontextmanager

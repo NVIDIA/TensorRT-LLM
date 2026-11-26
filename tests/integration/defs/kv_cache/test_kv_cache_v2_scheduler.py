@@ -199,6 +199,7 @@ def _run_v1_v2_compare(
         return llm.generate(prompts, sampling_params=sampling_params), warmup_outputs
 
     outputs_v1 = None
+    warmup_v1 = None
     if assert_outputs_match:
         kv_v1 = KvCacheConfig(use_kv_cache_manager_v2=False, **kv_extra)
         with LLM(model_path, kv_cache_config=kv_v1, **llm_kwargs) as llm:

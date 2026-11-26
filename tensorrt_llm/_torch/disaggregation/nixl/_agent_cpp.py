@@ -65,6 +65,26 @@ class BindingsNixlTransferStatus(TransferStatus):
         get = getattr(self._cpp_status, "get_last_status", None)
         return int(get()) if get is not None else -1
 
+    def release(self) -> bool:
+        """Release the backend request handle (releases GIL).
+
+        Returns:
+            True if the backend accepted the release. For NIXL, calls after a
+            successful release return True without reaching the backend.
+        """
+        return self._cpp_status.release()
+
+    def __del__(self):
+        """Release the handle without the GIL before the C++ status is destroyed.
+
+        Releasing waits for the NIXL agent's lock, which load_remote_agent holds
+        for the whole metadata load. The C++ destructor that runs next finds
+        nothing left to release, so it cannot stop every Python thread while
+        it waits.
+        """
+        if getattr(self, "_cpp_status", None) is not None:
+            self.release()
+
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using C++ bindings with GIL release support.
@@ -92,8 +112,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         for key, value in backend_params.items():
             backend_params[key] = str(value)
         backend_params["num_threads"] = str(num_threads)
-        # C++ reads "num_workers" (not "num_threads") for progress threads, default 1.
-        # Env-gated so the default is unchanged (more threads can hurt the coalesced bounce WRITE).
+        # C++ reads "num_workers" (not "num_threads") for progress threads. It is set only from
+        # TRTLLM_NIXL_NUM_WORKERS; otherwise the backend default (1) applies.
         # Validate at the boundary: only a positive int reaches the backend.
         nixl_num_workers = os.environ.get("TRTLLM_NIXL_NUM_WORKERS")
         if nixl_num_workers is not None:

@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftKVCacheView,
     MiniMaxM3KVCacheManagerV2,
+    default_sparse_layer_ids,
     derive_shared_draft_layout,
     extend_attention_op_pools_for_shared_draft_layers,
     shared_draft_layer_count,
@@ -471,6 +472,94 @@ def test_shared_draft_layer_count_follows_the_base_manager():
     assert shared_draft_layer_count(None, None) == 0
 
 
+def _text_config(sparse_attention_freq):
+    return SimpleNamespace(
+        num_hidden_layers=len(sparse_attention_freq),
+        sparse_attention_config={"sparse_attention_freq": list(sparse_attention_freq)},
+    )
+
+
+def test_default_sparse_layers_follow_the_text_config():
+    # The model reads its dense/sparse split from the config; so does the cache.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5) == [0, 2, 3]
+    assert default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 5) == [3, 4]
+    # Without a config spanning the target layers, layers 0..2 stay dense.
+    assert default_sparse_layer_ids(None, 5) == [3, 4]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), None) == []
+
+
+def test_default_sparse_layers_log_a_fallback_that_ignores_the_config(monkeypatch):
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager as cache_manager
+
+    log = Mock()
+    monkeypatch.setattr(cache_manager, "logger", log)
+    # A config whose split is not the default, on a manager with a different layer count.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert log.info.call_count == 1
+    # The default split, a matching layer count, or no config: nothing to report.
+    default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 6)
+    default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5)
+    default_sparse_layer_ids(None, 6)
+    assert log.info.call_count == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["msa", "triton"])
+def test_index_k_cache_follows_the_config_sparse_layers(
+    monkeypatch: pytest.MonkeyPatch, implementation: str
+) -> None:
+    """Every layer the config makes sparse gets an index-K buffer and view, and only those."""
+    resolved = []
+    registered = {}
+
+    def fake_base_init(self, *args, **kwargs):
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        # Five target layers and the shared Eagle3 layer appended after them.
+        self.layer_offsets = {layer: layer for layer in range(6)}
+        # The base _build_base_config registers the extra pool buffers here.
+        registered.update(self._extra_buffers_per_layer(tokens_per_block=32))
+
+    def fake_get_index_k_buffer(self, layer_idx, **kwargs):
+        resolved.append(layer_idx)
+        return torch.empty(0)
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
+    mode = SimpleNamespace(
+        is_mtp_eagle_one_model=lambda: False,
+        is_mtp_vanilla=lambda: False,
+        is_eagle3_one_model=lambda: True,
+    )
+
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=5,
+        spec_config=SimpleNamespace(spec_dec_mode=mode, _num_draft_hidden_layers=None),
+        sparse_attention_config=SimpleNamespace(
+            implementation=implementation, indexer_kv_dtype="bf16"
+        ),
+        pretrained_config=_text_config([1, 0, 1, 1, 0]),
+    )
+
+    assert manager._shared_draft_layer_ids == [5]
+    assert manager.sparse_layer_ids == [0, 2, 3]
+    assert manager.disable_index_value_layer_ids == {0, 2, 3}
+    assert sorted(registered) == [0, 2, 3]
+    for buffers in registered.values():
+        assert [buffer.role for buffer in buffers] == [Role.INDEX_KEY]
+    assert resolved == [0, 2, 3]
+    for layer in (0, 2, 3):
+        assert manager.get_index_k_buffer(layer) is not None
+    for layer in (1, 4, 5):
+        assert manager.get_index_k_buffer(layer) is None
+    # The Triton path runs the dense target layers on the native attention op.
+    expected_dense_native = (1, 4) if implementation == "triton" else ()
+    assert manager._dense_native_layer_ids == expected_dense_native
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("local_draft_layers", [[], [60], [61]])
 @pytest.mark.parametrize("swa_scratch_reuse", [False, True])
@@ -739,3 +828,118 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
     assert index_nhd.data_ptr() == index_hnd.data_ptr()
     torch.testing.assert_close(manager.get_index_k_buffer(0, "HND"), index_hnd)
     torch.testing.assert_close(index_hnd, before[:, 2, :1])
+
+
+# Bytes per token for local layers 0/1/2 (dense global 11, sparse global 27,
+# shared Eagle global 60), each with 4 KV heads x head_dim 128 (K + V), plus a
+# 128-wide index-K on the sparse layer: 256 B in BF16, 128 B in FP8.
+# BF16 K/V is 2048 B per layer and FP8 K/V is 1024 B. With NVFP4 only the
+# sparse layer is NVFP4 (512 B data + 64 B FP8 block scales); the dense and
+# Eagle layers keep FP8 K/V (1024 B), the Eagle layer on P32 physical pages.
+_M3_LAYER_BYTES_PER_TOKEN = {
+    (DataType.BF16, "bf16"): [2048, 2048 + 256, 2048],
+    (DataType.BF16, "fp8"): [2048, 2048 + 128, 2048],
+    (DataType.FP8, "bf16"): [1024, 1024 + 256, 1024],
+    (DataType.FP8, "fp8"): [1024, 1024 + 128, 1024],
+    (DataType.NVFP4, "bf16"): [1024, 576 + 256, 1024],
+    (DataType.NVFP4, "fp8"): [1024, 576 + 128, 1024],
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("main_dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp8"])
+def test_m3_budget_estimate_covers_actual_paged_buffers(
+    main_dtype: DataType, index_dtype: str
+) -> None:
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = main_dtype
+    manager.kv_cache_type = CacheType.SELF
+    manager.kv_factor = 2
+    manager.num_kv_heads_per_layer = [4, 4, 4]
+    manager.head_dim_per_layer = [128, 128, 128]
+    manager.num_local_layers = 3
+    # Nonidentity PP mapping: local layers 0/1/2 are global layers 11/27/60.
+    manager.pp_layers = [11, 27, 60]
+    manager.layer_offsets = {11: 0, 27: 1, 60: 2}
+    manager.sparse_layer_ids = {27}
+    manager.disable_index_value_layer_ids = {27}
+    manager._shared_draft_layer_ids = [60]
+    manager.sparse_index_dim = 128
+    manager.indexer_kv_dtype = index_dtype
+    manager.tokens_per_block = 128
+    manager._ledger_tokens_per_block = 128
+    manager._generation_kv_capacity_headroom = 1
+    manager.max_num_tokens = 8192
+    manager.max_seq_len = 8192
+    manager.max_batch_size = 1
+    manager.max_beam_width = 1
+    manager.enable_partial_reuse = False
+    manager.max_draft_len = 0
+    manager.max_attention_window_vec = [None, None, None]
+    manager.max_cuda_graph_batch_size = None
+    manager.num_extra_kv_tokens = 0
+    manager.enable_swa_scratch_reuse = False
+    manager.enable_block_reuse = False
+    manager.block_reuse_policy = kv_cache_manager_v2.BlockReusePolicy.ALL_REUSABLE
+    manager.reuse_match_backoff = 0
+    manager.enable_stats = False
+    manager._has_cp_helix = False
+    manager.layer_specs = None
+
+    config = manager._build_base_config(
+        KvCacheConfig(
+            pool_ratio=[1.0],
+            enable_block_reuse=False,
+            max_util_for_resume=0.9,
+            enable_partial_reuse=False,
+        ),
+        tokens_per_block=manager.tokens_per_block,
+        cache_tiers=[kv_cache_manager_v2.GpuCacheTierConfig(quota=1 << 20)],
+    )
+    config = manager._build_cache_config(config)
+    config = manager._remove_zero_size_buffers(config)
+
+    # Independently total final allocator descriptors. Eagle P32 buffers use
+    # their physical-page override; all other buffers use the ledger P128.
+    actual_bytes_per_token = []
+    for layer in config.layers:
+        layer_bytes = 0
+        for buffer in layer.buffers:
+            tokens_per_page = buffer.tokens_per_block_override or manager.tokens_per_block
+            assert buffer.size % tokens_per_page == 0
+            layer_bytes += buffer.size // tokens_per_page
+        actual_bytes_per_token.append(layer_bytes)
+    expected_layer_bytes = _M3_LAYER_BYTES_PER_TOKEN[(main_dtype, index_dtype)]
+    assert actual_bytes_per_token == expected_layer_bytes
+    estimated_layer_bytes, _ = manager._get_runtime_cache_size_layer_components()
+    assert estimated_layer_bytes == expected_layer_bytes
+    assert [
+        sum(buffer.role == Role.INDEX_KEY for buffer in layer.buffers) for layer in config.layers
+    ] == [0, 1, 0]
+
+    expected_index_bytes = 128 * (2 if index_dtype == "bf16" else 1)
+    assert manager.get_layer_bytes_per_token(1, Role.INDEX_KEY) == expected_index_bytes
+    assert manager.get_layer_bytes_per_token(0, Role.INDEX_KEY) == 0
+    assert manager.get_layer_bytes_per_token(2, Role.INDEX_KEY) == 0
+    for role in (Role.KEY, Role.VALUE):
+        assert manager.get_layer_bytes_per_token(1, role) == (
+            KVCacheManagerV2.get_layer_bytes_per_token(manager, 1, role)
+        )
+    if main_dtype == DataType.NVFP4:
+        for role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+            assert manager.get_layer_bytes_per_token(1, role) == (
+                KVCacheManagerV2.get_layer_bytes_per_token(manager, 1, role)
+            )
+        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        assert all(buffer.role not in scale_roles for buffer in config.layers[0].buffers)
+        assert all(buffer.role not in scale_roles for buffer in config.layers[2].buffers)
+
+    # The cache-created event sizes its block counts from the same per-token total.
+    assert manager.get_cache_bytes_per_token() == sum(actual_bytes_per_token)
+    tier = kv_cache_manager_v2.GpuCacheTierConfig(quota=sum(actual_bytes_per_token) * 128 * 10)
+    assert manager._get_event_num_blocks_per_cache_level([tier], 128) == [10]
+
+    configured_footprint = sum(actual_bytes_per_token) * manager.max_num_tokens
+    estimated_quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)
+    assert estimated_quota >= configured_footprint

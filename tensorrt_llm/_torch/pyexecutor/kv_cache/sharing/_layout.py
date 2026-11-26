@@ -568,7 +568,11 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         windows=tuple(desc.window for desc in layer_groups),
         sink_blocks=tuple(desc.sink_blocks for desc in layer_groups),
         recurrent=tuple(desc.kind == "state" for desc in layer_groups),
-        sparse=tuple(_sparse(layer_cfg[layer_ids[0]]) for layer_ids in grouping),
+        # Every layer of the group, not just its first: grouping follows the life cycle,
+        # which sparsity does not take part in, so a group can hold both kinds.
+        sparse=tuple(
+            any(_sparse(layer_cfg[layer_id]) for layer_id in layer_ids) for layer_ids in grouping
+        ),
         layers=tuple(desc.layers for desc in layer_groups),
         shards=tuple((desc.shard.count, desc.shard.index) for desc in layer_groups),
         page_bytes={g: sum(p.slot_bytes for p in pools) for g, pools in device_pools.items()},

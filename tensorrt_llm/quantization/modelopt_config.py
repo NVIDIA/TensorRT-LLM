@@ -70,6 +70,20 @@ def canonicalize_quant_algo(value: Any) -> Any:
     return _QUANT_ALGO_ALIASES.get(value.lower(), value)
 
 
+def reject_checkpoint_nvfp4_plus(quant_algo: Any, source: str) -> None:
+    """Raise if a checkpoint's quantization config names ``NVFP4_PLUS``.
+
+    NVFP4_PLUS serves MXFP4 checkpoints and is chosen with
+    ``OVERRIDE_QUANT_ALGO=NVFP4_PLUS``. No checkpoint stores it, and its loader
+    would read any scales such a checkpoint carried as E8M0.
+    """
+    if isinstance(quant_algo, str) and quant_algo.upper() == "NVFP4_PLUS":
+        raise ValueError(
+            f"{source} names quant_algo NVFP4_PLUS, which is not a checkpoint "
+            "format; serve an MXFP4 checkpoint with OVERRIDE_QUANT_ALGO=NVFP4_PLUS."
+        )
+
+
 def _canonicalize_algos(result: Dict[str, Any]) -> Dict[str, Any]:
     """Canonicalize ``quant_algo`` at the top level and inside ``quantized_layers``.
 
@@ -79,6 +93,7 @@ def _canonicalize_algos(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     if "quant_algo" in result:
         result["quant_algo"] = canonicalize_quant_algo(result["quant_algo"])
+        reject_checkpoint_nvfp4_plus(result["quant_algo"], "The checkpoint quantization config")
     layers = result.get("quantized_layers")
     if isinstance(layers, dict):
         result["quantized_layers"] = {
@@ -89,6 +104,9 @@ def _canonicalize_algos(result: Dict[str, Any]) -> Dict[str, Any]:
             )
             for name, cfg in layers.items()
         }
+        for name, cfg in result["quantized_layers"].items():
+            if isinstance(cfg, dict):
+                reject_checkpoint_nvfp4_plus(cfg.get("quant_algo"), f"Quantized layer {name}")
     return result
 
 

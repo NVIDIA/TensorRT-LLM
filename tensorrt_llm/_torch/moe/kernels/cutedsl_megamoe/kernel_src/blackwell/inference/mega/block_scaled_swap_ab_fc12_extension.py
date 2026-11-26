@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Block-scaled SwapAb adapter between FC12 scheduling and kernel tensor views."""
 
 import dataclasses
@@ -16,7 +13,8 @@ from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 from .....helpers.dsl_helpers import spin_peek, spin_wait
 from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo, peek_ready_bit
 
-TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk"]
+
+TensorRole = Literal["a", "b", "sfa", "sfb", "c", "sfc", "topk", "fc1_act_scale"]
 
 
 @cute.jit
@@ -54,18 +52,14 @@ class BlockScaledSwapAbFc12Extension:
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            result = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            result = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return result
 
         fc1_done_counter_pointer = rebuild(self.fc1_done_counter_pointer)
         fc2_spin_threshold = rebuild(self.fc2_spin_threshold)
         fc1_ready_counter_pointer = (
-            rebuild(self.fc1_ready_counter_pointer)
-            if self.fc1_ready_counter_pointer is not None
-            else None
+            rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
         if value_index != len(values):
             raise ValueError(
@@ -91,9 +85,7 @@ class BlockScaledSwapAbFc12Extension:
                 if is_fc1:
                     counter_pointer = self.fc1_ready_counter_pointer + counter_slot
                     peek_flag = Int32(0)
-                    if spin_peek(
-                        counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile
-                    ):
+                    if spin_peek(counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile):
                         peek_flag = Int32(peek_ready_bit)
                     phase_and_flags = work_tile.phase_and_flags | peek_flag
 
@@ -151,25 +143,20 @@ class BlockScaledSwapAbFc12Extension:
             result = cute.domain_offset((0, 0, expert_idx), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
-            return (
-                cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)),
-                None,
-            )
+            return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name in ("sfb", "sfc")):
             result = cute.domain_offset((sf_token_offset, 0, 0), tensor)
             per_expert_shape = (shape[0], shape[1], singleton)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
-            return (
-                cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)),
-                None,
-            )
+            return (cute.make_tensor(result.iterator, cute.make_layout(sf_layout.shape, stride=stride)), None)
 
         if cutlass.const_expr(tensor_name == "c"):
             result = cute.domain_offset((data_token_offset, 0, 0), tensor)
             return (_rewrite_tensor_shape(result, (shape[0], shape[1], singleton)), None)
 
-        if cutlass.const_expr(tensor_name == "topk"):
+        if cutlass.const_expr(tensor_name in ("topk", "fc1_act_scale")):
+            # Both follow the data-token pool (not the independently padded SF pool).
             return (cute.domain_offset((data_token_offset,), tensor), None)
 
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")

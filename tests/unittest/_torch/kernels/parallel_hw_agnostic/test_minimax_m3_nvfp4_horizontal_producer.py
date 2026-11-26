@@ -345,6 +345,7 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_invalid_inputs(
         num_heads_q = 1 << 30
 
     with pytest.raises(RuntimeError, match=error):
+        call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = weights
         _run_nvfp4(
             packed,
             data_cache,
@@ -354,7 +355,10 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_invalid_inputs(
             inv_scales,
             num_heads_q,
             num_kv_heads,
-            *weights,
+            call_q_weight,
+            call_k_weight,
+            call_index_q_weight,
+            call_index_k_weight,
             rope_cache,
             position_ids,
         )
@@ -385,6 +389,7 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = weights
         graph_q, graph_index_q = _run_nvfp4(
             packed,
             data_cache,
@@ -394,7 +399,10 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
             inv_scales,
             num_heads_q,
             num_kv_heads,
-            *weights,
+            call_q_weight,
+            call_k_weight,
+            call_index_q_weight,
+            call_index_k_weight,
             rope_cache,
             position_ids,
         )
@@ -415,6 +423,7 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     index_cache.zero_()
 
     reference_data, reference_scale, reference_index = _nvfp4_caches(num_pages, num_kv_heads)
+    call_q_weight, call_k_weight, call_index_q_weight, call_index_k_weight = weights
     reference_q, reference_index_q = _run_nvfp4(
         replay_packed,
         reference_data,
@@ -424,7 +433,10 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
         replay_scales,
         num_heads_q,
         num_kv_heads,
-        *weights,
+        call_q_weight,
+        call_k_weight,
+        call_index_q_weight,
+        call_index_k_weight,
         rope_cache,
         replay_positions,
     )

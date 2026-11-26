@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import unittest
 
 import pytest
@@ -232,6 +234,30 @@ def test_sa_config_invalid_zero():
             max_draft_len=4,
             max_matching_ngram_size=0,
         )
+
+
+@pytest.mark.cpu_only
+def test_sa_never_gets_a_separate_draft_kv_cache():
+    """SA is one-engine but weight-free: no draft model, no draft KV cache.
+
+    Without the SA exemption the executor builds a zero-layer draft KV cache
+    manager for it and splits the KV budget with that manager.
+    """
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm._torch.speculative.sa_worker import SAWorker
+    from tensorrt_llm._torch.speculative.utils import (
+        get_num_extra_kv_tokens,
+        get_num_spec_layers,
+        get_spec_worker,
+    )
+
+    config = SADecodingConfig(max_draft_len=4)
+    assert config.spec_dec_mode.use_one_engine()
+    assert should_use_separate_draft_kv_cache(config) is False
+    assert get_num_spec_layers(config) == 0
+    # The extra tokens are the target's own reservation for the draft window.
+    assert get_num_extra_kv_tokens(config) == 3
+    assert isinstance(get_spec_worker(config, model_config=None, mapping=None), SAWorker)
 
 
 class _FakeSARequest:

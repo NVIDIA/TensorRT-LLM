@@ -14,6 +14,7 @@
 # limitations under the License.
 """Shared helpers for VisualGen accuracy tests."""
 
+import ast
 import base64
 import contextlib
 import gc
@@ -27,11 +28,12 @@ import threading
 import traceback
 import zipfile
 from dataclasses import dataclass
-from typing import Collection, Iterator, Literal
+from typing import Any, Collection, Iterator, Literal
 
 import pytest
 import torch
 import torch._inductor.config as inductor_config
+import torch.nn.functional as F
 from torch._inductor.async_compile import shutdown_compile_workers
 
 # =============================================================================
@@ -383,7 +385,14 @@ class ReusableLPIPSScorer:
         batch = batch.permute(0, 3, 1, 2).to(device=self.device, dtype=torch.float32)
         return batch / 127.5 - 1.0
 
-    def score_video(self, reference_path, generated_path):
+    def score_video(
+        self,
+        reference_path,
+        generated_path,
+        *,
+        frame_start=0,
+        frame_stop=None,
+    ):
         reference = self._decode_video_to_lpips_batch(reference_path)
         generated = self._decode_video_to_lpips_batch(generated_path)
         if generated.shape[1:] != reference.shape[1:]:
@@ -392,10 +401,16 @@ class ReusableLPIPSScorer:
                 f"{tuple(generated.shape[1:])} vs {tuple(reference.shape[1:])}."
             )
         paired_frame_count = min(generated.shape[0], reference.shape[0])
+        frame_stop = paired_frame_count if frame_stop is None else frame_stop
+        if frame_start < 0 or frame_start >= frame_stop or frame_stop > paired_frame_count:
+            raise ValueError(
+                f"LPIPS frame window [{frame_start}, {frame_stop}) is outside "
+                f"the {paired_frame_count} paired frames."
+            )
         with torch.no_grad():
             scores = self._get_model()(
-                generated[:paired_frame_count],
-                reference[:paired_frame_count],
+                generated[frame_start:frame_stop],
+                reference[frame_start:frame_stop],
             ).flatten()
         return float(scores.mean().item())
 
@@ -406,6 +421,40 @@ class ReusableLPIPSScorer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _multi_resolution_log_stft_distance(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> float:
+    """Mean log1p-magnitude STFT L1 over three FFT sizes; the result is not in dB."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"Audio shape mismatch: generated {tuple(actual.shape)}, "
+            f"golden {tuple(expected.shape)}."
+        )
+    actual = actual.float().reshape(-1, actual.shape[-1])
+    expected = expected.float().reshape(-1, expected.shape[-1])
+    distances: list[torch.Tensor] = []
+    for n_fft in (512, 1024, 2048):
+        hop_length = n_fft // 4
+        window = torch.hann_window(n_fft)
+        actual_stft = torch.stft(
+            actual,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            return_complex=True,
+        ).abs()
+        expected_stft = torch.stft(
+            expected,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            return_complex=True,
+        ).abs()
+        distances.append(F.l1_loss(torch.log1p(actual_stft), torch.log1p(expected_stft)))
+    return float(torch.stack(distances).mean())
 
 
 def _llm_models_root():
@@ -435,6 +484,8 @@ def _require_exists(path, label, is_dir=False):
 
 
 def _golden_media_family(media_name):
+    if media_name.startswith("fasth3_"):
+        return "minimax_h3"
     if media_name.startswith("cosmos3_"):
         return "cosmos3"
     if media_name.startswith(("fastwan_", "wan21_", "wan22_")):
@@ -445,6 +496,8 @@ def _golden_media_family(media_name):
         return "glm_image"
     if media_name.startswith("hunyuan_"):
         return "hunyuan"
+    if media_name.startswith("ltx23_"):
+        return "ltx23"
     if media_name.startswith("ltx2_"):
         return "ltx2"
     if media_name.startswith(("qwenimage_", "qwen_image_layered_")):
@@ -573,6 +626,24 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_workspace_config
 
 
+# NVFP4 GEMM backends allowed in fixed-golden runs. The backends are not bit-identical and
+# autotuning picks among them by timing, so the pick can change between processes and machines.
+# Backend selection and parity are covered by the NVFP4 operator unit tests.
+_FIXED_NVFP4_GEMM_BACKENDS = ("cutlass",)
+_NVFP4_GEMM_TUNING_OP = "trtllm::nvfp4_gemm::gemm"
+
+
+@contextlib.contextmanager
+def _fixed_nvfp4_gemm_backends() -> Iterator[None]:
+    """Pin NVFP4 GEMMs built in this thread to ``_FIXED_NVFP4_GEMM_BACKENDS``."""
+    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+
+    extra_attrs = dict(get_model_extra_attrs() or {})
+    extra_attrs["nvfp4_gemm_allowed_backends"] = list(_FIXED_NVFP4_GEMM_BACKENDS)
+    with model_extra_attrs(extra_attrs):
+        yield
+
+
 @contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
     """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
@@ -588,17 +659,72 @@ def _fixed_nvfp4_quantization_backend(features):
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        with model_extra_attrs(extra_attrs):
+        with _fixed_nvfp4_gemm_backends():
             yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
+
+
+def _run_diffusion_worker_with_fixed_nvfp4_gemm(**worker_kwargs: Any) -> None:
+    """Run a spawned VisualGen worker with its NVFP4 GEMMs pinned to the fixed backends.
+
+    ``_fixed_nvfp4_quantization_backend`` sets a thread-local in the calling process, so it
+    cannot reach a worker that VisualGen spawns. Patch ``executor.run_diffusion_worker`` with
+    this function while constructing ``VisualGen``: each spawned worker then builds its
+    pipeline, and every NVFP4 ``Linear`` in it, under the GEMM pin. Unlike that helper, it
+    leaves the FP4 activation quantizer autotuned: its TRT-LLM and FlashInfer tactics are
+    bit-identical (``test_fp4_quantize_flashinfer.py``), so only the GEMM backend needs the pin.
+
+    Args:
+        **worker_kwargs: Keyword arguments for ``executor.run_diffusion_worker``.
+
+    Raises:
+        RuntimeError: If called in the process that patched ``executor.run_diffusion_worker``.
+    """
+    from tensorrt_llm._torch.visual_gen import executor
+
+    run_worker = executor.run_diffusion_worker
+    if run_worker is _run_diffusion_worker_with_fixed_nvfp4_gemm:
+        raise RuntimeError(
+            "The NVFP4 GEMM pin only works as the target of a spawned VisualGen worker."
+        )
+    with _fixed_nvfp4_gemm_backends():
+        run_worker(**worker_kwargs)
+
+
+def _assert_nvfp4_gemm_cache_pinned(cache_path: str | os.PathLike[str]) -> None:
+    """Check that every NVFP4 GEMM decision in an autotuner cache used the fixed backends.
+
+    Args:
+        cache_path: Autotuner cache JSON written through ``TLLM_AUTOTUNER_CACHE_PATH``.
+
+    Raises:
+        AssertionError: If the cache has no NVFP4 GEMM decision, or a decision was tuned
+            without the backend pin or picked a tactic outside it.
+    """
+    with open(cache_path) as cache_file:
+        cache = json.load(cache_file)
+    entries = [
+        (key, value)
+        for section, section_entries in cache.items()
+        if section != "metadata"
+        for key, value in section_entries.items()
+        if key.startswith(f"('{_NVFP4_GEMM_TUNING_OP}'")
+    ]
+    assert entries, f"No {_NVFP4_GEMM_TUNING_OP} tuning decisions recorded in {cache_path}"
+    pinned_backends = repr(_FIXED_NVFP4_GEMM_BACKENDS)
+    unpinned = [key for key, _ in entries if pinned_backends not in key]
+    assert not unpinned, f"NVFP4 GEMMs tuned without the backend pin: {unpinned}"
+    for key, value in entries:
+        tactic = ast.literal_eval(value["tactic"])
+        backend = tactic[0] if isinstance(tactic, tuple) else None
+        assert tactic == -1 or backend in _FIXED_NVFP4_GEMM_BACKENDS, (
+            f"NVFP4 GEMM tactic {value['tactic']} is outside {_FIXED_NVFP4_GEMM_BACKENDS}: {key}"
+        )
 
 
 def _feature_generator_process_entry(connection, generator, args):
@@ -723,10 +849,23 @@ def _run_reusable_image_lpips_eval(sample_id, reference_path, generated_path, sc
     return score
 
 
-def _run_reusable_video_lpips_eval(sample_id, reference_path, generated_path, scorer):
+def _run_reusable_video_lpips_eval(
+    sample_id,
+    reference_path,
+    generated_path,
+    scorer,
+    *,
+    frame_start=0,
+    frame_stop=None,
+):
     try:
         with _lpips_deterministic_algorithms():
-            score = scorer.score_video(reference_path, generated_path)
+            score = scorer.score_video(
+                reference_path,
+                generated_path,
+                frame_start=frame_start,
+                frame_stop=frame_stop,
+            )
     except Exception as error:
         pytest.fail(f"LPIPS video eval failed for {sample_id}: {error}")
     print(f"\n[E2E {sample_id} LPIPS] score: {score:.6f}")

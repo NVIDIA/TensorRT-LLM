@@ -15,11 +15,13 @@
 
 """Host-side access to the DWDP fabric-gather kernel (``trtllm::dwdp_fabric_gather``).
 
-Opt-in via ``TRTLLM_DWDP_PREFETCH_GATHER=1``: an SM kernel issuing 16-byte loads out-runs the copy
-engine but occupies SMs for the whole step, so it only pays off while compute hides behind the copy.
-``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and
-``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER`` and
-``TRTLLM_DWDP_GATHER_KERNEL=tma``.  See ``apply_compute_side_defaults`` for the compute-side knobs.
+Opt-in via ``DwdpConfig.copy_mode='gather'`` (or the deprecated ``TRTLLM_DWDP_PREFETCH_GATHER=1``):
+an SM kernel issuing 16-byte loads out-runs the copy engine but occupies SMs for the whole step, so
+it only pays off while compute hides behind the copy.  ``DwdpConfig.gather_kernel`` picks the kernel
+of every launch of a manager (:func:`use_tma`).  ``TRTLLM_DWDP_GATHER_LIB`` loads the op from a
+prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and ``TRTLLM_DWDP_GATHER_THREADS`` size the grid;
+the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER``.  See ``apply_compute_side_defaults`` for the
+compute-side knobs.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 _ENABLE_ENV = "TRTLLM_DWDP_PREFETCH_GATHER"
+_KERNEL_ENV = "TRTLLM_DWDP_GATHER_KERNEL"
 _LIB_ENV = "TRTLLM_DWDP_GATHER_LIB"
 _BLOCKS_ENV = "TRTLLM_DWDP_GATHER_BLOCKS"
 _THREADS_ENV = "TRTLLM_DWDP_GATHER_THREADS"
@@ -97,26 +100,83 @@ def blocks_per_row(rows: int) -> int:
     return max(1, total_blocks() // max(rows, 1))
 
 
-#: Compute-side knobs the SM gather sets for itself unless the user pinned them.
+#: SMs the persistent grids leave to the gather (``resident_sms``), if the user pins the count.
 _SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
+#: Compute-side knobs the SM gather sets for itself unless the user pinned them.
 _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
 _ROUTING_NO_COOP_ENV = "TLLM_ROUTING_DISABLE_COOP_LAUNCH"
 
 
-def apply_compute_side_defaults() -> None:
-    """Tune the CuTeDSL persistent kernels for a resident gather; call before any kernel compiles.
+def available() -> bool:
+    """True if the gather transport is requested and its op is registered."""
+    return is_enabled() and gather_op() is not None
 
-    Reserves the gather's block count of SMs (``TRTLLM_CUTEDSL_SM_RESERVE``) and pins the SM107
-    dense GEMM to the CLC dynamic scheduler (``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER``) so static
-    persistent grids do not run a second wave on the occupied SMs.  Also turns off the
-    grid-cooperative MoE routing kernel (``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``), which needs every
-    SM co-resident and so would wait behind the gather.  The routing code reads that knob once, at
-    its first launch, so this must run before the first forward.  An explicit user setting wins.
+
+def env_request() -> Optional[bool]:
+    """What ``TRTLLM_DWDP_PREFETCH_GATHER`` asks for: None when it is unset or empty."""
+    if not os.environ.get(_ENABLE_ENV):
+        return None
+    return is_enabled()
+
+
+def resident_sms(gather: Optional[bool] = None) -> int:
+    """SMs the persistent compute grids leave to the gather; read once, by the DWDP managers.
+
+    ``TRTLLM_CUTEDSL_SM_RESERVE`` pins the count.  Otherwise it is the gather's block count where
+    the gather is the transport and one block of ``THREADS >= 512`` fills an SM; smaller blocks
+    share SMs with the compute kernels and reserve none.
+
+    Args:
+        gather: Whether the gather is the transport; None means :func:`available`, the expert
+            DWDP choice (``DwdpManager``).  Standalone dense DWDP passes its own choice.
     """
-    reserve = str(total_blocks() if THREADS >= 512 else 0)
+    pinned = _int_env(_SM_RESERVE_ENV, -1)
+    if pinned >= 0:
+        return pinned
+    uses_gather = available() if gather is None else gather
+    if not uses_gather or THREADS < 512:
+        return 0
+    return total_blocks()
+
+
+def use_tma(kernel: Optional[str]) -> bool:
+    """Whether a manager's gather launches run the TMA kernel (``DwdpConfig.gather_kernel``).
+
+    Each DWDP manager resolves this once and passes it to every launch of its gather.  ``kernel``
+    wins over a different ``TRTLLM_DWDP_GATHER_KERNEL``, with a warning; without ``kernel`` that
+    environment variable still applies and is reported as deprecated.  The environment is read,
+    never written.
+
+    Args:
+        kernel: ``"register"`` or ``"tma"``; None leaves the choice to the environment, and to the
+            register kernel when the variable is unset.
+    """
+    env = os.environ.get(_KERNEL_ENV)
+    if kernel is None:
+        if env:
+            logger.warning(
+                f"[DWDP] {_KERNEL_ENV}={env!r} is deprecated; set dwdp_config.gather_kernel instead"
+            )
+        return env == "tma"
+    if env and env != kernel:
+        logger.warning(
+            f"[DWDP] dwdp_config.gather_kernel={kernel!r} overrides {_KERNEL_ENV}={env!r}"
+        )
+    return kernel == "tma"
+
+
+def apply_compute_side_defaults() -> None:
+    """Tune the compute kernels for a resident gather; call before the first forward.
+
+    Pins the SM107 dense GEMM to the CLC dynamic scheduler
+    (``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER``) so static persistent grids do not run a second wave
+    on the SMs the gather holds (the persistent grids themselves leave :func:`resident_sms` SMs
+    out, see ``DwdpManager``).  Also turns off the grid-cooperative MoE routing kernel
+    (``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``), which needs every SM co-resident and so would wait
+    behind the gather.  The routing code reads that knob once, at its first launch, so this must
+    run before the first forward.  An explicit user setting wins.
+    """
     applied = []
-    if os.environ.setdefault(_SM_RESERVE_ENV, reserve) == reserve:
-        applied.append(f"{_SM_RESERVE_ENV}={reserve}")
     if os.environ.setdefault(_DENSE_GEMM_SCHEDULER_ENV, "clc_dynamic") == "clc_dynamic":
         applied.append(f"{_DENSE_GEMM_SCHEDULER_ENV}=clc_dynamic")
     if os.environ.setdefault(_ROUTING_NO_COOP_ENV, "1") == "1":

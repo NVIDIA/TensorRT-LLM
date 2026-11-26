@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from dataclasses import replace
 
 import torch
@@ -20,12 +21,12 @@ from packaging.version import Version
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
 from .activation import MoEActivationSupport
 from .cutlass import CutlassFusedMoEBase, TrtllmCutlassNvfp4Impl
-from .cutlass.eligibility import check_oss_cutlass_build
+from .cutlass.eligibility import BF16_ONLY, check_dtype, check_oss_cutlass_build
+from .cutlass.lora import moe_lora_active
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -34,14 +35,54 @@ from .impl_contract import (
     MoERejectReason,
     MoERunContext,
     MoEStaticCapability,
-    canonical_quant,
-    normalize_quant,
+    check_quant_matches_identity,
     nvfp4_fc1_row_alignment_rejection,
     require_comm_plan,
-    require_layer_quant_format,
 )
 from .impl_environment import MoEDep
-from .interface import _reject
+from .impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
+from .interface import MoESchedulerKind, _reject
+
+# Identity segments. The decode kernel is FlashInfer's CuTe DSL SM12x fused MoE
+# (``flashinfer.fused_moe.cute_dsl.blackwell_sm12x``); the NVFP4 leaf's CUTLASS
+# prefill is a per-call choice inside that one identity.
+PROVIDER_FLASHINFER = "flashinfer"
+TECHNIQUE_CUTEDSL = "cutedsl"
+KERNEL_B12X = "b12x"
+
+# The decode path reads no expert bias, fuses no LoRA and has no EPLB support;
+# the gates still decline EPLB explicitly because the inherited
+# ``_supports_load_balancer()`` answers True. Router weights folded into the
+# input are out too: the decode path hands ``token_final_scales`` straight to
+# the b12x wrapper, which has no defined behaviour for the ``None`` the fold
+# leaves there.
+_B12X_CAPABILITIES = MoEStaticCapability(
+    supports_moe_lora=False,
+    supports_dwdp=True,
+    supports_expert_bias=False,
+    supports_apply_router_weight_on_input=False,
+)
+
+# Pinned rather than inherited, so a change in the CUTLASS parent cannot
+# retarget these leaves. ``B12xMoEWrapper`` keeps one workspace across calls
+# (FlashInfer caches it by shape even without CUDA graphs) and, with CUDA
+# graphs, returns a view of its output buffer, which ``_SHARED_MOE_OUTPUT_BUF``
+# also shares across layers.
+_B12X_INPUT_REQUIREMENT = MoEInputRequirement(
+    routing_scales_dtype=torch.float32, run_moe_reuses_buffers=True
+)
+
+
+def _b12x_descriptor(quant: str, doc: str) -> MoEImplDescriptor:
+    """One B12x leaf's descriptor: ``flashinfer.cutedsl.b12x.<quant>``."""
+    return MoEImplDescriptor(
+        identity=MoEImplId(PROVIDER_FLASHINFER, TECHNIQUE_CUTEDSL, KERNEL_B12X, quant),
+        scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+        capabilities=_B12X_CAPABILITIES,
+        input_requirement=_B12X_INPUT_REQUIREMENT,
+        doc=doc,
+    )
+
 
 # Shared MoE output buffer pool, keyed by (max_num_tokens, hidden_size, dtype,
 # device). ``B12xMoEWrapper.__init__`` allocates a private
@@ -50,7 +91,10 @@ from .interface import _reject
 # bytes of GPU memory holding identical-shape buffers that are written
 # sequentially. We fold them into a single shared buffer because MoE layers
 # run sequentially on the same CUDA stream, and the wrapper consumes its
-# previous output before the next layer is dispatched.
+# previous output before the next layer is dispatched. Within one layer, the
+# scheduler runs the chunks of a multi-chunk forward on one stream and copies
+# every chunk but the last out of it -- the trailing ``torch.cat`` copies that
+# one -- because the leaves declare ``run_moe_reuses_buffers``.
 _SHARED_MOE_OUTPUT_BUF: dict = {}
 
 # ActivationType -> b12x activation string. b12x currently exposes "relu2"
@@ -60,7 +104,7 @@ _ACTIVATION_MAP = {
     ActivationType.Swiglu: "silu",
 }
 
-# FlashInfer's SM12x W4A16 fused MoE (0.6.17 and 0.6.18) selects a TC-decode
+# FlashInfer's SM12x W4A16 fused MoE (0.6.17 to 0.7.1) selects a TC-decode
 # "ultra-wide" FC2 tile of tile_n=512 / tile_k=32 for small m whenever that
 # collapses FC2 to FC1's wave count (m=3 and m=4 for Qwen3.6-35B-A3B on the
 # 188-SM RTX PRO 6000). tile_k=32 sits below the tile_k>=64 floor of its
@@ -68,12 +112,26 @@ _ACTIVATION_MAP = {
 # the ``force_tile_config`` re-pin across the custom-op boundary does not, so
 # the kernel it just selected is rejected with "force_tile_config fc2 tile
 # (tile_k=32, tile_n=512) does not fit ..." and CUDA-graph warmup aborts
-# executor init (nvbug 6721561). Accepting the ultra tile in the re-validation
-# under the same rule that produced it is the upstream fix; this shim mirrors
-# it so the pinned wheel behaves like the fixed one. Drop it once the
-# flashinfer pin carries ``_ultra_wide_fc2_tile_fits``.
+# executor init (nvbug 6721561). FlashInfer 0.7.2 fixes the re-pin: it calls
+# ``_candidate_tile_fits(..., enforce_search_floor=False)``. This shim accepts
+# the ultra tile in the re-validation of the releases before that, under the
+# same rule that produced it. It installs only over the validator signature of
+# those releases, which it mirrors, and stands aside on any other, such as
+# 0.7.2's with ``enforce_search_floor``.
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE = (512, 32, 256)  # (tile_n, tile_k, cta_threads)
 _FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE = Version("0.6.17")
+_FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS = (
+    "problem_n",
+    "problem_k",
+    "cta_m_blocks",
+    "tile_n",
+    "tile_k",
+    "cta_threads",
+    "max_shared_mem",
+    "scale_format",
+    "weight_layout",
+    "allow_logical_tail",
+)
 
 
 def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
@@ -99,6 +157,8 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
         return False
     if getattr(upstream_fits, "_trtllm_ultra_wide_fc2_shim", False):
         return True
+    if tuple(inspect.signature(upstream_fits).parameters) != _FLASHINFER_W4A16_PRE_FIX_FITS_PARAMS:
+        return False
 
     def candidate_tile_fits(
         *,
@@ -153,9 +213,9 @@ def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
 
 
 class CuteDslB12xFusedMoEBase:
-    """What the two B12x SM120/121 leaves share: the gates, the format check,
-    the quant method and the decode call, keyed by each leaf's
-    ``b12x_quant_algo``.
+    """What the two B12x SM120/121 leaves share: the gates, the quant method,
+    the ``run_moe`` admission and the decode call. Each leaf publishes one
+    ``flashinfer.cutedsl.b12x.<quant>`` identity.
 
     A mixin, because the NVFP4 leaf inherits the CUTLASS NVFP4 leaf (for
     prefill) while the W4A16 leaf inherits only ``CutlassFusedMoEBase``.
@@ -163,30 +223,18 @@ class CuteDslB12xFusedMoEBase:
     ``issubclass`` against it matches both leaves.
     """
 
-    #: Neither leaf publishes an identity; without this the NVFP4 leaf would
-    #: publish its CUTLASS parent's.
-    descriptor = None
-    #: The one format the leaf serves; ``None`` on this family class, which no
-    #: layer runs on. Compared as ``MoEProblem.identity_quant`` spells it, so the
-    #: NVFP4 leaf also admits the NVFP4_AWQ / NVFP4_ARC calibration aliases.
-    b12x_quant_algo: QuantAlgo | None = None
+    #: ``None`` on this family class, which no layer runs on. Each leaf
+    #: declares its own; one that did not would get this ``None`` rather than
+    #: the identity of the CUTLASS parent it inherits.
+    descriptor: MoEImplDescriptor | None = None
+    #: Whether the b12x kernel quantizes activations. It does so against the
+    #: global scales ``NVFP4CuteDslB12xFusedMoEMethod.transform_weights`` fixes
+    #: at load time, so the gate declines ``force_dynamic_quantization``.
+    b12x_quantizes_activations: bool = False
 
-    # The decode path reads no expert bias, fuses no LoRA and has no EPLB
-    # support; the gates still decline EPLB explicitly because the inherited
-    # ``_supports_load_balancer()`` answers True. Router weights folded into the
-    # input are out too: the decode path hands ``token_final_scales`` straight to
-    # the b12x wrapper, which has no defined behaviour for the ``None`` the fold
-    # leaves there.
-    capabilities = MoEStaticCapability(
-        supports_moe_lora=False,
-        supports_dwdp=True,
-        supports_expert_bias=False,
-        supports_apply_router_weight_on_input=False,
-    )
-
-    # Pinned rather than inherited, so a change in the CUTLASS parent cannot
-    # retarget these backends.
-    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+    # ``B12xMoEWrapper`` reads and writes bfloat16 only. Pinned, so the NVFP4
+    # leaf does not answer with its CUTLASS parent's set.
+    supported_dtypes = BF16_ONLY
 
     # The kinds ``_ACTIVATION_MAP`` gates on; the decode kernel takes no
     # activation constants.
@@ -202,22 +250,18 @@ class CuteDslB12xFusedMoEBase:
     _SUPPORTED_SM_VERSIONS = frozenset({120, 121})
 
     @classmethod
-    def _identity_quant(cls) -> str:
-        return normalize_quant(canonical_quant(cls.b12x_quant_algo))
-
-    @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        if cls.b12x_quant_algo is None:
+        if cls.descriptor is None:
             return _reject(
                 MoERejectReason.NOT_AN_IMPL,
                 f"{cls.__name__} names the B12x family; query "
-                f"CuteDslB12xNvfp4FusedMoE or CuteDslB12xW4a16Nvfp4FusedMoE",
+                f"FlashinferCutedslNvfp4Impl or FlashinferCutedslW4a16Nvfp4Impl",
             )
-        if p.identity_quant != cls._identity_quant():
-            return _reject(
-                MoERejectReason.QUANT_UNSUPPORTED,
-                f"{cls.__name__} implements quant={cls._identity_quant()}, got {p.identity_quant}",
-            )
+        # ``MoEProblem.identity_quant`` folds the NVFP4_AWQ / NVFP4_ARC
+        # calibration aliases onto ``nvfp4``, so the NVFP4 leaf admits them.
+        rejection = check_quant_matches_identity(cls, p)
+        if rejection is not None:
+            return rejection
         sm_version = d.env.sm
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
@@ -225,11 +269,9 @@ class CuteDslB12xFusedMoEBase:
                 MoERejectReason.SM_UNSUPPORTED,
                 f"{cls.__name__} requires {sm_list}, got SM{sm_version}",
             )
-        if p.dtype_act not in {torch.float16, torch.bfloat16}:
-            return _reject(
-                MoERejectReason.DTYPE_UNSUPPORTED,
-                f"{cls.__name__} requires float16 or bfloat16 activation dtype (got {p.dtype_act})",
-            )
+        rejection = check_dtype(cls, p)
+        if rejection is not None:
+            return rejection
         if p.swiglu_gptoss_style:
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
@@ -257,6 +299,16 @@ class CuteDslB12xFusedMoEBase:
             return _reject(
                 MoERejectReason.EPLB_UNSUPPORTED,
                 f"{cls.__name__} does not support the MoE load balancer",
+            )
+        # b12x quantizes the FC2 input inside the fused kernel against a scale
+        # passed in, with no per-call amax to derive it from. Per-call scales
+        # would therefore reach only the CUTLASS prefill chunks, and decode
+        # would keep the load-time ones.
+        if cls.b12x_quantizes_activations and d.force_dynamic_quantization:
+            return _reject(
+                MoERejectReason.DYNAMIC_QUANT_UNSUPPORTED,
+                f"{cls.__name__} quantizes decode activations with load-time "
+                "scales and cannot honour force_dynamic_quantization",
             )
         # No expert-parallel dispatch/combine kernel: EP must stay at 1.
         if d.ep_size != 1:
@@ -301,9 +353,6 @@ class CuteDslB12xFusedMoEBase:
         self._b12x_weights: dict | None = None
         self.b12x_wrapper = None
 
-    def _check_quant_config_is_my_format(self) -> None:
-        require_layer_quant_format(self, self._identity_quant())
-
     def _get_quant_method(self) -> object:
         """The b12x-aware NVFP4 quant method; its ``transform_weights`` attaches
         the ``b12x_wrapper`` / ``_b12x_weights`` the decode path reads."""
@@ -319,6 +368,58 @@ class CuteDslB12xFusedMoEBase:
                 "on the b12x path; b12x performs its own input quantization."
             )
 
+    def _admit_run_context(self, ctx: MoERunContext) -> None:
+        """Refuse what neither route of the leaf honours, then join the
+        input-ready event before any kernel reads ``ctx.x``.
+
+        On both routes the leaf finalizes, fuses no routed-expert LoRA, routes
+        nothing itself and holds every expert (its gate rejects
+        ``ep_size > 1``), so a context asking otherwise fails here instead of
+        having the request dropped. ``lora_params`` describes every adapter of
+        the forward, so only MoE LoRA on this layer is such a request -- with
+        no layer index to read it by, any ``lora_params`` is.
+        ``all_rank_num_tokens`` has no reader on either route: ``run_moe`` uses
+        it only for the all-to-all tuner shapes, and all-to-all is refused.
+        """
+        name = type(self).__name__
+        if not ctx.do_finalize:
+            raise NotImplementedError(
+                f"{name} always finalizes, so it cannot return the unfinalized "
+                "(gemm2_output, expert_weights, expanded_idx_to_permuted_idx) "
+                "triple that do_finalize=False asks for."
+            )
+        if ctx.lora_params:
+            # Reading the layer's adapters out of ``lora_params`` needs a
+            # layer index. With none the leaf cannot tell MoE LoRA from the
+            # adapters it may ignore, so it refuses every ``lora_params``
+            # rather than return output a caller reads as adapted.
+            if self.layer_idx is None:
+                raise NotImplementedError(
+                    f"{name} does not fuse routed-expert LoRA and has no "
+                    "layer_idx to tell whether lora_params carries any; pass "
+                    "layer_idx to create_moe_backend, or hand run_moe no "
+                    "lora_params."
+                )
+            if moe_lora_active(ctx.lora_params, self.layer_idx):
+                raise NotImplementedError(
+                    f"{name} does not fuse routed-expert LoRA; got MoE LoRA "
+                    f"tensors for layer {self.layer_idx}."
+                )
+        if ctx.token_selected_experts is None or ctx.token_final_scales is None:
+            raise ValueError(
+                f"{name} needs precomputed token_selected_experts and "
+                "token_final_scales; it cannot route from router_logits, and it "
+                "does not accept the None scales apply_router_weight_on_input "
+                "leaves behind once the scheduler has folded them into x."
+            )
+        if require_comm_plan(self, ctx).enable_alltoall:
+            raise NotImplementedError(
+                f"{name} holds every expert (ep_size == 1) and cannot take "
+                "tokens dispatched by all-to-all."
+            )
+        if ctx.x_ready_event is not None:
+            ctx.x_ready_event.wait()
+
     @nvtx_range("[b12x] decode")
     def _run_b12x_decode(self, ctx: MoERunContext) -> torch.Tensor:
         """Run the FlashInfer b12x kernel. The path both leaves reach."""
@@ -333,6 +434,16 @@ class CuteDslB12xFusedMoEBase:
             raise ValueError(
                 f"{type(self).__name__} expects unquantized input (x_sf=None) "
                 "on the b12x path; got a precomputed scale factor."
+            )
+        # The b12x kernel writes bfloat16, which is why ``supported_dtypes``
+        # admits bf16 activations alone: ``ConfigurableMoE`` derives
+        # ``output_dtype`` from the activation, so a layer built through the
+        # factory cannot get here. This is the backstop for a caller driving
+        # ``run_moe`` directly.
+        if ctx.output_dtype not in (None, torch.bfloat16):
+            raise ValueError(
+                f"{type(self).__name__} writes bfloat16 on the b12x path; "
+                f"cannot honour output_dtype={ctx.output_dtype}."
             )
 
         # Annotate the kwargs spread + wrapper entry separately so we can
@@ -358,8 +469,10 @@ class CuteDslB12xFusedMoEBase:
 CuteDslB12xFusedMoE = CuteDslB12xFusedMoEBase
 
 
-class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
-    """NVFP4 on SM120 / SM121: CUTLASS for prefill, b12x for decode.
+@register_moe_impl
+class FlashinferCutedslNvfp4Impl(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
+    """``flashinfer.cutedsl.b12x.nvfp4``: NVFP4 on SM120 / SM121, CUTLASS for
+    prefill, b12x for decode.
 
     Inherits the CUTLASS NVFP4 leaf because the prefill chunk it routes away is
     NVFP4 grouped GEMM, so ``super().run_moe`` / ``super().quantize_input``
@@ -372,7 +485,12 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
     never swaps a layout.
     """
 
-    b12x_quant_algo = QuantAlgo.NVFP4
+    descriptor = _b12x_descriptor(
+        "nvfp4",
+        "FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM "
+        "for prefill; SM120/SM121.",
+    )
+    b12x_quantizes_activations = True
 
     # Prefill chunks (``x.shape[0] >= threshold``) route via CUTLASS NVFP4
     # GroupGEMM; decode (``x.shape[0] < threshold``) uses b12x. 64 cleanly
@@ -418,6 +536,7 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
         *,
         workspace: dict | None = None,
     ) -> torch.Tensor:
+        self._admit_run_context(ctx)
         if self._route_to_cutlass(ctx.x):
             # The inherited ``run_moe`` forwards ``output_dtype`` straight into
             # the C++ ``trtllm::fused_moe`` op, which requires a concrete
@@ -441,8 +560,10 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
         return self._run_b12x_decode(ctx)
 
 
-class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase):
-    """W4A16_NVFP4 on SM120 / SM121: b12x for every call.
+@register_moe_impl
+class FlashinferCutedslW4a16Nvfp4Impl(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase):
+    """``flashinfer.cutedsl.b12x.w4a16_nvfp4``: W4A16_NVFP4 on SM120 / SM121,
+    b12x for every call.
 
     Inherits no CUTLASS leaf: this format never reaches a CUTLASS kernel (no
     prefill fallback). ``MoEWeightOwnerMixin.post_load_weights`` runs
@@ -453,7 +574,10 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
     every instance of this class runs the W4A16 decode kernel.
     """
 
-    b12x_quant_algo = QuantAlgo.W4A16_NVFP4
+    descriptor = _b12x_descriptor(
+        "w4a16_nvfp4",
+        "FlashInfer CuTe DSL SM12x fused MoE, BF16 activations and NVFP4 weights; SM120/SM121.",
+    )
     issues_fused_moe_op = False
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -472,8 +596,10 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
 
         The wrapper runs in ``quant_mode="w4a16"``: it dequantizes the NVFP4
         weights and leaves the bf16 / fp16 activation alone, so there is no
-        activation quantization here at all. The pre-quant scale is a separate
-        concern. An AWQ-style checkpoint stores ``W / s``, and
+        activation quantization here at all. That is the kernel's own range;
+        the leaf admits bf16 activations only (``supported_dtypes``), because
+        the wrapper hands the kernel a bfloat16 output buffer. The pre-quant
+        scale is a separate concern. An AWQ-style checkpoint stores ``W / s``, and
         ``load_quant_scales`` fills ``fc31_act_scale`` from its
         ``*.pre_quant_scale`` keys regardless of ``quant_algo``, so the weights
         the kernel dequantizes expect the scaled activation ``x * s``. Same as
@@ -493,4 +619,9 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
         workspace: dict | None = None,
     ) -> torch.Tensor:
         del workspace  # The b12x wrapper allocates its own intermediates.
+        self._admit_run_context(ctx)
         return self._run_b12x_decode(ctx)
+
+
+CuteDslB12xNvfp4FusedMoE = FlashinferCutedslNvfp4Impl
+CuteDslB12xW4a16Nvfp4FusedMoE = FlashinferCutedslW4a16Nvfp4Impl

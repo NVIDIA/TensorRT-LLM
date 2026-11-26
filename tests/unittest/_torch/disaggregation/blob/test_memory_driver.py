@@ -43,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.testing.broken_drivers import (
     BROKEN_TOGETHER_CONFORMANCE,
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
+    OFF_THREAD_NAME,
     SLOT,
     UNRELEASED_ENDPOINTS,
     UNRELEASED_MEMORY,
@@ -131,11 +132,13 @@ class CrashingStore(MemoryStore):
 
 class GatedStore(MemoryStore):
     """Holds reads, writes and queries of ``held`` keys (every key when None) while the gate is
-    closed, and says when one is waiting."""
+    closed, and says when one is waiting. With ``at_the_source`` a put is held before the
+    driver reads the caller's memory, not only before it commits."""
 
-    def __init__(self, held: set[str] | None = None) -> None:
+    def __init__(self, held: set[str] | None = None, *, at_the_source: bool = False) -> None:
         super().__init__()
         self.held = held
+        self.at_the_source = at_the_source
         self.gate = threading.Event()
         self.gate.set()
         self.waiting = threading.Event()
@@ -144,6 +147,10 @@ class GatedStore(MemoryStore):
         if (self.held is None or key in self.held) and not self.gate.is_set():
             self.waiting.set()
             self.gate.wait()
+
+    def reading_source(self, key: str) -> None:
+        if self.at_the_source:
+            self._hold(key)
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         self._hold(key)
@@ -212,6 +219,13 @@ class TestMemoryDriverConformance(DriverConformance):
 
     def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
         store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
+
+    def make_put_still_reading_the_source(
+        self,
+    ) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+        store = GatedStore(held={STAGED_KEY}, at_the_source=True)
         store.gate.clear()
         return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
 
@@ -1439,6 +1453,184 @@ def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     assert checks == {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
+
+
+# The suite's scenario hooks.
+
+
+def test_the_source_gate_holds_a_put_before_the_source_is_read() -> None:
+    """What the hook promises, for the in-memory driver: while the gate is closed nothing of the
+    source was read, so the store ends up with what the source holds once the gate opens."""
+    suite = _conformance(MemoryDriver, DEFAULT_CAPABILITIES, TestAsyncMemoryDriverConformance)
+    staged = suite.make_put_still_reading_the_source()
+    assert staged is not None
+    driver, key, reading, unblock = staged
+    assert reading is not None
+    with suite.harness(driver) as h:
+        source = h.endpoint(["P"])
+        source.fill_row(0, b"pppppppp")
+        try:
+            op = h.put([RowIO(key, (source.span(0),))])
+            assert reading.wait(h.timeout), "the put never reached its source"
+            source.fill_row(0, b"qqqqqqqq")
+        finally:
+            unblock()  # on every exit, or the worker behind the gate never returns
+        (result,) = h.wait_for_results(op)
+        assert result.status is RowStatus.READY
+        reader = h.endpoint(["R"])
+        h.wait_for_results(h.get([RowIO(key, (reader.span(0),))]))
+        assert reader.read_row(0) == b"qqqqqqqq"
+
+
+# The suite's memory hooks.
+
+
+def test_a_suite_overriding_only_allocate_is_asked_for_the_total_as_before() -> None:
+    asked: list[tuple[int, int, MemoryKind]] = []
+
+    class Suite(TestMemoryDriverConformance):
+        def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind) -> Allocation:
+            asked.append((nbytes, fill, memory_kind))
+            return super().allocate(nbytes, fill, memory_kind)
+
+    with Suite().harness() as h:
+        h.endpoint(["A", "B"], slot=4, fill=0x2D)
+    assert asked == [(8, 0x2D, MemoryKind.HOST)]
+
+
+def test_a_suite_overriding_allocate_rows_learns_the_row_size_and_count() -> None:
+    """Two endpoints of the same total, laid out differently: the hook tells them apart, which
+    a store whose pools each hold one row size needs to pick the pool."""
+    asked: list[tuple[int, int, int, MemoryKind]] = []
+
+    class Suite(TestMemoryDriverConformance):
+        def allocate_rows(
+            self, slot_bytes: int, rows: int, fill: int, memory_kind: MemoryKind
+        ) -> Allocation:
+            asked.append((slot_bytes, rows, fill, memory_kind))
+            return super().allocate_rows(slot_bytes, rows, fill, memory_kind)
+
+    with Suite().harness() as h:
+        h.endpoint(["A", "B"], slot=4)
+        h.endpoint(["C"], slot=8)
+    assert asked == [(4, 2, 0, MemoryKind.HOST), (8, 1, 0, MemoryKind.HOST)]
+
+
+def test_the_zero_budget_drain_check_closes_a_staged_driver_that_signals_nothing() -> None:
+    """A blocked-get hook without a signal still staged a driver; the check runs its second half
+    on that driver and closes it, rather than leaving it open beside a fresh one."""
+    closed: list[MemoryDriver] = []
+    staged: list[MemoryDriver] = []
+
+    class RecordsItsClose(MemoryDriver):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+    class Suite(TestMemoryDriverConformance):
+        driver_cls = RecordsItsClose
+
+        def make_blocked_get(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+            store = GatedStore(held={STAGED_KEY})
+            store.gate.clear()
+            driver = self._driver(store)
+            staged.append(driver)
+            return driver, STAGED_KEY, None, store.gate.set
+
+    Suite().test_drain_polled_without_a_budget_turns_true_once_nothing_runs()
+    assert closed == staged and len(staged) == 1
+
+
+class _TakesStraySpansAndNeverProvesItsEnd(MemoryDriver):
+    """Takes a row with a span in no registration, then can never prove that operation's access
+    ended: the worst a driver can do with memory the suite does not otherwise retain. Rows inside
+    the registrations move as usual."""
+
+    def _check_registered(self, rows: Sequence[RowIO]) -> None:
+        pass
+
+    def _check_extents(self, rows: Sequence[RowIO]) -> None:
+        pass
+
+    def _execute(self, op: MemoryOp) -> None:
+        if all(self._registered(span) for row in op.rows for span in row.io.spans):
+            super()._execute(op)
+        else:
+            self.mark_unprovable(op)
+
+
+class _RaisesOnAStraySpan(_TakesStraySpansAndNeverProvesItsEnd):
+    """Lets a raise that is not ``DriverRejected`` out of a put or get of a row with a span in no
+    registration, after the operation was recorded: the memory may be in use all the same."""
+
+    def _execute(self, op: MemoryOp) -> None:
+        super()._execute(op)
+        if op.unprovable:
+            raise RuntimeError("the binding failed with the row in flight")
+
+
+@pytest.mark.parametrize(
+    ("driver_cls", "outcome"),
+    [(_TakesStraySpansAndNeverProvesItsEnd, CHECK_FAILED), (_RaisesOnAStraySpan, RuntimeError)],
+)
+@pytest.mark.parametrize(
+    "check",
+    [
+        "test_a_row_outside_every_registration_is_rejected_before_any_effect",
+        "test_every_span_of_a_row_is_checked_against_the_registrations",
+    ],
+)
+def test_a_stray_span_a_driver_took_is_retained_when_its_rejection_check_fails(
+    check: str,
+    driver_cls: type[MemoryDriver],
+    outcome: type[BaseException] | tuple[type[BaseException], ...],
+) -> None:
+    """A driver that took the row fails the check; one that raised something other than
+    ``DriverRejected`` lets that raise through. Either way the stray memory the operation may
+    still touch is kept alive, as the endpoints of an unprovable operation are."""
+    suite = _conformance(driver_cls, DEFAULT_CAPABILITIES)
+    retained = len(UNRELEASED_MEMORY)
+    with pytest.raises(outcome):
+        _run_check(suite, check)
+    assert len(UNRELEASED_MEMORY) == retained + 1
+
+
+def test_a_drain_that_never_returns_fails_the_zero_budget_check_and_is_not_called_again() -> None:
+    """The check fails at the harness timeout, and the harness then asks nothing more of the
+    driver: its usual cleanup would drain again and hang the run. The stuck call is released
+    only once the check is over, so no thread is left behind."""
+    release = threading.Event()
+    budgets: list[float] = []
+
+    class DrainNeverReturns(MemoryDriver):
+        def drain(self, budget_s: float) -> bool:
+            budgets.append(budget_s)
+            release.wait(TIMEOUT)
+            return super().drain(budget_s)
+
+    suite = _conformance(DrainNeverReturns, DEFAULT_CAPABILITIES)
+    failures: list[BaseException] = []
+
+    def check() -> None:
+        try:
+            suite.test_drain_polled_without_a_budget_turns_true_once_nothing_runs()
+        except BaseException as error:  # noqa: BLE001 - judged below
+            failures.append(error)
+
+    checker = threading.Thread(target=check, daemon=True)
+    checker.start()
+    checker.join(TIMEOUT)
+    finished = not checker.is_alive()
+    release.set()  # lets the stuck drain and, if cleanup drained again, the check return
+    checker.join(TIMEOUT)
+    wait_until(
+        lambda: not any(t.name == OFF_THREAD_NAME for t in threading.enumerate()),
+        "the released drain call to return",
+        TIMEOUT,
+    )
+    assert finished, "the check hung in its own cleanup"
+    assert failures and "did not return" in str(failures[0]), failures
+    assert budgets == [0.0], "cleanup drained a driver whose drain had not returned"
 
 
 class TestMemoryDriverOnChange:

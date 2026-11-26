@@ -987,20 +987,14 @@ void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection dir
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-namespace detail
+void copyBytesToDeviceSyncSource(CUdeviceptr dst, void const* src, size_t numBytes, CUstream stream)
 {
-
-void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t numPageIndices, CUstream stream)
-{
-    if (numPageIndices == 0)
+    if (numBytes == 0)
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(
-        numPageIndices <= std::numeric_limits<size_t>::max() / sizeof(PageIndexPair), "Page-index array is too large");
-    TLLM_CHECK_WITH_INFO(dst != 0 && src != nullptr, "Page-index copy requires valid source and destination");
+    TLLM_CHECK_WITH_INFO(dst != 0 && src != nullptr, "Host-to-device staging requires a source and a destination");
 
-    size_t numBytes = numPageIndices * sizeof(PageIndexPair);
     CUdeviceptr srcAddress = reinterpret_cast<CUdeviceptr>(src);
     CUmemcpyAttributes attributes{};
     attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL;
@@ -1012,7 +1006,5 @@ void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t n
     size_t firstCopy = 0;
     TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &srcAddress, &numBytes, 1, &attributes, &firstCopy, 1, stream));
 }
-
-} // namespace detail
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

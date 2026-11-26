@@ -8,16 +8,29 @@ built, packaged, and reviewed with the code that uses them. The generic
 vendoring tool records where each tree came from, materializes it reproducibly,
 and rejects destination edits that are not represented by its lock entry.
 
-The generated lock is `3rdparty/vendor_sources.lock.yaml`. It records an
+Each generated lock is a `vendor_sources.lock.yaml` file in a `3rdparty`
+directory: the repository lock `3rdparty/vendor_sources.lock.yaml`, or a scoped
+vendor lock owned by one subtree (see
+[Scoped vendor locks](#scoped-vendor-locks)). A lock records an
 upstream Git URL, an immutable commit, the source and destination directories,
 the selected files, any persistent compatibility patch and its content digest,
 and a digest of the materialized destination. A short branch or tag may explain
 where the commit came from, but the full commit is authoritative.
 
 Use `scripts/vendor/manage.py` for every lock or vendor-state change. Do not
-edit the YAML, generated patches, or digests by hand. All examples below use the
-default lock. For an isolated test or another consumer repository, place
-`--lock PATH` before the subcommand.
+edit the YAML, generated patches, or digests by hand. Run the examples below
+from the repository root: commands use every lock in the Git index and select
+the lock that owns the named vendor. For an isolated test or another consumer
+repository, place `--lock PATH` before the subcommand to use only that lock.
+
+For a code-changing PR, start with the
+[PrimTS contributor walkthrough](#contributor-workflow-primts-example).
+It covers editing the vendored code, exporting to a temporary branch in your
+fork, and pinning that branch in TensorRT-LLM. An already-upstream update may
+instead use the [upstream-main fast-forward exception](#using-an-upstream-main-pin).
+An upstream PR merging alone is insufficient: the chosen pin must contain the
+latest canonical dev tip by Git ancestry. Canonical-branch promotion and divergent
+upstream refresh remain maintainer workflows.
 
 ## Lock contract
 
@@ -35,6 +48,46 @@ fail. Resolve it by discarding it with `sync`, recording a TensorRT-LLM-only
 adaptation with `patch`, or exporting an upstream-worthy change and pinning the
 resulting commit. `export` accepts this pending destination delta by default and
 does not change the lock or persistent patch.
+
+## Scoped vendor locks
+
+A lock at `<scope>/3rdparty/vendor_sources.lock.yaml` owns the directory
+`<scope>`. Its `destination` paths are relative to `<scope>` and stay inside it.
+The tool writes its persistent patches to
+`<scope>/3rdparty/vendor_patches/<vendor>.patch` and records them in the lock as
+`3rdparty/vendor_patches/<vendor>.patch`. The repository lock is the case where
+`<scope>` is the repository root; a lock in any other directory is a scoped
+vendor lock. Lock discovery treats every file named `vendor_sources.lock.yaml`
+in the Git index as a lock, and a file with that name whose parent directory is
+not `3rdparty` is an error rather than being skipped. Committing such a file,
+for example a test fixture, therefore fails the pre-commit check for every
+commit until the file is renamed or moved.
+
+Put a vendor used by only one subtree, such as the kernels of one Modeling V2
+model, in a scoped vendor lock for that subtree, and use the repository lock for
+sources shared across subtrees. A scoped vendor lock keeps the lock entry,
+patches, and optional vendor notes (for example `<scope>/3rdparty/README.md`)
+with the code that uses them:
+
+```text
+tensorrt_llm/_torch/modeling_v2/models/<model>/
+├── 3rdparty/
+│   ├── README.md
+│   ├── vendor_sources.lock.yaml
+│   └── vendor_patches/<vendor>.patch
+└── kernels/<vendored tree>/
+```
+
+Without `--lock`, the tool runs lock discovery: it lists the Git index of the
+current work tree and uses every tracked
+`<scope>/3rdparty/vendor_sources.lock.yaml`. `create` writes a new
+lock but does not stage it; run `git add` on it before other commands or the
+pre-commit check can see it. A `vendor_sources.lock.yaml` outside a `3rdparty`
+directory is an error. Across all locks, vendor names must be unique,
+destinations must not overlap, and no destination may contain another lock or
+its `3rdparty/vendor_patches` directory.
+
+Scoped locks and patches are owned by the CODEOWNERS of their directory.
 
 ## Include patterns
 
@@ -104,15 +157,20 @@ until `pin` succeeds.
 ## Add or adopt a vendor
 
 When neither the lock entry nor destination exists, create both from an
-immutable commit and a local upstream checkout:
+immutable commit and a local upstream checkout. `--scope` names the directory
+that owns the vendor, relative to the current directory (for example,
+`tensorrt_llm/_torch/modeling_v2/models/<model>` from the repository root, or
+`.` at the repository root for the repository lock), and `--destination` is
+relative to that scope:
 
 ```bash
 python scripts/vendor/manage.py create VENDOR \
+  --scope path/owning/the/vendor \
   --url https://example.com/organization/repository.git \
   --branch main \
   --commit FULL_COMMIT \
   --source path/in/upstream \
-  --destination path/in/tensorrt-llm \
+  --destination path/in/scope \
   --include '**/*.py' \
   --repo /path/to/upstream
 ```
@@ -125,10 +183,11 @@ to require an exact upstream match:
 
 ```bash
 python scripts/vendor/manage.py create VENDOR \
+  --scope path/owning/the/vendor \
   --url https://example.com/organization/repository.git \
   --commit FULL_COMMIT \
   --source path/in/upstream \
-  --destination path/in/tensorrt-llm \
+  --destination path/in/scope \
   --include '**/*.py' \
   --adopt exact \
   --repo /path/to/upstream
@@ -172,9 +231,10 @@ currently locked upstream selection:
 python scripts/vendor/manage.py patch VENDOR drop --repo /path/to/upstream
 ```
 
-Generated patches live under `3rdparty/vendor_patches/`. Review them, but update
-them only through the tool. Do not use a persistent patch for a change that
-should be contributed upstream; use the export workflow instead.
+Generated patches live in the `3rdparty/vendor_patches/` directory next to their
+lock (`<scope>/3rdparty/vendor_patches/` for a scoped vendor lock). Review them,
+but update them only through the tool. Do not use a persistent patch for a
+change that should be contributed upstream; use the export workflow instead.
 
 ## Export a destination change upstream
 
@@ -230,6 +290,288 @@ The same rule applies when adopting a newer commit that was developed upstream
 first: prepare the destination to exactly match the proposed commit plus the
 existing patch, then run `pin`. Do not use `sync` to look for that commit.
 
+## Contributor workflow: PrimTS example
+
+Suppose you need to fix a validation check in the vendored PrimTS `context.py`.
+The source change belongs in FlashInfer; TensorRT-LLM's PR must contain both the
+updated vendored files and a lock pointing to your committed temporary branch.
+The same export/pin mechanics work for other vendors using their own lock
+entry, paths, upstream fork, and maintainer policy.
+
+### 1. Identify the canonical baseline
+
+Start with a clean TensorRT-LLM checkout based on the latest **target base
+branch** (`main` or the intended release branch), and your own FlashInfer fork.
+Read `vendors.flashinfer-prims-ts` in that base branch's
+`3rdparty/vendor_sources.lock.yaml`: its `url`, `branch`, and `commit` identify
+the canonical source baseline. If it still points to another contributor's
+temporary branch, wait for the preceding promotion or coordinate with the
+maintainer; do not treat that temporary branch as the canonical branch.
+
+Replace every placeholder below. `PRIMTS_REPO` must be a new local directory
+for this example. The dev-branch name is illustrative: use the branch for your
+target base, not a dated branch copied from this document or another PR.
+Run all commands from the TensorRT-LLM repository root; `git -C` commands act
+on the separate FlashInfer checkout.
+
+```bash
+PRIMTS_REPO=/absolute/path/to/new-flashinfer-checkout
+PRIMTS_FORK_URL=https://github.com/YOUR_ACCOUNT/flashinfer.git
+PRIMTS_DEV_URL=https://github.com/MAINTAINER/flashinfer.git
+PRIMTS_DEV_BRANCH=trtllm-prims-ts-dev-YYYYMMDD
+PRIMTS_LOCKED_SHA=FULL_40_CHARACTER_LOCKED_COMMIT
+PRIMTS_TMP_BRANCH=trtllm-prims-ts-validation-fix
+
+git switch -c feat/prims-ts-validation-fix
+python scripts/vendor/manage.py check flashinfer-prims-ts
+git clone "$PRIMTS_FORK_URL" "$PRIMTS_REPO"
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
+```
+
+Compare `PRIMTS_LOCKED_SHA` with `PRIMTS_DEV_TIP`. The straightforward path below
+assumes they are equal. If they differ, the lock is not the live dev-branch tip:
+first rebase onto the consumer base containing the completed promotion, or
+follow [the advanced-tip instructions](#if-the-dev-branch-advances). Never
+substitute the live tip for the locked SHA when calling `export`.
+
+### 2. Edit and test the vendored code
+
+For this example, edit
+`tensorrt_llm/_torch/attention/backends/prims_ts/context.py`, add the appropriate
+tests, and run the affected TensorRT-LLM tests. Inspect your pending source delta:
+
+```bash
+git diff -- tensorrt_llm/_torch/attention/backends/prims_ts
+```
+
+An offline vendor check now fails until you pin the exported change; this is
+expected. Do not run `sync`, which would discard the pending edits, or record
+an upstream-worthy fix in the TensorRT-LLM-only compatibility patch. Do not
+hand-edit the lock or its digests to bypass the check.
+
+### 3. Create the temporary source branch and export
+
+Create the branch at the **locked SHA** in your clean FlashInfer checkout:
+
+```bash
+git -C "$PRIMTS_REPO" switch -c "$PRIMTS_TMP_BRANCH" "$PRIMTS_LOCKED_SHA"
+python scripts/vendor/manage.py export flashinfer-prims-ts --repo "$PRIMTS_REPO"
+git -C "$PRIMTS_REPO" diff -- flashinfer/attention/prims_ts
+```
+
+`export` requires that exact starting SHA. It transfers only the pending delta
+to `flashinfer/attention/prims_ts`; it does not copy TensorRT-LLM's existing
+compatibility patch upstream, change the lock, or commit anything. If the edit
+overlaps the compatibility patch and export refuses it, resolve the upstream
+change and downstream adaptation deliberately rather than copying the whole
+vendored directory over FlashInfer.
+
+### 4. Commit, check the live dev tip, and push to your fork
+
+Run the relevant FlashInfer tests and review the exported changes before committing.
+Stage any additional upstream test files explicitly as well.
+
+```bash
+git -C "$PRIMTS_REPO" add flashinfer/attention/prims_ts
+git -C "$PRIMTS_REPO" commit -s -m 'Fix PrimTS context validation'
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" HEAD
+```
+
+The ancestry check must succeed (exit status 0) before continuing. If it fails,
+follow the advanced-tip instructions below. The pinned commit must contain the
+**latest** dev tip, not just the older commit recorded in the consumer lock,
+because the maintainer must be able to fast-forward the dev branch after merge.
+
+```bash
+git -C "$PRIMTS_REPO" push "$PRIMTS_FORK_URL" "HEAD:refs/heads/$PRIMTS_TMP_BRANCH"
+PRIMTS_NEW_SHA=$(git -C "$PRIMTS_REPO" rev-parse HEAD)
+```
+
+Do not push directly to the canonical dev branch. Open the related FlashInfer PR
+separately; if it needs different history for upstream review, use a separate
+branch. Keep the consumer pin on your temporary branch unless it independently
+satisfies the [upstream-main exception](#using-an-upstream-main-pin).
+
+### 5. Pin the pushed commit and verify
+
+```bash
+python scripts/vendor/manage.py pin flashinfer-prims-ts \
+  --url "$PRIMTS_FORK_URL" \
+  --branch "$PRIMTS_TMP_BRANCH" \
+  --commit "$PRIMTS_NEW_SHA" \
+  --repo "$PRIMTS_REPO"
+python scripts/vendor/manage.py check flashinfer-prims-ts
+python scripts/vendor/manage.py check flashinfer-prims-ts --repo "$PRIMTS_REPO"
+git diff -- 3rdparty/vendor_sources.lock.yaml \
+  3rdparty/vendor_patches/flashinfer-prims-ts.patch \
+  tensorrt_llm/_torch/attention/backends/prims_ts
+```
+
+`pin` verifies that the committed source plus the existing compatibility patch
+reproduces your destination. It updates the lock, not the destination files.
+Keep the patch unchanged unless it needs a reviewed downstream adaptation or
+`pin` removes it because upstream has absorbed it.
+
+### 6. Submit the TensorRT-LLM PR
+
+Stage the lock and vendored files together, plus the relevant tests and any
+intentional compatibility-patch changes. Commit with DCO sign-off and push to
+your TensorRT-LLM fork (replace the remote name below):
+
+```bash
+git add 3rdparty/vendor_sources.lock.yaml tensorrt_llm/_torch/attention/backends/prims_ts
+# If the compatibility patch changed or was removed by pin:
+git add -u -- 3rdparty/vendor_patches/flashinfer-prims-ts.patch
+# Replace these placeholders with the specific regression tests you changed or added:
+git add -- path/to/changed_test.py path/to/new_test.py
+git diff --cached --stat
+git diff --cached
+git commit -s -m '[None][fix] update vendored PrimTS context validation'
+git push -u YOUR_TRTLLM_FORK_REMOTE HEAD
+```
+
+Open the PR against the same target base used in step 1 and run normal CI.
+Put this block in the **PR description**, replacing `123` with the real paired
+FlashInfer PR number; list all upstream PRs needed to attribute the source delta:
+
+````markdown
+<!-- vendor-promotion:start -->
+```yaml
+schema_version: 1
+vendors:
+  flashinfer-prims-ts:
+    upstream_prs:
+      - https://github.com/flashinfer-ai/flashinfer/pull/123
+```
+<!-- vendor-promotion:end -->
+````
+
+If there genuinely is no paired upstream PR, replace `upstream_prs` with a
+nonempty `unpaired_reason` explaining why; do not use it to bypass a failed
+match. See [contributor metadata](../scripts/vendor/README.md#contributor-metadata)
+for multiple PRs and ambiguity resolution.
+
+Leave the lock on your temporary fork branch through review and merge. Do not
+delete or rewrite that branch before promotion completes. The maintainer or
+bot then fast-forwards the canonical dev branch and creates a separate
+**lock-only** PR restoring its URL/branch without changing the reviewed SHA or
+vendored code. A paired FlashInfer PR merging does not by itself permit switching
+the consumer pin to upstream; the exception below requires exact ancestry.
+
+### Using an upstream-main pin
+
+When all intended changes are already on the configured upstream branch, the
+consumer lock may use that upstream repository/branch directly if:
+
+```text
+previous canonical pin <= latest canonical dev tip <= chosen upstream pin <= upstream main tip
+```
+
+`<=` means Git ancestor-or-equal, not equivalent patches under different SHAs.
+Check both live tips against the **exact SHA** you intend to pin, for example
+using the source repository and dev variables from the walkthrough:
+
+```bash
+PRIMTS_UPSTREAM_URL=https://github.com/flashinfer-ai/flashinfer.git
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_UPSTREAM_URL" main || {
+  echo 'STOP: could not fetch the upstream branch.' >&2
+  exit 1
+}
+PRIMTS_UPSTREAM_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched upstream revision is not a commit.' >&2
+  exit 1
+}
+PRIMTS_NEW_SHA=$PRIMTS_UPSTREAM_TIP  # Or an older reviewed commit on main.
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" "$PRIMTS_NEW_SHA"
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_NEW_SHA" "$PRIMTS_UPSTREAM_TIP"
+```
+
+Both checks must succeed. Bring the selected destination files and compatibility
+patch into alignment with that exact revision, retaining necessary downstream
+adaptations, then use `manage.py pin` as in step 5 with `--url
+"$PRIMTS_UPSTREAM_URL" --branch main --commit "$PRIMTS_NEW_SHA"`. `pin` verifies
+materialization; it does not import a newer source tree. Commit the source/lock
+update together and run normal review and CI.
+
+No upstream PR list, `unpaired_reason`, or vendor-promotion entry is needed for
+this qualifying vendor. Other changed vendors still need their own metadata.
+Upstream merge commits are allowed. The bot checks live ancestry again before
+feedback and promotion; a later dev advance may require a newer pin. If dev and
+upstream diverge, use a temporary fork based on dev or ask for a maintainer
+refresh rather than forcing the canonical branch or bypassing metadata checks.
+
+Promotion still restores the canonical fork/branch and fast-forwards it only to
+the reviewed SHA. It saves versioned ancestry proof instead of individual PR
+mappings. See the [toolkit exception and provenance contract](../scripts/vendor/README.md#upstream-main-fast-forward-exception).
+
+### If the dev branch advances
+
+If your changes have not yet been exported, first export and commit at the
+locked SHA as in steps 3–4. If you already exported and pinned the change, keep
+working on that temporary source branch; do not export the same change again.
+Save the previously observed dev tip before fetching, and require the new tip
+to contain both that tip and the locked revision. Rebase only after these
+checks succeed, resolving conflicts and rerunning tests:
+
+```bash
+PRIMTS_PREVIOUS_DEV_TIP=$PRIMTS_DEV_TIP
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH" || {
+  echo 'STOP: could not fetch the canonical branch.' >&2
+  exit 1
+}
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse --verify 'FETCH_HEAD^{commit}') || {
+  echo 'STOP: the fetched canonical revision is not a commit.' >&2
+  exit 1
+}
+if ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_PREVIOUS_DEV_TIP" "$PRIMTS_DEV_TIP" ||
+   ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_LOCKED_SHA" "$PRIMTS_DEV_TIP"; then
+  echo 'STOP: canonical history changed; ask the maintainer before rebasing.' >&2
+  exit 1
+fi
+git -C "$PRIMTS_REPO" rebase "$PRIMTS_DEV_TIP"
+```
+
+If either ancestry check fails, do not rebase or force-push. Ask the maintainer
+whether a refresh or history rewrite occurred and which canonical branch to use.
+
+Update the TensorRT-LLM destination to match the rebased selected source files
+plus the existing compatibility patch, retaining downstream adaptations. This
+may require incorporating other promoted changes or resolving patch conflicts;
+neither `sync` nor `pin` imports a new revision for you. Then repeat the ancestry
+check, push, pin, source verification, and consumer tests with the **new SHA**.
+For an already-published branch, coordinate before rewriting it and use
+`--force-with-lease`, or push a new temporary branch and pin that instead.
+Never force-push the canonical branch.
+
+Updating only your source branch or PR description does not update the consumer
+pin. The bot rechecks live ancestry before promotion; repeat this process if
+another promotion advances the dev branch again. After a maintainer refresh
+changes the canonical branch name, rebase the consumer PR onto its latest target
+base and use that new canonical branch rather than continuing the retired one.
+
 ## Remove a vendor
 
 Remove a lock entry and its generated compatibility patch while preserving the
@@ -242,6 +584,12 @@ python scripts/vendor/manage.py remove VENDOR
 The preserved destination is no longer protected by the lock. Delete or move
 it separately as part of the reviewed migration that removes the vendor.
 
+Without `--lock`, removing the last vendor of a scoped vendor lock also deletes
+that lock and its empty `3rdparty/vendor_patches/` and `3rdparty/` directories;
+stage the deletion with `git add`. Until then, commands without `--lock` fail,
+because the Git index still lists the deleted lock. The repository lock is kept
+even when it becomes empty.
+
 ## Source access and checks
 
 The default check is deliberately offline:
@@ -252,9 +600,10 @@ python scripts/vendor/manage.py check --offline
 ```
 
 It validates the lock schema and path safety, patch metadata, and the checked-in
-destination digest. It never invokes Git, performs DNS resolution, or contacts
-a recorded URL. This is the always-run pre-commit check. A pending destination
-delta therefore blocks a commit until it is synchronized, patched, or pinned.
+destination digest of every lock. It reads the local Git index to find locks,
+but never fetches, performs DNS resolution, or contacts a recorded URL. This
+is the always-run pre-commit check. A pending destination delta therefore
+blocks a commit until it is synchronized, patched, or pinned.
 
 When network access is available, attempt verification against every recorded
 upstream:
@@ -285,16 +634,20 @@ form.
 An offline digest proves that the committed destination matches the lock. It
 cannot independently prove that a URL, commit, and source directory produced
 that destination. Creating and pinning vendors therefore require a fetched or
-local repository, and URL or commit changes require vendor CODEOWNER review.
+local repository, and URL or commit changes require review by the CODEOWNERS
+of the lock file.
 Never put credentials in a lock URL. Run checks that use internal credentials
 only in a trusted environment, not with pull-request-controlled scripts.
 
 ## Promotion and local monitoring
 
-The generic toolkit under `scripts/vendor/` supports every vendor key in this
-lock. `promote.py` prepares a verified lock-only follow-up after a source-update
-PR merges; `bot.py` can monitor PRs locally, request missing contributor metadata,
-match upstream commits, and publish promotions with squash auto-merge.
+The generic toolkit under `scripts/vendor/` supports every vendor key in the
+repository lock and in scoped vendor locks. `promote.py` prepares a verified
+lock-only follow-up after a source-update PR merges; `bot.py` can monitor PRs
+locally, request missing contributor metadata, match upstream commits, and
+publish promotions with squash auto-merge. Both take `--lock PATH`, the
+repository-relative path of the lock that defines `--vendor` (default
+`3rdparty/vendor_sources.lock.yaml`).
 
 See the [toolkit guide](../scripts/vendor/README.md) for the workflow diagram,
 contributor description format, author resolution of ambiguous matches,
@@ -310,6 +663,18 @@ code-changing PR with normal CI: stop its monitor or configure an audited
 in the existing workdir after merge. See the toolkit guide's
 [base-branch setup](../scripts/vendor/README.md#different-consumer-base-branches)
 and [refresh cutover](../scripts/vendor/README.md#switching-canonical-branches-after-a-refresh).
+
+A monitor tracks only PRs that change its `--lock`, and every poll first checks
+that its vendor is in that lock on the base branch. Start a monitor after its
+vendor's lock entry has merged. Move a vendor to another lock only after its
+pending promotions have merged, then start a new workdir with `--lock` naming
+the new lock; the old monitor's polls fail until it is stopped. Open
+source-update PRs for the vendor conflict with the move. After they are rebased
+onto the new lock, the new monitor tracks them and takes over earlier bot
+reviews, which are keyed by vendor and base branch rather than by lock. A promotion
+still pending at the move can no longer complete: close it, and repoint the
+moved entry at the canonical repository and branch in a reviewed lock-only
+`manage.py pin` change once the canonical branch contains the pinned commit.
 
 Use the entry points under `scripts/vendor/` directly. The old top-level scripts
 and PrimTS-specific CLI aliases are not retained; callers must migrate to the

@@ -289,7 +289,11 @@ def test_prompt_logprobs_match_their_advertised_support(llm, model_info):
             response=generation_pb2.ResponseOptions(
                 return_prompt_logprobs=True,
                 prompt_candidates=generation_pb2.CandidateTokenSelection(top_n=1),
-            )
+            ),
+            # Earlier probes cache this prompt. A reused prefix is not rescored,
+            # so prompt logprobs over it are rejected; a fresh salt scores the
+            # whole prompt and probes the advertised capability itself.
+            kv=generation_pb2.KvOptions(cache_salt="prompt-logprobs-probe"),
         ),
     )
     assert caps.supported == accepted, (

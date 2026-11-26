@@ -112,6 +112,15 @@ void StreamingEventSink::addRemovedLifeCycle(Digest const& blockKey, LifeCycleId
     addRemovedBlockUnlocked(blockKey);
 }
 
+void StreamingEventSink::addAllBlocksCleared()
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    // Reset markers must survive the entry cap, like removals. Keep queued
+    // events in order and discard all residency remembered before the reset.
+    mPendingEvents.emplace_back(StreamingAllBlocksClearedData{});
+    mStoredBlocks.clear();
+}
+
 void StreamingEventSink::addCacheLevelUpdated(Digest const&, CacheLevel, CacheLevel, LifeCycleId)
 {
     // The streaming protocol currently tracks radix-tree residency, not cache-tier movement.

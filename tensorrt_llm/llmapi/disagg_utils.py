@@ -13,9 +13,11 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
 from mpi4py.util import pkl5
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import (ConfigDict, Field, TypeAdapter, ValidationError,
+                      model_validator)
 
 from .._utils import global_mpi_rank, global_mpi_size
+from .utils import StrictBaseModel
 
 __all__ = [
     'InternalRequestAuthKey',
@@ -29,8 +31,10 @@ __all__ = [
     'validate_internal_request_auth_key',
 ]
 
-InternalRequestAuthKey = Annotated[str, Field(strict=True, min_length=1)] | None
-_AUTH_KEY_ADAPTER = TypeAdapter(InternalRequestAuthKey)
+_NonEmptyStr = Annotated[str, Field(strict=True, min_length=1)]
+_AuthKey = _NonEmptyStr
+InternalRequestAuthKey = _AuthKey | None
+_NON_EMPTY_STR_ADAPTER = TypeAdapter(Optional[_NonEmptyStr])
 
 
 def validate_config_bool(value: Any, field_name: str) -> bool:
@@ -47,13 +51,36 @@ def validate_config_non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
+def _validate_non_empty_str(value: object, field_name: str) -> str | None:
+    """Validate an optional non-empty string without including its value in errors."""
+    try:
+        return _NON_EMPTY_STR_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise ValueError(f"{field_name} must be a non-empty string") from None
+
+
 def validate_internal_request_auth_key(value: object) -> str | None:
     """Validate the serving auth key without including its value in errors."""
-    try:
-        return _AUTH_KEY_ADAPTER.validate_python(value)
-    except ValidationError:
+    return _validate_non_empty_str(value, "internal_request_auth_key")
+
+
+def validate_etcd_client_options(subject: str, user: Optional[str],
+                                 password: Optional[str],
+                                 ca_cert: Optional[str],
+                                 cert_key: Optional[str],
+                                 cert_cert: Optional[str]) -> None:
+    """Check the combinations of etcd credentials and TLS files."""
+    if (user is None) != (password is None):
+        raise ValueError(f"{subject} user and password must be set together")
+    if user is not None and ca_cert is None:
         raise ValueError(
-            "internal_request_auth_key must be a non-empty string") from None
+            f"{subject} user and password require ca_cert: the etcd client "
+            "sends its authentication token only over a TLS connection")
+    if (cert_key is None) != (cert_cert is None):
+        raise ValueError(
+            f"{subject} cert_key and cert_cert must be set together")
+    if cert_key is not None and ca_cert is None:
+        raise ValueError(f"{subject} cert_key and cert_cert require ca_cert")
 
 
 def _extract_internal_request_auth_key(
@@ -92,6 +119,7 @@ class ServerRole(IntEnum):
     MM_ENCODER = 2
     VISUAL_GEN = 3
     EMBEDDING = 4
+    RERANK = 5
 
 
 @dataclass
@@ -127,6 +155,10 @@ class MinimalInstances:
     generation_servers: int = 1  # the minimal number of generation servers
 
 
+_ETCD_OPTION_NAMES = ("user", "password", "ca_cert", "cert_key", "cert_cert",
+                      "record_auth_key")
+
+
 @dataclass
 class DisaggClusterConfig:
     cluster_uri: str  # the uri of the cluster storage
@@ -134,6 +166,84 @@ class DisaggClusterConfig:
     minimal_instances: Optional[MinimalInstances] = None
     heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
     inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
+    user: Annotated[
+        Optional[_NonEmptyStr],
+        Field(description="User name for an `etcd://` cluster_uri. Requires "
+              "`password` and `ca_cert`.")] = None
+    password: Annotated[
+        Optional[_NonEmptyStr],
+        Field(description="Password for an `etcd://` cluster_uri. Requires "
+              "`user` and `ca_cert`.")] = field(default=None, repr=False)
+    ca_cert: Annotated[
+        Optional[_NonEmptyStr],
+        Field(description="Path to the PEM file of the CA certificate used to "
+              "verify etcd. Enables TLS for an `etcd://` cluster_uri.")] = None
+    cert_key: Annotated[
+        Optional[_NonEmptyStr],
+        Field(description="Path to the PEM file of the client key. Requires "
+              "`cert_cert` and `ca_cert`.")] = None
+    cert_cert: Annotated[
+        Optional[_NonEmptyStr],
+        Field(description="Path to the PEM file of the client certificate. "
+              "Requires `cert_key` and `ca_cert`.")] = None
+    record_auth_key: Annotated[
+        Optional[_AuthKey],
+        Field(description="Shared secret used to sign and verify the records "
+              "in an `etcd://` cluster storage. When set, records without a "
+              "valid signature are ignored by readers. Set the same value on "
+              "the disaggregated server and on every worker.")] = field(
+                  default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.validate_etcd_options()
+
+    def cluster_storage_options(self) -> Dict[str, str]:
+        """The etcd settings that are set, as keyword arguments for the cluster storage."""
+        return {
+            name: getattr(self, name)
+            for name in _ETCD_OPTION_NAMES if getattr(self, name) is not None
+        }
+
+    def validate_etcd_options(self) -> None:
+        """Check the etcd settings; errors name the setting but not its value."""
+        for name in _ETCD_OPTION_NAMES:
+            _validate_non_empty_str(getattr(self, name),
+                                    f"disagg_cluster {name}")
+        validate_etcd_client_options("disagg_cluster", self.user, self.password,
+                                     self.ca_cert, self.cert_key,
+                                     self.cert_cert)
+        options = self.cluster_storage_options()
+        if options and not self.cluster_uri.startswith("etcd://"):
+            raise ValueError(
+                f"disagg_cluster settings for etcd ({', '.join(options)}) "
+                "require an etcd:// cluster_uri")
+
+
+# The output-length predictors (serve/output_length_predictor.py implements them).
+OutputLengthPredictorName = Literal["ridge", "ridge_gbm"]
+
+
+class OutputLengthPredictionConfig(StrictBaseModel):
+    """Generation priority from an online prediction of each request's output length.
+
+    After the context phase the orchestrator predicts the reply's length from the
+    conversation's earlier replies (``conversation_params.conversation_id``) and the
+    prompt length, never from ``max_tokens``, and sets the generation request's
+    ``priority`` (higher for shorter replies). The predictor learns online in the
+    coordinator. Generation servers order by it with
+    ``scheduler_config.waiting_queue_policy: priority``. Requires
+    ``schedule_style: context_first``; a request served without a context
+    phase (conditional disaggregation) gets the prior's priority.
+    """
+
+    predictor: OutputLengthPredictorName = Field(
+        default="ridge",
+        description=(
+            "'ridge': a ridge regression on the request's history features, "
+            "refit every 120 s. 'ridge_gbm': also a gradient-boosted tree "
+            "ensemble refit every 300 s in a separate process, which needs "
+            "numpy and scikit-learn in the server's Python environment "
+            "(checked at startup)."))
 
 
 @dataclass
@@ -184,15 +294,65 @@ class DisaggServerConfig():
     conversation_affinity_header_for_subagents: Optional[str] = None
     # Apply parent affinity to context only (default), or context and generation.
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
+    # (num_serve_frontends, serve_frontend_affinity_port_stride) of the context
+    # servers when they expose per-frontend affinity ports: context requests
+    # with a conversation id go to the port of one frontend.
+    ctx_frontend_affinity: Optional[Tuple[int, int]] = None
+    # Generation priority from the predicted output length; None: off.
+    output_length_prediction: Optional[OutputLengthPredictionConfig] = None
 
 
-@dataclass
-class MetadataServerConfig():
-    server_type: Literal['etcd']
-    hostname: str = "localhost"
-    port: int = 2379
-    health_check_timeout: float = 5.0
-    refresh_interval: float = 10.0
+class MetadataServerConfig(StrictBaseModel):
+    """Settings of the metadata server that context and generation servers register with."""
+
+    # Keeps the values of rejected fields, such as credentials, out of errors.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    server_type: Literal['etcd'] = Field(
+        description="Type of the metadata server.")
+    hostname: str = Field(default="localhost",
+                          description="Host of the metadata server.")
+    port: int = Field(default=2379, description="Port of the metadata server.")
+    health_check_timeout: float = Field(
+        default=5.0,
+        description="Seconds without a healthy response after which a server "
+        "is considered dead.")
+    refresh_interval: float = Field(
+        default=10.0,
+        description="Seconds between fetches of the latest server list.")
+    user: Optional[str] = Field(
+        default=None,
+        description="User name for the metadata server. Requires `password` "
+        "and `ca_cert`.")
+    password: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="Password for the metadata server. Requires `user` and "
+        "`ca_cert`.")
+    ca_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the CA certificate used to verify the metadata "
+        "server. Enables TLS.")
+    cert_key: Optional[str] = Field(
+        default=None,
+        description="Path to the client key. Requires `cert_cert` and "
+        "`ca_cert`.")
+    cert_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the client certificate. Requires `cert_key` and "
+        "`ca_cert`.")
+    record_auth_key: Optional[_AuthKey] = Field(
+        default=None,
+        repr=False,
+        description="Shared secret used to sign and verify server records. "
+        "When set, records without a valid signature are ignored by readers.")
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> "MetadataServerConfig":
+        validate_etcd_client_options("metadata server", self.user,
+                                     self.password, self.ca_cert, self.cert_key,
+                                     self.cert_cert)
+        return self
 
 
 def get_usage_tokens_from_ctx(
@@ -278,6 +438,7 @@ def extract_disagg_cfg(
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
         subagent_affinity_scope: Literal['context', 'both'] = 'context',
+        output_length_prediction: Optional[OutputLengthPredictionConfig] = None,
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -306,12 +467,33 @@ def extract_disagg_cfg(
                 # Inherit the value from the top-level
                 servers[key] = value
 
+    ctx_frontend_affinity = None
+    ctx_num_frontends = context_servers.get("num_serve_frontends", 1)
+    ctx_port_stride = context_servers.get("serve_frontend_affinity_port_stride")
+    if ctx_num_frontends > 1 and ctx_port_stride is not None:
+        ctx_frontend_affinity = (ctx_num_frontends, ctx_port_stride)
+
     server_configs = []
     disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    if ctx_router_config.args.get("max_queue_wait_s") is not None:
+        raise ValueError(
+            "context_servers.router.max_queue_wait_s is a generation router "
+            "option (pooled generation dispatch); remove it, or set it on "
+            "generation_servers.router together with max_requests_per_server")
+    if (gen_router_config.args.get("max_queue_wait_s") is not None
+            and gen_router_config.args.get("max_requests_per_server") is None):
+        raise ValueError("generation_servers.router.max_queue_wait_s needs "
+                         "max_requests_per_server")
+    if gen_router_config.args.get("max_requests_per_server") is not None:
+        # The pooled generation router fails a request that waits for a seat past
+        # the context servers' KV transfer timeout. This is the fallback until the
+        # context servers report their own value in /server_info.
+        gen_router_config.args["kv_transfer_timeout_ms"] = (
+            _ctx_kv_transfer_timeout_ms(context_servers))
     if disagg_cluster:
         disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
     else:
@@ -366,8 +548,27 @@ def extract_disagg_cfg(
             "subagent_affinity_scope must be 'context' or 'both', got "
             f"{subagent_affinity_scope!r}")
     config.subagent_affinity_scope = subagent_affinity_scope
+    config.ctx_frontend_affinity = ctx_frontend_affinity
+    if output_length_prediction is not None:
+        config.output_length_prediction = (
+            OutputLengthPredictionConfig.model_validate(
+                output_length_prediction))
+        check_output_length_prediction_schedule(config)
     _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def check_output_length_prediction_schedule(config: DisaggServerConfig) -> None:
+    """Refuse output_length_prediction with schedule_style generation_first.
+
+    Runs again in OpenAIDisaggregatedService, after the CLI / env override of schedule_style.
+    """
+    if (config.output_length_prediction is not None
+            and config.schedule_style == "generation_first"):
+        # The prediction needs the context phase's prompt length; a
+        # generation_first request reaches its generation server without it.
+        raise ValueError("output_length_prediction requires schedule_style "
+                         "'context_first'")
 
 
 def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
@@ -405,6 +606,19 @@ def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
             "the 'conversation' router on the "
             f"{', '.join(non_conversation)} fleet(s), but they use a different "
             "router type; sub-agent instance affinity will be inactive there.")
+
+
+def _ctx_kv_transfer_timeout_ms(context_servers: dict) -> Optional[int]:
+    """``context_servers.cache_transceiver_config.kv_transfer_timeout_ms``, else its default.
+
+    The pooled generation router prefers the value the context servers report in
+    ``/server_info`` (their own ``--config``); this one applies until they do.
+    """
+    cfg = context_servers.get("cache_transceiver_config") or {}
+    if "kv_transfer_timeout_ms" in cfg:
+        return cfg["kv_transfer_timeout_ms"]
+    from .llm_args import CacheTransceiverConfig
+    return CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
@@ -453,15 +667,27 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 def extract_router_config(server_cfg: dict) -> RouterConfig:
 
     args = server_cfg.pop("router", {})
-    router_type = args.pop("type", RouterConfig.type)
+    # create_router matches the type case-insensitively.
+    router_type = args.pop("type", RouterConfig.type).lower()
 
-    if router_type == "kv_cache_aware" and "model_path" not in args:
-        model_path = server_cfg.get("model")
-        if model_path is not None:
-            args["model_path"] = model_path
+    if router_type == "kv_cache_aware":
+        # The cache-aware router loads the servers' tokenizer and prompt renderer
+        # the way they do: from their model, at its revision, in their checkpoint
+        # format.
+        server_args = {
+            "model_path": server_cfg.get("model"),
+            "revision": server_cfg.get("revision",
+                                       server_cfg.get("hf_revision")),
+            "checkpoint_format": server_cfg.get("checkpoint_format"),
+        }
+        for key, value in server_args.items():
+            if value is not None:
+                args.setdefault(key, value)
 
     # add fields that are not specific to router
-    extract_keys = ["max_batch_size", "max_num_tokens"]
+    extract_keys = [
+        "max_batch_size", "max_num_tokens", "enable_tokenization_cache"
+    ]
     for key in extract_keys:
         if key in server_cfg:
             args[key] = server_cfg[key]
@@ -526,6 +752,7 @@ def extract_disagg_cluster_config(
         DisaggClusterConfig(cluster_uri or cluster_config_dict["cluster_uri"]),
         cluster_config_dict,
     )
+    cluster_config.validate_etcd_options()
     return cluster_config
 
 

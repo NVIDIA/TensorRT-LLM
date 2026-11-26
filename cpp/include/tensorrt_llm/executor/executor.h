@@ -252,27 +252,6 @@ public:
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs;
 };
 
-/// @brief Configuration for prompt tuning
-class PromptTuningConfig
-{
-public:
-    explicit PromptTuningConfig(
-        Tensor embeddingTable, std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt);
-
-    [[nodiscard]] Tensor getEmbeddingTable() const;
-
-    [[nodiscard]] std::optional<VecTokenExtraIds> getInputTokenExtraIds() const;
-
-private:
-    friend class Serialization;
-    /// @brief The prompt embedding table. Expected shape: [task vocab_size, hidden_size]. Data type must match model
-    /// weights.
-    Tensor mEmbeddingTable;
-
-    /// @brief The input token extra ids for KV Cache reuse when p-tuning is enabled
-    std::optional<VecTokenExtraIds> mInputTokenExtraIds;
-};
-
 /// @brief Multimodal input data class
 class MultimodalInput
 {
@@ -610,7 +589,6 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
-    /// @param pTuningConfig The prompt tuning configuration
     /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
     /// exact prompt runs}
     /// @param mRopeConfig The mrope configuration
@@ -641,7 +619,6 @@ public:
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
-        std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<MropeConfig> mRopeConfig = std::nullopt, std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
@@ -672,7 +649,6 @@ public:
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
-    [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -699,7 +675,6 @@ public:
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
-    void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);
@@ -732,14 +707,8 @@ struct Result
     /// @brief The output tokens for each beam
     BeamTokens outputTokenIds;
 
-    /// @brief The cumulative log probabilities. Size beamSize.
-    std::optional<VecLogProbs> cumLogProbs;
-
-    /// @brief The log probabilities for each generated token. Size [beamSize, outputLen]
-    std::optional<std::vector<VecLogProbs>> logProbs;
-
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
-    /// Currently only supported when beamSize is 1 and when using BatchingType::kINFLIGHT.
+    /// Currently only supported when beamSize is 1 and when using in-flight batching.
     std::vector<FinishReason> finishReasons;
 
     /// @brief The params of the context phase.
@@ -990,46 +959,6 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
-};
-
-/// @brief Configuration class for the runtime perf knobs
-class ExtendedRuntimePerfKnobConfig
-{
-public:
-    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = true, bool enableContextFMHAFP32Acc = false,
-        bool cudaGraphMode = false, SizeType32 cudaGraphCacheSize = 0);
-
-    bool operator==(ExtendedRuntimePerfKnobConfig const& other) const
-    {
-        return mMultiBlockMode == other.mMultiBlockMode && mEnableContextFMHAFP32Acc == other.mEnableContextFMHAFP32Acc
-            && mCudaGraphMode == other.mCudaGraphMode && mCudaGraphCacheSize == other.mCudaGraphCacheSize;
-    }
-
-    [[nodiscard]] bool getMultiBlockMode() const;
-    [[nodiscard]] bool getEnableContextFMHAFP32Acc() const;
-    [[nodiscard]] bool getCudaGraphMode() const;
-    [[nodiscard]] SizeType32 getCudaGraphCacheSize() const;
-
-    void setMultiBlockMode(bool multiBlockMode);
-    void setEnableContextFMHAFP32Acc(bool enableContextFMHAFP32Acc);
-    void setCudaGraphMode(bool cudaGraphMode);
-    void setCudaGraphCacheSize(SizeType32 cacheSize);
-
-private:
-    friend class Serialization;
-
-    /// @brief Control if multi block mode should be enabled or not.
-    bool mMultiBlockMode;
-
-    /// @brief If enable FMHA runner FP32 accumulation.
-    bool mEnableContextFMHAFP32Acc;
-
-    /// @brief Control if enable cuda graph.
-    bool mCudaGraphMode;
-
-    /// @brief Number of cuda graphs to be cached in the runtime.
-    /// The larger the cache, the better the perf, but more GPU memory is consumed.
-    SizeType32 mCudaGraphCacheSize;
 };
 
 /// @brief config for PeftCacheManager

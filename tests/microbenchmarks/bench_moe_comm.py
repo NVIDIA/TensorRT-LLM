@@ -72,6 +72,11 @@ from tensorrt_llm._torch.moe.fused_moe import MoE
 from tensorrt_llm._torch.moe.fused_moe.communication import Communication, CommunicationFactory
 from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
 from tensorrt_llm._torch.moe.fused_moe.routing import DefaultMoeRoutingMethod
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._utils import local_mpi_rank, mpi_allgather, mpi_barrier, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -494,31 +499,34 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
+    cupti = cupti_kernels = cupti_events = None
     if cupti_ctx is not None:
         cupti, cupti_kernels, cupti_events = cupti_ctx
 
     # ---- 1. Discover receive shape and allocate the combine payload ----
-    backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
-    recv_hidden_states, _, _, _ = backend.dispatch(
-        hidden_states,
-        hidden_states_sf,
-        token_selected_slots,
-        token_final_scales,
-        all_rank_num_tokens,
-    )
-    if payload_in_workspace:
-        # A view of the fixed combine input region, as the MoE scheduler passes it, so combine
-        # skips its staging copy. The region's address is fixed, so graph replay stays valid.
-        static_moe_out = backend.get_combine_payload_tensor_in_workspace(
-            max_tokens, hidden_size, torch.bfloat16
+    # Release shape-discovery leases before capture claims the warmup windows.
+    with discard_nccl_window_tensor_outputs(hidden_states):
+        backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
+        recv_hidden_states, _, _, _ = backend.dispatch(
+            hidden_states,
+            hidden_states_sf,
+            token_selected_slots,
+            token_final_scales,
+            all_rank_num_tokens,
         )
-    else:
-        static_moe_out = torch.zeros(
-            (recv_hidden_states.shape[0], hidden_size),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-    backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+        if payload_in_workspace:
+            # A view of the fixed combine input region, as the MoE scheduler passes it, so combine
+            # skips its staging copy. The region's address is fixed, so graph replay stays valid.
+            static_moe_out = backend.get_combine_payload_tensor_in_workspace(
+                max_tokens, hidden_size, torch.bfloat16
+            )
+        else:
+            static_moe_out = torch.zeros(
+                (recv_hidden_states.shape[0], hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
     torch.cuda.synchronize()
 
     # ---- 2. Prepare timing events and CUPTI event IDs ----
@@ -571,74 +579,87 @@ def _time_dispatch_and_combine(
     # ---- 3. Define iterations and optionally capture the CUDA graph ----
     def _run_iterations() -> None:
         for _ in range(warmup):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            backend.prepare_dispatch(
-                token_selected_slots, all_rank_num_tokens
-            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
-            backend.dispatch(
-                hidden_states,
-                hidden_states_sf,
-                token_selected_slots,
-                token_final_scales,
-                all_rank_num_tokens,
-            )
-            static_moe_out.zero_()
-            backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+            with discard_nccl_window_tensor_outputs(hidden_states):
+                if l2_buffer is not None:
+                    l2_buffer.zero_()
+                backend.prepare_dispatch(
+                    token_selected_slots, all_rank_num_tokens
+                )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
+                backend.dispatch(
+                    hidden_states,
+                    hidden_states_sf,
+                    token_selected_slots,
+                    token_final_scales,
+                    all_rank_num_tokens,
+                )
+                static_moe_out.zero_()
+                backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
         for i in range(iters):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            _record_event(d_starts[i])
-            backend.prepare_dispatch(
-                token_selected_slots, all_rank_num_tokens
-            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
-            backend.dispatch(
-                hidden_states,
-                hidden_states_sf,
-                token_selected_slots,
-                token_final_scales,
-                all_rank_num_tokens,
-            )
-            _record_event(d_ends[i])
-            static_moe_out.zero_()
-            _record_event(c_starts[i])
-            backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
-            _record_event(c_ends[i])
+            with discard_nccl_window_tensor_outputs(hidden_states):
+                if l2_buffer is not None:
+                    l2_buffer.zero_()
+                _record_event(d_starts[i])
+                backend.prepare_dispatch(
+                    token_selected_slots, all_rank_num_tokens
+                )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
+                backend.dispatch(
+                    hidden_states,
+                    hidden_states_sf,
+                    token_selected_slots,
+                    token_final_scales,
+                    all_rank_num_tokens,
+                )
+                _record_event(d_ends[i])
+                static_moe_out.zero_()
+                _record_event(c_starts[i])
+                backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+                _record_event(c_ends[i])
 
-    if use_cuda_graph:
-        # Keep warmup and timed iterations in one replay to avoid a host-side gap.
-        big_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(big_graph):
+    big_graph = pool = None
+    try:
+        if use_cuda_graph:
+            # Keep warmup and timed iterations in one replay to avoid a host-side gap.
+            big_graph = torch.cuda.CUDAGraph()
+            pool = torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(big_graph, pool):
+                _run_iterations()
+
+        # ---- 4. Clear setup records, synchronize, and execute ----
+        if cupti_ctx is not None:
+            cupti.activity_flush_all(0)
+            cupti_kernels.clear()
+            cupti_events.clear()
+        _sync()
+        if use_cuda_graph:
+            big_graph.replay()
+        else:
             _run_iterations()
+        _sync()
+        if cupti_ctx is not None:
+            cupti.activity_flush_all(0)
 
-    # ---- 4. Clear setup records, synchronize, and execute ----
-    if cupti_ctx is not None:
-        cupti.activity_flush_all(0)
-        cupti_kernels.clear()
-        cupti_events.clear()
-    _sync()
-    if use_cuda_graph:
-        big_graph.replay()
-    else:
-        _run_iterations()
-    _sync()
-    if cupti_ctx is not None:
-        cupti.activity_flush_all(0)
+        # ---- 5. Read per-iteration CUDA-event timings ----
+        dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
+        combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
 
-    # ---- 5. Read per-iteration CUDA-event timings ----
-    dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
-    combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
+        # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
+        detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
+        if cupti_ctx is not None:
+            try:
+                detailed_stats = _build_kernel_stats_cupti(
+                    cupti_kernels, cupti_events, phase_event_ids
+                )
+            except RuntimeError as exc:
+                # Let every MPI rank reach the reporting collectives even if one trace is incomplete.
+                detailed_stats["cupti_error"] = str(exc)
 
-    # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
-    detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
-    if cupti_ctx is not None:
-        try:
-            detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
-        except RuntimeError as exc:
-            # Let every MPI rank reach the reporting collectives even if one trace is incomplete.
-            detailed_stats["cupti_error"] = str(exc)
-
-    return dispatch_times_us, combine_times_us, detailed_stats
+        return dispatch_times_us, combine_times_us, detailed_stats
+    finally:
+        if big_graph is not None:
+            torch.cuda.synchronize()
+            big_graph.reset()
+        if pool is not None:
+            release_nccl_window_graph_owner(pool)
 
 
 def _compute_stats(values: List[float]) -> Dict[str, float]:
@@ -816,6 +837,16 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable Programmatic Dependent Launch (sets TRTLLM_ENABLE_PDL=1).",
     )
+    parser.add_argument(
+        "--sync_protocol",
+        choices=["auto", "fence", "sentinel"],
+        default="auto",
+        help=(
+            "NVLINK_ONE_SIDED sync protocol (sets TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL): "
+            "auto = sentinel for the steps it can carry where supported, fence = fence only, "
+            "sentinel = ask for it (warns when it stays off)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -944,6 +975,7 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "sync_protocol": args.sync_protocol,
         "payload_in_workspace": not bool(args.no_payload_in_workspace),
         "cupti_enabled": cupti_ctx is not None,
         "warning": cupti_warning,
@@ -986,7 +1018,6 @@ def _run_benchmark_worker_under_current_mpi(
                 experts_per_rank,
                 payload_in_workspace=not bool(args.no_payload_in_workspace),
                 alltoall_result_do_sum=True,
-                use_flashinfer=False,
             )
 
             if backend is None:
@@ -1092,10 +1123,21 @@ def _run_benchmark_worker_under_current_mpi(
                 combine_times_us = detailed_stats["combine_us_kernel_span"]
 
             # Prepare output
+            uses_sentinel = getattr(backend, "use_sentinel_for_dispatch", None)
             output = {
                 "backend": backend_name,
                 "payload_in_workspace": payload_in_workspace,
                 "local_batch_size": int(local_num_tokens),
+                "sentinel": bool(
+                    uses_sentinel
+                    and uses_sentinel(
+                        max(all_rank_num_tokens),
+                        hidden_states,
+                        hidden_states_sf,
+                        token_final_scales,
+                        None,
+                    )
+                ),
                 "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
                 "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
             }
@@ -1220,6 +1262,7 @@ def main() -> None:
 
     _worker_env = dict(_WORKER_ENV)
     _worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+    _worker_env["TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"] = args.sync_protocol
 
     world_size = mpi_world_size()
     if world_size > 1:

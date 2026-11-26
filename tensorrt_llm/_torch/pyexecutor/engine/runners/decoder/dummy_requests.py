@@ -10,11 +10,13 @@ from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+    is_context_only_kv_cache,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager, get_num_extra_kv_tokens
@@ -29,6 +31,10 @@ from .config import DecoderRunnerConfig
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
+
+# Temperature-only params (no top-k / top-p / min-p, no seed) for the capture pass of the one-engine
+# temperature-only graph variant.
+TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7)
 
 
 class DummyRequestFactory:
@@ -106,8 +112,12 @@ class DummyRequestFactory:
         least_requests: bool = True,
         chunk_alignment: int | None = None,
         chunk_aligned: bool = False,
+        num_context_requests: int | None = None,
     ) -> ScheduledRequests | None:
         """Creates a generic dummy ScheduledRequests object for warmup.
+
+        ``num_context_requests``, when set, splits the context tokens evenly
+        over that many requests instead of following ``least_requests``.
 
         ``chunk_alignment``, when set, rewrites the context lengths onto one
         side of it, so a kernel specializing on chunk alignment can be primed
@@ -118,9 +128,10 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if num_gen_requests and getattr(kv_cache_manager, "kda_context_only", False) is True:
-            # A disaggregated KDA context server keeps no draft-verify state,
-            # so generation shapes cannot run there.
+        if num_gen_requests and is_context_only_kv_cache(kv_cache_manager):
+            # A disaggregated context server keeps no generation-only cache
+            # state (KDA draft-verify buffers, FP4 MLA V scales), so
+            # generation shapes cannot run there.
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -170,7 +181,16 @@ class DummyRequestFactory:
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
+            if num_context_requests is not None:
+                if not 0 < num_context_requests <= min(num_ctx_tokens, max_context_requests):
+                    return None
+                base_length, remainder = divmod(num_ctx_tokens, num_context_requests)
+                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
+                    num_context_requests - remainder
+                )
+                if ctx_token_nums[0] > max_seq_len:
+                    return None
+            elif least_requests:
                 num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
                 ctx_token_nums = [max_seq_len] * num_full_seqs
                 if remainder:
@@ -293,21 +313,25 @@ class DummyRequestFactory:
         force_non_greedy: bool = False,
         context_token_nums: Sequence[int] = (),
         context_request_kwargs: dict[str, Any] | None = None,
+        temperature_only: bool = False,
     ) -> ScheduledRequests | None:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
 
         With ``context_token_nums``, the first rows are context requests of
         those lengths, created with ``context_request_kwargs``; the rest are
-        generation requests.
+        generation requests. ``temperature_only`` (with ``force_non_greedy``)
+        gives the dummies temperature-only sampling params, for the capture
+        pass of the temperature-only variant.
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
+        if force_non_greedy and temperature_only:
+            capture_sampling_params = TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if (
-            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-            or getattr(kv_cache_manager, "kda_context_only", False) is True
-        ):
+        if getattr(
+            kv_cache_manager, "context_swa_layer_limit", None
+        ) is not None or is_context_only_kv_cache(kv_cache_manager):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -343,45 +367,80 @@ class DummyRequestFactory:
             if context_requests is None:
                 return None
 
+        num_long_requests = 1
+        short_dummy_request_kwargs: dict[str, Any] = {}
+        long_dummy_request_kwargs: dict[str, Any] = {}
+        if (
+            not num_contexts
+            and isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.num_locality_domains > 1
+        ):
+            num_locality_domains = kv_cache_manager.num_locality_domains
+            num_long_requests = min(num_locality_domains, batch_size)
+            # One longest request per domain grows every per-domain attention
+            # workspace to the long-sequence bound during capture. Short requests
+            # start from domain 0 to keep the generation-only split balanced.
+            short_dummy_request_kwargs["locality_domain_ids"] = [
+                request_idx % num_locality_domains
+                for request_idx in range(batch_size - num_long_requests)
+            ]
+            long_dummy_request_kwargs["locality_domain_ids"] = list(range(num_long_requests))
+
         # Fill all rows but the longest with minimal-length generation requests.
-        num_fillers = batch_size - 1 - num_contexts
-        requests = kv_cache_manager.add_dummy_requests(
-            list(range(num_contexts, batch_size - 1)),
-            token_nums=(
-                None
-                if self._dummy_request_tokens is None
-                else [self._dummy_request_tokens] * num_fillers
-            ),
-            is_gen=True,
-            max_num_draft_tokens=runtime_draft_token_buffer_width,
-            kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-            use_mrope=self._config.use_mrope,
-            max_beam_width=self._config.max_beam_width,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, num_fillers),
-        )
-        if requests is None:
-            for request in context_requests:
-                kv_cache_manager.free_resources(request)
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.free_resources(request)
-            return None
+        num_fillers = batch_size - num_long_requests - num_contexts
+        requests = []
+        if num_fillers > 0:
+            requests = kv_cache_manager.add_dummy_requests(
+                list(range(num_contexts, batch_size - num_long_requests)),
+                token_nums=(
+                    None
+                    if self._dummy_request_tokens is None
+                    else [self._dummy_request_tokens] * num_fillers
+                ),
+                is_gen=True,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
+                kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
+                use_mrope=self._config.use_mrope,
+                max_beam_width=self._config.max_beam_width,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                capture_sampling_params=capture_sampling_params,
+                **self._dummy_request_kwargs(resource_manager, num_fillers),
+                **short_dummy_request_kwargs,
+            )
+            if requests is None:
+                for request in context_requests:
+                    kv_cache_manager.free_resources(request)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(request)
+                return None
         requests = context_requests + requests
 
-        max_seq_len_request = self.add_longest_dummy_request(
-            resource_manager,
-            requests,
-            batch_size,
-            max_seq_len,
-            runtime_draft_token_buffer_width,
-            capture_sampling_params,
-        )
-        if max_seq_len_request is None:
+        if num_long_requests == 1:
+            longest = self.add_longest_dummy_request(
+                resource_manager,
+                requests,
+                batch_size,
+                max_seq_len,
+                runtime_draft_token_buffer_width,
+                capture_sampling_params,
+            )
+            max_seq_len_requests = None if longest is None else [longest]
+        else:
+            max_seq_len_requests = self.add_longest_dummy_requests(
+                resource_manager,
+                requests,
+                batch_size,
+                max_seq_len,
+                runtime_draft_token_buffer_width,
+                capture_sampling_params,
+                num_long_requests=num_long_requests,
+                dummy_request_kwargs=long_dummy_request_kwargs,
+            )
+        if max_seq_len_requests is None:
             return None
 
         if num_contexts:
-            requests.append(max_seq_len_request)
+            requests.extend(max_seq_len_requests)
             for request, token_num in zip(requests, context_token_nums):
                 request.state = LlmRequestState.CONTEXT_INIT
                 request.context_current_position = 0
@@ -391,10 +450,9 @@ class DummyRequestFactory:
             result.context_requests_last_chunk = requests[:num_contexts]
             result.generation_requests = requests[num_contexts:]
         else:
-            # Insert the longest request first to simulate padding for the CUDA
-            # graph.
-            requests.insert(0, max_seq_len_request)
-            result.generation_requests = requests
+            # Put the longest requests first to simulate padding for the CUDA
+            # graph; with locality domains this also seeds each domain group.
+            result.generation_requests = max_seq_len_requests + requests
         return self.finish_cuda_graph_warmup_request(
             result, resource_manager, batch_size, draft_len
         )
@@ -409,6 +467,28 @@ class DummyRequestFactory:
         capture_sampling_params: SamplingParams | None,
     ) -> LlmRequest | None:
         """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
+        longest = self.add_longest_dummy_requests(
+            resource_manager,
+            requests,
+            batch_size,
+            max_seq_len,
+            runtime_draft_token_buffer_width,
+            capture_sampling_params,
+        )
+        return None if longest is None else longest[0]
+
+    def add_longest_dummy_requests(
+        self,
+        resource_manager: ResourceManager,
+        requests: list[LlmRequest],
+        batch_size: int,
+        max_seq_len: int | None,
+        runtime_draft_token_buffer_width: int,
+        capture_sampling_params: SamplingParams | None,
+        num_long_requests: int = 1,
+        dummy_request_kwargs: dict[str, Any] | None = None,
+    ) -> list[LlmRequest] | None:
+        """Add the longest dummy requests; free ``requests`` if they do not fit."""
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
@@ -422,7 +502,8 @@ class DummyRequestFactory:
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache_manager.free_resources(r)
 
-        # Add one dummy request with the maximum possible sequence length.
+        # Add the dummy requests with the maximum possible sequence length.
+        available_tokens_batch_size = math.ceil(batch_size / num_long_requests)
         max_seq_len = min(
             self._config.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len,
@@ -432,13 +513,15 @@ class DummyRequestFactory:
         # for the actual KV reservation per request.
         _kv_draft = self._config.max_draft_loop_tokens
         available_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=max_seq_len, batch_size=batch_size, max_num_draft_tokens=_kv_draft
+            token_num_upper_bound=max_seq_len,
+            batch_size=available_tokens_batch_size,
+            max_num_draft_tokens=_kv_draft,
         )
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size,
+                batch_size=available_tokens_batch_size,
                 token_num_upper_bound=max_seq_len,
                 max_num_draft_tokens=_kv_draft,
             )
@@ -457,9 +540,9 @@ class DummyRequestFactory:
 
         token_num = int(token_num)  # Ensure int for range() in add_dummy_requests
 
-        max_seq_len_request = kv_cache_manager.add_dummy_requests(
-            request_ids=[batch_size - 1],
-            token_nums=[token_num],
+        max_seq_len_requests = kv_cache_manager.add_dummy_requests(
+            request_ids=list(range(batch_size - num_long_requests, batch_size)),
+            token_nums=[token_num] * num_long_requests,
             is_gen=True,
             max_num_draft_tokens=runtime_draft_token_buffer_width,
             kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
@@ -467,13 +550,14 @@ class DummyRequestFactory:
             max_beam_width=self._config.max_beam_width,
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, 1),
+            **self._dummy_request_kwargs(resource_manager, num_long_requests),
+            **(dummy_request_kwargs or {}),
         )
 
-        if max_seq_len_request is None:
+        if max_seq_len_requests is None:
             free_warmup_requests()
             return None
-        return max_seq_len_request[0]
+        return max_seq_len_requests
 
     def finish_cuda_graph_warmup_request(
         self,
