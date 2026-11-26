@@ -57,7 +57,7 @@ def _executor() -> PyExecutor:
     executor.active_requests = []
     executor.canceled_req_ids = []
     executor.waiting_queue = Mock()
-    executor.dist = SimpleNamespace(rank=0)
+    executor.dist = SimpleNamespace(rank=0, tp_size=1, world_size=1)
     executor.enable_attention_dp = False
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()
@@ -121,8 +121,8 @@ def test_unstarted_load_can_be_released_before_teardown() -> None:
     executor = _executor()
     request = _request()
     calls = []
-    executor.kv_connector_manager.release_unstarted_prefix_loads.side_effect = (
-        lambda req: calls.append("release")
+    executor.kv_connector_manager.release_unstarted_prefix_loads.side_effect = lambda req: (
+        calls.append("release")
     )
     executor._do_terminate_request.side_effect = lambda req: calls.append("free")
 
@@ -356,7 +356,9 @@ def test_control_drain_waits_for_detached_connector_load() -> None:
 def test_control_drain_waits_for_peer_ranks_under_attention_dp() -> None:
     executor = _executor()
     executor.enable_attention_dp = True
-    executor.dist = SimpleNamespace(rank=0, world_size=2, tp_allgather=lambda drained: [drained, 0])
+    executor.dist = SimpleNamespace(
+        rank=0, tp_size=2, world_size=2, tp_allgather=lambda drained: [drained, 0]
+    )
     executor.waiting_queue = []
     pending = SimpleNamespace(control_requires_drain=True)
     executor.control_requests = [pending]
@@ -821,3 +823,27 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+def test_single_rank_connector_does_not_poll_native_sends() -> None:
+    executor = _executor()
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+
+    assert not executor._has_pending_native_sends()
+    executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_adp", [False, True])
+def test_multirank_native_only_keeps_existing_progress_contract(enable_adp: bool) -> None:
+    executor = _executor()
+    executor.kv_connector_manager = None
+    executor.enable_attention_dp = enable_adp
+    executor.dist.tp_size = 1
+    executor.dist.world_size = 2
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+
+    assert not executor._has_pending_connector_transfers()
+    assert not executor._has_pending_native_sends()
+    executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()

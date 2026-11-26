@@ -24,6 +24,12 @@ class AbortStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ABORT_STATUS_UNSPECIFIED: _ClassVar[AbortStatus]
     ABORT_STATUS_ABORTED: _ClassVar[AbortStatus]
     ABORT_STATUS_ALREADY_FINISHED: _ClassVar[AbortStatus]
+
+class ShutdownStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SHUTDOWN_STATUS_UNSPECIFIED: _ClassVar[ShutdownStatus]
+    SHUTDOWN_STATUS_ACCEPTED: _ClassVar[ShutdownStatus]
+    SHUTDOWN_STATUS_ALREADY_STOPPING: _ClassVar[ShutdownStatus]
 HEALTH_STATE_UNSPECIFIED: HealthState
 HEALTH_STATE_STARTING: HealthState
 HEALTH_STATE_READY: HealthState
@@ -32,6 +38,9 @@ HEALTH_STATE_NOT_READY: HealthState
 ABORT_STATUS_UNSPECIFIED: AbortStatus
 ABORT_STATUS_ABORTED: AbortStatus
 ABORT_STATUS_ALREADY_FINISHED: AbortStatus
+SHUTDOWN_STATUS_UNSPECIFIED: ShutdownStatus
+SHUTDOWN_STATUS_ACCEPTED: ShutdownStatus
+SHUTDOWN_STATUS_ALREADY_STOPPING: ShutdownStatus
 
 class HealthRequest(_message.Message):
     __slots__ = ("include_inference_probe", "model", "role")
@@ -82,3 +91,17 @@ class AbortResponse(_message.Message):
     status: AbortStatus
     message: str
     def __init__(self, status: _Optional[_Union[AbortStatus, str]] = ..., message: _Optional[str] = ...) -> None: ...
+
+class ShutdownRequest(_message.Message):
+    __slots__ = ("expected_instance_id",)
+    EXPECTED_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    expected_instance_id: str
+    def __init__(self, expected_instance_id: _Optional[str] = ...) -> None: ...
+
+class ShutdownResponse(_message.Message):
+    __slots__ = ("status", "instance_id")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    status: ShutdownStatus
+    instance_id: str
+    def __init__(self, status: _Optional[_Union[ShutdownStatus, str]] = ..., instance_id: _Optional[str] = ...) -> None: ...

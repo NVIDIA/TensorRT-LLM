@@ -16,6 +16,7 @@ syntax = "proto3";
 
 package openengine.v1;
 
+import "openengine/v1/encoding.proto";
 import "openengine/v1/generation.proto";
 import "openengine/v1/kv.proto";
 import "openengine/v1/lifecycle.proto";
@@ -32,12 +33,20 @@ import "openengine/v1/server.proto";
 // - traceparent and tracestate: W3C Trace Context.
 //
 // The openengine- prefix is reserved for metadata defined by this protocol.
-// Routing and admission keys apply to Inference RPCs. Trace Context applies to
-// every RPC and should be propagated across downstream calls.
+// Routing and admission keys apply to Generate and Encode. Trace Context applies
+// to every RPC and should be propagated across downstream calls.
 
 service Inference {
   // Core inference path.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+}
+
+// Optional service for engines that produce transferable encoded media.
+service Encoder {
+  // Produce engine-owned media outputs; the endpoint's role is set at startup.
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+  // Release a completed output at its producer; never cancels an active transfer.
+  rpc ReleaseEncodedMedia(ReleaseEncodedMediaRequest) returns (ReleaseEncodedMediaResponse);
 }
 
 service Control {
@@ -49,6 +58,8 @@ service Control {
   // Health and lifecycle.
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
+  // Identity-fenced, idempotent shutdown of the entire engine serving group.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 
   // LoRA lifecycle.
   rpc LoadLora(LoadLoraRequest) returns (LoadLoraResponse);

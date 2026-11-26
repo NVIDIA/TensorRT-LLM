@@ -1487,7 +1487,7 @@ class TestListenerAbortAndShutdown:
         executor = object.__new__(PyExecutor)
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
-        executor.dist = SimpleNamespace(rank=1, pp_size=1)
+        executor.dist = SimpleNamespace(rank=1, pp_size=1, world_size=2)
         executor.disable_overlap_scheduler = True
         executor.enable_attention_dp = False
         executor.control_request_barrier = threading.Event()

@@ -304,9 +304,9 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.2.0`](https://github.com/ai-dynamo/openengine/tree/v0.2.0), Git commit `475dcf2e332c4f9975dcdf7f65838cbabd5acc31`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `b7001e32713d4b8abc70d49dd1be6113`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
+TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
 

@@ -22,6 +22,8 @@ from typing import Sequence
 _BINDINGS_PACKAGE = "tensorrt_llm.grpc.openengine._generated"
 _PROTO_PACKAGE = Path("openengine/v1")
 _PROTO_NAMES = (
+    "encoded_media",
+    "encoding",
     "error",
     "generation",
     "kv",

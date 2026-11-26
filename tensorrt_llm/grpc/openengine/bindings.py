@@ -29,6 +29,8 @@ with warnings.catch_warnings():
         category=UserWarning,
     )
     from ._generated import (
+        encoded_media_pb2,
+        encoding_pb2,
         error_pb2,
         generation_pb2,
         kv_pb2,
@@ -45,6 +47,8 @@ __all__ = [
     "MINIMUM_CLIENT_REVISION",
     "SCHEMA_RELEASE",
     "SCHEMA_REVISION",
+    "encoded_media_pb2",
+    "encoding_pb2",
     "error_pb2",
     "generation_pb2",
     "kv_pb2",
