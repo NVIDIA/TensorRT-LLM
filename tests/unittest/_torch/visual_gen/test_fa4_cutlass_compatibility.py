@@ -11,12 +11,10 @@ import torch
 
 cute = pytest.importorskip("cutlass.cute")
 
-from tensorrt_llm._torch.visual_gen.attention._fa4_compat import (  # noqa: E402
-    install_flash_attn_tile_scheduler_compatibility,
-)
 from tensorrt_llm._torch.visual_gen.attention.backends import flash_attn4, parallel  # noqa: E402
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (  # noqa: E402
     _install_cutlass_dsl_compatibility,
+    _install_flash_attn_tile_scheduler_compatibility,
 )
 
 
@@ -65,7 +63,7 @@ def test_fa4_work_tile_info_survives_cutlass_task_scheduling_import() -> None:
     from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo as CutlassWorkTileInfo
 
     del task_scheduling
-    install_flash_attn_tile_scheduler_compatibility()
+    _install_flash_attn_tile_scheduler_compatibility()
     tile_idx = (cutlass.Int32(1), cutlass.Int32(2), cutlass.Int32(3), cutlass.Int32(0))
 
     # FA4's four-axis coordinate must construct whether or not the task-scheduling
