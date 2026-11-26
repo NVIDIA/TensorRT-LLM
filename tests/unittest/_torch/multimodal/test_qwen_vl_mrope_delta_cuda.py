@@ -20,7 +20,7 @@ def test_child_takes_the_parent_delta_while_its_copy_is_queued() -> None:
         request_id=1,
         max_new_tokens=100,
         input_tokens=[0] * 10,
-        sampling_config=SamplingConfig(SamplingParams(n=2)._get_sampling_config()),
+        sampling_config=SamplingConfig(SamplingParams(n=2, top_k=4)._get_sampling_config()),
         is_streaming=False,
         py_multimodal_data={"mrope_config": {"mrope_position_deltas": deltas}},
     )
@@ -30,7 +30,8 @@ def test_child_takes_the_parent_delta_while_its_copy_is_queued() -> None:
     torch.cuda.synchronize()
     # The child's copy queues on the current stream behind a step in flight.
     torch.cuda._sleep(1 << 28)
-    child = parent.create_child_request(2)
+    parent.create_child_request(2)
+    child = parent.child_requests[0]
     text_config = SimpleNamespace(max_position_embeddings=40)
     cap_mrope_decode_tokens(parent, text_config)
     cap_mrope_decode_tokens(child, text_config)
