@@ -577,8 +577,8 @@ def test_steady_decode_reuses_converted_tables(
 @torch.inference_mode()
 def test_draft_conversion_keeps_holes_with_scratch_enabled():
     manager = _manager(False, True, True, 2 * BLOCK, draft_stages=3)
-    request = _admit(manager, 1, 300)
     try:
+        _admit(manager, 1, 300)
         params = manager._device_batch_page_params
         host = params.cpu()
         draft = manager._draft_page_table_index
@@ -597,7 +597,6 @@ def test_draft_conversion_keeps_holes_with_scratch_enabled():
             out[scratch_table, 0, 1].item() == 23 * host[scratch_table, 1] + host[scratch_table, 2]
         )
     finally:
-        manager.free_resources(request)
         manager.shutdown()
 
 

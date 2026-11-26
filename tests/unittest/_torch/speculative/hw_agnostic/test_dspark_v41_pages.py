@@ -4,7 +4,7 @@
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -62,13 +62,22 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         assert not worker.return_confidence
 
     worker._lazy_init.side_effect = initialize
-    DSv41DSparkWorker.prepare_draft_context(
+    prepare_args = (
         worker,
         draft,
         metadata,
         SimpleNamespace(num_contexts=1),
         SimpleNamespace(get_resource_manager=lambda _: manager),
     )
+    with (
+        patch.object(torch, "full", side_effect=torch.OutOfMemoryError("draft page table")),
+        pytest.raises(torch.OutOfMemoryError, match="draft page table"),
+    ):
+        DSv41DSparkWorker.prepare_draft_context(*prepare_args)
+    assert worker._draft_kv_manager is None
+    worker._prepare_page_tables.assert_not_called()
+
+    DSv41DSparkWorker.prepare_draft_context(*prepare_args)
     assert worker._draft_kv_manager is manager
     assert worker._draft_prepared_batch is None
     assert not worker._managed_residency

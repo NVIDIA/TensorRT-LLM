@@ -125,6 +125,16 @@ def is_fused_dspark_rmsnorm_rope_supported(
     )
 
 
+def _is_dspark_attention_rope_supported(
+    x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor
+) -> bool:
+    return freqs.shape[1:] == (_DSV4_DSPARK_ROPE_DIM // 2, 2) and (
+        is_fused_dspark_rmsnorm_rope_supported(
+            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
+        )
+    )
+
+
 def _is_dspark_cache_write_supported(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -136,9 +146,7 @@ def _is_dspark_cache_write_supported(
     batch = x.shape[0] if x.ndim == 3 else -1
     return (
         x.shape == (batch, 1, _DSV4_DSPARK_HEAD_DIM)
-        and is_fused_dspark_rmsnorm_rope_supported(
-            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
-        )
+        and _is_dspark_attention_rope_supported(x, weight, freqs)
         and kv_cache.is_cuda
         and kv_cache.dtype == x.dtype
         and kv_cache.ndim == 3
@@ -165,9 +173,7 @@ def _is_dspark_draft_block_supported(
     return (
         block_size in _DSV4_DSPARK_BLOCK_SIZES
         and x.shape[-1:] == (_DSV4_DSPARK_HEAD_DIM,)
-        and is_fused_dspark_rmsnorm_rope_supported(
-            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
-        )
+        and _is_dspark_attention_rope_supported(x, weight, freqs)
     )
 
 
@@ -223,9 +229,7 @@ def is_fused_dspark_attention_preparation_supported(
             and main_x.shape[-1] == _DSV4_DSPARK_HEAD_DIM
             and main_x.shape[0] == block_x.shape[0]
             and all(t.device == main_x.device for t in (weight, main_freqs, block_x, block_freqs))
-            and is_fused_dspark_rmsnorm_rope_supported(
-                main_x, weight, main_freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
-            )
+            and _is_dspark_attention_rope_supported(main_x, weight, main_freqs)
             and _is_dspark_page_write_layout_supported(
                 main_x, kv_cache, block_tables, start_pos, capacities
             )

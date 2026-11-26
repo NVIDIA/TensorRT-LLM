@@ -83,14 +83,19 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 for spec in specs
             ):
                 raise ValueError("V4.1 DSpark draft storage does not match the checkpoint")
+            shape = (self._batch_to_slot.shape[0], manager.max_blocks_per_seq)
+            managed_table = manager.draft_page_table()
+            if managed_table is None or managed_table.shape[0] < shape[0]:
+                raise ValueError("The manager's draft page table does not cover the worker batch")
             self._prewarm_draft_pages(draft_model, manager)
-            self._draft_kv_manager = manager
+            # An allocation failure can be retried during warmup. A partial
+            # bind must not be reused, including when switching back to another manager.
+            self._draft_kv_manager = None
             self._draft_layer_ids = layers
             self._draft_reuse_policy = specs[0].reuse_policy
             self._draft_kv_buffers = tuple(
                 manager.get_buffers(layer, kv_layout="HND") for layer in layers
             )
-            shape = (self._batch_to_slot.shape[0], manager.max_blocks_per_seq)
             slots = self._ctx_len.numel()
             self._draft_table_storage = torch.full(
                 (slots + shape[0], shape[1]),
@@ -101,9 +106,6 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._draft_slot_block_tables = self._draft_table_storage[:slots]
             self._draft_fallback_block_tables = self._draft_table_storage[slots:]
             self._draft_block_tables = self._draft_fallback_block_tables
-            managed_table = manager.draft_page_table()
-            if managed_table is None or managed_table.shape[0] < shape[0]:
-                raise ValueError("The manager's draft page table does not cover the worker batch")
             self._draft_managed_block_tables = managed_table[: shape[0]]
             self._draft_capacities = torch.zeros(
                 shape[0], dtype=torch.long, device=self._ctx_len.device
@@ -124,6 +126,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._managed_residency.clear()
             self._chunking_ids.clear()
             self._table_slots = None
+            self._draft_kv_manager = manager
         spec_metadata._dspark_worker = self
         self._prepare_page_tables(
             spec_metadata.request_ids,

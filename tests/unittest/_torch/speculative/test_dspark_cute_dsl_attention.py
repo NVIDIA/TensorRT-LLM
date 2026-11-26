@@ -577,7 +577,7 @@ def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
         assert torch.cuda.current_device() == caller
         for actual, reference in zip(pools, expected):
             torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
-    assert set(compile_devices) == {device for device, _ in cases}
+    assert sorted(compile_devices) == sorted({device for device, _ in cases})
 
 
 def _norm_rope(x, weight, freqs):
