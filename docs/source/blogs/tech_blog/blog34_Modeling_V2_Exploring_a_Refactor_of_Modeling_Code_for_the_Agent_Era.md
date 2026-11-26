@@ -143,8 +143,8 @@ The abstractions in Modeling V2 have to serve two goals that pull in opposite di
 Modeling V2 defines only a few abstractions, nested as family → ModelCore → Target:
 
 - **Family**: one model architecture, usually one Hugging Face `architectures` value. It owns the `route` function and the code its ModelCores share.
-- **ModelCore**: owns the model's weights in one format, and the state derived from them, such as dimensions and communication groups. On each step, it picks a Target. In code, a ModelCore is the class that `route` returns, a `DecoderModelForCausalLM`, together with the `DecoderModel` it wraps. The runtime expects this two-class shape, but both classes belong to the ModelCore.
-- **Target**: such as `PrefillTarget` and `DecodeTarget`. Each holds the forward pass for one kind of step, on the ModelCore's weights.
+- **ModelCore**: the class that holds all of the model's weights in one format, the state derived from them, such as dimensions and communication groups, and its Targets. On each step, it picks a Target.
+- **Target**: a modeling class that calls ops to run the forward pass for one kind of step, on the ModelCore's weights. `PrefillTarget` and `DecodeTarget` are typical examples.
 - **Weights**: a ModelCore's `weights.py` describes how checkpoint tensors map to its weight format, including mapping, transformation and sharding. This keeps loading logic out of the forward pass.
 - **`OpWrapper`**: a thin, stateless wrapper around one kernel call, whose contract can be executed:
 
@@ -157,6 +157,30 @@ Modeling V2 defines only a few abstractions, nested as family → ModelCore → 
 | `ARCHS` | The GPU architectures those configurations were tested on. |
 
 Each op's tests check `__call__` against `reference` on every cell. If an upstream kernel change breaks a claim the op makes, the build fails, rather than leaving an outdated comment.
+
+ModelCore and Target are concepts, not classes. The code has no `ModelCore` or `Target` base class, because a base class would fix how a ModelCore stores its weights or how a Target runs its forward, and that is exactly what we want to leave open. Every Modeling V2 model still has both levels, and they are easy to find in its code. Here is a shortened excerpt from the GLM-5.3-Flash FP8 TP4 ModelCore:
+
+```python
+class PrefillTarget:  # a Target: runs a step that has context requests
+    def __init__(self, core):
+        self.core = core  # reads the weights through the ModelCore; holds none
+
+    def forward(self, step, input_ids, attn_metadata):
+        ...  # calls ops layer by layer on self.core's weights
+
+
+class Glm53FlashFp8Sm10xTp4Core(DecoderModel):  # the ModelCore
+    def post_load_weights(self):
+        ...  # builds the layers on this rank's weights
+        self._prefill = PrefillTarget(self)
+        self._decode = DecodeTarget(self)
+
+    def forward(self, attn_metadata, input_ids=None, **kwargs):
+        target = self._decode if attn_metadata.num_contexts == 0 else self._prefill
+        return target.forward(StepSchedule.build(attn_metadata), input_ids, attn_metadata)
+```
+
+`Glm53FlashFp8Sm10xTp4Core` holds the weights and the two Targets, and picks one Target per step. `PrefillTarget` and `DecodeTarget` are plain Python classes that call ops one after another. The class that `route` returns, `ModelingV2Glm53FlashFp8Sm10xTp4`, is a `DecoderModelForCausalLM` that wraps the ModelCore in the shape the runtime expects. Other models follow the same split under their own names. For example, `DeepseekV3DefaultModelingV2` in the DeepSeek R1 ModelCore and `GptOssDefaultModelingV2` in the GPT-OSS ModelCore each build a `PrefillTarget` and a `DecodeTarget`.
 
 The guiding principle is to **provide the thinnest contract that keeps semantics consistent, and nothing more.** Most Modeling V2 code is written by coding agents. The abstractions make sure that every op states what it computes and where it has been verified, that every ModelCore's weights are well defined, and that every ModelCore plugs into the runtime the same way. Beyond that, we deliberately do not constrain how the code is written. A thick framework of base layers and plug-in points would bring back the coupling we set out to remove, and would limit the optimizations an agent can explore.
 

@@ -88,11 +88,13 @@ The class that `route` returns contains the same three parts in CamelCase, for e
 These names are conventions, not requirements.
 
 In code, a ModelCore is two classes: the `DecoderModelForCausalLM` subclass
-that `route` returns, and the `DecoderModel` it wraps as `self.model`. The
-runtime expects this shape; both classes belong to the ModelCore.
+that `route` returns, and the `DecoderModel` it wraps as `self.model`, which
+holds the weights and the Targets. The runtime expects this shape; both classes
+belong to the ModelCore.
 
-A **Target** is one execution path of a ModelCore: the forward pass for one
-kind of step, on the ModelCore's weights. A ModelCore can contain several
+A **Target** is one execution path of a ModelCore: a class that calls
+operations to run the forward pass for one kind of step, on the ModelCore's
+weights. A ModelCore can contain several
 Targets and picks one on each forward step from host-side values of the step,
 such as prefill versus decode or the number of tokens. The DeepSeek R1
 ModelCore, for example, has separate `PrefillTarget` and `DecodeTarget`
@@ -103,6 +105,15 @@ format, and all of its Targets run on the same weights. A factor that changes
 how weights are sharded, packed or quantized is decided at load time and
 selects a ModelCore. A factor that only changes the computation on the same
 weights is decided per step and selects a Target.
+
+ModelCore and Target are concepts, not base classes. Nothing in the code
+inherits from a `ModelCore` or `Target` class, so neither constrains how a
+model stores its weights or runs its forward. Every ModelCore still has both
+levels. In
+[`glm_5_3_flash_fp8__sm_10x__tp4`](models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/modeling.py),
+for example, `Glm53FlashFp8Sm10xTp4Core` holds the weights, builds a
+`PrefillTarget` and a `DecodeTarget` in `post_load_weights`, and picks one of
+them in each `forward`.
 
 Some identifiers predate these terms: `NoTarget` and
 `config.modeling_v2_target` refer to the ModelCore that routing selects.
