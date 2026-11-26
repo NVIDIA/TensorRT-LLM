@@ -6,11 +6,11 @@ power of two, with the shared expert accumulated by FC2 (`_moe_acc_padded`).
 MTP5 at 1-3 requests carries 6 / 12 / 18 rows per decode step (MTP3 at 3: 12). Routing pads
 them to 8 / 16 / 32: the padding tokens route to a non-local expert at weight 0, the routing
 kernel rebuilds the maps, and before this path the output was cleared and the shared expert
-added after FC2 in a separate launch. Now `_moe_begin_layer` hands the slot's first `rows`
+added after FC2 in a separate launch. Now `Moe.begin_layer` hands the slot's first `rows`
 rows to the shared expert there too, as at the power-of-two widths, and FC2 adds onto them.
 
-This drives the target's own methods (`_moe_begin_layer`, `_routed`, and the add of
-`_mlp_and_close` on the old path) on a core holding only the decode MoE state, prequantized
+This drives the target's own ops (`Moe.begin_layer`, `Moe.routed`, and `Moe.combine`, the
+add on the old path) on a core holding only the decode MoE state, prequantized
 as the pre-MoE collective leaves a decode width (the routed experts' quantize at the exact
 rows stands in for it on one GPU), and checks:
 
@@ -35,6 +35,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    forward_ops as _ops,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as _modeling,
@@ -161,7 +164,7 @@ def _layer_weights(layer: int, stacks) -> SimpleNamespace:
 
 def _slot(dev) -> SimpleNamespace:
     """The fields of `_build_moe`'s trunk slot that a decode width reads."""
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     counts, barrier = _routing_op.allocate_workspace(dev)
     f32 = {"dtype": torch.float32, "device": dev}
     return SimpleNamespace(
@@ -172,17 +175,21 @@ def _slot(dev) -> SimpleNamespace:
         maps=_routing_op.allocate_maps(rows, dev),
         counts=counts,
         barrier=barrier,
-        router_out=torch.zeros((_modeling._DECODE_MAX_ROWS, EXPERTS), **f32),
-        router_partials=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32
-        ),
-        router_x=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev
-        ),
+        router_out=torch.zeros((_ops._DECODE_MAX_ROWS, EXPERTS), **f32),
+        router_partials=torch.zeros((_ops._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
+        router_x=torch.zeros((_ops._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
         topk_out={w: _topk_op.allocate_decode_outputs(w, dev) for w in ROWS},
         c=_experts_op.allocate_decode_c(rows, INTER, dev),
         sfc=_experts_op.allocate_sfc(rows, INTER, dev),
     )
+
+
+def _attach_ops(core) -> SimpleNamespace:
+    """The core's ops, as its `__init__` builds them (`core.op`)."""
+    return SimpleNamespace(
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
+        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+    )  # fmt: skip
 
 
 def state() -> SimpleNamespace:
@@ -198,6 +205,7 @@ def state() -> SimpleNamespace:
     core.expert_offset = OFFSET
     core.routed_scale = ROUTED_SCALE
     core.max_draft_len = 5
+    core.wide_cells = core.max_draft_len > 1
     core.fc1_kblk = FC1_KBLK
     core.fc2_kblk = FC2_KBLK
     core._moe_acc_padded = True
@@ -206,12 +214,10 @@ def state() -> SimpleNamespace:
         copy=_copy_op.compile(), argmax=None,
     )  # fmt: skip
     core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slot = 0
     core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
     core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._moe_rep_maps = None
     core._ctx_hot_ids = {}
     core._dec_hot_ids = {}
     core._pf = None
@@ -254,6 +260,7 @@ def state() -> SimpleNamespace:
         zero_pre=None,
         merge=None,
     )
+    core.op = _attach_ops(core)
     stacks = _experts()
     st = SimpleNamespace(core=core, layers=[_layer_weights(i, stacks) for i in LAYERS])
     _STATE["state"] = st
@@ -261,29 +268,30 @@ def state() -> SimpleNamespace:
 
 
 def moe_layer(core, x, partial, m, rows: int, layer: int):
-    """`_mlp_and_close`'s MoE half at a decode width from the pre-MoE collective's output on:
-    the routed experts' NVFP4 input already written (`_moe_prequant` holds at 1..64 rows).
-    The shared expert's result is `partial`, copied on the side stream into the buffer its
-    GEMM writes: the routed output when `_moe_begin_layer` hands one out, else a fresh tensor
-    that is added after. Returns `(mlp_out, slot)`."""
+    """A decode Target's trunk MoE layer (`DecodeTarget.forward`) from the pre-MoE
+    collective's output on: the routed experts' NVFP4 input already written (`Comm.prequant`
+    holds at 1..64 rows). The shared expert's result is `partial`, copied on the side stream
+    into the buffer its GEMM writes: the routed output when `Moe.begin_layer` hands one out
+    (`Moe.open_layer`), else a fresh tensor that `Moe.combine` adds after. Returns
+    `(mlp_out, slot)`."""
+    op = core.op
     _quant_op.cute_dsl_moe_quantize_nvfp4(
         x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
     )
-    acc = core._moe_begin_layer(rows)
-    slot = core._moe_slot
+    began, acc = op.moe.open_layer(rows)
+    assert began
+    slot = op.moe.slot
     main = torch.cuda.current_stream()
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
         shared = acc if acc is not None else torch.empty_like(partial)
-        core._copy_into(shared, partial)
-    routed = core._routed(
-        x, m, rows, True, side if acc is not None else None, True, acc is not None, layer
-    )
-    if acc is not None:
-        return routed, slot
-    main.wait_stream(side)
-    return core._add(routed, shared), slot
+        op.rows.copy(shared, partial)
+    routed = op.moe.routed(
+        _ops.PREFILL, x, m, rows, True, side if acc is not None else None, began,
+        acc is not None, layer,
+    )  # fmt: skip
+    return op.moe.combine(routed, shared, acc, rows, main, side), slot
 
 
 def layer_inputs(rows: int) -> list:
@@ -303,7 +311,7 @@ def poison(core) -> None:
     """NaN in both slots' outputs: a padding row that were read, or a real row that were not
     written before FC2 added onto it, would carry a NaN out."""
     for s in core._moe_slots:
-        s.out[: _modeling._DECODE_MAX_ROWS].fill_(float("nan"))
+        s.out[: _ops._DECODE_MAX_ROWS].fill_(float("nan"))
 
 
 def run_step(st, inputs, rows: int) -> list:
@@ -516,13 +524,13 @@ def test_which_widths_accumulate(monkeypatch) -> None:
     try:
         for on in (True, False):
             monkeypatch.setattr(core, "_moe_acc_padded", on)
-            for rows in range(1, _modeling._DECODE_MAX_ROWS + 1):
+            for rows in range(1, _ops._DECODE_MAX_ROWS + 1):
                 before = dict(core.route_hits)
-                slot = core._moe_slot
-                acc = core._moe_begin_layer(rows)
-                assert core._moe_slot == slot ^ 1
+                slot = core.op.moe.slot
+                acc = core.op.moe.begin_layer(rows)
+                assert core.op.moe.slot == slot ^ 1
                 if on or rows in pow2:
-                    s = core._moe_slots[core._moe_slot]
+                    s = core._moe_slots[core.op.moe.slot]
                     assert acc is not None and acc.data_ptr() == s.out.data_ptr(), rows
                     assert tuple(acc.shape) == (rows, HIDDEN)
                 else:
@@ -530,6 +538,6 @@ def test_which_widths_accumulate(monkeypatch) -> None:
                 counted = _took(core, before, "moe_acc_padded")
                 assert counted == (1 if on and rows not in pow2 else 0), rows
             for rows in (65, 100, 200):
-                assert core._moe_begin_layer(rows) is None, rows
+                assert core.op.moe.begin_layer(rows) is None, rows
     finally:
-        core._moe_slot = 0
+        core.op.moe.slot = 0

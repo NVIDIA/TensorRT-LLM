@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: the trunk's routed MoE layer at a decode width up to 64 that is not a power of
-two, run unpadded on the fused top-k's own maps (`_moe_dec_unpadded`,
+two, run unpadded on the fused top-k's own maps (`Moe.dec_unpadded`,
 `TRTLLM_GLM52_MOE_DEC_UNPAD`).
 
-MTP5 at 1-3 requests carries 6 / 12 / 18 rows per decode step. Before, `_moe_experts` padded
+MTP5 at 1-3 requests carries 6 / 12 / 18 rows per decode step. Before, `Moe.experts` padded
 them to 8 / 16 / 32: two fills and two cats for the padding ids and weights, two staging
 copies and the routing kernel rebuilding the maps the top-k had already written, seven
 launches between the top-k and FC1 (8.3 us of each MoE layer's critical chain at 12 rows on
@@ -12,7 +12,7 @@ B300). Unpadded, FC1 takes the top-k's maps and weights directly; on an MTP3 / M
 the step widths (multiples of `max_draft_len + 1`) also select on a top-k handle that
 releases FC1 early (`k.topk_sig`), as the power-of-two widths do.
 
-This drives the target's own methods (`_moe_begin_layer`, `_routed`) on a core holding only
+This drives the target's own ops (`Moe.begin_layer`, `Moe.routed`) on a core holding only
 the decode MoE state (as `test_modeling_v2_moe_decode_acc_padded.py`), prequantized as the
 pre-MoE collective leaves a decode width, and checks:
 
@@ -38,6 +38,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    forward_ops as _ops,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as _modeling,
@@ -166,7 +169,7 @@ def _layer_weights(layer: int, stacks) -> SimpleNamespace:
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     counts, barrier = _routing_op.allocate_workspace(dev)
     f32 = {"dtype": torch.float32, "device": dev}
     return SimpleNamespace(
@@ -177,17 +180,21 @@ def _slot(dev) -> SimpleNamespace:
         maps=_routing_op.allocate_maps(rows, dev),
         counts=counts,
         barrier=barrier,
-        router_out=torch.zeros((_modeling._DECODE_MAX_ROWS, EXPERTS), **f32),
-        router_partials=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32
-        ),
-        router_x=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev
-        ),
+        router_out=torch.zeros((_ops._DECODE_MAX_ROWS, EXPERTS), **f32),
+        router_partials=torch.zeros((_ops._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
+        router_x=torch.zeros((_ops._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
         topk_out={w: _topk_op.allocate_decode_outputs(w, dev) for w in ROWS},
         c=_experts_op.allocate_decode_c(rows, INTER, dev),
         sfc=_experts_op.allocate_sfc(rows, INTER, dev),
     )
+
+
+def _attach_ops(core) -> SimpleNamespace:
+    """The core's ops, as its `__init__` builds them (`core.op`)."""
+    return SimpleNamespace(
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
+        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+    )  # fmt: skip
 
 
 def state() -> SimpleNamespace:
@@ -203,24 +210,22 @@ def state() -> SimpleNamespace:
     core.expert_offset = OFFSET
     core.routed_scale = ROUTED_SCALE
     core.max_draft_len = MAX_DRAFT_LEN
+    core.wide_cells = core.max_draft_len > 1
     core.num_layers = NUM_LAYERS
     core.fc1_kblk = FC1_KBLK
     core.fc2_kblk = FC2_KBLK
     core._moe_acc_padded = True
     core._moe_dec_unpad = True
     core._moe_dec_unpad_signal = True
-    core._moe_topk_signaled = False
     core._rows = SimpleNamespace(
         norm=None, add=_add_op.compile(), gather=None, topk=None, swiglu=None,
         copy=_copy_op.compile(), argmax=None,
     )  # fmt: skip
     core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slot = 0
     core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
     core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._moe_rep_maps = None
     core._ctx_hot_ids = {}
     core._dec_hot_ids = {}
     core._pf = None
@@ -267,6 +272,7 @@ def state() -> SimpleNamespace:
         zero_pre=None,
         merge=None,
     )
+    core.op = _attach_ops(core)
     stacks = _experts()
     st = SimpleNamespace(core=core, layers=[_layer_weights(i, stacks) for i in LAYERS])
     _STATE["state"] = st
@@ -274,23 +280,24 @@ def state() -> SimpleNamespace:
 
 
 def moe_layer(core, x, partial, m, rows: int, layer: int):
-    """`_mlp_and_close`'s MoE half at a decode width, from the pre-MoE collective's output on
-    (its NVFP4 epilogue stood in for by the quantize at the exact rows); the shared expert's
-    result `partial` copied on the side stream into the buffer `_moe_begin_layer` hands out.
-    Returns `(mlp_out, slot)`."""
+    """A decode Target's trunk MoE layer (`DecodeTarget.forward`) at a decode width, from the
+    pre-MoE collective's output on (its NVFP4 epilogue stood in for by the quantize at the
+    exact rows); the shared expert's result `partial` copied on the side stream into the
+    buffer `Moe.begin_layer` hands out (`Moe.open_layer`). Returns `(mlp_out, slot)`."""
+    op = core.op
     _quant_op.cute_dsl_moe_quantize_nvfp4(
         x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
     )
-    acc = core._moe_begin_layer(rows)
-    assert acc is not None, "a decode width always accumulates here"
-    slot = core._moe_slot
+    began, acc = op.moe.open_layer(rows)
+    assert began and acc is not None, "a decode width always accumulates here"
+    slot = op.moe.slot
     main = torch.cuda.current_stream()
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        core._copy_into(acc, partial)
-    routed = core._routed(x, m, rows, True, side, True, True, layer)
-    return routed, slot
+        op.rows.copy(acc, partial)
+    routed = op.moe.routed(_ops.PREFILL, x, m, rows, True, side, began, True, layer)
+    return op.moe.combine(routed, None, acc, rows, main, side), slot
 
 
 def layer_inputs(rows: int) -> list:
@@ -307,7 +314,7 @@ def fill(inputs, rows: int, tag: str) -> None:
 
 def poison(core) -> None:
     for s in core._moe_slots:
-        s.out[: _modeling._DECODE_MAX_ROWS].fill_(float("nan"))
+        s.out[: _ops._DECODE_MAX_ROWS].fill_(float("nan"))
 
 
 def run_step(st, inputs, rows: int) -> list:
@@ -476,32 +483,35 @@ def test_capture_replays_match_eager(rows: int) -> None:
 
 
 @pytest.mark.parametrize("rows", [r for r in ROWS if r & (r - 1)])
-def test_mtp_layer_keeps_the_padded_path(rows: int) -> None:
-    """The MTP layer's call (`_mtp_close`: not prequantized, no shared partial, layer slot
-    `num_layers`) at a width that is not a power of two: the plain top-k handle, the padded
-    path with its own quantize and clear, and a result within the band of the reference."""
+def test_mtp_layer_keeps_the_padded_path(rows: int, monkeypatch) -> None:
+    """The MTP layer's call (`Mtp.moe` on the trunk's NVFP4 path, as the Targets' MTP close
+    makes it: not prequantized, no shared partial, layer slot `num_layers`) at a width that
+    is not a power of two: the plain top-k handle, the padded path with its own quantize and
+    clear, and a result within the band of the reference."""
     st = state()
     core = st.core
     core._moe_dec_unpad = True
     m = st.layers[0]
+    monkeypatch.setattr(core, "_mtp_fp4", m, raising=False)
     x = layer_inputs(rows)[0][0]
     fill([(x, torch.empty_like(x))], rows, f"mtp {rows}")
     before = dict(core.route_hits)
     poison(core)
-    routed = core._routed(x, m, rows, False, None, False, False, NUM_LAYERS)
+    routed = core.op.mtp.moe(_ops.PREFILL, x, rows)
     torch.cuda.synchronize()
-    assert not core._moe_topk_signaled
+    assert _took(core, before, "mtp_moe_fp4") == 1
+    assert not core.op.moe._topk_signaled
     assert _took(core, before, "moe_dec_unpad") == 0
     assert _took(core, before, "moe_dec_unpad_signal") == 0
     assert bool(torch.isfinite(routed).all())
-    slot = core._moe_slot ^ 1  # `_routed` advanced it after (began False)
+    slot = core.op.moe.slot ^ 1  # `Moe.routed` advanced it after (began False)
     snap = _snapshot(core, [(routed, slot)], rows, False)
     ref = _reference(core, snap, x, torch.zeros_like(x), m, rows, 0)
     assert_within_ulp(routed, ref, element_ulp=REF_ELEMENT_ULP, rms_ulp=REF_RMS_ULP)
 
 
 def test_gate_and_fail_fast(monkeypatch) -> None:
-    """`_moe_dec_unpadded` holds for every decode width with a top-k handle and only with the
+    """`Moe.dec_unpadded` holds for every decode width with a top-k handle and only with the
     switch on; an early-release top-k followed by the padded path raises instead of
     launching the routing kernel on ids still being written."""
     st = state()
@@ -509,20 +519,20 @@ def test_gate_and_fail_fast(monkeypatch) -> None:
     for on in (True, False):
         monkeypatch.setattr(core, "_moe_dec_unpad", on)
         for rows in ROWS:
-            assert core._moe_dec_unpadded(rows) == on, rows
-        assert not core._moe_dec_unpadded(65)
+            assert core.op.moe.dec_unpadded(rows) == on, rows
+        assert not core.op.moe.dec_unpadded(65)
     monkeypatch.setattr(core, "_moe_dec_unpad", False)
     rows = 12
     m = st.layers[0]
     x = layer_inputs(rows)[0][0]
     fill([(x, torch.empty_like(x))], rows, "fail fast")
-    monkeypatch.setattr(core, "_moe_topk_signaled", True)
-    s = core._moe_slots[core._moe_slot]
+    monkeypatch.setattr(core.op.moe, "_topk_signaled", True)
+    s = core._moe_slots[core.op.moe.slot]
     t = s.topk_out[rows]
     with pytest.raises(RuntimeError, match="early-release top-k"):
-        core._moe_experts(
+        core.op.moe.experts(
             x, t["topk_indices"].view(rows, TOP_K), t["topk_weights"].view(rows, TOP_K),
             {k: t[k] for k in _routing_op.MAP_KEYS}, m, rows, False, None, False, False,
             NUM_LAYERS,
         )  # fmt: skip
-    assert core._moe_topk_signaled is False
+    assert core.op.moe._topk_signaled is False

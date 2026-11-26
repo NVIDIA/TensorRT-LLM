@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test: the unpadded trunk decode MoE (`_moe_dec_unpadded`) with decode expert replicas,
+"""GPU test: the unpadded trunk decode MoE (`Moe.dec_unpadded`) with decode expert replicas,
 all four EP ranks simulated on one GPU.
 
 Unpadded, a decode width that is not a power of two runs on the replica top-k's maps (hot
@@ -24,6 +24,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    forward_ops as _ops,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as _modeling,
@@ -151,7 +154,7 @@ def _rank_weights(gw, router, bias, off: int, hot: list[int]) -> SimpleNamespace
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     counts, barrier = _routing_op.allocate_workspace(dev)
     f32 = {"dtype": torch.float32, "device": dev}
     return SimpleNamespace(
@@ -162,13 +165,9 @@ def _slot(dev) -> SimpleNamespace:
         maps=_routing_op.allocate_maps(rows, dev),
         counts=counts,
         barrier=barrier,
-        router_out=torch.zeros((_modeling._DECODE_MAX_ROWS, EXPERTS), **f32),
-        router_partials=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32
-        ),
-        router_x=torch.zeros(
-            (_modeling._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev
-        ),
+        router_out=torch.zeros((_ops._DECODE_MAX_ROWS, EXPERTS), **f32),
+        router_partials=torch.zeros((_ops._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
+        router_x=torch.zeros((_ops._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
         topk_out={w: _topk_rep_op.allocate_outputs(w, NREP, dev) for w in ROWS},
         c=_experts_op.allocate_decode_c(rows, INTER, dev),
         sfc=_experts_op.allocate_sfc(rows, INTER, dev),
@@ -185,24 +184,22 @@ def state() -> SimpleNamespace:
     core.expert_offset = 0
     core.routed_scale = ROUTED_SCALE
     core.max_draft_len = 5
+    core.wide_cells = core.max_draft_len > 1
     core.num_layers = NUM_LAYERS
     core.fc1_kblk, core.fc2_kblk = FC1_KBLK, FC2_KBLK
     core._moe_acc_padded = True
     core._moe_dec_unpad = True
     core._moe_dec_unpad_signal = True
-    core._moe_topk_signaled = False
     core.dec_replicas = NREP
     core._rows = SimpleNamespace(
         norm=None, add=_add_op.compile(), gather=None, topk=None, swiglu=None,
         copy=_copy_op.compile(), argmax=None,
     )  # fmt: skip
     core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slot = 0
     core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
     core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._moe_rep_maps = None
     core._ctx_hot_ids = {}
     core._pf = None
     core._dec_hot_none = torch.full((NREP,), -1, dtype=torch.int32, device=dev)
@@ -229,6 +226,10 @@ def state() -> SimpleNamespace:
         pair=None, pair_rep=None, topk_pre=None, topk_pre_rep=None, quant_pre=None,
         zero_pre=None, merge=None,
     )  # fmt: skip
+    core.op = SimpleNamespace(
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
+        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+    )  # fmt: skip
     g = torch.Generator(device="cuda").manual_seed(_seed("rep router"))
     router = (torch.randn(EXPERTS, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5).to(
         torch.bfloat16
@@ -251,18 +252,21 @@ def _hot_ids(st, x) -> list[int]:
 
 
 def _rank_step(core, x, partial, m, rows: int):
-    """`_mlp_and_close`'s MoE half on one rank (as test_modeling_v2_moe_decode_unpad.py)."""
+    """A decode Target's trunk MoE layer on one rank (as test_modeling_v2_moe_decode_unpad.py)."""
+    op = core.op
     _quant_op.cute_dsl_moe_quantize_nvfp4(
         x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
     )
-    acc = core._moe_begin_layer(rows)
-    slot = core._moe_slot
+    began, acc = op.moe.open_layer(rows)
+    assert began and acc is not None, "a decode width always accumulates here"
+    slot = op.moe.slot
     main = torch.cuda.current_stream()
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        core._copy_into(acc, partial)
-    out = core._routed(x, m, rows, True, side, True, True, LAYER)
+        op.rows.copy(acc, partial)
+    routed = op.moe.routed(_ops.PREFILL, x, m, rows, True, side, began, True, LAYER)
+    out = op.moe.combine(routed, None, acc, rows, main, side)
     torch.cuda.synchronize()
     s = core._moe_slots[slot]
     padded = _pow2(rows)

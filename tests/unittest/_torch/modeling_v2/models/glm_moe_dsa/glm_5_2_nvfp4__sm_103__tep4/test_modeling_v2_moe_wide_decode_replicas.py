@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: the wide decode expert replicas (MTP3 / MTP5 decode rows 65..128) through the
-target's own routed-experts methods.
+target's own routed-experts ops.
 
-On a wide decode step `_moe_topk` runs the wide replica top-k for a trunk layer with hot ids
-(`_moe_topk_wide_rep`) and `_moe_experts` runs its maps on the context replicas' `64 + R` deep
+On a wide decode step `Moe.topk` runs the wide replica top-k for a trunk layer with hot ids
+(`Moe.topk_wide_rep`) and `Moe.experts` runs its maps on the context replicas' `64 + R` deep
 prefill pair. A rank then computes the hot experts the assignment gave it from replica slots
-`64 + h`, and none from their home slots. This drives `_moe_begin_layer` / `_routed` on a core
-holding only the MoE state (as the wide decode capture test does) and checks:
+`64 + h`, and none from their home slots. This drives `Moe.open_layer` / `Moe.routed` (as
+`WideDecodeTarget.forward` calls them) on a core holding only the MoE state (as the wide
+decode capture test does) and checks:
 
 * the four EP ranks emulated on one GPU (the expert offset per call): the sum of their outputs
   -- what the post-MoE all-reduce adds -- within the experts test's band of the fp32 reference
@@ -33,6 +34,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    forward_ops as _ops,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as _modeling,
@@ -184,7 +188,7 @@ def _rank_weights(lw: SimpleNamespace, offset: int) -> SimpleNamespace:
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     counts, barrier = _routing_op.allocate_workspace(dev)
     return SimpleNamespace(
         out=torch.zeros((rows, HIDDEN), dtype=torch.bfloat16, device=dev),
@@ -218,6 +222,7 @@ def state() -> SimpleNamespace:
     core.expert_offset = WIN
     core.routed_scale = ROUTED_SCALE
     core.max_draft_len = 3
+    core.wide_cells = core.max_draft_len > 1
     core.fc1_kblk, core.fc2_kblk = FC1_KBLK, FC2_KBLK
     core.ctx_replicas = NREP
     core.wide_dec_replicas = True
@@ -226,16 +231,18 @@ def state() -> SimpleNamespace:
         argmax=None,
     )  # fmt: skip
     core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slot = 0
     core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _modeling._MOE_MAX_T
+    rows = _ops._MOE_MAX_T
     core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
     core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._moe_rep_maps = None
     hot = torch.tensor(HOT_IDS, dtype=torch.int32, device=dev)
     core._ctx_hot_ids = {i: hot.clone() for i in LAYERS}
     core._dec_hot_ids = {}
     core._pf = None
+    core.op = SimpleNamespace(
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
+        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+    )  # fmt: skip
     k = SimpleNamespace(
         routing=None,
         pair=_experts_op.build_prefill_pair(
@@ -273,20 +280,25 @@ def state() -> SimpleNamespace:
 
 
 def moe_layer(core, x, partial, m, rows: int, layer: int):
-    """`_mlp_and_close`'s MoE half on an MTP3 decode step's exact rows (prequantized off: the
-    routed experts quantize): the shared expert's partial copied on the side stream into the
-    routed output, FC2 accumulating onto it. Returns `(out, slot)`."""
-    exact = core._moe_decode_exact(rows)
+    """`WideDecodeTarget.forward`'s trunk MoE layer on an MTP3 decode step's exact rows
+    (prequantized off: the routed experts quantize): the shared expert's partial copied on the
+    side stream into the routed output, FC2 accumulating onto it. Returns `(out, slot)`."""
+    op = core.op
+    exact = op.moe.wide_exact(rows)
     assert exact
-    acc = core._moe_begin_layer(rows, exact)
-    slot = core._moe_slot
+    began, acc = op.moe.open_layer(rows, exact)
+    assert began and acc is not None
+    slot = op.moe.slot
     main = torch.cuda.current_stream()
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        core._copy_into(acc, partial)
-    routed = core._routed(x, m, rows, False, side, True, True, layer, exact)
-    return routed, slot
+        op.mlp.shared_after_collective(exact)
+        op.rows.copy(acc, partial)
+    routed = op.moe.routed(
+        _ops.Phase(wide=True), x, m, rows, False, side, began, True, layer, exact
+    )
+    return op.moe.combine(routed, None, acc, rows, main, side), slot
 
 
 def _snapshot(core, results, rows: int) -> dict:
@@ -473,17 +485,17 @@ def test_wider_steps_keep_the_wide_top_k(rows: int) -> None:
 
 
 def test_only_trunk_layers_with_hot_ids_on_wide_steps_take_replicas() -> None:
-    """`_moe_topk_wide_rep` answers only for a trunk layer with hot ids (not the MTP layer,
+    """`Moe.topk_wide_rep` answers only for a trunk layer with hot ids (not the MTP layer,
     which has none) and a built handle; `_build_moe_wide_rep` builds nothing without the wide
     top-k (MTP1, no speculation), the context replicas' pair, `ctx_replicas` or the switch.
-    MTP1 and no speculation never run a wide decode step (`_moe_decode_exact`)."""
+    MTP1 and no speculation never run a wide decode step (`Moe.decode_exact`)."""
     core = state().core
     k = core._moe_k
-    assert core._moe_topk_wide_rep(128, LAYERS[0]) is not None
-    assert core._moe_topk_wide_rep(65, LAYERS[1]) is not None
-    assert core._moe_topk_wide_rep(128, 78) is None, "the MTP layer has no hot ids"
+    assert core.op.moe.topk_wide_rep(128, LAYERS[0]) is not None
+    assert core.op.moe.topk_wide_rep(65, LAYERS[1]) is not None
+    assert core.op.moe.topk_wide_rep(128, 78) is None, "the MTP layer has no hot ids"
     for rows in WIDE_ROWS:
-        assert core._moe_topk_wide_rep(rows, LAYERS[0]) is None, f"replicas at {rows} rows"
+        assert core.op.moe.topk_wide_rep(rows, LAYERS[0]) is None, f"replicas at {rows} rows"
     dev = torch.cuda.current_device()
     base = dict(
         topk_wide=k.topk_wide, pair_rep=k.pair_rep, ctx=core.ctx_replicas, sw=True,
@@ -505,8 +517,10 @@ def test_only_trunk_layers_with_hot_ids_on_wide_steps_take_replicas() -> None:
             assert kk.topk_wide_rep == {}, c
         for draft_len in (0, 1):
             core.max_draft_len = draft_len
-            assert not any(core._moe_decode_exact(r) for r in range(1, 257))
+            core.wide_cells = core.max_draft_len > 1
+            assert not any(core.op.moe.decode_exact(r) for r in range(1, 257))
     finally:
         core.ctx_replicas, core.wide_dec_replicas = NREP, True
         core._ctx_hot_ids = base["hot"]
         core.max_draft_len = 3
+        core.wide_cells = core.max_draft_len > 1

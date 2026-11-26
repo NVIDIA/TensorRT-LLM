@@ -10,11 +10,13 @@ accepted row), and draft steps 1.. copy it instead of scoring and selecting. Wha
 * the flag resolves as the engine's attention module resolves the MTP layer's sparse params;
 * the stash is the engine's own rows (`Indexer._mtp_last_accepted_rows` plus the context last
   rows), with and without accepted counts, decode and mixed steps;
-* the target's MTP layer, over a whole draft loop on a fake core: with the flag on, step 0 runs
-  the indexer and stashes, steps 1.. run no q side / scorer / top-k, still project and append
-  their keys, and attend over the stashed rows; with it off, every step runs the indexer as
-  before (the same calls, in the same order); the two give the same outputs when the indexer
-  would select step 0's rows again, and a dense (skipped) step is untouched either way.
+* the target's MTP layer (`DecodeTarget.mtp_forward`), over a whole draft loop on a fake core
+  whose ops record the indexer front (the real `Attn.qkv_gen` and the real share stash / load
+  around them): with the flag on, step 0 runs the indexer and stashes, steps 1.. run no
+  q side / scorer / top-k, still project and append their keys, and attend over the stashed
+  rows; with it off, every step runs the indexer as before (the same calls, in the same
+  order); the two give the same outputs when the indexer would select step 0's rows again,
+  and a dense (skipped) step is untouched either way.
 
 Dispatch and index arithmetic only: no kernel runs.
 """
@@ -28,6 +30,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    forward_ops as F,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
 )
@@ -108,14 +113,14 @@ def test_stash_is_the_engine_rows(ctx_lens, seqs, gen_p, accepted) -> None:
         else torch.tensor(accepted, dtype=torch.int32, device=dev),
         shared_topk_indices=torch.full((64, TOPK), -7, dtype=torch.int32, device=dev),
     )
-    M._mtp_share_store(md, topk, ctx, tc, seqs, gen_p)
+    F._mtp_share_store(md, topk, ctx, tc, seqs, gen_p)
     want = _engine_stash(md, topk, ctx, tc, seqs, gen_p)
     n = ctx + seqs
     assert torch.equal(md.shared_topk_indices[:n], want)
     assert bool((md.shared_topk_indices[n:] == -7).all())
     # A later step's selection is the stash's first `n` rows.
     out = torch.empty((n, TOPK), dtype=torch.int32, device=dev)
-    M._mtp_share_load(md, out, n)
+    F._mtp_share_load(md, out, n)
     assert torch.equal(out, want)
 
 
@@ -124,46 +129,89 @@ def test_stash_is_the_engine_rows(ctx_lens, seqs, gen_p, accepted) -> None:
 
 class _Loop:
     """A fake core and a draft loop's metadata. `fresh(step)` is the selection the indexer
-    would make at `step` (one row per query row); `calls` records the indexer front."""
+    would make at `step` (one row per query row); `calls` records the indexer front, `slots`
+    the selection each step's attention reads (`Attn.draft_slots`)."""
 
     def __init__(self, share: bool, max_draft_len: int, seqs: int, fresh, skip_gen=False):
         self.calls: list[tuple] = []
         self.slots: list[torch.Tensor] = []
         self.fresh = fresh
         self.step = 0
+        self.topk_buf = None
+        attn = SimpleNamespace(norm1=None, norm2=None, o=None)
         core = SimpleNamespace(
             num_layers=NUM_LAYERS,
             max_draft_len=max_draft_len,
+            dec_cell_up=False,
             mtp_index_share=share,
             _mtp_share_stash=share and max_draft_len > 1,
-            _attn={NUM_LAYERS: "attn"},
+            _mtp_out_normed=max_draft_len > 1,
+            _attn={NUM_LAYERS: attn},
             _idx={NUM_LAYERS: "ix"},
+            _mlp={NUM_LAYERS: (None, None)},
+            _shared_gu_il={NUM_LAYERS: None},
+            _side_stream=torch.cuda.Stream(),
+            _mtp={"head_norm": None},
+            heads=1,
+            v_dim=1,
+            kv_lora=1,
             route_hits={},
             route_misses={},
         )
         core._count = lambda name, hit: core.route_hits.__setitem__(
             name, core.route_hits.get(name, 0) + 1
         )
-        core._qkva_ix_fold = lambda x, i, rows: None
-        core._qb_ixqb_runner = lambda i, rows: self.calls.append(("qb_ixqb", rows)) or None
-        core._qkv = lambda x, a, q_b=True, qkva=None: ("q", "q_a", "latent", None)
+        # The indexer front's ops record; `Attn.qkv_gen` and the share stash / load are the
+        # target's own.
+        gemm = SimpleNamespace(
+            qkva_ix_fold=lambda ph, x, i, rows: None,
+            qb_ixqb_runner=lambda ph, i, rows: self.calls.append(("qb_ixqb", rows)) or None,
+        )
+        attn_op = F.Attn(core)
+        attn_op.qkv = lambda ph, x, a, q_b=True, qkva=None: ("q", "q_a", "latent", None)
 
-        def project(x, q_a, pos, ix, rows, need_q, kw=None, ixq=None, kc=None):
+        def draft_slots(md, req_idx, buf, stride, pool_layer):
+            self.slots.append(buf.clone())
+            return buf, "global", None
+
+        attn_op.draft_slots = draft_slots
+        attn_op.gen_query = lambda *a: (None, None, None, None)
+        attn_op.sparse_decode = lambda *a: None
+        attn_op.v_b = lambda *a: False
+        indexer = F.Indexer(core)
+        indexer.topk_buf = lambda md, rows, tc, skip_ctx, skip_gen: self.topk_buf
+
+        def project(ph, x, q_a, pos, ix, rows, need_q, kw=None, ixq=None, kc=None):
             self.calls.append(("project", rows, need_q))
             k_pre = ("k", rows)
             return ("q_fp8", "w", k_pre) if need_q else (None, None, k_pre)
 
-        core._indexer_project = project
-        core._indexer_write_k = lambda md, k_pool, k_pre, rows: self.calls.append(("write_k", rows))
+        indexer.project = project
+        indexer.write_k = lambda md, k_pool, k_pre, rows: self.calls.append(("write_k", rows))
 
         def decode(md, k_pool, q_fp8, weights, topk_buf, ctx, seqs_, gen_p, memo=None):
             self.calls.append(("select", seqs_, gen_p))
             topk_buf.copy_(self.fresh(self.step, seqs_, gen_p))
 
-        core._indexer_decode = decode
-        core._dec8_takes = lambda *a: False
-        core._dec8w_takes = lambda *a: False
-        core._attn_gen = lambda *a: None
+        indexer.decode = decode
+
+        def same(x, *args, **kwargs):
+            return x
+
+        gemm.project = lambda ph, name, x, *a, **k: x
+        core.op = SimpleNamespace(
+            rows=SimpleNamespace(embed=same, rmsnorm=same, add=same, add_rmsnorm=same),
+            comm=SimpleNamespace(reduce=same, reduce_norm=same),
+            gemm=gemm,
+            attn=attn_op,
+            indexer=indexer,
+            mlp=SimpleNamespace(shared=lambda ph, o, *a, **k: o),
+            mtp=SimpleNamespace(
+                front=lambda ph, e, h, rows: h,
+                moe=lambda ph, o, rows, exact=False: o,
+                out=lambda residual, reduced: reduced,
+            ),
+        )
         self.core = core
         self.target = M.DecodeTarget(core)
         self.md = SimpleNamespace(
@@ -171,13 +219,21 @@ class _Loop:
             indexer_skip_topk=False,
             mtp_num_accepted=None,
             shared_topk_indices=torch.full((64, TOPK), -7, dtype=torch.int32),
-            kv_cache_manager=SimpleNamespace(get_indexer_k_cache_buffers=lambda i: "k_pool"),
+            kv_cache_manager=SimpleNamespace(
+                get_indexer_k_cache_buffers=lambda i: "k_pool", layer_offsets={NUM_LAYERS: 0}
+            ),
+            host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
+            tokens_per_block=64,
+            req_idx_per_token=torch.zeros(64, dtype=torch.int32),
+            skip_indexer_for_gen_reqs=skip_gen,
+            num_seqs=seqs,
         )
         self.seqs = seqs
         self.skip_gen = skip_gen
 
     def run(self, accepted: list[int]) -> None:
-        """The engine's loop: step 0 at `max_draft_len + 1` rows per request, then 1 row."""
+        """The engine's loop: step 0 at `max_draft_len + 1` rows per request, then 1 row, each
+        a call of the MTP layer's decode forward."""
         md, d = self.md, self.core.max_draft_len
         md.mtp_num_accepted = torch.tensor(accepted, dtype=torch.int32)
         for step in range(d):
@@ -185,19 +241,16 @@ class _Loop:
             md.indexer_skip_topk = step > 0
             gen_p = d + 1 if step == 0 else 1
             rows = self.seqs * gen_p
-            topk_buf = (
+            # The engine's dense index on a skipped phase (`Indexer.topk_buf`).
+            self.topk_buf = (
                 torch.full((rows, TOPK), -3, dtype=torch.int32)
                 if self.skip_gen
                 else torch.empty((rows, TOPK), dtype=torch.int32)
             )
-
-            def slots_of(buf, fresh):
-                self.slots.append(buf.clone())
-                return buf, "global", None
-
-            self.target._layer_attention(
-                md, "x", "pos", "out", NUM_LAYERS, 0, slots_of, topk_buf, rows, gen_p,
-                self.skip_gen, False,
+            hidden = torch.zeros((rows, 1), dtype=torch.bfloat16)
+            self.target.mtp_forward(
+                None, None, torch.zeros(rows, dtype=torch.int32), hidden, md,
+                position_ids=torch.zeros(rows, dtype=torch.int32),
             )  # fmt: skip
         md.in_mtp_draft_loop = False
 
