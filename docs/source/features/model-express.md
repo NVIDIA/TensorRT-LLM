@@ -336,6 +336,8 @@ Exact-token comparison roles opt in with `--exact-token-comparison`, requesting
 in the parent environment. Model dtype and the full prompt workload stay
 unchanged. Accuracy-evaluation workers and their unscored donors retain their
 inherited attention configuration.
+Each role submits the eight prompts in one `LLM.generate` call; request arrival
+can still split them into different executor batches between roles.
 Vision-language rows use an image probe instead of token-ID prompts: each of
 `seashore.png` and `inpaint.png` from `LLM_MODELS_ROOT/multimodals/test_data`
 is asked the same four questions, so every role also runs the vision encoder

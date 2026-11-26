@@ -366,7 +366,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     donor_gpu_ids = gpu_ids[: case.tp_size]
     receiver_gpu_ids = gpu_ids[case.tp_size :]
     donor_port, receiver_port = mx_metadata_ports(case.tp_size)
-    # Every role of a row gets the same probe and MoE settings.
+    # Every role gets the same probe, MoE and exact-comparison attention settings.
     role_args = ("--exact-token-comparison", *probe_worker_args(case), *moe_worker_args(case))
 
     try:

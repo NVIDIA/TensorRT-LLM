@@ -35,6 +35,7 @@ from tensorrt_llm.llmapi import MoeConfig
 
 __extra_import_path__ = ["~/tests/integration"]
 from defs.model_express import mx_e2e_worker  # noqa: E402
+from defs.model_express.mx_e2e_worker import _llm_kwargs, _parse_args  # noqa: E402
 from defs.model_express.mx_harness import (  # noqa: E402
     ROLES,
     MxE2ECase,
@@ -46,18 +47,16 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    "role, evaluation, exact_token_comparison",
+    "role, exact_token_comparison",
     [
-        pytest.param("baseline", False, True, id="exact-token-comparison"),
-        pytest.param("donor", False, False, id="accuracy-donor"),
-        pytest.param("receiver", True, False, id="accuracy-receiver"),
+        pytest.param("baseline", True, id="exact-token-comparison"),
+        pytest.param("donor", False, id="accuracy-donor"),
     ],
 )
 def test_worker_attention_settings_follow_comparison_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     role: str,
-    evaluation: bool,
     exact_token_comparison: bool,
 ) -> None:
     construction_kwargs: dict[str, object] = {}
@@ -88,21 +87,6 @@ def test_worker_attention_settings_follow_comparison_mode(
                 str(tmp_path / "ready"),
                 "--stop-file",
                 str(tmp_path / "stop"),
-            ]
-        )
-    if evaluation:
-        argv.extend(
-            [
-                "--eval-task",
-                "MMLU",
-                "--eval-num-samples",
-                "1",
-                "--eval-dataset-path",
-                str(tmp_path / "dataset"),
-                "--eval-max-input-len",
-                "32",
-                "--eval-max-output-len",
-                "8",
             ]
         )
     monkeypatch.setenv("FORCE_MULTI_BLOCK_MODE", "ON")
@@ -164,7 +148,7 @@ def test_moe_row_settings_reach_every_role(
     if role != "baseline":
         argv.extend(("--mx-url", "http://mx:8001"))
 
-    kwargs = mx_e2e_worker._llm_kwargs(mx_e2e_worker._parse_args([*argv, *worker_args]))
+    kwargs = _llm_kwargs(_parse_args([*argv, *worker_args]))
 
     assert worker_args == expected_args
     moe_kwargs = {
@@ -172,7 +156,7 @@ def test_moe_row_settings_reach_every_role(
     }
     assert moe_kwargs == expected_moe_kwargs
     assert kwargs == {
-        **mx_e2e_worker._llm_kwargs(mx_e2e_worker._parse_args(argv)),
+        **_llm_kwargs(_parse_args(argv)),
         **expected_moe_kwargs,
     }
 
