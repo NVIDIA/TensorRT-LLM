@@ -99,6 +99,10 @@ Supported entries use TensorRT-LLM's `Attention` and apply encoder overrides exp
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+### Image inputs for Nemotron Shortcut
+
+BF16, MXFP8 and NVFP4 support image chat with the checkpoint template and raw image captioning. For a raw caption, place `A photo of` on the line immediately after the `<nemo:img>` placeholder. The processor uses [OpenCV](#optional-dependencies) to resize images.
+
 ## Adding a Model
 
 See the [multimodal onboarding guide](../developer-guide/multimodal.md#onboarding-a-model)

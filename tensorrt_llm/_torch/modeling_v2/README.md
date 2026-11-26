@@ -209,8 +209,14 @@ Check in `route` every requirement the target has, not only in the target's
 constructor. A configuration that `route` declines falls back to Modeling V1
 under `auto`; one that the constructor rejects with an assertion fails.
 
-A family without a Modeling V1 model can use `@recurrent_state_specs(...)`
-in its routing module to declare its recurrent state.
+A family whose checkpoint has no Modeling V1 model also declares its input
+processor in `routing.py`, in a function decorated with
+`@input_processors(...)` for the same architecture names. It receives the
+checkpoint config and `disable_mm_encoder`, and returns the config and the
+input processor class to build, or `None` for the default input processor.
+When its layers carry recurrent state, a function decorated with
+`@recurrent_state_specs(...)` declares that state as
+`get_recurrent_state_spec` does for a Modeling V1 model class.
 [Nemotron Shortcut routing](models/nemotron_shortcut/routing.py) is an example.
 
 `route` reads no MoE tactic (`moe_config.tactic`, `speculative_config.moe_tactic`),

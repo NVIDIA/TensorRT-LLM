@@ -1230,6 +1230,7 @@ def create_input_processor(
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
     prompt_token_cache_config: Optional["PromptTokenCacheConfig"] = None,
+    disable_mm_encoder: bool = False,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1298,15 +1299,21 @@ def create_input_processor(
                 .get(model_cls)
         except (RuntimeError, ConfigInputError,
                 UnsupportedError):  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+            # A family implemented only in Modeling V2 has no class in the built-in registry.
+            model_cls = None
+            from tensorrt_llm._torch.modeling_v2 import \
+                modeling_v2_input_processor
+            config, input_processor_cls = modeling_v2_input_processor(
+                config, disable_mm_encoder=disable_mm_encoder)
+            if input_processor_cls is None:
+                logger.info("Unregistered model, using DefaultInputProcessor")
         if input_processor_cls is not None:
             if "vision_gpu_normalize" in kwargs:
                 kwargs["vision_gpu_normalize"] = kwargs[
                     "vision_gpu_normalize"] and getattr(
                         model_cls, "supports_vision_gpu_normalize", False)
-            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
-                    and input_processor_cls.supports_tokenization_cache):
+            if getattr(input_processor_cls, "supports_tokenization_cache",
+                       False):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
             elif enable_tokenization_cache:
                 logger.warning_once(

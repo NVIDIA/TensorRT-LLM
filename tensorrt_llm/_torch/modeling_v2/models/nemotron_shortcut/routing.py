@@ -10,6 +10,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..._router_index import (
     NoTarget,
     engine_kv_cache_quant_algo,
+    input_processors,
     recurrent_state_specs,
     routes,
 )
@@ -135,9 +136,14 @@ def route(model_config, llm_args, compute_capability):
         mapping.moe_tp_size,
         mapping.moe_ep_size,
     )
+    media = bool(getattr(cfg, "media_config", None)) and not llm_args.disable_mm_encoder
     if quant is None:
         if layout not in _FOUR_RANK_LAYOUTS:
             raise NoTarget(f"Unsupported BF16 text decoder mapping: {layout}.")
+        if media:
+            from .bf16__sm_103__default.multimodal import ShortcutBf16ForConditionalGeneration
+
+            return ShortcutBf16ForConditionalGeneration
         from .bf16__sm_103__default.modeling import ShortcutBf16ForCausalLM
 
         return ShortcutBf16ForCausalLM
@@ -147,16 +153,39 @@ def route(model_config, llm_args, compute_capability):
             raise NoTarget("The MXFP8 text decoder requires 32-element scale blocks.")
         if layout not in _QUANTIZED_LAYOUTS or mapping.world_size == 1:
             raise NoTarget(f"Unsupported MXFP8 text decoder mapping: {layout}.")
+        if media:
+            from .mxfp8__sm_103__default.multimodal import ShortcutMxfp8ForConditionalGeneration
+
+            return ShortcutMxfp8ForConditionalGeneration
         from .mxfp8__sm_103__default.modeling import ShortcutMxfp8ForCausalLM
 
         return ShortcutMxfp8ForCausalLM
     if quant == QuantAlgo.MIXED_PRECISION:
         if layout not in _QUANTIZED_LAYOUTS:
             raise NoTarget(f"Unsupported mixed-precision text decoder mapping: {layout}.")
+        if media:
+            from .nvfp4__sm_103__default.multimodal import ShortcutNvfp4ForConditionalGeneration
+
+            return ShortcutNvfp4ForConditionalGeneration
         from .nvfp4__sm_103__default.modeling import ShortcutNvfp4ForCausalLM
 
         return ShortcutNvfp4ForCausalLM
     raise NoTarget(f"Unsupported checkpoint precision: {quant}.")
+
+
+@input_processors(NemotronShortcutTextConfig.causal_lm_architecture)
+def input_processor(config, *, disable_mm_encoder):
+    if disable_mm_encoder:
+        from .input_processor import ShortcutTextInputProcessor
+
+        return config, ShortcutTextInputProcessor
+    media_config = config.get_media_config()
+    if media_config is None:
+        return config, None
+    # Importing the module registers the image and video placeholders.
+    from .multimodal import ShortcutInputProcessor
+
+    return media_config, ShortcutInputProcessor
 
 
 @recurrent_state_specs(NemotronShortcutTextConfig.causal_lm_architecture)

@@ -1161,6 +1161,14 @@ def load_pretrained_config(model_name_or_path: str,
         text_dict = (config_dict["text_config"] if model_type
                      == NemotronShortcutConfig.model_type else config_dict)
         model_config = NemotronShortcutTextConfig.from_dict(text_dict, **kwargs)
+        if config_dict.get("vision_config"):
+            model_config.media_config = {
+                key: config_dict[key]
+                for key in ("vision_config", "vision_feature_layer", "image_token_id",
+                            "multimodal_projector_bias", "projector_hidden_act",
+                            "projector_norm_eps", "spatial_merge_size")
+                if key in config_dict
+            }
         model_config.architectures = [
             NemotronShortcutTextConfig.causal_lm_architecture
         ]
