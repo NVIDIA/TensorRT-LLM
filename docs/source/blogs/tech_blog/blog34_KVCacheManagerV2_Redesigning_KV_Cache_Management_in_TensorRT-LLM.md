@@ -6,6 +6,7 @@ By NVIDIA TensorRT LLM Team
 - [Introduction and Motivation](#introduction-and-motivation)
 - [What KVCM2 Is For](#what-kvcm2-is-for)
 - [KVCacheManagerV2 Design](#kvcachemanagerv2-design)
+  - [Terms](#terms)
   - [Design Philosophy](#design-philosophy)
   - [Describing a Model](#describing-a-model)
   - [Lifecycles: Grouping Buffers Into Big Pages](#lifecycles-grouping-buffers-into-big-pages)
@@ -52,6 +53,16 @@ Why a new manager rather than an extension of the existing one? We tried the ext
 <p align="center"><sub><em>Figure 1: V1 and V2 KV cache manager architectures.</em></sub></p>
 
 ## KVCacheManagerV2 Design
+
+### Terms
+
+- **Block** — a fixed run of tokens in a sequence; the unit of matching in the reuse tree.
+- **Lifecycle** — a set of buffers, across layers, with identical retention behavior.
+- **Coalesced buffer** — all buffers of one lifecycle that have the same size, laid out contiguously so that one index reaches every layer.
+- **Pool** — a memory pool of fixed-size pages at one tier (GPU, host or disk).
+- **Pool group** — pools that share slot IDs and grow and shrink together. Each serves one or more lifecycles; quotas and eviction are per pool group.
+- **Slot** — one ID in a pool group: the memory one block needs for one lifecycle, across all of its layers and buffers.
+- **Page** — a slot holding one block's data, together with its status, locks and readiness event. A page index names the whole slot; a kernel reaches one layer's part of it from that index and a per-layer offset.
 
 ### Design Philosophy
 
@@ -110,6 +121,8 @@ This decouples which tokens — tree structure, shared globally across requests 
 
 Matching is therefore two-phase: find the longest token prefix by walking the tree, then shorten it until every lifecycle can actually serve it. Shortening is iterative, because a shorter history moves the stale ranges and can expose a requirement that was not there a moment ago; since every retry strictly shortens the match, it terminates. The phase is what makes sliding-window prefix reuse work at all — a sliding-window lifecycle is never asked for pages covering blocks it would have discarded anyway, only for its sink blocks and its trailing window.
 
+Multi-turn conversations show what this buys. Under the `per_conversation` reuse policy, a conversation's full-attention pages are committed as usual, but its sliding-window blocks and SSM state are kept only at the ends of the last `max_num_turns` turns. Older turns lose those copies while their full-attention pages stay in the tree, so the next turn — or an agent's next tool call — still matches its whole history for a fraction of the memory.
+
 <div align="center">
 <figure>
   <img src="../media/tech_blog34_one_tree_many_lifecycles.png" width="800">
@@ -159,7 +172,7 @@ Two capabilities fall directly out of the page-status machine.
 
 **Preemption without recomputation.** When the scheduler needs to evict a request, `suspend()` demotes its locks to holders, taking its pages from `LOCKED` to `HELD`: eligible to migrate to host or disk, but not to be dropped. `resume()` reverses it, batch-migrating whatever moved back to GPU, and the request keeps its place in the tree and its committed prefix throughout. Where V1 must drop a preempted sequence and recompute its prefill, V2 can park it in host memory and bring it back.
 
-**Scratch slots for sliding-window prefill.** The scratch range covers the blocks this step writes that will already be out of window once its tokens become history — a range that grows with the prompt being prefilled and shrinks as the window widens. Those blocks get shared scratch slots rather than unique pages, so data destined to be discarded immediately never occupies a page of its own. Sharing is what makes it cheap: what a scratch slot holds is dead as soon as the layer that wrote it has attended over it, so every layer in the step writes through the same scratch memory, and the cost does not grow with the number of layers. We have not seen this technique described elsewhere; as far as we know it originated here.
+**Scratch slots for sliding-window prefill.** When a prefill chunk is longer than the window, most blocks it writes are already out of window by the end of the step; their KV data is needed only while each layer attends over the chunk. These blocks form the scratch range, and they get shared scratch slots instead of pages of their own. Only one layer runs at a time, so scratch blocks share a slot's per-layer parts: *n* scratch blocks in an *L*-layer lifecycle need about *n / L* slots. For example, a 32K-token chunk over a 128-token window with 64-token blocks leaves about 510 scratch blocks, which 24 sliding-window layers serve from about 22 slots. Scratch memory therefore grows with the chunk size for a single layer, not with the window or the layer count. The trade-off is that scratch blocks keep nothing after the step, so later requests cannot reuse them. We have not seen this technique described elsewhere; as far as we know it originated here.
 
 ### Block Keys and Reuse Scopes
 
