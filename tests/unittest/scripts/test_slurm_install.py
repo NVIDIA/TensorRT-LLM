@@ -906,7 +906,7 @@ def test_l0_takes_checkpoints_from_a_watcher_beside_the_tests() -> None:
     batch = _groovy_function_body(lines, "runLLMTestlistWithSbatch")
     stop = batch.index('touch "\\$PROGRESS_STOP_FILE"')
     busy = batch.index('while [ -e "\\$PROGRESS_STOP_FILE.busy" ]', stop)
-    final_copy = batch.index("${scpXmlCmd} && break", busy)
+    final_copy = batch.index("${scpXmlCmd} && { touch '${finalXmlMarker}'; break; }", busy)
     batch.index('touch "\\$PROGRESS_DONE_FILE"', final_copy)
     # Its checkpoints, like its final snapshot, wait for the job's results.xml, without which the
     # copy brings nothing back.
