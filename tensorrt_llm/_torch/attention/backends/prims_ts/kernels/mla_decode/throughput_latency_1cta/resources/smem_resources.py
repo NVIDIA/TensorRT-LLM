@@ -38,6 +38,8 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...helpers.sparse_indices import cache_sparse_source_lengths
 from ...helpers.nvfp4_kv import (
+    begin_raw_load,
+    gather_fp8_tile,
     publish_nvfp4_kv,
     source_is_fp8,
     load_nvfp4_panel,
@@ -151,15 +153,20 @@ class SmemQResource(MlaResource):
             )
         return [self._tmem_alloc]
 
+    def _q_stage_bytes(self):
+        """Bytes of one Q SMEM stage (a stub when Q is staged in the K/V ring)."""
+        if self.cfg.q_in_kv:
+            return 1024
+        if self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy:
+            return 4096
+        return self.cfg.qk_smem_tile_bytes
+
     def get_smem_requirements(self):
         """Return the SMEM allocation used for staged Q tiles."""
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=(
-                    4096 if self.cfg.q_nope_tmem else self.cfg.qk_smem_tile_bytes
-                )
-                * self.cfg.q_stages,
+                size_bytes=self._q_stage_bytes() * self.cfg.q_stages,
                 alignment=self.cfg.stensor_align,
             )
         allocations = [self._alloc]
@@ -178,8 +185,7 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(self.cfg.q_tma_stage):
             self.q_temp_state = smem_array(context, self.q_temp_alloc, Int64, 4)
         elem_count = (
-            (4096 if self.cfg.q_nope_tmem else self.cfg.qk_smem_tile_bytes)
-            * self.cfg.q_stages
+            self._q_stage_bytes() * self.cfg.q_stages
         ) // self.cfg.qkv_dtype_bytes
         self._smem_q = smem_array(context, self._alloc, qkv_dtype(self.cfg), elem_count)
         if self._smem_q is not None:
@@ -293,7 +299,9 @@ class SmemQResource(MlaResource):
             == qk_stage_idx % self.cfg.load_num_warps
         ):
             smem_offset = Int32(q_stage_smem_element_offset(self.cfg, qk_stage_idx))
-            if cutlass.const_expr(self.cfg.q_nope_tmem):
+            if cutlass.const_expr(
+                self.cfg.q_nope_tmem and not self.cfg.q_tmem_mma_copy
+            ):
                 smem_offset = Int32(0)
             prims.cp_async_bulk_tensor_shared_cta_global(
                 stage_base.data_ptr(smem_offset),
@@ -457,6 +465,37 @@ class SmemQResource(MlaResource):
         # Every Q staging read ends before any loader may expand KV over it.
         prims.barrier_cta_sync(barrier_id=12, thread_count=256)
 
+    @cute.jit
+    def load_q_panels_into(self, stage_info: StageInfo, q_base, first_panel: int):
+        """Issue the TMA loads of Q panels first_panel and first_panel + 1 (q_in_kv).
+
+        q_base is the first of the two K/V ring slices holding the tile's Q, so
+        each panel lands where a dedicated Q stage would hold it; the copies
+        complete on the K/V stage barrier of stage_info.
+        """
+        for panel in cutlass.range_constexpr(first_panel, first_panel + 2):
+            self._load_q_stage(
+                stage_info,
+                q_base,
+                panel,
+                Int32(panel * self.cfg.head_dim_per_stage_kv),
+                self.tma_desc_q_latent,
+            )
+
+    @cute.jit
+    def copy_q_to_tmem(self, stage_info: StageInfo, q_base):
+        """Copy a staged E4M3 Q at q_base to the Q TMEM columns; return its address.
+
+        The MMA thread issues the copy after the previous tile's QK and before
+        this tile's; tcgen05 executes its operations in order.
+        """
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        cache = decode_gen_task_cache(stage_info)
+        tmem_q = cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(self._tmem_alloc.offset)
+        if prims.elect_sync():
+            copy_q_fp8_to_tmem(q_base.data_ptr(Int32(0)), tmem_q, cta_group=1)
+        return Int64(tmem_q)
+
     @producer_work
     @cute.jit
     def load_q(self, stage_info: StageInfo):
@@ -474,9 +513,10 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(cfg.q_tma_stage):
             self.stage_q_via_tma(stage_info, stage_base)
             return
-        if cutlass.const_expr(cfg.q_nope_tmem):
+        if cutlass.const_expr(cfg.q_nope_tmem and not cfg.q_tmem_mma_copy):
             self.copy_nope_to_tmem(stage_info)
         else:
+            # An MMA-copied Q lands in the ordinary SW128 panels the copy reads.
             for qk_stage_idx in cutlass.range_constexpr(latent_stages):
                 dim_offset = Int32(qk_stage_idx * cfg.head_dim_per_stage_kv)
                 self._load_q_stage(
@@ -549,9 +589,17 @@ class SmemQResource(MlaResource):
         if cutlass.const_expr(self.cfg.q_nope_tmem):
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             cache = decode_gen_task_cache(stage_info)
-            desc_q = Int64(
-                cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(self._tmem_alloc.offset)
+            tmem_q = cache[_TASK_CACHE_TMEM_BASE_OFFSET] + Int32(
+                self._tmem_alloc.offset
             )
+            if cutlass.const_expr(self.cfg.q_tmem_mma_copy):
+                # The MMA thread issues the copy after the previous tile's QK and
+                # before this tile's; tcgen05 executes its operations in order.
+                if prims.elect_sync():
+                    copy_q_fp8_to_tmem(
+                        stage_base.data_ptr(Int32(0)), tmem_q, cta_group=1
+                    )
+            desc_q = Int64(tmem_q)
         return desc_q, desc_q_rope
 
 
@@ -884,22 +932,41 @@ class SmemPageOffsetsResource(MlaResource):
                         destinations += (
                             target._smem_kv.data_ptr(target.kv_stage_offset(slot)),
                         )
-                record_bytes = Int32(cfg.nvfp4_row_bytes)
-                if source_is_fp8(cfg, raw[0] < Int32(0)):
-                    record_bytes = Int32(512)
-                issue_whole_record(
-                    destinations[0],
-                    target._nv_barriers.data_ptr(
-                        stage_info.stage_idx & Int32(1)
-                        if cfg.single_raw_prefetch
-                        else stage_info.stage_idx
-                    ),
-                    raw,
-                    target.tma_desc_c_latent,
-                    target.tma_desc_c_rope,
-                    issuer=issuer,
-                    row_bytes=record_bytes,
+                raw_full = target._nv_barriers.data_ptr(
+                    stage_info.stage_idx & Int32(1)
+                    if cfg.single_raw_prefetch
+                    else stage_info.stage_idx
                 )
+                fp8_tile = source_is_fp8(cfg, raw[0] < Int32(0))
+                if cutlass.const_expr(cfg.tma_fp8_primary_tiles):
+                    if fp8_tile:
+                        # The loaders gather this tile straight into its retained
+                        # stage. Its raw slot carries no bytes but keeps the
+                        # ring's epochs: arrive without a transaction.
+                        begin_raw_load(raw_full, Int32(0))
+                    else:
+                        issue_whole_record(
+                            destinations[0],
+                            raw_full,
+                            raw,
+                            target.tma_desc_c_latent,
+                            target.tma_desc_c_rope,
+                            issuer=issuer,
+                            row_bytes=Int32(cfg.nvfp4_row_bytes),
+                        )
+                else:
+                    record_bytes = Int32(cfg.nvfp4_row_bytes)
+                    if fp8_tile:
+                        record_bytes = Int32(512)
+                    issue_whole_record(
+                        destinations[0],
+                        raw_full,
+                        raw,
+                        target.tma_desc_c_latent,
+                        target.tma_desc_c_rope,
+                        issuer=issuer,
+                        row_bytes=record_bytes,
+                    )
             return
         for fragment in cutlass.range_constexpr((cfg.pages_per_kv_tile + 31) // 32):
             fragment_lane = lane_idx + Int32(fragment * 32)
@@ -1141,6 +1208,20 @@ class SmemKvResource(MlaResource):
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         (
+            "kv_q_desc_var",
+            Int64,
+            Int64(0),
+            "Q TMEM address after a K/V-ring-staged Q copy (q_in_kv).",
+            "kv_q_desc",
+        ),
+        (
+            "kv_q_desc_rope_var",
+            Int64,
+            Int64(0),
+            "Q RoPE descriptor slot of a K/V-ring-staged Q (unused without RoPE).",
+            "kv_q_desc_rope",
+        ),
+        (
             "kv_desc_var",
             Int64,
             Int64(0),
@@ -1190,6 +1271,14 @@ class SmemKvResource(MlaResource):
     v_desc_1_var: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    kv_q_desc_var: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    kv_q_desc_rope_var: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    # q_in_kv: the Q resource whose TMA descriptor and TMEM columns a ring-staged Q uses.
+    q_ref: object = None
 
     _nv_raw_alloc: object = None
     _nv_raw: object = None
@@ -1416,6 +1505,30 @@ class SmemKvResource(MlaResource):
             )
 
     @cute.jit
+    def _tma_fp8_tile(self, cached_page_ids, page_id_slot):
+        """Whether this tile's rows are FP8 primary rows gathered straight into its stage."""
+        cfg = self.cfg
+        if cutlass.const_expr(not cfg.tma_fp8_primary_tiles):
+            return cutlass.Boolean(False)
+        return source_is_fp8(
+            cfg, cached_page_ids[page_id_slot * cfg.sparse_cache_words] < Int32(0)
+        )
+
+    @cute.jit
+    def _gather_fp8_tile(self, dst, stage_info, cached_page_ids, page_id_slot, warp):
+        """Gather this warp's rows of an FP8 primary tile into the four retained panels."""
+        cfg = self.cfg
+        gather_fp8_tile(
+            dst,
+            self.tma_desc_v,
+            stage_info.barrier,
+            cached_page_ids,
+            page_id_slot * cfg.sparse_cache_words,
+            warp,
+            rows=cfg.tile_size_kv // cfg.load_num_warps,
+        )
+
+    @cute.jit
     def _raw_record_view(self, cached_page_ids, page_id_slot):
         """Return (raw-full barrier, parity, raw buffer, raw-empty barrier) for a tile."""
         cfg = self.cfg
@@ -1448,20 +1561,23 @@ class SmemKvResource(MlaResource):
         step only converts and stores the register snapshot.
         """
         cfg = self.cfg
-        assert cfg.early_raw_snapshot and cfg.kv_cache_format != "fp8"
+        assert cfg.early_raw_snapshot and (
+            cfg.kv_cache_format != "fp8" or cfg.tma_fp8_primary_tiles
+        )
         raw_full, raw_phase, raw, raw_empty = self._raw_record_view(
             cached_page_ids, page_id_slot
         )
         while not prims.mbarrier_try_wait_parity(raw_full, raw_phase):
             pass
-        snapshot_nvfp4_record(
-            raw,
-            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-            self._nv_packed,
-            self._nv_scales,
-            self._nv_rope,
-            rope_dim=cfg.rope_dim,
-        )
+        if not self._tma_fp8_tile(cached_page_ids, page_id_slot):
+            snapshot_nvfp4_record(
+                raw,
+                cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                self._nv_packed,
+                self._nv_scales,
+                self._nv_rope,
+                rope_dim=cfg.rope_dim,
+            )
         release_raw_record(raw_empty)
 
     @cute.jit
@@ -1521,15 +1637,24 @@ class SmemKvResource(MlaResource):
                 if cutlass.const_expr(cfg.early_raw_snapshot):
                     # snapshot_raw_record already waited, read and released
                     # this tile's raw slot before the KV acquire.
-                    store_nvfp4_record(
-                        destinations[0],
-                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
-                        self._nv_packed,
-                        self._nv_scales,
-                        self._nv_rope,
-                        stage_bytes=cfg.kv_smem_tile_bytes,
-                        rope_dim=cfg.rope_dim,
-                    )
+                    if self._tma_fp8_tile(cached_page_ids, page_id_slot):
+                        self._gather_fp8_tile(
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
+                        )
+                    else:
+                        store_nvfp4_record(
+                            destinations[0],
+                            cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                            self._nv_packed,
+                            self._nv_scales,
+                            self._nv_rope,
+                            stage_bytes=cfg.kv_smem_tile_bytes,
+                            rope_dim=cfg.rope_dim,
+                        )
                 else:
                     # The metadata warp issues gathers independently, so
                     # all eight original load warps can convert in parallel.
@@ -1541,7 +1666,17 @@ class SmemKvResource(MlaResource):
                         _, _, raw_ptr, raw_empty = self._raw_record_view(
                             cached_page_ids, page_id_slot
                         )
-                    if source_is_fp8(
+                    if self._tma_fp8_tile(cached_page_ids, page_id_slot):
+                        # The raw slot carried no bytes for this tile.
+                        release_raw_record(raw_empty)
+                        self._gather_fp8_tile(
+                            destinations[0],
+                            stage_info,
+                            cached_page_ids,
+                            page_id_slot,
+                            warp,
+                        )
+                    elif source_is_fp8(
                         cfg,
                         cached_page_ids[page_id_slot * cfg.sparse_cache_words]
                         < Int32(0),
@@ -1793,15 +1928,20 @@ class SmemKvResource(MlaResource):
                     is_v=is_v,
                     active_width=active_width,
                 )
-                publish_nvfp4_kv(
-                    stage_info.barrier,
-                    (
-                        cfg.whole_kv_tile_bytes
-                        if cfg.whole_kv_tile
-                        else cfg.kv_smem_tile_bytes
+                # Gathered FP8 primary tiles complete their bytes through TMA.
+                if not (
+                    qk_stage_idx == 0
+                    and self._tma_fp8_tile(cached_page_ids, page_id_slot)
+                ):
+                    publish_nvfp4_kv(
+                        stage_info.barrier,
+                        (
+                            cfg.whole_kv_tile_bytes
+                            if cfg.whole_kv_tile
+                            else cfg.kv_smem_tile_bytes
+                        )
+                        // cfg.load_num_warps,
                     )
-                    // cfg.load_num_warps,
-                )
                 return
             if cutlass.const_expr(
                 not is_v and active_width == 64 and cfg.rope_dim == 64
@@ -2171,9 +2311,17 @@ class SmemKvResource(MlaResource):
             if cutlass.const_expr(reuse_k):
                 # K waits advance independently of releases. Keep its payload
                 # live until the corresponding delayed PV has consumed it.
-                stage_base = self._smem_kv.subview(
-                    self.kv_stage_offset(self.consumer_release_state.index)
-                )
+                stage_idx = self.consumer_release_state.index
+                if cutlass.const_expr(self.cfg.num_ctas_per_head_dim > 1):
+                    # A V split reads its own columns' K slices, which start
+                    # v_head_dim_stages slices per lower V owner into the tile.
+                    v_partition = cta_idx_head_dim_v_for_stage(
+                        self.cta_idx_head_dim_v, stage_info
+                    )
+                    stage_idx = (
+                        stage_idx + v_partition * Int32(self.cfg.v_head_dim_stages)
+                    ) % Int32(self.cfg.kv_stages)
+                stage_base = self._smem_kv.subview(self.kv_stage_offset(stage_idx))
             if cutlass.const_expr(self.cfg.whole_kv_tile):
                 stage_base = stage_base.subview(Int32(k_subtile_idx * 16384))
             v_leading_byte_offset = (
@@ -2232,6 +2380,31 @@ class SmemKvResource(MlaResource):
                 layout=qkv_smem_swizzle(self.cfg),
             )
             return desc
+
+    @producer_work
+    @cute.jit
+    def load_q_half(self, stage_info: StageInfo, *, half: cutlass.Constexpr[int]):
+        """Load Q panels 2 * half and 2 * half + 1 into the acquired K/V stage (q_in_kv).
+
+        A tile's Q occupies two consecutive ring slices: every ring item spans an
+        even number of D128 slices, so the pair never wraps and the second slice
+        follows the first in SMEM, as the four Q panels of a dedicated stage do.
+        """
+        q_base = self._smem_kv.subview(
+            self.kv_stage_offset(stage_info.stage_idx - Int32(half))
+        )
+        self.q_ref.load_q_panels_into(stage_info, q_base, 2 * half)
+
+    @consumer_work(returns=("kv_q_desc", "kv_q_desc_rope"))
+    @cute.jit
+    def q_desc_from_kv(self, stage_info: StageInfo):
+        """Copy the ring-staged Q to TMEM after waiting on both of its slices (q_in_kv)."""
+        # The second Q slice is the stage just waited on; the first precedes it.
+        q_base = self._smem_kv.subview(
+            self.kv_stage_offset(stage_info.stage_idx - Int32(1))
+        )
+        tmem_q = self.q_ref.copy_q_to_tmem(stage_info, q_base)
+        return tmem_q, tmem_q
 
     @consumer_work(returns=("kv_desc",))
     @cute.jit

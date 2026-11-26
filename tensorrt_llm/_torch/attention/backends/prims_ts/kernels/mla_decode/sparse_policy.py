@@ -40,6 +40,21 @@ class SparseMlaProfile:
     kv_tile_size: int = 128
     page_pipeline_stages: int = 0
     whole_kv_tile: bool = False
+    # Keep-AB with retained FP8 K: warp-specialized M64 QK/PV (Layout E), P in
+    # shared memory and one N=256 PV pass per two D128 slices.
+    ws_mma: bool = False
+    # With ws_mma: columns per SMEM-transposed output chunk (32 or 64), 0 = direct.
+    ws_store_cols: int = 0
+    # With ws_store_cols=64: store each output chunk with a TMA tensor store.
+    ws_tma_store: bool = False
+    # With ws_tma_store and a quantized output: how many of each lane's eight
+    # 32-channel tail stripes are only read and rounded to BF16 before the tail
+    # releases O, and quantized after it, overlapping the next tile (0..8).
+    ws_tail_staged_stripes: int = 0
+    # Keep-AB WS FP8: stage a tile's Q in the next two K/V ring slices instead of a
+    # dedicated 32 KB stage (the MMA warp still copies it to TMEM), so the ring
+    # can retain more K/V slices.
+    ws_q_in_kv: bool = False
 
 
 def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):
@@ -863,7 +878,10 @@ def resolve_sparse_mla_profile(
             if remaining * 4 <= sm_count
             else 2
         )
-    # Retaining K through PV requires a single owner of the V dimension.
+    # This policy retains K through PV only with one V owner. configure_sparse_mla
+    # also accepts non-WS Keep-AB V owners reading their own slices of a retained
+    # K tile (the DS4.1 decode uses that), but no generic shape has been measured
+    # with it; Swap-AB and the WS NVFP4 retained schedule need one owner.
     reuse = profile.reuse_kv and v_ctas == 1
     if profile.family == "2cta" and kv_cache_format != "native":
         # Convert each CTA's64 K rows once, then exchange the peer's V

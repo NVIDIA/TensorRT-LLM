@@ -14,11 +14,14 @@
 
 """Task definitions for the FMHA decode TS kernel.
 
-The schedule follows the SwapsMmaAb decode pipeline shape:
+Shared K/V streams follow the SwapsMmaAb decode pipeline shape:
 
 - HEAD: initial Q / K setup and first BMM1 wave
 - LOOP: staggered K/V loads with Qk0 -> Pv0 -> Qk1 -> Pv1
 - TAIL: final V loads, final BMM2, final correction/output
+
+Separate-operand conversion creates independent K and V tasks and rings;
+the MMA task still issues QK and PV serially.
 
 Each schedule is written as explicit TS resource transitions. Producer
 resources use acquire/work/commit; consumer resources use wait/work/release.
@@ -59,8 +62,7 @@ from ..task_compat import (
     runtime_domain_end,
     task_context_kwargs,
 )
-from .direct_sparse_metadata import DirectSparseMetadataView
-from .direct_sparse_metadata import HeadIndexedMetadataView
+from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
     KV_INST0,
@@ -278,7 +280,14 @@ def _can_hold_native_page_window(
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
         or cfg.use_sliding_window_causal
-        or not cfg.fixed_seqlen
+        or (
+            not cfg.fixed_seqlen
+            and not (
+                cfg.runtime_split_kv
+                and cfg.runtime_page_window
+                and cfg.runtime_page_window_pages > 32
+            )
+        )
     ):
         return False
     if cfg.runtime_split_kv:
@@ -350,7 +359,7 @@ def _staged_kv_load(
             section=section,
         )
         load_label = f"{label}_cached"
-    for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+    for head_dim_stage_idx in range(cfg.num_raw_kv_head_dim_stages):
         # ProdAcquire/ProdWork/ProdCommit: issue one K or V slice into the
         # matching SMEM stage.
         resource.acquire()
@@ -708,6 +717,9 @@ class DecodeGenTask(TaskCacheStageInfoMixin, Task):
         self.max_seq_len_kv = kwargs.pop("max_seq_len_kv", cutlass.Int32(0))
         self.seq_len_q = kwargs.pop("seq_len_q", None)
         self.domain_bias = kwargs.pop("domain_bias", 0)
+        # Iterations per loop step of the shared domain; the static schedule
+        # bound must already count scaled iterations.
+        self.domain_scale = kwargs.pop("domain_scale", 1)
         self.q_bound_resources = kwargs.pop("q_bound_resources", ())
         super().__init__(**kwargs)
         self._tmem_base_offset = cutlass.Int32(0)
@@ -1012,7 +1024,21 @@ class DecodeGenTask(TaskCacheStageInfoMixin, Task):
     def _resolve_domain(
         self, tile_coord: cute.Coord, static_domain: cutlass.Int32 | int
     ) -> cutlass.Int32 | int:
-        """Resolve one tile's loop domain, falling back to the schedule's ``static_domain``."""
+        """Resolve one tile's loop domain, falling back to the schedule's ``static_domain``.
+
+        ``domain_scale`` multiplies the shared MMA-loop domain for tasks that
+        run several schedule iterations per loop step. A static fallback
+        returns the schedule's own bound, which is already scaled.
+        """
+        domain = self._shared_loop_domain(tile_coord, static_domain)
+        if self.domain_scale == 1 or domain is static_domain:
+            return domain
+        return domain * cutlass.Int32(self.domain_scale)
+
+    def _shared_loop_domain(
+        self, tile_coord: cute.Coord, static_domain: cutlass.Int32 | int
+    ) -> cutlass.Int32 | int:
+        """Return the MMA-loop domain plus bias, or the static schedule bound ``static_domain``."""
         if self.cfg is None:
             return static_domain
         if cutlass.const_expr(not self.cfg.fixed_seqlen and self.seq_len_q is None):
@@ -1680,18 +1706,24 @@ def create_page_offsets_task_split_kv(
         _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
         if membership_lifetime is not None:
             membership_lifetime.commit()
-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
+        if cfg.num_insts_kv != 1:
+            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
-            _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+            if not cfg.uses_dual_kv_transform:
+                _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
+            if cfg.uses_dual_kv_transform:
+                _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+            if cfg.num_insts_kv != 1:
+                _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
+                _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
 
         # TAIL: drain V0/V1 through distinct page-offset stages.
         _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
+        if cfg.num_insts_kv != 1:
+            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(
@@ -1894,6 +1926,7 @@ def create_load_task_split_kv(
                 "load_v1",
             ),
         )
+        active_instances = active_instances[: cfg.num_insts_kv]
         # Preserve the original full-resource lowering order while allowing a
         # per-instance task to omit the other stream's resources.
         for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
@@ -1926,7 +1959,7 @@ def create_load_task_split_kv(
             """Acquire, load all head-dim stages, and release page offsets."""
             if not hold_page_window:
                 _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+            for head_dim_stage_idx in range(cfg.num_raw_kv_head_dim_stages):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
@@ -2002,18 +2035,16 @@ def create_load_task_split_kv(
                 if smem_k is None:
                     continue
                 assert smem_v is not None
-                load_tile(
-                    smem_v,
-                    load_v,
-                    smem_page_offsets_v_local,
-                    FmhaStage.Loop,
-                )
+                if not cfg.uses_dual_kv_transform:
+                    load_tile(smem_v, load_v, smem_page_offsets_v_local, FmhaStage.Loop)
                 route = _resolve_and_store_sparse_route(
                     sparse_kv_metadata, FmhaStage.Loop, prefetch_by_label[load_k]
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
                 _publish_k_scales(sage_k_scales_by_label[load_k], route, FmhaStage.Loop)
+                if cfg.uses_dual_kv_transform:
+                    load_tile(smem_v, load_v, smem_page_offsets_v_local, FmhaStage.Loop)
                 prefetch_by_label[load_k] = _prefetch_sparse_route(
                     sparse_kv_metadata, "next_loop"
                 )
@@ -2261,7 +2292,7 @@ def create_load_task_one_inst_qkv(
                 _page_offsets_consume(
                     smem_page_offsets, label.replace("load", "read_offsets")
                 )
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+            for head_dim_stage_idx in range(cfg.num_raw_kv_head_dim_stages):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
@@ -2724,6 +2755,98 @@ def create_mma_task_split_kv(
     )
 
 
+def create_mma_task_dual_transform_kv(
+    smem_q: MemoryResource,
+    tmem_k: MemoryResource,
+    tmem_v: MemoryResource,
+    tmem_s0: MemoryResource,
+    smem_p0: MemoryResource,
+    tmem_o: MemoryResource,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    **kw: TaskKwarg,
+) -> Task:
+    """Create the MMA task that reads K and V from separate converted FIFOs.
+
+    HEAD issues QK for the first tile. Each LOOP iteration issues QK for the
+    next tile before PV for the current one, so QK can proceed while Softmax
+    still owns the current P. TAIL issues the last PV after releasing Q.
+    """
+    assert cfg.uses_dual_kv_transform
+
+    @schedule
+    def mma_schedule(
+        smem_q: MemoryResource,
+        tmem_k: MemoryResource,
+        tmem_v: MemoryResource,
+        tmem_s0: MemoryResource,
+        smem_p0: MemoryResource,
+        tmem_o: MemoryResource,
+    ):
+        """Issue QK from the K FIFO and PV from the V FIFO for each work tile."""
+
+        def prelude():
+            """Initialize descriptor slots that stay valid across work tiles."""
+            smem_q.init_descriptor_state()
+            tmem_k.init_descriptor_state()
+            tmem_v.init_descriptor_state()
+            smem_p0.init_descriptor_state()
+
+        def body(q_desc):
+            """Issue the HEAD/LOOP/TAIL QK and PV waves for one work tile."""
+            _consume_staged_qk_mma(
+                tmem_k, tmem_s0, q_desc, "k_desc_0", "qk_mma_head", FmhaStage.Head, cfg
+            )
+            with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
+                _consume_staged_qk_mma(
+                    tmem_k,
+                    tmem_s0,
+                    q_desc,
+                    "k_desc_0",
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                    cfg,
+                )
+                _consume_staged_pv_mma(
+                    tmem_v,
+                    smem_p0,
+                    tmem_o,
+                    "v_desc_0",
+                    "vp_mma_loop",
+                    0,
+                    FmhaStage.Loop,
+                    cfg,
+                )
+            smem_q.release()
+            _consume_staged_pv_mma(
+                tmem_v,
+                smem_p0,
+                tmem_o,
+                "v_desc_0",
+                "vp_mma_tail",
+                0,
+                FmhaStage.Tail,
+                cfg,
+            )
+
+        _decode_work_tile_schedule_with_invariant_bridge(
+            cfg, None, prelude, lambda: smem_q.q_desc(), lambda: smem_q.wait(), body
+        )
+
+    return DecodeGenTask(
+        src_resources=[smem_q, tmem_k, tmem_v, smem_p0],
+        dst_resources=[tmem_s0, tmem_o],
+        cfg=cfg,
+        warp_idx=cfg.mma_warp_idx,
+        num_warps=cfg.mma_num_warps,
+        schedule=mma_schedule(smem_q, tmem_k, tmem_v, tmem_s0, smem_p0, tmem_o),
+        num_registers=cfg.mma_load_task_num_registers,
+        name="MmaTask",
+        **kw,
+    )
+
+
 def create_mma_task_one_inst_qkv(
     smem_q: MemoryResource,
     smem_k: MemoryResource,
@@ -2881,6 +3004,122 @@ def create_mma_task_one_inst_qkv(
 # Mirrors LoadTask's shared-KV cadence and converts raw K/V into the Q-side
 # MMA input type before MmaTask consumes it.
 # ======================================================================
+def create_kv_operand_transform_task(
+    smem_kv: MemoryResource,
+    converted_kv: MemoryResource,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    is_v: bool,
+    **kw: TaskKwarg,
+) -> Task:
+    """Create the converter for one operand of the dual K/V transform.
+
+    Each call creates one task. ``is_v`` selects its operand and warp group.
+    The destination is an FP8 SMEM ring for D256 Keeps or a TMEM FIFO for
+    the dual-transform Swaps profile. K runs one tile ahead of V, matching
+    the MMA task: HEAD converts the first K tile, each
+    LOOP iteration converts the next K (or the current V), and TAIL converts
+    the last V. Every tile converts all ``num_head_dim_stages_kv`` stages.
+    """
+    assert cfg.uses_dual_kv_transform or cfg.uses_dual_smem_transform
+    label = "transform_v0" if is_v else "transform_k0"
+    # The SMEM dual transform runs V in the transform_kv1 warp group.
+    v_warp_idx = (
+        cfg.transform_kv1_warp_idx
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_warp_idx
+    )
+    v_num_warps = (
+        cfg.transform_kv1_num_warps
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_num_warps
+    )
+    v_num_registers = (
+        cfg.transform_kv1_task_num_registers
+        if cfg.uses_dual_smem_transform
+        else cfg.transform_v_task_num_registers
+    )
+
+    # At D512 the four unrolled per-stage bodies of each converter crowd the
+    # Q64 softmax out of the instruction cache. Register-prefetched D256 also
+    # keeps one conversion body per operand. Select the head slice at run time.
+    stages = cfg.num_head_dim_stages_kv
+    early_prefetch = cfg.uses_prefetched_smem_nvfp4_transform
+    flatten_loop = stages == 4 or early_prefetch
+
+    @schedule
+    def conversion_schedule(smem_kv: MemoryResource, converted_kv: MemoryResource):
+        """Convert one operand's raw ring into its converted FIFO for each work tile."""
+        smem_kv.init_descriptor_state()
+
+        def body():
+            """Convert every tile of one work tile into the converted FIFO."""
+            converted_kv.init_load_state()
+
+            def convert_stage(work):
+                """Convert one raw stage into one converted FIFO slot."""
+                converted_kv.acquire()
+                smem_kv.wait()
+                work()
+                converted_kv.commit()
+                smem_kv.release()
+
+            def convert_prefetched_stage(read_row):
+                """Release the raw slot before waiting for the FP8 destination."""
+                smem_kv.wait()
+                packet = read_row()
+                smem_kv.release()
+                converted_kv.acquire()
+                converted_kv.transform_prefetched_row(packet=packet)
+                converted_kv.commit()
+
+            def convert_tile():
+                """Convert one KV tile, one head-dimension stage at a time."""
+                for head_stage in range(stages):
+                    if early_prefetch:
+                        convert_prefetched_stage(
+                            lambda head_stage=head_stage: smem_kv.prefetch_nvfp4_row(
+                                head_dim_stage_idx=head_stage
+                            )
+                        )
+                    else:
+                        convert_stage(
+                            lambda head_stage=head_stage: getattr(converted_kv, label)(
+                                head_dim_stage_idx=head_stage
+                            )
+                        )
+
+            if not is_v:
+                convert_tile()
+            if flatten_loop:
+                with domain_loop(0, runtime_domain_end(domain * stages), 1, unroll=1):
+                    if early_prefetch:
+                        convert_prefetched_stage(smem_kv.prefetch_nvfp4_loop_row)
+                    else:
+                        convert_stage(getattr(converted_kv, f"{label}_loop_stage"))
+            else:
+                with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
+                    convert_tile()
+            if is_v:
+                convert_tile()
+
+        _decode_work_tile_schedule(cfg, None, body)
+
+    return DecodeGenTask(
+        src_resources=[smem_kv],
+        dst_resources=[converted_kv],
+        cfg=cfg,
+        warp_idx=v_warp_idx if is_v else cfg.transform_kv_warp_idx,
+        num_warps=v_num_warps if is_v else cfg.transform_kv_num_warps,
+        schedule=conversion_schedule(smem_kv, converted_kv),
+        num_registers=v_num_registers if is_v else cfg.transform_kv_task_num_registers,
+        name="TransformVTask" if is_v else "TransformKTask",
+        domain_scale=stages if flatten_loop else 1,
+        **kw,
+    )
+
+
 def create_transform_kv_task(
     smem_kv: MemoryResource | None,
     smem_k0: MemoryResource | None,
@@ -2893,9 +3132,14 @@ def create_transform_kv_task(
     *,
     domain: int | cutlass.Int32,
     task_class: type[DecodeGenTask] = DecodeGenTask,
+    inst_id: int | None = None,
     **kw: TaskKwarg,
 ) -> Task:
     """Create the K/V transform task.
+
+    ``inst_id`` restricts the task to one KV instance's stream, converted
+    into that instance's own ring by the transform_kv (instance 0) or
+    transform_kv1 (instance 1) warp group.
 
     Consume one shared ``smem_kv``, or the four split `smem_k0/k1/v0/v1`
     and publish the same ordered K0/V0/K1/V1 stream into ``smem_transformed_kv``.
@@ -2911,6 +3155,11 @@ def create_transform_kv_task(
     tail_labels = (
         ("transform_v0",) if cfg.num_insts_kv == 1 else ("transform_v0", "transform_v1")
     )
+    if inst_id is not None:
+        # Same HEAD/LOOP/TAIL order as the MMA task's use of this instance.
+        head_labels = (f"transform_k{inst_id}",)
+        loop_labels = (f"transform_k{inst_id}", f"transform_v{inst_id}")
+        tail_labels = (f"transform_v{inst_id}",)
 
     split_sources = (smem_k0, smem_k1, smem_v0, smem_v1)
     use_split_sources = smem_kv is None
@@ -2918,6 +3167,23 @@ def create_transform_kv_task(
         raise ValueError(
             "create_transform_kv_task requires either smem_kv, or smem_k0, smem_k1, smem_v0, and smem_v1"
         )
+    # One shared raw ring with several head-dimension stages can run its
+    # steady state once per raw stage, letting the TMEM converter pick K or V
+    # and the stage at run time. Unrolling every (operand, stage) pair puts
+    # 2 * num_head_dim_stages_kv converter bodies in the hot loop (about 16 KB
+    # of code at D512). With the larger D512 Q32 softmax and correction code
+    # that overflows the instruction cache (GB300 B128/KV128K/sQ4: 4.39 ->
+    # 3.79 ms); narrower tiles fit and keep the unrolled bodies (D512 Q8/Q16
+    # and D256 Q8/Q16 were 5-12% slower flattened).
+    loop_stages_per_step = 2 * cfg.num_head_dim_stages_kv
+    flatten_loop = (
+        cfg.store_transformed_kv_in_tmem
+        and cfg.num_insts_kv == 1
+        and inst_id is None
+        and not use_split_sources
+        and cfg.num_head_dim_stages_kv == 4
+        and cfg.tile_size_q >= 32
+    )
 
     def transform_kv_schedule_body(
         smem_transformed_kv: MemoryResource,
@@ -2928,6 +3194,18 @@ def create_transform_kv_task(
 
         def transform_one(label: str) -> None:
             source = source_for_label(label)
+            if cfg.num_raw_kv_head_dim_stages == 1 < cfg.num_head_dim_stages_kv:
+                # One raw stage holds every head-dim slice: convert all of
+                # them before returning it to the loader.
+                source.wait()
+                for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                    smem_transformed_kv.acquire()
+                    getattr(smem_transformed_kv, label)(
+                        head_dim_stage_idx=head_dim_stage_idx
+                    )
+                    smem_transformed_kv.commit()
+                source.release()
+                return
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 smem_transformed_kv.acquire()
                 source.wait()
@@ -2943,9 +3221,20 @@ def create_transform_kv_task(
         # Keep the transformed-K/V steady state as one compact runtime loop.
         # Static decode domains can be large, and the compiler default may
         # otherwise fully unroll this transform body once per K/V tile.
-        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
-            for label in loop_labels:
-                transform_one(label)
+        if flatten_loop:
+            source = source_for_label(loop_labels[0])
+            with domain_loop(
+                0, runtime_domain_end(domain * loop_stages_per_step), 1, unroll=1
+            ):
+                smem_transformed_kv.acquire()
+                source.wait()
+                smem_transformed_kv.transform_kv_loop_stage()
+                smem_transformed_kv.commit()
+                source.release()
+        else:
+            with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
+                for label in loop_labels:
+                    transform_one(label)
 
         for label in tail_labels:
             transform_one(label)
@@ -3012,6 +3301,107 @@ def create_transform_kv_task(
         src_resources=src,
         dst_resources=[smem_transformed_kv],
         cfg=cfg,
+        warp_idx=cfg.transform_kv1_warp_idx
+        if inst_id == 1
+        else cfg.transform_kv_warp_idx,
+        num_warps=(
+            cfg.transform_kv1_num_warps if inst_id == 1 else cfg.transform_kv_num_warps
+        ),
+        schedule=captured_schedule,
+        num_registers=(
+            cfg.transform_kv1_task_num_registers
+            if inst_id == 1
+            else cfg.transform_kv_task_num_registers
+        ),
+        name="TransformKv1Task" if inst_id == 1 else "TransformKvTask",
+        domain_scale=loop_stages_per_step if flatten_loop else 1,
+        **kw,
+    )
+
+
+def create_nvfp4_keeps_transform_task(
+    smem_kv_raw: MemoryResource,
+    smem_k0: MemoryResource,
+    smem_v0: MemoryResource,
+    work_queue: WorkQueue | None,
+    cfg: FmhaDecodeConfig,
+    *,
+    domain: int | cutlass.Int32,
+    task_class: type[DecodeGenTask] = DecodeGenTask,
+    **kw: TaskKwarg,
+) -> Task:
+    """Feed an FP8 or BF16 KeepsMmaAb pipeline from a raw NVFP4 ring.
+
+    The shared K/V load task fills ``smem_kv_raw`` in the order K(head),
+    then K(i+1), V(i) per loop iteration, then V(tail); this task converts
+    each raw stage, in the same order, into the matching K or V ring: one
+    D256 stage for FP8, or one stage per D128 head-dim slice for BF16.
+    """
+    assert cfg.uses_keeps_transformed_kv and cfg.num_insts_kv == 1
+
+    def transform_body(
+        smem_kv_raw: MemoryResource,
+        smem_k0: MemoryResource,
+        smem_v0: MemoryResource,
+    ) -> None:
+        """Convert one work tile's raw stages in the load task's K/V order."""
+        smem_k0.init_load_state()
+        smem_v0.init_load_state()
+
+        def transform_one(dst: MemoryResource, kv_kind: int) -> None:
+            """Convert the next raw ``kv_kind`` stage into ``dst``, then return it.
+
+            ConsWait on the raw ring, ProdAcquire/Work/Commit on the K/V ring
+            for each head-dim stage, and only then ConsRelease: the loader may
+            overwrite the raw stage once its rows have been read (into
+            registers, with register capture, before the first acquire).
+            """
+            smem_kv_raw.wait()
+            if cfg.uses_nvfp4_raw_register_capture:
+                # A single raw stage: read it into registers and return it
+                # first, so the loader refills it during the conversion.
+                smem_kv_raw.capture_tile(kv_kind=kv_kind)
+                smem_kv_raw.release()
+            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                dst.acquire()
+                dst.transform_from_raw(head_dim_stage_idx=head_dim_stage_idx)
+                dst.commit()
+            if not cfg.uses_nvfp4_raw_register_capture:
+                smem_kv_raw.release()
+
+        transform_one(smem_k0, KV_KIND_K)
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
+            transform_one(smem_k0, KV_KIND_K)
+            transform_one(smem_v0, KV_KIND_V)
+        transform_one(smem_v0, KV_KIND_V)
+
+    @schedule
+    def transform_schedule(
+        smem_kv_raw: MemoryResource,
+        smem_k0: MemoryResource,
+        smem_v0: MemoryResource,
+        work_queue: WorkQueue | None = None,
+    ) -> None:
+        """Bind the raw ring's consumer state, then run each work tile."""
+        smem_kv_raw.init_descriptor_state()
+        _decode_work_tile_schedule(
+            cfg,
+            work_queue,
+            lambda: transform_body(smem_kv_raw, smem_k0, smem_v0),
+        )
+
+    captured_schedule = (
+        transform_schedule(smem_kv_raw, smem_k0, smem_v0)
+        if work_queue is None
+        else transform_schedule(smem_kv_raw, smem_k0, smem_v0, work_queue)
+    )
+    src = [smem_kv_raw]
+    if work_queue is not None:
+        src.append(work_queue)
+    return task_class(
+        src_resources=src,
+        dst_resources=[smem_k0, smem_v0],
+        cfg=cfg,
         warp_idx=cfg.transform_kv_warp_idx,
         num_warps=cfg.transform_kv_num_warps,
         schedule=captured_schedule,
@@ -3042,13 +3432,20 @@ def create_mma_task(
     *,
     domain: int | cutlass.Int32,
     task_class: type[DecodeGenTask] = DecodeGenTask,
+    smem_kv1: MemoryResource | None = None,
     **kw: TaskKwarg,
 ) -> Task:
-    """Create the MMA task for the shared K/V ring path."""
+    """Create the MMA task for the shared K/V ring path.
+
+    ``smem_kv1``, when given, supplies instance 1's K/V descriptors from its
+    own ring (per-instance converters); otherwise both instances read
+    ``smem_kv``.
+    """
 
     def mma_schedule_body(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource,
         tmem_s0: MemoryResource,
         tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
@@ -3072,7 +3469,7 @@ def create_mma_task(
         )
         if cfg.num_insts_kv != 1:
             _consume_staged_qk_mma(
-                smem_kv,
+                smem_kv1,
                 tmem_s1,
                 q_desc,
                 "k_desc_1",
@@ -3120,7 +3517,7 @@ def create_mma_task(
             if cfg.num_insts_kv != 1:
                 if cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
-                        smem_kv,
+                        smem_kv1,
                         smem_p1,
                         tmem_o,
                         "v_desc_1",
@@ -3130,7 +3527,7 @@ def create_mma_task(
                         cfg,
                     )
                 _consume_staged_qk_mma(
-                    smem_kv,
+                    smem_kv1,
                     tmem_s1,
                     q_desc,
                     "k_desc_1",
@@ -3140,7 +3537,7 @@ def create_mma_task(
                 )
                 if not cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
-                        smem_kv,
+                        smem_kv1,
                         smem_p1,
                         tmem_o,
                         "v_desc_1",
@@ -3169,7 +3566,7 @@ def create_mma_task(
         )
         if cfg.num_insts_kv != 1:
             _consume_staged_pv_mma(
-                smem_kv,
+                smem_kv1,
                 smem_p1,
                 tmem_o,
                 "v_desc_1",
@@ -3182,12 +3579,15 @@ def create_mma_task(
     def mma_schedule_prelude(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource | None,
         smem_p0: MemoryResource,
         smem_p1: MemoryResource | None,
     ) -> None:
         """Initialize invariant shared-ring descriptor slots."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
+        if smem_kv1 is not None:
+            smem_kv1.init_descriptor_state()
         smem_p0.init_descriptor_state()
         if cfg.num_insts_kv != 1:
             assert smem_p1 is not None
@@ -3197,6 +3597,7 @@ def create_mma_task(
     def mma_schedule(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
+        smem_kv1: MemoryResource | None,
         tmem_s0: MemoryResource,
         tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
@@ -3211,6 +3612,7 @@ def create_mma_task(
             lambda: mma_schedule_prelude(
                 smem_q,
                 smem_kv,
+                smem_kv1,
                 smem_p0,
                 smem_p1,
             ),
@@ -3219,6 +3621,7 @@ def create_mma_task(
             lambda q_desc: mma_schedule_body(
                 smem_q,
                 smem_kv,
+                smem_kv if smem_kv1 is None else smem_kv1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -3231,6 +3634,7 @@ def create_mma_task(
     captured_schedule = mma_schedule(
         smem_q,
         smem_kv,
+        smem_kv1,
         tmem_s0,
         tmem_s1,
         smem_p0,
@@ -3239,6 +3643,8 @@ def create_mma_task(
         work_queue,
     )
     src = [smem_q, smem_kv, smem_p0]
+    if smem_kv1 is not None:
+        src.append(smem_kv1)
     dst = [tmem_s0, tmem_o]
     if cfg.num_insts_kv != 1:
         src.append(smem_p1)
@@ -3258,6 +3664,12 @@ def create_mma_task(
     )
 
 
+def reads_memberships_from_gmem(tmem_s: MemoryResource) -> bool:
+    """Whether Softmax reads grouped-Q page memberships from GMEM."""
+    page_offsets = getattr(tmem_s, "page_offsets_ref", None)
+    return page_offsets is not None and not page_offsets.cache_memberships_in_smem
+
+
 def _softmax_schedule_body(
     cfg: FmhaDecodeConfig,
     inst_id: int,
@@ -3270,6 +3682,7 @@ def _softmax_schedule_body(
     sparse_softmax_metadata: MemoryResource | None,
     membership_lifetime: MemoryResource | None,
     sage_k_scales: MemoryResource | None,
+    memberships_in_gmem: bool = False,
 ) -> None:
     """Build one softmax instance's loop, P publication, and final stats handoff.
 
@@ -3314,6 +3727,21 @@ def _softmax_schedule_body(
         (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, use_sage)]
 
+    # GMEM-resident grouped-Q page memberships are independent of S; see
+    # FmhaDecodeConfig.preloads_page_memberships.
+    preloads_memberships = (
+        cfg.preloads_page_memberships
+        and not use_sparse
+        and not use_sage
+        and memberships_in_gmem
+    )
+    if cutlass.const_expr(preloads_memberships):
+        (
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+        ) = tmem_s.load_first_page_memberships()
     with domain_loop(0, runtime_domain_end(domain), 1, unroll=1) as d:
         if use_sparse:
             # Consume the independent metadata stream first so its SMEM
@@ -3344,6 +3772,14 @@ def _softmax_schedule_body(
             new_max_arr=new_max_arr,
             s_arr=s_arr,
         )
+        if cutlass.const_expr(preloads_memberships):
+            compute_softmax_loop = tmem_s.compute_softmax_loop_with_memberships
+            softmax_loop_kwargs.update(
+                page_membership0=page_membership0,
+                page_membership1=page_membership1,
+                page_membership2=page_membership2,
+                page_membership3=page_membership3,
+            )
         if cutlass.const_expr(cfg.use_sage_attention):
             softmax_loop_kwargs["sage_q_scale"] = sage_q_scale
             softmax_loop_kwargs["sage_k_stage_bytes"] = sage_k_stage_bytes
@@ -3360,12 +3796,22 @@ def _softmax_schedule_body(
         old_max_arr, sum_arr, new_max_arr, s_arr = compute_softmax_loop(
             **softmax_loop_kwargs
         )
+        if cutlass.const_expr(preloads_memberships):
+            (
+                page_membership0,
+                page_membership1,
+                page_membership2,
+                page_membership3,
+            ) = tmem_s.load_next_page_memberships()
         if cutlass.const_expr(releases_sage_stage_after_max):
             # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
-        if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
+        if cutlass.const_expr(
+            (not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p)
+            and not cfg.streams_scores_in_q32_bands
+        ):
             # ConsRelease: free S once the scores are in registers unless
-            # a Keeps TMEM-P operand still aliases the consumed columns.
+            # a Keeps TMEM-P operand or streamed Swaps P pass still reads them.
             tmem_s.release()
         # Publish old/new max before the P path so correction can observe
         # the same stats order as the decode pipeline.
@@ -3424,9 +3870,12 @@ def _softmax_schedule_body(
                     tmem_softmax_order.release_softmax1()
                 else:
                     tmem_softmax_order.release_softmax0()
-        if cutlass.const_expr(cfg.use_keeps_mma_ab and cfg.uses_tmem_p):
-            # TMEM-P has consumed the aliased S columns, so the next QK
-            # wave can now overwrite S.
+        if cutlass.const_expr(
+            (cfg.use_keeps_mma_ab and cfg.uses_tmem_p)
+            or cfg.streams_scores_in_q32_bands
+        ):
+            # P has consumed the retained S columns, so the next QK wave
+            # can now overwrite them.
             tmem_s.release()
         if cutlass.const_expr(use_sage and not releases_sage_stage_after_max):
             # ConsRelease: both passes have read this tile's ``sfK`` words.
@@ -3501,6 +3950,7 @@ def create_softmax0_task(
     **kw: TaskKwarg,
 ) -> Task:
     """Create the first softmax task, including optional ordered publication."""
+    memberships_in_gmem = reads_memberships_from_gmem(tmem_s0)
 
     @_schedule_with_optional_resources
     def softmax0_schedule(
@@ -3530,6 +3980,7 @@ def create_softmax0_task(
                 sparse_softmax_metadata,
                 membership_lifetime,
                 sage_k_scales,
+                memberships_in_gmem=memberships_in_gmem,
             ),
         )
 
@@ -3590,6 +4041,7 @@ def create_softmax1_task(
     **kw: TaskKwarg,
 ) -> Task:
     """Create the second softmax task, including optional ordered publication."""
+    memberships_in_gmem = reads_memberships_from_gmem(tmem_s1)
 
     @_schedule_with_optional_resources
     def softmax1_schedule(
@@ -3625,6 +4077,7 @@ def create_softmax1_task(
                 sparse_softmax_metadata,
                 membership_lifetime,
                 sage_k_scales,
+                memberships_in_gmem=memberships_in_gmem,
             ),
         )
 
