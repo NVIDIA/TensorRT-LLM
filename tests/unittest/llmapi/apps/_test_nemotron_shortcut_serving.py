@@ -97,7 +97,54 @@ class _StructuredOutput:
 
 @pytest.mark.parametrize("server", PRECISIONS, indirect=True)
 class TestServing(_StructuredOutput):
+    @pytest.mark.parametrize("budget", [0, 8])
+    def test_thinking_budget(self, server, budget, record_property):
+        client, model = server
+        result = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            logprobs=True,
+            max_completion_tokens=64,
+            messages=[{"role": "user", "content": "What is two plus two? Answer with a digit."}],
+            extra_body={
+                "thinking_token_budget": budget,
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+        )
+        choice = result.choices[0]
+        message = choice.message
+        tokens = [item.token for item in choice.logprobs.content]
+        record_property("sampled_tokens", json.dumps(tokens))
+        # The generation starts inside <think>. Count sampled tokens up to the
+        # closing marker, including tokenizers that split the marker across tokens.
+        assert "".join(tokens[budget:]).startswith("</think>")
+        assert "</think>" not in "".join(tokens[:budget])
+        assert bool((message.reasoning_content or "").strip()) == bool(budget)
+        assert "4" in message.content and "</think>" not in message.content
 
+    def test_streaming_reasoning(self, server):
+        client, model = server
+        stream = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "What is two plus two? Answer with a digit."}],
+            temperature=0,
+            max_completion_tokens=64,
+            stream=True,
+            extra_body={
+                "thinking_token_budget": 8,
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
+        )
+        reasoning = []
+        content = []
+        with stream:
+            for event in stream:
+                for choice in event.choices:
+                    reasoning.append(getattr(choice.delta, "reasoning_content", None) or "")
+                    content.append(choice.delta.content or "")
+        assert "".join(reasoning).strip()
+        answer = "".join(content)
+        assert "4" in answer and "<think>" not in answer and "</think>" not in answer
 
     def test_image_tool_roundtrip(self, server):
         client, model = server

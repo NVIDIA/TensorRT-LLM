@@ -1021,3 +1021,31 @@ def test_decoder_runner_forward_enters_model_context() -> None:
 
     engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
     assert get_model_extra_attrs() is None
+
+
+@pytest.mark.cpu_only
+def test_logit_post_processors_see_the_overlapped_token() -> None:
+    runner = object.__new__(DecoderRunner)
+    runner._mapping = SimpleNamespace(is_last_pp_rank=lambda: True)
+    seen = []
+    request = SimpleNamespace(
+        py_request_id=7,
+        py_logits_post_processors=[
+            lambda request_id, rows, token_ids, stream, client: seen.append(token_ids)
+        ],
+        py_beam_width=1,
+        get_beam_width_by_iter=lambda for_next_iteration: 1,
+        get_tokens=lambda beam: [1, 2, 3],
+    )
+    scheduled = SimpleNamespace(
+        context_requests=[], generation_requests=[request], all_requests=lambda: [request]
+    )
+    copied = Mock()
+
+    # With overlap, the host history is one sampled token behind the step's logits.
+    runner._execute_logit_post_processors(
+        scheduled, {"logits": torch.ones(1, 32)}, None, ((7,), torch.tensor([9]), copied)
+    )
+
+    copied.synchronize.assert_called_once_with()
+    assert seen == [[[1, 2, 3, 9]]]

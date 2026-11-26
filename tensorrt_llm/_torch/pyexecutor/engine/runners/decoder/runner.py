@@ -698,6 +698,29 @@ class DecoderRunner(ScheduledModelRunner):
         )
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
+        pending_single_tokens = None
+        if (
+            new_tensors_device is not None
+            and not enable_spec_decode
+            and self._mapping.is_last_pp_rank()
+        ):
+            # Capture the previous slots before input preparation assigns the new ones.
+            # With overlap, the CPU history of these requests is one sampled token behind.
+            slots = {
+                r.py_request_id: r.py_batch_idx
+                for r in semantic_requests.generation_requests
+                if r.py_logits_post_processors
+                and r.py_beam_width == 1
+                and r.py_batch_idx is not None
+            }
+            if slots:
+                last = new_tensors_device.new_tokens[0, list(slots.values()), 0]
+                host = last.to("cpu", non_blocking=True)
+                pending_single_tokens = (
+                    tuple(slots),
+                    host,
+                    torch.cuda.current_stream().record_event(),
+                )
         context_plan = (
             ContextLogitsPlan.for_batch(
                 self._context_logits_heads,
@@ -976,7 +999,9 @@ class DecoderRunner(ScheduledModelRunner):
 
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
-            self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
+            self._execute_logit_post_processors(
+                semantic_requests, outputs, pending_beam_histories, pending_single_tokens
+            )
 
             if not isinstance(outputs, dict):
                 return outputs
@@ -1172,11 +1197,13 @@ class DecoderRunner(ScheduledModelRunner):
         scheduled_requests: ScheduledRequests,
         outputs: dict,
         pending_beam_histories: tuple[list[LlmRequest], PendingBeamHistories] | None = None,
+        pending_single_tokens: tuple[tuple[int, ...], torch.Tensor, torch.cuda.Event] | None = None,
     ) -> None:
         """Apply logit post processors (in-place modify outputs Tensors) if any.
 
-        pending_beam_histories is what _start_beam_histories returned for this
-        step.
+        For beam search, _start_beam_histories supplies the histories for this step.
+        For overlapped single-beam requests, pending_single_tokens contains the request
+        IDs, their previous sampled tokens on the host, and the event for that copy.
         """
 
         if not (self._mapping.is_last_pp_rank()):
@@ -1227,6 +1254,11 @@ class DecoderRunner(ScheduledModelRunner):
             }
 
         logits_row_offset = 0
+        single_tokens = {}
+        if pending_single_tokens is not None:
+            request_ids, tokens, copied = pending_single_tokens
+            copied.synchronize()
+            single_tokens = dict(zip(request_ids, tokens.tolist()))
         request_groups = (
             (scheduled_requests.context_requests, True),
             (scheduled_requests.generation_requests, False),
@@ -1264,6 +1296,8 @@ class DecoderRunner(ScheduledModelRunner):
                     elif (histories := beam_histories.get(id(request))) is not None:
                         prompt = request.get_tokens(0)[: request.py_prompt_len]
                         token_ids = [prompt + history for history in histories]
+                    elif request.py_request_id in single_tokens:
+                        token_ids = [request.get_tokens(0) + [single_tokens[request.py_request_id]]]
                     else:
                         token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
                     if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
