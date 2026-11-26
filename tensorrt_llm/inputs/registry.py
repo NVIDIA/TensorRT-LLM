@@ -1780,9 +1780,10 @@ def create_input_processor_with_hash(
             except Exception as e:
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
-                    # if trying for first time, fall back to basic input processor
-                    # and set the flag to False so that we don't try again
-                    input_processor.multimodal_hashing_supported = False
+                    # If trying for the first time, fall back to the basic
+                    # input processor. Latch hashing off only when that
+                    # succeeds: a request both reject says nothing about
+                    # hashing support.
                     logger.warning("Falling back to basic input processor.")
                     try:
                         prompt_token_ids, extra_processed_inputs = input_processor(
@@ -1791,6 +1792,7 @@ def create_input_processor_with_hash(
                         logger.warning(f"Basic input processor failed: {e}.")
                         logger.debug(traceback.format_exc())
                         raise e2
+                    input_processor.multimodal_hashing_supported = False
                 else:
                     raise e
         else:

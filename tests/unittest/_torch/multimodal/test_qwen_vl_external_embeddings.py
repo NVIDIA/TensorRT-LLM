@@ -13,8 +13,8 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5VLInputProcessorBase,
     Qwen2VLModelBase,
 )
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModelBase
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.external_embeddings import ExternalEmbeddingItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -45,6 +45,10 @@ class _FakeTokenizer:
         """Tokenize ``text`` into a [1, n] id tensor."""
         ids = [self.piece_id(piece) for piece in self._PIECE_RE.findall(text)]
         return SimpleNamespace(input_ids=torch.tensor([ids]))
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        """Id of one special token."""
+        return _SPECIAL_IDS[token]
 
     def decode(self, ids: list) -> str:
         """Inverse of the special-token mapping, enough for token-id prompts."""
@@ -231,7 +235,7 @@ def test_bare_image_tensor_needs_a_grid() -> None:
 
 def test_qwen2_5_video_scales_time_by_second_per_grid() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
-    video = _video(2, 2, 2, fps=1.0)  # second_per_grid_ts = temporal_patch_size / fps = 2
+    video = _video(2, 2, 2, second_per_grid_ts=2.0)
     tokens, params = _attach(
         processor, "<|vision_start|><|video_pad|><|vision_end|>", {"video": [video]}
     )
@@ -244,12 +248,14 @@ def test_qwen2_5_video_scales_time_by_second_per_grid() -> None:
 @pytest.mark.parametrize(
     "timing, match",
     [
-        ({}, "exactly one of"),
-        ({"fps": 2.0, "second_per_grid_ts": 1.0}, "exactly one of"),
+        ({}, "requires 'second_per_grid_ts'"),
+        # VideoData's fps is the source rate; Qwen2.5 needs the sampled one.
+        ({"fps": 24.0}, "not 'timestamps' / 'fps'"),
+        ({"fps": 2.0, "second_per_grid_ts": 1.0}, "not 'timestamps' / 'fps'"),
         ({"timestamps": [0.0, 1.0]}, "not 'timestamps'"),
     ],
 )
-def test_qwen2_5_video_requires_one_time_scale(timing: dict, match: str) -> None:
+def test_qwen2_5_video_requires_second_per_grid_ts(timing: dict, match: str) -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
@@ -266,9 +272,12 @@ def _attach_framed_video(processor: Any, video: dict) -> tuple:
 
 @pytest.mark.parametrize(
     "timing, match",
-    [({"second_per_grid_ts": 1e5}, "positions exceed"), ({"fps": 1e-300}, "overflows float32")],
+    [
+        ({"second_per_grid_ts": 1e9}, "do not fit int32"),
+        ({"second_per_grid_ts": 1e300}, "overflows float32"),
+    ],
 )
-def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing: dict, match: str) -> None:
+def test_qwen2_5_video_positions_past_int32_are_rejected(timing: dict, match: str) -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
         _attach_framed_video(processor, _video(8, 2, 2, **timing))
@@ -280,6 +289,7 @@ def _admitted(
     max_new_tokens: int,
     draft_tokens: int = 0,
     max_positions: int = 128000,
+    generation_only: bool = False,
 ) -> LlmRequest:
     """A request after the Qwen-VL model's admission hook."""
     request = LlmRequest(
@@ -289,6 +299,11 @@ def _admitted(
         sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
         is_streaming=False,
         py_multimodal_data={"mrope_config": mrope_config},
+        llm_request_type=(
+            LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+            if generation_only
+            else LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION
+        ),
     )
     pretrained_config = _make_processor(Qwen2_5VLInputProcessorBase).config
     pretrained_config.text_config.max_position_embeddings = max_positions
@@ -313,6 +328,17 @@ def test_qwen2_5_video_decoding_is_capped_at_admission() -> None:
     assert _admitted(trailing, 10, 10**6).max_new_tokens == 10**6
 
 
+def test_qwen2_5_video_prompt_past_rotary_table_is_rejected_at_admission() -> None:
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    # Preprocessing accepts it (positions fit int32); the engine's table bounds it.
+    tokens, extra = _attach_framed_video(processor, _video(8, 2, 2, second_per_grid_ts=1e5))
+    mrope_config = extra["multimodal_data"]["mrope_config"]
+    with pytest.raises(ValueError, match="past the model's 128000 max_position_embeddings"):
+        _admitted(mrope_config, len(tokens), 1)
+    # A larger table, as model_kwargs may set on the engine, admits it.
+    assert _admitted(mrope_config, len(tokens), 1, max_positions=2 * 10**6).max_new_tokens == 1
+
+
 def test_mrope_decode_cap_counts_forwarded_positions() -> None:
     # Prompt positions 0..99 shifted by 32667 end at 32766; the last sampled token is not
     # forwarded, so two new tokens write only position 32767.
@@ -321,8 +347,16 @@ def test_mrope_decode_cap_counts_forwarded_positions() -> None:
     assert _admitted(deltas, 100, 3, max_positions=32768).max_new_tokens == 2
     # A speculative step forwards its draft tokens past the last accepted one.
     assert _admitted(deltas, 100, 10, draft_tokens=1, max_positions=32768).max_new_tokens == 1
-    with pytest.raises(ValueError, match="start past"):
-        _admitted(deltas, 100, 10, draft_tokens=2, max_positions=32768)
+    # The prompt forward samples the first token without forwarding drafts.
+    assert _admitted(deltas, 100, 10, draft_tokens=2, max_positions=32768).max_new_tokens == 1
+    # A generation-only request forwards its first token and drafts first.
+    assert _admitted(deltas, 100, 10, max_positions=32768, generation_only=True).max_new_tokens == 2
+    with pytest.raises(ValueError, match="1 draft tokens starts past"):
+        _admitted(deltas, 100, 10, draft_tokens=1, max_positions=32768, generation_only=True)
+    # The prompt's last position, 100 - 1 + 32669, is past the table.
+    past = {"mrope_position_deltas": torch.tensor([[32669]], dtype=torch.int32)}
+    with pytest.raises(ValueError, match="last mRoPE position 32768"):
+        _admitted(past, 100, 1, max_positions=32768)
 
 
 def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected() -> None:
@@ -347,7 +381,7 @@ def test_qwen3_out_of_range_timestamps_are_rejected(timestamps: list[float]) -> 
 def test_qwen2_5_bare_video_placeholder_is_rejected() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match="framed"):
-        _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, fps=2.0)]})
+        _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, second_per_grid_ts=1.0)]})
 
 
 @pytest.mark.parametrize(
@@ -382,7 +416,30 @@ def test_qwen2_5_bare_video_placeholder_is_rejected() -> None:
             "<|image_pad|>",
             "needs image placeholders framed",
         ),
-        ({"image": None}, "<|image_pad|>", "must be a list"),
+        ({"image": None}, "<|image_pad|>", "must be a tensor, dict, or a list of them"),
+        (
+            {"image": [torch.zeros(1, _HIDDEN).expand(64, _HIDDEN)]},
+            "<|image_pad|>",
+            "self-overlapping view",
+        ),
+        ({"image": [torch.empty(4, _HIDDEN, device="meta")]}, "<|image_pad|>", "cpu or cuda"),
+        (
+            {
+                "image": [
+                    {
+                        "mm_embeddings": torch.ones(4, _HIDDEN),
+                        "image_grid_thw": torch.ones(10**6, dtype=torch.long),
+                    }
+                ]
+            },
+            "<|image_pad|>",
+            "image_grid_thw has 1000000 entries, at most 3",
+        ),
+        (
+            {"video": [_video(2, 4, 2, timestamps=torch.tensor([0.25, 0.45]))]},
+            "<|video_pad|>",
+            "timestamps must be float64 or integer, got torch.float32",
+        ),
         (
             {"video": [_video(1, 2, 2, fps=1.0, frames_indices=list(range(10**6)))]},
             "<|video_pad|>",
@@ -431,8 +488,8 @@ def test_position_metadata_joins_the_cache_key() -> None:
     def clip(**timing: float | list[float]) -> dict:
         return {"video": [{"mm_embeddings": rows, "video_grid_thw": [2, 2, 4], **timing}]}
 
-    slow = _hashes(qwen2_5, video, clip(fps=1.0))
-    fast = _hashes(qwen2_5, video, clip(fps=2.0))
+    slow = _hashes(qwen2_5, video, clip(second_per_grid_ts=2.0))
+    fast = _hashes(qwen2_5, video, clip(second_per_grid_ts=1.0))
     assert slow[0] == fast[0]
     assert slow[1] != fast[1]
 
@@ -440,6 +497,37 @@ def test_position_metadata_joins_the_cache_key() -> None:
     early = _hashes(qwen3, video, clip(timestamps=[0.0, 1.0]))
     late = _hashes(qwen3, video, clip(timestamps=[0.0, 2.0]))
     assert early[0] != late[0]
+
+
+def test_float64_and_integer_timestamp_tensors_are_accepted() -> None:
+    processor = _make_processor(Qwen3VLInputProcessorBase)
+    for timestamps in (torch.tensor([0.25, 1.25], dtype=torch.float64), torch.tensor([0, 1])):
+        tokens, _ = _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps))
+        assert tokens[0] == _FakeTokenizer.piece_id(f"<{float(timestamps[0]):.1f} seconds>")
+
+
+def test_rows_past_the_rotary_table_are_rejected_before_expansion() -> None:
+    processor = _make_processor(Qwen3VLInputProcessorBase)
+    processor.config.text_config.max_position_embeddings = 6
+    image = {"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
+    with pytest.raises(ValueError, match="8 rows in total, more than the model's 6 positions"):
+        _attach(
+            processor, "<|vision_start|><|image_pad|><|vision_end|>" * 2, {"image": [image] * 2}
+        )
+
+
+def test_embeddings_without_a_local_encoder_or_handoff_are_rejected_at_admission() -> None:
+    model = SimpleNamespace(mm_encoder=None)
+    with pytest.raises(ValueError, match="disable_mm_encoder"):
+        Qwen3VLModelBase.validate_multimodal_request_data(
+            model, {"multimodal_embedding": [torch.ones(4, _HIDDEN)]}
+        )
+    # Models that take encoder handoffs accept them; raw media is untouched.
+    Qwen3VLModelBase.validate_multimodal_request_data(
+        SimpleNamespace(mm_encoder=None, support_mm_disagg=True),
+        {"multimodal_embedding": [torch.ones(4, _HIDDEN)]},
+    )
+    Qwen3VLModelBase.validate_multimodal_request_data(model, {"image": {}})
 
 
 def test_uuids_of_absent_modalities_are_ignored() -> None:

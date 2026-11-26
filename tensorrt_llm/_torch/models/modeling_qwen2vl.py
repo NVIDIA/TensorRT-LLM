@@ -6,7 +6,8 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional,
+                    Tuple, Union)
 
 import numpy as np
 import torch
@@ -72,6 +73,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
+from ..modules.multi_stream_utils import private_stream
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
@@ -84,6 +86,9 @@ from .modeling_multimodal_utils import (
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
+
+if TYPE_CHECKING:
+    from ..pyexecutor.llm_request import LlmRequest
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
@@ -149,6 +154,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
     supports_tokenization_cache = True
+    # Processors that expand attached image / video embeddings into the prompt.
+    supports_external_embeddings: ClassVar[bool] = False
 
     def export_decode_state(
             self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1288,7 +1295,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
-        self._check_mrope_positions(mrope_position_ids)
+        _check_mrope_positions_fit_int32(mrope_position_ids)
 
         mrope_config = {}
         mrope_config['mrope_position_ids'] = mrope_position_ids.to(
@@ -1296,22 +1303,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_config['mrope_position_deltas'] = mrope_position_deltas.to(
             'cpu').to(torch.int32).clone()
         return mrope_config
-
-    def _check_mrope_positions(self, position_ids: torch.Tensor) -> None:
-        """Reject prompts whose positions fall outside the rotary table.
-
-        A video time scale moves positions independently of the token count.
-        Admission caps decoding to the table (cap_mrope_decode_tokens).
-        """
-        text_config = getattr(self.config, "text_config", self.config)
-        max_positions = getattr(text_config, "max_position_embeddings", None)
-        if type(max_positions) is not int:
-            return
-        if position_ids.numel() and (int(position_ids.min()) < 0 or int(
-                position_ids.max()) >= max_positions):
-            raise ValueError(
-                f"Qwen mRoPE positions exceed the model's {max_positions} "
-                "positions; check the video time scale")
 
     # Qwen-VL prompt placeholders for one image or video item. A video is
     # framed by vision start / end; Qwen3-VL also accepts it bare.
@@ -1332,23 +1323,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """Validate video timing and return what prompt and MRoPE need.
 
         Qwen2-VL / Qwen2.5-VL scale the MRoPE time axis by the seconds per
-        temporal patch, which HF derives as ``temporal_patch_size / fps`` from
-        the sampled frame rate. Rows and grid do not determine it, so one of
-        the two is required.
+        temporal patch, ``second_per_grid_ts``, which HF derives as
+        ``temporal_patch_size / fps`` from the sampled frame rate. Rows and
+        grid do not determine it, so it is required.
         """
-        if item.timestamps is not None or item.frames_indices is not None:
+        if (item.timestamps is not None or item.frames_indices is not None
+                or item.fps is not None):
             raise ValueError(
-                f"{type(self).__name__} takes 'second_per_grid_ts' or 'fps' for "
-                "video embeddings, not 'timestamps' / 'frames_indices'")
-        if (item.second_per_grid_ts is None) == (item.fps is None):
+                f"{type(self).__name__} takes 'second_per_grid_ts' "
+                "(temporal_patch_size / sampled fps) for video embeddings, not "
+                "'timestamps' / 'fps' / 'frames_indices'")
+        if item.second_per_grid_ts is None:
             raise ValueError(
-                f"video embedding of grid {item.grid_thw}: pass exactly one of "
-                "'second_per_grid_ts' or 'fps' (the sampled frame rate)")
-        if item.second_per_grid_ts is not None:
-            second_per_grid_t = item.second_per_grid_ts
-        else:
-            temporal_patch_size = self.config.vision_config.temporal_patch_size
-            second_per_grid_t = temporal_patch_size / item.fps
+                f"video embedding of grid {item.grid_thw} requires "
+                "'second_per_grid_ts' (temporal_patch_size / sampled fps)")
+        second_per_grid_t = item.second_per_grid_ts
         # MRoPE takes the time scale as float32.
         if second_per_grid_t > torch.finfo(torch.float32).max:
             raise ValueError(
@@ -1356,10 +1345,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 f"{second_per_grid_t} seconds per grid overflows float32")
         return {"second_per_grid_t": second_per_grid_t}
 
-    def _expand_external_video_placeholder(self, item: ExternalEmbeddingItem,
-                                           video_metadata: Dict[str, Any],
-                                           framed: bool) -> str:
-        """Prompt text for one video, as the HF processor expands it.
+    def _expand_external_video_placeholder(
+            self, item: ExternalEmbeddingItem, video_metadata: Dict[str, Any],
+            framed: bool) -> Tuple[str, List[int]]:
+        """Prompt text for one video with one pad per run, and the run lengths.
 
         MRoPE gives video positions only to pads that follow vision start, so
         a bare placeholder is rejected rather than given text positions.
@@ -1368,8 +1357,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             raise ValueError(
                 f"{type(self).__name__} needs video placeholders framed as "
                 "<|vision_start|><|video_pad|><|vision_end|>")
-        return (self._VISION_START + self._VIDEO_PAD * item.num_rows +
-                self._VISION_END)
+        return (self._VISION_START + self._VIDEO_PAD + self._VISION_END,
+                [item.num_rows])
 
     def _validate_external_embedding_grid(
         self,
@@ -1385,7 +1374,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             # give; take it from the model's image or video processor.
             raise ValueError(
                 f"{name} requires '{item.modality}_grid_thw' for mRoPE "
-                "positions")
+                "positions; pass the item as {'mm_embeddings': rows, "
+                f"'{item.modality}_grid_thw': (t, h, w), ...}}")
         t, h, w = grid
         if item.modality == "image" and t != 1:
             raise ValueError(
@@ -1414,20 +1404,26 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         carries MRoPE positions; the wrapper keys each item by its rows and the
         metadata passed with them.
         """
-        build_disagg_prefill_multimodal_inputs = getattr(
-            self, "build_disagg_prefill_multimodal_inputs", None)
-        if not callable(build_disagg_prefill_multimodal_inputs):
+        if not self.supports_external_embeddings:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support external multimodal embeddings"
             )
         items_by_modality = parse_external_embeddings(
             multimodal_embedding,
-            temporal_patch_size=getattr(self.config.vision_config,
-                                        "temporal_patch_size", 1))
+            temporal_patch_size=self.config.vision_config.temporal_patch_size)
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
 
+        # Bound the expanded prompt before building it: every row is a prompt
+        # token.
+        total_rows = sum(item.num_rows for items in items_by_modality.values()
+                         for item in items)
+        max_positions = self.config.text_config.max_position_embeddings
+        if total_rows > max_positions:
+            raise ValueError(
+                f"Attached embeddings have {total_rows} rows in total, more "
+                f"than the model's {max_positions} positions")
         width = self._external_embedding_width()
         grids: Dict[str, List[Tuple[int, int, int]]] = {}
         video_metadata: List[Dict[str, Any]] = []
@@ -1456,6 +1452,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         item_refs: List[Tuple[str, int]] = []
         consumed = {"image": 0, "video": 0}
         pieces: List[str] = []
+        # Rows each pad of the compact prompt expands to, in prompt order.
+        pad_runs: List[int] = []
         last_end = 0
         for match in matches:
             modality = "image" if match.lastgroup == "image" else "video"
@@ -1479,12 +1477,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     raise ValueError(
                         f"{type(self).__name__} needs image placeholders "
                         "framed as <|vision_start|><|image_pad|><|vision_end|>")
-                pieces.append(self._IMAGE_PAD * item.num_rows)
+                pieces.append(self._IMAGE_PAD)
+                pad_runs.append(item.num_rows)
             else:
-                pieces.append(
-                    self._expand_external_video_placeholder(
-                        item, video_metadata[index],
-                        match.lastgroup == "framed_video"))
+                text, runs = self._expand_external_video_placeholder(
+                    item, video_metadata[index],
+                    match.lastgroup == "framed_video")
+                pieces.append(text)
+                pad_runs.extend(runs)
             last_end = match.end()
         pieces.append(text_prompt[last_end:])
         for modality, items in items_by_modality.items():
@@ -1492,9 +1492,29 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Prompt has {consumed[modality]} {modality} placeholders "
                     f"but {len(items)} {modality} embeddings were given")
-        expanded_prompt = "".join(pieces)
-        prompt_token_ids = self.tokenizer(
-            expanded_prompt, return_tensors="pt").input_ids[0].tolist()
+        # The pads are added special tokens, so tokenizing one pad per run and
+        # repeating its id gives the ids of the fully expanded text.
+        compact_ids = self.tokenizer("".join(pieces),
+                                     return_tensors="pt").input_ids[0].tolist()
+        pad_ids = {
+            self.tokenizer.convert_tokens_to_ids(pad)
+            for pad in (self._IMAGE_PAD, self._VIDEO_PAD)
+        }
+        prompt_token_ids: List[int] = []
+        runs = iter(pad_runs)
+        for token_id in compact_ids:
+            if token_id in pad_ids:
+                run = next(runs, None)
+                if run is None:
+                    raise ValueError(
+                        "Prompt text holds more image / video pads than the "
+                        "attached embeddings")
+                prompt_token_ids.extend([token_id] * run)
+            else:
+                prompt_token_ids.append(token_id)
+        if next(runs, None) is not None:
+            raise ValueError("Prompt tokenized to fewer image / video pads "
+                             "than the attached embeddings")
 
         rows = [item.num_rows for item in ordered_items]
 
@@ -2488,37 +2508,90 @@ def _qwen_vision_input_partitions(
     }
 
 
-def cap_mrope_decode_tokens(request: Any,
-                            text_config: Any,
-                            lookahead: int = 0) -> None:
-    """Cap a request's new tokens so its decode positions fit the rotary table.
+def _check_mrope_positions_fit_int32(position_ids: torch.Tensor) -> None:
+    """Reject mRoPE positions the int32 delta and position buffers cannot hold.
 
-    A positive mRoPE delta puts decode positions ahead of the token count,
-    which max_seq_len bounds, so a request may run past the
-    max_position_embeddings rotary table. The executor runs this at
-    admission, after max_new_tokens is clamped to max_seq_len. Every new
-    token but the last is forwarded, the first at ``prompt_len + delta``.
-    ``lookahead`` reserves the draft tokens a speculative step forwards past
-    the last accepted token.
+    A video time scale moves positions independently of the token count. The
+    rotary-table bound is checked at admission (cap_mrope_decode_tokens),
+    against the engine's config.
     """
-    max_positions = getattr(text_config, "max_position_embeddings", None)
+    if position_ids.numel() and (int(position_ids.min()) < 0 or int(
+            position_ids.max()) > torch.iinfo(torch.int32).max):
+        raise ValueError(
+            "Qwen mRoPE positions do not fit int32; check the video time scale")
+
+
+def _mrope_delta(deltas: torch.Tensor) -> int:
+    """Largest mRoPE delta of a request, read without syncing the executor.
+
+    Disaggregated workers receive the deltas as CUDA tensors; reading them on
+    the current stream would wait for the in-flight forward step.
+    """
+    if not deltas.is_cuda:
+        return int(deltas.max())
+    stream = private_stream(deltas.device.index, "mrope_delta_read")
+    with torch.cuda.stream(stream):
+        return int(deltas.max().to("cpu"))
+
+
+def cap_mrope_decode_tokens(request: "LlmRequest",
+                            text_config: PretrainedConfig,
+                            lookahead: int = 0) -> None:
+    """Bound a request's mRoPE positions by the rotary table at admission.
+
+    A positive mRoPE delta puts positions ahead of the token count, which
+    max_seq_len bounds, so a prompt or its decode may run past the
+    max_position_embeddings rotary table. The executor runs this after
+    max_new_tokens is clamped to max_seq_len. The last prompt position is
+    ``orig_prompt_len - 1 + delta``; every new token but the last is
+    forwarded, the first at ``orig_prompt_len + delta``.
+
+    Args:
+        request: Request being admitted. Its max_new_tokens is lowered when
+            decoding would pass the table.
+        text_config: Config of the language model the engine runs.
+        lookahead: Draft tokens a speculative step forwards past the last
+            accepted token.
+
+    Raises:
+        ValueError: The prompt does not fit the table, or a generation-only
+            request has no room to forward its first token.
+    """
+    max_positions = text_config.max_position_embeddings
     mrope_config = (request.py_multimodal_data or {}).get("mrope_config") or {}
     deltas = mrope_config.get("mrope_position_deltas")
-    if (type(max_positions) is not int or not isinstance(deltas, torch.Tensor)
-            or not deltas.numel()):
+    if not isinstance(deltas, torch.Tensor) or not deltas.numel():
         return
-    delta = int(deltas.max())
+    delta = _mrope_delta(deltas)
     if delta <= 0:
         return
-    budget = max_positions - request.orig_prompt_len - delta + 1 - lookahead
-    if budget <= 0:
+    prompt_len = request.orig_prompt_len
+    if prompt_len - 1 + delta >= max_positions:
         raise ValueError(
-            f"Qwen mRoPE decode positions start past the model's "
-            f"{max_positions} positions; check the video time scale")
+            f"The prompt's last mRoPE position {prompt_len - 1 + delta} "
+            f"(prompt length {prompt_len} + mRoPE delta {delta} - 1) is past "
+            f"the model's {max_positions} max_position_embeddings; shorten "
+            "the prompt or check the video time scale (second_per_grid_ts)")
+    budget = max_positions - prompt_len - delta + 1 - lookahead
+    if request.is_generation_only_request:
+        # The first generation step forwards the first token and its drafts.
+        if budget <= 1:
+            raise ValueError(
+                f"mRoPE decode of a {prompt_len}-token prompt with delta "
+                f"{delta} and {lookahead} draft tokens starts past the "
+                f"model's {max_positions} max_position_embeddings; shorten "
+                "the prompt or check the video time scale "
+                "(second_per_grid_ts)")
+    else:
+        # The prompt forward samples the first token; only later ones are
+        # forwarded with their drafts.
+        budget = max(budget, 1)
     if request.py_max_new_tokens > budget:
         logger.warning(
             f"max_new_tokens ({request.py_max_new_tokens}) would take mRoPE "
-            f"positions past the model's {max_positions}; using {budget}.")
+            f"positions past the model's {max_positions} "
+            f"(prompt length {prompt_len}, delta {delta}, {lookahead} draft "
+            f"tokens); using {budget}.")
         request.max_new_tokens = budget
         request.py_max_new_tokens = budget
 
@@ -2537,14 +2610,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     ) -> dict[str, MultimodalItemPartition] | None:
         return _qwen_vision_item_partitions(param, modality)
 
-    def validate_request(self, request: Any) -> None:
-        """Cap decoding so mRoPE positions stay in the rotary table."""
-        spec_config = getattr(self.model_config, "spec_config", None)
-        cap_mrope_decode_tokens(
-            request,
-            getattr(self.model_config.pretrained_config, "text_config",
-                    self.model_config.pretrained_config),
-            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0)
+    def validate_request(self, request: "LlmRequest") -> None:
+        """Bound mRoPE positions by the rotary table (cap_mrope_decode_tokens)."""
+        spec_config = self.model_config.spec_config
+        cap_mrope_decode_tokens(request,
+                                self.model_config.pretrained_config.text_config,
+                                lookahead=(spec_config.max_total_draft_tokens if
+                                           spec_config is not None else 0) or 0)
 
     def __init__(
         self,
@@ -2852,6 +2924,8 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
+
+    supports_external_embeddings: ClassVar[bool] = True
 
     def build_disagg_prefill_multimodal_inputs(
         self,

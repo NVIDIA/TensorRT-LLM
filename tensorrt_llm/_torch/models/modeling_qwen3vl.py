@@ -6,7 +6,7 @@ import dataclasses
 import math
 import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 from typing import Mapping as TypingMapping
 
 import numpy as np
@@ -75,7 +75,6 @@ from .modeling_qwen2vl import (
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
-    cap_mrope_decode_tokens,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -259,6 +258,8 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     than a ``tokens_per_second``-scaled stretch.
     """
 
+    supports_external_embeddings: ClassVar[bool] = True
+
     def __init__(
         self,
         model_path: str,
@@ -410,13 +411,16 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         item: ExternalEmbeddingItem,
         video_metadata: Dict[str, Any],
         framed: bool,
-    ) -> str:
-        """Per-frame timestamped prompt text, as HF's Qwen3-VL processor builds it."""
+    ) -> Tuple[str, List[int]]:
+        """Per-frame timestamped prompt text, as HF's Qwen3-VL processor builds it.
+
+        Each frame holds one pad; the returned run lengths give its rows.
+        """
         frame_rows = item.num_rows // item.grid_thw[0]
-        frame = self._VISION_START + self._VIDEO_PAD * frame_rows + self._VISION_END
-        return "".join(
-            f"<{timestamp:.1f} seconds>" + frame for timestamp in video_metadata["timestamps"]
-        )
+        frame = self._VISION_START + self._VIDEO_PAD + self._VISION_END
+        timestamps = video_metadata["timestamps"]
+        text = "".join(f"<{timestamp:.1f} seconds>" + frame for timestamp in timestamps)
+        return text, [frame_rows] * len(timestamps)
 
     @classmethod
     def get_rope_index(
@@ -1728,18 +1732,23 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         """
         return None
 
-    def validate_request(self, request: Any) -> None:
-        """Cap decoding so mRoPE positions stay in the rotary table."""
-        spec_config = getattr(self.model_config, "spec_config", None)
-        cap_mrope_decode_tokens(
-            request,
-            getattr(
-                self.model_config.pretrained_config,
-                "text_config",
-                self.model_config.pretrained_config,
-            ),
-            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0,
-        )
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Reject attached embeddings a model without encoder handoff cannot splice.
+
+        Without a local encoder, select_multimodal_params treats an
+        embedding-only payload as an encoder handoff and raises inside the
+        forward step, which fails the whole batch.
+        """
+        if (
+            mm_data.get("multimodal_embedding") is not None
+            and self.mm_encoder is None
+            and not getattr(self, "support_mm_disagg", False)
+        ):
+            raise ValueError(
+                f"{type(self).__name__} with disable_mm_encoder cannot take "
+                "precomputed multimodal embeddings; send the image/video pixels "
+                "to a worker that runs the vision encoder"
+            )
 
     def __init__(
         self,

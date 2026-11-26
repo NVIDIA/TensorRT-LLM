@@ -23,6 +23,7 @@ pytestmark = pytest.mark.cpu_only
 def _make_qwen3_vl_config(hidden_size: int):
     text_config = SimpleNamespace(hidden_size=hidden_size,
                                   vocab_size=100,
+                                  max_position_embeddings=128000,
                                   dtype=torch.float32)
     vision_config = SimpleNamespace(
         spatial_merge_size=2,
@@ -61,6 +62,9 @@ class _PromptTokenizer:
         }
         self.text_id = text_id
 
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self.special_ids[token]
+
     def __call__(self, text: str, return_tensors: str) -> SimpleNamespace:
         ids = [
             self.special_ids.get(piece, self.text_id)
@@ -95,13 +99,18 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     config = _make_qwen3_vl_config(hidden_size)
     expected_embedding_width = hidden_size * (
         1 + len(config.vision_config.deepstack_visual_indexes))
+    # The hook tokenizes one pad per image and repeats it to the image's rows.
     tokenizer = _make_tokenizer([
         7,
         config.vision_start_token_id,
-        *([config.image_token_id] * 4),
+        config.image_token_id,
         config.vision_end_token_id,
         8,
     ])
+    tokenizer.convert_tokens_to_ids = {
+        "<|image_pad|>": config.image_token_id,
+        "<|video_pad|>": config.video_token_id,
+    }.get
     processor = _make_qwen3_vl_processor(config, tokenizer)
 
     num_image_tokens = 4
@@ -137,9 +146,9 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         config.vision_end_token_id,
         8,
     ]
-    tokenizer.assert_called_once_with("<|vision_start|>" + "<|image_pad|>" * 4 +
-                                      "<|vision_end|>Describe this image.",
-                                      return_tensors="pt")
+    tokenizer.assert_called_once_with(
+        "<|vision_start|><|image_pad|><|vision_end|>Describe this image.",
+        return_tensors="pt")
 
     multimodal_data = extra_processed_inputs["multimodal_data"]
     assert multimodal_data["multimodal_embedding"] == [image_embedding]

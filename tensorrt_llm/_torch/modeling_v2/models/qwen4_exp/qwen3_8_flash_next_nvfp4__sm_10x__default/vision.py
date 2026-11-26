@@ -597,11 +597,18 @@ def validate_request(tower, request) -> None:
 
     Refused: a frame past `VISION_CALL_MAX_PATCHES` patches (the one bound the tower keeps),
     a malformed grid or pixel payload (or pixels not at the tower's dtype), media whose rows disagree with the prompt's
-    placeholder count, missing or mis-sized `mrope_position_ids`, and a request with both
-    images and videos whose item metadata is missing or does not list its items."""
+    placeholder count, missing or mis-sized `mrope_position_ids`, a request with both
+    images and videos whose item metadata is missing or does not list its items, and
+    precomputed image/video embeddings, which the tower cannot splice."""
     data = request.py_multimodal_data
     if not data:
         return
+    if data.get("multimodal_embedding") is not None:
+        raise ValueError(
+            "this target does not splice precomputed image/video embeddings "
+            "(multimodal_data['multimodal_embedding']); send the image/video pixels "
+            "(multimodal_data['image'/'video']) so the vision tower runs"
+        )
     grids = {}
     for modality, (pixel_key, grid_key) in MEDIA_KEYS.items():
         media = data.get(modality)

@@ -5,13 +5,14 @@
 Each entry of ``multi_modal_embeddings[modality]`` is either a bare tensor of
 shape ``[rows, width]`` or a dict holding the tensor under ``"mm_embeddings"``
 plus the geometry and timing metadata that the raw-media path would have
-derived from the image or video (grid, timestamps, ...). Models validate the
-metadata they need; this module only normalizes the container.
+derived from the image or video (grid, timestamps, ...). This module splits
+the container, checks the tensor contract, the item keys and the types of
+their values; models check the values against their own geometry and timing.
 """
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -23,7 +24,6 @@ _EMBEDDING_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64
 
 _ITEM_KEYS = frozenset(
     {
-        "mm_embeddings",
         "image_grid_thw",
         "video_grid_thw",
         "timestamps",
@@ -44,10 +44,10 @@ class ExternalEmbeddingItem:
     grid_thw: Optional[tuple[int, int, int]] = None
     """Pre-merge patch grid ``(t, h, w)`` as the vision processor reports it."""
     timestamps: Optional[tuple[float, ...]] = None
-    """Seconds per temporal patch, for models that print frame timestamps."""
+    """Timestamp in seconds of each temporal patch, for models that print frame
+    timestamps. Compute them in float64 as the HF processor does."""
     fps: Optional[float] = None
-    """Frames per second. Qwen3-VL reads it with ``frames_indices`` as the
-    source video's rate; Qwen2.5-VL reads it alone as the sampled rate."""
+    """Source video frames per second, read with ``frames_indices`` (Qwen3-VL)."""
     frames_indices: Optional[tuple[int, ...]] = None
     """Source frame index of each sampled frame (Qwen3-VL)."""
     second_per_grid_ts: Optional[float] = None
@@ -59,11 +59,13 @@ class ExternalEmbeddingItem:
         return int(self.embedding.shape[0])
 
 
-def _as_int_tuple(value: Any, name: str) -> tuple[int, ...]:
+def _as_int_tuple(value: Any, name: str, max_len: Optional[int] = None) -> tuple[int, ...]:
     """Convert a list, tuple or tensor of integers to a tuple of Python ints."""
     if isinstance(value, torch.Tensor):
         if value.dtype.is_floating_point or value.dtype.is_complex:
             raise ValueError(f"{name} must hold integers, got {value.dtype}")
+        if max_len is not None and value.numel() > max_len:
+            raise ValueError(f"{name} has {value.numel()} entries, at most {max_len}")
         value = value.reshape(-1).tolist()
     if not isinstance(value, (list, tuple)):
         raise TypeError(f"{name} must be a list, tuple or tensor of integers")
@@ -76,8 +78,20 @@ def _as_int_tuple(value: Any, name: str) -> tuple[int, ...]:
 
 
 def _as_float_tuple(value: Any, name: str) -> tuple[float, ...]:
-    """Convert a list, tuple or tensor of numbers to a tuple of finite floats."""
+    """Convert a list, tuple or tensor of numbers to a tuple of finite floats.
+
+    Floating tensors must be float64: a value computed in lower precision can
+    print to different digits than the float64 value HF computes.
+    """
     if isinstance(value, torch.Tensor):
+        if value.dtype.is_complex or (
+            value.dtype.is_floating_point and value.dtype != torch.float64
+        ):
+            raise ValueError(
+                f"{name} must be float64 or integer, got {value.dtype}; compute the "
+                "values in float64 (.double() or .tolist() of a lower-precision tensor "
+                "does not restore them)"
+            )
         value = value.reshape(-1).tolist()
     if not isinstance(value, (list, tuple)):
         raise TypeError(f"{name} must be a list, tuple or tensor of numbers")
@@ -108,6 +122,11 @@ def _check_embedding_tensor(embedding: Any, name: str) -> torch.Tensor:
         raise TypeError(f"{name} must be a torch.Tensor, got {type(embedding).__name__}")
     if embedding.layout != torch.strided:
         raise ValueError(f"{name} must be a dense tensor, got layout {embedding.layout}")
+    if embedding.device.type not in ("cpu", "cuda"):
+        raise ValueError(f"{name} must be on cpu or cuda, got {embedding.device.type}")
+    # A broadcast view (stride 0) claims more rows than its storage holds.
+    if embedding.untyped_storage().nbytes() < embedding.numel() * embedding.element_size():
+        raise ValueError(f"{name} must not be a self-overlapping view; pass a contiguous copy")
     # Batching concatenates items before casting to the model dtype, and
     # float8 does not promote with other dtypes.
     if embedding.dtype not in _EMBEDDING_DTYPES:
@@ -144,7 +163,7 @@ def _parse_item(
 
     grid = None
     if grid_key in metadata:
-        grid = _as_int_tuple(metadata[grid_key], grid_key)
+        grid = _as_int_tuple(metadata[grid_key], grid_key, max_len=3)
         if len(grid) != 3:
             raise ValueError(f"{name}: {grid_key} must have 3 entries (t, h, w), got {grid}")
         if any(dim <= 0 for dim in grid):
@@ -163,8 +182,9 @@ def _parse_item(
                     f"{name}: {key} has {length} entries for {grid[0]} temporal patches"
                 )
 
-    def optional(key: str, convert: Callable[[Any, str], Any]) -> Any:
-        return convert(metadata[key], key) if key in metadata else None
+    def optional(field: str, convert: Callable[[Any, str], Any]) -> Any:
+        """Convert ``metadata[field]`` if present."""
+        return convert(metadata[field], field) if field in metadata else None
 
     return ExternalEmbeddingItem(
         modality,
@@ -179,7 +199,6 @@ def _parse_item(
 
 def parse_external_embeddings(
     multimodal_embedding: Any,
-    supported_modalities: Sequence[str] = EXTERNAL_EMBEDDING_MODALITIES,
     temporal_patch_size: int = 1,
 ) -> dict[str, list[ExternalEmbeddingItem]]:
     """Normalize ``multi_modal_embeddings`` to per-modality item lists.
@@ -191,7 +210,6 @@ def parse_external_embeddings(
             float32 or float64 tensor; the model checks ``rows`` against
             ``<modality>_grid_thw`` and ``width`` against its own row width
             (the text hidden size, times 1 + deepstack levels for Qwen3-VL).
-        supported_modalities: Modalities the caller accepts.
         temporal_patch_size: Video frames per temporal patch, bounding ``frames_indices``.
 
     Returns:
@@ -199,16 +217,18 @@ def parse_external_embeddings(
     """
     if not isinstance(multimodal_embedding, dict):
         raise ValueError("multimodal_embedding must be a dictionary")
-    unsupported = set(multimodal_embedding) - set(supported_modalities)
+    unsupported = set(multimodal_embedding) - set(EXTERNAL_EMBEDDING_MODALITIES)
     if unsupported:
         raise ValueError(
             f"Unsupported modalities {sorted(unsupported)} for external multimodal "
-            f"embeddings; supported: {list(supported_modalities)}"
+            f"embeddings; supported: {list(EXTERNAL_EMBEDDING_MODALITIES)}"
         )
     items: dict[str, list[ExternalEmbeddingItem]] = {}
     for modality, entries in multimodal_embedding.items():
         if not isinstance(entries, (torch.Tensor, dict, list, tuple)):
-            raise TypeError(f"multi_modal_embeddings['{modality}'] must be a list")
+            raise TypeError(
+                f"multi_modal_embeddings['{modality}'] must be a tensor, dict, or a list of them"
+            )
         embeddings, metadata = split_multimodal_embedding_items(entries)
         items[modality] = [
             _parse_item(modality, i, embedding, item_metadata, temporal_patch_size)

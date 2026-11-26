@@ -622,6 +622,29 @@ _UUID_HASH_SNAPSHOT = {
 }
 
 
+def test_request_rejected_by_both_paths_does_not_latch_hashing_off() -> None:
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = None
+        reject = True
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            if self.reject:
+                raise ValueError("prompt too long")
+            return [10, 101, 102, 20], {"multimodal_data": {"image": {}}}
+
+    processor = Processor()
+    wrapped = create_input_processor_with_hash(processor)
+    inputs = {"prompt": "unused", "multi_modal_data": {"image": [np.array([1], dtype=np.uint8)]}}
+    with pytest.raises(ValueError, match="prompt too long"):
+        wrapped(inputs, None)
+    assert processor.multimodal_hashing_supported is None
+
+    processor.reject = False
+    _, extra = wrapped(inputs, None)
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes
+
+
 def test_mixed_hashing_uses_processor_metadata_without_frontend_order() -> None:
     class Processor(_KwargsHashFakeProcessor):
         multimodal_hashing_supported = None
