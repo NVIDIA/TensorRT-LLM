@@ -367,11 +367,23 @@ def _check_sm107_ull(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
     """
     transceiver = llm_args.cache_transceiver_config
     role = (_worker_env(llm_args, "TRTLLM_DISAGG_ROLE") or "").strip().lower()
-    if transceiver is None or transceiver.backend is None or (role and not role.startswith("gen")):
+    if transceiver is None or transceiver.backend is None:
+        raise NoTarget(
+            "the sm107 Kimi K3 ULL target requires a disaggregated generation server "
+            "with cache_transceiver_config.backend"
+        )
+    if role and not role.startswith("gen"):
         raise NoTarget(
             "the sm107 Kimi K3 ULL target requires a disaggregated generation server "
             f"with a KV cache transceiver, got role {role!r}"
         )
+    if getattr(llm_args, "disable_overlap_scheduler", False):
+        raise NoTarget(
+            "the sm107 Kimi K3 ULL target requires the overlap scheduler "
+            "(disable_overlap_scheduler=False)"
+        )
+    if hasattr(llm_args, "cuda_graph_config") and llm_args.cuda_graph_config is None:
+        raise NoTarget("the sm107 Kimi K3 ULL target requires CUDA graphs (cuda_graph_config)")
     if llm_args.guided_decoding_backend is not None:
         raise NoTarget("the sm107 Kimi K3 ULL target does not support guided_decoding_backend")
     if not mapping.moe_tp_ep_user_specified:

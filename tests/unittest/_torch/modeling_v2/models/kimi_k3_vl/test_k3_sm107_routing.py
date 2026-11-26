@@ -124,6 +124,8 @@ def _llm_args(worker: dict, **overrides):
         "max_batch_size": worker["max_batch_size"],
         "cache_transceiver_config": SimpleNamespace(**transceiver) if transceiver else None,
         "guided_decoding_backend": worker.get("guided_decoding_backend"),
+        "disable_overlap_scheduler": worker.get("disable_overlap_scheduler", False),
+        "cuda_graph_config": worker.get("cuda_graph_config"),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -343,6 +345,8 @@ def _ull_args(**overrides):
         "max_batch_size": 4,
         "cache_transceiver_config": SimpleNamespace(backend="NIXL"),
         "guided_decoding_backend": None,
+        "disable_overlap_scheduler": False,
+        "cuda_graph_config": SimpleNamespace(batch_sizes=[1, 2, 3, 4], enable_padding=True),
         "env_overrides": {"TRTLLM_DISAGG_ROLE": "generation"},
     }
     fields.update(overrides)
@@ -378,15 +382,17 @@ def test_ull_declines_the_implicit_moe_split() -> None:
             "enable_kv_pool_rebalance=False",
         ),
         (_ull_args(env_overrides={"TRTLLM_ENABLE_PDL": "0"}), "TRTLLM_ENABLE_PDL='0'"),
-        (_ull_args(cache_transceiver_config=None), "disaggregated generation server"),
+        (_ull_args(cache_transceiver_config=None), "cache_transceiver_config.backend"),
         (
             _ull_args(cache_transceiver_config=SimpleNamespace(backend=None)),
-            "disaggregated generation server",
+            "cache_transceiver_config.backend",
         ),
         (
             _ull_args(env_overrides={"TRTLLM_DISAGG_ROLE": "context"}),
             "disaggregated generation server",
         ),
+        (_ull_args(disable_overlap_scheduler=True), "disable_overlap_scheduler=False"),
+        (_ull_args(cuda_graph_config=None), "cuda_graph_config"),
         (_ull_args(guided_decoding_backend="xgrammar"), "guided_decoding_backend"),
         (
             _ull_args(moe_config=SimpleNamespace(backend="CUTLASS")),
