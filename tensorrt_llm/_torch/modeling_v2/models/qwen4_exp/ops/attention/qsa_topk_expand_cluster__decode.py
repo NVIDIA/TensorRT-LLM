@@ -5,6 +5,12 @@
 Each CTA holds a slice of the row's window in registers; radix passes (12, 11, 8 bits, top down)
 narrow to the threshold class, every CTA adding its histogram into every CTA's copy through
 distributed shared memory so the cluster narrows in step.
+
+`cowrite`: a CTA's selected blocks take consecutive positions of the row's block list, so the CTA
+first writes them into a shared position -> block map and then stores its stretch of
+`topk_indices` and of the token selection with all its threads, consecutive threads at
+consecutive columns, instead of each key's thread storing its block and its `compress_ratio`
+tokens at scattered columns. The same values at the same columns.
 """
 
 from __future__ import annotations
@@ -108,7 +114,18 @@ def geometry(width: int, cluster: int) -> tuple[int, int]:
 
 class _TopkExpandClusterKernel:
     def __init__(
-        self, *, width, key_stride, block_topk, compress, token_topk, pdl, cluster, solo=0, pairs=0
+        self,
+        *,
+        width,
+        key_stride,
+        block_topk,
+        compress,
+        token_topk,
+        pdl,
+        cluster,
+        solo=0,
+        pairs=0,
+        cowrite=False,
     ):
         self.width, self.key_stride, self.k, self.cr, self.token_topk, self.pdl = (
             width,
@@ -130,6 +147,10 @@ class _TopkExpandClusterKernel:
         self.solo = min(int(solo), self.cap) if cluster == 2 else 0
         self.pairs = int(pairs) if cluster == 2 else 0
         assert 0 <= self.pairs <= MAP_MAX_ROWS, pairs
+        #: The coalesced write (step 5): the position -> block map sits in the first pass's local
+        #: histogram, free once the passes are done.
+        self.cowrite = bool(cowrite)
+        assert not self.cowrite or block_topk <= _HIST, block_topk
 
     def smem_bytes(self) -> int:
         words = _HIST + sum(1 << bits for _, bits in _PASSES) + 32 + 32 + 32 * self.groups + 16
@@ -278,6 +299,52 @@ class _TopkExpandClusterKernel:
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
             self._narrow(merged, tidx, warp, lane, wsum, state, shift, bits)
+
+    @cute.jit
+    def _write_coalesced(
+        self, keys, pre, smap, mTopk, mSel, tidx, row, g_lo, base, skip, run, prefix, mask, seqlen
+    ):
+        """Step 5 with `cowrite`: this CTA's selected blocks hold positions `base .. base + m - 1`
+        (m = its keys above the class plus its class keys past `skip`). Each key's thread puts its
+        block at its position in `smap` (the first pass's local histogram, free once the passes are
+        done; no peer writes it), then all threads store `topk_indices[row, base .. base + m)` and
+        the token selection's `[base * cr, (base + m) * cr)`, consecutive threads at consecutive
+        columns: the values and columns of the scattered stores."""
+        nt: cutlass.Constexpr = self.threads
+        G: cutlass.Constexpr = self.groups
+        cr: cutlass.Constexpr = self.cr
+        for j in cutlass.range_constexpr(G):
+            gl = g_lo + j * nt + tidx
+            ab = pre[j] & 0xFFFF
+            cb = (pre[j] >> 16) & 0xFFFF
+            for c in cutlass.range_constexpr(KPT):
+                kv = keys[c, j]
+                if kv >= 0:
+                    mk = kv & mask
+                    sel = cutlass.Int32(0)
+                    pos = cutlass.Int32(0)
+                    if mk > prefix:
+                        sel = cutlass.Int32(1)
+                        pos = ab + cutlass.max(cb - skip, cutlass.Int32(0))
+                        ab = ab + 1
+                    if mk == prefix:
+                        if cb >= skip:
+                            sel = cutlass.Int32(1)
+                            pos = ab + cb - skip
+                        cb = cb + 1
+                    if sel == 1:
+                        smap[pos] = gl * KPT + c
+        cute.arch.sync_threads()
+        m = (run & 0xFFFF) + ((run >> 16) & 0xFFFF) - skip
+        for i in cutlass.range(tidx, m, nt):
+            mTopk[row, base + i] = smap[i]
+        for i in cutlass.range(tidx, m * cr, nt):
+            blk = i // cr
+            tok = smap[blk] * cr + (i - blk * cr)
+            val = cutlass.Int32(-1)
+            if tok < seqlen:
+                val = tok
+            mSel[row, base * cr + i] = val
 
     @cute.kernel
     def kernel(self, mKeys, mEnd, mPos, mLen, mTopk, mSel, ld_keys: cute.CopyAtom):
@@ -577,34 +644,52 @@ class _TopkExpandClusterKernel:
                     skip = e_r - take
 
         # 5. Each selected block at its position, with its tokens below the sequence length.
-        for j in cutlass.range_constexpr(G):
-            gl = g_lo + j * nt + tidx
-            ab = pre[j] & 0xFFFF
-            cb = (pre[j] >> 16) & 0xFFFF
-            for c in cutlass.range_constexpr(KPT):
-                kv = keys[c, j]
-                if kv >= 0:
-                    mk = kv & mask
-                    sel = cutlass.Int32(0)
-                    pos = cutlass.Int32(0)
-                    if mk > prefix:
-                        sel = cutlass.Int32(1)
-                        pos = base + ab + cutlass.max(cb - skip, cutlass.Int32(0))
-                        ab = ab + 1
-                    if mk == prefix:
-                        if cb >= skip:
+        if const_expr(self.cowrite):
+            self._write_coalesced(
+                keys,
+                pre,
+                local,
+                mTopk,
+                mSel,
+                tidx,
+                row,
+                g_lo,
+                base,
+                skip,
+                run,
+                prefix,
+                mask,
+                seqlen,
+            )
+        else:
+            for j in cutlass.range_constexpr(G):
+                gl = g_lo + j * nt + tidx
+                ab = pre[j] & 0xFFFF
+                cb = (pre[j] >> 16) & 0xFFFF
+                for c in cutlass.range_constexpr(KPT):
+                    kv = keys[c, j]
+                    if kv >= 0:
+                        mk = kv & mask
+                        sel = cutlass.Int32(0)
+                        pos = cutlass.Int32(0)
+                        if mk > prefix:
                             sel = cutlass.Int32(1)
-                            pos = base + ab + cb - skip
-                        cb = cb + 1
-                    if sel == 1:
-                        col = gl * KPT + c
-                        mTopk[row, pos] = col
-                        for tt in cutlass.range_constexpr(cr):
-                            tok = col * cr + tt
-                            val = cutlass.Int32(-1)
-                            if tok < seqlen:
-                                val = tok
-                            mSel[row, pos * cr + tt] = val
+                            pos = base + ab + cutlass.max(cb - skip, cutlass.Int32(0))
+                            ab = ab + 1
+                        if mk == prefix:
+                            if cb >= skip:
+                                sel = cutlass.Int32(1)
+                                pos = base + ab + cb - skip
+                            cb = cb + 1
+                        if sel == 1:
+                            col = gl * KPT + c
+                            mTopk[row, pos] = col
+                            for tt in cutlass.range_constexpr(cr):
+                                tok = col * cr + tt
+                                val = cutlass.Int32(-1)
+                                if tok < seqlen:
+                                    val = tok
+                                mSel[row, pos * cr + tt] = val
 
         # 6. Over the cluster's threads (this CTA's alone): the block list's -1 padding, then the
         # causal tail and -1.
@@ -648,11 +733,13 @@ def launch(
     out=None,
     solo_blocks=0,
     pairs=0,
+    cowrite=False,
 ):
     """Writes `topk_indices`; returns the int32 token selection (`out` when given). In clusters
     of 2 (past `MAX_ROWS` rows) a row of at most `solo_blocks` blocks takes one CTA alone, and
     `pairs` P > 0 maps up to `MAP_MAX_ROWS` rows onto P clusters (`_row_map`); both change the
-    work's placement only, never the selection. Ignored in clusters of 4 or 8."""
+    work's placement only, never the selection. Ignored in clusters of 4 or 8. `cowrite`: the
+    selected blocks and tokens are stored through a shared map, coalesced (the same values)."""
     rows, width = scores.shape
     block_topk = topk_indices.shape[1]
     sel = out
@@ -681,7 +768,7 @@ def launch(
         cluster,
         int(solo_blocks),
         int(pairs),
-    )
+    ) + (("cowrite",) if cowrite else ())
     ptrs = (
         row_ends.data_ptr(),
         query_positions.data_ptr(),
@@ -702,6 +789,7 @@ def launch(
             cluster=cluster,
             solo=int(solo_blocks),
             pairs=int(pairs),
+            cowrite=bool(cowrite),
         )
         fn = _COMPILED[key] = cute.compile(
             kernel,
@@ -957,6 +1045,7 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         out=None,
         solo_blocks=0,
         pairs=0,
+        cowrite=False,
     ):
         return launch(
             scores,
@@ -969,6 +1058,7 @@ class QsaTopkExpandClusterDecode(OpWrapper):
             out=out,
             solo_blocks=solo_blocks,
             pairs=pairs,
+            cowrite=cowrite,
         )
 
     def reference(
@@ -983,9 +1073,11 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         out=None,
         solo_blocks=0,
         pairs=0,
+        cowrite=False,
     ):
-        """`(topk_indices_after, selection)` via a stable descending sort per row; ignores `out`
-        and the placement knobs (`solo_blocks`, `pairs`), which do not change the result."""
+        """`(topk_indices_after, selection)` via a stable descending sort per row; ignores `out`,
+        the placement knobs (`solo_blocks`, `pairs`) and the write form (`cowrite`), which do not
+        change the result."""
         rows, _ = scores.shape
         k = topk_indices.shape[1]
         device = scores.device
@@ -1030,7 +1122,9 @@ class QsaTopkExpandClusterDecode(OpWrapper):
         out=None,
         solo_blocks=0,
         pairs=0,
+        cowrite=False,
     ):
+        assert not cowrite or topk_indices.shape[1] <= _HIST, "cowrite: k <= 4096"
         assert int(solo_blocks) >= 0 and 0 <= int(pairs) <= MAP_MAX_ROWS, (
             "solo_blocks >= 0, pairs in 0..MAP_MAX_ROWS"
         )
