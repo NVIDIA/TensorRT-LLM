@@ -738,66 +738,6 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     assert captured.metadata.max_num_requests == 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.inference_mode()
-def test_qwen3_vision_replays_image_and_video_without_uploading_lengths(monkeypatch):
-    config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
-    vision_config = config.vision_config
-    vision_config.depth = 1
-    vision_config.deepstack_visual_indexes = []
-    vision_config.hidden_size = vision_config.out_hidden_size = 144
-    vision_config.intermediate_size = 576
-    vision_config.num_heads = 2
-    model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
-    encoder = Qwen3VisionModelBase(model_config, Qwen3VisionModel).cuda().eval()
-    torch.manual_seed(0)
-    for weight in encoder.parameters():
-        weight.normal_(std=0.02)
-    vision = encoder.visual
-    vision.setup_attn_metadata(2048)
-    requests = []
-    for modality, grid in (
-        ("image", [1, 16, 16]),
-        ("video", [2, 16, 16]),
-        ("image", [1, 16, 24]),
-        ("video", [1, 16, 20]),
-    ):
-        num_patches = int(np.prod(grid))
-        pixels = torch.randn(num_patches, 3 * 2 * 16 * 16, device="cuda")
-        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
-        requests.append(
-            MultimodalParams(
-                multimodal_data={
-                    modality: {pixel_key: pixels, f"{modality}_grid_thw": torch.tensor([grid])},
-                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                        [(modality, 0)], output_embedding_lengths=[num_patches // 4]
-                    ),
-                }
-            )
-        )
-    eager = torch.cat([encoder([request])[0] for request in requests])
-    vision.enable_blocks_cuda_graph(
-        MultimodalEncoderCudaGraphConfig(buckets=[(1024, 2), (1024, 3)])
-    )
-    captured = vision._blocks_graph_runner._captured
-    length_buffers = {graph.metadata.seq_lens_cuda.data_ptr() for graph in captured.values()}
-    copy_tensor = torch.Tensor.copy_
-
-    def check_copy(dst, src, *args, **kwargs):
-        if src.device.type == "cpu" and dst.is_cuda and dst.data_ptr() in length_buffers:
-            pytest.fail("Graph replay uploaded lengths already available on the device")
-        return copy_tensor(dst, src, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "copy_", check_copy)
-    monkeypatch.setattr(
-        vision, "_run_encoder_blocks", lambda *a, **kw: pytest.fail("Eager fallback")
-    )
-    (actual,) = encoder(requests)
-    assert captured[(1025, 3)].metadata.seq_lens_cuda.tolist() == [256, 384, 385]
-    assert captured[(1025, 4)].metadata.seq_lens_cuda.tolist() == [256, 256, 320, 193]
-    torch.testing.assert_close(actual, eager, rtol=5e-2, atol=5e-2)
-
-
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("support_fused_qkv", [True, False])
 @pytest.mark.parametrize("rope_impl", ["torch", "flash_attn", "flashinfer"])

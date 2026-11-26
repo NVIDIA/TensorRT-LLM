@@ -11,12 +11,10 @@ from tensorrt_llm._torch.attention import attention as trtllm_attention
 from tensorrt_llm._torch.attention.backends import interface as attention_interface
 from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
-    MultimodalEncoderMixin,
-    prepare_encoder_attn_metadata,
-)
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
+from tensorrt_llm._utils import prefer_pinned
 
 
 class PixtralAttention(trtllm_attention.Attention):
@@ -262,10 +260,16 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
         modeling_utils._load_weights_impl(self, weights)
 
     def _prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
+        request_ids = list(range(1, batch_size + 1))
+        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=prefer_pinned())
+
+        self.attn_metadata.num_contexts = batch_size
+        self.attn_metadata.request_ids = request_ids
         self.attn_metadata.prompt_lens = seq_lengths
-        return prepare_encoder_attn_metadata(
-            seq_lengths, self.attn_metadata, max_seq_len=max(seq_lengths)
-        )
+        self.attn_metadata.seq_lens = seq_lens
+        self.attn_metadata.max_seq_len = max(seq_lengths)
+        self.attn_metadata.prepare()
+        return self.attn_metadata
 
 
 class _RopeFunction:

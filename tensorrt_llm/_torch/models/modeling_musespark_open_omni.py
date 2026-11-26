@@ -796,7 +796,8 @@ def validate_vision_segment_lengths(mm_data: Dict[str, Any], max_seq_len: int) -
     where the executor's error handling fails every request in the scheduled
     batch, so the same arithmetic runs here too, per request, before
     scheduling. The grids are host tensors the input processor computed, so
-    this is a cheap host read.
+    this is a cheap host read. The message matches the tower's so clients see
+    the same error text wherever the condition is caught.
     """
     if not isinstance(mm_data, dict) or max_seq_len <= 0:
         return
@@ -993,7 +994,7 @@ def _items_in_prompt_order(params: Any) -> List[Tuple[str, Any]]:
 
 
 class MuseSparkOpenVisionEncoder(nn.Module):
-    """Runs each modality across requests and returns embeddings in prompt order.
+    """Runs the towers once over every media item in the batch.
 
     Despite the name this is the model's whole perception side: the packed
     NaViT vision tower plus, when the config enables it, the `wav_ae` audio
@@ -1028,37 +1029,67 @@ class MuseSparkOpenVisionEncoder(nn.Module):
         if not ordered:
             return torch.empty(0)
 
-        by_modality: Dict[str, List[Any]] = {}
+        pixel_values, grids, waveforms = [], [], []
         for modality, payload in ordered:
-            by_modality.setdefault(modality, []).append(payload)
+            if modality == "audio":
+                waveforms.append(payload)
+            else:
+                values, grid = payload
+                pixel_values.append(values)
+                grids.append(grid)
 
-        item_embeddings = {}
-        for modality, _ in _VISION_MODALITIES:
-            items = by_modality.get(modality)
-            if not items:
-                continue
-            pixel_values, grids = zip(*items)
-            pixels = pixel_values[0] if len(items) == 1 else torch.cat(pixel_values)
-            grid = grids[0] if len(items) == 1 else torch.cat(grids)
-            embeddings = self.tower(pixels.to(dtype=self.tower.dtype), grid)
-            if len(by_modality) == 1:
-                return embeddings
-            lengths = [
-                num_placeholder_rows(item_grid[0].tolist(), self._vision_config)
-                for item_grid in grids
-            ]
-            item_embeddings[modality] = iter(embeddings.split(lengths))
+        vision_rows = None
+        if pixel_values:
+            # The preprocessing normalizes `(x/255 - 0.5)/0.5` in fp32, the
+            # reference's arithmetic, and the engine stages `pixel_values` to
+            # the device without changing its dtype, so the cast to the tower's
+            # dtype happens here.
+            packed = torch.cat(pixel_values, dim=0).to(dtype=self.tower.dtype)
+            # One tower pass for the whole vision batch: the tower is packed
+            # variable-resolution, so per-item passes would only add launches.
+            vision_rows = self.tower(packed, torch.cat(grids, dim=0))
+        if not waveforms:
+            return vision_rows
 
-        if "audio" in by_modality:
-            if self.audio_tower is None:
-                raise ValueError(
-                    "audio items reached the encoder but the config does not enable "
-                    "the waveform encoder (audio_perception_modality_args.input_mode != 'wav')"
+        if self.audio_tower is None:
+            # The input processor refuses audio when the config disables it,
+            # so reaching here means data arrived through a path that skipped
+            # it. Refuse rather than drop: a silently dropped clip answers
+            # from text alone with no error anywhere.
+            raise ValueError(
+                "audio items reached the encoder but the config does not enable "
+                "the waveform encoder (audio_perception_modality_args.input_mode "
+                "!= 'wav')"
+            )
+        # Per-clip passes: clips have unequal lengths and each is padded
+        # independently to its own multiple of 1920. The tower casts the
+        # float32 waveform to its own dtype (BF16).
+        audio_rows = self.audio_tower(waveforms)
+        if vision_rows is None:
+            return torch.cat(audio_rows, dim=0)
+
+        # Interleave back into prompt order. The vision tower emitted its rows
+        # in the order its items appear in `ordered`; per-item row counts
+        # come from the grids, a host read (see _per_item_chunks).
+        rows: List[torch.Tensor] = []
+        vision_offset, audio_index = 0, 0
+        for modality, payload in ordered:
+            if modality == "audio":
+                rows.append(audio_rows[audio_index])
+                audio_index += 1
+            else:
+                _, grid = payload
+                count = num_placeholder_rows(
+                    [int(x) for x in grid.reshape(-1)], self._vision_config
                 )
-            item_embeddings["audio"] = iter(self.audio_tower(by_modality["audio"]))
-
-        embeddings = [next(item_embeddings[modality]) for modality, _ in ordered]
-        return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings)
+                rows.append(vision_rows[vision_offset : vision_offset + count])
+                vision_offset += count
+        if vision_offset != vision_rows.shape[0]:
+            raise ValueError(
+                f"vision tower emitted {vision_rows.shape[0]} rows but the grids "
+                f"describe {vision_offset}; the interleave would misalign audio"
+            )
+        return torch.cat(rows, dim=0)
 
 
 @register_vision_encoder(MuseSparkOpenVisionEncoder)
@@ -1246,7 +1277,7 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
         ]
 
     def encode_multimodal_inputs(self, multimodal_params: List[Any]) -> torch.Tensor:
-        """The mixin's uniform encoder entry: one vision tower pass per modality.
+        """The mixin's uniform encoder entry: one tower pass over the batch.
 
         Called by the startup KV-cache profiler, which runs the encoder at the
         scheduling limits so the towers' activations land in the measured

@@ -5,8 +5,6 @@ import gc
 import pathlib
 import pickle
 import sys
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import get_context
 
 import cloudpickle
 import mpi4py
@@ -117,48 +115,6 @@ def test_pixtral_vision_model_vs_hf():
         )
 
     torch.testing.assert_close(out, hf_out, atol=0.2, rtol=0.2)
-
-
-@pytest.mark.parametrize("backend", ["TRTLLM", "VANILLA", "FLASHINFER"])
-def test_pixtral_uniform_shapes_reuse_device_attention_offsets(backend):
-    with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as process:
-        process.submit(_check_uniform_shape_offsets, backend).result()
-
-
-@torch.inference_mode()
-def _check_uniform_shape_offsets(backend):
-    from torch.profiler import ProfilerActivity, profile
-
-    config = transformers.PixtralVisionConfig(
-        hidden_size=256,
-        num_attention_heads=2,
-        head_dim=128,
-        image_size=128,
-        patch_size=16,
-        intermediate_size=512,
-        num_hidden_layers=1,
-        dtype=torch.bfloat16,
-        hidden_act="silu",
-    )
-    tower = (
-        modeling_pixtral.PixtralVisionModel(
-            model_config_lib.ModelConfig(pretrained_config=config, attn_backend=backend)
-        )
-        .to(device="cuda", dtype=torch.bfloat16)
-        .eval()
-    )
-    tower.setup_attn_metadata(max_num_tokens=32)
-    inputs = [
-        (torch.ones(2, 3, h, w, device="cuda", dtype=torch.bfloat16), torch.tensor([[h, w]] * 2))
-        for h, w in ((32, 48), (64, 32))
-    ]
-    with profile(activities=[ProfilerActivity.CUDA]) as trace:
-        outputs = [tower(pixels, sizes) for pixels, sizes in inputs]
-        torch.cuda.synchronize()
-    assert [len(out) for out in outputs] == [12, 16]
-    cuda_events = [event for event in trace.events() if event.device_type.name == "CUDA"]
-    assert any(not event.name.lower().startswith(("memcpy", "memset")) for event in cuda_events)
-    assert not any("HtoD" in event.name for event in cuda_events)
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

@@ -40,7 +40,7 @@ from tensorrt_llm._torch.models.musespark_open_vision import (
     VISION_PROJECTION_CKPT_KEY,
     MuseSparkOpenNaViTVisionTower,
     MuseSparkOpenVisionAttention,
-    _pixel_unshuffle,
+    _pixel_shuffle_permutation,
     _window_geometry,
     apply_rope_2d,
     precompute_rope_freqs_cis,
@@ -801,21 +801,14 @@ class TestForward:
                     assert folded[b, f * r2 + s] == x[b * r2 + s, f]
 
     def test_pixel_shuffle_permutation_groups_2x2_blocks(self):
-        pixels = torch.arange(2 * 4 * 6 * 3).reshape(-1, 3)
-        merged = _pixel_unshuffle(pixels, 2, 4, 6, 2)
-        expected = torch.stack(
-            [
-                pixels.reshape(2, 4, 6, 3)[t, h : h + 2, w : w + 2].permute(2, 0, 1).reshape(-1)
-                for t in range(2)
-                for h in range(0, 4, 2)
-                for w in range(0, 6, 2)
-            ]
-        )
-        torch.testing.assert_close(merged, expected)
+        perm = _pixel_shuffle_permutation(4, 4, 2)
+        assert sorted(perm.tolist()) == list(range(16))
+        # First group is the top-left 2x2 block of a row-major 4x4 grid.
+        assert perm[:4].tolist() == [0, 1, 4, 5]
 
     def test_odd_grid_is_rejected(self):
         with pytest.raises(ValueError, match="downsample_factor"):
-            _pixel_unshuffle(torch.empty(12, 3), 1, 3, 4, 2)
+            _pixel_shuffle_permutation(3, 4, 2)
 
     def test_adapter_activates_twice(self, tiny_tower):
         torch.manual_seed(1)

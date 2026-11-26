@@ -503,14 +503,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 "Cross-attention with fused QKV input is not supported: pass "
                 "Q, K, V as separate tensors when metadata.is_cross is True.")
         max_seqlen_q = int(seqlens_q.max().item())
-        # The device mirror tracks the same lengths as the CPU view, including
-        # when the encoder changes shape between successive tower calls.
-        lengths = metadata.seq_lens_cuda
-        if lengths is None or lengths.device != q.device:
-            lengths = seqlens_q.to(q.device)
-        cu_seqlens_q = F.pad(
-            torch.cumsum(lengths[:len(seqlens_q)], dim=0, dtype=torch.int32),
-            (1, 0))
+        cu_seqlens_q = F.pad(torch.cumsum(seqlens_q, dim=0, dtype=torch.int32),
+                             (1, 0)).to(q.device)
         if is_cross:
             assert seqlens_kv is not None, (
                 "metadata.seq_lens_kv must be set for cross-attention "

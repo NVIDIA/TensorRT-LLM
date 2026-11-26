@@ -1444,17 +1444,7 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         metadata: AttentionMetadata,
         padded_seq_lengths: Sequence[int],
     ) -> None:
-        vision = self._vision
-        prepare_encoder_attn_metadata(
-            list(padded_seq_lengths),
-            metadata,
-            max_seq_len=vision._fixed_max_seq_len,
-            live_seq_lens_cuda=(
-                vision.attn_metadata.seq_lens_cuda
-                if vision._blocks_graph_runner is not None
-                else None
-            ),
-        )
+        self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
 
 def _qwen3vl_prepare_pixels(value: torch.Tensor, bucket: dict[str, Any]) -> torch.Tensor:

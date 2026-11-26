@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM configuration, loading and vision ownership regressions without checkpoint files."""
 
-from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
-from multiprocessing import get_context
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, create_autospec, patch
 
@@ -482,59 +480,6 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
     assert metadata.item_refs == tuple(("image", i) for i in range(num_images))
     assert metadata.encoder_token_lengths == (16,) * num_images
     assert metadata.output_embedding_lengths == (4,) * num_images
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_mixed_host_vision_groups_fit_transfer_budget():
-    with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as process:
-        process.submit(_check_mixed_host_vision_transfers).result()
-
-
-@torch.inference_mode()
-def _check_mixed_host_vision_transfers():
-    from tensorrt_llm._torch.models.modeling_glm5_next_vision import _glm5_next_build_batched_input
-    from tensorrt_llm.inputs.multimodal import (
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-        MultimodalItemMetadata,
-        MultimodalParams,
-    )
-
-    model = Glm5NextVisionModelBase(ModelConfig(pretrained_config=_config())).cuda().eval()
-    model.visual.setup_attn_metadata(max_num_tokens=128)
-    torch.manual_seed(17)
-    for weight in model.parameters():
-        weight.normal_(0, 0.01)
-    data = {}
-    refs = []
-    lengths = []
-    for modality, grids, key in (
-        ("image", [[1, 4, 4], [1, 4, 6]], "pixel_values"),
-        ("video", [[1, 4, 4], [2, 4, 6]], "pixel_values_videos"),
-    ):
-        grid = torch.tensor(grids)
-        patches = grid.prod(dim=1)
-        data[modality] = {
-            key: torch.randn(int(patches.sum()), 24, dtype=torch.bfloat16),
-            f"{modality}_grid_thw": grid,
-        }
-        refs.extend((modality, i) for i in range(len(grids)))
-        lengths.extend((patches // 4).tolist())
-    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-        refs, output_embedding_lengths=lengths
-    )
-    params = [MultimodalParams(multimodal_data=data)]
-    expected = model.encode_batched(**_glm5_next_build_batched_input(params))
-    model(params)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-    ) as trace:
-        (output,) = model(params)
-        torch.cuda.synchronize()
-    copies = [e for e in trace.events() if e.name.startswith("Memcpy HtoD")]
-    # One upload holds both pixel batches. Each tower's segment lengths vary.
-    assert len(copies) == 3
-    torch.testing.assert_close(output, expected, rtol=0.02, atol=0.01)
-    assert len(output) == sum(lengths)
 
 
 def _materialize_meta(module: torch.nn.Module) -> None:
