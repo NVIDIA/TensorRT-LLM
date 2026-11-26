@@ -380,18 +380,23 @@ async def _drain_attached_frontends(
 
     SIGTERM starts each frontend's graceful shutdown. Frontends still running
     drain_timeout_s plus a 10 s grace later, or once force_exit() is true, are
-    killed. Without drain_timeout_s the drain has no deadline, as each server's
-    own graceful shutdown waits for every request then: a frontend that never
-    exits is ended by a second Ctrl-C (force_exit()) or by the outer kill.
-    poll() reaps every frontend, killed ones included, so the event loop keeps
-    serving until the last one exits.
+    killed. Without drain_timeout_s, a frontend's own server waits for every
+    request, so they are killed 30 s after SIGTERM: one that never exits cannot
+    hold the engine's shutdown up. poll() reaps every frontend, killed ones
+    included, so the event loop keeps serving until the last one exits.
     """
     for child in children:
         child.terminate()
-    deadline = None if drain_timeout_s is None else time.monotonic() + drain_timeout_s + 10
+    wait_s = 30 if drain_timeout_s is None else drain_timeout_s + 10
+    deadline = time.monotonic() + wait_s
     killed = False
     while any(child.poll() is None for child in children):
-        if not killed and (force_exit() or (deadline is not None and time.monotonic() >= deadline)):
+        if not killed and (force_exit() or time.monotonic() >= deadline):
+            if drain_timeout_s is None and not force_exit():
+                logger.warning(
+                    f"Killing the attached serving frontends still running {wait_s} s after "
+                    "SIGTERM; set serve_graceful_shutdown_timeout_s to let them drain longer."
+                )
             for child in children:
                 child.kill()
             killed = True

@@ -18,7 +18,7 @@ import traceback
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import copy_context
 from datetime import datetime
 from http import HTTPStatus
@@ -628,11 +628,64 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
 _InputProcessingResult = TypeVar("_InputProcessingResult")
 
 
+class _LauncherSocketServer(uvicorn.Server):
+    """Serves the app to the attached frontends on the launcher's Unix socket.
+
+    It serves while the app is up: the lifespan starts it once its startup is
+    done and stops it before it shuts the engine down. Only the HTTP server
+    handles shutdown signals, and the HTTP server stops when this one fails.
+    """
+
+    def __init__(self, config: uvicorn.Config, sockets: list[socket.socket],
+                 http_server: uvicorn.Server) -> None:
+        super().__init__(config)
+        self._sockets = sockets
+        self._http_server = http_server
+        self._serving: Optional[asyncio.Task] = None
+
+    @contextmanager
+    def capture_signals(self):
+        yield
+
+    async def start(self) -> None:
+        """Start serving; return once it serves, or raise why it could not."""
+        self._serving = asyncio.create_task(self._serve_until_stopped())
+        while not self.started and not self._serving.done():
+            await asyncio.sleep(0.01)
+        if self._serving.done():
+            self._serving.result()
+
+    async def stop(self, force: bool = False) -> None:
+        """Stop serving; force skips waiting for the requests still open.
+
+        A failure of the server is left to raise_failure().
+        """
+        if self._serving is None:
+            return
+        self.should_exit = True
+        self.force_exit = self.force_exit or force
+        await asyncio.wait([self._serving])
+
+    def raise_failure(self) -> None:
+        """Raise the error the server failed with, if it failed."""
+        if (self._serving is not None and self._serving.done()
+                and not self._serving.cancelled()
+                and self._serving.exception() is not None):
+            raise self._serving.exception()
+
+    async def _serve_until_stopped(self) -> None:
+        try:
+            await self.serve(sockets=self._sockets)
+        finally:
+            self._http_server.should_exit = True
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     # Class defaults, so a server built without __init__ serves alone.
     _stop_attached_frontends: Optional[Callable[..., Awaitable]] = None
     _attached_frontends_stopped: Optional[asyncio.Task] = None
+    _launcher_socket_server: Optional["_LauncherSocketServer"] = None
 
     @staticmethod
     def _iteration_stats_buffer_maxlen(
@@ -924,14 +977,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.encode_batcher.start()
                 logger.info("Started encode dynamic batcher")
 
+            if self._launcher_socket_server is not None:
+                await self._launcher_socket_server.start()
+
             yield
 
             try:
-                if self._attached_frontends_stopped is not None:
-                    # The engine serves the attached frontends' requests until
-                    # they exit. A drain that raises still shuts the engine
-                    # down; the launcher terminates the frontends that remain.
-                    await self._attached_frontends_stopped
+                await self._stop_attached_serving()
             finally:
                 await self._perf_metrics_writer.close()
                 for task in (self._launcher_watchdog_task,
@@ -4625,38 +4677,56 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._stop_attached_frontends is None:
             await server.serve(sockets=sockets)
             return
-        self._attached_frontends_stopped = asyncio.create_task(
-            self._stop_attached_frontends_on_shutdown(server))
         # The attached frontends reach the launcher's /health and forwarded
         # routes on its Unix socket. A server of its own keeps that socket open
-        # while they drain. It starts first, so the main server installs its
-        # signal handlers last and receives a shutdown signal first. Once a
-        # server stops, uvicorn passes the signal on to the handler it replaced.
-        launcher_uds = [s for s in sockets if s.family == socket.AF_UNIX]
-        sockets = [s for s in sockets if s.family != socket.AF_UNIX]
-        launcher_server = uvicorn.Server(
+        # while they drain; the lifespan runs it.
+        self._launcher_socket_server = _LauncherSocketServer(
             uvicorn.Config(self.app,
                            lifespan="off",
                            log_level="info",
                            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-                           **config_kwargs))
-
-        async def serve_http() -> None:
-            try:
-                await server.serve(sockets=sockets)
-            finally:
-                launcher_server.should_exit = True
-
-        await asyncio.gather(launcher_server.serve(sockets=launcher_uds),
-                             serve_http())
+                           **config_kwargs),
+            sockets=[s for s in sockets if s.family == socket.AF_UNIX],
+            http_server=server)
+        sockets = [s for s in sockets if s.family != socket.AF_UNIX]
+        self._attached_frontends_stopped = asyncio.create_task(
+            self._stop_attached_frontends_on_shutdown(server))
+        try:
+            await server.serve(sockets=sockets)
+        finally:
+            # serve() can end without a lifespan shutdown, e.g. on a forced
+            # exit or a failed startup. The launcher then terminates the
+            # attached frontends that remain.
+            self._attached_frontends_stopped.cancel()
+            await self._launcher_socket_server.stop(force=True)
+            await asyncio.wait([self._attached_frontends_stopped])
+            self._launcher_socket_server.raise_failure()
 
     async def _stop_attached_frontends_on_shutdown(
             self, server: uvicorn.Server) -> None:
         """Stop the attached frontends once uvicorn begins its shutdown.
 
         They drain their requests while this frontend drains its own. The
-        lifespan shutdown awaits this before it shuts the engine down.
+        lifespan shutdown awaits this before it shuts the engine down; if
+        serve() ends first, __call__ cancels it.
         """
         while not server.should_exit:
             await asyncio.sleep(0.1)
         await self._stop_attached_frontends(lambda: server.force_exit)
+
+    async def _stop_attached_serving(self) -> None:
+        """Wait for the attached frontends to exit, then close the launcher's socket.
+
+        The engine serves the attached frontends' requests until they exit. A
+        drain that raises still closes the socket and lets the lifespan shut
+        the engine down; the launcher terminates the frontends that remain.
+        """
+        drained = False
+        try:
+            if self._attached_frontends_stopped is not None:
+                await self._attached_frontends_stopped
+            drained = True
+        finally:
+            if self._launcher_socket_server is not None:
+                # Frontends that did not drain may still hold requests open.
+                await self._launcher_socket_server.stop(force=not drained)

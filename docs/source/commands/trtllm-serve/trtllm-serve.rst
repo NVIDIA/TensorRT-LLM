@@ -104,6 +104,7 @@ A server can still have request handlers running when it is told to stop, for ex
 .. note::
 
    * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
+   * With several frontends, the launcher keeps the engine up while the other frontends drain, and kills those still running ``N + 10`` seconds after the shutdown signal, or 30 seconds after it when the setting is off.
    * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
 
 Inference Endpoints
