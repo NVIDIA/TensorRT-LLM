@@ -827,7 +827,9 @@ def test_one_slow_pass_of_one_design_leaves_the_read_cost(monkeypatch):
 def test_forced_routes_realize_a_design_with_distinct_slots_per_token():
     g = SimpleNamespace(ep=4, M=5, T=6, K=3, tile=4)
     for x in calibrate.make_designs(g, 20, np.random.default_rng(0)):
-        ids = np.stack([calibrate.forced_routes(x, rank, g.K) for rank in range(g.ep)])
+        per_rank = [calibrate.forced_routes(x, rank, g.K) for rank in range(g.ep)]
+        assert all(r.flags.c_contiguous for r in per_rank)
+        ids = np.stack(per_rank)
         assert ids.shape == (g.ep, g.T, g.K)
         assert (np.bincount(ids.ravel(), minlength=x.size).reshape(x.shape) == x).all()
         assert (np.diff(np.sort(ids, -1), axis=-1) > 0).all()

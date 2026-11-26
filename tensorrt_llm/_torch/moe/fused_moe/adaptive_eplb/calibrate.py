@@ -195,7 +195,7 @@ def forced_routes(x: np.ndarray, rank: int, top_k: int) -> np.ndarray:
     column by column, a token's ``top_k`` slots are distinct.
     """
     rows = np.repeat(np.arange(x.size), x.ravel())[rank :: len(x)]
-    return rows.reshape(top_k, -1).T
+    return np.ascontiguousarray(rows.reshape(top_k, -1).T)
 
 
 def model_terms(xs: np.ndarray, tile_rows: int) -> np.ndarray:
@@ -345,7 +345,7 @@ class LiveTimer:
     def _route(self, experts, table, weights, stats) -> torch.Tensor:
         staging = self.backend.route_staging(*experts.shape, experts.device)
         if staging is None:
-            out = torch.empty_like(experts, dtype=self.backend.slot_id_dtype)
+            out = experts.new_empty(experts.shape, dtype=self.backend.slot_id_dtype)
             pair, word = (None, None), None
         else:
             out, pair = staging.topk_idx, (weights, staging.topk_weights)

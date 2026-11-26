@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from _torch.moe import adaptive_eplb_reference as reference
 
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import calibrate
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertStatistics,
     RouteTables,
@@ -309,3 +312,37 @@ def test_route_into_op_rejects_statistics_of_another_expert_count(num_experts):
         torch.ops.trtllm.adaptive_eplb_route_into(
             ids, *device_tables, 3, out, None, None, *_stats(num_experts), True
         )
+
+
+@needs_gpu
+def test_live_timer_fixed_routes_when_backend_stages_nothing():
+    """A bucket whose inputs are read in place returns no route staging; LiveTimer.fixed still
+    routes home designs into contiguous buffers under inference mode."""
+    seen = []
+
+    def time_decode_steps(tokens, steps, *, warmup, iters):
+        with torch.inference_mode():
+            for step in steps:
+                ids = step()
+                assert ids.shape == (tokens, TOP_K) and ids.is_contiguous()
+                seen.append(ids.clone())
+        return [1.0] * len(steps), 1.0
+
+    backend = SimpleNamespace(
+        slot_id_dtype=torch.int32,
+        route_staging=lambda *_: None,
+        time_decode_steps=time_decode_steps,
+    )
+    settings = calibrate.Settings(
+        designs=4, fixed_designs=2, reps=1, warmup=0, iters=1, holdout_z=3.0
+    )
+    timer = calibrate.LiveTimer(
+        backend, rank=0, num_experts=384, settings=settings, gather=lambda v: [v]
+    )
+    rng = np.random.default_rng(7)
+    homes = SimpleNamespace(ep=32, M=12, T=32, K=TOP_K, tile=256)
+    own = calibrate.make_designs(homes, 2, rng)
+    padded = np.concatenate([own, np.zeros((*own.shape[:2], 4), int)], 2)
+    y = timer.fixed(32, TOP_K, padded)
+    assert y.shape == (1, 2, len(calibrate.FIXED_PARTS)) and np.isfinite(y).all()
+    assert len(seen) == 2 * len(calibrate.FIXED_PARTS)
