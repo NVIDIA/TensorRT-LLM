@@ -234,6 +234,12 @@ class HttpClusterStorageServer(ClusterStorage):
     # Granularity at which the expiry sweep samples the event loop.
     _OUTAGE_SAMPLE_SEC = 0.1
 
+    # Each record describes a worker. Bound both the individual record and the
+    # number retained by this process; existing workers can renew at capacity.
+    MAX_RECORDS = 4096
+    MAX_KEY_BYTES = 1024
+    MAX_VALUE_BYTES = 64 << 10
+
     def __init__(self,
                  cluster_uri,
                  cluster_name,
@@ -321,7 +327,17 @@ class HttpClusterStorageServer(ClusterStorage):
         return await self._set(storage_item)
 
     async def _set(self, storage_item: StorageItem) -> bool:
+        value = storage_item.value or ""
+        if (len(storage_item.key) > self.MAX_KEY_BYTES
+                or len(value) > self.MAX_VALUE_BYTES
+                or len(storage_item.key.encode("utf-8")) > self.MAX_KEY_BYTES
+                or len(value.encode("utf-8")) > self.MAX_VALUE_BYTES):
+            return False
         async with self._lock:
+            if len(
+                    self._storage
+            ) >= self.MAX_RECORDS and storage_item.key not in self._storage:
+                return False
             if storage_item.key in self._storage and not storage_item.overwrite_if_exists:
                 return False
             if storage_item.expire_time < 0 and storage_item.ttl and storage_item.ttl > 0:

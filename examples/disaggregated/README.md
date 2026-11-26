@@ -583,7 +583,7 @@ disagg_cluster:
   # cert_cert: /path/to/client-cert.pem
   # record_auth_key: <shared secret>
 ```
-- `cluster_uri`: the http address of disagg-server like `http://<your-disagg-server-host>:<your-disagg-server-port>` or a pre-configured Etcd server address like `etcd://<your-etcd-host>:2379`.
+- `cluster_uri`: the http address of disagg-server like `http://<your-disagg-server-host>:<your-disagg-server-port>` or a pre-configured Etcd server address like `etcd://<your-etcd-host>:2379`. The loopback HTTP registry accepts up to 4,096 records, with UTF-8 keys up to 1 KiB and values up to 64 KiB. At capacity it still allows updates to existing records. A write exceeding a limit returns `false`.
 - `cluster_name` : optional namespace to isolate multiple disagg-clusters in Etcd.
 - `minimal_instances`: the equivalence of `num_instances` in the auto-scaling concept, disagg-server will reject requests when 
 the active context/generation servers is below the corresponding threshold.
