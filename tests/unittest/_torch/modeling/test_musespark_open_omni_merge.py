@@ -33,10 +33,13 @@ import os
 
 import pytest
 import torch
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 ORACLE_ENV = "MUSESPARK_OPEN_VISION_ORACLE"
+# The captured refset under LLM_MODELS_ROOT; ORACLE_ENV overrides it.
+ORACLE_SUBDIR = os.path.join("Muse-Spark-Open-test-data", "vision-oracle")
 
 # From the checkpoint's config.json. Asserted against the manifest below rather
 # than trusted, so a refset captured from a different config fails loudly.
@@ -52,16 +55,10 @@ NORM_IDENTITY_ATOL = 2.0e-2
 
 
 def _oracle_dir():
-    root = os.environ.get(ORACLE_ENV)
-    return root if root and os.path.isdir(root) else None
+    return os.environ.get(ORACLE_ENV) or get_checkpoint(ORACLE_SUBDIR)
 
 
-pytestmark = [
-    pytest.mark.cpu_only,
-    pytest.mark.skipif(
-        _oracle_dir() is None, reason=f"set {ORACLE_ENV} to the captured refset directory"
-    ),
-]
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(scope="module")

@@ -1,13 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""TP must reconstruct each expert before its nonlinear post-expert norm."""
+"""TP must reconstruct each expert before its nonlinear post-expert norm.
 
+The two distributed tests run their bodies on four MPI workers spawned by the test process.
+"""
+
+import pickle
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+import cloudpickle
 import pytest
 import torch
+from mpi4py import MPI
 
+import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
 
 
@@ -119,24 +127,24 @@ def test_tp_finalize_matches_unsharded_expert_math(tp_size, device):
     assert not torch.allclose(wrong, expected, rtol=0.01, atol=0.01)
 
 
-@pytest.mark.parametrize("tokens", [1, 16, 128])
+RANKS = 4
+
+
+def _on_every_rank(executor, body, *args) -> list:
+    """`body(*args)` on each of the four MPI workers; the per-rank results in rank order."""
+    # The workers unpickle the rank bodies by value: this module is not importable there.
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
+    return list(executor.map(body, *[[arg] * RANKS for arg in args]))
+
+
 @torch.inference_mode()
-def test_tp_forward_distributed_and_graph(tokens):
-    """Real model finalize/tail and NCCL, with rank-local FC2 partials.
-
-    Launch under MPI with 4, 8 or 16 ranks. Synthetic expert outputs isolate
-    the reduction contract from quantized GEMM rounding and weight loading.
-    """
-    from mpi4py import MPI
-
+def _tp_forward_on_rank(tokens):
     from tensorrt_llm._torch.distributed import AllReduce
     from tensorrt_llm.functional import AllReduceStrategy
     from tensorrt_llm.mapping import Mapping
 
-    world = MPI.COMM_WORLD.Get_size()
-    rank = MPI.COMM_WORLD.Get_rank()
-    if world not in (4, 8, 16):
-        pytest.skip("Launch with 4, 8 or 16 MPI ranks")
+    world, rank = RANKS, tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank % torch.cuda.device_count())
     hidden, top_k = 4096, 8
     torch.manual_seed(23)
@@ -201,14 +209,25 @@ def test_tp_forward_distributed_and_graph(tokens):
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
     assert not torch.allclose(captured, original)
+    return True
 
 
-@pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "nvfp4"])
-@pytest.mark.parametrize("tokens", [1, 16])
+# The worker pool is reused across tests, and NCCL starts threads that outlive each test.
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skipif(torch.cuda.device_count() < RANKS, reason="four GPUs required")
+@pytest.mark.parametrize("mpi_pool_executor", [RANKS], indirect=True)
+@pytest.mark.parametrize("tokens", [1, 16, 128])
+def test_tp_forward_distributed_and_graph(mpi_pool_executor, tokens):
+    """Real model finalize/tail and NCCL, with rank-local FC2 partials, on four ranks.
+
+    Synthetic expert outputs isolate the reduction contract from quantized GEMM
+    rounding and weight loading.
+    """
+    assert all(_on_every_rank(mpi_pool_executor, _tp_forward_on_rank, tokens))
+
+
 @torch.inference_mode()
-def test_tp_backend_matches_complete_experts(quantized, tokens):
-    """Production loader, GEMMs and finalize versus complete expert weights."""
-    from mpi4py import MPI
+def _tp_backend_on_rank(quantized, tokens):
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.distributed import AllReduce
@@ -222,9 +241,7 @@ def test_tp_backend_matches_complete_experts(quantized, tokens):
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-    world, rank = MPI.COMM_WORLD.Get_size(), MPI.COMM_WORLD.Get_rank()
-    if world not in (4, 8, 16):
-        pytest.skip("Launch with 4, 8 or 16 MPI ranks")
+    world, rank = RANKS, tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank % torch.cuda.device_count())
     torch.manual_seed(101)
     hidden, intermediate, experts, top_k = 4096, 4096, 16, 8
@@ -276,6 +293,8 @@ def test_tp_backend_matches_complete_experts(quantized, tokens):
             model_config=config,
             override_quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4) if quantized else None,
             layer_idx=0,
+            # The comparison must run on the requested TRTLLM backend, not a fallback.
+            allow_backend_degradation=False,
         ).cuda()
         moe.load_weights([weights])
         moe.post_load_weights()
@@ -330,3 +349,14 @@ def test_tp_backend_matches_complete_experts(quantized, tokens):
     assert torch.isfinite(actual).all()
     assert relative_l2 < 0.03
     assert cosine > 0.999
+    return True
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skipif(torch.cuda.device_count() < RANKS, reason="four GPUs required")
+@pytest.mark.parametrize("mpi_pool_executor", [RANKS], indirect=True)
+@pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "nvfp4"])
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_tp_backend_matches_complete_experts(mpi_pool_executor, quantized, tokens):
+    """Production loader, GEMMs and finalize versus complete expert weights, on four ranks."""
+    assert all(_on_every_rank(mpi_pool_executor, _tp_backend_on_rank, quantized, tokens))
