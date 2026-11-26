@@ -180,6 +180,13 @@ class ShortcutDecoder(DecoderModel):
         self.expert_inter = cfg.moe_intermediate_size // moe_tp
         self.local_experts = self.num_experts // ep
         self.moe_ep_rank = mapping.moe_ep_rank
+        self.expert_placements = {}
+        if getattr(model_config, "moe_load_balancer", None) is not None:
+            from .expert_placement import create_placements
+
+            self.expert_placements = create_placements(
+                model_config, self.kinds, (_ATTN_MOE, _GDP_MOE), self.num_experts, self.topk
+            )
 
         attention_layers = [i for i, kind in enumerate(self.kinds) if kind == _ATTN_MOE]
         if self.mtp_enabled:
@@ -280,7 +287,8 @@ class ShortcutDecoder(DecoderModel):
 
     def _declare_moe(self, w: nn.ParameterDict, prefix: str, P) -> None:
         """The post-mixer norm, router and latent / shared experts."""
-        slots = self.local_experts
+        placement = self.expert_placements.get(prefix)
+        slots = len(placement.initial_local_expert_ids) if placement else self.local_experts
         H = self.hidden
         w[f"{prefix}pre_moe_norm"] = P(H)
         self._declare_matrix(w, f"{prefix}router", (self.num_experts, H), P)
@@ -341,6 +349,7 @@ class ShortcutDecoder(DecoderModel):
     def _moe_views(self, prefix: str) -> dict:
         w = self.w
         views = {"pre_moe_norm": w[f"{prefix}pre_moe_norm"]}
+        views["placement"] = self.expert_placements.get(prefix)
         for name in (
             "router",
             "fc1_latent",
@@ -520,9 +529,14 @@ class ShortcutDecoder(DecoderModel):
         expert_op = (
             grouped_experts if isinstance(p["experts_up"], torch.Tensor) else self._grouped_experts
         )
+        placement = p.get("placement")
+        if placement is not None:
+            ids = placement.route(ids)
         mixed = expert_op(
             latent, ids, weights, p["experts_up"], p["experts_down"], self.moe_ep_rank, self.clamp
         )
+        if placement is not None:
+            placement.finish()
         mixed = (
             reducescatter(mixed, sizes, self.tp_group, self.process_group)
             if self.attn_dp

@@ -8,9 +8,11 @@ from ..manifest import (
     block_columns,
     check_checkpoint_keys,
     copy_checked,
+    dynamic_placements,
     expert_ids,
     load_unquantized,
     output_head_entry,
+    pad_expert_weight,
 )
 
 
@@ -67,6 +69,17 @@ def load(model, weights):
             )
         else:
             load_unquantized(core.w[name], entries, weights)
+    for prefix, placement in dynamic_placements(core):
+        host = {}
+        for plane in ("up", "down"):
+            name = f"{prefix}experts_{plane}"
+            ((key, (_, *axes), _, _),) = manifest[name]
+            tensors = weights[key][(slice(None), *axes)].cpu()
+            host[plane] = pad_expert_weight(tensors, core.w[name].shape[-2:])
+            scales = weights[key + "_scale"][(slice(None), *block_columns(axes, 32))].cpu()
+            interleaved = torch.ops.trtllm.block_scale_interleave(scales.contiguous())
+            host[plane + "_scale"] = interleaved.view(core.num_experts, -1)
+        placement.bind_weights(core.w, prefix, host)
     load_unquantized(head, head_entry, weights)
     if head.is_cuda:
         torch.cuda.current_stream(head.device).synchronize()

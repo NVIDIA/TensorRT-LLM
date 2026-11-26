@@ -71,6 +71,24 @@ def copy_checked(target, source, key):
     target.copy_(source, non_blocking=True)
 
 
+def dynamic_placements(core):
+    return (
+        (prefix, placement)
+        for prefix, placement in core.expert_placements.items()
+        if placement.layer_load_balancer.is_dynamic_routing()
+    )
+
+
+def pad_expert_weight(weight, shape):
+    """Keep the checkpoint mapping when the native layout already fits."""
+    if tuple(weight.shape[-2:]) == tuple(shape):
+        return weight
+    rows, cols = weight.shape[-2:]
+    padded = weight.new_zeros((*weight.shape[:-2], *shape))
+    padded[..., :rows, :cols].copy_(weight)
+    return padded
+
+
 def expert_ids(selection):
     return range(selection.start, selection.stop) if isinstance(selection, slice) else selection
 
@@ -147,7 +165,12 @@ def build_manifest(core):
         """The post-mixer norm (under block prefix `p`) and the MoE itself."""
         e = p + "moe."
         el, il, si = core.local_experts, core.expert_inter, core.shared_inter
-        experts = slice(expert_rank * el, (expert_rank + 1) * el)
+        placement = core.expert_placements.get(dst)
+        experts = (
+            placement.initial_local_expert_ids
+            if placement is not None
+            else slice(expert_rank * el, (expert_rank + 1) * el)
+        )
         return {
             f"{dst}pre_moe_norm": [(p + "pre_moe_layernorm.weight", None, None, None)],
             f"{dst}router": [(e + "gate.weight", None, None, None)],

@@ -23,8 +23,8 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _ROOT = Path(__file__).resolve().parents[4]
-# Worker shutdown contracts below cover the collective path, which only
-# per-layer dynamic EPLB takes.
+# Worker shutdown contracts below cover the collective path, which per-layer
+# dynamic EPLB and online expert placement take.
 _PER_LAYER_DYNAMIC_SHUTDOWN = {"uses_collective_shutdown": lambda llm_args: True}
 _TORCH_ROOT = _ROOT / "tensorrt_llm/_torch"
 _QUEUE = "CUDA_SCALE_LAUNCH_QUEUES"

@@ -45,6 +45,8 @@ class Nvfp4Projection:
     inverse_input_scale: torch.Tensor
     alpha: torch.Tensor
     out_features: int
+    # Online placement replaces raw calibration in the same slots as the matrices.
+    live_scales: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def apply(self, x):
         if x.shape[0] == 0:
@@ -57,8 +59,13 @@ class Nvfp4Projection:
         from flashinfer.gemm import grouped_gemm_nt_masked
         from flashinfer.quantization.fp4_quantization import scaled_fp4_grouped_quantize
 
-        inverse = self.inverse_input_scale[start:end]
-        alpha = self.alpha[start:end]
+        if self.live_scales is None:
+            inverse = self.inverse_input_scale[start:end]
+            alpha = self.alpha[start:end]
+        else:
+            input_scale, weight_scale = self.live_scales
+            inverse = input_scale[start:end].reciprocal()
+            alpha = input_scale[start:end] * weight_scale[start:end]
         lhs = scaled_fp4_grouped_quantize(x, counts, inverse, nvfp4_4over6=None)
         w = self.weight[start:end]
         experts, padded_n, half_k = w.shape

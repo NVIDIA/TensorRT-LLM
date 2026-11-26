@@ -10,8 +10,10 @@ from ..manifest import (
     block_columns,
     check_checkpoint_keys,
     copy_checked,
+    dynamic_placements,
     expert_ids,
     load_unquantized,
+    pad_expert_weight,
 )
 from .ops import Fp8Projection, Nvfp4Projection
 
@@ -24,6 +26,7 @@ class Projection:
     shape: tuple
     # Source and destination windows in uncompressed matrix coordinates.
     windows: list
+    online: bool = False
 
     @property
     def is_bank(self):
@@ -69,6 +72,7 @@ class Projection:
             scale.reciprocal(),
             scale * w[self.name + "_weight_scale_2"],
             self.shape[-2],
+            (scale, w[self.name + "_weight_scale_2"]) if self.online else None,
         )
 
     def module(self, expert=None):
@@ -176,6 +180,30 @@ def _load_projection(part, w, weights):
             scale.copy_(swizzled.reshape(-1).view(torch.uint8))
 
 
+def _bind_expert_banks(core, weights):
+    for prefix, placement in dynamic_placements(core):
+        host = {}
+        for plane in ("up", "down"):
+            (part,) = core.projections[f"{prefix}experts_{plane}"]
+            ((window, _),) = part.windows
+            part.online = True
+            rows = core.w[part.name].shape[-2:]
+            for expert in range(core.num_experts):
+                key = part.module(expert)
+                weight = weights[key + ".weight"][block_columns(window[1:], 2)].cpu()
+                linear = weights[key + ".weight_scale"][block_columns(window[1:], 16)].cpu()
+                scale = torch.ops.trtllm.block_scale_interleave(
+                    linear.view(torch.uint8).contiguous()
+                )
+                host.setdefault(plane, []).append(pad_expert_weight(weight, rows))
+                host.setdefault(plane + "_weight_scale", []).append(scale.flatten())
+                for suffix in ("input_scale", "weight_scale_2"):
+                    host.setdefault(plane + "_" + suffix, []).append(
+                        weights[key + "." + suffix][()].cpu()
+                    )
+        placement.bind_weights(core.w, prefix, host)
+
+
 def _kv_scale_keys(entries, weights, *, required):
     # Cache calibration can be present even when the K/V projection weights are excluded.
     pair = tuple(
@@ -237,6 +265,7 @@ def load(model, weights):
                 _load_projection(part, core.w, weights)
             continue
         load_unquantized(core.w[name], entries, weights)
+    _bind_expert_banks(core, weights)
 
     head = model.lm_head
     if head.weight.dtype != torch.float8_e4m3fn:

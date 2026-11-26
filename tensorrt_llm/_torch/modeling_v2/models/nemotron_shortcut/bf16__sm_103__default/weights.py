@@ -7,6 +7,7 @@ import torch
 from ..manifest import (
     build_manifest,
     check_checkpoint_keys,
+    dynamic_placements,
     load_unquantized,
     output_head_entry,
 )
@@ -30,5 +31,12 @@ def load(model, weights):
 
     for name, entries in manifest.items():
         load_unquantized(parameters[name], entries, weights)
+    for prefix, placement in dynamic_placements(core):
+        host_planes = {}
+        for plane in ("up", "down"):
+            name = f"{prefix}experts_{plane}"
+            ((key, (_, *axes), _, _),) = manifest[name]
+            host_planes[plane] = weights[key][(slice(None), *axes)]
+        placement.bind_weights(core.w, prefix, host_planes)
     if head.is_cuda:
         torch.cuda.current_stream(head.device).synchronize()

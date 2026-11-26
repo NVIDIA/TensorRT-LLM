@@ -64,9 +64,12 @@ def configure_moe_launch_queues(
 def uses_collective_shutdown(llm_args: Any) -> bool:
     """Return whether executor teardown must release EP resources collectively.
 
-    Only the per-layer dynamic EPLB fabric arena needs an all-rank release.
-    Every other configuration keeps the best-effort, rank-local teardown.
+    Online placement must join its weight-copy workers before any rank frees
+    mapped expert weights. Per-layer dynamic placement also owns a fabric arena.
     """
     moe_config = getattr(llm_args, "moe_config", None)
     load_balancer = getattr(moe_config, "load_balancer", None)
-    return getattr(load_balancer, "mode", None) == "per_layer_dynamic"
+    return (
+        getattr(load_balancer, "mode", None) == "per_layer_dynamic"
+        or getattr(load_balancer, "layer_updates_per_iter", 0) > 0
+    )
