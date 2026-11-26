@@ -1421,6 +1421,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if req is not None:
                 if getattr(session, "timed_out", False) is True:
                     req.py_kv_transfer_timed_out = True
+                elif mark_retired and getattr(req, "py_kv_transfer_committed_cause", None) is None:
+                    # Keep the agreed failure for outcome accounting: a send can
+                    # retire before the transfer manager holds its request. An
+                    # agreed timeout stays.
+                    req.py_kv_transfer_committed_cause = "error"
                 if not mark_retired:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 else:

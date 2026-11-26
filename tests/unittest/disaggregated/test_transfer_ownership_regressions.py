@@ -1149,6 +1149,94 @@ def test_direct_send_cancellation_keeps_a_committed_outcome(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("committed", "expected"),
+    [
+        ("failure", (0, 1, 0)),
+        ("timeout", (0, 0, 1)),
+        ("peer-timeout", (0, 0, 1)),
+        (None, (0, 0, 0)),
+    ],
+    ids=["failure", "timeout", "peer-timeout", "cancel-only"],
+)
+def test_failed_send_poll_before_cancellation_counts_once(
+    committed: str | None, expected: tuple[int, int, int]
+) -> None:
+    """A send the poll retires as failed, before any transfer claim, is counted at cancellation."""
+    rid = 98
+    request = SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        parent_request_id=None,
+        is_child=False,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+        py_kv_send_session_retired=False,
+        py_kv_transfer_timed_out=False,
+        py_kv_transfer_committed_cause=None,
+    )
+    session = SimpleNamespace(
+        _enforce_physical_ownership=False,
+        status=SessionStatus.CANCELLED if committed is None else SessionStatus.ERROR,
+        timed_out=committed == "timeout",
+        committed_failure=committed is not None,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        has_transferring_tasks=Mock(return_value=False),
+        wait_complete=Mock(return_value=WaitResult.FAILED),
+        close=Mock(return_value=True),
+        disagg_request_id=rid,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {rid: session}
+    transceiver._send_reqs = {rid: request}
+    transceiver._ctx_consensus = Mock(side_effect=lambda rids: rids)
+
+    def outcome(_rids, cancelled, failed, completed, locally_quiesced):
+        """Settle as the vote does, marking a timeout one peer rank observed."""
+        if committed == "peer-timeout" and failed:
+            request.py_kv_transfer_committed_cause = "timeout"
+        return (
+            cancelled,
+            [rid for rid in failed if rid not in set(cancelled)],
+            [rid for rid in completed if rid not in set(cancelled) | set(failed)],
+            locally_quiesced,
+            set(failed) & set(locally_quiesced),
+        )
+
+    transceiver._ctx_consensus_outcome = Mock(side_effect=outcome)
+    transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
+    coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=None,
+        kv_cache_manager=None,
+        dist=SimpleNamespace(rank=0, tp_size=1, pp_size=1, cp_size=1, world_size=1),
+        effects=Mock(),
+        registry=SimpleNamespace(active_requests=lambda: [], canceled_request_ids=lambda: [rid]),
+        enable_attention_dp=False,
+        enable_transfer_metrics=True,
+    )
+
+    # The poll retires the session before the request holds a transfer claim.
+    for _ in range(2):
+        transceiver.check_context_transfer_status(None)
+        assert transceiver._send_sessions == transceiver._send_reqs == {}
+    # The client abort then finishes the request; its boundary counts the cause.
+    coordinator.record_cancelled_transfer_outcome(request)
+    coordinator.record_cancelled_transfer_outcome(request)
+
+    assert request.py_kv_send_session_retired is True
+    assert request.py_kv_transfer_committed_cause == {
+        "failure": "error",
+        "peer-timeout": "timeout",
+    }.get(committed)
+    assert request.py_kv_transfer_timed_out is (committed == "timeout")
+    assert coordinator.transfer_outcomes == expected
+
+
+@pytest.mark.cpu_only
 def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
     rid = 89
     initial_state = object()
