@@ -31,7 +31,7 @@ import torch
 from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
 from ...bindings.executor import FinishReason
-from ...sampling_params import SamplingParams
+from ...sampling_params import LogprobMode, SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -51,7 +51,9 @@ from ..pyexecutor.sampler.sampler_features import max_token_room, meet_stop_toke
 from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
 from . import logit_edits
+from .interface import OneModelSamplingParams
 from .spec_store_scatter import spec_store_scatter
+from .target_logprobs import OUTPUT_KEY as TARGET_LOGPROBS_KEY
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -82,6 +84,33 @@ UNSUPPORTED_MIN_P_MSG = (
     "config when using one-model speculative decoding. Restore that default, "
     "drop min_p from the request, or disable speculative decoding."
 )
+UNSUPPORTED_LOGPROBS_FORMAT_MSG = (
+    "One-model speculative decoding returns only the sampled token's logprob. Request it with "
+    "logprobs=0 (or True) and logprobs_simple_format=True, or disable speculative decoding."
+)
+UNSUPPORTED_PROCESSED_LOGPROBS_MSG = (
+    "logprobs_mode='processed' with one-model speculative decoding supports temperature only: it needs "
+    "a sampled request (temperature > 0) without top_k, top_p, min_p, penalties, embedding_bias or "
+    "bad_words. Use logprobs_mode='raw', simplify the request, or disable speculative decoding."
+)
+UNSUPPORTED_LOGPROBS_TREE_MSG = (
+    "logprobs are not supported with tree speculative decoding (dynamic tree). Drop logprobs, use a "
+    "linear speculation mode, or disable speculative decoding."
+)
+UNSUPPORTED_LOGPROBS_RELAXED_ACCEPTANCE_MSG = (
+    "logprobs are not supported with relaxed acceptance for thinking: it emits draft tokens the target "
+    "did not sample, so their logprobs would not be the target's. Drop logprobs, disable "
+    "use_relaxed_acceptance_for_thinking, or disable speculative decoding."
+)
+UNSUPPORTED_LOGPROBS_MODE_MSG = (
+    "logprobs are not supported with this speculative decoding mode (SA). Drop logprobs, or disable "
+    "speculative decoding."
+)
+_TARGET_LOGPROBS_LIMIT_MSGS = {
+    "tree": UNSUPPORTED_LOGPROBS_TREE_MSG,
+    "relaxed_acceptance": UNSUPPORTED_LOGPROBS_RELAXED_ACCEPTANCE_MSG,
+    "mode": UNSUPPORTED_LOGPROBS_MODE_MSG,
+}
 # embedding_bias and bad_words are served only where the deploy opted into rewriting the
 # target logits ahead of acceptance, and by the workers that verify through that pass.
 LOGIT_EDITS_DISABLED_MSG = (
@@ -184,11 +213,44 @@ def penalty_unsupported_reason(spec_config) -> Optional[str]:
     return None if limit is None else _EDIT_PASS_LIMIT_MSGS[limit][1]
 
 
+def target_logprobs_unsupported_reason(spec_config) -> Optional[str]:
+    """Why this one-model deploy cannot return target logprobs, or None when it can.
+
+    The scores are read from one target logits row per verified position of a linear draft, so the deploys whose
+    rows are tree nodes, or whose emitted tokens are not draws from the target row, cannot serve them.
+    """
+    limit = _edit_pass_limit(spec_config)
+    return None if limit is None else _TARGET_LOGPROBS_LIMIT_MSGS[limit]
+
+
+def _logprobs_rejection_reason(
+    *,
+    num_logprobs: Optional[int],
+    simple_format: bool,
+    processed: bool,
+    sampled_temperature_only: bool,
+    has_penalty_or_edits: bool,
+    deploy_reason: Optional[str],
+) -> Optional[str]:
+    """Why a request for generation logprobs cannot be served, or None. Shared by the early admission check
+    (from ``SamplingParams``) and ``SpecSampler.validate_request`` (from the ``LlmRequest``)."""
+    if num_logprobs is None:
+        return None
+    if deploy_reason is not None:
+        return deploy_reason
+    if num_logprobs != 0 or not simple_format:
+        return UNSUPPORTED_LOGPROBS_FORMAT_MSG
+    if processed and not (sampled_temperature_only and not has_penalty_or_edits):
+        return UNSUPPORTED_PROCESSED_LOGPROBS_MSG
+    return None
+
+
 def one_model_sampling_rejection_reason(
     sampling_params: Optional[SamplingParams],
     *,
     fused_sampling: bool = False,
     logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
+    target_logprobs_unsupported: Optional[str] = None,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -202,12 +264,36 @@ def one_model_sampling_rejection_reason(
     check stays as the backstop for submission paths that bypass the LLM API.
 
     ``logit_edits_unsupported`` is ``logit_edits_unsupported_reason`` of the deploy: why it
-    cannot serve embedding_bias and bad_words, or None when it can.
+    cannot serve embedding_bias and bad_words, or None when it can. ``target_logprobs_unsupported``
+    is ``target_logprobs_unsupported_reason`` of the deploy.
 
     Returns ``None`` when nothing in ``sampling_params`` is unsupported.
     """
     if sampling_params is None:
         return None
+    processed = (
+        sampling_params.logprobs is not None
+        and sampling_params.logprobs_mode == LogprobMode.PROCESSED
+    )
+    reason = _logprobs_rejection_reason(
+        num_logprobs=sampling_params.logprobs,
+        simple_format=sampling_params.logprobs_simple_format,
+        processed=processed,
+        sampled_temperature_only=bool(sampling_params.temperature)
+        and not sampling_params.top_k
+        and sampling_params.top_p in (None, 1.0)
+        and not sampling_params.min_p,
+        has_penalty_or_edits=(
+            sampling_params.repetition_penalty not in (None, 1.0)
+            or bool(sampling_params.presence_penalty)
+            or bool(sampling_params.frequency_penalty)
+            or bool(sampling_params.bad or sampling_params.bad_token_ids)
+            or sampling_params.embedding_bias is not None
+        ),
+        deploy_reason=target_logprobs_unsupported,
+    )
+    if reason is not None:
+        return reason
     # min_tokens is what SamplingParams calls the field LlmRequest carries as
     # py_min_length. The OpenAI frontend always forwards it, so gate on the
     # value rather than on its presence -- same reasoning as the LlmRequest
@@ -270,6 +356,8 @@ class SampleStateSpec(SampleState):
     # instead would see the NEXT step's buffer, which update_requests itself
     # installs.
     draft_lens: Optional[list[int]] = None
+    # [rows, width] host copy of the target logprobs of the emitted tokens, when a request of the batch asked.
+    target_logprobs: Optional[torch.Tensor] = None
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -304,14 +392,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """Reject sampling parameters the one-model speculative path cannot honor.
 
         The fused backend supports min_p; other one-model sampling backends do
-        not. This sampler also does not return context logits, generation logits,
-        or log probabilities. Raised during request admission, so only the
-        offending request fails rather than the whole executor step.
+        not. This sampler returns the target logprob of each emitted token, but not
+        context logits, generation logits or top-k logprobs. Raised during request
+        admission, so only the offending request fails rather than the whole executor
+        step.
         """
         requested_outputs = (
             ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
             ("return_generation_logits", request.py_return_generation_logits),
-            ("logprobs", request.py_return_log_probs),
         )
         unsupported_outputs = [name for name, requested in requested_outputs if requested]
         if unsupported_outputs:
@@ -320,6 +408,20 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"{', '.join(unsupported_outputs)}. Drop these options from "
                 "the request, or disable speculative decoding."
             )
+
+        if request.py_return_log_probs:
+            params = OneModelSamplingParams.of_request(request)
+            reason = _logprobs_rejection_reason(
+                num_logprobs=request.py_num_logprobs,
+                simple_format=request.py_logprobs_simple_format,
+                processed=request.py_logprobs_mode == LogprobMode.PROCESSED,
+                sampled_temperature_only=params.is_temperature_only,
+                has_penalty_or_edits=has_occurrence_penalty(request)
+                or logit_edits.request_has_logit_edits(request),
+                deploy_reason=self._target_logprobs_unsupported,
+            )
+            if reason is not None:
+                raise ValueError(reason)
 
         # A greedy request cannot carry a watermark, so it is served normally.
         reason = getattr(self, "_watermark_unsupported_reason", None)
@@ -475,6 +577,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         fused_sampling: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
         logit_edits_unsupported: Optional[str] = LOGIT_EDITS_DISABLED_MSG,
+        target_logprobs_unsupported: Optional[str] = None,
     ):
         """
         Initialize the speculative sampler.
@@ -492,6 +595,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             logit_edits_unsupported: why this deploy cannot serve embedding_bias and
                 bad_words (None when it can). Such requests are rejected at admission;
                 the edits themselves are applied inside the worker.
+            target_logprobs_unsupported: why this deploy cannot return target logprobs
+                (None when it can). Such requests are rejected at admission.
         """
         self._enable_penalty = enable_penalty
         self._penalty_unsupported_reason = penalty_unsupported_reason
@@ -499,6 +604,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
         self._logit_edits_unsupported = logit_edits_unsupported
+        self._target_logprobs_unsupported = target_logprobs_unsupported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -604,6 +710,27 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             store_copies_done.record(self._d2h_side_stream)
         return host, copier.event
 
+    def _copy_target_logprobs_to_host(
+        self,
+        outputs: dict[str, torch.Tensor | bool],
+        sampling_requests: list[LlmRequest],
+        num_skip: int,
+    ) -> Optional[torch.Tensor]:
+        """Host copy of the target logprobs of the sampling requests, or None when no request asked.
+
+        The scores are a forward output the next replay rewrites, so they are copied on the main stream like
+        ``verify_lens``. A batch without a logprob request copies nothing.
+        """
+        if not any(request.py_return_log_probs for request in sampling_requests):
+            return None
+        scores = outputs.get(TARGET_LOGPROBS_KEY)
+        if not isinstance(scores, torch.Tensor):
+            raise ValueError(
+                "this step's forward did not score the emitted tokens: logprobs need the dense target "
+                "logits of a linear, non-ragged verification"
+            )
+        return self._copy_to_host(scores[num_skip : num_skip + len(sampling_requests)])
+
     def bind_spec_step_fold(self, spec_step_fold: SpecStepFold) -> None:
         """Let the model's forward store into this sampler's per-slot store (see SpecStepFold)."""
         self.spec_step_fold = spec_step_fold
@@ -654,6 +781,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         max_accepted_path_len = self.max_accepted_path_len
         max_seq_len = self.max_seq_len
         draft_lens = state.draft_lens
+        target_logprobs = (
+            state.target_logprobs.tolist() if state.target_logprobs is not None else None
+        )
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -669,9 +799,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             end_id = req.py_end_id
             room = max_token_room(req, max_seq_len, beam_idx)
             stop_words = req.py_stop_words_list
+            appended = 0
             for i in range(num_new_tokens):
                 new_token = new_tokens[i][seq_slot][beam_idx]
                 req.add_new_token(new_token, beam_idx)
+                appended = i + 1
                 if new_token == end_id:
                     req.finish_by(FinishReason.END_ID, beam_idx)
                     break
@@ -681,6 +813,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 if stop_words and meet_stop_token_criteria(req, new_token, beam_idx):
                     req.finish_by(FinishReason.STOP_WORDS, beam_idx)
                     break
+            if target_logprobs is not None and req.py_return_log_probs:
+                # One score per token appended: a stop token ends the loop above before every accepted token is.
+                req.py_result.append_log_probs([target_logprobs[req_idx][:appended]])
             num_accepted = num_new_tokens - 1
             req.py_num_accepted_draft_tokens = num_accepted
             # Pair acceptance with the SAME step's draft count, snapshotted at sample_async time
@@ -883,6 +1018,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         host_tensors, side_stream_event = self._copy_outputs_to_host(
             o_verify_lens, forward_stored_rows, store_copies_done
         )
+        host_target_logprobs = self._copy_target_logprobs_to_host(
+            outputs, sampling_requests, num_skip
+        )
         sampler_event = self._record_sampler_event(side_stream_event=side_stream_event)
 
         # Add dummy draft tokens to context requests for KV cache preparation
@@ -896,4 +1034,5 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             sampler_event=sampler_event,
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
+            target_logprobs=host_target_logprobs,
         )

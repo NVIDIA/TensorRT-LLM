@@ -39,6 +39,7 @@ from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 from .spec_sampler_base import (SpecSampler, logit_edits_unsupported_reason,
                                 penalty_unsupported_reason,
+                                target_logprobs_unsupported_reason,
                                 verifies_through_edit_pass)
 from .suffix_automaton import SuffixAutomatonManager
 
@@ -731,7 +732,9 @@ def get_spec_decoder(
             fused_sampling=fused_sampling,
             watermark_unsupported_reason=_watermark_unsupported_reason(
                 spec_config, sampler_args.watermark_config),
-            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config))
+            logit_edits_unsupported=logit_edits_unsupported_reason(spec_config),
+            target_logprobs_unsupported=target_logprobs_unsupported_reason(
+                spec_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

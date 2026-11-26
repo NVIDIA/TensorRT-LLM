@@ -39,6 +39,8 @@ from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.target_logprobs import OUTPUT_KEY as TARGET_LOGPROBS_KEY
+from ..speculative.target_logprobs import target_logprobs
 from ..utils import AuxStreamType, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -2338,6 +2340,41 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         )
         return logits, vocab_sharded
 
+    @staticmethod
+    def _score_emitted_tokens(outputs, logits, vocab_sharded: bool,
+                              attn_metadata: AttentionMetadata,
+                              spec_metadata: Optional[SpecMetadata]) -> None:
+        """Publish the target logprob of every emitted token as ``outputs["target_logprobs"]``.
+
+        The scores read the dense target logits the worker verified, so this covers every worker through one
+        launch (see speculative/target_logprobs.py). Nothing is published for a layout it cannot read: sharded
+        logits, ragged windows, or tree rows; the sampler then rejects a request that asks, and a batch without
+        one never reaches this step's scores (the kernel skips rows without a divisor). Every condition here is
+        static for a captured graph.
+        """
+        divisors = (None if spec_metadata is None else
+                    spec_metadata.request_logprob_temperatures)
+        if (divisors is None or not isinstance(outputs, dict) or vocab_sharded
+                or outputs.get("logits_vocab_shard")
+                or spec_metadata.sharded_target_logits
+                or spec_metadata.is_ragged_verify
+                or not isinstance(logits, torch.Tensor) or logits.dim() != 2):
+            return
+        new_tokens = outputs["new_tokens"]
+        new_tokens_lens = outputs["new_tokens_lens"]
+        batch, width = new_tokens_lens.shape[0], new_tokens.shape[1]
+        num_contexts = attn_metadata.num_contexts
+        if (batch > divisors.numel() or logits.shape[0] != num_contexts +
+            (batch - num_contexts) * width):
+            return
+        outputs[TARGET_LOGPROBS_KEY] = target_logprobs(
+            logits,
+            new_tokens,
+            new_tokens_lens,
+            divisors[:batch],
+            num_contexts=num_contexts,
+            width=width)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2416,15 +2453,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=spec_input_ids,
-                                    position_ids=spec_position_ids,
-                                    hidden_states=hidden_states,
-                                    logits=logits,
-                                    attn_metadata=attn_metadata,
-                                    spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model,
-                                    resource_manager=resource_manager,
-                                    **worker_kwargs)
+            outputs = self.spec_worker(input_ids=spec_input_ids,
+                                       position_ids=spec_position_ids,
+                                       hidden_states=hidden_states,
+                                       logits=logits,
+                                       attn_metadata=attn_metadata,
+                                       spec_metadata=spec_metadata,
+                                       draft_model=self.draft_model,
+                                       resource_manager=resource_manager,
+                                       **worker_kwargs)
+            self._score_emitted_tokens(outputs, logits, vocab_sharded,
+                                       attn_metadata, spec_metadata)
+            return outputs
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

@@ -29,6 +29,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.sampling_params import LogprobMode
 
 from ..._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
@@ -143,7 +144,7 @@ def _sampling_scan_cache_key(spec_metadata, requests: list["LlmRequest"]):
         if (getattr(request, "is_dummy_request", False)
                 and not getattr(request, "is_cuda_graph_dummy", False)):
             return None
-        entries.append((request.py_request_id,
+        entries.append((request.py_request_id, id(request),
                         request.state == LlmRequestState.GENERATION_IN_PROGRESS,
                         request.py_seq_slot))
     return (tuple(entries), spec_metadata.runtime_draft_len,
@@ -691,6 +692,20 @@ class OneModelSamplingParams:
         )
 
 
+def target_logprob_temperature(request: "LlmRequest",
+                               params: OneModelSamplingParams) -> float:
+    """The divisor of the target-logprob kernel for ``request``.
+
+    0.0 when the request asked for no logprobs (the kernel then skips it), 1.0 for ``LogprobMode.RAW`` and the
+    request's temperature for ``LogprobMode.PROCESSED``.
+    """
+    if not getattr(request, "py_return_log_probs", False):
+        return 0.0
+    if request.py_logprobs_mode == LogprobMode.RAW:
+        return 1.0
+    return params.temperature
+
+
 def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
     """A batch's sampling mode as attention-DP ranks exchange it: bit 0 when every request is greedy, bit 1
     when every request is greedy or unseeded temperature-only (the two flags of
@@ -699,8 +714,12 @@ def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
     temperature_only = spec_metadata.shard_temperature_only_graphs
     for request in requests:
         params = OneModelSamplingParams.of_request(request)
-        greedy &= params.is_greedy
-        temperature_only &= params.is_greedy or params.is_shard_sampleable
+        # A request scoring its tokens needs the dense target logits, which the greedy and the vocabulary-sharded
+        # temperature variants do not materialise.
+        wants_logprobs = getattr(request, "py_return_log_probs", False)
+        greedy &= params.is_greedy and not wants_logprobs
+        temperature_only &= ((params.is_greedy or params.is_shard_sampleable)
+                             and not wants_logprobs)
     return int(greedy) | int(temperature_only) << 1
 
 
@@ -931,6 +950,13 @@ class SpecMetadata:
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
     request_min_ps: Optional[torch.Tensor] = None
+    # Per-request divisor of the target-logprob kernel (target_logprob_temperature), in batch order; zero rows are
+    # skipped by the kernel.
+    request_logprob_temperatures: Optional[torch.Tensor] = None
+    # [0] the values last uploaded to request_logprob_temperatures, [1] the values the last scan found. A list for
+    # the reason _sampling_params_signature is one: the graph views share the tensor.
+    _logprob_state: list = field(default_factory=lambda: [None, None],
+                                 repr=False)
     # Describe what the sampling-parameter buffers currently hold, so a step
     # that reproduces them can skip the refill. Two entries because the two
     # buffer groups depend on different things:
@@ -1283,6 +1309,35 @@ class SpecMetadata:
                 dtype=torch.float32,
                 device='cuda')
 
+    def prepare_logprob_buffers(self) -> None:
+        """Allocate the per-request divisors of the target-logprob kernel. Idempotent.
+
+        Allocated before any graph is captured, so every captured variant that can score its tokens reads one
+        stable address (see ``populate_sampling_params_for_one_model``).
+        """
+        if (self.request_logprob_temperatures is None
+                and self.max_num_requests > 0):
+            self.request_logprob_temperatures = torch.zeros(
+                self.max_num_requests, dtype=torch.float32, device='cuda')
+            self._logprob_state[0] = None
+
+    def _populate_logprob_params(self) -> None:
+        """Upload the per-request divisors found by the last scan, only when they changed.
+
+        A step without logprob requests after another step without any compares two Nones and does nothing; a
+        step that follows one with requests zeroes the buffer once, so no stale row is scored.
+        """
+        found = self._logprob_state[1]
+        uploaded = self._logprob_state[0]
+        buffer = self.request_logprob_temperatures
+        if buffer is None or found is uploaded or found == uploaded:
+            return
+        values = np.zeros(buffer.numel(), dtype=np.float32)
+        if found is not None:
+            values[:len(found)] = found
+        _upload_host_values(buffer, values)
+        self._logprob_state[0] = found
+
     def prepare_penalty_buffers(self):
         """Allocate the occurrence-penalty state. Idempotent; no-op when disabled.
 
@@ -1594,6 +1649,7 @@ class SpecMetadata:
         # different graphs, so every view must share one allocation: allocate it
         # here before the shallow copy rather than lazily in each view.
         self.prepare_rejection_sampling_buffers()
+        self.prepare_logprob_buffers()
         self.prepare_penalty_buffers()
         self.prepare_logit_edit_buffers()
         self.prepare_watermark_buffers()
@@ -1645,7 +1701,8 @@ class SpecMetadata:
             cached = self._sampling_scan_cache
             if cached is not None and cached[0] == scan_key:
                 (_, per_request_normalized, per_request_slot_ids,
-                 self.is_all_greedy_sample, all_temperature_only) = cached
+                 self.is_all_greedy_sample, all_temperature_only,
+                 self._logprob_state[1]) = cached
                 _set_temperature_only(self, all_temperature_only)
                 return per_request_normalized, per_request_slot_ids
 
@@ -1653,6 +1710,7 @@ class SpecMetadata:
         has_non_greedy_requests = False
         all_temperature_only = True
         per_request_slot_ids: list[int] = []
+        logprob_temperatures: list[float] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
 
@@ -1670,8 +1728,15 @@ class SpecMetadata:
             else:
                 num_tokens = 1
 
-            has_non_greedy_requests |= not params.is_greedy
-            all_temperature_only &= params.is_greedy or params.is_shard_sampleable
+            logprob_temperature = target_logprob_temperature(request, params)
+            logprob_temperatures.append(logprob_temperature)
+            # A request scoring its tokens needs the dense target logits, which the greedy and the
+            # vocabulary-sharded temperature variants do not materialise (see one_model_sampling_mode).
+            wants_logprobs = logprob_temperature != 0.0
+            has_non_greedy_requests |= not params.is_greedy or wants_logprobs
+            all_temperature_only &= ((params.is_greedy
+                                      or params.is_shard_sampleable)
+                                     and not wants_logprobs)
 
             per_request_normalized.append(
                 (params.temperature, params.top_k, params.top_p, params.min_p,
@@ -1699,11 +1764,15 @@ class SpecMetadata:
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
         _set_temperature_only(self, all_temperature_only)
+        # None when no request asks, so a batch without logprob requests compares equal by identity.
+        self._logprob_state[1] = (tuple(logprob_temperatures)
+                                  if any(logprob_temperatures) else None)
         if scan_key is not None:
             self._sampling_scan_cache = (scan_key, per_request_normalized,
                                          per_request_slot_ids,
                                          self.is_all_greedy_sample,
-                                         all_temperature_only)
+                                         all_temperature_only,
+                                         self._logprob_state[1])
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1766,6 +1835,7 @@ class SpecMetadata:
         # batch_slot_ids below; this runs earlier than prepare() in the
         # model-engine flow. No-op unless use_rejection_sampling is set.
         self.prepare_rejection_sampling_buffers()
+        self.prepare_logprob_buffers()
         # Likewise for the occurrence-penalty workspace. No-op unless enable_penalty.
         self.prepare_penalty_buffers()
         # And the embedding-bias and bad-words tables, under the same flag.
@@ -1845,6 +1915,10 @@ class SpecMetadata:
             self.logit_edit_state.observe(requests)
         # Likewise the watermark: a greedy request is simply not flagged.
         self._populate_watermark_params(requests)
+
+        # Logprob requests never share a batch variant with the all-greedy one, and the divisors are the only
+        # per-request input of the target-logprob kernel.
+        self._populate_logprob_params()
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
