@@ -25,7 +25,6 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f, prefer_pinned
 
 from .base import Metadata, UnsupportedMetadataConfiguration, _Registry
 from .core import TrtllmCoreMetadata
-from .draft import DraftMetadata, LinearDraftLengthsMetadata
 from .dsa import DSAMetadata
 
 if TYPE_CHECKING:
@@ -355,16 +354,3 @@ class DeepseekV4Metadata(Metadata):
             self.sparse_mla_swa_lens,
             self.sparse_mla_extra_lens,
         )
-
-
-class DeepseekV4DraftMetadata(DraftMetadata):
-    """DeepSeek-V4's sparse MLA state in the draft steps of a linear chain.
-
-    Before each draft step it derives the sparse state of the draft set again,
-    from the rows and lengths the step runs with.
-    """
-
-    requires = (LinearDraftLengthsMetadata, DeepseekV4Metadata)
-
-    def begin_draft_step(self, step: int) -> None:
-        self.draft.get_metadata(DeepseekV4Metadata).derive()

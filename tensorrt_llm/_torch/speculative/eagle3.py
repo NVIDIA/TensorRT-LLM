@@ -20,7 +20,7 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..attention.metadata.core import TrtllmCoreMetadata
-from ..attention.metadata.draft import DraftMetadata
+from ..attention.metadata.draft.base import DraftMetadata
 from ..model_config import ModelConfig
 from ..modules.bf16_draft_head import is_plain_mtp_shared_head
 from ..modules.logits_processor import LogitsProcessor
@@ -1004,7 +1004,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 draft_metadata.begin_draft_loop_all(num_accepted_tokens)
                 draft_scope.callback(draft_metadata.end_draft_loop_all)
                 draft_metadata.begin_draft_step_all(0)
-                draft_attn_metadata = draft_metadata.draft
+                draft_attn_metadata = draft_metadata.draft_set
                 # The attention custom ops resolve the metadata from the
                 # model's extra attributes, not from their arguments.
                 extra_attrs = get_model_extra_attrs()

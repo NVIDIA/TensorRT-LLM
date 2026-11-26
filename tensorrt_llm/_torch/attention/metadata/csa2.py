@@ -26,7 +26,6 @@ from ..backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from ..backends.sparse.csa2.params import CSA2MetadataParams
 from .base import Metadata, _Registry
 from .core import TrtllmCoreMetadata
-from .draft import DraftMetadata, LinearDraftLengthsMetadata
 from .sparse import SparseMetadata
 
 if TYPE_CHECKING:
@@ -286,18 +285,3 @@ def _take_over_request_state() -> None:
 
 
 _take_over_request_state()
-
-
-class CSA2DraftMetadata(DraftMetadata):
-    """The CSA2 request state in the draft steps of a linear chain.
-
-    Before each draft step it resolves the positions and owner slots of the
-    draft set again, from the KV lengths the step runs with.
-    """
-
-    requires = (LinearDraftLengthsMetadata, CSA2Metadata)
-
-    def begin_draft_step(self, step: int) -> None:
-        request_state = self.draft.get_metadata(CSA2Metadata)
-        if request_state._csa2_ready_for_kv_update:
-            request_state._refresh_live_endpoints()

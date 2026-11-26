@@ -162,22 +162,35 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.batch_inputs import BatchInputs
     from tensorrt_llm._torch.attention.metadata.chunked_prefill import ChunkedPrefillMetadata
     from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
-    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2DraftMetadata, CSA2Metadata
-    from tensorrt_llm._torch.attention.metadata.deepseek_v4 import (
-        DeepseekV4DraftMetadata,
-        DeepseekV4Metadata,
-    )
-    from tensorrt_llm._torch.attention.metadata.draft import (
-        DenseLinearDraftMetadata,
-        DFlashDraftMetadata,
+    from tensorrt_llm._torch.attention.metadata.csa2 import CSA2Metadata
+    from tensorrt_llm._torch.attention.metadata.deepseek_v4 import DeepseekV4Metadata
+    from tensorrt_llm._torch.attention.metadata.draft.csa2 import CSA2DraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.deepseek_v4 import DeepseekV4DraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.dense_linear import DenseLinearDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.dflash import DFlashDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.embedded_dspark import (
         EmbeddedDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.linear import LinearDraftMetadata
+    from tensorrt_llm._torch.attention.metadata.draft.linear_lengths import (
         LinearDraftLengthsMetadata,
-        LinearDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_dense_linear import (
         SharedKVCacheDenseLinearDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_dflash import (
         SharedKVCacheDFlashDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_linear import (
         SharedKVCacheLinearDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.shared_kv_cache_standalone_dspark import (
         SharedKVCacheStandaloneDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.standalone_dspark import (
         StandaloneDSparkDraftMetadata,
+    )
+    from tensorrt_llm._torch.attention.metadata.draft.suffix_automaton import (
         SuffixAutomatonDraftMetadata,
     )
     from tensorrt_llm._torch.attention.metadata.minimax_m3 import (

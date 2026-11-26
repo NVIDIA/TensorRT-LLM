@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.metadata.batch_inputs import SpecStepInputs
 from tensorrt_llm._torch.attention.metadata.core import TrtllmCoreMetadata
+from tensorrt_llm._torch.attention.metadata.draft.base import DraftMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
@@ -3150,9 +3151,9 @@ class DecoderInputPreparer:
         attn_metadata.padded_num_tokens = None
         attn_metadata.prepare_all(inputs)
         # The draft layers of a linear chain read a second set of metadata.
-        draft_attn_metadata = getattr(attn_metadata, "draft", None)
-        if draft_attn_metadata is not None and spec is not None and spec.runtime_draft_len > 0:
-            draft_attn_metadata.prepare_all(inputs)
+        draft_set = getattr(attn_metadata.get_metadata(DraftMetadata), "draft_set", None)
+        if draft_set is not None and spec is not None and spec.runtime_draft_len > 0:
+            draft_set.prepare_all(inputs)
         host.num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
         host.remote_tail_modes = set()
 
