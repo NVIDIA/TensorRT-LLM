@@ -11,6 +11,60 @@ TensorRT LLM provides multiple API levels:
 
 This guide focuses on the LLM API, which is the primary interface for most users.
 
+## VisualGen Python API
+
+The VisualGen Python contract has a separate live snapshot in
+`tests/unittest/api_stability/references/visual_gen_api.yaml`. It covers the
+`tensorrt_llm.visual_gen` exports, the top-level VisualGen re-exports, public
+methods and properties, Params, output dataclasses, and reachable VisualGen
+configuration types (including discriminated unions). Shared LLM types such as
+`QuantConfig` retain their existing LLM API references.
+
+The snapshot records parameter order and kind, requiredness, annotations,
+defaults, named default factories, async behavior, field aliases, model config,
+constraint metadata, and API status metadata. Output dataclasses also record
+constructor parameters (including `InitVar`), decorator options, slots, and
+positional matching fields. It reads class definitions without
+constructing an engine, evaluating properties, or invoking default factories.
+Anonymous/local factories and unsupported default or constraint values fail
+explicitly and need a stable encoding. Annotation spelling changes can require a
+reference update even when the behavior is equivalent.
+
+After reviewing an intentional Python API change, regenerate and test using a
+TensorRT-LLM build matching the checkout:
+
+```bash
+python3 tests/unittest/api_stability/visual_gen_api_snapshot.py --write
+python3 -m pytest -m cpu_only tests/unittest/api_stability/test_visual_gen_api.py \
+    tests/unittest/api_stability/test_visual_gen_snapshot_helpers.py
+```
+
+Commit and review the reference diff. Missing dependencies or import failures
+are test failures, not skips. The API stability directory already runs in the
+CPU and A10 CI test lists. The guard accepts imports from the checkout or a
+matching built wheel and rejects stale Python sources.
+
+The existing `scripts/generate_trtllm_serve_schemas.py` generator and
+`tests/unittest/llmapi/test_trtllm_serve_config_schemas.py` independently protect
+the editor JSON Schema for `--visual_gen_args` YAML, including nested configs.
+Continue regenerating those schemas for serving configuration changes.
+
+Changes to API reference files, `visual_gen/args.py`, `visual_gen/params.py`, or
+`visual_gen/__init__.py` require exactly one compatibility label through the
+existing workflow. Changes to methods, output types, and aliases are exposed
+through the required snapshot diff. Keep prototype APIs in the non-committed
+reference; recording their current shape does not promote them to stable APIs.
+
+Snapshots do not classify compatibility automatically. Validator logic, default
+factory behavior, exceptions, generated tensor shapes, and per-pipeline
+`extra_param_specs` / `ref_slot_specs` values still need behavioral tests and
+human review. Public class constants and descriptors other than ordinary
+properties, classmethods, and staticmethods are outside this initial gate.
+Semantic-only implementation changes may not trigger a reference
+diff or the path-based label check. VisualGen public API changes also follow
+the team review rules in
+`tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`.
+
 ## API Types and Stability Guarantees
 
 TensorRT LLM classifies APIs into two categories:

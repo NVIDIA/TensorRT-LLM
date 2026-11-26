@@ -156,6 +156,11 @@ Key files:
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
 - **Protected APIs exist** — changes to LLM API signatures will fail `tests/unittest/api_stability` tests. Get code owner review.
+- **VisualGen Python API is snapshotted** — intentional contract changes require regenerating
+  `tests/unittest/api_stability/references/visual_gen_api.yaml` with
+  `python3 tests/unittest/api_stability/visual_gen_api_snapshot.py --write` in a matching build.
+  Run the VisualGen API and snapshot-helper tests; review the reference diff and compatibility
+  label. Serving YAML editor schemas remain a separate required check. See the API change guide.
 - **Test hardware and model weights** — set `LLM_MODELS_ROOT` for tests that use model weights. Unit tests can also require GPUs; only `cpu_only`-marked unit tests run in the CPU-only stages.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
