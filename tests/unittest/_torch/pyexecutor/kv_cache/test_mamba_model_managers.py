@@ -1561,15 +1561,20 @@ def test_external_cache_reservation_rejects_unusable_quota(monkeypatch, resize_s
     cache.shutdown.assert_called_once()
 
 
-@pytest.mark.parametrize("byte_limit", [1500, 1800])
-def test_external_cache_reservation_handles_native_minimum_and_rounding(monkeypatch, byte_limit):
+@pytest.mark.parametrize(
+    "gpu_quota,byte_limit,expected_quota",
+    [(1024, 1500, None), (1024, 1800, 768), (4096, 7000, 3328)],
+)
+def test_external_cache_reservation_handles_native_minimum_and_rounding(
+    monkeypatch, gpu_quota, byte_limit, expected_quota
+):
     from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as module
 
     manager = object.__new__(KVCacheManagerV2)
     manager._get_external_cache_bytes = lambda cache: cache.quota
 
     class Pool:
-        quota = 1024
+        quota = gpu_quota
         shutdown_called = False
 
         def get_quota(self, level):
@@ -1588,9 +1593,9 @@ def test_external_cache_reservation_handles_native_minimum_and_rounding(monkeypa
     pool = Pool()
     monkeypatch.setattr(module, "KVCacheManagerPy", lambda *args, **kwargs: pool)
     config = KVCacheManagerConfig(
-        tokens_per_block=32, layers=[], cache_tiers=[GpuCacheTierConfig(quota=1024)]
+        tokens_per_block=32, layers=[], cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)]
     )
-    if byte_limit < 2 * 768:
+    if expected_quota is None:
         with pytest.raises(ValueError, match="external cache storage"):
             manager._allocate_cache_pools(
                 config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=byte_limit
@@ -1600,7 +1605,7 @@ def test_external_cache_reservation_handles_native_minimum_and_rounding(monkeypa
         manager._allocate_cache_pools(
             config, event_manager=None, cold_page_codec=None, max_gpu_total_bytes=byte_limit
         )
-        assert pool.quota == 768
+        assert pool.quota == expected_quota
         assert not pool.shutdown_called
 
 

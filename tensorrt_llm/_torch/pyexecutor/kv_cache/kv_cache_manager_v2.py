@@ -5239,17 +5239,28 @@ class KVCacheManagerV2(BaseResourceManager):
             upper_quota - 1,
             native_bytes * max_gpu_total_bytes // (native_bytes + external_bytes),
         )
+        best_quota = None
+        resized_quota = None
         while lower_quota < pool_quota < upper_quota:
             if not cache.resize(GPU_LEVEL, pool_quota):
                 # A quota below the native minimum cannot be resized. Search
                 # above it before concluding that the combined budget cannot fit.
                 lower_quota = pool_quota
             else:
+                resized_quota = pool_quota
                 external_bytes = self._get_external_cache_bytes(cache)
                 if cache.get_quota(GPU_LEVEL) + external_bytes <= max_gpu_total_bytes:
-                    return cache
-                upper_quota = pool_quota
+                    best_quota = lower_quota = pool_quota
+                else:
+                    upper_quota = pool_quota
+            # Keep searching above a fitting quota until the bracket is within 1/4096 of its top.
+            if best_quota is not None and upper_quota - lower_quota <= upper_quota >> 12:
+                break
             pool_quota = (lower_quota + upper_quota) // 2
+        if best_quota is not None and (
+            resized_quota == best_quota or cache.resize(GPU_LEVEL, best_quota)
+        ):
+            return cache
         cache.shutdown()
         raise ValueError(
             "The GPU cache quota cannot accommodate native pools and "
