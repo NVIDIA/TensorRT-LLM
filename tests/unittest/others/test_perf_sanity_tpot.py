@@ -1496,7 +1496,8 @@ def test_ttft_caller_groups_throughput_exemptions(perf_sanity_caller: Callable) 
             "d_baseline_total_token_throughput": 1200.0,
         }
     )
-    uploaded, error = perf_sanity_caller([older, latest], ttft=100.0, throughput=75.0)
+    uploaded, error = perf_sanity_caller([older, latest], ttft=100.0, throughput=100.0)
+    assert _metric_comparison(uploaded[0], "d_token_throughput") == pytest.approx((100.0, 100.0))
     assert _metric_comparison(uploaded[0], "d_total_token_throughput") == pytest.approx(
         (1000.0, 1200.0)
     )
@@ -1507,6 +1508,7 @@ def test_ttft_caller_groups_throughput_exemptions(perf_sanity_caller: Callable) 
         for line in uploaded[0]["s_regression_info"].splitlines()
         if "Not failing this stage" in line
     )
+    assert "exempt as a group" in warning
     assert "(d_token_throughput)" in warning
 
 
