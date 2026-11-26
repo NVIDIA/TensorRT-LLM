@@ -144,6 +144,7 @@ from __future__ import annotations
 import math
 import os
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -441,7 +442,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import ple_host_table as _ple_host
-from .._vision import _check_vision_deployment
+from .._vision import _check_vision_deployment, _splice_embeddings
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -3803,13 +3804,13 @@ class _KvRangeProbe:
 # ------------------------------------------------------------------ prefill ---
 
 
-class _PrefillStep(NamedTuple):
+@dataclass(slots=True)
+class _PrefillStep:
     """One step's host-side state, built by `PrefillTarget.prepare` and read by the forward's
     breaks. `num_tokens` is the batch's row count `n` and `physical_tokens` the `T` the
     forward runs over (`n`, or the prefill CUDA graph bucket it was padded to), and
     `dp_pad_rows` the rows the MoE blocks pad them with under attention DP (zero otherwise,
-    and on every step a prefill CUDA graph runs). A new one replaces it every step, so no
-    break reads a previous step's."""
+    and on every step a prefill CUDA graph runs). Each step with context tokens replaces it."""
 
     num_tokens: int
     physical_tokens: int
@@ -4285,10 +4286,7 @@ class PrefillTarget:
 
     def _splice(self, h) -> None:
         """Write multimodal embeddings at their prompt positions and zero the padding."""
-        step = self._step
-        if step.mm_embeds is not None:
-            h.index_copy_(0, step.mm_token_indices, step.mm_embeds)
-        h[step.num_tokens :].zero_()
+        _splice_embeddings(self._step, h)
 
     # -------------------------------------------------------------- forward ---
 

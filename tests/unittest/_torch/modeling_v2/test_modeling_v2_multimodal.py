@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
 from tensorrt_llm._torch.modeling_v2.multimodal import (
     MultimodalEncoderSpec,
     MultimodalModelForCausalLM,
@@ -134,6 +134,23 @@ def test_construction_and_checkpoint_ownership(disable, monkeypatch):
     assert weights.keys() == ["model.layers.0.weight"]
     assert weights["model.layers.0.weight"] == 3
     assert weights.mark_consumed("model.layers.0") == 1
+
+
+def test_decoder_kv_layer_specs_reach_engine_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    specs = (
+        KVCacheLayerSpec(head_dim=128, num_kv_heads=2, num_q_heads=8),
+        KVCacheLayerSpec(head_dim=256, num_kv_heads=1, num_q_heads=8),
+    )
+
+    class Decoder(_TinyLlm):
+        def __init__(self, model_config: ModelConfig) -> None:
+            super().__init__(model_config)
+            model_config.set_kv_cache_layer_specs(specs)
+
+    monkeypatch.setattr(_TinyModel, "llm_class", Decoder)
+    model = _model()
+    assert model.model_config is not model.llm.model_config
+    assert model.model_config.kv_cache_layer_specs == specs
 
 
 def test_attached_embeddings_require_encoder_prefill_disaggregation(monkeypatch):

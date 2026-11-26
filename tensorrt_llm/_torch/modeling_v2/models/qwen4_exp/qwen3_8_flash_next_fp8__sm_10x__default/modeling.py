@@ -90,6 +90,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -268,7 +269,7 @@ from tensorrt_llm._torch.modeling_v2.multimodal import (
 )
 
 from .. import ple_host_table as _ple_host
-from .._vision import _check_vision_deployment
+from .._vision import _check_vision_deployment, _splice_embeddings
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -4139,7 +4140,8 @@ def _pad_window(num_tokens: int, rows: int) -> int:
     return rows // 2 if num_tokens > rows // 2 else 0
 
 
-class _PrefillStep(NamedTuple):
+@dataclass(slots=True)
+class _PrefillStep:
     """One step's host-side state, built fresh by `PrefillTarget.prepare` and read by the breaks.
 
     `num_tokens` is the batch's rows `n`, `physical_tokens` the `T` the forward runs over (`n` or
@@ -5119,10 +5121,7 @@ class PrefillTarget:
 
     def _splice(self, h) -> None:
         """Write the active embeddings at their placeholders and zero the padding."""
-        step = self._step
-        if step.mm_embeds is not None:
-            h.index_copy_(0, step.mm_token_indices, step.mm_embeds)
-        h[step.num_tokens :].zero_()
+        _splice_embeddings(self._step, h)
 
     # -------------------------------------------------------------- forward ---
 

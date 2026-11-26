@@ -13,6 +13,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     _qwen3vl_build_batched_input,
 )
+from tensorrt_llm._torch.modules.multi_stream_utils import _record_stream
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
@@ -49,6 +50,18 @@ def _frame_calls(
             room -= cost
             frames -= take
     return calls
+
+
+def _splice_embeddings(step, h):
+    """Write the active embeddings and release the prefill step's references to the inputs."""
+    if step.mm_embeds is not None:
+        h.index_copy_(0, step.mm_token_indices, step.mm_embeds)
+        if h.is_cuda:
+            stream = torch.cuda.current_stream(h.device)
+            _record_stream((step.mm_embeds, step.mm_token_indices), stream)
+    step.mm_embeds = None
+    step.mm_token_indices = None
+    h[step.num_tokens :].zero_()
 
 
 def _project_items(op, inputs, lengths, *weights):

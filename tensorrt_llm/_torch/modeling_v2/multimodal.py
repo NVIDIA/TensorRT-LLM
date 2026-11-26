@@ -219,7 +219,10 @@ class MultimodalModelForCausalLM(MultimodalModelMixin, nn.Module):
                 self.mm_encoders[name] = tower
                 groups.append(EncoderGroup(spec.modalities, tower, tower.build_batched_input))
         self.mm_encoder_groups = tuple(groups)
-        # Publish the text config for KV sizing only after every tower has accepted the deployment.
+        # Publish the decoder's KV geometry and text config after all towers have been built.
+        layer_specs = self.llm.model_config.kv_cache_layer_specs
+        if layer_specs is not None:
+            model_config.set_kv_cache_layer_specs(layer_specs)
         model_config.pretrained_config = self.config
 
     @property

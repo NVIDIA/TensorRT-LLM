@@ -871,14 +871,21 @@ def test_the_splice_puts_each_items_embeddings_on_its_placeholders(
     assert (tower.calls, tower.patches) == (calls, patches)
     total = num_rows + 2
     h = torch.full((total + 3, HIDDEN), -1.0)
-    M.PrefillTarget._splice(
-        SimpleNamespace(
-            _step=SimpleNamespace(
-                mm_embeds=vision[0] if vision else None, mm_token_indices=indices, num_tokens=total
-            )
-        ),
-        h,
+    step = M._PrefillStep(
+        num_tokens=total,
+        physical_tokens=h.shape[0],
+        dp_pad_rows=None,
+        input_ids=torch.arange(total),
+        attn={},
+        gdn=(),
+        ple=(),
+        qsa=(),
+        mm_embeds=vision[0] if vision else None,
+        mm_token_indices=indices,
     )
+    target = SimpleNamespace(_step=step)
+    M.PrefillTarget._splice(target, h)
+    assert target._step.mm_embeds is None and target._step.mm_token_indices is None
     assert torch.count_nonzero(h[total:]) == 0, "padding rows must be zeroed"
     if want is None:
         assert vision is None and torch.all(h[:total] == -1.0)
