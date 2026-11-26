@@ -591,6 +591,132 @@ def test_prims_ts_main_bank_nan_scale() -> None:
     assert torch.count_nonzero(bank[physical < 0]) == 0
 
 
+def _native_staged_rows(swa: torch.Tensor, main: torch.Tensor | None, multiplier: float):
+    """Native E4M3 staging of one query that selects every SWA row, or, with ``main``, no SWA
+    row and every MAIN row: the staged bytes in selection order."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+
+    rows = (swa if main is None else main).shape[0]
+    assert rows <= 128
+    dtype = torch.int32 if main is None else torch.int64
+    selected = torch.arange(rows, device="cuda", dtype=dtype)[None]
+    unselected = torch.full((1, 128), -1, device="cuda", dtype=dtype)
+    q = torch.zeros(1, 1, 512, dtype=torch.bfloat16, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q, 0 if main is None else rows, staging_dtype=torch.float8_e4m3fn
+    )
+    metadata.stage_selected(
+        CSA2BackendForwardArgs(
+            swa_pool=swa,
+            swa_indices=selected if main is None else unselected,
+            main_pool=main,
+            topk_indices=None if main is None else selected,
+            swa_cache_format="swa",
+        ),
+        kv_scale_orig_quant=torch.tensor([multiplier], device="cuda"),
+        kv_scale_quant_orig=torch.tensor([1.0 / multiplier], device="cuda"),
+        q_scale_quant_orig=torch.ones(1, device="cuda"),
+    )
+    # Valid selections are staged in order from the primary pool's first row.
+    assert metadata.prepared_lens[0].item() == rows
+    torch.testing.assert_close(
+        metadata.prepared_indices[0, :rows].long(), selected[0].long(), atol=0, rtol=0
+    )
+    return metadata.swa_pool.view(torch.uint8)[0, :rows]
+
+
+@pytest.mark.parametrize("exponent", [0, -3, 2])
+@torch.inference_mode()
+def test_native_staging_matches_prims_ts_main_bytes(
+    _producer_probes: dict[_Kind, _Probe], exponent: int
+) -> None:
+    """Native E4M3 staging and PrimTS's selection bank turn each NVFP4 MAIN record into the same
+    E4M3(x / 2**e) bytes, so a change to either conversion fails here."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        decode_main_records,
+        main_records_storage,
+    )
+
+    main = _pool("main", 320, rows=96)
+    swa = _pool("swa", 528, rows=1)
+    native = _native_staged_rows(swa, main, 2.0**-exponent)
+    arenas = {}
+    bank = main_records_storage(arenas, main.device, main.shape[0])[: main.shape[0]]
+    records = torch.arange(main.shape[0], device=main.device, dtype=torch.int32)[None]
+    decode_main_records(main, records, bank, arenas, scale_exponent=exponent)
+    torch.testing.assert_close(native, bank, atol=0, rtol=0)
+    if exponent == 0:
+        owner, probe = _probe_output(records[0])
+        _producer_probes["main"](main, records[0], probe)
+        torch.testing.assert_close(native, probe.view(torch.uint8), atol=0, rtol=0)
+    assert torch.count_nonzero(native) > 0
+
+
+@torch.inference_mode()
+def test_native_staging_matches_prims_ts_swa_bytes(_producer_probes: dict[_Kind, _Probe]) -> None:
+    """Native unit-scale E4M3 staging and the PrimTS producer decode 528-byte scaled SWA records to
+    the same bytes for every finite UE8M0 group scale (0 to 254)."""
+    # Native staging reads 16-byte aligned rows.
+    swa = _pool("swa", 528, rows=16)
+    groups = torch.arange(16 * 16, device=swa.device).reshape(16, 16)
+    swa[:, 512:] = (groups % 255).to(torch.uint8)
+    native = _native_staged_rows(swa, None, 1.0)
+    indices = torch.arange(swa.shape[0], device=swa.device, dtype=torch.int32)
+    owner, probe = _probe_output(indices)
+    _producer_probes["swa"](swa, indices, probe)
+    torch.testing.assert_close(native, probe.view(torch.uint8), atol=0, rtol=0)
+
+
+def test_precompile_workers_compile_csa2_kernels(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Workers of the shared PrimTS precompile pool compile the CSA2 kernels plans lack into the
+    persistent cache, where this process then finds them: the NVFP4 MAIN and TMA gather kernels
+    of valid-prefix plans and a packed producer kernel, in one pool."""
+    from flashinfer.jit import env as jit_env
+
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile
+    from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed
+
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    relative = jit_env.FLASHINFER_JIT_DIR.relative_to(jit_env.FLASHINFER_CACHE_DIR)
+    monkeypatch.setattr(
+        jit_env, "FLASHINFER_JIT_DIR", tmp_path / ".cache" / "flashinfer" / relative
+    )
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_WORKERS", "2")
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+    device = torch.device("cuda", torch.cuda.current_device())
+    common = dict(max_topk=128, max_extra_topk=512, swa_cache_format="swa_fp8")
+    variants = [
+        dict(common, main_cache_format="main", valid_prefix=True),
+        dict(common, main_cache_format="main_fp8", valid_prefix=True),
+        dict(common, main_cache_format="main", valid_prefix=False),
+    ]
+    first = []
+    for options in variants:
+        missing = _prims_ts_packed.packed_sparse_mla_missing_rows(device, 16, 64, **options)
+        assert missing
+        first.append((missing[0], options))
+    prims_ts_precompile.precompile_payloads(
+        [
+            prims_ts_precompile.encode_payload(device.index, rows, 64, options, kind="csa2_packed")
+            for rows, options in first
+        ]
+    )
+    for rows, options in first:
+        assert rows not in _prims_ts_packed.packed_sparse_mla_missing_rows(
+            device, 16, 64, **options
+        )
+    # This process loads them without compiling.
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    _prims_ts_packed._compile_packed.cache_clear()
+    mla_decode._get_compiled_mla_decode.cache_clear()
+    for rows, options in first:
+        assert _prims_ts_packed.compile_packed_sparse_mla_rows(device, rows, 64, **options)
+
+
 @pytest.mark.parametrize("query_band", ["split", "unsplit"])
 @torch.inference_mode()
 def test_prims_ts_main_bank_attention_matches_packed(
@@ -876,6 +1002,68 @@ def test_prims_ts_large_plan_rounds_bf16_query_outside_the_arena(
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
     torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_prims_ts_large_plan_sets_up_query_rounding_only_eagerly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large plan whose first BF16 Q rounding setup failed after its Q buffer was allocated
+    rejects a CUDA Graph capture before setting the rounding up there; a later eager run sets
+    it up and matches the plan's arena copy."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    rows = torch.cuda.get_device_properties(0).multi_processor_count + 1
+    case = _gather_case(
+        rows, 64, True, True, _pool("swa_fp8", 512, 300), _pool("main_fp8", 512, 200)
+    )
+    _, expected, _ = _run_gather_case(packed, case, valid_prefix=True)
+    monkeypatch.setattr(packed, "_Q8_ARENA_ROWS", rows - 1)
+    setups = []
+
+    def failing_setup(*args, **kwargs):
+        setups.append(torch.cuda.is_current_stream_capturing())
+        raise RuntimeError("Q rounding setup failed")
+
+    wrapper = packed.PackedSparseMLA(
+        torch.empty(
+            packed.get_packed_sparse_mla_workspace_size(
+                "cuda", rows, 64, max_topk=128, max_extra_topk=149
+            ),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+    )
+    wrapper.plan(
+        torch.device("cuda", torch.cuda.current_device()),
+        rows,
+        64,
+        max_topk=128,
+        max_extra_topk=149,
+        has_sinks=True,
+        swa_cache_format="swa_fp8",
+        main_cache_format="main_fp8",
+        valid_prefix=True,
+    )
+    out = torch.full_like(case["q"], torch.nan)
+    inputs = {key: value for key, value in case.items() if key != "q"}
+
+    def run() -> None:
+        wrapper.run(case["q"], **inputs, softmax_scale=512**-0.5, out=out, validate=False)
+
+    with monkeypatch.context() as failing:
+        failing.setattr(packed.UnitScaleQuery, "plan", failing_setup)
+        with pytest.raises(RuntimeError, match="Q rounding setup failed"):
+            run()
+        assert wrapper._q8 is not None and wrapper._query is None
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="before CUDA Graph capture"):
+            with torch.cuda.graph(graph):
+                run()
+    assert setups == [False]
+    run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 def _force_gather(packed, monkeypatch: pytest.MonkeyPatch, **overrides) -> None:
@@ -1350,12 +1538,19 @@ def test_prims_ts_nvfp4_main_admission() -> None:
 def test_prims_ts_dependent_launch_reads_after_preceding_writer(
     route: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A programmatic dependent attention launch reads its inputs only after the kernel before it.
+    """A programmatic dependent attention launch reads its selections only after the kernel
+    before it.
 
-    Persistent NVFP4 MAIN and WS gather grids prepare their barriers and TMEM while that kernel
-    still runs. In a CUDA graph, one large copy whose last bytes are the MAIN selections directly
-    precedes the attention, which matches the same attention launched without PDL bit for bit.
+    A PDL attention grid may start while that kernel still runs; the persistent WS gather grid
+    runs its prologue then and waits after it, the NVFP4 MAIN grid waits at entry. In a CUDA
+    graph, the kernel directly before the attention releases its dependents
+    at entry and writes the MAIN selections only about a millisecond later; the attention takes
+    E4M3 Q, so that no Q rounding runs between the two, and matches the same attention launched
+    without PDL bit for bit. A dependent of the same writer that never waits reads the stale
+    selections, so an attention that read them before its wait would differ.
     """
+    from _torch.helpers import copy_without_wait, late_copy
+
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1363,9 +1558,11 @@ def test_prims_ts_dependent_launch_reads_after_preceding_writer(
     main_format = "main" if route == "nvfp4" else "main_fp8"
     main = _pool(main_format, 288 if route == "nvfp4" else 512, 200)
     case = _gather_case(rows, 64, True, True, _pool("swa_fp8", 512, 300), main)
+    q8 = case["q"].to(torch.float8_e4m3fn)
     stale = case["extra_sparse_indices"]
     width = stale.shape[1]
     fresh = torch.where(stale >= 0, (stale + 7) % main.shape[0], stale)
+    assert not torch.equal(fresh, stale)
 
     def plan(enabled: bool):
         monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1" if enabled else "0")
@@ -1402,7 +1599,7 @@ def test_prims_ts_dependent_launch_reads_after_preceding_writer(
     def run(wrapper, indices, out):
         inputs = {key: value for key, value in case.items() if key != "q"}
         inputs["extra_sparse_indices"] = indices
-        wrapper.run(case["q"], **inputs, softmax_scale=512**-0.5, out=out, validate=False)
+        wrapper.run(q8, **inputs, softmax_scale=512**-0.5, out=out, validate=False)
 
     reference = plan(False)
     expected = torch.full_like(case["q"], torch.nan)
@@ -1410,19 +1607,30 @@ def test_prims_ts_dependent_launch_reads_after_preceding_writer(
     expected_lse = reference._state.buffers["lse"].clone()
 
     dependent = plan(True)
-    # The selections are the last bytes a 256 MiB copy writes.
-    filler = 1 << 26
-    storage = torch.empty(filler + fresh.numel(), device=device, dtype=fresh.dtype)
-    source = torch.cat((torch.zeros(filler, device=device, dtype=fresh.dtype), fresh.flatten()))
-    indices = storage[filler:].view(fresh.shape)
+    delay_ns = 1_000_000
+    indices = torch.empty_like(fresh)
+    seen = torch.empty_like(fresh)
     out = torch.full_like(case["q"], torch.nan)
-    indices.copy_(stale)
+    # A process's first launch of a kernel loads it and does not overlap its predecessor.
+    late_copy(fresh, indices, 0)
+    copy_without_wait(indices, seen)
+    late_copy(fresh, indices, 0)
     run(dependent, indices, out)
+    torch.cuda.synchronize()
+    control = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(control):
+        late_copy(fresh, indices, delay_ns)
+        copy_without_wait(indices, seen)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        storage.copy_(source)
+        late_copy(fresh, indices, delay_ns)
         run(dependent, indices, out)
     for _ in range(3):
+        indices.copy_(stale)
+        control.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(indices, fresh)
+        assert not torch.equal(seen, fresh), "the writer finished before its dependent started"
         indices.copy_(stale)
         out.fill_(torch.nan)
         graph.replay()
@@ -1457,6 +1665,36 @@ def test_prims_ts_mxfp8_output_plan_contract() -> None:
     quant = (data, scales, torch.zeros(4, device=device, dtype=torch.int32), _rope_table(device, 4))
     with pytest.raises(ValueError, match="output_quant"):
         planned.run(case["q"], **inputs, softmax_scale=512**-0.5, out=out, output_quant=quant)
+    # An MXFP8 output plan rejects output buffers of another device before it zeroes their
+    # padded scale rows.
+    rows = 140
+    case = _gather_case(
+        rows, 64, True, True, _pool("swa_fp8", 512, 300), _pool("main_fp8", 512, 200)
+    )
+    size = packed.get_packed_sparse_mla_workspace_size(device, rows, 64, max_extra_topk=149)
+    mxfp8 = packed.PackedSparseMLA(torch.empty(size, device=device, dtype=torch.uint8))
+    mxfp8.plan(
+        device,
+        rows,
+        64,
+        max_extra_topk=149,
+        has_sinks=True,
+        swa_cache_format="swa_fp8",
+        main_cache_format="main_fp8",
+        output_groups=8,
+    )
+    elsewhere = torch.device("cpu")
+    scales = torch.full((8 * 256 * 128,), 0xFF, device=elsewhere, dtype=torch.uint8)
+    quant = (
+        torch.empty((8, rows, 4096), device=elsewhere, dtype=torch.float8_e4m3fn),
+        scales,
+        torch.zeros(rows, device=elsewhere, dtype=torch.int32),
+        _rope_table(elsewhere, rows),
+    )
+    inputs = {key: value for key, value in case.items() if key != "q"}
+    with pytest.raises(ValueError, match="plan's device"):
+        mxfp8.run(case["q"], **inputs, softmax_scale=512**-0.5, out=None, output_quant=quant)
+    assert bool((scales == 0xFF).all())
 
 
 @pytest.mark.parametrize("stride", [288, 321])
@@ -1742,17 +1980,19 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     with pytest.raises(ValueError, match="selection bank"):
         main_records_storage(arenas, device, main_records_rows_limit() + 1)
     base = workspace_reservation_bytes(device, 64, 640, 768)
-    # The selection bank, plus its epoch and an INT64 owner slot per MAIN pool row.
+    # The selection bank and its two INT32 index sets, plus its epoch and an INT64 owner
+    # slot per MAIN pool row.
+    selection_bank = 768 * 512 * 512 + 2 * 4 * 768 * 512
     assert workspace_reservation_bytes(device, 64, 640, 768, generation_queries=768) == (
-        base + 768 * 512 * 512 + 8
+        base + selection_bank + 8
     )
     assert workspace_reservation_bytes(
         device, 64, 640, 768, generation_queries=768, main_pool_rows=1000
-    ) == (base + 768 * 512 * 512 + 8 * 1001)
+    ) == (base + selection_bank + 8 * 1001)
     # A larger pool's owner slots beyond the reserved rows grow past the reservation.
     assert workspace_reservation_bytes(
         device, 64, 640, 768, generation_queries=768, main_pool_rows=1 << 40
-    ) == (base + 768 * 512 * 512 + 8 * (main_record_owners_reserved_rows() + 1))
+    ) == (base + selection_bank + 8 * (main_record_owners_reserved_rows() + 1))
     assert workspace_reservation_bytes(device, 64, 128, 768, generation_queries=768) == (
         workspace_reservation_bytes(device, 64, 128, 768)
     )

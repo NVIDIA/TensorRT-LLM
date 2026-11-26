@@ -36,6 +36,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor, bf16_projection
+from .compute import NATIVE_COMPUTE, CSA2ComputeCapabilities
 from .metadata import _SWA_TILE, CSA2TrtllmMetadata, csa2_side_stream
 from .params import (
     CSA2BackendForwardArgs,
@@ -904,14 +905,11 @@ class DeepseekV41Attention(nn.Module):
             and not self.rotary_emb.is_neox
             and (
                 (
-                    self.backend.compute_backend == "trtllm"
-                    and self.backend.native_fp8
+                    self.backend.native_fp8
                     and not self.backend.sparse_params.use_packed_sparse_attention
-                    and self._compute_helper is None
                 )
                 or (
-                    self.backend.compute_backend == "prims_ts"
-                    and self._compute_helper is not None
+                    self._compute.reads_e4m3_query
                     # The projection's E4M3 Q is unit-scale; a Q scale needs the BF16 Q.
                     and q_fp8_scale_exponent() == 0
                 )
@@ -922,7 +920,7 @@ class DeepseekV41Attention(nn.Module):
         ):
             return None
         word = None
-        if self.backend.compute_backend == "trtllm" and (
+        if self.backend.native_fp8 and (
             not self.backend.fused_decode
             or self._gen_fmha_decode(hidden_states.shape[0], attn_metadata)
         ):
@@ -954,8 +952,7 @@ class DeepseekV41Attention(nn.Module):
         """
         rows = q.shape[0]
         return (
-            self.backend.compute_backend == "prims_ts"
-            and self._compute_helper is not None
+            self._compute.reads_e4m3_query
             and not self.backend.sparse_params.use_packed_sparse_attention
             and attn_metadata.num_ctx_tokens == 0
             and 0 < rows < getattr(self, "_fp8_q_min_tokens", 0)
@@ -1080,11 +1077,9 @@ class DeepseekV41Attention(nn.Module):
         """Whether this forward's only tile is a generation tile on native FP8 staging."""
         return (
             attn_metadata.num_ctx_tokens == 0
-            and self.backend.compute_backend == "trtllm"
             and self.backend.native_fp8
             and not self.backend.fused_decode
             and not self.backend.sparse_params.use_packed_sparse_attention
-            and self._compute_helper is None
         )
 
     def _rope(self, x: torch.Tensor, positions: torch.Tensor, heads: int) -> torch.Tensor:
@@ -1627,13 +1622,20 @@ class DeepseekV41Attention(nn.Module):
         return self.o_b_proj(torch.cat(projections, dim=-1))
 
     @property
+    def _compute(self) -> CSA2ComputeCapabilities:
+        """The capabilities of this layer's compute provider: its helper, or the native one."""
+        helper = self._compute_helper
+        return NATIVE_COMPUTE if helper is None else helper
+
+    @property
     def supports_row_split(self) -> bool:
         """Whether ``project_rows`` and ``attend_rows`` reproduce ``forward``.
 
         The native path and the PrimTS helper do; both attend the projected BF16 query rows.
         """
-        return not self.backend.sparse_params.use_packed_sparse_attention and (
-            self._compute_helper is None or self.backend.compute_backend == "prims_ts"
+        return (
+            not self.backend.sparse_params.use_packed_sparse_attention
+            and self._compute.supports_row_split
         )
 
     def project_rows(
@@ -1675,8 +1677,9 @@ class DeepseekV41Attention(nn.Module):
         """Sparse attention of the first ``rows`` projected rows into ``output``; zero the rest.
 
         The metadata-driven remainder of ``forward``, including a Full layer's own global
-        projection when it was not precomputed, through the provider ``forward`` uses: the
-        PrimTS helper over packed KV, or the native backend.
+        projection when it was not precomputed, through the attention ``forward`` uses for the
+        same rows (``_direct_decode``): the direct decode, the PrimTS helper over packed KV, or
+        the native backend.
         """
         if rows:
             layer_idx = self.layer.layer_idx
@@ -1721,6 +1724,8 @@ class DeepseekV41Attention(nn.Module):
             )
 
             num_ctx = attn_metadata.num_ctx_tokens
+            # The projected query is already rotated, so the direct decode leaves it as is.
+            direct = self._direct_decode(rows, attn_metadata, q.device)
             for start, end in ((0, num_ctx), (num_ctx, rows)):
                 if start == end:
                     continue
@@ -1740,8 +1745,10 @@ class DeepseekV41Attention(nn.Module):
                         query_start=start,
                     ),
                 )
-                if self._compute_helper is not None and not self.backend.runs_fused_context(
-                    metadata
+                if (
+                    self._compute_helper is not None
+                    and not direct
+                    and not self.backend.runs_fused_context(metadata)
                 ):
                     compute = (
                         self._compute_helper.forward_context
@@ -1753,6 +1760,22 @@ class DeepseekV41Attention(nn.Module):
                     self.backend.forward(tile.flatten(1), None, None, metadata, forward_args=args)
         if rows < output.shape[0]:
             output[rows:].zero_()
+
+    def _direct_decode(
+        self, rows: int, attn_metadata: CSA2TrtllmMetadata, device: torch.device
+    ) -> bool:
+        """Whether a forward of ``rows`` rows attends with the direct decode, which reads the
+        packed pools without staging, compaction or a split-KV reduction and can apply the
+        query RoPE in its launch: the generation-only forwards of the native provider and PrimTS
+        that the backend admits."""
+        extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
+        return (
+            attn_metadata.num_ctx_tokens == 0
+            and self._compute.serves_direct_decode
+            and not self.rotary_emb.is_neox
+            and self.qk_rope_head_dim == 64
+            and self.backend.direct_decode_serves(rows, 0, pad_up(extra_width, 128), device)
+        )
 
     def _tile_metadata(
         self, attn_metadata: CSA2TrtllmMetadata, tile: torch.Tensor, start: int
@@ -1816,8 +1839,7 @@ class DeepseekV41Attention(nn.Module):
             and self.layer.mode in (CSA2Mode.SWA, CSA2Mode.REUSE)
             and attn_metadata.num_ctx_tokens == 0
             and hidden_states.shape[0] > 0
-            and self.backend.compute_backend == "prims_ts"
-            and self._compute_helper is not None
+            and self._compute.prepares_early_selection
             and not self.backend.sparse_params.use_packed_sparse_attention
         )
         if early_selection:
@@ -1894,7 +1916,7 @@ class DeepseekV41Attention(nn.Module):
             and hidden_states.shape[0] > 0
             and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
             and self.takes_mxfp8_input
-            and self.backend.compute_backend in ("trtllm", "prims_ts")
+            and self._compute.waits_query_ready
             and not self.backend.sparse_params.use_packed_sparse_attention
         )
         # Full/Reindex decode projects the attention query on the auxiliary stream after the
@@ -1903,7 +1925,7 @@ class DeepseekV41Attention(nn.Module):
             overlap
             and attn_metadata.num_ctx_tokens == 0
             and hidden_states.shape[0] > 0
-            and self.backend.compute_backend in ("trtllm", "prims_ts")
+            and self._compute.waits_query_ready
             and not self.backend.sparse_params.use_packed_sparse_attention
         )
         # Captured context tiles use generation FMHA instead of the shared Q/KV context scale.
@@ -1920,10 +1942,9 @@ class DeepseekV41Attention(nn.Module):
             and self._fuse_q_norm_quant
             # Native FP8 staging rescales the unit-scale E4M3 Q; PrimTS reads it as is.
             and (
-                self.backend.compute_backend == "prims_ts"
+                self._compute.reads_e4m3_query
                 or (
-                    self.backend.compute_backend == "trtllm"
-                    and self.backend.native_fp8
+                    self.backend.native_fp8
                     and not self.backend.sparse_params.use_packed_sparse_attention
                 )
             )
@@ -1931,19 +1952,9 @@ class DeepseekV41Attention(nn.Module):
             and not torch.cuda.is_current_stream_capturing()
             and is_sm_100f()
         )
-        # A direct-decode forward leaves the query RoPE to its attention launch. Native and PrimTS
-        # generation steps the backend admits take it: it attends the packed pools without
-        # staging, compaction or a split-KV reduction.
+        # A direct-decode forward leaves the query RoPE to its attention launch.
         extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
-        direct = (
-            attn_metadata.num_ctx_tokens == 0
-            and (self._compute_helper is None or self.backend.compute_backend == "prims_ts")
-            and not self.rotary_emb.is_neox
-            and self.qk_rope_head_dim == 64
-            and self.backend.direct_decode_serves(
-                hidden_states.shape[0], 0, pad_up(extra_width, 128), hidden_states.device
-            )
-        )
+        direct = self._direct_decode(hidden_states.shape[0], attn_metadata, hidden_states.device)
         # The query projections overlap the decode they release; at its split they can share SMs.
         projection_carveout = (
             self.backend.direct_decode_carveout(pad_up(extra_width, 128), hidden_states.device)
@@ -1993,7 +2004,7 @@ class DeepseekV41Attention(nn.Module):
                 and attn_metadata.num_ctx_tokens == shape[0]
                 and (
                     native_context
-                    or (self.backend.compute_backend == "prims_ts" and q_fp8_scale_exponent() == 0)
+                    or (self._compute.reads_e4m3_query and q_fp8_scale_exponent() == 0)
                 )
             )
             q = (
@@ -2163,7 +2174,7 @@ class DeepseekV41Attention(nn.Module):
                         (0 < attn_metadata.num_ctx_tokens == q.shape[0] and not native_context)
                         or (attn_metadata.num_ctx_tokens == 0 and positions.is_contiguous())
                     )
-                    and self.backend.compute_backend == "prims_ts"
+                    and self._compute.takes_mxfp8_output
                     and self._o_a_fp8_block128
                     and not inverse_rope_applied
                 )
@@ -2209,9 +2220,8 @@ class DeepseekV41Attention(nn.Module):
         )
         if output_fp8 is not None or (
             output_mxfp8 is not None
-            and self.backend.compute_backend == "prims_ts"
             and 0 < attn_metadata.num_ctx_tokens == q.shape[0]
-            and self._compute_helper.writes_mxfp8_output(
+            and self._compute.writes_mxfp8_output(
                 q.device, q.shape[0], _SWA_TILE + pad_up(extra_width, 128)
             )
         ):
@@ -2290,10 +2300,8 @@ class DeepseekV41Attention(nn.Module):
             projected = self._project_output(
                 output, positions, prequantized=output_fp8[:2], out=out
             )
-        elif output_mxfp8 is not None and (
-            # PrimTS writes the MXFP8 input only where its plan can, and then says so.
-            state.output_mxfp8_written or self.backend.compute_backend != "prims_ts"
-        ):
+        # Every writer of the MXFP8 input says so; otherwise the attention wrote the BF16 output.
+        elif output_mxfp8 is not None and state.output_mxfp8_written:
             projected = self._project_output_mxfp8(
                 output, positions, prequantized=output_mxfp8[:2], out=out
             )

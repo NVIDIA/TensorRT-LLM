@@ -17,8 +17,10 @@ from ._prims_ts_bank import (
     main_record_owners_reserved_rows,
     main_records_rows_limit,
 )
+from .compute import CSA2ComputeCapabilities
 from .params import (
     CSA2BackendForwardArgs,
+    CSA2Mode,
     PrimsTSMainFormat,
     SwaCacheFormat,
     q_fp8_scale_exponent,
@@ -37,7 +39,6 @@ _SWA_TILE = 128
 # (_reads_raw_selections).
 _RAW_SELECTION_HEADS = 32
 _PACKED_ABI = "packed_e4m3_unit_scale_v4"
-_MAX_SOFTMAX_SCALE = torch.finfo(torch.float32).max / math.log2(math.e)
 # CSA2 side stream that prepares selection metadata beside a layer's projections.
 _SELECTION_STREAM = 2
 # Generation tiles whose selections are final before their projections keep the
@@ -47,14 +48,11 @@ _EARLY_SELECTION_BANK_ROWS = 1024
 # (CSA2PrimsTS._main_selection_group).
 _MAIN_HOLDER_KEY = "main_holder"
 _SELECTION_BANK_HOLDER_KEY = "csa2_prims_ts_selection_bank_holder"
-
-
-def _validate_softmax_scale(scale: float) -> None:
-    if not math.isfinite(scale) or not 0 < scale <= _MAX_SOFTMAX_SCALE:
-        raise ValueError(
-            "CSA2 PrimTS softmax scale must be positive, finite and representable "
-            "after FP32 base-2 conversion"
-        )
+# Arena entry naming the MAIN rows the context MAIN bank last decoded in full
+# (CSA2PrimsTS._main_bank_key).
+_MAIN_BANK_HOLDER_KEY = "csa2_prims_ts_main_bank_holder"
+# Arena entry of the selection-bank index sets (_selection_index_views).
+_SELECTION_INDEX_KEY = "csa2_prims_ts_selection_indices"
 
 
 class _PrimsTSMetadata(NamedTuple):
@@ -102,9 +100,10 @@ def workspace_reservation_bytes(
     metadata is the only separate allocation, plus, for widths with MAIN rows,
     the reserved storage of the device's decoded context MAIN bank and its
     one-byte row marks (a phase that owns more MAIN rows grows them past the
-    reservation), and the selection bank of generation tiles of up to
-    ``generation_queries`` rows with its INT64 owner slot per row of a MAIN pool
-    of up to ``main_pool_rows`` rows, of which it covers up to
+    reservation), and the selection bank of tiles of up to ``generation_queries``
+    rows, the only tiles that take one (``_selection_bank_rows``), with its two
+    INT32 index sets and its INT64 owner slot per row of a MAIN pool of up to
+    ``main_pool_rows`` rows, of which it covers up to
     ``main_record_owners_reserved_rows()`` (a larger pool grows them past the reservation).
     """
     bank = 0
@@ -115,8 +114,43 @@ def workspace_reservation_bytes(
             bank += _HEAD_DIM * min(
                 max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
+            bank += 2 * 4 * selections
             bank += 8 * (min(main_pool_rows, main_record_owners_reserved_rows()) + 1)
     return _workspace_capacity(device, heads, width, queries) + 4 * queries * (width + 2) + bank
+
+
+def _selection_bank_rows(metadata: CSA2TrtllmMetadata) -> int:
+    """Most query rows of a tile that takes a selection bank, the rows the reservation covers.
+
+    Runtime tiles carry the generation step's query capacity; a standalone tile falls back to
+    the largest tile its metadata plans.
+    """
+    rows = getattr(metadata, "_csa2_prims_ts_selection_rows", None)
+    if rows is None:
+        rows = getattr(metadata, "_csa2_prims_ts_max_queries", metadata.max_num_tokens)
+    return rows
+
+
+def _selection_index_views(
+    arenas: dict, device: torch.device, capacity: int, rows: int, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rows``-row views of the device's INT32[capacity, width] selection-bank index sets.
+
+    The first set addresses bank row ``r * width + c`` for selection ``c`` of query ``r``; the
+    second receives the deduplicating compaction's bank rows. Plans of any row count read the
+    same arrays, which are allocated once outside CUDA Graph capture.
+    """
+    key = (_SELECTION_INDEX_KEY, device, width)
+    arrays = arenas.get(key)
+    if arrays is None or arrays[0].shape[0] < capacity:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("CSA2 PrimTS selection-bank indices cannot grow during capture")
+        indices = torch.arange(capacity * width, device=device, dtype=torch.int32).view(
+            capacity, width
+        )
+        arrays = (indices, torch.empty_like(indices))
+        arenas[key] = arrays
+    return arrays[0][:rows], arrays[1][:rows]
 
 
 def _allocate_metadata(device: torch.device, rows: int, width: int) -> _PrimsTSMetadata:
@@ -242,8 +276,42 @@ def _reads_raw_selections(
     )
 
 
-class CSA2PrimsTS:
+def _precompile_in_workers(
+    device: torch.device, max_rows: int, heads: int, options: dict, metadata
+) -> None:
+    """Compile the kernels ``precompile_packed_sparse_mla(device, max_rows, heads, **options)``
+    needs that the persistent cache lacks in the shared PrimTS precompile pool
+    (``fmha/prims_ts_precompile.py``), in parallel; that call then loads them.
+
+    Only first plans of the executor's warmup start a pool (``prims_ts_precompile.in_warmup``),
+    and the pool's settings apply (``TLLM_PRIMTS_WARM_WORKERS`` and the host budget among this
+    job's local ranks, ``TLLM_PRIMTS_WARM_TIMEOUT``, ``TLLM_PRIMTS_WARM_STRICT``); otherwise, or
+    where the pool fails, this process compiles them itself.
+    """
+    from ...fmha import prims_ts_precompile
+    from ._prims_ts_packed import packed_sparse_mla_missing_rows
+
+    local_ranks = prims_ts_precompile.local_rank_count(getattr(metadata, "mapping", None))
+    if not prims_ts_precompile.in_warmup() or not prims_ts_precompile.pool_enabled(
+        local_ranks=local_ranks
+    ):
+        return
+    payloads = [
+        prims_ts_precompile.encode_payload(device.index, rows, heads, options, kind="csa2_packed")
+        for rows in packed_sparse_mla_missing_rows(device, max_rows, heads, **options)
+    ]
+    prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
+
+
+class CSA2PrimsTS(CSA2ComputeCapabilities):
     """Module compute helper; plans and serial scratch belong to query metadata."""
+
+    supports_row_split = True
+    serves_direct_decode = True
+    prepares_early_selection = True
+    waits_query_ready = True
+    reads_e4m3_query = True
+    takes_mxfp8_output = True
 
     # A selection bank converts each selected MAIN row once (dedup_main_records).
     dedup_selection_bank = True
@@ -331,10 +399,7 @@ class CSA2PrimsTS:
             # Row counts select compile-time kernel variants. Compile every
             # variant this arena can plan for the MAIN format and output now, so
             # no request compiles one. All of them share the arena's storage.
-            precompile_packed_sparse_mla(
-                q.device,
-                arena["capacity"],
-                heads,
+            options = dict(
                 max_topk=_SWA_TILE,
                 max_extra_topk=width - _SWA_TILE,
                 swa_cache_format=swa_cache_format,
@@ -343,6 +408,8 @@ class CSA2PrimsTS:
                 output_groups=output_groups,
                 raw_selections=raw_selections,
             )
+            _precompile_in_workers(q.device, arena["capacity"], heads, options, metadata)
+            precompile_packed_sparse_mla(q.device, arena["capacity"], heads, **options)
             arena["main_formats"].add(variant)
         if rows > arena["capacity"]:
             raise ValueError("CSA2 PrimTS query count exceeds its reserved metadata capacity")
@@ -458,6 +525,8 @@ class CSA2PrimsTS:
             or not sinks.is_contiguous()
         ):
             raise ValueError("CSA2 PrimTS sinks must be contiguous CUDA FP32[H]")
+        from ._prims_ts_packed import _validate_softmax_scale
+
         scale = 1.0 / (self.attention.q_scaling * math.sqrt(_HEAD_DIM))
         _validate_softmax_scale(scale)
         swa_cache_format = raw.swa_cache_format or self.attention.swa_cache_format
@@ -529,10 +598,19 @@ class CSA2PrimsTS:
                 if bank.selected_only:
                     marks = main_bank_marks(arenas, q.device, bank.rows)
                 else:
-                    # After this layer's MAIN publication, on the stream that wrote it.
-                    decode_main_bank(
-                        inputs.main_pool, bank, main_source, scale_exponent=main_exponent
-                    )
+                    # A layer that publishes no MAIN rows reads the rows its owner's layer
+                    # decoded in this forward, while the bank still holds them.
+                    key = self._main_bank_key(raw, inputs, bank, main_source, main_exponent)
+                    if (
+                        key is None
+                        or self._publishes_main_rows(raw)
+                        or arenas.get(_MAIN_BANK_HOLDER_KEY) != key
+                    ):
+                        # After this layer's MAIN publication, on the stream that wrote it.
+                        decode_main_bank(
+                            inputs.main_pool, bank, main_source, scale_exponent=main_exponent
+                        )
+                        arenas[_MAIN_BANK_HOLDER_KEY] = key
             extra_indices = prepared.extra_indices
             arena = record["arena"]
             group = None if bank is not None else self._main_selection_group(inputs, q.shape[0])
@@ -540,22 +618,18 @@ class CSA2PrimsTS:
             if selection_bank:
                 if not has_extra or inputs.main_pool is None:
                     raise ValueError("CSA2 PrimTS selection banks need MAIN selections")
-                # Sized once for the largest tile this metadata plans, before capture.
-                max_queries = getattr(
-                    metadata, "_csa2_prims_ts_max_queries", metadata.max_num_tokens
-                )
+                # Sized once, before capture, for the largest tile that takes a selection
+                # bank, which the workspace reservation covers.
+                capacity = _selection_bank_rows(metadata)
+                main_width = prepared.extra_indices.shape[1]
                 main_source = main_records_storage(
-                    arenas,
-                    q.device,
-                    extra_indices.numel(),
-                    capacity=max(max_queries, q.shape[0]) * prepared.extra_indices.shape[1],
+                    arenas, q.device, extra_indices.numel(), capacity=capacity * main_width
                 )
                 if "selection_indices" not in record:
                     # Both index sets exist before capture, whichever a call uses.
-                    record["selection_indices"] = torch.arange(
-                        prepared.extra_indices.numel(), device=q.device, dtype=torch.int32
-                    ).view(prepared.extra_indices.shape)
-                    record["selection_rows"] = torch.empty_like(prepared.extra_indices)
+                    record["selection_indices"], record["selection_rows"] = _selection_index_views(
+                        arenas, q.device, capacity, prepared.extra_indices.shape[0], main_width
+                    )
                 dedup = self.dedup_selection_bank and self._shares_main_rows(raw, q.shape[0])
                 # Selection c of query r reads bank row r * width + c, or with dedup the bank
                 # row of the first selection of its MAIN row, the only selections decoded.
@@ -671,14 +745,64 @@ class CSA2PrimsTS:
             return output
 
     @staticmethod
+    def _main_bank_key(
+        raw: CSA2BackendForwardArgs,
+        inputs: CSA2BackendForwardArgs,
+        bank,
+        storage: torch.Tensor,
+        scale_exponent: int,
+    ) -> tuple | None:
+        """Key of the MAIN rows a full decode of ``bank`` writes into ``storage``, or None.
+
+        Only a KV owner's Full layer publishes MAIN rows into its pool, so within one forward
+        (``selection_forward_key``) the layers of an owner decode the same rows from the same
+        pool through the same plan; the key names those, the bank storage and the scale.
+        """
+        from .metadata import selection_forward_key
+
+        source = None if raw.state is None else raw.state.metadata
+        if source is None:
+            return None
+        pool = inputs.main_pool
+        return (
+            *selection_forward_key(source),
+            pool.data_ptr(),
+            tuple(pool.shape),
+            pool.stride(0),
+            bank.offsets.data_ptr(),
+            bank.pages.data_ptr(),
+            bank.base,
+            bank.rows,
+            bank.page_size,
+            bank.num_requests,
+            storage.data_ptr(),
+            scale_exponent,
+        )
+
+    def _publishes_main_rows(self, raw: CSA2BackendForwardArgs) -> bool:
+        """Whether this layer published MAIN rows in this forward: a Full layer whose KV the
+        forward did not precompute (``publish_layer_rows``)."""
+        layout = self.attention.sparse_params.layout
+        layer_idx = self.attention.layer_idx
+        source = None if raw.state is None else raw.state.metadata
+        return (
+            layout is None
+            or source is None
+            or (
+                layout.layer(layer_idx).mode == CSA2Mode.FULL
+                and layer_idx not in source.csa2_precomputed_kv_layers
+            )
+        )
+
+    @staticmethod
     def _main_selection_group(inputs: CSA2BackendForwardArgs, rows: int) -> tuple | None:
         """Key of the MAIN list a compaction of this tile writes, or None if no layer shares it.
 
         Layers of one staging group (KV owner, index source and query start) read one MAIN
         pool through the same selections, page table and visible prefixes in a forward, so
         their compactions write the same MAIN list and the same selection bank. The key
-        names the forward (its request metadata, index publication and staging epoch) and
-        whether the stream captures, so a CUDA Graph records its own compaction.
+        names the forward as native staging does (``selection_forward_key``) and whether the
+        stream captures, so a CUDA Graph records its own compaction.
         """
         source = None if inputs.state is None else inputs.state.metadata
         if (
@@ -688,12 +812,12 @@ class CSA2PrimsTS:
             or inputs.main_pool is None
         ):
             return None
+        from .metadata import selection_forward_key
+
         mapping = inputs.main_mapping
         return (
             inputs.stage_group,
-            id(source),
-            id(getattr(source, "csa2_indices", None)),
-            getattr(source, "_csa2_stage_epoch", 0),
+            *selection_forward_key(source),
             rows,
             torch.cuda.is_current_stream_capturing(),
             inputs.main_pool.data_ptr(),
@@ -731,7 +855,9 @@ class CSA2PrimsTS:
         record inside the packed producer's warps, and a bank row per selection,
         decoded by its own kernel, lets the tile take the TMA gather schedule over
         unit-scale E4M3 rows instead, when its selections fit the bank's reserved rows.
-        ``quantized_output`` is whether the tile stores the grouped MXFP8 output.
+        Only tiles of up to ``_selection_bank_rows`` query rows, the bank's allocated and
+        reserved capacity, take one. ``quantized_output`` is whether the tile stores the
+        grouped MXFP8 output.
 
         A tile with ``early_selection`` (selections final before its projections)
         compacts and decodes its selection bank on the side stream beside them, so
@@ -749,6 +875,8 @@ class CSA2PrimsTS:
         width = metadata.num_sparse_topk
         rows = metadata.num_tokens
         if swa_cache_format != "swa_fp8" or width <= _SWA_TILE or rows <= 0:
+            return False
+        if max(rows, q.shape[0]) > _selection_bank_rows(metadata):
             return False
         heads = self.attention.num_heads
         if not (early_selection and rows < _EARLY_SELECTION_BANK_ROWS) and decodes_nvfp4_main(

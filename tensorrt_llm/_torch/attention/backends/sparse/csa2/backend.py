@@ -25,6 +25,7 @@ from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_1
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .compute import CSA2ComputeCapabilities
 from .indexer import CSA2Indexer
 from .metadata import CSA2TrtllmMetadata
 from .params import (
@@ -562,6 +563,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             else forward_args.output.view(count, self.num_heads, _HEAD_DIM),
             mxfp8,
         )
+        if mxfp8 is not None:
+            state.output_mxfp8_written = True
         return forward_args.output
 
     def _forward_direct(self, q, metadata, forward_args):
@@ -942,7 +945,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
             *(() if mxfp8 is None else mxfp8[1:]),
         )
         if mxfp8 is not None:
-            inputs.state.output_mxfp8_written = True
+            # The module reads the flag on the state it passed in; publishing the rows can
+            # replace ``inputs.state`` with a copy that holds the packed index queries.
+            forward_args.sparse_backend_args.state.output_mxfp8_written = True
 
     def _native_slot_mapping(self, logical: torch.Tensor) -> bool:
         """Logical main selections may stay logical when native staging maps them."""
@@ -1276,7 +1281,7 @@ def get_csa2_backend(params: CSA2Params) -> type[CSA2TrtllmAttention]:
     return CSA2TrtllmAttention
 
 
-class CSA2FlashMLA:
+class CSA2FlashMLA(CSA2ComputeCapabilities):
     """Module-owned FlashMLA helper, matching the DSV4 composition pattern."""
 
     def __init__(self, attention=None):
@@ -1332,7 +1337,7 @@ class CSA2FlashMLA:
         return result
 
 
-class CSA2FlashInfer:
+class CSA2FlashInfer(CSA2ComputeCapabilities):
     """Module-owned FlashInfer plans and selected-row attention execution."""
 
     @dataclass

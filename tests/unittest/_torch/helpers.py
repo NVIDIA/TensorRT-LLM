@@ -414,6 +414,9 @@ def triton_num_compiled(kernel) -> int:
     return sum(len(cache[0]) for cache in caches.values())
 
 
+_COPY_BLOCK = 1024
+
+
 @triton.jit
 def _late_copy_kernel(src_ptr, dst_ptr, n, delay_ns, BLOCK: tl.constexpr):
     # Releases its PDL dependents at entry, then copies after ~delay_ns.
@@ -430,23 +433,48 @@ def _late_copy_kernel(src_ptr, dst_ptr, n, delay_ns, BLOCK: tl.constexpr):
                                       dtype=tl.int64,
                                       is_pure=False,
                                       pack=1)
-    offs = tl.arange(0, BLOCK)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
 
 
-def late_copy(src: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
-    """``dst.copy_(src)`` by a one-program kernel that releases a PDL-launched
-    successor at entry and stores ``dst`` only ~``delay_ns`` later: a
-    successor that reads ``dst`` before its griddepcontrol.wait sees the old
-    values."""
+@triton.jit
+def _copy_without_wait_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
+
+
+def _check_copy_operands(src: torch.Tensor, dst: torch.Tensor) -> None:
     assert src.is_contiguous() and dst.is_contiguous()
     assert src.dtype == dst.dtype and src.numel() == dst.numel()
-    _late_copy_kernel[(1, )](src,
-                             dst,
-                             src.numel(),
-                             delay_ns,
-                             BLOCK=triton.next_power_of_2(src.numel()))
+
+
+def late_copy(src: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
+    """``dst.copy_(src)`` by a kernel that releases a PDL-launched successor at
+    entry and stores ``dst`` only ~``delay_ns`` later: a successor that reads
+    ``dst`` before its griddepcontrol.wait sees the old values."""
+    _check_copy_operands(src, dst)
+    _late_copy_kernel[(triton.cdiv(src.numel(),
+                                   _COPY_BLOCK), )](src,
+                                                    dst,
+                                                    src.numel(),
+                                                    delay_ns,
+                                                    BLOCK=_COPY_BLOCK)
+
+
+def copy_without_wait(src: torch.Tensor, dst: torch.Tensor) -> None:
+    """``dst.copy_(src)`` launched as a PDL dependent that never executes
+    griddepcontrol.wait: right after ``late_copy`` into ``src``, it reads the
+    values ``src`` held before that copy's delayed stores."""
+    _check_copy_operands(src, dst)
+    _copy_without_wait_kernel[(triton.cdiv(src.numel(), _COPY_BLOCK), )](
+        src,
+        dst,
+        src.numel(),
+        BLOCK=_COPY_BLOCK,
+        # pyrefly: ignore [unexpected-keyword]
+        launch_pdl=True)
 
 
 def chi_square(counts: torch.Tensor,

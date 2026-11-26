@@ -48,18 +48,11 @@ from ...prims_ts.kernels.mla_decode.helpers.tile import (
 from ...prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
 )
-from .params import PrimsTSMainFormat, SwaCacheFormat
+from ._fp8_codec import e4m3_f16x2, f16x2_pow2, scaled_e2m1x4
+from .formats import PrimsTSMainFormat, SwaCacheFormat
 from .quantization import row_bytes
 
 __all__ = ["PackedKvProducer", "main_row_bytes"]
-
-
-def f16x2_pow2(exponent: int) -> int:
-    """The F16x2 bits of ``2**exponent`` in both halves, for a normal F16 power of two."""
-    if not -14 <= exponent <= 15:
-        raise ValueError("The F16 power of two must be normal")
-    bits = (exponent + 15) << 10
-    return bits | (bits << 16)
 
 
 @cute.jit
@@ -69,47 +62,14 @@ def cvt_e2m1_word_to_e4m3_words_scaled(
     """Scale eight dense-packed E2M1 values by an E4M3 group scale and a power-of-two factor.
 
     As ``_cvt_e2m1_word_to_e4m3_words``, with each exact F16 product also multiplied by the
-    F16x2 ``factor_pair`` (``f16x2_pow2``) before the RN/satfinite E4M3 rounding. E2M1 times
-    an E4M3 scale has at most five significant bits and lies in [2**-10, 2688], so the
-    factor is exact unless the product overflows F16, which the rounding saturates.
+    F16x2 ``factor_pair`` (``f16x2_pow2``) before the RN/satfinite E4M3 rounding: the
+    conversion native staging decodes MAIN records with (``_fp8_codec.scaled_e2m1x4``), on
+    the word's low and high halves.
     """
-    sf_pair = (sf_byte & Int32(0xFF)) * Int32(0x101)
-    return cute.arch.inline_ptx(
-        """
-        {
-            .reg .b16 sf;
-            .reg .b32 sfFp16x2;
-            .reg .b32 factor;
-            .reg .b8 b0, b1, b2, b3;
-            .reg .b32 h0, h1, h2, h3;
-            .reg .b16 e0, e1, e2, e3;
-            mov.b32 {sf, _}, {$r1};
-            cvt.rn.f16x2.e4m3x2 sfFp16x2, sf;
-            mov.b32 factor, {$r2};
-            mov.b32 {b0, b1, b2, b3}, {$r0};
-            cvt.rn.f16x2.e2m1x2 h0, b0;
-            cvt.rn.f16x2.e2m1x2 h1, b1;
-            cvt.rn.f16x2.e2m1x2 h2, b2;
-            cvt.rn.f16x2.e2m1x2 h3, b3;
-            mul.rn.f16x2 h0, h0, sfFp16x2;
-            mul.rn.f16x2 h1, h1, sfFp16x2;
-            mul.rn.f16x2 h2, h2, sfFp16x2;
-            mul.rn.f16x2 h3, h3, sfFp16x2;
-            mul.rn.f16x2 h0, h0, factor;
-            mul.rn.f16x2 h1, h1, factor;
-            mul.rn.f16x2 h2, h2, factor;
-            mul.rn.f16x2 h3, h3, factor;
-            cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;
-            cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;
-            cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;
-            cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;
-            mov.b32 {$w0}, {e0, e1};
-            mov.b32 {$w1}, {e2, e3};
-        }
-        """,
-        write_only_types=[Int32, Int32],
-        read_only_args=[packed_word, sf_pair, factor_pair],
-    )
+    group_scale = e4m3_f16x2((sf_byte & Int32(0xFF)) * Int32(0x101))
+    low = scaled_e2m1x4(packed_word, group_scale, factor_pair)
+    high = scaled_e2m1x4(packed_word >> Int32(16), group_scale, factor_pair)
+    return Int32(low), Int32(high)
 
 
 @cute.jit

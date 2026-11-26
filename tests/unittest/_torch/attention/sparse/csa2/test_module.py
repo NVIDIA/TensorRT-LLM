@@ -86,9 +86,13 @@ def test_module_sends_whole_context_and_generation_phases(
 ) -> None:
     """Exercise module orchestration and real publication/slicing, without FMHA."""
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        CSA2FlashInfer,
+        CSA2TrtllmAttention,
+    )
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
 
     count = contexts + generations
     hidden = (torch.arange(count * 512).reshape(count, 512) % 31 - 15).bfloat16()
@@ -275,18 +279,17 @@ def test_module_sends_whole_context_and_generation_phases(
     # Neox RoPE keeps the explicit norm / RoPE calls this test patches out of the cache writes.
     model.rotary_emb = SimpleNamespace(is_neox=True)
     model.attn_sink = torch.zeros(1)
-    model._compute_helper = (
-        None
-        if implementation == "trtllm"
-        else SimpleNamespace(
-            forward_context=lambda query, metadata, args: helper_compute(
-                AttentionInputType.context_only, query, metadata, args
-            ),
-            forward_generation=lambda query, metadata, args: helper_compute(
-                AttentionInputType.generation_only, query, metadata, args
-            ),
+    helper_type = {"flashinfer": CSA2FlashInfer, "prims_ts": CSA2PrimsTS}.get(implementation)
+    model._compute_helper = None
+    if helper_type is not None:
+        # The provider's capabilities, with this test's attention in place of its kernels.
+        model._compute_helper = helper_type.__new__(helper_type)
+        model._compute_helper.forward_context = lambda query, metadata, args: helper_compute(
+            AttentionInputType.context_only, query, metadata, args
         )
-    )
+        model._compute_helper.forward_generation = lambda query, metadata, args: helper_compute(
+            AttentionInputType.generation_only, query, metadata, args
+        )
     model._rope = lambda values, position, heads: values
     model._project_index_q = lambda qr, position: (position.float().reshape(-1, 1, 1), None)
     model._prepare_auxiliary = lambda local, global_hidden, batch, position, skip_global: (
@@ -2665,6 +2668,141 @@ def test_invalid_layout(ratios, kv, index, candidate):
         CSA2Layout(ratios, kv, index, candidate)
 
 
+# Backend states a CSA2TrtllmAttention can reach (native FP8 staging and the fused decode need
+# trtllm-gen without packed attention; PrimTS rejects packed attention and FP8 staging), and the
+# provider-dependent module predicates each one gives: row split, direct decode with no and with
+# context tokens, native FP8 generation staging, PrimTS small decode step for 4 and 64 rows,
+# and the decode FP8 Q request (none, Q only, or Q and amax word) at Q exponent 0 and 1.
+_PROVIDER_PREDICATES = {
+    ("trtllm", False, False, False): (True, (True, False), False, (False, False), ("none", "none")),
+    ("trtllm", False, False, True): (True, (True, False), False, (False, False), ("none", "none")),
+    ("trtllm", True, False, False): (True, (True, False), True, (False, False), ("word", "word")),
+    ("trtllm", True, False, True): (True, (True, False), False, (False, False), ("q", "q")),
+    ("trtllm", False, True, False): (False, (True, False), False, (False, False), ("none", "none")),
+    ("prims_ts", False, False, False): (True, (True, False), False, (True, False), ("q", "none")),
+    ("flash_mla", False, False, False): (
+        False,
+        (False, False),
+        False,
+        (False, False),
+        ("none", "none"),
+    ),
+    ("flash_mla", False, True, False): (
+        False,
+        (False, False),
+        False,
+        (False, False),
+        ("none", "none"),
+    ),
+    ("flashinfer", False, False, False): (
+        False,
+        (False, False),
+        False,
+        (False, False),
+        ("none", "none"),
+    ),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("state", list(_PROVIDER_PREDICATES), ids=lambda s: "-".join(map(str, s)))
+def test_module_provider_predicates(monkeypatch: pytest.MonkeyPatch, state: tuple) -> None:
+    """The module's provider-dependent choices for every reachable backend state."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module as csa2_module
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        CSA2FlashInfer,
+        CSA2FlashMLA,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+
+    provider, native_fp8, packed, fused_decode = state
+    backend = SimpleNamespace(
+        compute_backend=provider,
+        native_fp8=native_fp8,
+        fused_decode=fused_decode,
+        sparse_params=SimpleNamespace(use_packed_sparse_attention=packed),
+        direct_decode_serves=lambda *args: True,
+        gen_fmha_serves=lambda *args: False,
+    )
+    helper = {"prims_ts": CSA2PrimsTS, "flash_mla": CSA2FlashMLA, "flashinfer": CSA2FlashInfer}
+    model = DeepseekV41Attention.__new__(DeepseekV41Attention)
+    nn.Module.__init__(model)
+    model.backend = backend
+    model._compute_helper = helper[provider](backend) if provider in helper else None
+    model.rotary_emb = SimpleNamespace(is_neox=False)
+    model.qk_rope_head_dim, model.qk_head_dim, model.num_heads_tp = 64, 512, 32
+    model.layer, model.layout = SimpleNamespace(mode=CSA2Mode.FULL), SimpleNamespace(index_topk=512)
+    model.attn_sink = torch.zeros(1)
+    model._fp8_q_projection, model._fp8_q_min_tokens = True, 32
+    model.projection_quantization = "mxfp8"
+    model._q_amax_word = lambda device: torch.zeros(1, dtype=torch.int32)
+    monkeypatch.setattr(csa2_module, "is_sm_100f", lambda: True)
+
+    decode, context = SimpleNamespace(num_ctx_tokens=0), SimpleNamespace(num_ctx_tokens=4)
+    positions = torch.arange(64, dtype=torch.int32)
+    device = torch.device("cpu")
+
+    def small_step(rows: int) -> bool:
+        q = torch.zeros(rows, 32, 512, dtype=torch.bfloat16)
+        return model._prims_ts_small_step(q, positions[:rows], decode)
+
+    def fp8_query(exponent: int) -> str:
+        monkeypatch.setattr(csa2_module, "q_fp8_scale_exponent", lambda: exponent)
+        hidden = torch.zeros(64, 8, dtype=torch.bfloat16)
+        assert model._fp8_query_request(hidden, positions, decode, True) is None
+        request = model._fp8_query_request(hidden, positions, decode, False)
+        return "none" if request is None else "q" if request.word is None else "word"
+
+    actual = (
+        model.supports_row_split,
+        (model._direct_decode(4, decode, device), model._direct_decode(4, context, device)),
+        model._stages_native_fp8_generation(decode)
+        and not model._stages_native_fp8_generation(context),
+        (small_step(4), small_step(64)),
+        (fp8_query(0), fp8_query(1)),
+    )
+    assert actual == _PROVIDER_PREDICATES[state]
+
+
+@pytest.mark.cpu_only
+def test_compute_capabilities() -> None:
+    """Each provider declares the capabilities the module asks for instead of its name."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
+        CSA2FlashInfer,
+        CSA2FlashMLA,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.compute import NATIVE_COMPUTE
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+
+    names = (
+        "supports_row_split",
+        "serves_direct_decode",
+        "prepares_early_selection",
+        "waits_query_ready",
+        "reads_e4m3_query",
+        "takes_mxfp8_output",
+    )
+    declared = {
+        provider: tuple(getattr(compute, name) for name in names)
+        for provider, compute in (
+            ("trtllm", NATIVE_COMPUTE),
+            ("prims_ts", CSA2PrimsTS(None)),
+            ("flash_mla", CSA2FlashMLA()),
+            ("flashinfer", CSA2FlashInfer()),
+        )
+    }
+    assert declared == {
+        "trtllm": (True, True, False, True, False, False),
+        "prims_ts": (True, True, True, True, True, True),
+        "flash_mla": (False,) * 6,
+        "flashinfer": (False,) * 6,
+    }
+    device = torch.device("cpu")
+    assert not NATIVE_COMPUTE.writes_mxfp8_output(device, 4, 640)
+    assert not CSA2FlashInfer().writes_mxfp8_output(device, 4, 640)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm,fp8_backend,backend",
@@ -3728,7 +3866,8 @@ def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
     """A PrimTS prefill of SWA-only, Full and Reuse layers on the fp8 KV cache runs every layer's
     context tile on the native fused context kernel, as the native provider does, and equals its
     outputs bit for bit on every row both select the same KV rows for; PrimTS attends those tiles
-    only without that kernel."""
+    only without that kernel, and then within the fused kernel's error of native BF16 staging
+    over the same cache."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import prims_ts
 
     manager, requests = fused_context_cache
@@ -3778,9 +3917,76 @@ def test_prims_ts_context_runs_fused_kernel(monkeypatch, fused_context_cache):
     calls.clear()
     for model in layers:
         model.backend.fused_context = False
-    own = _prefill_outputs(layers, manager, requests, hidden)
+    own, own_metadata = _prefill(layers, manager, requests, hidden)
     assert not calls and attended == [hidden.shape[0]] * len(layers)
-    assert all(torch.isfinite(value).all() for value in own)
+    bf16, _ = _native_context_layers(
+        manager.layout, kv_cache_dtype, weights, sparse_options={"use_fp8_staging": False}
+    )
+    exact, exact_metadata = _prefill(bf16, manager, requests, hidden)
+    same = ~tied
+    for layer, indices in native_metadata.csa2_indices.items():
+        same &= ~(indices != own_metadata.csa2_indices[layer]).any(-1)
+        same &= ~(indices != exact_metadata.csa2_indices[layer]).any(-1)
+    assert int(same.sum()) * 100 >= hidden.shape[0] * 98
+    for value, reference, truth in zip(own, expected, exact, strict=True):
+        assert torch.isfinite(value).all()
+
+        def error(output: torch.Tensor) -> float:
+            difference = (output[same] - truth[same]).float().abs().mean()
+            return (difference / truth[same].float().abs().mean()).item()
+
+        # About 6% for both FP8 paths on B200; PrimTS's own E4M3 attention is no worse.
+        assert error(value) <= 1.25 * error(reference) < 0.1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="CSA2 PrimTS requires SM100, SM103 or SM107",
+)
+@pytest.mark.parametrize(
+    "fused_context_cache", [pytest.param((2, "fp8"), id="2-fp8")], indirect=True
+)
+@torch.inference_mode()
+def test_prims_ts_reuse_layer_reads_its_owners_main_bank(monkeypatch, fused_context_cache):
+    """An eager PrimTS prefill decodes a KV owner's MAIN rows into the context bank once: its
+    Reuse layer reads the rows the owner's Full layer decoded, with the outputs of decoding
+    them again."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank, prims_ts
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(89)
+    layers, _ = _native_context_layers(
+        manager.layout, "fp8", sparse_options={"compute_backend": "prims_ts"}
+    )
+    for model in layers:
+        # PrimTS attends the context tiles itself, from the context MAIN bank.
+        model.backend.fused_context = False
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    decodes = []
+    decode = _prims_ts_bank.decode_main_bank
+
+    def record(pool, plan, bank, marks=None, **kwargs):
+        decodes.append(marks is None and not plan.selected_only)
+        return decode(pool, plan, bank, marks, **kwargs)
+
+    monkeypatch.setattr(_prims_ts_bank, "decode_main_bank", record)
+    shared, shared_metadata = _prefill(layers, manager, requests, hidden)
+    # Layer 0 is SWA-only; layer 1 (Full) owns the MAIN rows layer 2 (Reuse) reads.
+    assert decodes == [True]
+    decodes.clear()
+    monkeypatch.setattr(prims_ts.CSA2PrimsTS, "_main_bank_key", staticmethod(lambda *args: None))
+    again, again_metadata = _prefill(layers, manager, requests, hidden)
+    assert decodes == [True, True]
+    # Rows that select the same KV rows in both prefills attend the same operands.
+    same = torch.ones(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+    for layer, indices in shared_metadata.csa2_indices.items():
+        same &= ~(indices != again_metadata.csa2_indices[layer]).any(-1)
+    assert int(same.sum()) * 100 >= hidden.shape[0] * 98
+    for value, reference in zip(shared, again, strict=True):
+        torch.testing.assert_close(value[same], reference[same], atol=0, rtol=0)
 
 
 @skip_no_fused_context

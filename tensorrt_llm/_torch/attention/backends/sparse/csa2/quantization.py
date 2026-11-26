@@ -15,7 +15,7 @@ from typing import Literal
 
 import torch
 
-from .params import SwaCacheFormat, swa_fp8_scale_exponent
+from .formats import SwaCacheFormat, swa_fp8_scale_exponent
 
 CacheFormat = Literal["main", "index", "swa", "swa_fp8"]
 

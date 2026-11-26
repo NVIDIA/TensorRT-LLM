@@ -14,6 +14,9 @@ orchestration live in the model and executor modules.
 invokes its composed compute helper on the applicable hardware; the native
 provider inherits `TrtllmAttention.forward`. There is no CSA2 FMHA registration
 or controller, and enabling the dense PrimTS FMHA library does not select CSA2.
+The module's per-forward choices (row split, direct decode, early selection,
+query overlap, E4M3 query, MXFP8 O-A output) ask the provider's declared
+capabilities (`compute.py`: each helper, or `NATIVE_COMPUTE`), not its name.
 
 | Architecture | Default module compute path | Computation |
 | --- | --- | --- |
@@ -86,9 +89,10 @@ addresses bank rows instead of packed records, with the same validity, and the
 kernel copies those rows as it copies ordinary FP8 SWA rows. Each decode warp
 owns eight bank rows, whose pool records its lanes resolve together, and reads
 four rows at a time before converting them. The bank is decoded on the model
-stream after the layer's MAIN publication; its storage and marks are retained,
-grow by powers of two up to 64 MiB of bank and are part of the PrimTS workspace
-reservation. Larger phases keep decoding selections in the kernel.
+stream after the layer's MAIN publication; its storage and marks are retained and
+grow by powers of two up to 1 GiB of bank. The PrimTS workspace reservation covers
+their first 64 MiB; a phase that owns more MAIN rows allocates past it. Larger
+phases keep decoding selections in the kernel.
 With FP8 SWA rows, a tile without a MAIN bank that the native NVFP4 MAIN schedule
 serves (64 heads under the native one-CTA Keep-AB profile of an FP8 primary pool
 with an NVFP4 extra pool, see `decodes_nvfp4_main` in `_prims_ts_packed.py`) reads
@@ -102,7 +106,11 @@ whose selections are final before its projections keeps the selection bank below
 side stream beside the projections (below), and the gather kernel is faster than
 the NVFP4 MAIN kernel. Other tiles with FP8
 SWA whose gather schedule applies decode their selections into a selection bank
-instead, one E4M3 `uint8[512]` row per compacted selection, at the SWA rows' storage scale. Query rows of one request may select the same MAIN row: the
+instead, one E4M3 `uint8[512]` row per compacted selection, at the SWA rows' storage scale.
+Only tiles of up to one generation step's queries (`max_batch_size` times the tokens per
+step, at most `max_num_tokens`) take one: the bank and its two INT32 index sets are
+allocated once at that capacity, which the workspace reservation charges, and larger
+tiles keep decoding selections in the kernel. Query rows of one request may select the same MAIN row: the
 compaction then also claims an epoch-tagged INT64 owner slot per kept pool row
 (never cleared, since each call claims with the next epoch), and
 `dedup_main_records` decodes each selected row once, into the bank row of its
@@ -226,7 +234,8 @@ schedule on the first, next to its own TopK (consumers wait for both). Every ker
 input stays the same, so results are bit-identical.
 
 `backend.py` contains the single sparse backend and both plain Flash helper
-classes; `prims_ts.py` contains the PrimTS helper, `_prims_ts_packed.py` its host
+classes; `compute.py` the provider capabilities they and the PrimTS helper
+declare; `prims_ts.py` contains the PrimTS helper, `_prims_ts_packed.py` its host
 plan/launch adapter, `_prims_ts_producer.py` its packed KV producer,
 `_prims_ts_bank.py` its context MAIN bank decoder, and
 `_prims_ts_quantization.py` its unit-scale E4M3 Q staging.
@@ -242,7 +251,7 @@ of the compute backend and its staging precision:
 
 | KV-cache dtype | D512 persistent SWA row |
 |---|---|
-| `fp8` | 512 E4M3 payload bytes, unit persistent scale, no scale footer |
+| `fp8` | 512 E4M3 payload bytes at the process-wide power-of-two storage scale (unit by default), no scale footer |
 | `fp8_ds_mla` | Legacy MXFP8: 512 E4M3 payload bytes + 16 UE8M0 scale bytes, group size 32 |
 | Omitted / `auto`, or `bfloat16` | Legacy 528-byte format |
 
@@ -728,7 +737,11 @@ must be warmed before capture; a cold captured profile is rejected. The row
 count selects compile-time split-KV and reduction-topology kernel variants, so
 the first plan of each MAIN format (packed records or the context bank) in an
 arena compiles every variant up to the arena's query capacity; later row counts
-only plan. Plans of single-split schedules share their kernel objects across row
+only plan. During the executor's warmup that first plan sends the variants the
+persistent CuTe DSL cache lacks to the shared PrimTS precompile workers
+(`fmha/prims_ts_precompile.py`, with its `TLLM_PRIMTS_WARM_*` settings), which
+compile them in parallel, and then loads them; elsewhere, or where the pool
+fails, it compiles them itself. Plans of single-split schedules share their kernel objects across row
 counts (`_LAUNCH_KERNELS` in `_prims_ts_packed.py`) and lay out only their
 row-sized workspace, so a context chunk of a new length plans in well under a
 millisecond. All profiles

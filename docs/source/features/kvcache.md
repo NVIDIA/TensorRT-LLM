@@ -384,15 +384,18 @@ for capability requirements and consumer handling.
 
 DeepSeek v4.1 CSA2 selects persistent sliding-window attention (SWA) storage from
 `KvCacheConfig.dtype`. With explicit `fp8`, each 512-dimensional SWA row contains
-512 E4M3 bytes with a unit persistent scale and no scale footer. With
+512 E4M3 bytes at one process-wide power-of-two scale (unit by default;
+`TRTLLM_CSA2_SWA_FP8_AMAX` sets it) and no scale footer. With
 `fp8_ds_mla`, SWA retains the MXFP8 layout: 512 E4M3 payload bytes and 16 UE8M0
 scale bytes (one per 32 channels). Omitted / `auto` and `bfloat16` retain that
-legacy 528-byte SWA layout.
+legacy 528-byte SWA layout. The dtype also selects the default attention provider;
+see [DeepSeek-V4.1 CSA2](sparse-attention.md#deepseek-v41-csa2).
 
 This choice does not change the NVFP4 MAIN cache or INDEX layout. Attention
 compute/staging precision and MXFP8 projection quantization are independent of
 the persistent SWA encoding. Disaggregated context and generation instances must
-use matching SWA layouts; transfers do not convert between them.
+use matching SWA layouts; transfers do not convert between them, and a peer whose
+layout differs is rejected when it registers.
 
 ### Enable Offloading to Host Memory
 

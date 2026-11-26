@@ -557,6 +557,80 @@ def test_prims_ts_selection_bank_claims_in_compaction(
 
 
 @skip_prims_ts_unsupported
+@torch.inference_mode()
+def test_prims_ts_selection_bank_fits_its_reservation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A selection bank serves tiles of up to one generation step's queries and is allocated
+    exactly as the workspace reservation charges it.
+
+    512 MAIN selections, 128 requests of one token per step and a 4096-token prefill limit:
+    the bank, its two index sets and its owner slots of a 128-row tile take the bytes that
+    ``workspace_reservation_bytes`` adds for 128 generation rows, not a bank for 4096 rows.
+    A 129-row tile takes no selection bank.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank, _prims_ts_packed
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import prims_ts as prims_ts_module
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _forbid_prims_ts_staging(monkeypatch)
+    monkeypatch.setattr(_prims_ts_packed, "decodes_nvfp4_main", lambda *args, **kwargs: False)
+    torch.manual_seed(509)
+    count, heads, generation_rows, prefill_rows = 128, 64, 128, 4096
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(count, 128, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(count, 512, 512, device="cuda", dtype=torch.bfloat16)
+    args = _inputs(
+        q,
+        swa,
+        main,
+        torch.ones(count, 128, device="cuda", dtype=torch.bool),
+        torch.ones(count, 512, device="cuda", dtype=torch.bool),
+        torch.zeros(heads, device="cuda"),
+        swa_cache_format=attn.swa_cache_format,
+    )
+
+    def tile(rows: int) -> CSA2TrtllmMetadata:
+        metadata = CSA2TrtllmMetadata.for_query_tile(q[:rows], 512, kv_input_mode="packed")
+        metadata._csa2_prims_ts_max_queries = prefill_rows
+        metadata._csa2_prims_ts_selection_rows = generation_rows
+        return metadata
+
+    metadata = tile(count)
+    _helper_forward(attn, q.flatten(1), metadata, args)
+    helper = attn._test_compute_helper
+    assert helper._uses_selection_bank(q.flatten(1), metadata, "swa_fp8")
+    longer = torch.zeros(count + 1, heads, 512, device="cuda", dtype=torch.bfloat16)
+    longer_tile = CSA2TrtllmMetadata.for_query_tile(longer, 512, kv_input_mode="packed")
+    longer_tile._csa2_prims_ts_selection_rows = generation_rows
+    assert not helper._uses_selection_bank(longer.flatten(1), longer_tile, "swa_fp8")
+    longer_tile._csa2_prims_ts_selection_rows = count + 1
+    assert helper._uses_selection_bank(longer.flatten(1), longer_tile, "swa_fp8")
+
+    device = q.device
+    arenas = metadata.fmha_plan_caches[prims_ts_module._ARENA_CACHE_KEY]
+    pool_rows = args.sparse_backend_args.main_pool.shape[0]
+    allocated = sum(
+        tensor.untyped_storage().nbytes()
+        for tensor in (
+            arenas[(_prims_ts_bank._RECORDS_CACHE_KEY, device)],
+            *arenas[(prims_ts_module._SELECTION_INDEX_KEY, device, 512)],
+            arenas[(_prims_ts_bank._OWNERS_CACHE_KEY, device)],
+            arenas[(_prims_ts_bank._EPOCH_CACHE_KEY, device)],
+        )
+    )
+    assert (_prims_ts_bank._RETIRED_RECORDS_CACHE_KEY, device) not in arenas
+    reserved = prims_ts_module.workspace_reservation_bytes(
+        device,
+        heads,
+        640,
+        prefill_rows,
+        generation_queries=generation_rows,
+        main_pool_rows=pool_rows,
+    ) - prims_ts_module.workspace_reservation_bytes(device, heads, 640, prefill_rows)
+    assert allocated == reserved
+
+
+@skip_prims_ts_unsupported
 @pytest.mark.parametrize(
     ("early", "band"),
     [(False, "below"), (True, "below"), (True, "limit")],
@@ -2830,6 +2904,136 @@ def test_prims_ts_scales_keep_image_token_magnitudes(
     scaled = error(covering)
     assert scaled < 0.03
     assert unit > 3 * scaled
+
+
+@pytest.mark.cpu_only
+def test_precompile_worker_imports_csa2_kernels_without_runtime() -> None:
+    """The PrimTS precompile workers import the CSA2 PrimTS kernels' host code without running
+    TensorRT-LLM's initialization: no MPI, bindings, attention interface or CSA2 params."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from tensorrt_llm._torch.attention.backends.fmha import _prims_ts_worker
+
+    source = """
+import json, runpy, sys
+worker = runpy.run_path(sys.argv[1])
+worker["_init_worker"](json.load(sys.stdin))
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed
+assert callable(_prims_ts_packed.compile_packed_sparse_mla_rows)
+assert sys.modules["tensorrt_llm"].__spec__.origin is None
+for name in (
+    "mpi4py.MPI",
+    "tensorrt_llm._utils",
+    "tensorrt_llm.bindings",
+    "tensorrt_llm._torch.attention.backends.interface",
+    "tensorrt_llm._torch.attention.backends.sparse.csa2.params",
+):
+    assert name not in sys.modules, name
+print(_prims_ts_packed.__file__)
+"""
+    worker = Path(_prims_ts_worker.__file__)
+    result = subprocess.run(
+        [sys.executable, "-c", source, str(worker)],
+        input=json.dumps(sys.path),
+        timeout=300,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert (
+        Path(result.stdout.splitlines()[-1]).resolve()
+        == worker.parents[1] / "sparse" / "csa2" / "_prims_ts_packed.py"
+    )
+
+
+@pytest.mark.cpu_only
+def test_prims_ts_first_plans_precompile_in_workers_only_in_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first plan of the executor's warmup sends the kernels it lacks to the shared PrimTS
+    precompile pool as JSON payloads, sharing the host budget among the job's local ranks;
+    outside the warmup it compiles them itself."""
+    import json
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed, prims_ts
+
+    pools = []
+    monkeypatch.setattr(prims_ts_precompile, "pool_enabled", lambda local_ranks: True)
+    monkeypatch.setattr(
+        prims_ts_precompile,
+        "precompile_payloads",
+        lambda payloads, local_ranks: pools.append((payloads, local_ranks)),
+    )
+    missing = []
+    monkeypatch.setattr(
+        _prims_ts_packed,
+        "packed_sparse_mla_missing_rows",
+        lambda device, max_rows, heads, **options: missing.append((max_rows, heads, options))
+        or [1, 5],
+    )
+    options = dict(
+        max_topk=128,
+        max_extra_topk=512,
+        swa_cache_format="swa_fp8",
+        main_cache_format="main",
+        valid_prefix=True,
+        output_groups=None,
+        raw_selections=False,
+    )
+    metadata = SimpleNamespace(mapping=SimpleNamespace(world_size=8, gpus_per_node=4))
+    device = torch.device("cuda", 1)
+    prims_ts._precompile_in_workers(device, 64, 32, options, metadata)
+    assert not pools and not missing
+    with prims_ts_precompile.warmup_workers():
+        assert prims_ts_precompile.in_warmup()
+        prims_ts._precompile_in_workers(device, 64, 32, options, metadata)
+    assert not prims_ts_precompile.in_warmup()
+    assert missing == [(64, 32, options)]
+    [(payloads, local_ranks)] = pools
+    assert local_ranks == 4
+    assert [(p["kind"], p["device_index"], p["rows"], p["heads"]) for p in payloads] == [
+        ("csa2_packed", 1, 1, 32),
+        ("csa2_packed", 1, 5, 32),
+    ]
+    assert all(p["plan_kwargs"] == options for p in payloads)
+    assert json.loads(json.dumps(payloads)) == payloads
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_gen_fmha_marks_mxfp8_output_written(monkeypatch: pytest.MonkeyPatch, mxfp8: bool) -> None:
+    """The ``gen_fmha`` core says when it wrote the grouped MXFP8 O-A input instead of the BF16
+    output, as the fused decode kernel and PrimTS do: the module projects that input only then."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import gen_fmha
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+
+    written = []
+    monkeypatch.setattr(
+        gen_fmha,
+        "gen_sparse_attention",
+        lambda q8, metadata, sinks, output, out_mxfp8: written.append((output, out_mxfp8)),
+    )
+    buffers = (torch.empty(0),) if mxfp8 else None
+    state = SimpleNamespace(output_mxfp8=buffers, output_mxfp8_written=False)
+    attention = SimpleNamespace(num_heads=2, sparse_attn_predict=lambda *args, **kwargs: None)
+    forward_args = SimpleNamespace(
+        output=None,
+        quant_q_buffer=torch.zeros(3, 2 * 512),
+        attention_sinks=None,
+        sparse_backend_args=SimpleNamespace(state=state),
+    )
+    q = torch.zeros(3, 2 * 512, dtype=torch.bfloat16)
+    CSA2TrtllmAttention._forward_gen_fmha(attention, q, SimpleNamespace(num_tokens=3), forward_args)
+    [(output, out_mxfp8)] = written
+    assert out_mxfp8 is buffers and (output is None) is mxfp8
+    assert state.output_mxfp8_written is mxfp8
 
 
 @pytest.mark.cpu_only

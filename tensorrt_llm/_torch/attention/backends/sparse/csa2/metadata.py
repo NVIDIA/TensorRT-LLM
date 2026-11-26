@@ -112,6 +112,22 @@ def _layout_layers(layout) -> tuple:
     return tuple(layout.layer(i) for i in range(len(layout.compress_ratios)))
 
 
+def selection_forward_key(source) -> tuple:
+    """The forward whose selections the layers of a staging group share: the request metadata
+    ``source``, its KV cache manager, its published index selections (``csa2_indices``, fresh
+    for every forward and prepare) and its staging epoch.
+
+    Native staging, its shared context bank and PrimTS's MAIN compaction reuse a group's
+    first-layer work within the forward this key names.
+    """
+    return (
+        id(source),
+        id(getattr(source, "kv_cache_manager", None)),
+        id(getattr(source, "csa2_indices", None)),
+        getattr(source, "_csa2_stage_epoch", 0),
+    )
+
+
 def _tma_backed_empty(shape, dtype, device):
     numel = math.prod(shape)
     element_size = torch.empty((), dtype=dtype).element_size()
@@ -1021,6 +1037,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 self._csa2_query_tiles[key] = metadata
                 metadata.fmha_plan_caches["csa2_prims_ts_arenas"] = self._csa2_prims_ts_arenas
                 metadata._csa2_prims_ts_max_queries = max(self.max_num_tokens, q.shape[0])
+                # Tiles of up to one generation step's queries take a PrimTS selection bank;
+                # the workspace reservation covers that many rows.
+                draft_width = 1 + (
+                    getattr(getattr(self, "kv_cache_manager", None), "max_total_draft_tokens", 0)
+                    or 0
+                )
+                metadata._csa2_prims_ts_selection_rows = min(
+                    self.max_num_tokens, self.max_num_requests * draft_width
+                )
             metadata.shared_plan = shared_plan
             metadata.prims_ts_main_bank = main_bank
             metadata._csa2_graph_reserved |= self.is_cuda_graph or capturing
@@ -1120,7 +1145,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         groups = source.__dict__.setdefault("_csa2_stage_groups", {})
         key = (group, self.prepared_lens.shape[0], self.num_sparse_topk)
         capturing = torch.cuda.is_current_stream_capturing()
-        frame = (id(source), id(source.kv_cache_manager), getattr(source, "_csa2_stage_epoch", 0))
+        frame = selection_forward_key(source)
         entry = groups.get(key)
         if entry is None:
             if capturing:
@@ -1130,7 +1155,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             # plus every graph reservation shared by shallow metadata clones.
             for previous, scratch in tuple(groups.items()):
                 serials = (scratch["serial"], scratch["scale_serial"])
-                used = any(serial is not None and serial[:3] == frame for serial in serials)
+                used = any(
+                    serial is not None and serial[: len(frame)] == frame for serial in serials
+                )
                 if not scratch["graph_reserved"] and not used:
                     del groups[previous]
             capacity, device = self.prepared_lens.shape[0], self.prepared_lens.device
@@ -1382,8 +1409,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 serial = (
                     inputs.stage_group,
                     swa_cache_format,
-                    id(source.csa2_indices),
-                    getattr(source, "_csa2_stage_epoch", 0),
+                    *selection_forward_key(source),
                     count,
                 )
             compact = serial is None or serial != getattr(self, "_csa2_shared_serial", None)

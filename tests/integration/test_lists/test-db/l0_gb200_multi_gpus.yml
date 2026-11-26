@@ -41,7 +41,8 @@ l0_gb200_multi_gpus:
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
-  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[trtllm-world2]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[prims_ts-world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-groups]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded-mxfp4]

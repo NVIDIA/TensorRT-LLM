@@ -17,7 +17,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from functools import cache
+from functools import cache, partial
 from hashlib import sha256
 from pathlib import Path
 
@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from ...prims_ts._compile_cache import build_and_load_attention_kernel
+from ...prims_ts._compile_cache import build_and_load_attention_kernel, is_attention_kernel_cached
 from ...prims_ts.decode import (
     _append_workspace_section,
     _resolve_cuda_device,
@@ -44,7 +44,9 @@ from ...prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
 from ...prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
     ThroughputLatencyMlaDecodeTs,
 )
+from ...prims_ts.mla_decode import _COMPILE_OPTIONS as _MLA_DECODE_COMPILE_OPTIONS
 from ...prims_ts.mla_decode import (
+    _compile_mla_decode,
     _fake_output_quant_args,
     _get_compiled_mla_decode,
     _make_mla_decode_compile_spec,
@@ -54,8 +56,7 @@ from ...prims_ts.mla_decode import (
 from ._prims_ts_output import MXFP8OutputQuant, mxfp8_output_args
 from ._prims_ts_producer import PackedKvProducer, main_row_bytes
 from ._prims_ts_quantization import UnitScaleQuery
-from .params import PrimsTSMainFormat, SwaCacheFormat, q_fp8_scale_exponent, swa_scale_exponent
-from .prims_ts import _validate_softmax_scale
+from .formats import PrimsTSMainFormat, SwaCacheFormat, q_fp8_scale_exponent, swa_scale_exponent
 from .quantization import row_bytes
 
 __all__ = [
@@ -70,6 +71,15 @@ _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _HEAD_DIM = 512
 _QUERY_TILE = 64
 _KV_TILE = 128
+_MAX_SOFTMAX_SCALE = torch.finfo(torch.float32).max / math.log2(math.e)
+
+
+def _validate_softmax_scale(scale: float) -> None:
+    if not math.isfinite(scale) or not 0 < scale <= _MAX_SOFTMAX_SCALE:
+        raise ValueError(
+            "CSA2 PrimTS softmax scale must be positive, finite and representable "
+            "after FP32 base-2 conversion"
+        )
 
 
 @dataclass(frozen=True)
@@ -884,8 +894,45 @@ def precompile_packed_sparse_mla(
         raise ValueError("max_rows must be a positive integer")
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("precompile_packed_sparse_mla() must run before CUDA Graph capture")
-    capacity = _validate_geometry(max_rows, heads, max_topk, max_extra_topk)
+    _validate_geometry(max_rows, heads, max_topk, max_extra_topk)
     device, _ = _resolve_cuda_device(device)
+    specs, native_specs = _precompile_specs(
+        device,
+        max_rows,
+        heads,
+        max_topk=max_topk,
+        max_extra_topk=max_extra_topk,
+        has_sinks=has_sinks,
+        swa_cache_format=swa_cache_format,
+        main_cache_format=main_cache_format,
+        valid_prefix=valid_prefix,
+        output_groups=output_groups,
+        raw_selections=raw_selections,
+    )
+    for spec in specs:
+        _compile_packed(spec)
+    for spec in native_specs:
+        _get_compiled_mla_decode(spec)
+    return len(specs) + len(native_specs)
+
+
+def _precompile_specs(
+    device: torch.device,
+    max_rows: int,
+    heads: int,
+    *,
+    max_topk: int,
+    max_extra_topk: int,
+    has_sinks: bool,
+    swa_cache_format: SwaCacheFormat,
+    main_cache_format: PrimsTSMainFormat,
+    valid_prefix: bool,
+    output_groups: int | None,
+    raw_selections: bool,
+) -> tuple[dict, dict]:
+    """The packed producer and the native kernel specs plans of 1 to ``max_rows`` rows select
+    (:func:`precompile_packed_sparse_mla`), in order, each with the first row count selecting it."""
+    capacity = _validate_geometry(max_rows, heads, max_topk, max_extra_topk)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     capability = _compute_capability(device)
     gathers = valid_prefix and gathers_plain_rows(
@@ -932,7 +979,7 @@ def precompile_packed_sparse_mla(
         )
         native = launch.nvfp4 or launch.gather
         if native is not None:
-            native_specs.setdefault(native.spec)
+            native_specs.setdefault(native.spec, rows)
             continue
         specs.setdefault(
             _compile_spec(
@@ -944,18 +991,15 @@ def precompile_packed_sparse_mla(
                 swa_cache_format,
                 main_cache_format,
                 raw_selections,
-            )
+            ),
+            rows,
         )
-    for spec in specs:
-        _compile_packed(spec)
-    for spec in native_specs:
-        _get_compiled_mla_decode(spec)
-    return len(specs) + len(native_specs)
+    return specs, native_specs
 
 
-@cache
-def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
-    """Compile symbolic raw-pool and batch layouts without allocating fake backing."""
+def _packed_kernel(spec: _CompileSpec) -> tuple[Callable[[], object], tuple[str, ...]]:
+    """The packed kernel's compile function, over symbolic raw-pool and batch layouts without
+    allocating fake backing, and the source keys of its persistent cache entry."""
     batch = cute.sym_int()
     q_stride = (_HEAD_DIM, 1, spec.heads * _HEAD_DIM, spec.heads * _HEAD_DIM)
     q_shape = (spec.heads, _HEAD_DIM, 1, batch)
@@ -1084,12 +1128,95 @@ def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
             source.with_name("_prims_ts_output.py"),
             source.with_name("_prims_ts_producer.py"),
             source.with_name("_prims_ts_quantization.py"),
+            source.with_name("_fp8_codec.py"),
         )
     )
+    return compile_kernel, source_keys
+
+
+@cache
+def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
+    """Build the packed kernel of ``spec``, or load it from the persistent cache."""
+    compile_kernel, source_keys = _packed_kernel(spec)
     with torch.cuda.device(spec.device_index):
         return build_and_load_attention_kernel(
             "mla_decode", "csa2_packed", spec, _COMPILE_OPTIONS, compile_kernel, extra=source_keys
         )
+
+
+def _kernel_cached(spec: _CompileSpec | _MLADecodeCompileSpec) -> bool:
+    """Whether the persistent cache holds the kernel of ``spec``: a packed producer kernel, or a
+    native TMA gather or NVFP4 MAIN kernel. Neither loads nor builds it."""
+    if isinstance(spec, _CompileSpec):
+        compile_kernel, extra = _packed_kernel(spec)
+        kind, options = "csa2_packed", _COMPILE_OPTIONS
+    else:
+        compile_kernel, extra = partial(_compile_mla_decode, spec), ()
+        kind, options = "main", _MLA_DECODE_COMPILE_OPTIONS
+    with torch.cuda.device(spec.device_index):
+        return is_attention_kernel_cached(
+            "mla_decode", kind, spec, options, compile_kernel, extra=extra
+        )
+
+
+def packed_sparse_mla_missing_rows(
+    device: torch.device | str | int, max_rows: int, heads: int, **options
+) -> list[int]:
+    """One row count for each kernel :func:`precompile_packed_sparse_mla` compiles for these
+    arguments that the persistent cache does not hold yet, in its order.
+
+    :func:`compile_packed_sparse_mla_rows` of a row count compiles exactly its kernel, so
+    precompile workers can split these kernels among them.
+    """
+    device, _ = _resolve_cuda_device(device)
+    specs, native_specs = _precompile_specs(device, max_rows, heads, **_precompile_options(options))
+    return [
+        rows
+        for kernels in (specs, native_specs)
+        for spec, rows in kernels.items()
+        if not _kernel_cached(spec)
+    ]
+
+
+def compile_packed_sparse_mla_rows(
+    device: torch.device | str | int, rows: int, heads: int, **options
+) -> bool:
+    """Compile the kernel of a row count :func:`packed_sparse_mla_missing_rows` returned for these
+    options; returns whether the persistent cache holds it."""
+    device, _ = _resolve_cuda_device(device)
+    specs, native_specs = _precompile_specs(device, rows, heads, **_precompile_options(options))
+    selected = [
+        spec
+        for kernels in (specs, native_specs)
+        for spec, first in kernels.items()
+        if first == rows
+    ]
+    if len(selected) != 1:
+        raise ValueError(f"No precompiled kernel is first selected by {rows} rows")
+    (spec,) = selected
+    if isinstance(spec, _CompileSpec):
+        _compile_packed(spec)
+    else:
+        _get_compiled_mla_decode(spec)
+    return _kernel_cached(spec)
+
+
+def _precompile_options(options: dict) -> dict:
+    """``options`` with :func:`precompile_packed_sparse_mla`'s defaults for those not given."""
+    defaults = dict(
+        max_topk=128,
+        max_extra_topk=0,
+        has_sinks=True,
+        swa_cache_format="swa",
+        main_cache_format="main",
+        valid_prefix=False,
+        output_groups=None,
+        raw_selections=False,
+    )
+    unknown = set(options) - set(defaults)
+    if unknown:
+        raise TypeError(f"Unknown precompile options: {sorted(unknown)}")
+    return {**defaults, **options}
 
 
 class PackedSparseMLA:
@@ -1326,10 +1453,16 @@ class PackedSparseMLA:
         return self._q8
 
     def _own_query(self, state: _Plan, q8: torch.Tensor) -> UnitScaleQuery:
-        """The plan's Q rounding: planned with the arena, else on the plan's first BF16 Q."""
+        """The plan's Q rounding: planned with the arena, else on the plan's first BF16 Q,
+        which must be an eager run (its setup compiles the converter)."""
         if state.query is not None:
             return state.query
         if self._query is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Run a PrimTS plan of more than _Q8_ARENA_ROWS rows once before CUDA Graph "
+                    "capture with the Q dtype it captures"
+                )
             self._query = UnitScaleQuery.plan(
                 state.device, state.rows, state.heads, q8, round(math.log2(state.q_scale))
             )
@@ -1650,6 +1783,11 @@ class PackedSparseMLA:
         query = q8.as_strided(kernel_shape, kernel_stride)
         quant_args = None
         if quantized:
+            if any(
+                not isinstance(tensor, torch.Tensor) or tensor.device != state.device
+                for tensor in output_quant
+            ):
+                raise ValueError("output_quant tensors must be on the plan's device")
             data = output_quant[0]
             if data.ndim != 3 or data.shape[:2] != (state.output_groups, state.rows):
                 raise ValueError("output_quant data must be E4M3 [groups, rows, D] of the plan")

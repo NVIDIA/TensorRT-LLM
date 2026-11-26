@@ -1233,6 +1233,42 @@ def test_graph_workspace_is_independent_of_context_gather_cap(
 
 
 @pytest.mark.cpu_only
+def test_selection_forward_key_names_one_forward(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native staging, its shared bank and PrimTS's MAIN compaction share a group's first-layer
+    work only within one forward: the same request metadata, cache manager, published index
+    selections and staging epoch."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import selection_forward_key
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+
+    source = SimpleNamespace(kv_cache_manager=object(), csa2_indices={}, _csa2_stage_epoch=3)
+    key = selection_forward_key(source)
+    assert selection_forward_key(source) == key
+    for change in (
+        lambda: setattr(source, "csa2_indices", {}),
+        lambda: setattr(source, "_csa2_stage_epoch", source._csa2_stage_epoch + 1),
+        lambda: setattr(source, "kv_cache_manager", object()),
+    ):
+        change()
+        assert selection_forward_key(source) != key
+        key = selection_forward_key(source)
+    assert selection_forward_key(SimpleNamespace(**vars(source))) != key
+    # PrimTS's MAIN compaction key names the forward the same way.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    pool, selections = torch.zeros(4, 288, dtype=torch.uint8), torch.zeros(2, 8, dtype=torch.int32)
+    inputs = CSA2BackendForwardArgs(
+        swa_pool=pool,
+        swa_indices=selections,
+        main_pool=pool,
+        topk_indices=selections,
+        stage_group=(1, 1, 0),
+        state=SimpleNamespace(metadata=source),
+    )
+    group = CSA2PrimsTS._main_selection_group(inputs, 2)
+    assert group[1 : 1 + len(key)] == key
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("swa_only", [False, True])
 @pytest.mark.parametrize("attention_dp", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
@@ -1274,13 +1310,15 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
         arena_bytes = 4096 + 4 * queries * (width + 2)
         # Widths with MAIN rows also retain the reserved rows of the device's context MAIN
         # bank and its one-byte row marks, and the selection bank of the largest generation
-        # tile with an INT64 owner slot per MAIN pool row, up to the reserved owner rows.
+        # tile with its two INT32 index sets and an INT64 owner slot per MAIN pool row, up to
+        # the reserved owner rows.
         bank_bytes = 0
         if width > 128:
             selections = generation_queries * (width - 128)
             bank_bytes = main_bank_reserved_rows() * 513 + 512 * min(
                 max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
+            bank_bytes += 2 * 4 * selections
             bank_bytes += 8 * (min(main_pool_rows, main_record_owners_reserved_rows()) + 1)
         assert (
             reserve(
