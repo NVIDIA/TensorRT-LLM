@@ -292,6 +292,7 @@ class DiskCacheTierConfig:
     keep_copy_after_restore: bool = False
     write_through: bool = False
     protected_copy_fraction: float = 1.0
+    write_behind_bytes: int = 0
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...

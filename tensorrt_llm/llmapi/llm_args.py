@@ -6683,6 +6683,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, "
         "not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache."
     )
+    disk_write_behind_mib: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Host memory, in MiB, for write-behind of host-to-disk KV cache writes (0: off). A block's write completes "
+        "once its bytes are copied there, so the host memory it came from can be reused without waiting for the "
+        "disk; a disk I/O thread writes the file afterwards, and reads of the block are served from that memory "
+        "until then. Writes that do not fit run as before. Requires `disk_io_threads` > 0. Process-wide, like the "
+        "disk I/O pool. Only used by KV cache manager v2 with a disk cache.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -7217,6 +7226,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.disk_write_through requires disk_io_threads > 0"
             )
+        if self.disk_write_behind_mib > 0 and self.disk_io_threads == 0:
+            raise ValueError(
+                "kv_cache_config.disk_write_behind_mib requires disk_io_threads > 0"
+            )
         disk_options = [
             name for name, value in (
                 ("disk_io_threads", self.disk_io_threads > 0),
@@ -7225,6 +7238,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 ("disk_write_through", self.disk_write_through),
                 ("disk_protected_copy_fraction",
                  self.disk_protected_copy_fraction != 1.0),
+                ("disk_write_behind_mib", self.disk_write_behind_mib > 0),
             ) if value
         ]
         if disk_options:

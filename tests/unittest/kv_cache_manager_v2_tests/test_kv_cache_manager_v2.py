@@ -12180,8 +12180,102 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.manager.clear_reusable_blocks()
 
 
+_WRITE_BEHIND_BYTES = 256 << 20
+
+
+class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
+    """The disk-option tests again with write-behind staging for host -> disk writes.
+
+    A staged write completes once the page is copied into staging; a pool worker writes the file later, and reads of
+    the page are served from staging until then. Every test here that runs the I/O pool also stages, so its restores
+    pass refcheck through staging and through the file. Write-behind is process-wide and set by each manager's disk
+    tier, so a later manager with write_behind_bytes 0 turns it off again.
+    """
+
+    disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
+
+    def prepare(self, *args, **kwargs) -> None:
+        options = dict(self.disk_tier_options or {})
+        if options.get("num_io_threads", 0) > 0:
+            options.setdefault("write_behind_bytes", _WRITE_BEHIND_BYTES)
+        self.disk_tier_options = options
+        super().prepare(*args, **kwargs)
+
+    def tearDown(self) -> None:
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        super().tearDown()
+
+    def test_failed_write_through_copy_is_not_reused(self) -> None:
+        # A staged write's flush failure keeps the page in staging and records nothing, so the copy stays usable:
+        # covered by test_failed_flush_keeps_staged_pages_readable instead.
+        self.skipTest(
+            "write-behind keeps a failed flush's page readable instead of discarding the copy"
+        )
+
+    def _push_first_request_to_disk(self) -> tuple["TestNoBatching.Request", itertools.count]:
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertTrue(_introspection.async_disk_io_enabled())
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        # GPU and host each hold about one request, so these push the first one's pages GPU -> host -> disk.
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        return first, req_ids
+
+    def _restore_prefix(self, first: "TestNoBatching.Request", req_ids: itertools.count) -> None:
+        prompt = first.kv_cache.committed_tokens[: 32 * 11]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        # refcheck: the restored KV must be exactly what the first request computed.
+        self._run_and_close(reuse)
+
+    def _wait_for_flushes(self, timeout: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout
+        while _introspection.disk_write_behind_pages_for_testing() > 0:
+            self.assertLess(time.monotonic(), deadline, "write-behind flushes did not finish")
+            time.sleep(0.01)
+
+    def test_restores_are_served_from_staging_before_the_flush(self) -> None:
+        # No flush runs, so every page written to disk is still in staging when the prefix is restored from disk.
+        _introspection.delay_disk_write_behind_flushes_for_testing(3600)
+        first, req_ids = self._push_first_request_to_disk()
+        self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        self._restore_prefix(first, req_ids)
+        # Flush, then restore the same prefix from the file.
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        self._wait_for_flushes()
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, 32 * 22 - 256))
+        self._restore_prefix(first, req_ids)
+        self.manager.clear_reusable_blocks()
+
+    def test_failed_flush_keeps_staged_pages_readable(self) -> None:
+        # Every flush fails: the pages stay in staging, and restoring them from "disk" still returns their KV.
+        _introspection.inject_disk_write_failures_for_testing(1 << 30)
+        try:
+            first, req_ids = self._push_first_request_to_disk()
+            self._restore_prefix(first, req_ids)
+            self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        finally:
+            _introspection.inject_disk_write_failures_for_testing(0)
+        self.manager.clear_reusable_blocks()
+
+    def test_staging_is_released_after_flushes(self) -> None:
+        first, req_ids = self._push_first_request_to_disk()
+        self._wait_for_flushes()
+        self._restore_prefix(first, req_ids)
+        self.manager.clear_reusable_blocks()
+
+
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
+
+
+class TestResizeQuotaDiskWriteBehind(TestResizeQuota):
+    # Quota changes resize the disk file while pages may still be in write-behind staging.
+    disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
 
 
 class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):

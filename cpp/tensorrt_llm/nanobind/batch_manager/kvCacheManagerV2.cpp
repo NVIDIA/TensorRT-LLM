@@ -1790,15 +1790,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::HostMemBackingConfig::validate) DEF_COPY(kv::HostMemBackingConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string, int, bool, bool, float>(), nb::arg("quota"), nb::arg("path"),
+        .def(nb::init<size_t, std::string, int, bool, bool, float, size_t>(), nb::arg("quota"), nb::arg("path"),
             nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false,
-            nb::arg("protected_copy_fraction") = 1.0F)
+            nb::arg("protected_copy_fraction") = 1.0F, nb::arg("write_behind_bytes") = 0)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
         .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
         .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
         .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
+        .def_rw("write_behind_bytes", &kv::DiskCacheTierConfig::writeBehindBytes)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2442,6 +2443,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
+    mIntrospection.def(
+        "disk_write_behind_pages_for_testing", []() { return kv::diskWriteBehindPagesForTesting(); },
+        "Pages in disk write-behind staging (pending a flush, or kept after a failed one).");
+    mIntrospection.def(
+        "delay_disk_write_behind_flushes_for_testing",
+        [](double seconds) { kv::delayDiskWriteBehindFlushesForTesting(seconds); }, nb::arg("seconds"),
+        "A disk write-behind flush starts only once it has been queued for `seconds`.");
     mIntrospection.def(
         "delay_background_disk_writes_for_testing",
         [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),

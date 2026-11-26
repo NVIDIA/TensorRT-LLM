@@ -37,6 +37,22 @@ struct Task
 //! Process-wide: run host <-> disk copies on a pool of \p numThreads threads. The first nonzero call sizes it.
 void configureAsyncDiskIo(size_t numThreads) noexcept;
 
+//! Process-wide: up to \p bytes of host memory for write-behind (0: off). With the async I/O pool running, a
+//! host-to-disk page write that fits completes once the page is copied there, and a pool worker writes the file
+//! afterwards; reads of the page are served from staging until then. Applies to writes issued from now on.
+void configureDiskWriteBehind(size_t bytes) noexcept;
+
+//! Call before closing (\p minPos 0) or shrinking a disk pool file, after waitForDiskIo() when closing: drops the
+//! file's pages left in write-behind staging at offsets >= \p minPos (a failed flush keeps its page there).
+void discardDiskWriteBehind(int fd, ssize_t minPos) noexcept;
+
+//! Testing only: pages in write-behind staging (pending a flush, or kept after a failed one).
+[[nodiscard]] size_t diskWriteBehindPagesForTesting() noexcept;
+
+//! Testing only: a write-behind flush starts only once it has been queued for \p seconds (0: no delay), so reads are
+//! served from staging meanwhile.
+void delayDiskWriteBehindFlushesForTesting(double seconds) noexcept;
+
 //! Whether the last write to the disk page at (\p fd, \p pos) failed; reports each failure once. A disk copy made by
 //! a failed write holds stale bytes and must not be reused.
 [[nodiscard]] bool consumeFailedDiskWrite(int fd, ssize_t pos) noexcept;

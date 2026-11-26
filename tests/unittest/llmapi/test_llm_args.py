@@ -2985,6 +2985,25 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_write_behind(tmp_path):
+    assert KvCacheConfig().disk_write_behind_mib == 0
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=16,
+                           disk_write_behind_mib=4096)
+    assert config.disk_write_behind_mib == 4096
+    # Staged pages are written by the I/O pool, so write-behind needs it.
+    with pytest.raises(ValidationError,
+                       match="disk_write_behind_mib requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_behind_mib=4096)
+    with pytest.raises(ValidationError,
+                       match="disk_write_behind_mib requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4, disk_write_behind_mib=4096)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=4, disk_write_behind_mib=-1)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

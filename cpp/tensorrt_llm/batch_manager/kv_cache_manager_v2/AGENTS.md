@@ -460,6 +460,19 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   device-mapped host memory with `cuStreamWaitValue64`, or in a host function
   when that is unavailable or fails. Pieces are served reads first, then
   required writes, then background writes, with aging so no queue starves.
+- Write-behind (`disk_write_behind_mib` -> `DiskCacheTierConfig::writeBehindBytes`,
+  process-wide, needs the async pool): a host -> disk write that fits the staging
+  bound completes once each page is copied into staging (stage pieces, served
+  first), and a flush piece writes the file later, so the host slot is free at
+  memory speed. Every read of a disk page (`readDiskPage`: pool reads, the
+  synchronous paths, disk -> disk) is served from staging while a write of that
+  page is pending. A newer write replaces the pending page; a superseded flush
+  writes nothing, and flushes of one page never overlap. A failed flush keeps the
+  page in staging and records no failure, so its disk copy stays valid. Closing
+  or shrinking a disk file drops its staged pages (`discardDiskWriteBehind`),
+  and a disk -> disk copy drops the destination's. Background writes stage into
+  half the bound at most and keep their share of the background cap until their
+  flush.
 
 ### Remote cache levels
 

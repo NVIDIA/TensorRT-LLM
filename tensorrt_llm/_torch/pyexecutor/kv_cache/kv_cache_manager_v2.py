@@ -3439,6 +3439,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     keep_copy_after_restore=kv_cache_config.disk_keep_copy_after_restore,
                     write_through=kv_cache_config.disk_write_through,
                     protected_copy_fraction=kv_cache_config.disk_protected_copy_fraction,
+                    write_behind_bytes=kv_cache_config.disk_write_behind_mib << 20,
                 )
             )
             logger.info(
@@ -3446,7 +3447,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"at {disk_cache_path} (io_threads={kv_cache_config.disk_io_threads}, "
                 f"keep_copy_after_restore={kv_cache_config.disk_keep_copy_after_restore}, "
                 f"write_through={kv_cache_config.disk_write_through}, "
-                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction})"
+                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction}, "
+                f"write_behind_mib={kv_cache_config.disk_write_behind_mib})"
             )
         if kv_cache_config.remote_cache_config is not None and remote_init_error is None:
             try:

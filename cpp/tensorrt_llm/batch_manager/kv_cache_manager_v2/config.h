@@ -114,6 +114,12 @@ struct DiskCacheTierConfig
     //! lower value keeps more distinct pages on disk (capacity-bound deployments).
     float protectedCopyFraction = 1.0F;
 
+    //! Host memory, in bytes, for write-behind of host -> disk writes (0: off). A page write that fits completes once
+    //! the page is copied there, so the host slot it came from is free at memory speed; an I/O worker writes the file
+    //! afterwards, and reads of the page are served from that memory until then. Requires numIoThreads > 0.
+    //! Process-wide, like the I/O pool: the last disk tier configured sets it.
+    size_t writeBehindBytes = 0;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

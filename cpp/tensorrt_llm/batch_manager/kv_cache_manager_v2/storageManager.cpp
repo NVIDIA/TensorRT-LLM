@@ -714,6 +714,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             mWriteThroughAt[level] = disk->writeThrough && hostAbove;
             mDiskWriteThrough = mDiskWriteThrough || mWriteThroughAt[level];
             configureAsyncDiskIo(static_cast<size_t>(disk->numIoThreads)); // validate() rejects negative values
+            if (asyncDiskIoEnabled())
+            {
+                configureDiskWriteBehind(disk->writeBehindBytes);
+            }
         }
     }
     if (mDiskWriteThrough && !asyncDiskIoEnabled())
