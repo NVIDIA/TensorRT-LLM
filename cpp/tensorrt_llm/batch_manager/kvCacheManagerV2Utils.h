@@ -104,4 +104,12 @@ void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
+//! Writes per-layer K/V page tables for the copyIndex rows of a base-page table.
+//! input is [pools, rows, 2, blocks] in pinned host or device memory; output is [layers, rows, 2, blocks].
+//! converters holds (pool, scale, offset) per output K/V lane, and poolLanes lists the lanes stored in pool p
+//! at [poolLaneOffsets[p], poolLaneOffsets[p + 1]). Only the first maxBlocks columns are written.
+void copyPerLayerBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& converters, ITensor const& poolLaneOffsets, ITensor const& poolLanes, SizeType32 maxBlocks,
+    CUstream stream);
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -104,8 +104,17 @@ add_tllm_gtest(
   tllm::runtime_lora
   LABELS
   "unit;runtime;gpu")
-add_tllm_gtest(moeLoadBalancerTest SOURCES moeLoadBalancerTest.cpp FULL_STACK
-               LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  moeLoadBalancerTest
+  OWNER
+  runtime
+  SOURCES
+  moeLoadBalancerTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_moe_load_balance
+  tllm::kernel_moe_load_balance
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   runtimeMpiUtilsTest
   OWNER
@@ -157,8 +166,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;gpu")
-add_tllm_gtest(transposeKVKernelTest SOURCES transposeKVKernelTest.cpp
-               FULL_STACK LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  transposeKVKernelTest
+  OWNER
+  runtime
+  SOURCES
+  transposeKVKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   utilsTest
   OWNER

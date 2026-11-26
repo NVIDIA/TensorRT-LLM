@@ -91,7 +91,7 @@ from the document, with `~` expanded and no variable expansion.
 
 | key | what it becomes |
 |---|---|
-| `image_reference` · `video_reference` · `audio_reference` | a `path` goes out as the path and the server reads the file; `url` and `base64` go out as written |
+| `image_reference` · `video_reference` · `audio_reference` | a `path` goes out as the path and the server reads the file, which it does only under the directory its `TRTLLM_MEDIA_ALLOWED_INPUT_DIR` names; `url` and `base64` go out as written |
 | `prompt_file` | that request's `prompt`: a JSON object's `prompt` field, the whole object serialized when it has none, or the file's text when it is not JSON |
 | `extra_params.action_file` | `extra_params.action`, a JSON `[T, D]` trajectory |
 

@@ -195,6 +195,7 @@ def test_blob_config_holds_only_the_key_prefix() -> None:
             BlobConfig(key_prefix=prefix)
     # Tuning such as workers belongs to the driver's own section.
     with pytest.raises(TypeError, match="workers"):
+        # pyrefly: ignore [unexpected-keyword]
         BlobConfig(workers=2)
 
 

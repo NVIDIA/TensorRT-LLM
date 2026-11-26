@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -710,6 +714,30 @@ class TestParseChatMessageContentPart:
         with pytest.raises(ValueError, match="non-empty 'data' field"):
             parse_chat_message_content_part(part, mm_tracker)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grid", [None, [1, 4, 6]])
+    async def test_image_embeds_part_keeps_image_grid(self, mm_tracker, grid):
+        import base64
+        import io
+
+        import torch
+
+        embeds = torch.ones(6, 4)
+        with io.BytesIO() as buf:
+            torch.save(embeds, buf)
+            image_embeds = {"data": base64.b64encode(buf.getvalue()).decode("ascii")}
+        if grid is not None:
+            image_embeds["image_grid_thw"] = grid
+        part = {"type": "image_embeds", "image_embeds": image_embeds}
+
+        item = await parse_chat_message_content_part(part, mm_tracker)["data"]
+
+        if grid is None:
+            torch.testing.assert_close(item, embeds)
+        else:
+            assert item["image_grid_thw"] == grid
+            torch.testing.assert_close(item["mm_embeddings"], embeds)
+
 
 class TestMakeMediaIo:
     """_make_media_io constructs correctly-configured MediaIO instances."""
@@ -720,25 +748,30 @@ class TestMakeMediaIo:
         assert io._num_frames == 8
         assert io._fps == 1
 
-    def test_request_keys_shallow_merge_over_server(self):
-        server = MultimodalServerConfig(
-            media_io_kwargs={"image": {"format": "pil", "device": "cuda"}}
+    @pytest.mark.parametrize(
+        ("flags", "key"),
+        [
+            ([], "format"),
+            (["--grpc", "--grpc-protocol", "openengine"], "format"),
+            (["--enable_visual_gen"], "format"),
+            (["--enable_visual_gen"], "device"),
+        ],
+    )
+    def test_server_flag_rejects_representation(self, tmp_path, flags, key):
+        from click.testing import CliRunner
+
+        from tensorrt_llm.commands.serve import serve
+
+        result = CliRunner().invoke(
+            serve, [str(tmp_path), *flags, "--media_io_kwargs", json.dumps({"video": {key: None}})]
         )
-        request = {"image": {"format": "pt"}}
-        io = _make_media_io("image", server, request)
-        assert io._format == "pt"
-        assert io._device == "cuda"
+        assert result.exit_code == 2
+        assert f"media_io_kwargs.video.{key}" in result.output
 
     def test_other_modalities_fall_back_to_server(self):
-        server = MultimodalServerConfig(
-            media_io_kwargs={
-                "video": {"num_frames": 8},
-                "image": {"format": "pil"},
-            }
-        )
-        request = {"video": {"num_frames": 32}}
-        io = _make_media_io("image", server, request)
-        assert io._format == "pil"
+        server = MultimodalServerConfig(media_io_kwargs={"video": {"fps": 4}})
+        io = _make_media_io("video", server, {"audio": {}})
+        assert io._fps == 4
 
     def test_video_num_frames_override_drops_server_fps(self):
         """Overriding only `num_frames` drops the server's `fps` so the loader's built-in is used."""
@@ -766,10 +799,10 @@ class TestMediaIoKwargsLoaderForwarding:
     def test_io_constructed_with_resolved_kwargs(self, mm_tracker_factory):
         """Merged kwargs are baked into the MediaIO instance, not forwarded as call-time args."""
         tracker = mm_tracker_factory(
-            server_kwargs={"image": {"format": "pil", "device": "cuda"}},
-            request_kwargs={"image": {"format": "pt"}},
+            server_kwargs={"video": {"num_frames": 8, "extract_audio": True}},
+            request_kwargs={"video": {"num_frames": 4}},
         )
-        part = {"type": "image_url", "image_url": {"url": "i"}}
+        part = {"type": "video_url", "video_url": {"url": "v"}}
 
         captured = []
         original = _chat_utils._make_media_io
@@ -780,11 +813,11 @@ class TestMediaIoKwargsLoaderForwarding:
             return io
 
         with patch.object(_chat_utils, "_make_media_io", side_effect=spy):
-            parse_chat_message_content_part(part, tracker)
+            parse_chat_message_content_part(part, tracker)["data"].close()
 
         assert len(captured) == 1
-        assert captured[0]._format == "pt"
-        assert captured[0]._device == "cuda"
+        assert captured[0]._num_frames == 4
+        assert captured[0]._extract_audio is True
 
     @pytest.mark.asyncio
     async def test_input_audio_synthesizes_data_url(self, mm_tracker_factory):
@@ -900,7 +933,7 @@ class TestChatCompletionRequestSchemaValidation:
 class TestRequestLocalMediaPaths:
     """Local media references in a request are read only from the allowed directory."""
 
-    _ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+    _ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
 
     @pytest.fixture
     def media_dirs(self, tmp_path):
@@ -946,7 +979,7 @@ class TestRequestLocalMediaPaths:
         path = allowed / "img.png"
         url = f"file://{path}" if form == "file_uri" else str(path)
         image = await self._load(url)
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -998,7 +1031,7 @@ class TestRequestLocalMediaPaths:
             Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")
             encoded = base64.b64encode(buf.getvalue()).decode("ascii")
         image = await self._load(f"data:image/png;base64,{encoded}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_remote_url_not_checked_as_local(self, monkeypatch):
@@ -1041,7 +1074,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         (allowed / "alias.png").symlink_to(allowed / "img.png")
         image = await self._load(f"file://{allowed}/alias.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_symlink_appearing_after_resolution_refused(self, monkeypatch, media_dirs):
@@ -1059,6 +1092,71 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setattr(os.path, "realpath", realpath_before_swap)
         with pytest.raises(ValueError, match="Local media paths are not accepted"):
             await self._load(f"file://{link}")
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="the check reads /proc/self/fd")
+    async def test_directory_swapped_for_symlink_after_resolution_refused(
+        self, monkeypatch, media_dirs
+    ):
+        """A directory swapped for a symlink after resolution does not open a file elsewhere."""
+        import posixpath
+
+        from PIL import Image
+
+        allowed, other = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        sub = allowed / "sub"
+        sub.mkdir()
+        Image.new("RGB", (8, 8), (0, 128, 255)).save(sub / "img.png")
+        target = os.path.realpath(sub / "img.png")
+        real_realpath = os.path.realpath
+
+        def realpath_then_swap(path, *args, **kwargs):
+            resolved = real_realpath(path, *args, **kwargs)
+            if resolved == target and not sub.is_symlink():
+                os.rename(sub, allowed / "sub.moved")
+                os.symlink(other, sub)
+            return resolved
+
+        monkeypatch.setattr(posixpath, "realpath", realpath_then_swap)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://{sub}/img.png")
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="the check reads /proc/self/fd")
+    @pytest.mark.parametrize("descriptor_dir", ["/proc/self/fd", None])
+    async def test_a_non_regular_file_outside_the_root_gets_the_location_refusal(
+        self, monkeypatch, media_dirs, descriptor_dir
+    ):
+        """A file reached through a swapped directory is refused for its location.
+
+        The refusal is the same whatever the file is, and whichever way decoders
+        reach the descriptor.
+        """
+        import posixpath
+
+        from tensorrt_llm.inputs import media_io
+
+        allowed, other = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        monkeypatch.setattr(media_io, "_DESCRIPTOR_DIR", descriptor_dir)
+        sub = allowed / "sub"
+        sub.mkdir()
+        (sub / "pipe.png").write_bytes(b"")
+        os.mkfifo(other / "pipe.png")
+        target = os.path.realpath(sub / "pipe.png")
+        real_realpath = os.path.realpath
+
+        def realpath_then_swap(path, *args, **kwargs):
+            resolved = real_realpath(path, *args, **kwargs)
+            if resolved == target and not sub.is_symlink():
+                os.rename(sub, allowed / "sub.moved")
+                os.symlink(other, sub)
+            return resolved
+
+        monkeypatch.setattr(posixpath, "realpath", realpath_then_swap)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://{sub}/pipe.png")
 
     @pytest.mark.asyncio
     async def test_fifo_refused_without_blocking(self, monkeypatch, media_dirs):
@@ -1090,7 +1188,7 @@ class TestRequestLocalMediaPaths:
 
         monkeypatch.setattr(media_io, "open_allowed_local_media", open_then_replace)
         image = await self._load(f"file://{path}")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_loaded_without_descriptor_directory(self, monkeypatch, media_dirs):
@@ -1099,7 +1197,7 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setenv(self._ENV, str(allowed))
         monkeypatch.setattr("tensorrt_llm.inputs.media_io._DESCRIPTOR_DIR", None)
         image = await self._load(f"file://{allowed}/img.png")
-        assert tuple(image.shape) == (3, 8, 8)
+        assert image.size == (8, 8)
 
     @pytest.mark.asyncio
     async def test_misconfigured_directory_refused_generically(

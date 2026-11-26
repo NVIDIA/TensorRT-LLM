@@ -5,9 +5,10 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "jieba (>=0.42.1,<0.43.0)",
+    "rapidfuzz (>=3.14.6,<4.0.0)",
     "rouge (>=1.0.1,<2.0.0)"
 ]
 

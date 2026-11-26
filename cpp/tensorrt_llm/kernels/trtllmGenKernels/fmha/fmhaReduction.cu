@@ -126,19 +126,6 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
     // Whether to store the softmax stats.
     bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
 
-    // The softmaxScaleLog2. The maxima stored in partialStats are raw BMM1 outputs (see the
-    // softmaxStats export below, which scales maxVal on the way out), so the correction factors
-    // computed by the reduction must use exactly the softmax scale that the primary kernel applied.
-    // On FP8 paths that scale carries the BMM1 dequant product (dequantQ * dequantKv) and lives on
-    // the device only: ptrScaleSoftmaxLog2 points at bmm1_scale[kIdxScaleSoftmaxLog2Ptr], whereas
-    // the host mirror mScaleSoftmaxLog2 never saw the dequant scales. Reading the host mirror is
-    // therefore correct only when dequantQ * dequantKv == 1, and silently raises the per-CtaKv
-    // weights to that product otherwise. Prefer the device scale whenever it is available; it is
-    // written before the producer kernel triggers its programmatic launch completion, so it is
-    // already visible here even though this read precedes cudaGridDependencySynchronize below.
-    float const softmaxScaleLog2
-        = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2 : params.mScaleSoftmaxLog2;
-
     int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
     static_assert(NumBytesPerPartialElt == 2, "The data type of partialO should be either fp16 or bf16.");
 
@@ -206,9 +193,24 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         cudaGridDependencySynchronize();
 #endif
 
+        // The softmaxScaleLog2. The maxima stored in partialStats are raw BMM1 outputs (see the
+        // softmaxStats export below, which scales maxVal on the way out), so the correction factors
+        // computed by the reduction must use exactly the softmax scale that the primary kernel applied.
+        // On FP8 paths that scale carries the BMM1 dequant product (dequantQ * dequantKv) and lives on
+        // the device only: ptrScaleSoftmaxLog2 points at bmm1_scale[kIdxScaleSoftmaxLog2Ptr], whereas
+        // the host mirror mScaleSoftmaxLog2 never saw the dequant scales. Reading the host mirror is
+        // therefore correct only when dequantQ * dequantKv == 1, and silently raises the per-CtaKv
+        // weights to that product otherwise. Prefer the device scale whenever it is available; an
+        // earlier kernel writes it, so it is read after the wait.
+        float const softmaxScaleLog2
+            = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2 : params.mScaleSoftmaxLog2;
+
         // Add offset to the pointers.
         float2* localPartialStatsPtr = partialStatsPtr + loadRowIdx;
         DtypePartialO* localPartialOPtr = partialOPtr + destMemOffset;
+
+        // The attention sink of this row, loaded ahead of the reduction loop to hide its latency.
+        float const attentionSink{attentionSinksPtr != nullptr ? attentionSinksPtr[localHeadIdxO] : 0.f};
 
         // Reduce max, sum and partialO vectors from different CtasKv.
         float sumVal{0.f};
@@ -254,7 +256,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
         // Update the sums with the attention sink value.
         if (attentionSinksPtr != nullptr)
         {
-            float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+            // One FP64 FMA, written out so that the compiler cannot split it into a hoisted multiply and an add.
+            float attentionSinkVal = exp2f(static_cast<float>(
+                ::fma(static_cast<double>(attentionSink), M_LOG2E, -static_cast<double>(maxVal * softmaxScaleLog2))));
             // Multiply the attention sink value by the quantization scale included in the sum value.
             sumVal += attentionSinkVal * softmaxPScale;
         }

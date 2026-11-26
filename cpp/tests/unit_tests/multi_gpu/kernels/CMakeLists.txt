@@ -13,15 +13,51 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_tllm_gtest(allReduceKernelTest SOURCES allReduce/allReduceKernelTest.cu
-                 FULL_STACK LABELS "unit;full-stack;gpu")
-  add_tllm_gtest(allReduceFusionTest SOURCES allReduce/allReduceFusionTest.cu
-                 FULL_STACK LABELS "unit;full-stack;gpu")
-  add_tllm_gtest(gemmAllReduceTest SOURCES allReduce/gemmAllReduceTest.cu
-                 FULL_STACK LABELS "unit;full-stack;gpu")
+if(ENABLE_MULTI_DEVICE)
+  add_tllm_gtest(
+    allReduceKernelTest
+    OWNER
+    kernel
+    SOURCES
+    allReduce/allReduceKernelTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_custom_all_reduce
+    tllm::runtime_ipc
+    tllm::runtime_buffers
+    tllm::runtime_distributed
+    LABELS
+    "unit;kernels;all-reduce;multi-gpu;gpu")
+  add_tllm_gtest(
+    allReduceFusionTest
+    OWNER
+    kernel
+    SOURCES
+    allReduce/allReduceFusionTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_all_reduce_fusion
+    tllm::kernel_rms_norm
+    tllm::kernel_quantization
+    tllm::runtime_distributed
+    ${NCCL_LIB}
+    LABELS
+    "unit;kernels;all-reduce;multi-gpu;gpu")
+  add_tllm_gtest(
+    gemmAllReduceTest
+    OWNER
+    kernel
+    SOURCES
+    allReduce/gemmAllReduceTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_gemm_all_reduce
+    tllm::kernel_cutlass_headers
+    tllm::kernel_userbuffers
+    tllm::runtime_ipc_nvls
+    tllm::runtime_distributed
+    ${NCCL_LIB}
+    LABELS
+    "unit;kernels;all-reduce;multi-gpu;gpu"
+    NO_GTEST_MAIN)
   if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
-    target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
     target_compile_definitions(gemmAllReduceTest
                                PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   endif()

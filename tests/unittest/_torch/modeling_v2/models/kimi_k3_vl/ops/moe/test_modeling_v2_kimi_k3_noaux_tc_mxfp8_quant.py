@@ -1,17 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the kimi_k3_noaux_tc_mxfp8_quant catalog entry."""
+"""GPU test for the family op ``moe/kimi_k3_noaux_tc_mxfp8_quant``: its cells against its reference and against the
+two catalog entries it fuses (``noaux_tc_op``, ``mxfp8_quantize``), CUDA-graph replay, determinism, and the calls it
+rejects."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization import (
-    mxfp8_quantize as mxfp8,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
+from tensorrt_llm._torch.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
+from tensorrt_llm._torch.modeling_v2.catalog.quantization import mxfp8_quantize as mxfp8
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.kimi_k3_noaux_tc_mxfp8_quant import (
     kimi_k3_noaux_tc_mxfp8_quant,
 )
 
@@ -30,7 +30,9 @@ HIDDEN = 3584
 SF_COLS = HIDDEN // 32
 
 
-def _inputs(num_tokens: int, logit_scale: float = 2.5, seed: int = 0):
+def _inputs(
+    num_tokens: int, logit_scale: float = 2.5, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=gen, device="cuda") * logit_scale
     bias = torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.1
@@ -109,7 +111,7 @@ def test_certified_cells(cell) -> None:
 
 
 def test_cuda_graph_replay() -> None:
-    # The decode path calls this op inside a captured step: replay with new inputs equals eager.
+    # The generic MoE path calls this op inside a captured step: replay with new inputs equals eager.
     for num_tokens in (1, 8, 64):
         logits, bias, hidden = _inputs(num_tokens, seed=100 + num_tokens)
         kimi_k3_noaux_tc_mxfp8_quant(logits, bias, hidden, 1.0)  # warm up outside capture

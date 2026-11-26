@@ -14,9 +14,10 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
-    get_moe_load_balancer, maybe_create_moe_load_balancer,
-    moe_load_balancer_add_single_layer)
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+    _tensor_to_weight, get_moe_load_balancer, maybe_create_moe_load_balancer,
+    moe_load_balancer_add_single_layer, moe_load_balancer_mode)
+from tensorrt_llm.llmapi.llm_args import (MoeLoadBalancerConfig,
+                                          MoePerLayerDynamicLoadBalancerConfig)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -370,6 +371,18 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # Test passed if we got here without exceptions
             self.assertTrue(True, "Statistic kernel ran successfully")
 
+            # A rank without tokens counts nothing.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                layer.update_local_statistic(gathered_raw_expert_ids[:0], True,
+                                             True)
+                local_statistic = layer.get_local_statistic_tensor()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            self.assertEqual(local_statistic.tolist(), [0] * expert_count)
+
         except Exception as e:
             self.fail(f"Statistic kernel test failed with exception: {e}")
         finally:
@@ -445,6 +458,16 @@ class TestMoeLoadBalancer(unittest.TestCase):
                 torch.all(torch.eq(routed_slots, expected_slots)),
                 f"Routing results don't match expected slots.\nExpected: {expected_slots}\nGot: {routed_slots}"
             )
+
+            # A rank without tokens routes an empty batch.
+            with MoeLoadBalancerIterContext(balancer):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                empty_slots = layer.route(token_selected_experts[:0])
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            self.assertEqual(tuple(empty_slots.shape), (0, top_k))
 
         except Exception as e:
             self.fail(f"Routing kernel test failed with exception: {e}")
@@ -561,6 +584,139 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         finally:
             balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+_EP4 = dict(world_size=4, rank=1, tp_size=4, moe_ep_size=4)
+
+# (architecture, mapping kwargs, load-balancer config, the mode the engine
+# runs). The standard-mode and no-balancer cases, which
+# maybe_create_moe_load_balancer can build here with the runtime mocked.
+_STANDARD_MODE_CASES = [
+    pytest.param("DeepseekV3ForCausalLM",
+                 _EP4,
+                 MoeLoadBalancerConfig(num_slots=288),
+                 "static",
+                 id="static"),
+    pytest.param("DeepseekV3ForCausalLM",
+                 _EP4,
+                 MoeLoadBalancerConfig(num_slots=288, layer_updates_per_iter=2),
+                 "online",
+                 id="online"),
+    pytest.param("DeepseekV3ForCausalLM",
+                 _EP4,
+                 None,
+                 None,
+                 id="no-load-balancer-config"),
+    pytest.param("DeepseekV3ForCausalLM",
+                 dict(world_size=4,
+                      rank=1,
+                      tp_size=4,
+                      moe_tp_size=4,
+                      moe_ep_size=1),
+                 MoeLoadBalancerConfig(num_slots=256),
+                 None,
+                 id="one-ep-rank"),
+    pytest.param("LlamaForCausalLM",
+                 _EP4,
+                 MoeLoadBalancerConfig(num_slots=288),
+                 None,
+                 id="architecture-not-balanced"),
+]
+
+
+def _balancer_model_config(arch, mapping, load_balancer):
+    pretrained_config = PretrainedConfig()
+    pretrained_config.architectures = [arch]
+    return ModelConfig(pretrained_config=pretrained_config,
+                       mapping=mapping,
+                       moe_load_balancer=load_balancer)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "arch, mapping_kwargs, load_balancer, expected", _STANDARD_MODE_CASES + [
+        pytest.param("DeepseekV3ForCausalLM",
+                     _EP4,
+                     MoePerLayerDynamicLoadBalancerConfig(num_slots=288),
+                     "per_layer_dynamic",
+                     id="per-layer-dynamic"),
+    ])
+def test_moe_load_balancer_mode(arch, mapping_kwargs, load_balancer,
+                                expected) -> None:
+    mapping = Mapping(**mapping_kwargs)
+    model_config = _balancer_model_config(arch, mapping, load_balancer)
+
+    assert moe_load_balancer_mode(model_config, mapping) == expected
+    assert moe_load_balancer_mode(model_config, None) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch, mapping_kwargs, load_balancer, expected",
+                         _STANDARD_MODE_CASES)
+def test_maybe_create_moe_load_balancer_follows_the_mode(
+        arch, mapping_kwargs, load_balancer, expected,
+        mock_runtime: MagicMock) -> None:
+    """The loader creates a balancer exactly where the mode says EPLB runs."""
+    mapping = Mapping(**mapping_kwargs)
+    model_config = _balancer_model_config(arch, mapping, load_balancer)
+
+    with maybe_create_moe_load_balancer(model_config, mapping) as balancer:
+        if expected is None:
+            assert balancer is None
+        else:
+            try:
+                assert isinstance(balancer, MoeLoadBalancer)
+                assert balancer.is_static_routing() == (expected == "static")
+            finally:
+                balancer.shutdown()
+    assert get_moe_load_balancer() is None
+
+
+@pytest.mark.cpu_only
+def test_shutdown_stops_cpp_before_closing_host_weights(
+        mock_runtime: MagicMock) -> None:
+    """The C++ load balancer shuts down before the host weights its updates read are closed."""
+    balancer = MoeLoadBalancer(ep_rank=0, ep_size=4, layer_updates_per_iter=2)
+    # Every rank reports that it is safe to shut down.
+    balancer.shared_mpi_comm.allgather.return_value = [True]
+    layer = MagicMock(spec=SingleLayerMoeLoadBalancer)
+    balancer.single_layer_load_balancers.append(layer)
+    order = []
+    mock_runtime.return_value.shutdown.side_effect = lambda: order.append(
+        "C++ shutdown")
+    layer.py_pre_shutdown_cleanup.side_effect = lambda: order.append(
+        "host weights closed")
+
+    assert balancer.shutdown()
+    assert order == ["C++ shutdown", "host weights closed"]
+
+
+class TestTensorToWeight(unittest.TestCase):
+    """_tensor_to_weight describes a tensor as a (height, width, pitch) copy."""
+
+    def test_2d_contiguous(self):
+        t = torch.zeros(6, 10, dtype=torch.bfloat16)
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (6, 20, 20))
+        self.assertEqual(mw.weight_ptr, t.data_ptr())
+
+    def test_2d_row_strided_keeps_pitch(self):
+        t = torch.zeros(6, 16, dtype=torch.bfloat16)[:, :10]
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (6, 20, 32))
+
+    def test_3d_contiguous_collapses_leading_dims(self):
+        # TRTLLM-Gen BlockMajorK expert weight: [K / block_k, Mn, block_k].
+        t = torch.zeros(4, 8, 64, dtype=torch.bfloat16)
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (32, 128, 128))
+        self.assertEqual(mw.weight_ptr, t.data_ptr())
+
+    def test_3d_non_contiguous_rejected(self):
+        t = torch.zeros(8, 4, 64, dtype=torch.bfloat16).permute(1, 0, 2)
+        self.assertFalse(t.is_contiguous())
+        with self.assertRaises(AssertionError):
+            _tensor_to_weight(t)
 
 
 if __name__ == '__main__':

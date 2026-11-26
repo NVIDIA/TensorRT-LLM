@@ -221,12 +221,21 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
         return 0
     is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
     is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
+    # Draft layers declared through layer specs have a lifecycle of their own and
+    # read their own block offsets.
+    spec_draft_layers = (
+        set(kv_cache_manager.draft_layer_ids)
+        if getattr(kv_cache_manager, "layer_specs", None) is not None
+        else set()
+    )
     # NVFP4 sparse layers and the hybrid draft layer (read through its own view)
     # never read the staged table and may sit in pools with another factor.
     factors = {
         int(get_pool(layer_idx, "HND")[1])
         for layer_idx in layer_offsets
-        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
+        if not is_nvfp4(layer_idx)
+        and not is_hybrid_draft(layer_idx)
+        and layer_idx not in spec_draft_layers
     }
     return factors.pop() if len(factors) == 1 else 0
 

@@ -82,6 +82,8 @@ class PARDWorker(SpecWorkerBase):
     Reference: https://arxiv.org/pdf/2504.18583
     """
 
+    verifies_on_target_shard = True
+
     def __init__(
         self,
         spec_config: "PARDDecodingConfig",

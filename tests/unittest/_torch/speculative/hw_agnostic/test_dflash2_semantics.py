@@ -1019,13 +1019,14 @@ def _oracle_block_decode(weights, captured, noise_embedding, dflash2):
         hidden = hidden + delta
 
         normed = _rms(hidden, w[prefix + "post_attention_layernorm.weight"])
+        mlp_coefficients = None
         if dflash2:
             mlp_coefficients = _oracle_conv_coefficients(w, prefix + "mlp_conv", normed)
             normed = _oracle_conv(w, prefix + "mlp_conv", 0, normed, mlp_coefficients)
         gate = normed @ w[prefix + "mlp.gate_proj.weight"].T
         up = normed @ w[prefix + "mlp.up_proj.weight"].T
         delta = (F.silu(gate) * up) @ w[prefix + "mlp.down_proj.weight"].T
-        if dflash2:
+        if mlp_coefficients is not None:
             delta = _oracle_conv(w, prefix + "mlp_conv", 1, delta, mlp_coefficients)
         hidden = hidden + delta
 

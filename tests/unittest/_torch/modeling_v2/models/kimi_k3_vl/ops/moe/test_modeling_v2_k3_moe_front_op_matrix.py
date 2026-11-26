@@ -9,12 +9,16 @@ The shared comm/_rank_job helper starts its W-rank launcher as one ordered job.
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
-import _rank_job  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _rank_job
+else:
+    import _rank_job  # noqa: E402
 
 
 def _is_sm100() -> bool:

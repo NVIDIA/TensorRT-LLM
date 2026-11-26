@@ -150,10 +150,10 @@ __device__ __forceinline__ void process_chunk(__nv_bfloat162 in_lo, __nv_bfloat1
 // Baseline 1-warp-per-token variant. Each warp handles one (head, token)
 // pair and emits CHUNKS_PER_HEAD fp8 chunks + scales. The kernel hardcodes
 // the DSv4 layout: rope_dim=64 lives in the second half of the last chunk.
-template <int BLOCK_TOKENS, int CHUNKS_PER_HEAD, bool IS_NEOX>
+template <int BLOCK_TOKENS, int CHUNKS_PER_HEAD, bool IS_NEOX, typename TPosition>
 __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKernel(
     __nv_bfloat16 const* __restrict__ o_ptr,              //
-    int64_t const* __restrict__ positions_ptr,            //
+    TPosition const* __restrict__ positions_ptr,          //
     float const* __restrict__ cs_cache_ptr,               //
     __nv_fp8_e4m3* __restrict__ fp8_ptr,                  //
     float* __restrict__ scale_ptr,                        //
@@ -191,7 +191,7 @@ __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKe
         return;
     }
 
-    long const pos = positions_ptr[pid_token];
+    int64_t const pos = static_cast<int64_t>(positions_ptr[pid_token]);
     // Input layout: [num_tokens, num_heads, head_dim] flat — global head_idx works.
     auto const* in_row
         = o_ptr + static_cast<long>(pid_token) * o_stride_token + static_cast<long>(head_idx) * o_stride_head;
@@ -232,10 +232,10 @@ __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKe
 // scoreboard stalls by overlapping the next iter's input/cs LDGs with the
 // current iter's compute+store. TPW=2 is the sweet spot — TPW>=4 spills
 // registers and drops occupancy.
-template <int BLOCK_TOKENS, int CHUNKS_PER_HEAD, int TOKENS_PER_WARP, bool IS_NEOX>
+template <int BLOCK_TOKENS, int CHUNKS_PER_HEAD, int TOKENS_PER_WARP, bool IS_NEOX, typename TPosition>
 __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKernelPipelined(
     __nv_bfloat16 const* __restrict__ o_ptr,              //
-    int64_t const* __restrict__ positions_ptr,            //
+    TPosition const* __restrict__ positions_ptr,          //
     float const* __restrict__ cs_cache_ptr,               //
     __nv_fp8_e4m3* __restrict__ fp8_ptr,                  //
     float* __restrict__ scale_ptr,                        //
@@ -257,7 +257,7 @@ __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKe
     // ---- Stage 1: issue all input + position LDGs up front --------------
     __nv_bfloat162 in_lo_arr[TOKENS_PER_WARP][CHUNKS_PER_HEAD];
     __nv_bfloat162 in_hi_arr[TOKENS_PER_WARP][CHUNKS_PER_HEAD];
-    long pos_arr[TOKENS_PER_WARP];
+    int64_t pos_arr[TOKENS_PER_WARP];
     bool valid[TOKENS_PER_WARP];
     bool in_range[TOKENS_PER_WARP];
 
@@ -269,7 +269,7 @@ __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKe
         valid[t] = pid < num_tokens;
         if (valid[t])
         {
-            pos_arr[t] = positions_ptr[pid];
+            pos_arr[t] = static_cast<int64_t>(positions_ptr[pid]);
             auto const* in_row
                 = o_ptr + static_cast<long>(pid) * o_stride_token + static_cast<long>(head_idx) * o_stride_head;
 #pragma unroll
@@ -329,10 +329,10 @@ __global__ __launch_bounds__(BLOCK_TOKENS* kWarpSize) void inverseRopeFp8QuantKe
     }
 }
 
-template <int CHUNKS_PER_HEAD, bool IS_NEOX>
-inline void dispatchByM(int num_tokens, int num_heads, int heads_per_group, int scale_buf_m,              //
-    __nv_bfloat16 const* o_p, int64_t const* pos_p, float const* cs_p, __nv_fp8_e4m3* fp8_p, float* sc_p, //
-    int o_stride_token, int o_stride_head, int fp8_stride_group, int fp8_stride_token,                    //
+template <int CHUNKS_PER_HEAD, bool IS_NEOX, typename TPosition>
+inline void dispatchByM(int num_tokens, int num_heads, int heads_per_group, int scale_buf_m,                //
+    __nv_bfloat16 const* o_p, TPosition const* pos_p, float const* cs_p, __nv_fp8_e4m3* fp8_p, float* sc_p, //
+    int o_stride_token, int o_stride_head, int fp8_stride_group, int fp8_stride_token,                      //
     int scale_stride_group, int scale_stride_k, cudaStream_t stream)
 {
     // BTM=4 with TPW=2 above M=4096, otherwise baseline. Tuned on B200.
@@ -344,11 +344,12 @@ inline void dispatchByM(int num_tokens, int num_heads, int heads_per_group, int 
         int const grid_x = (scale_buf_m + tokens_per_cta - 1) / tokens_per_cta;
         dim3 grid(grid_x, num_heads);
         dim3 block(BTM * kWarpSize);
-        inverseRopeFp8QuantKernelPipelined<BTM, CHUNKS_PER_HEAD, TPW, IS_NEOX><<<grid, block, 0, stream>>>( //
-            o_p, pos_p, cs_p, fp8_p, sc_p,                                                                  //
-            num_tokens, scale_buf_m, heads_per_group,                                                       //
-            o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token,                              //
-            scale_stride_group, scale_stride_k);
+        inverseRopeFp8QuantKernelPipelined<BTM, CHUNKS_PER_HEAD, TPW, IS_NEOX, TPosition>
+            <<<grid, block, 0, stream>>>(                                          //
+                o_p, pos_p, cs_p, fp8_p, sc_p,                                     //
+                num_tokens, scale_buf_m, heads_per_group,                          //
+                o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token, //
+                scale_stride_group, scale_stride_k);
     }
     else
     {
@@ -356,18 +357,19 @@ inline void dispatchByM(int num_tokens, int num_heads, int heads_per_group, int 
         int const grid_x = (scale_buf_m + BTM - 1) / BTM;
         dim3 grid(grid_x, num_heads);
         dim3 block(BTM * kWarpSize);
-        inverseRopeFp8QuantKernel<BTM, CHUNKS_PER_HEAD, IS_NEOX><<<grid, block, 0, stream>>>( //
-            o_p, pos_p, cs_p, fp8_p, sc_p,                                                    //
-            num_tokens, scale_buf_m, heads_per_group,                                         //
-            o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token,                //
+        inverseRopeFp8QuantKernel<BTM, CHUNKS_PER_HEAD, IS_NEOX, TPosition><<<grid, block, 0, stream>>>( //
+            o_p, pos_p, cs_p, fp8_p, sc_p,                                                               //
+            num_tokens, scale_buf_m, heads_per_group,                                                    //
+            o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token,                           //
             scale_stride_group, scale_stride_k);
     }
 }
 
 } // namespace
 
+template <typename TPosition>
 void invokeInverseRopeFp8Quant(void const* o, //
-    void const* positions,                    //
+    TPosition const* positions,               //
     void const* cos_sin_cache,                //
     void* fp8_out,                            //
     void* scale_out,                          //
@@ -386,7 +388,7 @@ void invokeInverseRopeFp8Quant(void const* o, //
     cudaStream_t stream)
 {
     auto const* o_p = reinterpret_cast<__nv_bfloat16 const*>(o);
-    auto const* pos_p = reinterpret_cast<int64_t const*>(positions);
+    auto const* pos_p = positions;
     auto const* cs_p = reinterpret_cast<float const*>(cos_sin_cache);
     auto* fp8_p = reinterpret_cast<__nv_fp8_e4m3*>(fp8_out);
     auto* sc_p = reinterpret_cast<float*>(scale_out);
@@ -420,6 +422,11 @@ void invokeInverseRopeFp8Quant(void const* o, //
 
 #undef TRTLLM_INV_ROPE_DISPATCH_CHUNK
 }
+
+template void invokeInverseRopeFp8Quant<int32_t>(void const*, int32_t const*, void const*, void*, void*, int, int, int,
+    int, bool, int, int, int, int, int, int, int, cudaStream_t);
+template void invokeInverseRopeFp8Quant<int64_t>(void const*, int64_t const*, void const*, void*, void*, int, int, int,
+    int, bool, int, int, int, int, int, int, int, cudaStream_t);
 
 } // namespace kernels
 

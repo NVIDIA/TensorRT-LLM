@@ -15,9 +15,10 @@
 """B12x MoE backend gating and dispatch tests."""
 
 import dataclasses
+import inspect
 import sys
 import types
-from typing import Optional
+from typing import NoReturn, Optional
 from unittest.mock import patch
 
 import pytest
@@ -26,8 +27,8 @@ import torch
 from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
@@ -59,11 +60,11 @@ SUPPORTED_SM = [120, 121]
 # (leaf, the one quantization format it admits). Both leaves run the mixin's
 # ``can_implement``, so the gates other than the format are tested on one leaf.
 B12X_LEAVES = [
-    (CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4),
-    (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
+    (FlashinferCutedslNvfp4Impl, QuantAlgo.NVFP4),
+    (FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.W4A16_NVFP4),
 ]
 LEAF_IDS = [leaf.__name__ for leaf, _ in B12X_LEAVES]
-NVFP4_LEAF = CuteDslB12xNvfp4FusedMoE
+NVFP4_LEAF = FlashinferCutedslNvfp4Impl
 
 
 def _deployment(
@@ -131,10 +132,10 @@ def test_can_implement_accepts_supported_sm(leaf, quant_algo, sm_version):
 @pytest.mark.parametrize(
     "leaf,rejected_algo",
     [
-        (CuteDslB12xNvfp4FusedMoE, None),
-        (CuteDslB12xNvfp4FusedMoE, QuantAlgo.FP8_BLOCK_SCALES),
-        (CuteDslB12xNvfp4FusedMoE, QuantAlgo.W4A16_NVFP4),
-        (CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.NVFP4),
+        (FlashinferCutedslNvfp4Impl, None),
+        (FlashinferCutedslNvfp4Impl, QuantAlgo.FP8_BLOCK_SCALES),
+        (FlashinferCutedslNvfp4Impl, QuantAlgo.W4A16_NVFP4),
+        (FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.NVFP4),
     ],
 )
 def test_can_implement_rejects_foreign_quant(leaf, rejected_algo):
@@ -149,7 +150,7 @@ def test_family_name_is_not_an_implementation():
     points at them instead of failing on the format it does not carry."""
     verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120))
     assert verdict.reject_reason is MoERejectReason.NOT_AN_IMPL
-    assert CuteDslB12xNvfp4FusedMoE.__name__ in verdict.detail
+    assert FlashinferCutedslNvfp4Impl.__name__ in verdict.detail
 
 
 @pytest.mark.parametrize("alias", [QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC])
@@ -198,8 +199,8 @@ def test_can_implement_rejects_eplb():
 @pytest.mark.parametrize(
     "leaf,quant_algo,eligible",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4, False, id="nvfp4"),
-        pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4, True, id="w4a16"),
+        pytest.param(FlashinferCutedslNvfp4Impl, QuantAlgo.NVFP4, False, id="nvfp4"),
+        pytest.param(FlashinferCutedslW4a16Nvfp4Impl, QuantAlgo.W4A16_NVFP4, True, id="w4a16"),
     ],
 )
 def test_can_implement_declines_forced_dynamic_quantization(
@@ -254,8 +255,8 @@ def test_can_implement_rejects_unaligned_nvfp4_fc1_shard(
 def test_nvfp4_decode_applies_the_awq_pre_quant_scale():
     """b12x has no operand for an NVFP4_AWQ pre-quant scale, so a decode chunk
     is scaled before it is handed over, as the CUTLASS prefill path does."""
-    moe = object.__new__(CuteDslB12xNvfp4FusedMoE)
-    x = torch.ones(CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 4)
+    moe = object.__new__(FlashinferCutedslNvfp4Impl)
+    x = torch.ones(FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD - 1, 4)
 
     moe.fc31_act_scale = None
     out, out_sf = moe.quantize_input(x)
@@ -284,7 +285,7 @@ def test_w4a16_applies_the_awq_pre_quant_scale(has_pre_quant_scale):
     the broadcast shape are the production ones.
     """
     hidden_size = 8
-    moe = CuteDslB12xW4a16Nvfp4FusedMoE.__new__(CuteDslB12xW4a16Nvfp4FusedMoE)
+    moe = FlashinferCutedslW4a16Nvfp4Impl.__new__(FlashinferCutedslW4a16Nvfp4Impl)
     torch.nn.Module.__init__(moe)
     moe.register_parameter("fc31_act_scale", None)
     pre_quant_scale = None
@@ -399,7 +400,7 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
 def test_dispatch_rejects_non_tensor():
     """Non-tensor inputs (e.g. Fp4QuantizedTensor) stay on the b12x path
     so the existing ValueError surfaces in quantize_input."""
-    moe = object.__new__(CuteDslB12xNvfp4FusedMoE)
+    moe = object.__new__(FlashinferCutedslNvfp4Impl)
     assert moe._route_to_cutlass(object()) is False
 
 
@@ -407,15 +408,15 @@ def test_dispatch_rejects_non_tensor():
 # run_moe call boundary: each MoERunContext field is honoured or refused
 # ---------------------------------------------------------------------------
 
-_DECODE_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD - 1
-_PREFILL_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+_DECODE_TOKENS = FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD - 1
+_PREFILL_TOKENS = FlashinferCutedslNvfp4Impl._PREFILL_VIA_CUTLASS_THRESHOLD
 
 # (leaf, chunk size, the kernel that chunk reaches): both routes of the NVFP4
 # leaf, and the W4A16 leaf, which has only the b12x one.
 B12X_ROUTES = [
-    pytest.param(CuteDslB12xNvfp4FusedMoE, _DECODE_TOKENS, "b12x", id="nvfp4-decode"),
-    pytest.param(CuteDslB12xNvfp4FusedMoE, _PREFILL_TOKENS, "cutlass", id="nvfp4-prefill"),
-    pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, _PREFILL_TOKENS, "b12x", id="w4a16"),
+    pytest.param(FlashinferCutedslNvfp4Impl, _DECODE_TOKENS, "b12x", id="nvfp4-decode"),
+    pytest.param(FlashinferCutedslNvfp4Impl, _PREFILL_TOKENS, "cutlass", id="nvfp4-prefill"),
+    pytest.param(FlashinferCutedslW4a16Nvfp4Impl, _PREFILL_TOKENS, "b12x", id="w4a16"),
 ]
 B12X_KERNEL_ROUTES = [route for route in B12X_ROUTES if route.values[2] == "b12x"]
 
@@ -621,7 +622,7 @@ def test_cutlass_route_writes_the_requested_output_dtype(monkeypatch):
     """The NVFP4 prefill route is the CUTLASS op, which writes any
     high-precision dtype; only the b12x route is bound to bfloat16."""
     log = []
-    leaf = _leaf_with_recorded_kernels(CuteDslB12xNvfp4FusedMoE, log, monkeypatch)
+    leaf = _leaf_with_recorded_kernels(FlashinferCutedslNvfp4Impl, log, monkeypatch)
 
     out = leaf.run_moe(_run_context(_PREFILL_TOKENS, output_dtype=torch.float16))
 
@@ -647,11 +648,14 @@ def test_run_moe_joins_the_input_ready_event_before_its_kernel(
 # flashinfer W4A16 ultra-wide FC2 tile re-validation shim (nvbug 6721561)
 # ---------------------------------------------------------------------------
 
-# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size) and
-# the RTX PRO 6000 opt-in shared memory minus flashinfer's 512-byte reserve:
-# the exact geometry the post-merge failure re-pinned.
+# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size), the
+# SM count and opt-in shared memory of the RTX PRO 6000, and that memory minus
+# flashinfer's 512-byte reserve: the exact geometry the post-merge failure
+# re-pinned.
 _QWEN36_FC2 = dict(problem_n=2048, problem_k=512)
-_RTX_PRO_6000_SMEM = 101376 - 512
+_RTX_PRO_6000_SMS = 188
+_RTX_PRO_6000_OPTIN_SMEM = 101376
+_RTX_PRO_6000_SMEM = _RTX_PRO_6000_OPTIN_SMEM - 512
 _ULTRA_FC2 = dict(tile_n=512, tile_k=32, cta_threads=256)
 
 
@@ -671,6 +675,46 @@ def _reset_to_stock_validator(kernel, monkeypatch) -> None:
     )
 
 
+def _reset_to_pre_fix_validator(kernel: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from a validator that applies the search floor to every tile, as
+    flashinfer 0.6.17 to 0.7.1 do, with their signature. Where the installed
+    validator exempts forced tiles through ``enforce_search_floor``, that
+    validator with the floor always on stands in for them."""
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        return
+
+    def pre_fix_fits(
+        *,
+        problem_n: int,
+        problem_k: int,
+        cta_m_blocks: int,
+        tile_n: int,
+        tile_k: int,
+        cta_threads: int,
+        max_shared_mem: int,
+        scale_format: str = "e4m3_k16",
+        weight_layout: str = "packed",
+        allow_logical_tail: bool = False,
+    ) -> bool:
+        return stock(
+            problem_n=problem_n,
+            problem_k=problem_k,
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=cta_threads,
+            max_shared_mem=max_shared_mem,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+            allow_logical_tail=allow_logical_tail,
+            enforce_search_floor=True,
+        )
+
+    monkeypatch.setattr(kernel, "_candidate_tile_fits", pre_fix_fits)
+
+
 def _fits(kernel, **overrides) -> bool:
     kwargs = dict(cta_m_blocks=1, max_shared_mem=_RTX_PRO_6000_SMEM, **_QWEN36_FC2, **_ULTRA_FC2)
     kwargs.update(overrides)
@@ -679,7 +723,7 @@ def _fits(kernel, **overrides) -> bool:
 
 def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     assert not _fits(kernel), (
         "flashinfer's stock validator accepts the ultra-wide FC2 tile; the shim in "
         "fused_moe_cute_dsl_b12x.py is no longer needed"
@@ -703,7 +747,7 @@ def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
@@ -716,9 +760,67 @@ def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_yields_to_upstream_fix(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
     monkeypatch.setattr(kernel, "_ultra_wide_fc2_tile_fits", lambda **_: True, raising=False)
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
     assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_ultra_wide_fc2_shim_stands_aside_on_enforce_search_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flashinfer 0.7.2 re-validates forced tiles with
+    ``_candidate_tile_fits(..., enforce_search_floor=False)``; the hook leaves
+    that validator in place."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        pytest.skip("installed flashinfer predates enforce_search_floor")
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
+    assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_forced_ultra_wide_fc2_tile_reaches_kernel_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The custom-op launch recompiles with the tiles the selector chose,
+    forced through ``force_tile_config``. After the hook every W4A16 B12x leaf
+    runs at construction, that re-pin of the ultra-wide FC2 tile gets past tile
+    validation to the kernel build, on the installed flashinfer."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
+
+    class KernelBuildReached(Exception):
+        pass
+
+    built: dict[str, object] = {}
+
+    def build_kernel(**kwargs: object) -> NoReturn:
+        built.update(kwargs)
+        raise KernelBuildReached
+
+    # The build compiles CuTe DSL code for a GPU; only the tiles it gets matter.
+    monkeypatch.setattr(kernel, "W4A16FusedMoeKernel", build_kernel)
+    with pytest.raises(KernelBuildReached):
+        kernel.compile_w4a16_fused_moe(
+            size_m=4,
+            hidden_size=_QWEN36_FC2["problem_n"],
+            intermediate_size=_QWEN36_FC2["problem_k"],
+            num_experts=8,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=1,
+            sms=_RTX_PRO_6000_SMS,
+            max_shared_mem=_RTX_PRO_6000_OPTIN_SMEM,
+            # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n), 256 threads each.
+            force_tile_config=(128, 128, 32, 512),
+        )
+    assert (built["fc2_tile_n"], built["fc2_tile_k"]) == (512, 32)

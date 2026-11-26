@@ -193,6 +193,7 @@ def test_row_ids_requires_the_host_total():
     cumsum back to the host, which is illegal inside the captured graph."""
     lens = torch.tensor([3, 1, 2], dtype=torch.int32)
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         row_ids_from_lens(lens)
 
 

@@ -107,6 +107,8 @@ class SAWorker(SpecWorkerBase):
     pattern matching on previously generated tokens.
     """
 
+    verifies_on_target_shard = True
+
     def __init__(self, spec_config: "SADecodingConfig", model_config=None):
         super().__init__()
         self.spec_config = spec_config

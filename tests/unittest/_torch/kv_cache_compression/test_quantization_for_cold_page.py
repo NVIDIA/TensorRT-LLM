@@ -1328,6 +1328,7 @@ def _build_cold_creator(
     creator._kv_cache_config = SimpleNamespace(
         host_cache_size=None,
         disk_cache_size=None,
+        remote_cache_config=None,
         enable_block_reuse=False,
     )
     creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
