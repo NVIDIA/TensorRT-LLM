@@ -22,6 +22,7 @@ pytestmark = pytest.mark.cpu_only
 def _warmup_fixture(context_only: bool, available: int = 64):
     manager = SimpleNamespace(
         context_swa_layer_limit=20 if context_only else None,
+        is_context_only_cache=False,
         tokens_per_block=128,
         num_extra_kv_tokens=0,
         _kv_alloc_extra_tokens=0,

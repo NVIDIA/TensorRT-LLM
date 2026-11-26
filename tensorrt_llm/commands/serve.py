@@ -1617,17 +1617,18 @@ def launch_visual_gen_server(
     default=False,
     help="Enable locality domain execution for supported PyTorch backend ops.",
     status="prototype")
-@stability_option("--media_io_kwargs",
-                  type=str,
-                  default=None,
-                  help="Keyword arguments for media I/O as a JSON string. "
-                  "Keys are modality names (\"video\", \"image\", \"audio\") "
-                  "whose values are dicts of keyword arguments forwarded to "
-                  "the corresponding loader. "
-                  "Example: '{\"video\": {\"extract_audio\": true, "
-                  "\"num_frames\": 16}}' to enable audio extraction from "
-                  "video files.",
-                  status="prototype")
+@stability_option(
+    "--media_io_kwargs",
+    type=str,
+    default=None,
+    help="Keyword arguments for media I/O as a JSON string. "
+    "Keys are modality names (\"video\", \"image\", \"audio\") "
+    "whose values are dicts of keyword arguments forwarded to "
+    "the corresponding loader. The keys format and device are unsupported. "
+    "Example: '{\"video\": {\"extract_audio\": true, "
+    "\"num_frames\": 16}}' to enable audio extraction from "
+    "video files.",
+    status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
                   default=None,
@@ -1918,6 +1919,18 @@ def serve(
             "--enable_sleep_mode is only supported by the HTTP "
             "text-generation server.")
 
+    try:
+        media_options = json.loads(
+            media_io_kwargs) if media_io_kwargs is not None else None
+        multimodal_server_config = MultimodalServerConfig(
+            media_io_kwargs=media_options)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Invalid JSON for media_io_kwargs: {error}") from error
+    except ValueError as error:
+        raise click.BadParameter(str(error),
+                                 param_hint="--media_io_kwargs") from error
+
     def _serve_llm():
         try:
             from tensorrt_llm.usage.usage_lib import _mark_llm_startup
@@ -2025,17 +2038,6 @@ def serve(
             except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
-        # Parse media_io_kwargs from JSON string to dict if provided
-        parsed_media_io_kwargs = None
-        if media_io_kwargs is not None:
-            try:
-                parsed_media_io_kwargs = json.loads(media_io_kwargs)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
-
-        multimodal_server_config = MultimodalServerConfig(
-            media_io_kwargs=parsed_media_io_kwargs)
-
         if grpc:
             effective_num_serve_frontends = llm_args.get(
                 "num_serve_frontends", num_serve_frontends)
