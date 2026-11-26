@@ -633,16 +633,20 @@ class DisaggTransferCoordinator:
             for request in active
             if not request.is_finished
         ]
-        # Each rank's session-committed transfer cause for its ready receives.
-        # A peer shard can time out or fail while this one completes.
+        # Each rank's observed transfer cause for its ready receives: a timeout
+        # its executor or session observed, or a session-committed failure. A
+        # peer shard can time out or fail while this one completes.
         causes: dict[int, tuple[bool, bool]] = {}
         for request in ready if self._transfer_outcomes is not None else ():
-            cause = getattr(request, "py_kv_transfer_committed_cause", None)
-            if not request.is_generation_only_request or cause is None:
+            if not request.is_generation_only_request:
+                continue
+            timed_out = self._has_observed_transfer_timeout(request)
+            failed = getattr(request, "py_kv_transfer_committed_cause", None) == "error"
+            if not (timed_out or failed):
                 continue
             client = request.parent_request_id if request.is_child else request.py_request_id
-            timed_out, failed = causes.get(client, (False, False))
-            causes[client] = (timed_out or cause == "timeout", failed or cause == "error")
+            seen_timed_out, seen_failed = causes.get(client, (False, False))
+            causes[client] = (seen_timed_out or timed_out, seen_failed or failed)
         payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients, causes)
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
         peers = gather(payload, small_payload=True)

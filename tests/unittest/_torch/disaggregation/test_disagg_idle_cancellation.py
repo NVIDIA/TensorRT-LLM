@@ -2285,8 +2285,13 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
 @pytest.mark.parametrize("poll_counted", [False, True], ids=["abort-first", "poll-first"])
 @pytest.mark.parametrize(
     ("peer_cause", "expected"),
-    [("timeout", (0, 0, 1)), ("failure", (0, 1, 0)), (None, (0, 0, 0))],
-    ids=["peer-timeout", "peer-failure", "cancel-only"],
+    [
+        ("timeout", (0, 0, 1)),
+        ("executor-timeout", (0, 0, 1)),
+        ("failure", (0, 1, 0)),
+        (None, (0, 0, 0)),
+    ],
+    ids=["peer-timeout", "peer-executor-timeout", "peer-failure", "cancel-only"],
 )
 def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
     executor: PyExecutor,
@@ -2294,7 +2299,7 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
     peer_cause: str | None,
     expected: tuple[int, int, int],
 ) -> None:
-    """The cancellation vote carries a peer shard's committed cause to every rank.
+    """The cancellation vote carries a peer shard's observed cause to every rank.
 
     Rank 0's shard completes; only rank 1's shard times out or fails before the
     client abort. Every rank counts the agreed cause once, as a receive poll does.
@@ -2302,9 +2307,12 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
     Args:
         executor: Template executor whose state each rank copies.
         poll_counted: Whether a receive poll already counted the agreed outcome.
-        peer_cause: Rank 1's committed cause, or None for a cancellation alone.
+        peer_cause: Rank 1's committed cause, a timeout only its executor
+            observed, or None for a cancellation alone.
         expected: Per-rank (success, error, timeout) counts.
     """
+    if poll_counted and peer_cause == "executor-timeout":
+        pytest.skip("rank 1's executor flag is its own local count; poll-first is the same run")
     group = FakeDistGroup(world_size=2, tp_size=2)
     engines = []
     requests = []
@@ -2347,7 +2355,15 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
         )
         engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: retire(req, r))
         engine._try_cancel_request = Mock(side_effect=lambda req, r=rank: retire(req, r))
-        if poll_counted and peer_cause is not None:
+        if peer_cause == "executor-timeout":
+            # A 1 s deadline: rank 0's executor sees 700 ms, rank 1's sees 1100 ms
+            # and counts the timeout locally; the writer then completes.
+            request.py_kv_transfer_start_time = 0.0
+            engine.disagg._flag_transfer_timeout(
+                request, "generation", 1000, current_time=1.1 if rank == 1 else 0.7
+            )
+            assert request.py_kv_transfer_timed_out is (rank == 1)
+        elif poll_counted and peer_cause is not None:
             # The receive poll's rank-synchronized outcome already counted the cause.
             outcome = "timeout" if peer_cause == "timeout" else "error"
             engine.disagg._record_transfer_outcome(request, outcome, backend_failure=True)
