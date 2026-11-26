@@ -193,5 +193,6 @@ class DeepseekV41Aligner(nn.Module):
         grid = x.reshape(x.shape[0], n_h, n_w, -1).permute(0, 3, 1, 2)
         grid = F.pad(grid, (0, -n_w % ratio, 0, -n_h % ratio))
         neighborhoods = F.unfold(grid, ratio, stride=ratio).transpose(1, 2)
-        aligned = self.w2(F.gelu(self.w1(neighborhoods)))
+        flat = neighborhoods.flatten(0, 1)
+        aligned = self.w2(F.gelu(self.w1(flat))).unflatten(0, neighborhoods.shape[:2])
         return aligned if batched else aligned.squeeze(0)

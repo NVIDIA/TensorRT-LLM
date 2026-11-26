@@ -886,9 +886,8 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     Nothing rebuilds these tensors through the input processor any more, so the
     processor now restates the encoder's input layout on its own. A drift
     between the two would surface only as a crash during startup memory
-    estimation. Drive the encoder's real batching step (its encoder group, which
-    also checks the output length against the item metadata) instead of restating
-    its expectations here, so a change on either side fails this test.
+    estimation. Drive the encoder group with the profiling dummy and check that
+    the projected output length agrees with the item metadata.
     """
     proc = _make_dummy_processor()
     budget = 8192
@@ -1033,7 +1032,7 @@ def _mistral_cpu_param(sizes, offset=0, sizes_as_tensor=False, dtype=torch.float
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sizes_as_tensor", [False, True])
-def test_mistral_encoder_batches_equal_sizes_across_requests(sizes_as_tensor):
+def test_mistral_encoder_batches_mixed_sizes_across_requests(sizes_as_tensor):
     sizes = [[(2, 3), (4, 2)], [(2, 3)]]
     params = [
         _mistral_cpu_param(shape, index * 1000, sizes_as_tensor)
@@ -1041,16 +1040,14 @@ def test_mistral_encoder_batches_equal_sizes_across_requests(sizes_as_tensor):
     ]
     encoder = _MistralCpuEncoder()
     actual = encoder.encode_multimodal_inputs(params)
-    images_by_size = {}
+    ((pixels, image_sizes),) = encoder.calls
+    assert pixels.shape == (3, 3, 4, 3)
+    assert image_sizes.tolist() == [[2, 3], [4, 2], [2, 3]]
     per_request = []
     oracle = _MistralCpuEncoder()
-    for param, shapes in zip(params, sizes):
+    for param in params:
         image = param.multimodal_data["image"]
-        per_request.append(oracle._get_image_features(image["pixel_values"], image["image_sizes"]))
-        for tensor, (height, width) in zip(image["pixel_values"], shapes):
-            images_by_size.setdefault((height, width), []).append(tensor[:, :height, :width])
-    assert len(encoder.calls) == len(images_by_size)
-    for (pixels, image_sizes), (size, images) in zip(encoder.calls, images_by_size.items()):
-        assert torch.equal(pixels, torch.stack(images))
-        assert image_sizes.tolist() == [list(size)] * len(images)
+        per_request.append(
+            oracle._get_image_features(image["pixel_values"], torch.as_tensor(image["image_sizes"]))
+        )
     assert torch.equal(actual, torch.cat(per_request))

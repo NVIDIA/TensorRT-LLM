@@ -28,8 +28,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    EncoderGroup, MultimodalModelMixin, PreparedLlmInputs,
-    encode_multimodal_by_groups)
+    EncoderGroup, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -1154,8 +1153,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         if (self._vision_tower is None or self._multi_modal_projector is None):
             raise ValueError(
                 "Raw multimodal inputs require a local multimodal encoder.")
-        mm_embeds = self._vision_forward(list(multimodal_params))
-        return mm_embeds[0]
+        return super().encode_multimodal_inputs(multimodal_params)
 
     def get_language_model_extra_forward_kwargs(
         self,
@@ -1221,32 +1219,21 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
 
         return sub_model_config
 
-    # NOTE: this is defined as a separate method with this specific signature in order to be compatible
-    # with `get_multimodal_embeddings` callers.
-    def _vision_forward(
-            self,
-            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        views = []
-        for param in multimodal_params:
-            image = param.multimodal_data["image"]
-            refs, _ = param.get_item_layout()
-            shape = image["pixel_values"].shape[-2:]
-            # The processor can place several sizes in one request-wide tensor.
-            # Expose their cropped views before batching by shape across requests.
-            if not refs or all(
-                    tuple(size) == shape for size in image["image_sizes"]):
-                views.append(param)
-                continue
-            for index, (modality, local_index) in enumerate(refs):
-                selected = self.build_multimodal_encoder_input(
-                    param, [local_index], modality)
-                self._apply_metadata_slice(selected, param, [index])
-                views.append(selected)
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, views)]
-
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        return (EncoderGroup(("image", ), self._get_image_features), )
+        return (EncoderGroup(("image", ), self._get_image_features,
+                             self._build_batched_input), )
+
+    def _build_batched_input(
+            self, multimodal_params: List[MultimodalParams]
+    ) -> Dict[str, torch.Tensor]:
+        images = [param.multimodal_data["image"] for param in multimodal_params]
+        pixel_values, image_sizes = self.batch_pixel_values(
+            [image["pixel_values"] for image in images], [
+                torch.as_tensor(image["image_sizes"], device="cpu")
+                for image in images
+            ])
+        return {"pixel_values": pixel_values, "image_sizes": image_sizes}
 
     def get_multimodal_item_partitions(
         self,
@@ -1290,9 +1277,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def _get_image_features(
         self,
         pixel_values: torch.Tensor,
-        image_sizes: torch.Tensor | List[List[int]],
+        image_sizes: torch.Tensor,
     ):
-        image_sizes = torch.as_tensor(image_sizes, device="cpu")
         with nvtx_range("[mistral] ViT"):
             image_outputs = self._vision_tower(
                 pixel_values=pixel_values,
