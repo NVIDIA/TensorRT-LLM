@@ -15,7 +15,7 @@
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Set, Tuple, Union
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
@@ -850,6 +850,9 @@ class CompletionPostprocArgs(PostprocArgs):
     # Characters taken by the echoed prompt tokens; text offsets of streamed
     # tokens after the first chunk start after them.
     echo_text_offset: int = 0
+    # Indices of the choices whose streamed logprobs already start with the
+    # echoed prompt's entries.
+    echoed_prompt_logprobs: Set[int] = field(default_factory=set)
     stream_options: Optional[StreamOptions] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -927,13 +930,24 @@ def create_echo_prompt_logprobs(
 
 
 def _echo_prompt_logprobs(
-        args: CompletionPostprocArgs,
-        output: CompletionOutput) -> Optional[CompletionLogProbs]:
-    """Logprobs of the echoed prompt, or None if there are none to report."""
-    if not (args.echo and args.prompt_token_ids and output.prompt_logprobs):
+        args: CompletionPostprocArgs, output: CompletionOutput,
+        outputs: List[CompletionOutput]) -> Optional[CompletionLogProbs]:
+    """Logprobs of the echoed prompt, or None if there are none to report.
+
+    Every choice shares the prompt. With n > 1 each choice is its own
+    sequence, and its output gets the prompt logprobs only with its own
+    first response, which can come after another choice's; until then the
+    choice takes them from another output.
+    """
+    if not (args.echo and args.prompt_token_ids):
+        return None
+    prompt_logprobs = output.prompt_logprobs or next(
+        (other.prompt_logprobs
+         for other in outputs if other.prompt_logprobs), None)
+    if not prompt_logprobs:
         return None
     return create_echo_prompt_logprobs(args.prompt_token_ids, args.tokenizer,
-                                       output.prompt_logprobs)
+                                       prompt_logprobs)
 
 
 def _join_completion_logprobs(first: CompletionLogProbs,
@@ -980,9 +994,14 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
-            prompt_logprobs = (_echo_prompt_logprobs(args, output)
-                               if args.first_iteration else None)
+            # Each choice's logprobs start with the prompt's entries once, in
+            # its first chunk that has them.
+            prompt_logprobs = None
+            if output.index not in args.echoed_prompt_logprobs:
+                prompt_logprobs = _echo_prompt_logprobs(args, output,
+                                                        rsp.outputs)
             if prompt_logprobs is not None:
+                args.echoed_prompt_logprobs.add(output.index)
                 args.echo_text_offset = sum(
                     len(token) for token in prompt_logprobs.tokens)
             choice.logprobs = create_completion_logprobs(
@@ -1060,7 +1079,7 @@ def completion_response_post_processor(
         if args.return_logprobs:
             logprobs = output.logprobs
             token_ids = output.token_ids
-            prompt_logprobs = _echo_prompt_logprobs(args, output)
+            prompt_logprobs = _echo_prompt_logprobs(args, output, rsp.outputs)
             generated_offset = 0 if prompt_logprobs is None else sum(
                 len(token) for token in prompt_logprobs.tokens)
             choice.logprobs = create_completion_logprobs(

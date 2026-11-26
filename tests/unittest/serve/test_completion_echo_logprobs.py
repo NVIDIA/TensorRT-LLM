@@ -59,9 +59,9 @@ class _Tokenizer:
         return "".join(_TEXT[t] for t in ids)
 
 
-def _args(stream=False):
+def _args(stream=False, n=1):
     request = CompletionRequest(
-        model="m", prompt="The sky is", echo=True, logprobs=1, max_tokens=2, stream=stream
+        model="m", prompt="The sky is", echo=True, logprobs=1, max_tokens=2, stream=stream, n=n
     )
     args = CompletionPostprocArgs.from_request(request)
     args.prompt = request.prompt
@@ -145,6 +145,108 @@ def test_stream_reports_prompt_logprobs_in_the_first_chunk_only():
     assert first["text_offset"] == [0, 3, 6, 10, 13]
     assert second["tokens"] == [" green"]
     assert second["text_offset"] == [18]
+
+
+def _stream_output(index, **fields):
+    # One choice's output as a streaming call sees it: what changed since the previous call.
+    return SimpleNamespace(
+        **{
+            "index": index,
+            "finish_reason": None,
+            "stop_reason": None,
+            "text_diff": "",
+            "token_ids_diff": [],
+            "logprobs_diff": [],
+            "prompt_logprobs": [],
+            "_last_text_len": 0,
+            "length": 0,
+            **fields,
+        }
+    )
+
+
+def _stream_choices(args, outputs):
+    rsp = SimpleNamespace(outputs=outputs, context_logits=None, cached_tokens=0, id=1, _done=False)
+    events = completion_stream_post_processor(rsp, args)
+    return [json.loads(event[len("data: ") :])["choices"][0] for event in events]
+
+
+def test_stream_with_n_starts_every_choice_with_the_prompt_logprobs():
+    # With n > 1 each choice is its own sequence, and its output gets the prompt logprobs
+    # with its own first response. The first call here follows choice 0's first response,
+    # so choice 1's output has none until the second call.
+    args = _args(stream=True, n=2)
+    first = _stream_choices(
+        args,
+        [
+            _stream_output(
+                0,
+                text_diff=" blue",
+                token_ids_diff=[20],
+                logprobs_diff=GENERATED_LOGPROBS,
+                prompt_logprobs=PROMPT_LOGPROBS,
+                length=1,
+            ),
+            _stream_output(1),
+        ],
+    )
+    second = _stream_choices(
+        args,
+        [
+            _stream_output(0, prompt_logprobs=PROMPT_LOGPROBS, _last_text_len=5, length=1),
+            _stream_output(
+                1,
+                text_diff=" green",
+                token_ids_diff=[21],
+                logprobs_diff=[{21: Logprob(logprob=-1.5, rank=1)}],
+                prompt_logprobs=PROMPT_LOGPROBS,
+                length=1,
+            ),
+        ],
+    )
+
+    assert [choice["index"] for choice in first + second] == [0, 1, 0, 1]
+    # Each choice's first chunk has the echoed prompt and the prompt's logprobs.
+    assert [choice["text"] for choice in first] == ["The sky is blue", "The sky is"]
+    assert first[0]["logprobs"]["tokens"] == ["<s>", "The", " sky", " is", " blue"]
+    assert first[1]["logprobs"]["tokens"] == ["<s>", "The", " sky", " is"]
+    assert first[1]["logprobs"]["token_logprobs"] == [None, -2.0, -3.0, -0.5]
+    assert first[1]["logprobs"]["text_offset"] == [0, 3, 6, 10]
+    # Later chunks carry only generated tokens; the prompt's entries are not repeated.
+    assert second[0]["logprobs"]["tokens"] == []
+    assert second[1]["logprobs"]["tokens"] == [" green"]
+    assert second[1]["logprobs"]["text_offset"] == [13]
+
+
+def test_response_with_n_reports_the_prompt_logprobs_for_every_choice():
+    # A choice whose output has no prompt logprobs of its own reports the shared prompt's.
+    outputs = [
+        SimpleNamespace(
+            index=index,
+            text=text,
+            token_ids=[token_id],
+            logprobs=[{token_id: Logprob(logprob=logprob, rank=1)}],
+            prompt_logprobs=PROMPT_LOGPROBS if index == 0 else [],
+            length=1,
+            disaggregated_params=None,
+            stop_reason=None,
+            finish_reason="length",
+        )
+        for index, (text, token_id, logprob) in enumerate(
+            [(" blue", 20, -0.25), (" green", 21, -1.5)]
+        )
+    ]
+    rsp = SimpleNamespace(outputs=outputs, context_logits=None, cached_tokens=0, id=1, _done=False)
+    choices = completion_response_post_processor(rsp, _args(n=2)).choices
+
+    assert [choice.logprobs.tokens for choice in choices] == [
+        ["<s>", "The", " sky", " is", " blue"],
+        ["<s>", "The", " sky", " is", " green"],
+    ]
+    assert [choice.logprobs.token_logprobs for choice in choices] == [
+        [None, -2.0, -3.0, -0.5, -0.25],
+        [None, -2.0, -3.0, -0.5, -1.5],
+    ]
 
 
 def test_text_offset_starts_each_token_after_the_previous_one():
