@@ -3508,15 +3508,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             EncoderGroup(("audio",), self._encode_audio_group, pack),
         )
 
-    def encode_multimodal_inputs(
-        self, multimodal_params: List[MultimodalParams], **_: Any
-    ) -> torch.Tensor:
-        # Raw encoder hook per the `MultimodalModelMixin` contract. Cache
-        # bookkeeping belongs to callers (`_get_or_encode_multimodal_embeddings`,
-        # `_dispatch_cross_iter_prefetch`), not here — wrapping in
-        # `get_multimodal_embeddings` would double-cache.
-        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
-
     @torch.inference_mode()
     def forward(
         self,
@@ -3552,7 +3543,7 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
             if raw_ctx_params:
                 self._check_encoders_exist(raw_ctx_params)
                 mm_embedding = get_multimodal_embeddings(
-                    encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
+                    encoder_forward_fn=self.encode_multimodal_inputs,
                     multimodal_params=ctx_params,
                 )
             # E/P prefill: encoder already ran; use attached embeddings.

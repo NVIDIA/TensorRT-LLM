@@ -394,7 +394,7 @@ def _reorder_embeds_by_manifest(
 
 def encode_multimodal_by_groups(
     mm_encoder_groups: Sequence["EncoderGroup"],
-    multimodal_params: List[MultimodalParams],
+    multimodal_params: Sequence[MultimodalParams],
 ) -> torch.Tensor:
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
@@ -637,13 +637,15 @@ class MultimodalModelMixin:
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
-        """Run model-specific multimodal encoder work.
+        """Run the declared encoder groups, or override for model-specific work.
 
-        Returns the single primary multimodal embedding tensor for the supplied params. Rows are
-        expected to be concatenated in request order, and special multimodal tokens occupy token
-        positions but do not have rows here.
+        Return a single tensor in request and prompt order, excluding special tokens
+        that have no encoder embedding.
         """
-        raise NotImplementedError
+        groups = self.mm_encoder_groups
+        if not groups:
+            raise NotImplementedError
+        return encode_multimodal_by_groups(groups, multimodal_params)
 
     def validate_multimodal_request_data(self, mm_data: dict) -> None:
         """Admission-time validation of one request's multimodal payload.

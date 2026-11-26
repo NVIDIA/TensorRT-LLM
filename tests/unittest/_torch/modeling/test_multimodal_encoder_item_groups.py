@@ -379,9 +379,6 @@ class _GroupedEncoderModel(MultimodalModelMixin):
         # test can assert *which* rows came back, not just how many.
         return pixel_values.clone()
 
-    def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
-        return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
-
 
 @pytest.mark.parametrize("empty_record", [False, True])
 def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: bool) -> None:

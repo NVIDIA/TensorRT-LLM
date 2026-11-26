@@ -85,6 +85,8 @@ axis, batched fields have an item axis, and packed fields also provide host-side
 per-item lengths. Contiguous tensor selections can share storage; reordered
 selections may copy. Treat shared input storage as read-only.
 
+The default `MultimodalModelMixin.encode_multimodal_inputs` runs the model's
+`mm_encoder_groups`.
 An `EncoderGroup` with `build_batched_input=None` passes the declared fields
 to the tower as keyword arguments. Each call batches compatible items of one
 modality across requests. It concatenates tensors along the declared item axis
@@ -162,10 +164,10 @@ If output row counts are unknown too, the model must resolve them before using
 grouped assembly or item caching. A model-specific full-request encoder can
 compute those counts from its result. Metadata alone never enables scheduling.
 
-To opt in, the model sets `supports_mm_encoder_item_scheduling = True` and
-implements `encode_multimodal_inputs` and item selection. The engine also
-checks `disable_mm_encoder`, the scheduling policy, and supported combinations
-in `mm_item_scheduling_enabled()` and
+To opt in, the model sets `supports_mm_encoder_item_scheduling = True`, supports
+item selection, and either declares encoder groups or overrides
+`encode_multimodal_inputs`. The engine also checks `disable_mm_encoder`, the
+scheduling policy, and supported combinations in `mm_item_scheduling_enabled()` and
 `validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
 costs or output rows fail admission; they do not silently switch one request to
 full-request encoding. Keep the capability disabled until the model can supply
