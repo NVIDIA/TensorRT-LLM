@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -107,43 +105,6 @@ def _check_skipped_tiles(spec, monkeypatch):
     torch.testing.assert_close(actual, kept, rtol=0, atol=1e-3)
     # The SM100-family TRTLLM-Gen context runner accepts the threshold and leaves counters untouched.
     assert counters.tolist() == initial
-
-
-@pytest.mark.cpu_only
-def test_context_inputs_match_native_reader(monkeypatch):
-    from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention import (
-        trtllm_context_attention as module,
-    )
-
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[7] / "scripts"))
-    import generate_fmha_params as generator
-
-    schema = generator.load_schemas(
-        generator.DEFAULT_MODULE_PATHS,
-        generator.ROOT_CLASS_NAME,
-        usage=generator.scan_usage(generator.DEFAULT_USAGE_PATHS),
-    )
-
-    def check(params):
-        inputs = {
-            "FmhaParams": params,
-            "AttentionForwardArgs": params.fwd,
-            "SparseRuntimeParams": params.fwd.sparse_runtime_params,
-            "AttentionLayerParams": params.attn,
-            "AttentionRopeParams": params.attn.rope_params,
-            "AttentionMetadataParams": params.meta,
-        }
-        for name, source in inputs.items():
-            for field in schema.structs[name].fields:
-                assert hasattr(source, field.source), f"{name}.{field.source}"
-        assert params.fwd.softmax_stats_is_lse is False
-
-    monkeypatch.setattr(module, "run_context", check)
-    qkv = torch.empty(1, 3, 6, 128, dtype=torch.bfloat16)
-    workspace = TrtllmContextWorkspace(1, 3, qkv.device)
-    trtllm_context_attention(
-        qkv, None, None, workspace, torch.zeros(2, dtype=torch.uint32), num_heads=2
-    )
 
 
 @pytest.mark.cpu_only

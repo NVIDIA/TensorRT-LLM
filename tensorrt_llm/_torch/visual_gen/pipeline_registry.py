@@ -156,19 +156,12 @@ def register_pipeline(
     return decorator
 
 
-def register_pipeline_opt_in(
-    name: str, env_var: str
-) -> Callable[[_PipelineResolver], _PipelineResolver]:
+def register_pipeline_opt_in(name: str, env_var: str, resolver: _PipelineResolver) -> None:
     """Attach an opt-in resolver to an existing checkpoint family."""
-
-    def decorator(resolver: _PipelineResolver) -> _PipelineResolver:
-        entry = PIPELINE_REGISTRY[name]
-        if entry.opt_in is not None:
-            raise ValueError(f"Pipeline opt-in already registered: {name}")
-        entry.opt_in = (env_var, resolver)
-        return resolver
-
-    return decorator
+    entry = PIPELINE_REGISTRY[name]
+    if entry.opt_in is not None:
+        raise ValueError(f"Pipeline opt-in already registered: {name}")
+    entry.opt_in = (env_var, resolver)
 
 
 class AutoPipeline:
