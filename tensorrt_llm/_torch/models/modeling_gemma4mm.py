@@ -998,7 +998,7 @@ def _normalize_vision_patches(
 def _gemma4_square_grid(pixels: torch.Tensor) -> torch.Tensor:
     side = math.isqrt(pixels.shape[1])
     indices = torch.arange(side, device=pixels.device)
-    grid = torch.stack(torch.meshgrid(indices, indices, indexing="ij"), dim=-1)
+    grid = torch.stack(torch.meshgrid(indices, indices, indexing="xy"), dim=-1)
     return grid.reshape(1, -1, 2).expand(len(pixels), -1, -1)
 
 

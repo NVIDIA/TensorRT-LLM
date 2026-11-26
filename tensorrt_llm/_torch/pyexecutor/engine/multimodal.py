@@ -215,6 +215,9 @@ def setup_mm_encoder_attn_metadata(
     function rather than a ``MultimodalItemScheduler`` method: the scheduler is ``None``
     whenever item scheduling is off.
     """
+    if isinstance(model, MultimodalModelMixin):
+        # Inline encoders using SDPA also need the budget used by the KV profiler.
+        model.model_config.extra_attrs["encoder_max_num_tokens"] = encoder_max_num_tokens
     encoders = [module for module in model.modules() if isinstance(module, MultimodalEncoderMixin)]
     if not encoders:
         return

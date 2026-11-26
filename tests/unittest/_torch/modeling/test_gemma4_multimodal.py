@@ -359,6 +359,29 @@ def _encode_normalization_buckets(buckets, modality="image"):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "processor_class,side", [(Gemma4ImageProcessor, 32), (Gemma4UnifiedImageProcessor, 96)]
+)
+def test_prepared_gemma4_implicit_positions_match_processor(processor_class, side):
+    processor = processor_class(max_soft_tokens=70, do_resize=False)
+    image = processor(images=[Image.new("RGB", (side, side))], return_tensors="pt")
+    # Keep the four real patches, excluding the processor's padding.
+    pixels = image["pixel_values"][:, :4]
+    positions = image["image_position_ids"][:, :4]
+
+    def embed(pixel_values, image_position_ids, **_):
+        x, y = image_position_ids.unbind(-1)
+        return (pixel_values[..., 0] + x + 10 * y).reshape(-1, 1)
+
+    model = SimpleNamespace(_get_image_features=embed)
+    param = MultimodalParams(
+        multimodal_data=_single_item_data("image", {"pixel_values": pixels}, 4)
+    )
+    implicit = Gemma4MultimodalModelBase.encode_multimodal_inputs(model, [param])
+    torch.testing.assert_close(implicit, embed(pixels, positions), rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
 def test_prepared_gemma4_shape_groups_preserve_order_and_dtype():
     tower = mock.Mock(side_effect=lambda pixel_values, **_: pixel_values.flatten(0, 1))
     model = SimpleNamespace(_get_image_features=tower, vision_tower=None)

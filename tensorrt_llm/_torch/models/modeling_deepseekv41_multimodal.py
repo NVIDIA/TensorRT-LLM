@@ -27,6 +27,7 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
+from .modeling_multimodal_utils import _join_embeddings
 from .modeling_utils import register_auto_model
 
 
@@ -223,6 +224,11 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
     ) -> torch.Tensor:
         if self.vision is None or self.aligner is None:
             raise ValueError("Raw images require a local DeepSeek-V4.1 vision encoder")
+        patch_budget = self.model_config.extra_attrs.get(
+            "encoder_max_num_tokens", self.model_config.max_num_tokens
+        )
+        batches = []
+        patch_count = 0
         views = []
         device = self.text_embedding_layer.weight.device
         partitions = {
@@ -245,6 +251,13 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 rows, columns = llm_grid
                 if length != rows * (columns + 1) + 2:
                     raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
+                # An image is indivisible. If it exceeds the budget, encode it alone.
+                patches = pixels.shape[0]
+                if views and patch_count + patches > patch_budget:
+                    batches.append(encode_multimodal_by_groups(self.mm_encoder_groups, views))
+                    views.clear()
+                    patch_count = 0
+                patch_count += patches
                 pixels = pixels.to(device=device, dtype=self.embedding_dtype)
                 views.append(
                     MultimodalParams(
@@ -264,7 +277,8 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 )
         if not views:
             raise ValueError("No images supplied to DeepSeek-V4.1 encoder")
-        return encode_multimodal_by_groups(self.mm_encoder_groups, views)
+        batches.append(encode_multimodal_by_groups(self.mm_encoder_groups, views))
+        return _join_embeddings(batches)
 
     def get_language_model_extra_forward_kwargs(
         self, *, raw_input_ids, position_ids, mm_inputs, **forward_kwargs
