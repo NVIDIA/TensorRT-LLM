@@ -121,7 +121,6 @@ l0_dgx_b200:
   # Aggregated Helix TP2 x CP2 with FP8 KV and chunk-aware MLA profiling.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_agg_helix_tp2cp2 TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache TIMEOUT (60)
   # GLM-5.3-Flash modeling_v2 targets (SM100 only): the split target with vanilla MTP and the
   # MTP-fused target with MTP-Eagle.
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm100Default::test_gsm8k_mtp_vanilla
@@ -411,3 +410,4 @@ l0_dgx_b200:
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4] TIMEOUT (45)
   - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4_ep4] TIMEOUT (45)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[latency_adp_lmtp_tp4]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache TIMEOUT (60)
