@@ -205,7 +205,12 @@ def apply_coverage_tier(
     if note:
         return None, note
 
-    selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
+    selector = CoverageSelector(
+        db,
+        repo_root,
+        no_data_policy=no_data_policy,
+        import_sanity_files={path for _, rule in pairs for path in rule.import_sanity_files},
+    )
     cov = selector.decide(residual, pr.raw_diffs or pr.diffs, selection_diffs=pr.diffs)
     if not cov.ok:
         return None, f"coverage tier declined: {cov.reason}"

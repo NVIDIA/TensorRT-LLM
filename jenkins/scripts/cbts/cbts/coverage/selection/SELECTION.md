@@ -56,7 +56,7 @@ of:
 | Non-Python file | `path` is not a `.py`; the selector requires Python source to map changed lines to qualnames |
 | Shared pytest state | changed symbols reach non-function/unknown-scope fixtures, session/collection hooks, cached helpers, unresolved decorators, or explicit persistent-state mutations; local and imported dependencies are followed |
 | File without attributed coverage | `file_has_touch_rows(cf)` is false — absent, uninstrumented, or recorded only under the empty test context, so "who touches it" is unknown rather than empty |
-| **Unbounded import-executed change** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
+| **Import-executed change without validated sanity** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
 | No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
 | Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
 | Closure change with no wider row set | see the next section |
@@ -81,115 +81,31 @@ Existing Tier-1 forced fallbacks, missing/tainted test capture, and the residual
 compatibility check still apply. File-level records do not waive the import-time or
 changed-scope checks below.
 
-## 4. Bounding low-risk import-executed changes
+## 4. Import and definition-time sanity policy
 
-Every process, including an `mpi4py.futures` pool worker, records its own import phase (see
-`../collection/COLLECTION.md` §5.2); only the outer pytest's own pre-test import is unattributed,
-since it runs under the empty context and the merge filters that out with `WHERE test != ''`. So a
-`<module>` or `ClassName` row set can still fall short of the full set of tests that import the file:
-a test that imports it and never enters any function in it records nothing there at all. Widening to
-the file's row set recovers those cases but is a **recovery heuristic, not an upper bound** for the
-same reason — a test whose only interaction with the file is the bare import still records nothing,
-so it is absent from the file set too.
+`ImportSanityRule` classifies both source images with the AST scope map. Module statements,
+class-body edits, decorators, defaults, and signature edits require the registered inventory in
+`tests/integration/test_lists/import_sanity.yml`. Classification includes removed code and
+one-line function signatures; it does not follow binding consumers, factories, or decorators.
+Comments and AST-identical edits add no import obligation.
 
-Consequently, Tier 2 never uses `<module>` or class-body rows as an impact bound. Most import-executed
-changes still decline. A small AST allowlist can instead translate these low-risk module statements to
-the local functions and methods that consume the changed binding:
+A pure import/definition edit is claimed by the rule and can select sanity without coverage rows.
+A mixed file remains in the Tier-2 residual: the inventory is retained and ordinary runtime
+qualnames are resolved with the existing coverage policy. Ordinary function bodies keep direct
+symbol lookup, the default whole-file fallback for absent function rows, and the existing
+shared-pytest-state checks. A runtime residual file without test-attributed coverage still
+forces fallback. Explicit Tier-1 contributions and PR-added/modified tests remain additive.
 
-- a module binding whose value is a literal container/scalar, including replacement when both
-  the old and new statements are safe assignments to the same names;
-- an annotated literal when `from __future__ import annotations` postpones annotation evaluation;
-- a newly added builtin-module `import` (replacement imports remain unsupported);
-- an unambiguous top-level `from ... import ...` binding delta, computed from the complete pre- and
-  post-image; old targets must resolve to static declarations and new targets to static top-level
-  functions before their target and local-consumer rows are selected;
-- imports added inside an import-only `if TYPE_CHECKING:` / `if typing.TYPE_CHECKING:` block whose
-  guard comes directly from `typing` and has not been rebound; these are ignored because the block is
-  statically false at runtime;
-- a newly added function or method with only unshadowed builtin `classmethod`, `property`, or
-  `staticmethod` decorators, literal defaults, and annotations validated as safe name loads or
-  supported builtin / `typing` / `collections.abc` forms; plain, unshadowed `torch.Tensor` and
-  `torch.dtype` annotation loads are also supported;
-- a new top-level dataclass using a unique, unchanged `from dataclasses import dataclass`
-  binding (aliases are supported), optionally called with a literal `frozen` boolean. These
-  classes must have no bases, metaclass keywords, type parameters, or executable class-body
-  statements. Fields require unshadowed builtin type annotations and immutable literal defaults
-  in valid order. Methods use the safe declaration checks above with builtin eager annotations;
-  duplicate members, special methods, namespace reflection, and unsupported decorators decline.
-  The class body and its new methods are bounded together by functions consuming the class
-  binding, retaining external reference checks and the normal no-data fallback;
-- added parameters on undecorated functions or methods with safe annotations and literal defaults
-  when provided, preserving the existing parameters' declarations, relative order, and defaults,
-  along with positional-only parameters, variadic parameters, and the type comment;
-- a safe return annotation added to an undecorated function or method, with the same restrictions on
-  any simultaneous parameter additions;
-- a literal module binding deletion, retaining consumers from both the pre- and post-image; unsupported
-  deletions adjacent to a declaration still decline rather than being ignored as signature changes.
+Every inventory selector must exist in source and have an available, covering pre-merge test-db
+entry. Missing inventory, source selectors, registrations, or stages force fallback. Inventory
+entries are kept independently of coverage and capture quality. CPU checks use their existing
+parent registrations; cold imports and related import checks are also registered in package
+sanity. Package sanity stays enabled; import sanity alone does not require performance sanity.
 
-The AST layer reports bindings, consumers, and direct local caller edges; it does not infer visibility
-from underscores or any other spelling convention. Before using those facts, the selector checks the
-repository import/reference graph. A binding referenced from another file declines, as does an
-externally referenced no-data consumer whose local callers would otherwise be used as its bound.
-Every no-data caller reached during recursion is checked too; an external reference there declines
-the coverage decision instead of treating local callers or file rows as a complete bound.
-
-The analysis also declines if either image contains an attribute whose name matches a changed module
-binding, because the attribute receiver may alias the module and its consumers are not bounded by
-direct name loads. Signature additions on decorated functions or methods decline even when the
-decorator expression is unchanged: decorators can inspect signatures and register schemas during
-import, with consumers that never execute the Python function.
-
-Validated annotation loads of new class bindings do not count as import-time execution consumers;
-their function declarations already contribute impact. Other import-time uses of the class, such
-as registration calls or module-level construction, still decline. Changes to existing decorated
-method signatures remain unsupported even when safe dataclass additions occur in the same file.
-
-The dataclass namespace-discovery check scans the entire post-image, including unchanged functions.
-It rejects `dir`, `__import__`, and `import_module` along with the other namespace APIs, whether
-loaded directly, accessed as attributes, or imported under an alias. Attribute checks match by name
-without resolving the receiver: any `.modules` or `.__dict__` access declines, including an unrelated
-`model.modules()` call. This conservative limit also covers aliases of `sys.modules`.
-
-New classes without local consumers still go through external-reference checks. Registered external
-unit tests are selected; production-code references, unregistered test references, or references with
-unknown locations decline. A class with neither local consumers nor external references can have no
-impacted tests.
-
-The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
-are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2
-may walk direct, unshadowed local caller edges until every branch reaches a qualname with DB rows. An
-unresolved branch, cycle, or use of the function as a value falls back to the configured no-data policy
-(the whole file by default).
-This is why `_LINUX_EBADHANDLE = 521` can be bounded through `_is_lock_infra_error` and its recorded
-callers without treating all import-time execution as safe or assuming that `_` means private.
-
-### 4.1 Closures
-
-A named closure's body is recorded under its own qualname (`COLLECTION.md` §2.1), so both ways a
-changed line reaches it resolve to the closure itself, not its enclosing def:
-
-- **A direct line change inside the closure** resolves to that qualname through `qualnames_for_lines`
-  and goes through the ordinary `_qualname_impact` path below like any other function:
-  `tests_touching_func(f, q)` if it has rows, a local-caller bound or the configured no-data fallback
-  (file-level by default) if it does not yet.
-- **Binding-consumer resolution** — "does this def use a binding that just changed" — is a separate
-  mechanism, `_FunctionNames` in `python_change_analysis.py`. `_recorded_definition_groups` records a
-  nested def under its own qualname, so it gets its own fact there too; only a nested def's *signature*
-  (decorators, defaults, annotations), which genuinely runs in the outer scope at definition time, rolls
-  up into the outer def's own fact (`_include_signature_loads`) — its body, which only runs when the
-  nested def itself is later called, gets its own independent `_FunctionNames` fact instead, same as
-  any other qualname in `definition_groups`. A closure built by one test and invoked by a different one
-  (a cached decorator, a session-scoped fixture) is why this distinction matters: resolving to the outer
-  def would only find the constructing test, missing the one that actually depends on the binding.
-
-One case remains conservative by construction: **a lambda or genexpr body** attributes to its nearest
-enclosing *named* def, since `_collect_scopes` only discovers named `def`/`class` statements. A lambda or
-genexpr can appear anywhere an expression can, nested inside each other and themselves to arbitrary depth,
-so there is no static-analysis path to resolve a changed line to it directly; collection follows this by
-dropping their frames too (`COLLECTION.md` §5.1). The enclosing def's rows stand in instead, but only
-reflect when the enclosing def *itself* ran, not when the lambda inside it did, so the gap is the same
-shape as the cached-closure case above: a lambda created by one test and invoked by another gives the
-invoking test no rows on the enclosing def, and it can be missed.
+This is a deliberate sanity policy, not a proof that import-time changes have no runtime effect.
+For example, a changed module constant can alter inference behavior while all cold imports pass.
+The inventory checks loading and selected behavior; it is not exhaustive functional coverage.
+Standalone coverage callers without a validated inventory retain the conservative import bounds.
 
 ## 5. Full impact resolution
 

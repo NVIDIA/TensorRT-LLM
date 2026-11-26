@@ -23,6 +23,15 @@ for the overall CBTS architecture.
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
 | `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
+## ImportSanityRule
+
+Uses old/new AST scopes to identify import/definition edits and retain the fixed
+`tests/integration/test_lists/import_sanity.yml` inventory. Pure import files are claimed with
+`importsanityonly`; mixed files stay in the coverage residual and carry a mandatory sanity
+obligation. Other rules still contribute their tests. Missing inventory targets or runnable
+pre-merge registrations force fallback. This rule does not infer runtime readers of constants,
+imports, or decorators, and does not change runtime no-data or shared-state policy.
+
 ## PythonFormattingRule
 
 Claims Python files only after the raw patch matches the checked-out source
