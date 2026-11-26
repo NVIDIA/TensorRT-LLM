@@ -6643,6 +6643,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "still completes only once every block is copied. Process-wide: the first KV cache manager that sets a "
         "value above 1 sets it for the life of the process. Only used by KV cache manager v2."
     )
+    copy_stream_busy_skip: NonNegativeInt = Field(
+        default=0,
+        le=4096,
+        status="prototype",
+        description=
+        "Pooled CUDA streams that a KV cache block copy skips while they still have work pending (0: it takes "
+        "the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted, so "
+        "without skipping, a restore can wait behind an unrelated copy still pending on the stream it is handed, "
+        "such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows "
+        "until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets "
+        "it for the life of the process. Only used by KV cache manager v2.")
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -7246,6 +7257,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.host_copy_threads > 1 and self.use_kv_cache_manager_v2 is False:
             raise ValueError(
                 "kv_cache_config.host_copy_threads requires use_kv_cache_manager_v2"
+            )
+        if self.copy_stream_busy_skip > 0 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.copy_stream_busy_skip requires use_kv_cache_manager_v2"
             )
         disk_options = [
             name for name, value in (

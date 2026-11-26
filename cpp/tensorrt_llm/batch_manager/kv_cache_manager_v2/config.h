@@ -774,6 +774,16 @@ struct KVCacheManagerConfig
     //! Process-wide: the first manager that sets a value above 1 sets it for the life of the process.
     int hostCopyThreads = 1;
 
+    //! Upper bound of copyStreamBusySkip, matching KvCacheConfig.copy_stream_busy_skip.
+    static constexpr int kMaxCopyStreamBusySkip = 4096;
+
+    //! Pooled CUDA streams, 0 to kMaxCopyStreamBusySkip, that a page copy skips while they still have work pending
+    //! (0: it takes the next pooled stream, busy or not). A stream goes back to the pool once its work is submitted,
+    //! so without skipping, a restore can be queued behind an unrelated copy still waiting -- a disk write waiting for
+    //! the I/O pool, for one -- on the stream it was handed. Process-wide, like the stream pool: the first manager that
+    //! sets a nonzero value sets it for the life of the process.
+    int copyStreamBusySkip = 0;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

@@ -2025,7 +2025,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads)
+                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads, int copyStreamBusySkip)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2056,6 +2056,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->hostMemBacking = std::move(hostMemBacking);
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
                 cfg->hostCopyThreads = hostCopyThreads;
+                cfg->copyStreamBusySkip = copyStreamBusySkip;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2071,7 +2072,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_copy_threads") = 1)
+            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_copy_threads") = 1,
+            nb::arg("copy_stream_busy_skip") = 0)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2112,6 +2114,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA callback "
             "thread included. Process-wide: the first manager that sets a value above 1 sets it for the life of "
             "the process.")
+        .def_rw("copy_stream_busy_skip", &kv::KVCacheManagerConfig::copyStreamBusySkip,
+            "Pooled CUDA streams, 0 to 4096, that a page copy skips while they still have work pending (0: it takes "
+            "the next pooled stream, busy or not). Process-wide: the first manager that sets a nonzero value sets it "
+            "for the life of the process.")
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2455,6 +2461,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "host_copy_helper_tasks_for_testing", []() { return kv::hostCopyHelperTasksForTesting(); },
         "Page tasks of host-side copy callbacks run by pool workers so far.");
+    mIntrospection.def(
+        "copy_stream_busy_skip", []() { return kv::busyStreamSkip(); },
+        "Busy pooled streams a temporary copy stream may skip (0: off).");
+    mIntrospection.def(
+        "set_copy_stream_busy_skip_for_testing", [](size_t maxBusy) { kv::setBusyStreamSkipForTesting(maxBusy); },
+        nb::arg("max_busy"), "Set the busy-stream skip bound whatever was configured.");
+    mIntrospection.def(
+        "busy_copy_streams_skipped_for_testing", []() { return kv::busyStreamsSkippedForTesting(); },
+        "Busy pooled streams temporary copy streams have skipped so far.");
     mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");

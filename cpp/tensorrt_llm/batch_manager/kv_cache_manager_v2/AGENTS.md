@@ -483,6 +483,15 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   callback must be independent (distinct destinations, none another's source),
   which every caller guarantees. A forked child drops the pool and runs every task
   on the callback thread.
+- Busy-stream skipping (`copy_stream_busy_skip` -> `KVCacheManagerConfig::copyStreamBusySkip`,
+  process-wide, first nonzero value wins; `utils/cudaEvent.cpp`): a pooled stream
+  goes back to the FIFO pool as soon as its work is submitted, so a
+  `TemporaryCudaStream` can be handed one whose earlier work (a disk write waiting
+  on the I/O pool's completion flag) is still pending and queue an unrelated
+  restore behind it. With a bound N, the constructor skips up to N streams that
+  `cuStreamQuery` reports busy; they go back to the pool's tail, which creates a
+  stream when it runs empty. Events, not stream identity, order every copy, so
+  skipping changes no dependency.
 
 ### Remote cache levels
 

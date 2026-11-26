@@ -295,6 +295,23 @@ private:
     CudaStreamPool();
 };
 
+//! Process-wide: a TemporaryCudaStream skips up to \p maxBusy pooled streams that still have work pending (0: off).
+//! A pooled stream goes back to the pool as soon as its user has submitted work, so the next user can otherwise get a
+//! stream whose earlier work -- a disk write waiting for the I/O pool, say -- has not finished, and wait behind it
+//! although the two are unrelated. Skipped streams go back to the pool, which creates a stream when it runs empty, so
+//! the pool grows until a burst finds idle ones. The first call with a nonzero value sets it for the life of the
+//! process; later calls do not change it.
+void configureBusyStreamSkip(size_t maxBusy) noexcept;
+
+//! The bound configureBusyStreamSkip set (0: off).
+[[nodiscard]] size_t busyStreamSkip() noexcept;
+
+//! Testing only: set the bound whatever was configured.
+void setBusyStreamSkipForTesting(size_t maxBusy) noexcept;
+
+//! Testing only: busy pooled streams TemporaryCudaStream has skipped so far.
+[[nodiscard]] uint64_t busyStreamsSkippedForTesting() noexcept;
+
 // ---------------------------------------------------------------------------
 // CachedCudaEvent — pooled CUevent (no timing).
 // Mirrors _utils.py::CachedCudaEvent.
@@ -398,6 +415,8 @@ class CachedCudaStream
 {
 public:
     CachedCudaStream();
+    //! Takes a stream already taken from the pool.
+    explicit CachedCudaStream(CudaStreamPool::PoolItem item) noexcept;
 
     [[nodiscard]] CUstream handle() const noexcept
     {

@@ -88,6 +88,21 @@ def host_copy_helper_tasks_for_testing() -> int:
     return int(_cpp().host_copy_helper_tasks_for_testing())
 
 
+def copy_stream_busy_skip() -> int:
+    """Busy pooled streams a temporary copy stream may skip (0: off)."""
+    return int(_cpp().copy_stream_busy_skip())
+
+
+def set_copy_stream_busy_skip_for_testing(max_busy: int) -> None:
+    """Set the busy-stream skip bound whatever was configured."""
+    _cpp().set_copy_stream_busy_skip_for_testing(max_busy)
+
+
+def busy_copy_streams_skipped_for_testing() -> int:
+    """Busy pooled streams temporary copy streams have skipped so far."""
+    return int(_cpp().busy_copy_streams_skipped_for_testing())
+
+
 def inject_disk_write_failures_for_testing(count: int) -> None:
     """Make the next ``count`` disk write pieces fail without writing."""
     _cpp().inject_disk_write_failures_for_testing(count)

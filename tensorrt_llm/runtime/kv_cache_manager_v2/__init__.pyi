@@ -608,6 +608,9 @@ class KVCacheManagerConfig:
     # Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA
     # callback thread included. Process-wide: the first manager that sets a value above 1 sets it.
     host_copy_threads: int = 1
+    # Pooled CUDA streams, 0 to 4096, a page copy skips while they still have work pending (0: off).
+    # Process-wide: the first manager that sets a nonzero value sets it.
+    copy_stream_busy_skip: int = 0
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

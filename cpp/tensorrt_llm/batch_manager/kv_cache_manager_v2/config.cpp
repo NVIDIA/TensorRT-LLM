@@ -343,6 +343,11 @@ void KVCacheManagerConfig::validate() const
         throw std::invalid_argument(
             "KVCacheManagerConfig: hostCopyThreads must be between 1 and " + std::to_string(kMaxHostCopyThreads));
     }
+    if (copyStreamBusySkip < 0 || copyStreamBusySkip > kMaxCopyStreamBusySkip)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: copyStreamBusySkip must be between 0 and " + std::to_string(kMaxCopyStreamBusySkip));
+    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

@@ -18,6 +18,10 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
+#include "tensorrt_llm/common/logger.h"
+
+#include <utility>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -140,6 +144,11 @@ CachedCudaStream::CachedCudaStream()
 {
 }
 
+CachedCudaStream::CachedCudaStream(CudaStreamPool::PoolItem item) noexcept
+    : mPoolItem(std::move(item))
+{
+}
+
 CachedCudaEvent CachedCudaStream::recordEvent() noexcept
 {
     return CachedCudaEvent{reinterpret_cast<CudaStream>(handle())};
@@ -154,8 +163,77 @@ void CachedCudaStream::synchronize()
 // TemporaryCudaStream implementation
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+std::atomic<size_t> gBusyStreamSkip{0};
+std::atomic<uint64_t> gBusyStreamsSkipped{0};
+
+//! A pooled stream, skipping up to busyStreamSkip() streams that still have work pending. The last one taken is
+//! returned even if it is busy.
+CudaStreamPool::PoolItem acquireTemporaryStream()
+{
+    auto& pool = CudaStreamPool::instance();
+    auto item = pool.get();
+    size_t const maxBusy = gBusyStreamSkip.load(std::memory_order_relaxed);
+    if (maxBusy == 0 || cuStreamQuery(item.get()) != CUDA_ERROR_NOT_READY)
+    {
+        return item;
+    }
+    // Skipped streams stay out of the pool until this returns, so none is offered twice; they go back to the pool's
+    // tail when `busy` is destroyed. A stream that reports an error is not busy: its user sees the error.
+    std::vector<CudaStreamPool::PoolItem> busy;
+    do
+    {
+        busy.push_back(std::move(item));
+        item = pool.get();
+    } while (busy.size() < maxBusy && cuStreamQuery(item.get()) == CUDA_ERROR_NOT_READY);
+    gBusyStreamsSkipped.fetch_add(busy.size(), std::memory_order_relaxed);
+    return item;
+}
+
+} // namespace
+
+void configureBusyStreamSkip(size_t maxBusy) noexcept
+{
+    if (maxBusy == 0)
+    {
+        return;
+    }
+    static std::atomic<size_t> configured{0};
+    size_t expected = 0;
+    if (!configured.compare_exchange_strong(expected, maxBusy))
+    {
+        if (expected != maxBusy)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2] copy streams already skip up to %zu busy streams in this process; ignoring a "
+                "request for %zu",
+                expected, maxBusy);
+        }
+        return;
+    }
+    gBusyStreamSkip.store(maxBusy, std::memory_order_relaxed);
+    TLLM_LOG_INFO("[kvCacheManagerV2] copy streams skip up to %zu busy pooled streams", maxBusy);
+}
+
+size_t busyStreamSkip() noexcept
+{
+    return gBusyStreamSkip.load(std::memory_order_relaxed);
+}
+
+void setBusyStreamSkipForTesting(size_t maxBusy) noexcept
+{
+    gBusyStreamSkip.store(maxBusy, std::memory_order_relaxed);
+}
+
+uint64_t busyStreamsSkippedForTesting() noexcept
+{
+    return gBusyStreamsSkipped.load(std::memory_order_relaxed);
+}
+
 TemporaryCudaStream::TemporaryCudaStream(std::vector<CUevent> priorEvents)
-    : mStream()
+    : mStream(acquireTemporaryStream())
 {
     CudaStream cs = reinterpret_cast<CudaStream>(mStream.handle());
     streamWaitEvents(cs, std::move(priorEvents));

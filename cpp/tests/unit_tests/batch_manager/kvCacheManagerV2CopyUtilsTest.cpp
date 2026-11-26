@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-// Host copy threads of KVCacheManagerV2's copy path.
+// Host copy threads and busy-stream skipping of KVCacheManagerV2's copy path.
 //
 // Both settings are process-wide, so every test sets them through the testing hooks and restores the defaults. The
 // async disk I/O pool cannot be stopped once started, so the one test that starts it comes last.
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/copyUtils.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/cudaEvent.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -137,6 +138,7 @@ protected:
     void TearDown() override
     {
         setHostCopyThreadsForTesting(1);
+        setBusyStreamSkipForTesting(0);
         if (mStream != nullptr)
         {
             EXPECT_EQ(cuStreamSynchronize(mStream), CUDA_SUCCESS);
@@ -339,6 +341,62 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, FailedSynchronousWritesAreRecordedPerPage)
         EXPECT_EQ(std::memcmp(page.data(), src.data() + p * kPageBytes, kPageBytes), 0) << "page " << p;
     }
     EXPECT_EQ(failed, kFailures);
+}
+
+std::atomic<bool> gReleaseStreams{false};
+
+CUDA_CB void holdStream(void*) noexcept
+{
+    while (!gReleaseStreams.load())
+    {
+        std::this_thread::yield();
+    }
+}
+
+TEST_F(KvCacheManagerV2CopyUtilsTest, TemporaryStreamsSkipBusyPooledStreams)
+{
+    // Make every cached pooled stream busy: each one waits behind a host function that holds the callback thread.
+    auto& pool = CudaStreamPool::instance();
+    gReleaseStreams.store(false);
+    std::vector<CudaStreamPool::PoolItem> taken;
+    int const cached = pool.cachedCount();
+    ASSERT_GT(cached, 0);
+    for (int i = 0; i < cached; ++i)
+    {
+        taken.push_back(pool.get());
+        ASSERT_EQ(cuLaunchHostFunc(taken.back().get(), holdStream, nullptr), CUDA_SUCCESS);
+    }
+    std::vector<CUstream> busy;
+    for (auto const& item : taken)
+    {
+        busy.push_back(item.get());
+    }
+    taken.clear(); // back to the pool, still busy
+
+    {
+        // Off: the next pooled stream, busy as it is.
+        TemporaryCudaStream plain({});
+        EXPECT_EQ(cuStreamQuery(plain.get()), CUDA_ERROR_NOT_READY);
+    }
+    setBusyStreamSkipForTesting(4096);
+    uint64_t const skippedBefore = busyStreamsSkippedForTesting();
+    {
+        TemporaryCudaStream idle({});
+        EXPECT_EQ(cuStreamQuery(idle.get()), CUDA_SUCCESS);
+        EXPECT_EQ(std::find(busy.begin(), busy.end(), idle.get()), busy.end());
+    }
+    EXPECT_GE(busyStreamsSkippedForTesting() - skippedBefore, static_cast<uint64_t>(cached));
+    // A bound below the busy count hands out the last stream it took, busy or not.
+    setBusyStreamSkipForTesting(1);
+    {
+        TemporaryCudaStream bounded({});
+        EXPECT_EQ(cuStreamQuery(bounded.get()), CUDA_ERROR_NOT_READY);
+    }
+    gReleaseStreams.store(true);
+    for (CUstream stream : busy)
+    {
+        EXPECT_EQ(cuStreamSynchronize(stream), CUDA_SUCCESS);
+    }
 }
 
 // Last: the async disk I/O pool runs for the rest of the process once started.

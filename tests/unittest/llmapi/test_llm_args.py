@@ -3050,6 +3050,29 @@ def test_KvCacheConfig_host_copy_threads(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_copy_stream_busy_skip():
+    assert KvCacheConfig().copy_stream_busy_skip == 0
+    assert KvCacheConfig(
+        copy_stream_busy_skip=4096).copy_stream_busy_skip == 4096
+    for value in (-1, 4097):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(copy_stream_busy_skip=value)
+    with pytest.raises(
+            ValidationError,
+            match="copy_stream_busy_skip requires use_kv_cache_manager_v2"):
+        KvCacheConfig(copy_stream_busy_skip=64, use_kv_cache_manager_v2=False)
+
+    assert _kvcm2_manager_config().copy_stream_busy_skip == 0
+    assert _kvcm2_manager_config(
+        copy_stream_busy_skip=4096).copy_stream_busy_skip == 4096
+    for value in (-1, 4097):
+        with pytest.raises(
+                ValueError,
+                match="copyStreamBusySkip must be between 0 and 4096"):
+            _kvcm2_manager_config(copy_stream_busy_skip=value)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):
