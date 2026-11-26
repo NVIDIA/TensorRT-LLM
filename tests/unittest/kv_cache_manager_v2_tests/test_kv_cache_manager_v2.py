@@ -12194,6 +12194,17 @@ class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
 
     disk_tier_options = dict(_ALL_DISK_OPTIONS, write_behind_bytes=_WRITE_BEHIND_BYTES)
 
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+
     def prepare(self, *args, **kwargs) -> None:
         options = dict(self.disk_tier_options or {})
         if options.get("num_io_threads", 0) > 0:
