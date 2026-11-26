@@ -6675,13 +6675,15 @@ class PyExecutor:
         one is, so both come back through `get_finished` and only the KV cache
         manager knows which is which.
 
-        Returns True when *request* was preempted rather than finished, in
-        which case its pages are now released and it is back in context state
-        awaiting a re-prefill.
+        Returns True when *request* is ready to replay prefill. A request
+        with terminal intent instead returns False so the caller releases its
+        transfer claim and completes terminal teardown.
         """
         if not self._is_kv_manager_v2:
             return False
         if not self.kv_cache_manager.try_complete_preemption(request):
+            return False
+        if getattr(request, "py_request_termination_requested", False) is True:
             return False
         # The same teardown an immediate recompute pause does. Pausing alone
         # would clear py_seq_slot while SeqSlotManager still owned the slot,
@@ -12819,6 +12821,7 @@ class PyExecutor:
                     "whose KV blocks a transfer still owns")
         for request in failed_requests:
             req_id = request.py_request_id
+            request.py_request_termination_requested = True
             request.state = LlmRequestState.GENERATION_COMPLETE
             # A context request failing before its first chunk completed has
             # written no KV. Tag it so the V1 KV-cache release skips the
@@ -12963,6 +12966,7 @@ class PyExecutor:
     def _terminate_request(self, request: LlmRequest) -> None:
         if getattr(request, "py_request_terminated", False) is True:
             return
+        request.py_request_termination_requested = True
         if self.disagg.defer_gen_termination(request) is True:
             return
         connector = getattr(self, "kv_connector_manager", None)
@@ -13956,6 +13960,7 @@ class PyExecutor:
         for req in requests_to_pause:
             req.pause(self.max_input_len)
             req.py_request_resources_released = False
+            req.py_request_termination_requested = False
             req.py_request_terminated = False
             req.py_request_pp_termination_agreed = False
 

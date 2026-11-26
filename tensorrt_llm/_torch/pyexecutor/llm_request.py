@@ -1004,6 +1004,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 encoder_input_tokens, "tolist") else list(encoder_input_tokens))
             self.encoder_tokens = encoder_tokens
         self.py_return_encoder_output = return_encoder_output
+        self.py_request_termination_requested = False
         self.py_request_terminated = False
         self.py_client_id = client_id
         self.py_request_id = self.request_id

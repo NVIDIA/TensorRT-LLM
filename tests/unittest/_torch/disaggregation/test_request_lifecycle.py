@@ -3,7 +3,7 @@
 """Response publication and allocation lifetime across independent transfer owners."""
 
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -13,10 +13,12 @@ from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDis
 from tensorrt_llm._torch.disaggregation.orchestration.pp_termination import (
     DisaggPPTerminationHandler,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorEffects,
     PyExecutorRequestRegistry,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, executor_request_to_llm_request
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
@@ -316,3 +318,64 @@ def test_pp_ring_releases_a_delayed_owner_without_another_consensus() -> None:
         executor.resource_manager.free_resources.assert_called_once_with(request)
         assert executor._disagg_pp_termination_handler._pending_termination == {}
         assert request.py_request_pp_termination_agreed
+
+
+def test_failed_preemption_victim_terminates_after_connector_save() -> None:
+    """An error published during a save must retire the victim without replay."""
+    executor = _executor()
+    request = _request()
+    request_id = request.py_request_id
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor.resource_manager.resource_managers = {}
+    executor.async_transfer_manager = AsyncTransferManager(
+        executor.resource_manager, should_store_blocks=False
+    )
+    executor.async_transfer_manager.start_transfer(request)
+    manager = executor.kv_cache_manager
+    manager._pending_preemption = {request_id: request}
+    manager.is_preemption_pending = MethodType(KVCacheManagerV2.is_preemption_pending, manager)
+    manager.try_complete_preemption = MethodType(KVCacheManagerV2.try_complete_preemption, manager)
+    connector = executor.kv_connector_manager = Mock()
+    connector.capacity_only = False
+    connector.defer_load_termination.return_value = False
+    connector.has_pending_load.return_value = False
+    connector.take_finished_load_terminations.return_value = []
+    connector.get_finished.return_value = [request]
+    executor._pause_recompute_request = Mock(wraps=executor._pause_recompute_request)
+    channel = executor._response_channel
+    channel.register([request_id], Mock())
+    channel.release = Mock(wraps=channel.release)
+    executor._enqueue_responses.side_effect = channel.publish
+
+    executor._handle_errors("failed during save", requests=[request], charge_budget=False)
+
+    (response,) = channel.responses[request_id]
+    assert response.error_msg == "failed during save"
+    assert not executor.active_requests
+    assert request_id in channel.result_wait_queues
+    executor.resource_manager.free_resources.assert_not_called()
+    channel.release.assert_not_called()
+
+    executor._kv_connector_terminate_requests()
+
+    executor._pause_recompute_request.assert_not_called()
+    assert request.py_request_terminated
+    assert request_id not in channel.result_wait_queues
+
+    executor._kv_connector_terminate_requests()  # repeated completion notification
+    executor._terminate_request(request)
+
+    executor._pause_recompute_request.assert_not_called()
+    assert request.state == LlmRequestState.GENERATION_COMPLETE
+    assert request.py_request_terminated
+    assert not manager._pending_preemption
+    assert not executor.async_transfer_manager.requests_in_transfer()
+    assert request_id not in channel.result_wait_queues
+    channel.release.assert_called_once_with(request_id)
+    executor.sampler.release_request.assert_called_once_with(request)
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    executor._release_multimodal_resources.assert_called_once_with(request)
+    assert channel.responses[request_id] == [response]
