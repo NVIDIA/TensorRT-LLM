@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: FLUX.2-dev
   supported_gpus:
@@ -8,20 +11,25 @@ environment:
   server_env_var: TLLM_LOG_LEVEL=info
   client_env_var: ""
 server_configs:
-  - name: flux2_fp8_cfg1_ulysses4_teacache_on
+  - name: flux2_bf16_cfg1_ulysses4_teacache_cg_on
     server_config:
-      quant_config:
-        quant_algo: FP8
-        dynamic: true
       attention_config:
         backend: VANILLA
       parallel_config:
         cfg_size: 1
         ulysses_size: 4
+        async_ulysses: false
+        parallel_vae_size: 1
       cache_config:
         cache_backend: teacache
+      compilation_config:
+        resolutions:
+        - - 1024
+          - 1024
+        num_frames:
+        - 1
       cuda_graph_config:
-        enable: false
+        enable: true
     client_configs:
       - name: 1024x1024_1f_50s_con1
         prompt: A cat holding a sign that says hello world

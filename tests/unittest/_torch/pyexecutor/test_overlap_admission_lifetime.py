@@ -53,8 +53,11 @@ def _admission_executor(
         _kv_connector_deadlines={},
         kv_cache_transceiver=None,
         canceled_req_ids=[],
+        request_broadcaster=SimpleNamespace(deliver_prompts=lambda requests: None),
+        track_unique_tokens=False,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
+        _num_embeddings=123,
     )
     executor._fetch_and_enqueue_requests = (
         lambda queue, live, **_: executor.observed_live_counts.append(live)

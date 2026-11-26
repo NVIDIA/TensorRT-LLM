@@ -112,6 +112,7 @@ def _expected_video() -> torch.Tensor:
 class _StubPipeline:
     """Stand-in for BasePipeline covering exactly what the executor touches."""
 
+    supports_dynamic_batching = False
     default_generation_params: dict = {}
     extra_param_specs: dict = {}
     _warmed_up_shapes: set = set()

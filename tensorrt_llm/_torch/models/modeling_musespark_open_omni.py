@@ -396,35 +396,12 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
         return caps
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        """Ask the loaders for PIL and for the model's own video sampling.
-
-        Format: the framework's default is `pt` (`ToTensor()` output, a
-        float32 CHW tensor in 0..1), while this model's preprocessing works on
-        PIL: `to_rgb` composites RGBA by image mode and `resize_lanczos`
-        calls `Image.resize`. Asking for PIL also skips a round-trip through
-        0..1 floats on every request. `_to_pil` still normalizes whatever
-        arrives, because a per-request `media_io_kwargs` override outranks
-        this.
-
-        Video sampling: `VideoMediaIO` defaults to `num_frames=10,
-        fps=30`, 10 frames per video regardless of length, while this model
-        samples at `sampling_fps` capped at `num_frames_per_video` (2 fps
-        and 96 frames for the released checkpoint, `processor_config.json`
-        values included via `with_processor_config`). The loader samples
-        `min(num_frames, floor(duration * fps))` frames uniformly, which is
-        that policy. A server-level `--media_io_kwargs` and per-request
-        kwargs still override these defaults (`VideoMediaIO.merge_kwargs`
-        also drops the unmentioned `fps`/`num_frames` partner when an
-        override sets only one).
-        """
+        """Sample videos at the checkpoint's frame rate, up to its frame cap."""
         cfg = MuseSparkOpenPreprocessConfig.from_config(self._vision_config)
-        video: Dict[str, Any] = {
-            "format": "pil",
-            "num_frames": cfg.num_frames_per_video,
-        }
+        video: Dict[str, Any] = {"num_frames": cfg.num_frames_per_video}
         if cfg.sampling_fps:
             video["fps"] = cfg.sampling_fps
-        return {"image": {"format": "pil"}, "video": video}
+        return {"video": video}
 
     def get_dummy_mm_data(self, *, max_num_encoder_tokens: int, mm_counts, dtype):
         """Worst-case encoder tensors, built directly rather than via PIL.
@@ -1159,6 +1136,10 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     defaults. The per-request, per-chunk caching in
     `get_multimodal_embeddings` applies as for any mixin model.
     """
+
+    # The vision tower derives its backend from the decoder's, and the audio
+    # tower is plain PyTorch; neither applies encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset(), "audio": frozenset()}
 
     config_class = type(None)  # resolved from model_config, not from a HF class
 

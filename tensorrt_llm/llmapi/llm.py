@@ -1666,7 +1666,9 @@ class BaseLLM:
                        None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
             sampling_params,
-            fused_sampling=bool(mode is not None and mode.is_fused))
+            fused_sampling=bool(mode is not None and mode.is_fused),
+            logit_edits_unsupported=spec_sampler_base.
+            logit_edits_unsupported_reason(self.args.speculative_config))
         if reason is not None:
             raise RequestError(reason)
 
@@ -1777,7 +1779,7 @@ class BaseLLM:
             output_dir (str, optional): Directory where chrome traces are
                 written. If ``None``, falls back to the
                 ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
-                to ``/tmp``. Defaults to None.
+                to a temporary directory. Defaults to None.
             num_steps (int, optional): Number of engine iterations to
                 capture. When set, the engine stops the window automatically
                 and ``stop_profile`` does not need to be called. When
@@ -2046,6 +2048,41 @@ class _TorchLLM(BaseLLM):
         return normalized
 
     @set_api_status("prototype")
+    def get_memory_report(self) -> list[str]:
+        """Explain where the GPU workers' memory is going, as readable reports.
+
+        Each report splits one worker process's GPU memory by purpose (KV
+        cache, weights, runtime buffers, CUDA graphs, communication buffers,
+        library overhead) so that the parts add up to what the process holds.
+        In the monitor's full mode (``memory_monitor_config.mode='full'`` or
+        ``TLLM_MEM_MONITOR=1``), reports also break down startup step by step
+        and compare against the state after warmup.
+
+        Every rank reports with the Ray executor. With the default MPI
+        executor, every rank reports in full mode; otherwise rank 0 reports
+        and every other rank is listed as not gathered.
+
+        Returns:
+            list[str]: One entry per rank, rank 0 first: its report, or one
+            line saying why there is none (not gathered, not answered in
+            time, or the report could not be built). With
+            ``encode_only=True`` the encoder runs in this process, and the one
+            entry is this process's report.
+        """
+        if self._encode_only:
+            from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+            report = report_now(tag="on_demand", force=True, save=False)
+            return [
+                report or
+                "rank 0: the report could not be built; see this process's log"
+            ]
+        replies = self._collective_rpc("get_memory_report")
+        return [
+            report for reply in replies if reply for report in reply if report
+        ]
+
+    @set_api_status("prototype")
     def get_memory_status(self) -> RuntimeMemoryStatus:
         """Return the authoritative runtime-memory checkpoint status.
 
@@ -2185,6 +2222,7 @@ class _TorchLLM(BaseLLM):
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
             enable_tokenization_cache=self.args.enable_tokenization_cache,
+            prompt_token_cache_config=self.args.prompt_token_cache_config,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 

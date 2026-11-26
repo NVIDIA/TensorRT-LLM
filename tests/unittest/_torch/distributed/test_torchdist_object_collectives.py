@@ -298,6 +298,31 @@ def test_broadcast_or_none_is_one_round_for_nothing_two_for_payload(td, world):
         assert len(shapes) == 2, shapes
 
 
+def test_broadcast_or_none_with_header_rides_in_the_size_word(td, world):
+    """The header (rank 0's clock in the request fetch) costs no extra round: one collective for nothing, two for a
+    payload, as without it; the single-word size exchange is left as it was."""
+    rank, _, _ = world
+    shapes = []
+    orig_bc = dist.broadcast
+
+    def rec_bc(tensor, *args, **kwargs):
+        shapes.append(tuple(tensor.shape))
+        return orig_bc(tensor, *args, **kwargs)
+
+    header = [123_456_789, -1] if rank == 0 else [0, -1]
+    with mock.patch.object(dist, "broadcast", rec_bc):
+        assert td.broadcast_or_none_with_header(None, header, root=0) == ([123_456_789, -1], None)
+        assert shapes == [(3,)], shapes
+        shapes.clear()
+        obj = {"payload": list(range(50))}
+        got = td.broadcast_or_none_with_header(obj if rank == 0 else None, header, root=0)
+        assert got == ([123_456_789, -1], obj)
+        assert len(shapes) == 2 and shapes[0] == (3,), shapes
+        shapes.clear()
+        assert td.broadcast_or_none(None, root=0) is None
+        assert shapes == [(1,)], shapes
+
+
 def test_broadcast_root_stages_asynchronously_through_fenced_pinned_buffers(td, world):
     rank, _, _ = world
     pg = td._cuda_obj_pg("world")

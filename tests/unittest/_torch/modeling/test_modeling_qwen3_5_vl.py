@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_qwen3_5 import (
     _lm_head_nvfp4_enabled,
+    _normalize_qwen35_exclude_modules,
     _normalize_qwen35_quant_config_dict,
     _normalize_qwen35_vl_config,
 )
@@ -66,7 +67,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 #     Qwen3NextAttention, which hardcodes output gating.
 
 
-def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
+def _write_qwen35_dense_vl_config(
+    tmp_path: Path, *, text_only: bool = False, **extra_config
+) -> Path:
     config = {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "image_token_id": 248056,
@@ -124,10 +127,79 @@ def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
         },
         "vision_end_token_id": 248054,
         "vision_start_token_id": 248053,
-        **extra_config,
     }
+    if text_only:
+        config = {
+            **config["text_config"],
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "tie_word_embeddings": config["tie_word_embeddings"],
+        }
+    config.update(extra_config)
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     return tmp_path
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_only", [False, True], ids=["composite", "text-only"])
+def test_qwen35_dense_fp8_mlp_exclusions(tmp_path: Path, text_only: bool) -> None:
+    """Normalize dense FP8 exclusions from composite and flat text-only checkpoints.
+
+    Config type and shape assertions distinguish the two checkpoint loader routes.
+    A split-only layer checks normalized patterns without a packed exclusion masking them.
+
+    Args:
+        tmp_path: Directory for the synthetic checkpoint configuration.
+        text_only: Whether the synthetic checkpoint has a flat text-only configuration.
+    """
+    config_path = _write_qwen35_dense_vl_config(
+        tmp_path,
+        text_only=text_only,
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "model.language_model.layers.0.mlp.gate_proj",
+                "model.language_model.layers.0.mlp.up_proj",
+                "model.language_model.layers.0.mlp.down_proj",
+                "model.layers.0.mlp.mlp.gate_up_proj",
+                "model.language_model.layers.1.mlp.gate_proj",
+                "model.language_model.layers.1.mlp.up_proj",
+                "mtp.layers.0.mlp.gate_proj",
+                "mtp.layers.0.mlp.up_proj",
+                "mtp.layers.0.mlp.down_proj",
+                "mtp.layers.0.mlp.gate_up_proj*",
+            ],
+        },
+    )
+    model_config = ModelConfig.from_pretrained(str(config_path))
+    pretrained_config = model_config.pretrained_config
+    if text_only:
+        assert isinstance(pretrained_config, transformers.Qwen3NextConfig)
+        assert pretrained_config.architectures == ["Qwen3_5ForCausalLM"]
+        assert pretrained_config.get_text_config() is pretrained_config
+    else:
+        assert isinstance(pretrained_config, transformers.Qwen3_5Config)
+        assert pretrained_config.architectures == ["Qwen3_5ForConditionalGeneration"]
+        assert pretrained_config.get_text_config() is pretrained_config.text_config
+    _normalize_qwen35_exclude_modules(model_config)
+    _normalize_qwen35_exclude_modules(model_config)
+
+    quant_config = model_config.quant_config
+    assert quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    for projection in ("gate_proj", "up_proj"):
+        assert f"model.layers.1.mlp.mlp.{projection}" in quant_config.exclude_modules
+    assert not quant_config.is_module_excluded_from_quantization(
+        "model.layers.1.mlp.mlp.gate_up_proj"
+    )
+    for layer_idx in (0, model_config.pretrained_config.num_hidden_layers):
+        for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+            assert quant_config.is_module_excluded_from_quantization(
+                f"model.layers.{layer_idx}.mlp.mlp.{projection}"
+            )
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.1.mlp.mlp.down_proj")
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.0.self_attn.q_proj")
 
 
 def test_qwen35_dense_vl_config_preserves_vlm_architecture(

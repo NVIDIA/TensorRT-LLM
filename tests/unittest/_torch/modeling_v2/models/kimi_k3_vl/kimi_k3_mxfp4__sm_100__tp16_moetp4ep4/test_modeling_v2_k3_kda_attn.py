@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/k3_kda_attn catalog entry (and its sibling k3_kda_qkvg), on a real cache object and a
+"""GPU test for the ssm/k3_kda_attn op (and its sibling k3_kda_qkvg), on a real cache object and a
 caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + speculative verify of one request's golden token and 7 drafts, at the TP16 rank
@@ -26,7 +26,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
     CTAS,
     K3KdaBuffers,
 )
@@ -36,12 +36,12 @@ import _kda_cells as kc
 from _validating import validating
 
 _attn = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_attn"
 )
 k3_kda_attn, k3_kda_qkvg = _attn.k3_kda_attn, _attn.k3_kda_qkvg
 k3_kda_verify = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_verify"
 ).k3_kda_verify
 

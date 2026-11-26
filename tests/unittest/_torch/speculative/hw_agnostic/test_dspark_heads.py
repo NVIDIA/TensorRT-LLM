@@ -26,6 +26,8 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     markov_prev_embeddings,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 VOCAB, RANK, HID, B, BLK = 257, 16, 32, 3, 5
 
 

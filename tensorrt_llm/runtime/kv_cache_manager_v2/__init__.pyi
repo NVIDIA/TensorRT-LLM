@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 
@@ -80,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -174,6 +182,8 @@ class StorageStatistics:
     @property
     def evictable(self) -> int: ...
     @property
+    def retained_copies(self) -> int: ...
+    @property
     def available(self) -> int: ...
     @property
     def unavailable(self) -> int: ...
@@ -214,6 +224,7 @@ class ReusedBlocksByLevel:
     full: list[int]
     partial: list[int]
 
+@dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
@@ -258,6 +269,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_locality_domains: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -266,6 +278,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
@@ -275,6 +288,30 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
+    protected_copy_fraction: float = 1.0
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = ...  # how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = ...
+    expected_donors: int = 0  # 0: unknown
+    pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -401,7 +438,7 @@ class SparseCacheConfig:
     Setting both on one buffer is rejected.
     """
 
-    selection_id: int | None
+    selection_id: int | None = None
     """Layers whose selection is one selection, named so they can say so.
 
     A model running one indexer across several layers hands them all the same units every
@@ -423,6 +460,8 @@ class ReusePolicy(enum.IntEnum):
 @dataclass(slots=True)
 class AttentionLayerConfig:
     """One attention layer's buffers and its history rules.
+
+    Buffers with an effective OPTIONAL reuse policy require a sliding window.
 
     A sparse layer may also declare a sliding window, though the combination is unusual:
     sparsity already bounds how much history a step reads. Where both apply, the window
@@ -516,6 +555,16 @@ class PoolRebalanceConfig:
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
 
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
@@ -551,6 +600,10 @@ class KVCacheManagerConfig:
     # Regions, each with a life cycle of its own, numbered after every layer life cycle in
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
+    # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
+    # per-layer-group slot-count proportions at cold page sizes.
+    cold_typical_step: BatchDesc | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -722,25 +775,24 @@ KvCacheStatus: TypeAlias = _Status
 IndexSeq = array.array[int] | memoryview[int]
 
 class ReuseGroupStatus:
-    """Group availability at the initial prefix claim, not subsequent request progress."""
+    """Creation-time matches, narrowed to selected state at initial resume."""
 
-    # Lifecycle group from get_layer_group_id(layer_id), not a physical pool index.
     @property
     def group_id(self) -> LayerGroupId: ...
-    # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
     @property
     def policy(self) -> ReusePolicy: ...
-    # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
+    # Latest available endpoint at creation; selected endpoint after resume.
     @property
     def endpoint(self) -> int: ...
-    # All needed state is available, not necessarily on GPU or selected for reuse.
-    # False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    # Complete state at endpoint, independent of the REQUIRED prefix endpoint.
     @property
     def complete(self) -> bool: ...
-    # Retained [begin, end) ranges, including block-rounded SWA windows and sinks.
-    # SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
     @property
     def coverage(self) -> Sequence[tuple[int, int]]: ...
+    # Ascending half-open ranges of selectable token endpoints, independent of page alignment.
+    # The required pages are protected until initial resume.
+    @property
+    def endpoint_ranges(self) -> Sequence[tuple[int, int]]: ...
 
 class _KVCache:
     Status: ClassVar[Type[_Status]]
@@ -755,6 +807,7 @@ class _KVCache:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
+        optional_reuse_max_backtrack: int = 0,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -777,6 +830,9 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
     @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
@@ -810,7 +866,22 @@ class _KVCache:
         beam_id: BeamIndex = DEFAULT_BEAM_INDEX,
         valid_only: bool = False,
     ) -> Iterator[int]: ...
-    def resize(self, capacity: int | None, history_length: int | None = None) -> bool: ...
+    def resize(
+        self,
+        capacity: int | None = None,
+        history_length: int | None = None,
+        *,
+        complete_optional_recovery: bool = False,
+    ) -> bool:
+        """Resize capacity and/or history, preserving OPTIONAL recovery by default.
+
+        Set ``complete_optional_recovery`` only after submitting all recovery KV
+        accesses on the cache stream through the resulting history length. This
+        reclaims stale recovery pages even at unchanged history length. Returns
+        False on page exhaustion, rolling back capacity, history, and recovery
+        state together. ``commit`` also reports completed recovery.
+        """
+        ...
     @property
     def max_input_length(self) -> int | None:
         """Bound on ``capacity - history_length``: how far capacity may outrun the watermark.
@@ -839,13 +910,20 @@ class _KVCache:
     @property
     def history_length(self) -> int: ...
     @history_length.setter
-    def history_length(self, history_length: int) -> None: ...
+    def history_length(self, history_length: int) -> None:
+        """Set history length; pending OPTIONAL recovery requires an explicit resize call."""
+        ...
     def commit(
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        ssm_from_pending: bool = False,
     ) -> None: ...
+    def acquire_ssm_snapshot_slot(self) -> int | None: ...
+    @property
+    def pending_ssm_snapshot_slot(self) -> int | None: ...
+    def release_ssm_snapshot_slot(self) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
     @property
@@ -857,6 +935,8 @@ class _KVCache:
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
+    @property
+    def locality_domain_id(self) -> int | None: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None:
@@ -871,6 +951,7 @@ class _KVCache:
         self,
         cuda_stream: CudaStream | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+        optional_reuse_endpoints: dict[LayerGroupId, int] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
 
@@ -920,6 +1001,7 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    mapped_ranges: list[tuple[int, int]]
 
     storage_medium: CacheTier
     """What this pool's pages actually are.
@@ -1819,6 +1901,8 @@ class KVCacheManager:
         text_only: bool | None = None,
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -1828,6 +1912,10 @@ class KVCacheManager:
         It defaults to the non-empty input length; without either value, the beam
         sharing boundary is zero and the statistics boundary is unset. When set,
         it also marks generation-phase allocation stats.
+
+        ``optional_reuse_max_backtrack`` bounds selectable OPTIONAL endpoints to
+        [max(1, P - max_backtrack), P], where P is the REQUIRED match. Only their
+        lookback pages are held until initial resume. Defaults to zero (P only).
         """
         ...
     def refresh_retention(self) -> None: ...
@@ -1840,6 +1928,10 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_reuse_domains(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> list[int]:
+        """GPU-resident pages of the reuse match for input_tokens, counted per locality domain."""
     def probe_first_new_block_key(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -1881,7 +1973,16 @@ class KVCacheManager:
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote level failed on this rank (a transfer, or its donor went away). Lock-free."""
+        ...
+    @property
     def tokens_per_block(self) -> int: ...
+    @property
+    def num_locality_domains(self) -> int: ...
+    def get_mapped_buffer_views(
+        self, layer_id: LayerId, role: DataRole
+    ) -> list[tuple[MemAddress, int]]: ...
     @property
     def event_manager(self) -> Any | None: ...
     @property

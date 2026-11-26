@@ -148,19 +148,21 @@ Say we want to profile iterations 100 to 150 on a `trtllm-bench`/`trtllm-serve` 
 # Prepare dataset for the benchmark
 trtllm-bench --model ${MODEL_PATH} \
     prepare-dataset \
-    --output dataset.txt \
+    --output /tmp/dataset.txt \
     token-norm-dist \
     --num-requests=${NUM_SAMPLES} \
     --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
 
 # Benchmark and profile
+# To profile a server, replace the entire trtllm-bench invocation below
+# (including its arguments) with your trtllm-serve command and server arguments.
 TLLM_PROFILE_START_STOP=100-150 nsys profile \
   -o trace -f true \
   -t 'cuda,nvtx,python-gil' -c cudaProfilerApi \
   --cuda-graph-trace node \
   -e TLLM_PROFILE_RECORD_GC=1,TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_TORCH_PROFILE_TRACE=trace.json \
   --trace-fork-before-exec=true \
-  trtllm-bench \ # or trtllm-serve command
+  trtllm-bench \
     --model deepseek-ai/DeepSeek-V3 \
     --model_path ${MODEL_PATH} \
     throughput \
@@ -171,7 +173,8 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
+The PyTorch profiler results will be saved per rank as `trace-rank-<rank>.json`
+(for example, `trace-rank-0.json`). Use `chrome://tracing/` to inspect the saved profile.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
 

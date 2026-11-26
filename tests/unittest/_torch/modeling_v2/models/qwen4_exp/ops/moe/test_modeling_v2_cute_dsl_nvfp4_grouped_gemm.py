@@ -16,13 +16,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
+from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp import archs
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
     Fc2Expected,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.cute_dsl_nvfp4_grouped_gemm import (  # noqa: E501
     cute_dsl_nvfp4_grouped_gemm as op,
 )
-from tensorrt_llm._torch.autotuner import AutoTuner
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -295,6 +296,12 @@ def _cell_id(cell):
 
 
 # ── the certified cells ───────────────────────────────────────────────────
+
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not archs.fast_path("cute_dsl_moe", torch.cuda.get_device_capability()),
+    reason="the CuTe DSL MoE does not run on this GPU",
+)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[_cell_id(c) for c in op.CELLS])

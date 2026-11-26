@@ -146,6 +146,7 @@ class AllReduceParams:
         enable_allreduce: bool = True,
         trigger_completion_at_end: bool = True,
         fp8_payload: bool = False,
+        l2_prefetch: Optional[Tensor] = None,
     ):
         self.strategy = strategy
         self.fusion_op = fusion_op
@@ -161,6 +162,8 @@ class AllReduceParams:
         # Torch MNNVL path only (lossy): two-shot calls fused with a residual RMSNorm exchange E4M3 values
         # with one FP32 scale per 256 elements instead of BF16 (see MNNVLAllReduce.supports_fp8_payload).
         self.fp8_payload = fp8_payload
+        # Torch MNNVL fused-norm path only: a weight the all-reduce kernel pulls into L2 for the GEMM after it.
+        self.l2_prefetch = l2_prefetch
         assert fusion_op in (AllReduceFusionOp.NONE.value,
                              AllReduceFusionOp.RMS_NORM.value) or (residual
                                                                    is not None)
@@ -193,6 +196,8 @@ class MoEAllReduceParams(AllReduceParams):
         is_cutlass_min_latency: bool = False,
         shared_expert_gate: Optional[Tensor] = None,
         fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
+        l2_prefetch: Optional[Tensor] = None,
+        fc2_lamport: bool = False,
     ):
         super().__init__(
             fusion_op=fusion_op,
@@ -203,6 +208,7 @@ class MoEAllReduceParams(AllReduceParams):
             norm_pre_residual_weight=norm_pre_residual_weight,
             eps=eps,
             enable_allreduce=enable_allreduce,
+            l2_prefetch=l2_prefetch,
         )
         self.device_num_experts = device_num_experts
         self.expert_scale_factor = expert_scale_factor
@@ -210,6 +216,9 @@ class MoEAllReduceParams(AllReduceParams):
         self.shared_expert_output = shared_expert_output
         # Torch MNNVL path only: logits of the shared-expert gate; the shared output is scaled by their sigmoid.
         self.shared_expert_gate = shared_expert_gate
+        # Torch MNNVL fused-norm path only: the un-finalized fc2 rows are in a Lamport FC2 buffer, which the fold
+        # polls instead of waiting for FC2 (MnnvlAllReduceNorm.__call__).
+        self.fc2_lamport = fc2_lamport
         self.is_cutlass_min_latency = is_cutlass_min_latency
 
     def is_valid(self):

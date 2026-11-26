@@ -32,7 +32,9 @@ from ..operators.coverage import (
     CATALOG_TESTS_DIR,
     MODEL_OPS_DIRNAME,
     MODELING_V2_PACKAGE,
-    model_ops_tests_dir,
+    OP_MATRIX_SUFFIX,
+    collected_test_names,
+    entry_tests_dir,
 )
 
 ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
@@ -40,7 +42,7 @@ ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
 
 _MODEL_OPS_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
+    r"tensorrt_llm\._torch\.modeling_v2\.models\.[a-z0-9_]+\."
     r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
 )
 _RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")
@@ -269,18 +271,15 @@ def check_model_ops(
     return checks
 
 
-def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name: str) -> Check:
-    candidates = [
-        f"{tests_dir}/{category}/test_modeling_v2_{name}{suffix}.py"
-        for suffix in ("", "_op_matrix")
-    ]
+def _test_check(repo_root: Path, tests_dir: str, label: str, name: str) -> Check:
+    candidates = [f"{tests_dir}/{filename}" for filename in collected_test_names(name)]
     found = next((rel for rel in candidates if (repo_root / rel).is_file()), None)
     if found is None:
         return Check(name=label, passed=False, detail=f"missing: {candidates[0]}")
     test = repo_root / found
     # A multi-rank entry's collected file only launches its rank body, which
     # sits beside it as `_<name>_op_matrix.py`; the cells are driven there.
-    sources = [test, test.parent / f"_{name}_op_matrix.py"]
+    sources = [test, test.parent / f"_{name}{OP_MATRIX_SUFFIX}.py"]
 
     def drives_cells(path: Path) -> bool:
         if not path.is_file():
@@ -321,7 +320,12 @@ def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> 
     are; either name satisfies the check.
     """
     return [
-        _test_check(repo_root, CATALOG_TESTS_DIR, f"test:{category}/{name}", category, name)
+        _test_check(
+            repo_root,
+            entry_tests_dir(category, name, repo_root),
+            f"test:{category}/{name}",
+            name,
+        )
         for category, name in entries
     ]
 
@@ -331,9 +335,13 @@ def check_model_op_tests(
 ) -> list[Check]:
     """Every own ``ops/`` entry has its GPU test under the target's mirror of the tests tree."""
     own = Path(target_rel.rstrip("/")).name
-    tests_dir = model_ops_tests_dir(target_rel)
     return [
-        _test_check(repo_root, tests_dir, f"test:ops/{category}/{name}", category, name)
+        _test_check(
+            repo_root,
+            entry_tests_dir(category, name, repo_root, owner_rel=target_rel),
+            f"test:ops/{category}/{name}",
+            name,
+        )
         for target_dir, category, name in ops
         if target_dir == own
     ]
@@ -501,15 +509,18 @@ def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
         if entry.is_relative_to(catalog):
             category = entry.parent.name
             label = f"test:{category}/{entry.stem}"
-            tests_dir = CATALOG_TESTS_DIR
+            tests_dir = entry_tests_dir(category, entry.stem, repo_root)
         else:
             owner = entry.parent.parent.parent
             category = entry.parent.name
             label = f"test:{entry.relative_to(family).with_suffix('')}"
-            tests_dir = str(
-                Path(CATALOG_TESTS_DIR) / owner.relative_to(repo_root / MODELING_V2_PACKAGE)
+            tests_dir = entry_tests_dir(
+                category,
+                entry.stem,
+                repo_root,
+                owner_rel=str(owner.relative_to(repo_root)),
             )
-        checks.append(_test_check(repo_root, tests_dir, label, category, entry.stem))
+        checks.append(_test_check(repo_root, tests_dir, label, entry.stem))
     return checks
 
 

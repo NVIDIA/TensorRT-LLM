@@ -9,17 +9,10 @@ they live in code; judgement -- how to derive a forward, what to build next
 dispatch and close:
 
 1. ``preflight`` -- Python, plus one probe turn per agent configuration.
-   A broken host fails here; the substrate gate, which boots a GPU, runs
-   beside the first turns of the next stage and stops them when it fails.
+   A broken host fails here.
 2. ``execution`` -- the planner's task graph, driven until the contract holds
-   (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. With
-   ``perf.enabled`` the graph holds a ``tune`` task, which starts once the
-   core is correct and runs beside the remaining work. The onboarding's
-   verdict never waits for it: the run closes on that verdict, and a campaign
-   still running goes on past the close as the tune stage
-   (:meth:`_campaign_after_onboarding`), whose outcome changes no verdict of it.
-3. ``tune``      -- for ``trtllm-modeling-v2 tune``: a target onboarded
-   elsewhere, tuned on its own.
+   (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. The
+   run ends there: performance work is not the flow's.
 
 Every stage checkpoints before advancing, so a crash resumes where it was.
 """
@@ -32,10 +25,9 @@ import os
 import shutil
 import threading
 import time
-from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, Sequence
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -64,7 +56,6 @@ from ..infra.compute.rebuild import LIBRARY_PATTERNS
 from ..infra.files import write_text_atomic
 from ..infra.git import CommitPolicy, git_output
 from ..spec.task_schema import load_and_validate_task_yaml
-from ..tune import stage as tune_stage
 from . import orchestrator as orchestrator_mod
 from .execution.handoff import current_decision
 from .execution.tasks import ExecutionStage, _start_with_the_survey
@@ -73,7 +64,6 @@ from .records.journal import Journal
 from .records.state import (
     STAGE_EXECUTION,
     STAGE_PREFLIGHT,
-    STAGE_TUNE,
     STATE_FILENAME,
     WorkflowState,
     is_remediable,
@@ -142,13 +132,11 @@ class TrtllmModelingV2Workflow:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         clean: bool = False,
         dry_run: bool = False,
-        skip_substrate_gate: bool = False,
         prompts: PromptBundle | None = None,
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
         git_runner: Any | None = None,
         agent_turn_timeout: float | None = None,
-        entry_stage: str = "",
         event_window_s: float = DEFAULT_EVENT_WINDOW_S,
         primers: bool = True,
     ) -> None:
@@ -163,8 +151,6 @@ class TrtllmModelingV2Workflow:
         self._primer_lock = threading.Lock()
         #: Per worker thread: the worktree block its turns carry.
         self._tls = threading.local()
-        # `trtllm-modeling-v2 tune`: start (or re-enter) at the tune stage.
-        self.entry_stage = entry_stage
         self.task_path = self.workspace / "task.yaml"
         self.plan_path = self.workspace / "plan.md"
         self.vocabulary_path = self.workspace / "vocabulary.yaml"
@@ -176,7 +162,6 @@ class TrtllmModelingV2Workflow:
         self.revision_cap = max(1, revision_cap)
         self.max_attempts = max(1, max_attempts)
         self.dry_run = dry_run
-        self.skip_substrate_gate = skip_substrate_gate
         self._prompts_override = prompts
 
         # Injected so every stage is testable without a GPU, a cluster, or a
@@ -339,7 +324,7 @@ class TrtllmModelingV2Workflow:
         roots = [self.task_data.get("trtllm_repo_path")]
         if self.environment is not None:
             env = self.environment
-            roots += [env.spool, *(session.spool for session in env.sessions), *env.dev_spools]
+            roots += [env.spool, *(session.spool for session in env.sessions)]
         return tuple(dict.fromkeys(str(root) for root in roots if root and Path(root).is_dir()))
 
     def _run_turn(
@@ -547,10 +532,7 @@ class TrtllmModelingV2Workflow:
         self._role_agents()
 
         try:
-            # A substrate gate that fails while the first turns run stops them.
-            with orchestrator_mod.stoppable(self.workspace) as stop:
-                self._run_stages(state, log, stop)
-            bootstrap._await_substrate(self)
+            self._run_stages(state, log)
         except KeyboardInterrupt:
             print_message(
                 "[bold yellow]⚠ interrupted — re-run the same command to continue "
@@ -561,21 +543,15 @@ class TrtllmModelingV2Workflow:
             self.journal.event("run interrupted", f"stage={state.stage}")
             raise
 
-    def _run_stages(
-        self, state: WorkflowState, log, stop: Callable[[str], None] | None = None
-    ) -> None:
+    def _run_stages(self, state: WorkflowState, log) -> None:
         """Preflight, then the stage the run is at, to its close.
 
-        Toward the execution stage the substrate gate runs beside its first
-        turns (``stop`` ends them when it fails), and an execution stage with no
-        graph yet starts with the survey (:meth:`_start_with_the_survey`). A run
-        the failed gate stopped is left open, as a failed preflight is:
-        re-running the same command proves the substrate again and resumes.
+        An execution stage with no graph yet starts with the survey
+        (:meth:`_start_with_the_survey`).
         """
         self._state = state
-        beside = stop if state.stage != STAGE_TUNE and not state.done else None
         if state.stage == STAGE_PREFLIGHT:
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(
@@ -589,7 +565,7 @@ class TrtllmModelingV2Workflow:
         else:
             # Resuming past preflight still needs the resolved
             # environment, since every prompt and every gate carries it.
-            if not bootstrap._run_preflight(self, state, log, stop=beside):
+            if not bootstrap._run_preflight(self, state, log):
                 return
             if self.dry_run:
                 print_message(
@@ -599,27 +575,12 @@ class TrtllmModelingV2Workflow:
                 )
                 return
 
-        if state.done:
-            # A closed onboarding whose campaign did not end (`campaign_owed`): only it goes on.
-            self._campaign_after_onboarding(state, log)
-            return
-
         if state.stage == STAGE_EXECUTION:
             self.journal.mark_started()
             _start_with_the_survey(self)
             execution = ExecutionStage(self)
             if execution.run_execution(state, log):
-                # The onboarding's verdict; a campaign's is `state.tune["verdict"]`.
                 self._close_run(state, log, verdict="delivered")
-            if state.done and execution.campaign is not None:
-                self._campaign_after_onboarding(state, log, execution.campaign)
-            return
-
-        if state.stage == STAGE_TUNE:
-            verdict = tune_stage.run_tune_phase(self, state, log)
-            if verdict is None:
-                return
-            self._close_run(state, log, verdict=verdict)
             return
 
         raise ValueError(f"unsupported workflow stage: {state.stage}")
@@ -788,21 +749,6 @@ class TrtllmModelingV2Workflow:
 
         if self.resume:
             state = load_state(self.state_path)
-            if (
-                state.done
-                and campaign_owed(state)
-                and (self.entry_stage == STAGE_TUNE or not is_remediable(state.verdict))
-            ):
-                # The onboarding closed beside a campaign that did not end: only the
-                # campaign goes on. A re-run after a repair re-enters the onboarding
-                # instead, where the campaign's task resumes it.
-                print_message(
-                    f"[bold cyan]→ the run closed '{state.verdict}'; its campaign goes on "
-                    f"as the tune stage[/bold cyan]",
-                    log,
-                )
-                self._refresh_workspace_spec(source, log)
-                return state
             if state.done and is_remediable(state.verdict):
                 # The run closed on something the operator fixes outside it,
                 # and re-running its own checks is the only way to see the fix.
@@ -814,18 +760,6 @@ class TrtllmModelingV2Workflow:
                 self.journal.event("re-entered a closed run", f"verdict={state.verdict}")
                 state.done = False
                 state.verdict = ""
-            elif (
-                state.done
-                and self.entry_stage == STAGE_TUNE
-                and (state.verdict == "delivered" or state.verdict.startswith("tune"))
-            ):
-                # An explicit `tune` is the operator's decision to spend more:
-                # re-enter at tune, keep the campaign's history, reset its misses.
-                state.done, state.verdict, state.stage = False, "", STAGE_TUNE
-                state.tune = {**state.tune, "misses": 0, "entry": "re-entered"}
-                state.tune.pop("verdict", None)
-                if state.tune.get("phase") == "done":
-                    state.tune["phase"] = "campaign"
             elif state.done:
                 print_message(
                     "[bold green]✔ this run already completed; pass --clean to start "
@@ -845,12 +779,6 @@ class TrtllmModelingV2Workflow:
                 encoding="utf-8",
             )
         state = WorkflowState(task_path=str(self.task_path))
-        if self.entry_stage == STAGE_TUNE:
-            # Standalone: a target onboarded elsewhere. Preflight still runs
-            # (environment, prompts, skills); the stage then
-            # measures and tunes the target the task names.
-            state.stage = STAGE_TUNE
-            state.tune = {"entry": "standalone"}
         self._checkpoint(state)
         return state
 
@@ -915,16 +843,17 @@ class TrtllmModelingV2Workflow:
     def _mark_bringup(
         self, marker: str, evaluation: contract_mod.Evaluation
     ) -> contract_mod.Milestone | None:
-        """The bring-up checks hold on the target (``marker``): name its commit, once.
+        """The bring-up checks have passed on the target (``marker``): name its commit, once.
 
         ``evaluation`` is the contract evaluated on ``marker``. The first time
-        every check of :func:`~.contract.bringup_checks` passes there, the
-        checkout's ``HEAD``, whose snapshot they measured, gets the branch
-        ``<target branch>-bringup``, the journal says ``BRINGUP DELIVERED
-        <sha>`` with the time since the run opened, and the milestone is
-        appended to ``correctness.jsonl``. Nothing is recorded, and ``None``
-        returned, once a bring-up or correctness milestone is, or when no
-        commit is known to hold the state the checks measured.
+        every check of :func:`~.contract.bringup_checks` has passed, the commit
+        they measured, or the checkout's ``HEAD`` when they passed on different
+        states of the target, gets the branch ``<target branch>-bringup``, the
+        journal says ``BRINGUP DELIVERED <sha>`` with the time since the run
+        opened, and the milestone is appended to ``correctness.jsonl``. Nothing
+        is recorded, and ``None`` returned, once a bring-up or correctness
+        milestone is, or when no commit is known to hold the state the checks
+        measured.
         """
         contract = self._contract
         if contract is None or not marker or not contract_mod.bringup_holds(contract, evaluation):
@@ -941,7 +870,7 @@ class TrtllmModelingV2Workflow:
                 marker,
                 evaluation,
                 held,
-                f"{', '.join(c.key for c in held)} hold on it",
+                f"{', '.join(c.key for c in held)} passed",
             )
 
     def _deliver_milestone(
@@ -969,9 +898,9 @@ class TrtllmModelingV2Workflow:
             sha,
             "trtllm-modeling-v2: "
             + (
-                "the first unit's boot and accuracy hold at one rank"
+                "the first unit's bring-up checks passed at one member"
                 if bringup
-                else "every required check of the contract holds"
+                else "every required check of the contract passed"
             ),
             unwritten=f"{'bring-up' if bringup else 'correctness'} ref not written",
         )
@@ -1008,14 +937,15 @@ class TrtllmModelingV2Workflow:
         return milestone
 
     def _mark_cells(self, marker: str, evaluation: contract_mod.Evaluation) -> list[str]:
-        """Record the cells the contract holds on ``marker``; the ones that hold anew.
+        """Record the cells whose checks have all passed; the ones new to the record.
 
         A cell is a unit or a variant at one member (:func:`~.contract.cells`).
-        ``cells.json`` keeps, per cell, the latest commit every one of its
-        checks passed on, so a run stopped at any moment says what it proved
-        and where. The commit the most cells hold on at once gets the branch
-        ``<target branch>-best``, moved forward by a later commit that holds as
-        many.
+        ``cells.json`` keeps, per cell, the commit the target was at once every
+        one of its checks had passed, so a run stopped at any moment says what
+        it proved; a pass stands, so the checks may have measured earlier
+        commits (the delivery report names each). The commit by which the most
+        cells have passed gets the branch ``<target branch>-best``, moved
+        forward by a later commit with as many.
         """
         contract = self._contract
         if contract is None or not marker:
@@ -1042,26 +972,23 @@ class TrtllmModelingV2Workflow:
             moved = len(holding) >= int(best.get("cells") or 0) and best.get("sha") != sha
             if moved:
                 ref = self._point_branch(
-                    "best", sha, f"trtllm-modeling-v2: {len(holding)} of {len(owed)} cells hold"
+                    "best", sha, f"trtllm-modeling-v2: {len(holding)} of {len(owed)} cells passed"
                 )
                 record["best"] = {"sha": sha, "cells": len(holding), "ref": ref, "at": now}
             contract_mod.save_cells(self.workspace, record)
         if anew:
             self.journal.event(
                 f"CELLS {sha}",
-                f"{', '.join(anew)} hold on {sha[:10]}; {len(holding)} of {len(owed)} cells hold there",
+                f"{', '.join(anew)} passed; {len(holding)} of {len(owed)} cells have passed "
+                f"by {sha[:10]}",
             )
         if moved:
             self.journal.event(
                 f"BEST {sha}",
-                f"{len(holding)} of {len(owed)} cells hold on it"
+                f"{len(holding)} of {len(owed)} cells have passed by it"
                 + (f"; branch `{record['best']['ref']}`" if record["best"]["ref"] else ""),
             )
         return anew
-
-    def _tune_requested(self) -> bool:
-        perf = self.task_data.get("perf") or {}
-        return bool(perf.get("enabled")) or self.entry_stage == STAGE_TUNE
 
     def _checkpoint(self, state: WorkflowState) -> None:
         save_state(self.state_path, state)
@@ -1071,56 +998,9 @@ class TrtllmModelingV2Workflow:
         assert self.environment is not None, "preflight must run before any gate"
         return self.environment
 
-    def _campaign_after_onboarding(
-        self, state: WorkflowState, log, campaign: Future | None = None
-    ) -> None:
-        """The tune stage past the onboarding's close: its campaign, which changes no verdict of it.
-
-        ``campaign`` is the campaign's thread, still running when the onboarding's
-        verdict came; without one, the campaign resumes from its checkpoint
-        (``state.tune``) in a later process. Its outcome goes to
-        ``state.tune["verdict"]`` and the journal; ``state.verdict`` stays the
-        onboarding's.
-        """
-        state.tune["onboarded"] = state.verdict
-        self._checkpoint(state)
-        note = (
-            f"the onboarding closed `{state.verdict}`; its campaign goes on, and its "
-            f"outcome changes no verdict of the onboarding"
-        )
-        self.journal.event("tune stage", note)
-        print_message(f"[bold cyan]→ tune stage: {escape_markup(note)}[/bold cyan]", log)
-        if campaign is not None:
-            try:
-                decision, _ = campaign.result()
-            except Exception as exc:  # the campaign's own failure: a later process resumes it
-                decision = f"raised {type(exc).__name__}: {exc}"
-            verdict = tune_stage.campaign_verdict(decision)
-        else:
-            verdict = tune_stage.resume_campaign(self, state)
-        if verdict is None:
-            self.journal.event(
-                "tune stage", "the campaign did not end; the same command resumes it"
-            )
-            return
-        state.tune["verdict"] = verdict
-        self._checkpoint(state)
-        said = f"ended `{verdict}`; the onboarding's verdict stays `{state.verdict}`"
-        self.journal.event("tune stage", said)
-        print_message(f"[bold]tune stage {escape_markup(said)}[/bold]", log)
-
     def _close_run(self, state: WorkflowState, log, *, verdict: str) -> None:
         state.done = True
         state.verdict = verdict
-        if (
-            state.stage == STAGE_EXECUTION
-            and self._tune_requested()
-            and state.tune.get("phase") in ("ground", "campaign", "wrap")
-            and not state.tune.get("verdict")
-        ):
-            # A deferred campaign has no thread to hand over. Record it with the close
-            # so the next invocation resumes it without retrying in this process.
-            state.tune["onboarded"] = verdict
         self._checkpoint(state)
         metrics = metrics_mod.write(self.workspace, opened=self.journal.opened_at())
         cells = contract_mod.load_cells(self.workspace)
@@ -1129,9 +1009,9 @@ class TrtllmModelingV2Workflow:
                 [
                     f"- verdict: **{verdict}**",
                     f"- stage reached: `{state.stage}`",
-                    f"- cells that hold: {', '.join(sorted(cells['cells'])) or 'none'}"
+                    f"- cells whose checks passed: {', '.join(sorted(cells['cells'])) or 'none'}"
                     + (
-                        f"; the most at once on `{cells['best']['sha'][:10]}`"
+                        f"; the most by `{cells['best']['sha'][:10]}`"
                         + (
                             f" (branch `{cells['best']['ref']}`)"
                             if cells["best"].get("ref")
@@ -1154,11 +1034,6 @@ class TrtllmModelingV2Workflow:
             f"[bold]run closed — verdict {verdict}[/bold]",
             log,
         )
-
-
-def campaign_owed(state: WorkflowState) -> bool:
-    """Whether the onboarding closed beside a campaign that has not ended yet."""
-    return bool(state.tune.get("onboarded")) and not state.tune.get("verdict")
 
 
 @dataclass

@@ -24,7 +24,7 @@ def _make_inputs(
     rope_dim: int,
     num_heads: int,
     seed: int = 0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     shape = (batch, seq, hidden_dim)
     if num_heads > 1:
@@ -127,7 +127,7 @@ def test_cute_dsl_dspark_rmsnorm_rope_rejects_invalid_inputs():
 
 
 def test_dspark_rmsnorm_rope_kernel_rejects_invalid_num_heads():
-    from tensorrt_llm._torch.attention.kernels.blackwell.dspark_rmsnorm_rope import (
+    from tensorrt_llm._torch.attention.kernels.blackwell.dspark.rmsnorm_rope import (
         DSparkRMSNormRoPEKernel,
     )
 

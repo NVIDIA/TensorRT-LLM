@@ -893,10 +893,15 @@ class Mamba2Mixer(nn.Module):
                     )
             else:
                 # Non-MTP single-token decode
-                # flashinfer needs contiguous x/B/C with 128-byte alignment.
-                x_d = x_d.contiguous()
-                B_d = B_d.contiguous()
-                C_d = C_d.contiguous()
+                # flashinfer reads x/B/C through their batch stride, so the
+                # column views of zxbcdt can be passed as they are when they
+                # meet its pointer and stride alignment; copy them otherwise.
+                if not (self._use_flashinfer
+                        and not torch.compiler.is_compiling()
+                        and _flashinfer_row_views_ok(x_d, B_d, C_d)):
+                    x_d = x_d.contiguous()
+                    B_d = B_d.contiguous()
+                    C_d = C_d.contiguous()
                 ssu_kwargs = dict(
                     z=None,
                     dt_bias=dt_bias,
@@ -961,6 +966,18 @@ class Mamba2Mixer(nn.Module):
                         D,
                         **ssu_kwargs,
                     )
+
+
+def _flashinfer_row_views_ok(*tensors: torch.Tensor) -> bool:
+    # flashinfer's single-token state update reads each row at
+    # ptr + batch * stride(0) and checks 128-byte (TMA) pointer alignment and
+    # 16-byte batch-stride alignment; inner dims must be dense.
+    for t in tensors:
+        row_bytes = t.stride(0) * t.element_size()
+        if (t.data_ptr() % 128 != 0 or row_bytes % 16 != 0
+                or not t[0].is_contiguous()):
+            return False
+    return True
 
 
 # We want to cache the largest indexing vector we'd ever need and mask it, vs
