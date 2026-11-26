@@ -1163,7 +1163,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 None if raw_request is None else raw_request.headers))
 
     def _warn_if_output_format_unenforced(
-            self, sampling_params: SamplingParams,
+            self, sampling_params: Optional[SamplingParams],
             route: Literal["chat", "completions", "responses"]) -> None:
         """Warn, once per route, that a requested output format is not enforced.
 
@@ -1173,8 +1173,9 @@ class OpenAIServer(_VideoRoutesMixin):
         the request is served as if no format had been requested; this
         warning is the only sign of that.
         """
-        if (sampling_params.guided_decoding is None
-                or self.generator.args.guided_decoding_backend is not None):
+        if (sampling_params is None or sampling_params.guided_decoding is None
+                or getattr(getattr(self.generator, "args", None),
+                           "guided_decoding_backend", None) is not None):
             return
         logger.warning_once(
             f"{_OUTPUT_FORMAT_FIELDS[route]} is accepted but not enforced: "
@@ -2468,10 +2469,12 @@ class OpenAIServer(_VideoRoutesMixin):
                         status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
-            # After the checks above, which reject some requests that carry a
-            # format, and before the tool handling below sets a guided decoding
-            # mode of its own.
-            self._warn_if_output_format_unenforced(sampling_params, "chat")
+            # Record before tool handling below may install a guided decoding
+            # mode of its own; emit the warning only after generation is
+            # accepted so rejected requests cannot consume the once-per-route
+            # warning.
+            has_requested_output_format = (sampling_params.guided_decoding
+                                           is not None)
             reasoning_parser_name = self.generator.args.reasoning_parser
             # Message-level (dynamic) tools are a model extension (Kimi API);
             # only models whose extension declares them render them, so other
@@ -2765,6 +2768,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            if has_requested_output_format:
+                self._warn_if_output_format_unenforced(sampling_params, "chat")
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if raw_request is not None:
@@ -3394,8 +3399,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser,
                 tokenizer=self.tokenizer,
             )
-            self._warn_if_output_format_unenforced(sampling_params,
-                                                   "completions")
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
@@ -3460,6 +3463,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params,
+                                                   "completions")
 
             if request.stream:
                 generators = [
@@ -3577,7 +3582,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "thinking_token_budget is not supported by the Harmony "
                     "GPT-OSS serving path; use reasoning_effort instead")
-            self._warn_if_output_format_unenforced(sampling_params, "chat")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             # The server-level effective flag already enables engine metrics
             # for header or JSONL output.
@@ -3629,6 +3633,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
 
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -3836,7 +3841,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
-            self._warn_if_output_format_unenforced(sampling_params, "responses")
             if not self.use_harmony:
                 # Detokenize as chat completions does for these parsers: a
                 # parser that reads special tokens needs them kept, and Kimi-K3's
@@ -3895,6 +3899,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             _record_input_processing("total", input_started)
             input_started = None
+            self._warn_if_output_format_unenforced(sampling_params, "responses")
 
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.

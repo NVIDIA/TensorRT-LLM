@@ -29,6 +29,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
@@ -73,6 +74,13 @@ NAMED_TOOL_CHOICE = {
 }
 # Rejected by the stub server, which has no reasoning parser.
 THINKING_BUDGET = {"thinking_token_budget": 16}
+# Rejected by the stub server, which has no cache_transceiver_config.
+PROTECTED_DISAGG = {
+    "disaggregated_params": {
+        "request_type": "generation_only",
+        "ctx_info_endpoint": "tcp://127.0.0.1:9999",
+    }
+}
 
 
 class _ModelConfig:
@@ -280,7 +288,9 @@ def test_server_with_a_backend_logs_nothing(served, format_warnings, route, back
     [
         pytest.param("chat", NAMED_TOOL_CHOICE, id="chat-named-tool-choice"),
         pytest.param("chat", THINKING_BUDGET, id="chat-thinking-budget"),
+        pytest.param("chat", PROTECTED_DISAGG, id="chat-protected-disagg"),
         pytest.param("completions", THINKING_BUDGET, id="completions-thinking-budget"),
+        pytest.param("completions", PROTECTED_DISAGG, id="completions-protected-disagg"),
     ],
 )
 def test_rejected_request_leaves_the_warning_to_a_served_one(
@@ -310,14 +320,21 @@ def _harmony_client(served, monkeypatch):
     return TestClient(app)
 
 
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        pytest.param(THINKING_BUDGET, id="thinking-budget"),
+        pytest.param(PROTECTED_DISAGG, id="protected-disagg"),
+    ],
+)
 def test_harmony_rejected_request_leaves_the_warning_to_a_served_one(
-    served, format_warnings, monkeypatch
+    served, format_warnings, monkeypatch, rejected
 ):
     client = _harmony_client(served, monkeypatch)
     path, body = REQUESTS["chat"]
     body = {"model": MODEL, **body, **FORMATS["chat"]}
 
-    response = client.post(path, json={**body, **THINKING_BUDGET})
+    response = client.post(path, json={**body, **rejected})
     assert response.status_code == 400, response.text
     assert format_warnings() == []
 
@@ -356,5 +373,21 @@ def test_harmony_responses_format_is_served_and_warned_about(
     (final_channel,) = tag["format"]["tags"]
     assert final_channel["begin"] == "<|start|>assistant<|channel|>final<|message|>"
     assert final_channel["content"]["json_schema"] == SCHEMA
+    (warning,) = format_warnings()
+    assert warning.startswith("Responses API: 'text.format'")
+
+
+def test_warning_helper_ignores_none_sampling_params_and_minimal_generator_args(
+    served, format_warnings
+):
+    server = served.server
+    server.generator = SimpleNamespace(args=SimpleNamespace())
+
+    server._warn_if_output_format_unenforced(None, "responses")
+    assert format_warnings() == []
+
+    server._warn_if_output_format_unenforced(
+        SamplingParams(guided_decoding=GuidedDecodingParams(json=SCHEMA)), "responses"
+    )
     (warning,) = format_warnings()
     assert warning.startswith("Responses API: 'text.format'")
