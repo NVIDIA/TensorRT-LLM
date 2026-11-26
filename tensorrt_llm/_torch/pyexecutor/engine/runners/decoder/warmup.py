@@ -1350,22 +1350,22 @@ class DecoderWarmup:
 
         enable_megamoe_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
         enable_trtllm_autotuner = self._config.enable_autotuner
-        if not enable_trtllm_autotuner:
-            if enable_megamoe_autotune:
-                runner = self._graphs.breakable_cuda_graph_runner
-                if runner is not None and runner.uses_parent_moe_graph:
-                    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
-                        MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR,
-                    )
-
-                    self.model.extra_attrs[MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR] = True
-            return
-
-        graph_runner = None
-        if enable_megamoe_autotune and mode is not AutotunerWarmupMode.GENERATION_ONLY:
+        # The runner whose breakable prefill graph captures the MegaMoE launch, if MegaMoE tunes.
+        parent_runner = None
+        if enable_megamoe_autotune:
             runner = self._graphs.breakable_cuda_graph_runner
             if runner is not None and runner.uses_parent_moe_graph:
-                graph_runner = runner
+                parent_runner = runner
+        if not enable_trtllm_autotuner:
+            if parent_runner is not None:
+                from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                    MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR,
+                )
+
+                self.model.extra_attrs[MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR] = True
+            return
+
+        graph_runner = None if mode is AutotunerWarmupMode.GENERATION_ONLY else parent_runner
 
         mxfp8_methods = []
         for module in self.model.modules():

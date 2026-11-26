@@ -12,6 +12,7 @@ __all__ = [
     "balanced_copy_enabled",
     "hierarchy_group_sizes",
     "pair_team_objects_enabled",
+    "per_layer_helper_sets_supported",
 ]
 
 MIN_EP = 2
@@ -77,3 +78,16 @@ def pair_team_objects_enabled(world: int, helper_count: int) -> bool:
     through a team object (one multicast), else with unicast stores into each
     rank of the pair."""
     return balanced_copy_enabled(world, helper_count) and world <= MAX_PAIR_TEAM_EP
+
+
+def per_layer_helper_sets_supported(world: int) -> bool:
+    """Whether every MoE layer can have a helper set of its own at this world size.
+
+    Beyond ``MAX_PAIR_TEAM_EP`` that needs a ladder that ends in rank pairs.  On any other
+    ladder a rank joins a team object for every pair it is not in (47 pair and team objects at
+    EP32) and binds each of them once per helper set, which exceeds the binding budget.  Where
+    the finest group has an odd size (EP10: ranks 4 and 5), a rank pair also straddles two
+    groups, and helper slots kept resident on both sides can leave it without a common slot.
+    """
+    sizes = hierarchy_group_sizes(world)
+    return world <= MAX_PAIR_TEAM_EP or (len(sizes) > 1 and sizes[-1] == 2)

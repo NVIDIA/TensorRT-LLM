@@ -1364,7 +1364,11 @@ set wrong has a test that catches it:
   forward pass. `helper_slot_mode=per_layer_resident` gives each layer its own
   helper-slot set, and the copy keeps a per-layer table of the expert each
   helper slot holds so that it skips experts a whole team already holds. Any
-  other writer of those helper rows would invalidate the table.
+  other writer of those helper rows would invalidate the table. Beyond EP8,
+  `per_layer_resident` needs a rank hierarchy that ends in rank pairs (EP16);
+  other sizes are rejected when the slot pool is built, because their pair and
+  team multicast objects exceed the binding budget
+  (`geometry.per_layer_helper_sets_supported`).
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
@@ -1415,7 +1419,11 @@ set wrong has a test that catches it:
   bucket and attention DP, in either helper slot mode. The parent segment
   captures the COPY producer, the route wait, and the MAIN consumers. Replay
   writes the current READY generation on MAIN, and the lease is released
-  after submission.
+  after submission. `PerLayerDynamicMoeLoadBalancer.validate_breakable_prefill_graph`
+  rejects a deployment whose engine drops or clamps that bucket, whose MoE
+  chunking splits it, or whose shared expert is fused into the MoE kernel
+  (`moe_config.megamoe_fuse_shared_expert`), since the fused path routes
+  outside the layer's `load_balancer_overlap` scope.
 
 ## Canonical Examples
 

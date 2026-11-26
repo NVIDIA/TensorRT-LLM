@@ -28,7 +28,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
-from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
@@ -74,7 +73,7 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
     MiniMaxM3SparseAttentionConfig,
@@ -644,20 +643,12 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
-        dynamic_eplb = isinstance(self._moe_load_balancer, PerLayerDynamicMoeLoadBalancer)
-        # A layer joins the parent MoE graph in its ``load_balancer_overlap`` scope,
-        # which only the DeepSeek-V4 MoE block opens around its routed experts.
-        if dynamic_eplb and (
-            not any(
-                getattr(module, "_per_layer_dynamic_eplb_enabled", False)
-                for module in decoder_model.model.modules()
-            )
-            or get_sm_version() not in (100, 103)
-        ):
-            raise ValueError(
-                "Breakable prefill CUDA graph with per-layer dynamic EPLB "
-                "requires a DeepSeek-V4 decoder on SM100 or SM103"
-            )
+        # A load balancer whose layers join the captured graph says which deployments it supports.
+        validate_parent_graph = getattr(
+            self._moe_load_balancer, "validate_breakable_prefill_graph", None
+        )
+        if validate_parent_graph is not None:
+            validate_parent_graph(decoder_model, self._config.prefill_cuda_graph_num_tokens)
         logger.info(
             f"Breakable prefill CUDA graphs on {type(decoder_model.model).__name__} "
             f"for num_tokens={self._config.prefill_cuda_graph_num_tokens}"
@@ -665,7 +656,7 @@ class DecoderRunner(ScheduledModelRunner):
         return BreakableCUDAGraphRunner(
             decoder_model.model,
             getattr(decoder_model, "prepare_breakable_cuda_graph_replay", None),
-            capture_on_current_stream=dynamic_eplb,
+            capture_on_current_stream=validate_parent_graph is not None,
         )
 
     @property

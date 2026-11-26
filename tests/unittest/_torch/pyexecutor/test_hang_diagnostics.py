@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import threading
 from unittest.mock import MagicMock, Mock, call
 
 import pytest
@@ -137,9 +136,8 @@ def test_enqueue_responses_packs_only_what_other_ranks_gather_to_the_leader(
     executor.dist.allgather.return_value = [[]]
     executor.enable_attention_dp = attention_dp
     executor.gather_all_responses = gather_all
-    executor.response_cv = threading.Condition()
-    executor.responses = {}
-    executor.result_wait_queues = {}
+    executor._response_channel = Mock()
+    executor._stage_responses = False
     executor._maybe_record_hang_diagnostic_phase = Mock()
     packer = Mock(return_value=[(-1, "packed")])
     executor.peer_response_packer = packer

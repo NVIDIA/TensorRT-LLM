@@ -333,24 +333,22 @@ def _moe_tactic_schema() -> dict:
 
 
 def _required_property(name: str, schema: dict) -> dict:
-    return {"type": "object", "required": [name], "properties": {name: schema}}
+    return {"type": "object", **_is_set_to(name, schema)}
 
 
-def _dynamic_eplb_prefill_schema(inline_dynamic: dict, *, inherited_options: bool) -> dict:
+def _dynamic_eplb_prefill_schema(inline_dynamic: dict) -> dict:
     """Describe the constraints on the inline per-layer dynamic EPLB form."""
     from tensorrt_llm.llmapi.llm_args import (
         _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS,
         PrefillCudaGraphBackend,
     )
 
+    # Neither field is required: the CLI, or the enclosing mapping of a disaggregated server
+    # block, can supply it, and the merged runtime configuration rejects a missing one.
     capture_fields = {
         "prefill_capture_num_tokens": {"const": [_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS]},
         "enable_attention_dp": {"const": True},
     }
-    capture: dict = {"properties": capture_fields}
-    if not inherited_options:
-        # The CLI can supply attention DP independently of the YAML file.
-        capture["required"] = ["prefill_capture_num_tokens"]
 
     return {
         "if": _required_property("moe_config", _required_property("load_balancer", inline_dynamic)),
@@ -366,19 +364,19 @@ def _dynamic_eplb_prefill_schema(inline_dynamic: dict, *, inherited_options: boo
             "if": _required_property(
                 "prefill_cuda_graph_backend", {"const": PrefillCudaGraphBackend.BREAKABLE}
             ),
-            "then": capture,
+            "then": {"properties": capture_fields},
         },
     }
 
 
-def generate_serve_schema(*, inherited_options: bool = False) -> dict:
+def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
-    schema = _serve_schema(inherited_options=inherited_options)
+    schema = _serve_schema()
     _cross_field_rules(schema["$defs"])
     return schema
 
 
-def _serve_schema(*, inherited_options: bool = False) -> dict:
+def _serve_schema() -> dict:
     """The serve schema without ``_cross_field_rules``, so that later merges see unmodified definitions."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
@@ -506,9 +504,7 @@ def _serve_schema(*, inherited_options: bool = False) -> dict:
         "".join(f"[{char}{char.lower()}]" for char in name) for name in encoder_backend.pop("enum")
     ]
     encoder_backend["pattern"] = "^(?:" + "|".join(alternatives) + r")$(?![\s\S])"
-    schema["$defs"][_DYNAMIC_EPLB_PREFILL_SCHEMA] = _dynamic_eplb_prefill_schema(
-        inline_dynamic, inherited_options=inherited_options
-    )
+    schema["$defs"][_DYNAMIC_EPLB_PREFILL_SCHEMA] = _dynamic_eplb_prefill_schema(inline_dynamic)
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
@@ -585,7 +581,7 @@ def generate_disagg_schema() -> dict:
     )
     from tensorrt_llm.llmapi.llm_args import SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs
 
-    schema = _serve_schema(inherited_options=True)
+    schema = _serve_schema()
     properties = schema["properties"]
     for config_name, aliases in SERVE_CLI_CONFIG_FIELDS.items():
         config = _schema_for(TorchLlmArgs.model_fields[config_name].annotation, schema)

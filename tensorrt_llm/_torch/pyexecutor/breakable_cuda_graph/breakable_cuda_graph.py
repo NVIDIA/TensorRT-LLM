@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
-    "DynamicMoeGraphReplayError",
+    "SegmentReplayError",
     "break_graph",
     "eager_on_graph",
     "get_current_replay_token",
@@ -50,8 +50,12 @@ _wait_stream_hook_lock = threading.Lock()
 _wait_stream_hook_refcount = 0
 
 
-class DynamicMoeGraphReplayError(RuntimeError):
-    """A partially submitted parent graph requires distributed worker teardown."""
+class SegmentReplayError(RuntimeError):
+    """A graph with wrapped segments failed part way through its submission.
+
+    Other ranks may be waiting for what the remaining segments would have published, so the
+    worker must be torn down instead of recovering in place.
+    """
 
 
 def register_segment_replay(
@@ -68,7 +72,7 @@ def register_segment_replay(
     graph = capture.cuda_graph
     index = len(graph._segments) - 1
     if index in graph._segment_replays:
-        raise RuntimeError("A graph segment must have exactly one dynamic MoE owner")
+        raise RuntimeError("A graph segment takes at most one replay wrapper")
     graph._segment_replays[index] = (replay, keepalive)
     # The native event fork bypasses the Python wait_stream hook.
     forked.add(side_stream)
@@ -333,8 +337,8 @@ class BreakableCUDAGraph:
                         fn()
         except Exception as error:  # noqa: BLE001 - any partial submission can strand peers
             if self._segment_replays:
-                raise DynamicMoeGraphReplayError(
-                    f"Dynamic MoE parent graph replay failed at segment {index}: {error}"
+                raise SegmentReplayError(
+                    f"Graph replay failed at segment {index}: {error}"
                 ) from error
             raise
         finally:

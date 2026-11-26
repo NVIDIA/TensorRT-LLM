@@ -449,6 +449,54 @@ class _MulticastSpec:
         self.handles: List[Any] = []
 
 
+def _join_multicast(
+    vmm: _Vmm,
+    comm: Any,
+    rank: int,
+    objects: List[Tuple[Tuple[int, ...], Tuple[int, ...], int]],
+    label: str,
+) -> Dict[int, List[Any]]:
+    """Collectively create multicast objects and add this rank's device to those it joins.
+
+    An object is ``(members, creators, nbytes)``: every creator makes one alias of it, which the
+    other members import. Every rank passes the same objects in the same order. Returns, by
+    object index, this rank's handles of the objects it is a member of, one per creator.
+    """
+    cuda, check = vmm.cuda, vmm.check
+    created: Dict[Tuple[int, int], Any] = {}
+    exported: Dict[Tuple[int, int], bytes] = {}
+    for index, (members, creators, nbytes) in enumerate(objects):
+        for alias, creator in enumerate(creators):
+            if rank == creator:
+                handle = check(
+                    cuda.cuMulticastCreate(vmm.multicast_properties(len(members), nbytes)),
+                    f"cuMulticastCreate({label})",
+                )
+                vmm.register_created_multicast(handle)
+                created[(index, alias)] = handle
+                exported[(index, alias)] = bytes(
+                    check(
+                        cuda.cuMemExportToShareableHandle(handle, vmm.fabric, 0),
+                        f"cuMemExportToShareableHandle({label})",
+                    ).data
+                )
+    gathered = comm.allgather(exported)
+    joined: Dict[int, List[Any]] = {}
+    for index, (members, creators, _) in enumerate(objects):
+        if rank not in members:
+            continue
+        handles = []
+        for alias, creator in enumerate(creators):
+            handle = created.get((index, alias))
+            if handle is None:
+                handle = vmm.import_multicast(gathered[creator][(index, alias)])
+            check(cuda.cuMulticastAddDevice(handle, vmm.device), f"cuMulticastAddDevice({label})")
+            handles.append(handle)
+        joined[index] = handles
+    comm.barrier()
+    return joined
+
+
 def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpec]) -> None:
     """Collectively create, bind and map dual-creator multicast objects.
 
@@ -458,38 +506,12 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
     outside a group join only the collectives; specs are rank-ordered alike.
     """
     cuda, check = vmm.cuda, vmm.check
-    created: Dict[Tuple[int, int], Any] = {}
-    exported: Dict[Tuple[int, int], bytes] = {}
-    for index, spec in enumerate(specs):
-        for alias, creator in enumerate(spec.members[:2]):
-            if rank == creator:
-                handle = check(
-                    cuda.cuMulticastCreate(
-                        vmm.multicast_properties(len(spec.members), spec.nbytes)
-                    ),
-                    "cuMulticastCreate(shared slots)",
-                )
-                vmm.register_created_multicast(handle)
-                created[(index, alias)] = handle
-                exported[(index, alias)] = bytes(
-                    check(
-                        cuda.cuMemExportToShareableHandle(handle, vmm.fabric, 0),
-                        "cuMemExportToShareableHandle(shared multicast)",
-                    ).data
-                )
-    gathered = comm.allgather(exported)
-    joined = [(index, spec) for index, spec in enumerate(specs) if rank in spec.members]
-    for index, spec in joined:
-        for alias, creator in enumerate(spec.members[:2]):
-            handle = created.get((index, alias))
-            if handle is None:
-                handle = vmm.import_multicast(gathered[creator][(index, alias)])
-            spec.handles.append(handle)
-            check(
-                cuda.cuMulticastAddDevice(handle, vmm.device), "cuMulticastAddDevice(shared slots)"
-            )
-    comm.barrier()
-    for _, spec in joined:
+    objects = [(spec.members, spec.members[:2], spec.nbytes) for spec in specs]
+    joined = []
+    for index, handles in _join_multicast(vmm, comm, rank, objects, "shared slots").items():
+        specs[index].handles.extend(handles)
+        joined.append(specs[index])
+    for spec in joined:
         for handle in spec.handles:
             for offset, memory, nbytes in spec.binds:
                 check(
@@ -498,7 +520,7 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
                 )
                 vmm.record_multicast_bind(handle, offset, nbytes)
     comm.barrier()
-    for _, spec in joined:
+    for spec in joined:
         selected = spec.handles[1 if len(spec.handles) > 1 and rank == spec.members[0] else 0]
         for address in spec.mappings:
             vmm.map(address, spec.nbytes, selected)
@@ -628,8 +650,14 @@ class _SharedSlotPool:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.geometry import (
             balanced_copy_enabled,
             pair_team_objects_enabled,
+            per_layer_helper_sets_supported,
         )
 
+        if per_layer_sets and not per_layer_helper_sets_supported(world):
+            raise ValueError(
+                f"helper_slot_mode='per_layer_resident' is not supported at EP{world}; "
+                "use helper_slot_mode='shared_banks'"
+            )
         self.balanced_pairs = balanced_copy_enabled(world, helper_count)
         self.pair_teams = pair_team_objects_enabled(world, helper_count)
         if world < 4:
@@ -876,15 +904,21 @@ class _SharedSlotPool:
             span = int(value)
         except ValueError:
             span = 0
-        if span <= 0:
-            raise ValueError(f"{_PAIR_SPAN_LAYERS_ENV} must be a positive int; got {value!r}")
-        # Every member must bind the same offsets, so the span must agree.
-        spans = comm.allgather(span)
+        # The ranks exchange their values before any of them rejects one, so
+        # that they all leave the collective and raise together.  Every member
+        # must bind the same offsets, so the span must also agree.
+        gathered = comm.allgather((span, value))
+        invalid = {rank: text for rank, (item, text) in enumerate(gathered) if item <= 0}
+        if invalid:
+            raise ValueError(
+                f"{_PAIR_SPAN_LAYERS_ENV} must be a positive int; got {invalid} by EP rank"
+            )
+        spans = [item for item, _ in gathered]
         if any(item != span for item in spans):
             raise ValueError(f"{_PAIR_SPAN_LAYERS_ENV} differs across the EP group: {spans}")
         return span
 
-    def _create_pair_objects(self, span: int, comm: Any, teams: bool = True) -> _PairObjects:
+    def _create_pair_objects(self, span: int, comm: Any, teams: bool) -> _PairObjects:
         """Collectively create and map the pair and team objects of
         ``_PairObjects``; ``_bind_pair_set`` binds each helper set later.
 
@@ -897,57 +931,26 @@ class _SharedSlotPool:
         set stays inside this rank's reservation.
         """
         vmm, world, rank = self.vmm, self.world, self.rank
-        cuda, check = vmm.cuda, vmm.check
         nbytes = span * self.set_bytes
         objects = []
         for j in range(world // 2):
             pair = (2 * j, 2 * j + 1)
-            objects.append((pair, pair))
+            objects.append((pair, pair, nbytes))
             if teams:
                 objects.extend(
-                    ((owner,) + pair, (pair[0],)) for owner in range(world) if owner not in pair
+                    ((owner,) + pair, (pair[0],), nbytes)
+                    for owner in range(world)
+                    if owner not in pair
                 )
-        created: Dict[Tuple[int, int], Any] = {}
-        exported: Dict[Tuple[int, int], bytes] = {}
-        for index, (members, creators) in enumerate(objects):
-            for alias, creator in enumerate(creators):
-                if rank == creator:
-                    handle = check(
-                        cuda.cuMulticastCreate(vmm.multicast_properties(len(members), nbytes)),
-                        "cuMulticastCreate(pair multicast)",
-                    )
-                    vmm.register_created_multicast(handle)
-                    created[(index, alias)] = handle
-                    exported[(index, alias)] = bytes(
-                        check(
-                            cuda.cuMemExportToShareableHandle(handle, vmm.fabric, 0),
-                            "cuMemExportToShareableHandle(pair multicast)",
-                        ).data
-                    )
-        gathered = comm.allgather(exported)
-        joined = []
-        for index, (members, creators) in enumerate(objects):
-            if rank not in members:
-                continue
-            handles = []
-            for alias, creator in enumerate(creators):
-                handle = created.get((index, alias))
-                if handle is None:
-                    handle = vmm.import_multicast(gathered[creator][(index, alias)])
-                check(
-                    cuda.cuMulticastAddDevice(handle, vmm.device),
-                    "cuMulticastAddDevice(pair multicast)",
-                )
-                handles.append(handle)
-            joined.append((members, handles))
-        comm.barrier()
+        joined = _join_multicast(vmm, comm, rank, objects, "pair multicast")
         # An object is mapped before any set is bound into it; binds follow
         # when the pool creates each set (validated on VR200).
         bases = [0] * (world // 2)
         prefix = max(self.home_bytes.values())
         member_handles: List[Any] = []
         owner_handles: List[Any] = []
-        for members, handles in joined:
+        for index, handles in joined.items():
+            members = objects[index][0]
             if len(members) == 2:
                 member_handles.extend(handles)
                 selected = handles[1 if rank == members[0] else 0]

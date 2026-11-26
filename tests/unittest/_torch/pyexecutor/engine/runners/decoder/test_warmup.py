@@ -11,6 +11,7 @@ import sys
 import unittest
 from collections.abc import Iterator
 from dataclasses import replace
+from functools import partial
 from queue import Queue
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
@@ -31,17 +32,20 @@ from _torch.pyexecutor.engine_test_utils import (
     kv_cache_manager,
 )
 
+import tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.manager as eplb_manager_module
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs as graphs_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
-from tensorrt_llm._torch.models.modeling_utils import remove_weights
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, remove_weights
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import is_parent_moe_graph_enabled
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
+from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import filter_prefill_capture_num_tokens
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
@@ -916,6 +920,110 @@ def test_disabled_autotuner_keeps_dynamic_parent_default_available(monkeypatch, 
     assert decoder.model.extra_attrs == (
         {MEGAMOE_ALLOW_UNTUNED_PARENT_GRAPH_ATTR: True} if dynamic_parent else {}
     )
+
+
+def _dynamic_eplb_moe_block() -> torch.nn.Module:
+    """Stand in for a DeepSeek-V4 MoE block, which runs its shared expert until that is fused."""
+    block = torch.nn.Module()
+    block._per_layer_dynamic_eplb_enabled = True
+    block.shared_experts = torch.nn.Identity()
+    return block
+
+
+def _dynamic_eplb_breakable_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_block: torch.nn.Module,
+    *,
+    prefill_cuda_graph_num_tokens: list[int],
+    moe_max_num_tokens: int,
+) -> DecoderRunner:
+    """A decoder runner on SM100 whose decoder has one per-layer dynamic EPLB MoE block."""
+    model = object.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Sequential(moe_block)
+    model.model_config = SimpleNamespace(moe_max_num_tokens=moe_max_num_tokens)
+    runner = object.__new__(DecoderRunner)
+    runner._model = model
+    balancer = Mock(spec=PerLayerDynamicMoeLoadBalancer)
+    balancer.validate_breakable_prefill_graph = partial(
+        PerLayerDynamicMoeLoadBalancer.validate_breakable_prefill_graph, balancer
+    )
+    runner._moe_load_balancer = balancer
+    runner._config = decoder_config(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=prefill_cuda_graph_num_tokens,
+    )
+    monkeypatch.setattr(eplb_manager_module, "get_sm_version", lambda: 100)
+    return runner
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_num_tokens", "max_batch_size", "moe_max_num_tokens", "error"),
+    [
+        (8192, 16, 8192, None),
+        # The engine drops a bucket above max_num_tokens ...
+        (4096, 16, 8192, r"engine captures num_tokens=\[\]"),
+        # ... and clamps one above max_batch_size * (max_seq_len - 1).
+        (8192, 1, 8192, r"engine captures num_tokens=\[8191\]"),
+        # MoE chunking would route the bucket as two 4096-row chunks.
+        (8192, 16, 4096, "splits it at 4096 tokens"),
+    ],
+)
+def test_dynamic_eplb_breakable_runner_requires_the_whole_capture_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+    max_num_tokens: int,
+    max_batch_size: int,
+    moe_max_num_tokens: int,
+    error: str | None,
+) -> None:
+    """A bucket that the engine or the MoE cannot run whole is rejected before warmup."""
+    captured, _ = filter_prefill_capture_num_tokens(
+        [8192], max_num_tokens=max_num_tokens, max_batch_size=max_batch_size, max_seq_len=8192
+    )
+    runner = _dynamic_eplb_breakable_runner(
+        monkeypatch,
+        _dynamic_eplb_moe_block(),
+        prefill_cuda_graph_num_tokens=captured,
+        moe_max_num_tokens=moe_max_num_tokens,
+    )
+
+    if error is None:
+        assert runner._initialize_breakable_cuda_graph_runner().uses_parent_moe_graph
+    else:
+        with pytest.raises(ValueError, match=error):
+            runner._initialize_breakable_cuda_graph_runner()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fuses_shared_expert", [False, True])
+def test_dynamic_eplb_breakable_runner_rejects_a_fused_shared_expert(
+    monkeypatch: pytest.MonkeyPatch, fuses_shared_expert: bool
+) -> None:
+    """A block whose shared expert was fused routes outside its ``load_balancer_overlap`` scope."""
+    from tensorrt_llm._torch.models.modeling_deepseekv4 import fuse_megamoe_shared_experts
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
+
+    block = _dynamic_eplb_moe_block()
+    backend = Mock(spec=MegaMoECuteDsl)
+    backend.can_fuse_shared_expert.return_value = True
+    block.experts = SimpleNamespace(
+        backend=backend,
+        num_fused_shared_expert=int(fuses_shared_expert),
+        layer_idx=0,
+        fuse_shared_expert=Mock(),
+    )
+    fuse_megamoe_shared_experts([SimpleNamespace(mlp=block)])
+    assert (block.shared_experts is None) == fuses_shared_expert
+    runner = _dynamic_eplb_breakable_runner(
+        monkeypatch, block, prefill_cuda_graph_num_tokens=[8192], moe_max_num_tokens=8192
+    )
+
+    if fuses_shared_expert:
+        with pytest.raises(ValueError, match="megamoe_fuse_shared_expert"):
+            runner._initialize_breakable_cuda_graph_runner()
+    else:
+        assert runner._initialize_breakable_cuda_graph_runner().uses_parent_moe_graph
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])

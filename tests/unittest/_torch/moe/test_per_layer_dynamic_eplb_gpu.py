@@ -18,17 +18,20 @@ Every forward runs the whole path: HALO-Q exchanges the routing counts, plans
 the hot experts, copies their weights into helper slots with an in-switch
 multicast and remaps the routes, and MegaMoE computes on the remapped slots.
 Three quarters of the tokens pick the experts of one rank, so the plan must
-use helper slots.  Three forwards cover a fresh plan, the same plan again with
-its helpers already resident, and a different plan.  A second case removes the
-pair team objects, so an owner outside a rank pair writes its share of the
-copy with unicast stores, as at EP16. A third case captures the full MoE,
-replays changing routes on MAIN, and clears and recaptures the parent graph.
-After each forward every rank checks
+use helper slots.  Three forwards cover a fresh plan, the same plan again, and
+a different plan.  The first case gives the layer its own helper slots
+(``per_layer_resident``), so the repeated plan finds its helpers resident and
+must copy nothing.  A second case removes the pair team objects, so an owner
+outside a rank pair writes its share of the copy with unicast stores, as at
+EP16; its shared banks are copied in every forward.  A third case captures the
+full MoE, replays changing routes on MAIN, and clears and recaptures the parent
+graph.  After each forward every rank checks
 
 - the output against the NVFP4 reference MoE;
 - every route: a home slot must be the expert's own, and a helper slot must
   hold a byte-exact copy of the expert's weights in every plane;
-- that some route used a helper slot.
+- that some route used a helper slot;
+- in the eager cases, whether the ranks issued a copy.
 
 The path needs two or more EP ranks with NVLink multicast, so one GPU cannot
 run it; the planner alone is tested on one GPU by moeRebalanceHaloQTest.
@@ -38,6 +41,7 @@ import os
 import pickle
 import sys
 from contextlib import nullcontext
+from typing import Any
 
 import cloudpickle
 import pytest
@@ -81,7 +85,7 @@ TOKENS_PER_RANK = 128
 HOT_RANKS = (0, 0, 1)
 
 
-def _skip_reason():
+def _skip_reason() -> str | None:
     if torch.cuda.device_count() < EP_SIZE:
         return f"needs {EP_SIZE} GPUs"
     if not is_sm_100f():
@@ -105,7 +109,7 @@ def _skip_reason():
     return None
 
 
-def _init_worker(custom_paths):
+def _init_worker(custom_paths: list[str]) -> None:
     # Per-layer dynamic EPLB needs the larger launch queues from CUDA start.
     os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
     for custom_path in custom_paths:
@@ -113,7 +117,7 @@ def _init_worker(custom_paths):
             sys.path.append(custom_path)
 
 
-def _init_process_group(rank, world_size):
+def _init_process_group(rank: int, world_size: int) -> None:
     """Join the NCCL WORLD group, which MegaMoE resolves as its EP group."""
     master_addr = "127.0.0.1"
     store = None
@@ -144,12 +148,16 @@ def _init_process_group(rank, world_size):
     dist.init_process_group(backend="nccl", store=store, rank=rank, world_size=world_size)
 
 
-def _record_routes(layer, *, capture_only=False):
+def _record_routes(
+    layer: Any, *, capture_only: bool = False
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Record the logical experts and physical slots of each route the layer plans."""
     records = []
     route = layer.route
 
-    def recording_route(token_selected_experts, *args, **kwargs):
+    def recording_route(
+        token_selected_experts: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> torch.Tensor:
         physical = route(token_selected_experts, *args, **kwargs)
         if not capture_only or torch.cuda.is_current_stream_capturing():
             records.append((token_selected_experts, physical))
@@ -159,7 +167,7 @@ def _record_routes(layer, *, capture_only=False):
     return records
 
 
-def _gather_slot_rows(plane, world_size):
+def _gather_slot_rows(plane: torch.Tensor, world_size: int) -> torch.Tensor:
     """Return every rank's slot rows of a weight plane as bytes, rank-major."""
     rows = torch.stack([row.contiguous().reshape(-1).view(torch.uint8) for row in plane])
     gathered = rows.new_empty((world_size * rows.shape[0], rows.shape[1]))
@@ -167,7 +175,9 @@ def _gather_slot_rows(plane, world_size):
     return gathered
 
 
-def _check_routes(layer, records, world_size):
+def _check_routes(
+    layer: Any, records: list[tuple[torch.Tensor, torch.Tensor]], world_size: int
+) -> list[str]:
     """Check the last forward's routes against the slot weights; return the errors.
 
     Collective: it gathers the weight planes and sums the helper routes.
@@ -205,8 +215,20 @@ def _check_routes(layer, records, world_size):
     return errors
 
 
+def _copy_segments(group: Any) -> int:
+    """Return the copy segments that the ranks issued in the last forward.
+
+    Collective: it sums the count of every rank.
+    """
+    segments = torch.tensor(
+        [group.broadcaster.last_mode_counts()[2]], dtype=torch.int64, device="cuda"
+    )
+    dist.all_reduce(segments)
+    return int(segments.item())
+
+
 def _run_rank(
-    world_size: int, team_objects: bool, parent_graph: bool
+    world_size: int, team_objects: bool, parent_graph: bool, helper_slot_mode: str
 ) -> tuple[int, list[str], bool]:
     """Run the forwards on this rank and return its errors and shutdown result."""
     if parent_graph:
@@ -222,15 +244,18 @@ def _run_rank(
         # The planner, BCG capture, and replay must all bind to the same MAIN.
         stream_scope = torch.cuda.stream(torch.cuda.Stream()) if parent_graph else nullcontext()
         with stream_scope:
-            errors, shut_down = _run_forwards(rank, world_size, parent_graph)
+            errors, shut_down = _run_forwards(rank, world_size, parent_graph, helper_slot_mode)
     return rank, errors, shut_down
 
 
-def _run_forwards(rank, world_size, parent_graph):
+def _run_forwards(
+    rank: int, world_size: int, parent_graph: bool, helper_slot_mode: str
+) -> tuple[list[str], bool]:
     dtype = torch.bfloat16
     num_experts = MODEL.num_experts
     home = num_experts // world_size
     tokens = _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS if parent_graph else TOKENS_PER_RANK
+    resident = helper_slot_mode == "per_layer_resident"
 
     # All ranks draw the same tensors, so they build identical weights with one
     # activation scale; each rank then takes its own tokens.
@@ -275,7 +300,8 @@ def _run_forwards(rank, world_size, parent_graph):
         quant_config=quant_config,
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
         moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(
-            num_slots=num_experts + world_size * HELPER_SLOTS_PER_RANK
+            num_slots=num_experts + world_size * HELPER_SLOTS_PER_RANK,
+            helper_slot_mode=helper_slot_mode,
         ),
         max_num_tokens=max(256, tokens),
     )
@@ -304,11 +330,11 @@ def _run_forwards(rank, world_size, parent_graph):
         group = layer._scheduler_group
         logits = torch.empty_like(all_logits[rank])
 
-        def forward():
+        def forward() -> torch.Tensor:
             with MoeLoadBalancerIterContext(balancer):
                 return moe.forward(x, logits, all_rank_num_tokens=[tokens] * world_size)
 
-        def warmup_or_capture():
+        def warmup_or_capture() -> torch.Tensor:
             assert runner is not None
             if runner.is_capturing:
                 with runner.capture_context(), layer.use_parent_moe_graph():
@@ -360,6 +386,15 @@ def _run_forwards(rank, world_size, parent_graph):
                     f"forward {step}: {error}"
                     for error in _check_routes(layer, records, world_size)
                 ]
+                if runner is None:
+                    # Resident helper slots keep their experts, so the copy of a
+                    # repeated plan is skipped; shared banks are copied every time.
+                    repeated = step > 0 and hot_rank == HOT_RANKS[step - 1]
+                    skipped = _copy_segments(group) == 0
+                    if skipped != (resident and repeated):
+                        errors.append(
+                            f"forward {step}: the copy was {'skipped' if skipped else 'issued'}"
+                        )
         finally:
             if runner is not None:
                 torch.cuda.synchronize()
@@ -370,11 +405,17 @@ def _run_forwards(rank, world_size, parent_graph):
 
 @pytest.mark.threadleak(enabled=False)  # the MPIPoolExecutor manager thread outlives the test
 @pytest.mark.parametrize(
-    ("team_objects", "parent_graph"),
-    [(True, False), (False, False), (True, True)],
-    ids=["pair_teams", "pair_unicast", "parent_graph"],
+    ("team_objects", "parent_graph", "helper_slot_mode"),
+    [
+        (True, False, "per_layer_resident"),
+        (False, False, "shared_banks"),
+        (True, True, "shared_banks"),
+    ],
+    ids=["pair_teams_resident", "pair_unicast", "parent_graph"],
 )
-def test_per_layer_dynamic_eplb_megamoe_cutedsl(team_objects: bool, parent_graph: bool) -> None:
+def test_per_layer_dynamic_eplb_megamoe_cutedsl(
+    team_objects: bool, parent_graph: bool, helper_slot_mode: str
+) -> None:
     reason = _skip_reason()
     if reason:
         pytest.skip(reason)
@@ -385,7 +426,11 @@ def test_per_layer_dynamic_eplb_megamoe_cutedsl(team_objects: bool, parent_graph
     ) as executor:
         results = list(
             executor.map(
-                _run_rank, [EP_SIZE] * EP_SIZE, [team_objects] * EP_SIZE, [parent_graph] * EP_SIZE
+                _run_rank,
+                [EP_SIZE] * EP_SIZE,
+                [team_objects] * EP_SIZE,
+                [parent_graph] * EP_SIZE,
+                [helper_slot_mode] * EP_SIZE,
             )
         )
     for rank, errors, shut_down in sorted(results):

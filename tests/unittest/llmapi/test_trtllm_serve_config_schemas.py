@@ -1346,7 +1346,8 @@ def test_encoder_attention_backend_schema(
             "per_layer_resident",
             False,
         ),
-        ({"prefill_capture_num_tokens": None}, "per_layer_resident", False),
+        # --set prefill_capture_num_tokens=[8192] may supply the bucket.
+        ({"prefill_capture_num_tokens": None}, "per_layer_resident", True),
         ({"prefill_capture_num_tokens": [4096, 8192]}, "per_layer_resident", False),
         ({"enable_attention_dp": False}, "per_layer_resident", False),
         ({"enable_attention_dp": True}, "shared_banks", True),
@@ -1369,6 +1370,26 @@ def test_per_layer_dynamic_eplb_prefill_schema(
     config = {name: value for name, value in config.items() if value is not None}
     errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+def test_per_layer_dynamic_eplb_prefill_bucket_is_required_after_the_cli_merge(
+    schemas: dict[str, dict], tmp_path: Path
+) -> None:
+    """A fragment may leave the capture bucket to --set; the merged configuration requires it."""
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    fragment = {
+        "moe_config": {"load_balancer": {"mode": "per_layer_dynamic", "num_slots": 320}},
+        "prefill_cuda_graph_backend": "breakable",
+        "enable_attention_dp": True,
+    }
+    Draft202012Validator(schemas[generator.SERVE_SCHEMA]).validate(fragment)
+    with pytest.raises(ValueError, match="with breakable prefill requires"):
+        TorchLlmArgs(model=tmp_path, gpus_per_node=1, **fragment)
+    # As merged from --set 'prefill_capture_num_tokens=[8192]'.
+    merged = {**fragment, "prefill_capture_num_tokens": [8192]}
+    args = TorchLlmArgs(model=tmp_path, gpus_per_node=1, **merged)
+    assert args.prefill_capture_num_tokens == [8192]
 
 
 def test_disagg_dynamic_eplb_prefill_allows_inherited_capture_fields(

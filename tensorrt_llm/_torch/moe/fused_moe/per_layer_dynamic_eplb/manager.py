@@ -8,6 +8,9 @@ from typing import Any, Optional
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+
 from ..moe_load_balancer import BaseMoeLoadBalancer
 from .layer import PerLayerDynamicMoeLayerLoadBalancer, _append_note
 
@@ -115,6 +118,47 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         )
         self.single_layer_load_balancers.append(layer)
         return layer
+
+    def validate_breakable_prefill_graph(
+        self, decoder_model: torch.nn.Module, captured_num_tokens: list[int]
+    ) -> None:
+        """Reject a breakable prefill CUDA graph that the load-balanced layers cannot join.
+
+        A layer joins the parent MoE graph in its ``load_balancer_overlap`` scope, which only the
+        DeepSeek-V4 MoE block opens, and only around a shared expert that it runs outside the MoE
+        kernel. A parent-graph route carries the whole capture bucket, so the engine must neither
+        drop nor clamp the bucket and the MoE must not split it into chunks.
+        """
+        moe_blocks = [
+            module
+            for module in decoder_model.model.modules()
+            if getattr(module, "_per_layer_dynamic_eplb_enabled", False)
+        ]
+        if not moe_blocks or get_sm_version() not in (100, 103):
+            raise ValueError(
+                "Breakable prefill CUDA graph with per-layer dynamic EPLB "
+                "requires a DeepSeek-V4 decoder on SM100 or SM103"
+            )
+        if any(block.shared_experts is None for block in moe_blocks):
+            raise ValueError(
+                "Breakable prefill CUDA graph with per-layer dynamic EPLB does not support "
+                "a shared expert fused into the MoE kernel; set "
+                "moe_config.megamoe_fuse_shared_expert=False"
+            )
+        bucket = _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+        if captured_num_tokens != [bucket]:
+            raise ValueError(
+                "Breakable prefill CUDA graph with per-layer dynamic EPLB requires the "
+                f"{bucket}-token bucket, but the engine captures num_tokens={captured_num_tokens}; "
+                f"max_num_tokens and max_batch_size * (max_seq_len - 1) must reach {bucket}"
+            )
+        moe_chunk_tokens = decoder_model.model_config.moe_max_num_tokens
+        if moe_chunk_tokens < bucket:
+            raise ValueError(
+                "Breakable prefill CUDA graph with per-layer dynamic EPLB requires the "
+                f"{bucket}-token bucket in one MoE chunk, but moe_config.max_num_tokens "
+                f"splits it at {moe_chunk_tokens} tokens"
+            )
 
     def get_copy_stream(self, device: int) -> torch.cuda.Stream:
         """Return this model's single highest-priority auxiliary stream."""

@@ -327,6 +327,32 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
 
 
 @pytest.mark.parametrize(
+    ("world", "supported"),
+    [
+        (4, True),
+        (6, True),
+        (8, True),
+        # A ladder that ends in rank pairs has no team objects above EP8.
+        (16, True),
+        # Rank pairs 4/5 straddle the two five-rank groups.
+        (10, False),
+        (12, False),
+        # 47 pair and team objects per helper set.
+        (32, False),
+    ],
+)
+def test_per_layer_helper_sets_are_limited_to_supported_worlds(world: int, supported: bool) -> None:
+    """A helper set per layer is rejected where its multicast binds or its pair slots do not fit."""
+    path = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/geometry.py"
+    spec = importlib.util.spec_from_file_location("_scheduler_geometry_under_test", path)
+    assert spec is not None and spec.loader is not None
+    geometry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(geometry)
+
+    assert geometry.per_layer_helper_sets_supported(world) is supported
+
+
+@pytest.mark.parametrize(
     (
         "hidden",
         "intermediate",
@@ -595,6 +621,70 @@ def test_ep_collective_adapter_uses_the_resolved_process_group():
         comm.validate_geometry(expected_rank=0, expected_world=3)
     with pytest.raises(ValueError, match="broadcast root"):
         comm.bcast("payload", 3)
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (("61", "61", "61", "61"), None),
+        ((None, "0", None, "sixty"), r"must be a positive int; got \{1: '0', 3: 'sixty'\}"),
+        (("61", "61", "64", "61"), r"differs across the EP group: \[61, 61, 64, 61\]"),
+    ],
+    ids=["agreed", "invalid_on_some_ranks", "different_spans"],
+)
+def test_pair_span_is_accepted_or_rejected_by_every_rank_together(values, message):
+    """A rank that rejected its own span before the exchange would leave the
+    other ranks waiting in the collective."""
+    source = _TORCH_ROOT / "moe/fused_moe/per_layer_dynamic_eplb/arena.py"
+    constants = _module_constants(
+        source, {"_HELPER_BANK_COUNT", "_PAIR_SPAN_LAYERS_ENV", "_PAIR_SPAN_LAYERS_DEFAULT"}
+    )
+    world = len(values)
+    # The exchange completes once every rank has entered it; the timeout only
+    # bounds a run in which one never does.
+    exchange = threading.Barrier(world, timeout=10)
+    payloads = [None] * world
+    entered = [False] * world
+    outcomes = [None] * world
+
+    def run_rank(rank):
+        def allgather(payload):
+            payloads[rank] = payload
+            entered[rank] = True
+            exchange.wait()
+            return list(payloads)
+
+        # Each rank reads its own environment; None leaves the variable unset.
+        environ = {} if values[rank] is None else {constants["_PAIR_SPAN_LAYERS_ENV"]: values[rank]}
+        pool_cls = _extract_class(
+            source,
+            "_SharedSlotPool",
+            {"_pair_span"},
+            {"Any": Any, "os": SimpleNamespace(environ=environ), **constants},
+        )
+        pool = pool_cls.__new__(pool_cls)
+        pool.per_layer_sets = True
+        try:
+            outcomes[rank] = pool._pair_span(SimpleNamespace(allgather=allgather))
+        except (ValueError, threading.BrokenBarrierError) as error:
+            outcomes[rank] = error
+        finally:
+            if not entered[rank]:
+                # This rank left before the exchange: release the ranks waiting for it.
+                exchange.abort()
+
+    ranks = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(world)]
+    for thread in ranks:
+        thread.start()
+    for thread in ranks:
+        thread.join()
+
+    if message is None:
+        assert outcomes == [61] * world
+    else:
+        assert all(isinstance(outcome, ValueError) for outcome in outcomes), outcomes
+        assert len({str(outcome) for outcome in outcomes}) == 1
+        assert re.search(message, str(outcomes[0]))
 
 
 def test_model_engine_warmup_uses_load_balancer_public_api():

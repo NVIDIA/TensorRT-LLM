@@ -2673,10 +2673,7 @@
                 8192
               ]
             }
-          },
-          "required": [
-            "prefill_capture_num_tokens"
-          ]
+          }
         }
       }
     },
