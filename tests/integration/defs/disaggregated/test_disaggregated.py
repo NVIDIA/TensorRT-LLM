@@ -33,16 +33,16 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (get_ucx_tls, parse_gsm8k_output,
-                         resolve_llm_model_path, wait_for_reported_addr,
-                         wait_for_server)
+from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
+                         wait_for_reported_addr, wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_no_sm100f, skip_pre_blackwell,
                            skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
 from defs.trt_test_alternative import check_call, check_output, print_info
-from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
-                               run_disagg_server, run_gen_worker, terminate,
+from disagg_test_utils import (ProcessWrapper, resolve_server_start_timeout,
+                               run_ctx_worker, run_disagg_server,
+                               run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics,
@@ -69,18 +69,6 @@ class TestConfig:
 
     def __str__(self):
         return self.test_desc
-
-
-def get_ucx_net_devices():
-    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
-
-    Every worker runs on this host, so loopback is the only TCP device UCX
-    needs. With every netdev enabled, UCX protocol selection re-queries each
-    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
-    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
-    nodes (https://nvbugs/6836097).
-    """
-    return "lo"
 
 
 def apply_pre_hopper_nccl_workaround(env: dict) -> None:
@@ -788,7 +776,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int | None = None,
     schedule_style: str | None = None,
     save_log: bool = False,
     startup_callback=None,
@@ -800,7 +788,7 @@ def setup_disagg_cluster(
     share_gpu: bool = False,
     config_overrides: dict[str, Any] | None = None,
     log_output_dir: str | None = None,
-    prepare_fmha_metadata: bool = False,
+    share_jit_builds: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch the workers and the disagg server, wait for ready.
@@ -809,7 +797,8 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
-        server_start_timeout: Timeout in seconds for server to become ready
+        server_start_timeout: Timeout in seconds for server to become ready;
+            None picks one from the config (see resolve_server_start_timeout)
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
@@ -820,13 +809,19 @@ def setup_disagg_cluster(
             work_dir instead of the inherited stdout
         log_output_dir: With save_log, directory the logs are copied to if
             startup fails (CI's --output-dir, so they get uploaded)
-        prepare_fmha_metadata: Prepare shared FMHA artifacts before single-rank
-            Blackwell Python transceiver workers start.
+        share_jit_builds: Give the workers one TLLM_JIT_SHARE_DIR in work_dir,
+            so a kernel that every server's warmup tunes is built once instead
+            of concurrently in each process
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
         where server_port is the port the disagg server bound
     """
+    ctx_env = (ctx_env or env or os.environ).copy()
+    gen_env = (gen_env or env or os.environ).copy()
+    for worker_env in (ctx_env, gen_env):
+        apply_pre_hopper_nccl_workaround(worker_env)
+
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
     for key, value in (config_overrides or {}).items():
@@ -834,6 +829,8 @@ def setup_disagg_cluster(
             config.setdefault(key, {}).update(value)
         else:
             config[key] = value
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -860,6 +857,12 @@ def setup_disagg_cluster(
     else:
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
+    ctx_worker_env = ctx_env or env
+    gen_worker_env = gen_env or env
+    if share_jit_builds:
+        jit_share = {"TLLM_JIT_SHARE_DIR": os.path.join(work_dir, "jit_share")}
+        ctx_worker_env = {**(ctx_worker_env or os.environ), **jit_share}
+        gen_worker_env = {**(gen_worker_env or os.environ), **jit_share}
     server_env = env
     report_addr = None
     if config.get("num_workers", 1) > 1:
@@ -923,43 +926,6 @@ def setup_disagg_cluster(
                                                 disagg_cluster)
         gen_worker_config = build_worker_config(config, gen_servers,
                                                 disagg_cluster)
-        if prepare_fmha_metadata and get_sm_version() in (100, 103):
-            prepared_caches = set()
-            for worker_config, ranks, worker_env in (
-                (ctx_worker_config, gpus_per_ctx, ctx_env or env),
-                (gen_worker_config, gpus_per_gen, gen_env or env),
-            ):
-                worker_env = worker_env or os.environ
-                if (ranks != 1 or worker_config.get(
-                        "cache_transceiver_config",
-                    {}).get("transceiver_runtime") != "PYTHON"):
-                    continue
-                # Managed MPI workspaces select their cache after spawning.
-                if (not worker_env.get("FLASHINFER_CUBIN_DIR") and
-                    (worker_env.get("TRTLLM_CACHE_DIR")
-                     or worker_env.get("TRTLLM_FLASHINFER_WORKSPACE_MANAGED")
-                     == "1")):
-                    continue
-                cache_key = tuple(
-                    (key, value) for key, value in sorted(worker_env.items())
-                    if key.startswith("FLASHINFER_") or key in (
-                        "HOME", "PATH", "PYTHONPATH", "TRTLLM_CACHE_DIR"))
-                if cache_key in prepared_caches:
-                    continue
-                # Both single-rank workers must see verified metadata before
-                # either starts warming up against their shared cold cache.
-                check_call([
-                    "python3", "-c",
-                    "from flashinfer.jit.attention import gen_trtllm_gen_fmha_module; "
-                    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
-                    "print(f'Preparing FMHA metadata in {FLASHINFER_CUBIN_DIR}', flush=True); "
-                    "gen_trtllm_gen_fmha_module()"
-                ],
-                           env=worker_env,
-                           cwd=cwd,
-                           timeout=server_start_timeout)
-                prepared_caches.add(cache_key)
-
         server_config = {
             "hostname":
             server_host,
@@ -1007,7 +973,7 @@ def setup_disagg_cluster(
                 cluster_uri=f"http://{server_host}:{server_port}")
 
         # Build worker configs and launch workers
-        # The server may have selected a port after metadata preparation.
+        # The server may have selected its port above.
         ctx_worker_config["disagg_cluster"] = disagg_cluster
         gen_worker_config["disagg_cluster"] = disagg_cluster
         ctx_worker_config[
@@ -1024,7 +990,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=ctx_env or env,
+                               env=ctx_worker_env,
                                save_log=save_log,
                                worker_index=i)
             ctx_workers.append(w)
@@ -1045,7 +1011,7 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=gen_env or env,
+                               env=gen_worker_env,
                                save_log=save_log,
                                worker_index=i)
             gen_workers.append(w)
@@ -1188,9 +1154,10 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300,
+                           server_start_timeout=None,
                            assert_ctx_log_contains=None,
-                           config_overrides=None):
+                           config_overrides=None,
+                           share_jit_builds=False):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
@@ -1204,9 +1171,6 @@ def run_disaggregated_test(example_dir,
         )
 
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
-    apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -1227,11 +1191,13 @@ def run_disaggregated_test(example_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
                              share_gpu=share_gpu,
                              config_overrides=config_overrides,
-                             prepare_fmha_metadata=test_desc in (
-                                 "overlap_transceiver_runtime_python",
-                                 "overlap_transceiver_runtime_python_bounce"))
+                             share_jit_builds=share_jit_builds)
 
     server_host = config.get("hostname", "localhost")
+    # The client gets the same budget as the readiness wait in
+    # setup_disagg_cluster: both resolve it from this post-override config.
+    server_start_timeout = resolve_server_start_timeout(config,
+                                                        server_start_timeout)
 
     success = False
     try:
@@ -1457,8 +1423,6 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -1634,8 +1598,6 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -1719,8 +1681,6 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
@@ -1740,8 +1700,6 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
     run_disaggregated_test(
         disaggregated_example_root,
@@ -1771,13 +1729,9 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                 "kv_cache_transfer_end"} <= gen_timing.keys()
         validate_timing_metrics(item, "Python transceiver perf_metrics test")
 
-    env = llm_venv._new_env | {
-        "UCX_TLS": get_ucx_tls(),
-        "UCX_NET_DEVICES": get_ucx_net_devices(),
-    }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
-                           env=env,
+                           env=llm_venv._new_env,
                            extra_endpoints_test=extra_endpoints_test,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory(),
@@ -1813,8 +1767,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
     output_path = str(tmp_path / "cache_time")
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -2022,14 +1974,11 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
         qwen_model_root
     ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
-    # Cold model initialization and JIT across eight Blackwell ranks took
-    # about 640s on B300; allow headroom for CI variability (NVBug 6771023).
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(8)
@@ -2151,8 +2100,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["UCX_MM_ERROR_HANDLING"] = "y"
 
     # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
@@ -2164,12 +2111,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
     # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
     # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
-    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
-    # essentially every gen forward. Require its kernel-compile marker (logged
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache). Select the lib
+    # explicitly on the generation server. Require its kernel-compile marker (logged
     # at INFO) in a generation-worker log: correct client output alone would
     # not distinguish the CuTe DSL path from a silent fallback to another FMHA
-    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
-    # documented off switch.
+    # library.
     gen_env = None
     assert_gen_log_contains = None
     # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
@@ -2181,7 +2127,10 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # there rather than delaying those failures.
     server_start_timeout = 300
     if get_sm_version() in (100, 103):
-        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        gen_env = {
+            "TLLM_LOG_LEVEL": "INFO",
+            "TLLM_FMHA_LIBS": "cute_dsl_mla,fallback"
+        }
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
         server_start_timeout = 1200
 
@@ -2492,8 +2441,6 @@ def run_disaggregated_benchmark(example_dir,
                                 cwd=None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2762,8 +2709,6 @@ def run_disaggregated_aiperf(config_file,
             when the run fails (pass the output_dir fixture so CI uploads them)
     """
     run_env = env.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -3245,7 +3190,8 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                            env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=900)
+                           server_start_timeout=900,
+                           share_jit_builds=True)
 
 
 def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
@@ -3414,8 +3360,6 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
     metrics_dir, transfer_dir = str(tmp_path / "metrics"), str(tmp_path /
                                                                "transfers")
     env = baseline_env(llm_venv._new_env) | {
-        "UCX_TLS": get_ucx_tls(),
-        "UCX_NET_DEVICES": get_ucx_net_devices(),
         "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
         "TRTLLM_NIXL_NUM_THREADS": "1",
         "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": transfer_dir,
@@ -4234,7 +4178,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    env=None,
                                    cwd=None,
                                    startup_callback=None,
-                                   progress_callback=None) -> None:
+                                   progress_callback=None,
+                                   share_jit_builds: bool = False) -> None:
     """Run the Qwen3-32B FP8 Eagle3 mixed-stress test.
 
     Spins up a disaggregated cluster, drives total_requests heterogeneous
@@ -4265,8 +4210,6 @@ def run_disaggregated_mixed_stress(example_dir: str,
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     setup_start = time.monotonic()
@@ -4274,7 +4217,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
                              save_log=True, startup_callback=startup_callback,
-                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS,
+                             share_jit_builds=share_jit_builds)
     print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
           flush=True)
 
@@ -4421,8 +4365,6 @@ def run_disaggregated_cancel_test(example_dir,
                                   cwd=None):
     """Run disaggregated test with request cancellation stress test."""
     run_env = env.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -4476,7 +4418,8 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
@@ -4573,8 +4516,6 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -4717,8 +4658,6 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,
@@ -4815,4 +4754,5 @@ def test_disaggregated_mixed_stress_test(disaggregated_test_root,
         incomplete_threshold=test_config.incomplete_threshold,
         server_start_timeout=600,
         env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+        share_jit_builds=True)

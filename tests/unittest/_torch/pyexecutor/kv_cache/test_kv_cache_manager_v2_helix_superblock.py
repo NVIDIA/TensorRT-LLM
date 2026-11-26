@@ -235,10 +235,14 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
+        _keep_growth_block=False,
         # A draft manager never commits generation blocks.
         try_commit_generation_blocks=lambda request: None,
         # No lender attached, so a resize has no one to tell.
         _sharing=None,
+    )
+    mgr._generation_history_length = lambda request: KVCacheManagerV2._generation_history_length(
+        mgr, request
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
@@ -483,6 +487,7 @@ def _failing_gen_scheduler(
     sched = SimpleNamespace(
         has_cp_helix=True,
         enable_recompute_pause=enable_recompute_pause,
+        _single_beam=False,
         kv_cache_manager=SimpleNamespace(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,

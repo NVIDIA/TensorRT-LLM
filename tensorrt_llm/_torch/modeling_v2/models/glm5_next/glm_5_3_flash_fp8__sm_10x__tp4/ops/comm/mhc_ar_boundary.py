@@ -46,7 +46,7 @@ class MhcArBoundary(OpWrapper):
     ``mHC.fused_hc(..., norm_weight=...)`` returns, ``post`` without its trailing unit dimension.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # GLM-5.3-Flash at tp4: hc_mult 4, hidden 4096, 20 Sinkhorn iterations.
     _GLM = dict(world=WORLD, mult=MULT, hidden=HIDDEN, sinkhorn_iters=20)

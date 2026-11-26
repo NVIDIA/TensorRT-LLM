@@ -292,6 +292,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         self.has_cp_helix = kv_cache_manager._has_cp_helix
+        # Every request runs at exactly max_beam_width (checked on admission).
+        self._single_beam = kv_cache_manager.max_beam_width == 1
         draft_mgr_name = (
             type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
         )
@@ -731,20 +733,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
         if self._gen_paused_ids:
             requests_list = self._filter_paused_requests(requests_list)
-        # Only context requests can carry an exclusive mode, so test the state
-        # first: during decode every request fails it, one cheap compare each.
-        exclusive_remote_mode = next(
-            (
-                getattr(req, "py_csa2_remote_tail_mode", None)
-                for req in requests_list
-                if req.state_value == self._context_init_state_value
-                and not defer_remote_tail_context
-                and self.remote_tail_phase is not RemoteTailPhase.DECODE
-                and req.request_id not in inflight_request_ids
-                and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
-            ),
-            None,
-        )
+        exclusive_remote_mode = None
+        if not defer_remote_tail_context and self.remote_tail_phase is not RemoteTailPhase.DECODE:
+            # Only context requests can carry an exclusive mode, so test the state
+            # first: during decode every request fails it, one cheap compare each.
+            context_init_state_value = self._context_init_state_value
+            exclusive_remote_mode = next(
+                (
+                    getattr(req, "py_csa2_remote_tail_mode", None)
+                    for req in requests_list
+                    if req.state_value == context_init_state_value
+                    and getattr(req, "py_csa2_remote_tail_mode", None) == "source"
+                    and req.request_id not in inflight_request_ids
+                ),
+                None,
+            )
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
@@ -799,6 +802,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
+        # Membership costs two binding calls per request; the set is usually empty.
+        has_inflight = len(inflight_request_ids) > 0
         while req_it < req_it_end:
             req = requests_list[req_it]
 
@@ -807,7 +812,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             # --- Filter ---
-            if req.request_id in inflight_request_ids:
+            if has_inflight and req.request_id in inflight_request_ids:
                 req_it += 1
                 continue
 
@@ -2439,7 +2444,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
         """
-        beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
+        beam_width = (
+            1 if self._single_beam else req.get_beam_width_by_iter(for_next_iteration=False)
+        )
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
@@ -3170,7 +3177,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             context_requests.extend(last)
         else:
             context_requests.sort(key=self._lora_key)
-        generation_requests.sort(key=self._lora_key)
+        # Requests without a LoRA task share one key, which the stable sort keeps in place.
+        if any(getattr(req, "lora_task_id", None) is not None for req in generation_requests):
+            generation_requests.sort(key=self._lora_key)
 
     # ---- can_schedule (PP dry-run) ----
 

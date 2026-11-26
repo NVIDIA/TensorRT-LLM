@@ -46,6 +46,7 @@ def _create_compile_restricted_runner(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
     engine = Mock()
+    engine.model.runtime_hooks = None
     engine.llm_args.torch_compile_config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
     config = ModelEngine._decoder_runner_config(engine)
     runner_type = Mock()
@@ -240,15 +241,21 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     )
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
+    warmup.model = model
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     warmup.sparse_attention_config = None
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
-    warmup._config = SimpleNamespace(max_beam_width=1)
+    warmup._config = SimpleNamespace(
+        max_beam_width=1, max_batch_size=8, max_num_tokens=64, max_seq_len=128
+    )
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
-    warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
+    warmup._metadata = SimpleNamespace(
+        attn_metadata=object(), _warmup_dspark_ragged_compressor_metadata=Mock()
+    )
+    warmup._prims_ts_dense_mla_warmup = SimpleNamespace(run=Mock())
     warmup._context_warmups_supported = True
     warmup._context_logits_heads = ()
     warmup._torch_compile_bypass = runner._bypass_torch_compile
@@ -276,6 +283,9 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     ):
         monkeypatch.setattr(warmup, method, Mock())
     monkeypatch.setattr(
+        warmup, "_prewarm_prims_ts_sparse_mla", lambda *args: observed.append(("prims_ts", None))
+    )
+    monkeypatch.setattr(
         warmup,
         "_prewarm_fmha_libraries",
         lambda _: observed.append(("_prewarm_fmha_libraries", None)),
@@ -284,11 +294,13 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_run_attention_warmup",
         "_run_autotuner_warmup",
         "_run_mamba_hybrid_warmup",
+        "_prewarm_lowm_mma_row_buckets",
         "_general_warmup",
     ):
         monkeypatch.setattr(warmup, method, observe(method))
     monkeypatch.setattr(graphs, "run_cuda_graph_warmup", observe("_run_cuda_graph_warmup"))
     monkeypatch.setattr(graphs, "_warm_inforward_split", Mock())
+    warmup._prims_ts_dense_mla_warmup.run.side_effect = observe("_prims_ts_dense_mla_warmup")
     monkeypatch.setattr(warmup_module, "warmup_sampling_module", Mock())
     monkeypatch.setattr(warmup_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(warmup_module.AutoTuner, "get", Mock())
@@ -309,15 +321,25 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
 
     assert observed == [
         ("_prewarm_fmha_libraries", None),
+        ("prims_ts", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),
         ("_run_mamba_hybrid_warmup", not enabled),
+        ("_prewarm_lowm_mma_row_buckets", True),
         ("_run_cuda_graph_warmup", True),
         ("_run_cuda_graph_warmup", True),
+        ("_prims_ts_dense_mla_warmup", True),
         ("_general_warmup", not enabled),
     ]
     assert not model._bypass_active
+    warmup._prims_ts_dense_mla_warmup.run.assert_called_once_with(
+        model,
+        warmup._metadata.attn_metadata,
+        max_batch_size=8,
+        max_num_tokens=64,
+        max_seq_len=128,
+    )
 
 
 @skip_pre_hopper

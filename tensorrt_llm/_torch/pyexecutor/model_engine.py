@@ -64,29 +64,41 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderConfig, resolve_scheduled_encoder_args
+from .engine.runners.encoder import EncoderConfig
 from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoderRunnerConfig
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
-from .engine.runners.mm_encoder import MultimodalEncoderRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader
+from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
-def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
-    """``spec_decode_fast_paths`` of the language model (the model itself, or a
-    multimodal model's language model): the one-engine speculative language
-    model's, or that of a model that builds its own speculative branch, such as
-    a Modeling V2 target; False for a model that does not set it."""
+def _language_model_flag(model: torch.nn.Module, name: str) -> bool:
+    """Boolean attribute ``name`` of the language model (the model itself, or a
+    multimodal model's language model); False for a model that does not set it."""
     if isinstance(model, MultimodalModelMixin):
         try:
             model = model.language_model
         except NotImplementedError:
             return False
-    return bool(getattr(model, "spec_decode_fast_paths", False))
+    return bool(getattr(model, name, False))
+
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the language model: the one-engine
+    speculative language model's, or that of a model that builds its own
+    speculative branch, such as a Modeling V2 target."""
+    return _language_model_flag(model, "spec_decode_fast_paths")
+
+
+def _spec_samples_sharded_temperature(model: torch.nn.Module) -> bool:
+    """Whether the language model's one-engine spec worker draws temperature-only
+    target tokens on the LM head's vocab shard
+    (``SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature``)."""
+    return _language_model_flag(model, "spec_samples_sharded_temperature")
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -147,12 +159,10 @@ class ModelEngine:
             model_weights_restore_mode=model_weights_restore_mode,
         )
         if not self.model.model_config.is_generation:
-            if not self.llm_args.mm_encoder_only:
-                raise ValueError(
-                    "Non-generation models run through ScheduledEncoderExecutor, which does not "
-                    "use ModelEngine."
-                )
-            self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
+            raise ValueError(
+                "Non-generation models run through ScheduledEncoderExecutor, which does not "
+                "use ModelEngine."
+            )
         self._validate_breakable_cuda_graph_compatibility()
         self._init_from_model()
         self._size_cuda_graphs()
@@ -288,6 +298,7 @@ class ModelEngine:
         else:
             self.model = model
         self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
+        self.spec_samples_sharded_temperature = _spec_samples_sharded_temperature(self.model)
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
@@ -455,12 +466,7 @@ class ModelEngine:
 
         self.attn_backend = resolve_attention_backend(self.model, self.llm_args)
 
-        runner_cls = resolve_runner_type(self.model, self.llm_args)
-        if self.is_spec_decode and issubclass(runner_cls, MultimodalEncoderRunner):
-            raise ValueError(
-                f"{runner_cls.__name__} does not support speculative decoding; "
-                "multimodal encoder models must not set speculative_config."
-            )
+        runner_cls = resolve_runner_type(self.model)
 
         if self.is_spec_decode:
             update_spec_config_from_loaded_model(self.spec_config, self.model)
@@ -493,8 +499,6 @@ class ModelEngine:
         assert self._model_caller is not None
         if issubclass(runner_cls, EncoderDecoderRunner):
             return self._initialize_encoder_decoder_runner(runner_cls)
-        if issubclass(runner_cls, MultimodalEncoderRunner):
-            return runner_cls.create(self.model, moe_load_balancer=self.moe_load_balancer)
         if issubclass(runner_cls, DecoderRunner):
             return self._initialize_decoder_runner(runner_cls)
         raise TypeError(
@@ -584,8 +588,11 @@ class ModelEngine:
                 and self.model.samples_from_vocab_shards
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            spec_samples_sharded_temperature=self.spec_samples_sharded_temperature,
+            guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
+            steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )
 
@@ -656,6 +663,11 @@ class ModelEngine:
     def cuda_graph_padding_enabled(self) -> bool:
         """Return whether decode graph batches are padded to capture sizes."""
         return self._cuda_graph_padding_enabled
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
@@ -980,6 +992,8 @@ class ModelEngine:
         self._mm_item_scheduler = None
         self._lora_model = None
         self._lora_owner = None
+        if self.model is not None:
+            release_localized_moe_weights(self.model)
         self.model = None
         self.input_processor = None
         release_gc()

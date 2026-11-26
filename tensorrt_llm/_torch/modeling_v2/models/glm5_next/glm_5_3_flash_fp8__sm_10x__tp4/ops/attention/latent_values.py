@@ -51,7 +51,7 @@ def _latent_values_kernel(
 class LatentValues(OpWrapper):
     """``latent`` BF16 [R, H, L], ``w_v_t`` BF16 [H, L, V], ``keep`` bool [R] -> BF16 [R, H * V]."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP-3 verify of one request", spec=dict(r=4, h=16, l=512, v=256)),
         Cell(why="MTP-3 verify of eight requests", spec=dict(r=32, h=16, l=512, v=256)),

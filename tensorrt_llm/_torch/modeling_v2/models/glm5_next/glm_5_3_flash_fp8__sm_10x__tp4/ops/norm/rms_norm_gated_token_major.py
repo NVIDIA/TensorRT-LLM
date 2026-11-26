@@ -145,7 +145,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
         A new contiguous ``[tokens * heads, N]`` tensor in ``x.dtype`` (float8_e4m3fn with ``fp8_scale``).
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The op's own forms; the shapes the shipped target normalizes are in this entry's test.
     CELLS: tuple[Cell, ...] = (
         Cell(

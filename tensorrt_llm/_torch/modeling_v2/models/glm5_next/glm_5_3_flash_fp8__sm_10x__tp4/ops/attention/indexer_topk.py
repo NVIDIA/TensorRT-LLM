@@ -35,7 +35,7 @@ class IndexerTopk(OpWrapper):
     view); ``num_cand[r] <= C``.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # select_k = index_topk / index_kpool = 512. The target's context rows score the FP8
     # scorer's [rows, max_kv_len // 4] view, max_kv_len being the largest visible length of
     # the scored rows, and DeepGEMM pads its rows (`row_pad` extra columns); context cells give

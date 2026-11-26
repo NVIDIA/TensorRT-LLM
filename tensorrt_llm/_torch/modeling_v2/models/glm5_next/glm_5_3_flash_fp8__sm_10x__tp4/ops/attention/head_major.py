@@ -66,7 +66,7 @@ def _quantize_kernel(
 class SaturateFp8(OpWrapper):
     """``clamp(x, -448, 448)`` as E4M3, ``[H, R, D]`` BF16 -> ``[R, H, D]``."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(why="MLA generation query, one draft row, 16 heads", spec=dict(h=16, r=1, d=512)),
         Cell(
@@ -100,7 +100,7 @@ class Quantize1x128(OpWrapper):
     """``fp8_quantize_1x128`` of ``x.transpose(0, 1).reshape(R, H * D)`` for ``[H, R, D]`` BF16:
     E4M3 ``[R, H * D]`` and FP32 ``[H * D / 128, R]``."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(why="MLA context values, 13K prompt / 4 ranks", spec=dict(h=64, r=3328, d=256)),
         Cell(why="MLA context values, ragged rows", spec=dict(h=64, r=517, d=256)),

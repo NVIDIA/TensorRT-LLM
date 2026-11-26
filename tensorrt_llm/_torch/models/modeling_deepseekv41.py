@@ -18,7 +18,7 @@ import copy
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, cast
 
@@ -57,7 +57,13 @@ from ..configs.deepseek_v41 import (
 )
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
 from ..model_config import ModelConfig
-from ..modules.engram import Engram, ShardedFp8MultiHeadEmbedding, adp_exchange, engram_gate
+from ..modules.engram import (
+    Engram,
+    EngramPreReplayHook,
+    ShardedFp8MultiHeadEmbedding,
+    adp_exchange,
+    engram_gate,
+)
 from ..modules.engram.projection import EngramFp8Projection
 from ..modules.mhc.hyper_connection import HCState, mHC
 from ..modules.mhc.mhc_lowm import (
@@ -70,8 +76,10 @@ from ..modules.mhc.mhc_lowm import (
     mhc_split_enabled,
 )
 from ..modules.multi_stream_utils import do_multi_stream
+from ..moe.fused_moe.impl_contract import MOE_DECODE_OPTIONS, MoEDecodeOptions
 from ..moe.fused_moe.moe_scheduler import routes_padding_nowhere
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import SpecMetadata
 from ..speculative.dspark import DSparkSpecMetadata
 from ..utils import AuxStreamType, MxFp8QuantizedTensor, decode_stream_priority
@@ -334,6 +342,9 @@ _ENGRAM_CONTEXT_SCHEDULE = {1: (0, None), 14: (6, 32)}
 _ENGRAM_PRECOMPUTE_MAX_ROWS = 64
 # Batches with fewer tokens on the busiest rank, decode included, keep the model-stream path.
 _ENGRAM_CONTEXT_MIN_TOKENS = 256
+# MoE calls of up to this many rows (decode sizes, where the 8-row FC2 cubin tiles run in rounds) take the CuTe DSL
+# FC2 (MoEDecodeOptions.cute_fc2_rows).
+_MOE_CUTE_FC2_ROWS = 16
 
 
 @dataclass(frozen=True)
@@ -1522,6 +1533,17 @@ class DeepseekV41Model(DeepseekV4Model):
     _prologue_stream: torch.cuda.Stream | None = None
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
+        # Its NVFP4 MoEs run the FC2 of small un-finalized calls as the CuTe DSL kernel and route decode
+        # steps in one cluster.
+        model_config.extra_attrs[MOE_DECODE_OPTIONS] = replace(
+            MoEDecodeOptions.of(model_config.extra_attrs),
+            cute_fc2_rows=_MOE_CUTE_FC2_ROWS,
+            one_cluster_route=True,
+        )
+        # Batch-1 attention-TP workers split each MoE call's experts over the two EP ranks.
+        model_config.extra_attrs["moe_dynamic_ep"] = True
+        # The router logits come as K-chunk partials from 12 rows per rank (SM100/SM103).
+        model_config.extra_attrs["moe_router_partials_small_m"] = True
         super().__init__(model_config, *args, **kwargs)
         self._decoder_replay_observed = False
         self._decoder_replay_reuse_warning_emitted = False
@@ -3617,6 +3639,15 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     model_cls = DeepseekV41Model
     weight_loader_cls = DeepseekV41WeightLoader
 
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Enable steady staging on SM100/SM103 and share tuned tactics across ranks."""
+        return replace(
+            super().runtime_hooks,
+            steady_decode_prepare=is_blackwell_datacenter(),
+            merge_tuned_tactics_across_ranks=True,
+        )
+
     def __pp_init__(self) -> None:
         super().__pp_init__()
         self.model_config.extra_attrs.pop("csa2_context_swa_layer_limit", None)
@@ -3890,11 +3921,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         contexts = [
             request for request in scheduled_requests.context_requests if not request.is_dummy
         ]
-        contexts.extend(
-            request
-            for request in scheduled_requests.generation_requests
-            if not request.is_dummy and request.py_request_id in promoted_context_request_ids
-        )
+        if promoted_context_request_ids:
+            contexts.extend(
+                request
+                for request in scheduled_requests.generation_requests
+                if not request.is_dummy and request.py_request_id in promoted_context_request_ids
+            )
         if not contexts:
             return
         lookback = provider.config.max_ngram_size - 1
@@ -4005,7 +4037,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
         """Refresh local hash rows before the captured DP gather and lookup."""
-        if not self.model.use_engram or self.model.engram_hash_provider is None:
+        if not self.model.use_engram:
+            return
+        provider = self.model.engram_hash_provider
+        if provider is None:
             return
 
         def _refresh(
@@ -4025,4 +4060,4 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 refresh=True,
             )
 
-        runner.register_pre_replay_hook(_refresh)
+        runner.register_pre_replay_hook(EngramPreReplayHook(provider, _refresh))

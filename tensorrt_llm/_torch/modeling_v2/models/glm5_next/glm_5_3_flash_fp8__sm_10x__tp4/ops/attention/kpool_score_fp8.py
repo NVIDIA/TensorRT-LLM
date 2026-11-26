@@ -42,7 +42,7 @@ class KpoolScoreFp8(OpWrapper):
     - None when there is no row or no complete pool (``max_kv_len < kpool``).
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The indexer has 32 heads of 128 and scores pools of 4 over 32-token blocks. Each cell
     # gives (cached, new) per context request and the scored row range (a rank's ceil(T / 4)
     # sequence-parallel rows); max_kv_len is the largest visible length among those rows, as
@@ -74,7 +74,7 @@ class KpoolScoreFp8(OpWrapper):
     The pools selected from these scores can therefore differ from those of the BF16 scores
     (`kpool_score`) where two pools score within that rounding of each other.
 
-    sm_100 only (DeepGEMM MQA logits). The target scores every packed context row here
+    sm_100 and sm_103 only (DeepGEMM MQA logits). The target scores every packed context row here
     (`MlaLayer.context_rows`); when this returns None the rows have no complete pool and
     attend their incomplete trailing pool only.
 

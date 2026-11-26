@@ -62,6 +62,8 @@ DEVICE = "cuda"
 LOSSLESS_REL_L2 = 0.01
 QUANT_LOSS_BUDGET = {"FP8": 0.05, "FP8_BLOCK_SCALES": 0.05, "NVFP4": 0.1}
 SAGE_LOSS_BUDGET = 0.05
+# Below the error of the same recipe without the compensation of Q and K.
+DECO_LOSS_BUDGET = 0.02
 # The SageAttention recipe the perf sweep uses: int8 Q/K, FP8 V, block sizes 1/16/1.
 SAGE_RECIPE = QuantAttentionConfig(
     qk_dtype="int8", v_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1
@@ -328,6 +330,8 @@ def _assert_attention_backend(model, backend_name: str, quant_attention_config=N
         "CUTEDSL": "CuTeDSLAttention",
         "FA4": "FlashAttn4Attention",
     }[backend_name]
+    if getattr(quant_attention_config, "deco_attention", False):
+        expected = "DeCoAttention"
     assert model.blocks, "No transformer blocks were built"
     for block in model.blocks:
         backend = block.attn1.attn
@@ -370,6 +374,42 @@ def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     _assert_attention_backend(model, "TRTLLM", SAGE_RECIPE)
     scores = _score(lambda case: _run_trtllm(model, case), dit_inputs, reference)
     _assert_within(scores, SAGE_LOSS_BUDGET, f"{EXPERT} SageAttention vs BF16")
+
+
+@pytest.mark.parametrize("v_dtype", ("fp8", "nvfp4"))
+def test_deco_attention_loss_budget(
+    checkpoint, dit_inputs, require_deco_kernels, deco_recipe, monkeypatch, v_dtype
+):
+    """DeCo-Attention against dense BF16 attention on the same block and inputs, with V in
+    ``v_dtype`` (NVFP4 on SM120 only)."""
+    recipe = deco_recipe(v_dtype)
+    require_deco_kernels(v_dtype)
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+    weights = _block_weights(checkpoint, EXPERT)
+    model = _trtllm_block(checkpoint, EXPERT, weights)
+    reference = {case["name"]: _run_trtllm(model, case) for case in dit_inputs}
+    del model
+    model = _trtllm_block(
+        checkpoint,
+        EXPERT,
+        weights,
+        attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=recipe),
+    )
+    _assert_attention_backend(model, "CUTEDSL", recipe)
+    prepare, calls = deco_attention.prepare, []
+
+    def recording(q, *args, **kwargs):
+        calls.append(tuple(q.shape))
+        return prepare(q, *args, **kwargs)
+
+    monkeypatch.setattr(deco_attention, "prepare", recording)
+    scores = _score(lambda case: _run_trtllm(model, case), dit_inputs, reference)
+    # The self-attention of every block reaches the DeCo kernels once per case.
+    assert len(calls) == len(dit_inputs) * len(model.blocks), (
+        f"Expected one DeCo-Attention kernel call per case and block, found {calls}"
+    )
+    _assert_within(scores, DECO_LOSS_BUDGET, f"{EXPERT} DeCo-Attention vs BF16")
 
 
 def _attention_backend_supported(backend: str) -> bool:

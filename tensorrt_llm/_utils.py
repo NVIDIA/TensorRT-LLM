@@ -1373,6 +1373,51 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def wait_event(event: torch.cuda.Event) -> None:
+    """``event.synchronize()``, skipped for a completed event: ``synchronize``
+    releases the GIL even then, ``query`` keeps it."""
+    if not event.query():
+        event.synchronize()
+
+
+_current_cuda_streams: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def current_cuda_stream(
+        device_index: Optional[int] = None) -> torch.cuda.Stream:
+    """``torch.cuda.current_stream()`` without a per-call device lookup or Stream construction."""
+    if device_index is None:
+        device_index = torch._C._cuda_getDevice()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    stream = _current_cuda_streams.get(key)
+    if stream is None:
+        stream = _current_cuda_streams[key] = torch.cuda.current_stream(
+            device_index)
+    return stream
+
+
+class CudaStreamScope:
+    """``torch.cuda.stream(stream)`` for a stream of the current device, without
+    the per-call device lookups."""
+
+    __slots__ = ("_stream", "_previous")
+
+    def __init__(self, stream: Optional[torch.cuda.Stream]) -> None:
+        self._stream = stream
+        self._previous = None
+
+    def __enter__(self) -> None:
+        if self._stream is not None:
+            self._previous = torch.cuda.current_stream(
+                self._stream.device_index)
+            torch.cuda.set_stream(self._stream)
+
+    def __exit__(self, *exc_info) -> None:
+        if self._previous is not None:
+            torch.cuda.set_stream(self._previous)
+            self._previous = None
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a
@@ -1421,6 +1466,72 @@ def run_once(f: Callable[P, None]) -> Callable[P, None]:
     wrapper.has_run = False  # type: ignore[attr-defined]
     return wrapper
 
+
+# 64Ki slots (512 KiB) make the reserving frame land in a fresh 1 MiB chunk,
+# leaving about 512 KiB for the frames it calls.
+_FRAME_STACK_RESERVE_SLOTS = 1 << 16
+_FRAME_STACK_RESERVE_DISABLE_ENV = "TLLM_DISABLE_FRAME_STACK_RESERVE"
+
+
+def run_with_frame_stack_reserve(fn: Callable[P, _T], /, *args: P.args,
+                                 **kwargs: P.kwargs) -> _T:
+    """Call ``fn`` from a frame that reserves a large CPython data-stack chunk.
+
+    CPython allocates frames in per-thread data-stack chunks. On versions that
+    release an emptied chunk immediately (CPython gh-142183), a frequently
+    called function whose frame lands on a chunk boundary maps and unmaps
+    memory on every call. On affected interpreters, this function's
+    ``co_stacksize`` is raised to ``_FRAME_STACK_RESERVE_SLOTS`` at import, so
+    its frame alone needs a new, large chunk, and a long-running loop called
+    through it starts near the beginning of that chunk. Ordinary call depths
+    below it then never reach a boundary. The reserved slots are never
+    written, so they cost little resident memory, although a frame object
+    built for this frame (for a traceback or a profiler) allocates them.
+
+    Wrap a thread's long-running entry point once; every call maps and later
+    unmaps one chunk of its own. On interpreters that cache an emptied chunk,
+    and when ``TLLM_DISABLE_FRAME_STACK_RESERVE`` is set to ``1`` at import
+    time, this is a plain call.
+
+    Args:
+        fn: The callable to run.
+        *args: Positional arguments forwarded to ``fn``.
+        **kwargs: Keyword arguments forwarded to ``fn``.
+
+    Returns:
+        Whatever ``fn`` returns. Exceptions from ``fn`` propagate unchanged.
+    """
+    return fn(*args, **kwargs)
+
+
+def _frame_stack_reserve_needed(implementation: str,
+                                version: Sequence[int]) -> bool:
+    """Whether the given interpreter frees an emptied data-stack chunk.
+
+    Args:
+        implementation: ``sys.implementation.name``.
+        version: ``sys.version_info`` or a ``(major, minor, micro)`` tuple.
+    """
+    if implementation != "cpython":
+        return False
+    # 3.11 introduced chunked data stacks; 3.13.13 and 3.14.4 keep one
+    # emptied chunk per thread for reuse.
+    version = tuple(version[:3])
+    return ((3, 11) <= version < (3, 13, 13) or (3, 14) <= version < (3, 14, 4))
+
+
+def _needs_frame_stack_reserve() -> bool:
+    if os.environ.get(_FRAME_STACK_RESERVE_DISABLE_ENV) == "1":
+        return False
+    return _frame_stack_reserve_needed(sys.implementation.name,
+                                       sys.version_info)
+
+
+if _needs_frame_stack_reserve():
+    # Enlarge the frame only; the bytecode and everything else are unchanged.
+    run_with_frame_stack_reserve.__code__ = (
+        run_with_frame_stack_reserve.__code__.replace(
+            co_stacksize=_FRAME_STACK_RESERVE_SLOTS))
 
 TORCH_PYBIND11_ABI = None
 

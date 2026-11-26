@@ -61,6 +61,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
+from ..recurrent_state_spec import RecurrentStateSpec, recurrent_state_spec_from_mamba_params
 from ..utils import AuxStreamType, get_model_extra_attrs
 from .checkpoints.hf.glm5_next_weight_mapper import (
     Glm5NextHfWeightMapper,
@@ -617,6 +618,19 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
     def get_preferred_transceiver_runtime(cls, pretrained_config=None) -> str:
         """Use Python NIXL to transfer the hybrid cache, including recurrent state."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: QuantConfig | None = None,
+    ) -> RecurrentStateSpec:
+        """Declare the KDA state of the linear-attention layers."""
+        from ..attention.backends.sparse.glm_kpool.cache_manager import get_glm5_next_cache_params
+
+        params = get_glm5_next_cache_params(pretrained_config, quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
     # -- whole-model materialization --------------------------------------
 

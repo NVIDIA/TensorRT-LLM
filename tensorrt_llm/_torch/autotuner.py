@@ -23,6 +23,7 @@ import inspect
 import itertools
 import json
 import os
+import threading
 import time
 import zlib
 from abc import ABC, abstractmethod
@@ -349,7 +350,9 @@ class TunableRunner(ABC):
 def autotune(tune_mode: bool = True,
              cache_path: str = None,
              skip_dynamic_tuning_buckets: bool = False,
-             post_tune_merge_dist: Optional[Distributed] = None):
+             post_tune_merge_dist: Optional[Distributed] = None,
+             *,
+             quiet: bool = False):
     """Context manager for autotuning with distributed support.
 
     Args:
@@ -366,8 +369,11 @@ def autotune(tune_mode: bool = True,
             collective at context exit (before the cache is saved) — for
             pipelines whose warmup is not SPMD and so cannot use the per-op
             distributed strategies.
+        quiet: Log where the tuning starts and ends at debug level rather than
+            info, for a context entered around each call of an op.
     """
     autotuner = AutoTuner.get()
+    log_bounds = logger.debug if quiet else logger.info
     if post_tune_merge_dist is not None:
         # Save the singleton's prior state: the full-world dist attached for the
         # merge is temporary and must not leak into later sessions. Attach the
@@ -400,7 +406,7 @@ def autotune(tune_mode: bool = True,
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
-        logger.info("[Autotuner] Autotuning process starts ...")
+        log_bounds("[Autotuner] Autotuning process starts ...")
 
     # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
     # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
@@ -424,7 +430,7 @@ def autotune(tune_mode: bool = True,
         if autotune_enabled:
             AutoTuner.L2_FLUSH_BUFFERS.clear()
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
-            logger.info("[Autotuner] Autotuning process ends")
+            log_bounds("[Autotuner] Autotuning process ends")
 
         try:
             # Merge tactics across ranks in one collective before the cache is
@@ -1989,9 +1995,12 @@ class AutoTuner:
         # One stream for all workers: the allocator caches their blocks where
         # the profiling loop below allocates, and GPU time is not the cost here.
         stream = torch.cuda.current_stream()
-        failures = []
+        failure_count = 0
+        first_failure = ""
+        failure_lock = threading.Lock()
 
         def warm(profile: OptimizationProfile) -> None:
+            nonlocal failure_count, first_failure
             torch.cuda.set_device(device)
             try:
                 with torch.cuda.stream(stream):
@@ -2003,8 +2012,12 @@ class AutoTuner:
                                 tensors, profile, **kwargs):
                             runner(tensors, tactic=tactic, **kwargs)
                     stream.synchronize()
-            except Exception as e:  # noqa: BLE001 - the profiling loop reports it
-                failures.append(e)
+            except Exception as exc:  # noqa: BLE001 - the profiling loop reports it
+                with failure_lock:
+                    failure_count += 1
+                    is_first_failure = failure_count == 1
+                if is_first_failure:
+                    first_failure = f"{type(exc).__name__}: {exc}"
 
         start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(
@@ -2014,9 +2027,8 @@ class AutoTuner:
         logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
                     f"{num_threads} threads to drive their JIT in "
                     f"{time.perf_counter() - start:.1f}s" +
-                    (f"; {len(failures)} failed and are left to profiling "
-                     f"({type(failures[0]).__name__}: {failures[0]})"
-                     if failures else ""))
+                    (f"; {failure_count} failed and are left to profiling "
+                     f"({first_failure})" if failure_count else ""))
 
     @staticmethod
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],

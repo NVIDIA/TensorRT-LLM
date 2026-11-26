@@ -9,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
@@ -554,6 +555,36 @@ class _KwargsHashFakeProcessor:
 
     def get_mm_special_token_ids(self):
         return None
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    ("modality", "caller", "decoded", "kinds"),
+    [
+        ("image", torch.zeros(3, 4, 8), Image.new("RGB", (8, 4)), "float tensor and PIL image"),
+        (
+            "video",
+            VideoData([torch.zeros(3, 4, 8)], {}),
+            VideoData(np.zeros((1, 4, 8, 3), dtype=np.uint8), {}),
+            "float tensor and uint8 array",
+        ),
+        (
+            "image",
+            np.zeros((4, 8, 3), dtype=np.float32),
+            torch.zeros((3, 4, 8), dtype=torch.uint8),
+            "float array and uint8 tensor",
+        ),
+    ],
+)
+def test_reject_mixed_media_representations(modality, caller, decoded, kinds, reverse) -> None:
+    wrapped = create_input_processor_with_hash(_KwargsHashFakeProcessor())
+    items = [decoded, caller] if reverse else [caller, decoded]
+
+    with pytest.raises(
+        ValueError,
+        match=f"{modality} inputs in one request must use one representation; got {kinds}",
+    ):
+        wrapped({"prompt": "two items", "multi_modal_data": {modality: items}}, None)
 
 
 _CONTENT_HASH_SNAPSHOT = {

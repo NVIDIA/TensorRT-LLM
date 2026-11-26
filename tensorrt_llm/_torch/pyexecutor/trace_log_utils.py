@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Gated trace/log utilities for pyexecutor.
 
 Leaf module — no other pyexecutor file is imported here, so any consumer
@@ -30,11 +44,19 @@ def log_mem_snapshot(tag: str) -> None:
 
     Derived quantities the reader may need:
 
-    - ``used      = total - free`` — whole-process GPU consumption
-    - ``slack     = reserved - alloc`` — Torch caching allocator free blocks
+    - ``used      = total - free`` — **device-wide** consumption. This is not
+      this process's usage: TensorRT-LLM supports colocated processes (Ray
+      fractional GPUs, GMS weight sharing, RLHF alongside a trainer,
+      disaggregated ctx+gen on one device), whose memory is included here.
+      The memory monitor's full mode (``memory_monitor_config.mode='full'``
+      or ``TLLM_MEM_MONITOR=1``) adds the NVML per-process split.
+    - ``slack     = reserved - alloc`` — reserved but not handed out. Besides
+      fragmented space this covers blocks already requested for release that
+      are waiting on other streams, so it is not all immediately reusable.
     - ``non_torch = used - reserved`` — bytes outside Torch (KV pool C++
-      cudaMalloc, NCCL buffers, cuBLAS workspace, CUDA driver context,
-      CUDA graph mempool, etc.)
+      ``cuMemCreate``, NCCL buffers, cuBLAS workspace, CUDA driver context,
+      lazily loaded module code, etc.). CUDA-graph pools are **not** in here:
+      they use the native allocator and are already inside ``reserved``.
     """
     if os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
         return

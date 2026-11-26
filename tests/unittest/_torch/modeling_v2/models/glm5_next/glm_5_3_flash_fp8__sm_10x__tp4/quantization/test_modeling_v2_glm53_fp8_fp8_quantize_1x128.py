@@ -26,7 +26,8 @@ __extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() != 100, reason="fp8_quantize_1x128 is certified on sm_100"
+    get_sm_version() not in (100, 103),
+    reason="fp8_quantize_1x128 is certified on sm_100 and sm_103",
 )
 
 DEV = "cuda"

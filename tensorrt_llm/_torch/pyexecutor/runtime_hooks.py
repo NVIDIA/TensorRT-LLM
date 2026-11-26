@@ -256,6 +256,8 @@ class RuntimeHooks:
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
+    # Opt into one-model MTP staging with graph padding and admissions.
+    steady_decode_prepare: bool = False
     # Streaming: also emit a response on decoding iterations 2..N, so the first
     # counted text reaches the client one step after the first token instead of
     # one stream interval later (a reasoning parser holds a leading reasoning
@@ -284,6 +286,13 @@ class RuntimeHooks:
     stage_decode_inputs: bool = False
     # Capture the decode CUDA graphs (at most 256 tokens per step) on a high-priority stream.
     prioritize_decode_graphs: bool = False
+    # Under attention DP, the graph-shape exchange also agrees on replaying one captured
+    # generation-only graph, whose shape fixes every rank's input counts; a speculative step
+    # then skips the all-gather of those counts.
+    skip_adp_count_gather: bool = False
+    # A generation-only one-model speculative step verifies its hidden states as they are: the
+    # decoder inputs gather every row there, in order.
+    skip_verify_row_gather: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side

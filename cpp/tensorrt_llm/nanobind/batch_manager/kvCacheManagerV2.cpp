@@ -2120,13 +2120,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("policy", &kv::ReuseGroupStatus::policy)
         .def_ro("endpoint", &kv::ReuseGroupStatus::endpoint)
         .def_ro("complete", &kv::ReuseGroupStatus::complete)
-        .def_ro("coverage", &kv::ReuseGroupStatus::coverage);
+        .def_ro("coverage", &kv::ReuseGroupStatus::coverage)
+        .def_prop_ro("endpoint_ranges",
+            [](kv::ReuseGroupStatus const& s)
+            {
+                std::vector<std::pair<int, int>> ranges;
+                ranges.reserve(s.endpointRanges.size());
+                for (auto const& range : s.endpointRanges)
+                    ranges.emplace_back(range.beg, range.end);
+                return ranges;
+            });
 
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            [](kv::KvCache& self, nb::object stream, std::optional<std::vector<int>> groups)
+            [](kv::KvCache& self, nb::object stream, std::optional<std::vector<int>> groups,
+                std::optional<std::map<int, int>> endpoints)
             {
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
@@ -2140,10 +2150,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         selected->push_back(kv::LifeCycleId{group});
                     }
                 }
+                std::optional<std::map<kv::LifeCycleId, int>> selectedEndpoints;
+                if (endpoints)
+                {
+                    selectedEndpoints.emplace();
+                    for (auto const& [group, endpoint] : *endpoints)
+                        selectedEndpoints->emplace(kv::LifeCycleId{group}, endpoint);
+                }
                 nb::gil_scoped_release rel;
-                return self.resume(optStream, std::move(selected));
+                return self.resume(optStream, std::move(selected), std::move(selectedEndpoints));
             },
-            nb::arg("cuda_stream") = nb::none(), nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("optional_reuse_groups") = nb::none(),
+            nb::arg("optional_reuse_endpoints") = nb::none())
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)
@@ -2162,12 +2180,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution,
             nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "resize",
-            [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
-            { return self.resize(capacity, historyLength); },
-            nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
             nb::call_guard<nb::gil_scoped_release>(),
@@ -2176,6 +2188,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "per step, because fetch_sparse_pages resolves one selection per request while an "
             "attention kernel indexes its selection per query token. Prefill and speculative "
             "decoding give a request several and are out of scope; this is the guard.")
+        .def("resize", &kv::KvCache::resize, nb::arg("capacity") = std::nullopt,
+            nb::arg("history_length") = std::nullopt, nb::kw_only(), nb::arg("complete_optional_recovery") = false,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
@@ -2602,13 +2617,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "drop_optional_pages",
         [](kv::KvCache& cache, int end, std::optional<std::vector<int>> groups)
         {
-            if (end <= 0 || end % cache.tokensPerBlock() || end > cache.numCommittedTokens())
+            if (end <= 0 || end > cache.numCommittedTokens())
             {
-                throw nb::value_error("Expected a committed, block-aligned checkpoint endpoint");
+                throw nb::value_error("Expected a committed checkpoint endpoint");
             }
             nb::gil_scoped_release rel;
             auto const apiLock = cache.manager().lockExclusive();
-            auto const& block = cache.blocks()[kv::BlockOrdinal{end / cache.tokensPerBlock() - 1}].treeBlock;
+            auto const match = cache.manager().radixTree().match(
+                cache.reuseScope(), kv::TokenSpan{cache.committedTokens().data(), end}, false, true);
+            auto* block = match.numTokens == end ? match.blocks.back() : nullptr;
             if (block)
             {
                 for (auto const& [lc, attention] : cache.manager().lifeCycles().attentionLifeCycles())
@@ -3613,7 +3630,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
                 std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
-                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId)
+                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId,
+                int optionalReuseMaxBacktrack)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -3623,7 +3641,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
                         expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig),
-                        /*inputKnownNoDigest=*/false, domain);
+                        /*inputKnownNoDigest=*/false, domain, optionalReuseMaxBacktrack);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -3640,13 +3658,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain);
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain,
+                            optionalReuseMaxBacktrack);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
             nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("locality_domain_id").none() = std::nullopt)
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("locality_domain_id").none() = std::nullopt,
+            nb::arg("optional_reuse_max_backtrack") = 0)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
