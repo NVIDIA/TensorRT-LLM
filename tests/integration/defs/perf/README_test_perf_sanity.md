@@ -40,12 +40,18 @@ so speculation in either source excludes the client. Eligibility is captured fro
 the rendered worker configuration before launch. TP, PP, CP and node capacity
 use the worker's integer coercion, including quoted integers. Inline TP, PP, CP
 and harness GPU hints are normalized before GPU arithmetic or comparisons, so
-quoted and numeric forms produce the same integer topology metadata. Node capacity is
-the worker's explicit `gpus_per_node`, otherwise `torch.cuda.device_count()` in
-a fresh process inheriting the server's effective environment, including its
-`CUDA_VISIBLE_DEVICES` override. With `RAY_LOCAL_WORLD_SIZE` set, the worker
-uses TP as node capacity. The hardware inventory and uploaded topology fields
-do not replace these worker rules.
+quoted and numeric forms produce the same integer topology metadata.
+Node capacity follows `trtllm-serve`'s argument order. When `gpus_per_node` is
+omitted from the worker YAML, retain the CUDA count from the inherited and
+per-server launch environment, before the YAML merge. An explicit numeric YAML
+value is used directly. Explicit YAML null requests the later default: a fresh
+probe mirrors initial CLI discovery, applies rendered `env_overrides` inside
+the running interpreter, then recounts. Keys and values are converted to strings;
+overrides are passed on stdin and the count uses an encoding-independent byte
+channel, so worker text-encoding settings do not alter probe startup or output.
+With `RAY_LOCAL_WORLD_SIZE` in the launch or rendered environment, the worker
+uses TP as node capacity instead. The hardware inventory and uploaded topology
+fields do not replace these capacity-source rules.
 Only the measured `test_e2e` path requests this snapshot, and only for regular
 aggregated servers with a measured concurrency-one client and a configured
 `OPEN_SEARCH_DB_BASE_URL` history endpoint. With that endpoint configured,

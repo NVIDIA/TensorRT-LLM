@@ -2631,7 +2631,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def is_single_node_worker(self, worker_config: dict) -> bool:
-        """Whether rendered worker topology fits its effective per-node CUDA capacity."""
+        """Whether rendered topology fits the serving CLI's resolved node capacity."""
         integer_field = TypeAdapter(int)
         parallelism = {
             field: integer_field.validate_python(worker_config.get(field, 1))
@@ -2643,15 +2643,33 @@ class ServerConfig:
         }
         server_env = os.environ.copy()
         server_env.update(self.to_env())
+        worker_env_overrides = {
+            str(name): str(value)
+            for name, value in (worker_config.get("env_overrides") or {}).items()
+        }
         node_capacity = worker_config.get("gpus_per_node")
-        if "RAY_LOCAL_WORLD_SIZE" in server_env:
+        if "RAY_LOCAL_WORLD_SIZE" in server_env or "RAY_LOCAL_WORLD_SIZE" in worker_env_overrides:
             node_capacity = parallelism["tensor_parallel_size"]
         elif node_capacity is None:
             try:
                 node_capacity = subprocess.check_output(
-                    [sys.executable, "-c", "import torch; print(torch.cuda.device_count())"],
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json, os, sys\n"
+                        "import torch\n"
+                        "capacity = torch.cuda.device_count()\n"
+                        "overrides = json.loads(sys.stdin.buffer.read())\n"
+                        "if overrides is not None:\n"
+                        "    os.environ.update(overrides)\n"
+                        "    capacity = torch.cuda.device_count()\n"
+                        "sys.stdout.buffer.write(str(capacity).encode('ascii'))",
+                    ],
+                    input=json.dumps(
+                        worker_env_overrides if "gpus_per_node" in worker_config else None
+                    ),
                     env=server_env,
-                    text=True,
+                    encoding="utf-8",
                     timeout=WORKER_DEVICE_COUNT_TIMEOUT,
                 )
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:

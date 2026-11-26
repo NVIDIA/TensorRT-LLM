@@ -18,14 +18,16 @@ import ast
 import importlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import redirect_stdout
 from copy import deepcopy
-from io import StringIO
+from io import BytesIO, TextIOWrapper
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -145,6 +147,7 @@ def perf_sanity_caller(
     try:
         harness = importlib.import_module("defs.perf.test_perf_sanity")
         database = importlib.import_module("defs.perf.open_search_db_utils")
+        real_check_output = subprocess.check_output
 
         def replay(
             history: list[dict] | None,
@@ -160,6 +163,7 @@ def perf_sanity_caller(
             probe_timeouts: list[float | None] | None = None,
             warmup_only: bool = False,
             expect_upload: bool = True,
+            real_worker_probe: bool = False,
         ) -> tuple[list[dict], RuntimeError | None]:
             def check_output(command, *args, **kwargs) -> str:
                 if isinstance(command, str):
@@ -167,19 +171,35 @@ def perf_sanity_caller(
                 assert command[:2] == [sys.executable, "-c"]
                 if probe_timeouts is not None:
                     probe_timeouts.append(kwargs.get("timeout"))
+                if real_worker_probe:
+                    return real_check_output(command, *args, **kwargs)
                 cuda_module = ModuleType("torch.cuda")
                 cuda_module.device_count = lambda: (
-                    worker_device_count(kwargs["env"]) if worker_device_count is not None else 4
+                    worker_device_count(dict(os.environ)) if worker_device_count is not None else 4
                 )
                 torch_module = ModuleType("torch")
                 torch_module.__path__ = []
                 torch_module.cuda = cuda_module
-                output = StringIO()
-                with monkeypatch.context() as query_context, redirect_stdout(output):
+                output_buffer = BytesIO()
+                with (
+                    TextIOWrapper(output_buffer, encoding="utf-8") as output,
+                    patch.dict(os.environ, kwargs["env"], clear=True),
+                    monkeypatch.context() as query_context,
+                    redirect_stdout(output),
+                ):
                     query_context.setitem(sys.modules, "torch", torch_module)
                     query_context.setitem(sys.modules, "torch.cuda", cuda_module)
+                    query_context.setattr(
+                        sys,
+                        "stdin",
+                        TextIOWrapper(
+                            BytesIO(kwargs.get("input", "").encode("utf-8")), encoding="utf-8"
+                        ),
+                    )
                     exec(command[2], {})
-                return output.getvalue()
+                    output.flush()
+                    result = output_buffer.getvalue().decode("utf-8")
+                return result
 
             monkeypatch.setattr(harness.subprocess, "check_output", check_output)
             configuration_data = config or {
@@ -901,6 +921,66 @@ def test_ttft_caller_checks_read_only_history(
         )
 
 
+def test_ttft_caller_keeps_rendered_encoding_after_probe_startup(
+    perf_sanity_caller: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late worker encoding override does not break a real read-only capacity probe."""
+    monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    torch_path = tmp_path / "probe_modules"
+    torch_path.mkdir()
+    (torch_path / "torch.py").write_text(
+        "import os\n"
+        "class cuda:\n"
+        "    @staticmethod\n"
+        "    def device_count():\n"
+        "        return len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))\n"
+    )
+    worker_path = tmp_path / "worker.yaml"
+    worker_path.write_text(
+        yaml.safe_dump(
+            {
+                "gpus_per_node": None,
+                "env_overrides": {
+                    "CUDA_VISIBLE_DEVICES": "0,1",
+                    "PYTHONIOENCODING": "utf-16",
+                },
+            }
+        )
+    )
+    launches = []
+    probe_timeouts = []
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history()],
+        config={
+            "metadata": {"model_name": "latency-control"},
+            "server_configs": [
+                {
+                    "name": "plain",
+                    "tensor_parallel_size": 2,
+                    "extra_llm_api_config_path": str(worker_path),
+                    "server_env_var": f"PYTHONPATH={torch_path}",
+                    "client_configs": [{"name": "con1", "concurrency": 1}],
+                }
+            ],
+        },
+        test_case="aggr-latency_control",
+        expect_upload=False,
+        real_worker_probe=True,
+        launches=launches,
+        probe_timeouts=probe_timeouts,
+    )
+    assert probe_timeouts
+    assert len(launches) == 1 and not uploaded
+    assert error is not None
+    assert _metric_comparison({"s_regression_info": str(error)}, "d_mean_ttft") == pytest.approx(
+        (125.0, 100.0)
+    )
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
+    assert os.environ["PYTHONIOENCODING"] == "utf-8"
+
+
 @pytest.mark.parametrize("mode", ["aggr", "aggr_upload"])
 def test_ttft_caller_skips_offline_capacity_probes(
     perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch, mode: str
@@ -996,81 +1076,130 @@ def test_ttft_caller_reports_capacity_probe_failure(
 
 
 def test_ttft_caller_uses_worker_visible_devices(
-    perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch
+    perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Default capacity follows each worker's inherited or overridden CUDA visibility."""
+    """Omitted capacity keeps the CLI count; explicit null recounts after worker overrides."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
     monkeypatch.setenv("LATENCY_TEST_PARENT", "inherited")
+    monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.delenv("LATENCY_TEST_RENDERED", raising=False)
     queried_masks = []
     visible_counts = {"0,1,2": 3, "0,1,2,3": 4, "0,1": 2}
 
     def device_count(environment: dict[str, str]) -> int:
         assert environment["LATENCY_TEST_PARENT"] == "inherited"
+        assert all(isinstance(value, str) for value in environment.values())
         mask = environment["CUDA_VISIBLE_DEVICES"]
         queried_masks.append(mask)
         return visible_counts[mask]
 
+    server_configs = [
+        {
+            "name": name,
+            "tensor_parallel_size": 4,
+            "server_env_var": variables,
+            "client_configs": [{"name": "con1", "concurrency": 1}],
+        }
+        for name, variables in (
+            ("inherited", ""),
+            ("full", "CUDA_VISIBLE_DEVICES=0,1,2,3"),
+            ("masked", "CUDA_VISIBLE_DEVICES=0,1"),
+        )
+    ]
+    for source in ("inline", "external"):
+        for capacity in ("omitted", "null"):
+            for name, variables, mask in (
+                ("full", "CUDA_VISIBLE_DEVICES=0,1", "0,1,2,3"),
+                ("masked", "CUDA_VISIBLE_DEVICES=0,1,2,3", "0,1"),
+            ):
+                worker_config = {
+                    "env_overrides": {"CUDA_VISIBLE_DEVICES": mask, "LATENCY_TEST_RENDERED": 17}
+                }
+                server = {
+                    "name": f"{source}-{capacity}-{name}",
+                    "tensor_parallel_size": 4,
+                    "server_env_var": variables,
+                    "client_configs": [{"name": "con1", "concurrency": 1}],
+                }
+                file_config = {"gpus_per_node": None} if capacity == "null" else {}
+                if source == "inline":
+                    server.update(worker_config)
+                else:
+                    file_config.update(worker_config)
+                if file_config:
+                    worker_path = tmp_path / f"{source}-{capacity}-{name}.yaml"
+                    worker_path.write_text(yaml.safe_dump(file_config))
+                    server["extra_llm_api_config_path"] = str(worker_path)
+                server_configs.append(server)
     config = {
         "metadata": {"model_name": "latency-control"},
-        "server_configs": [
-            {
-                "name": name,
-                "tensor_parallel_size": 4,
-                "server_env_var": variables,
-                "client_configs": [{"name": "con1", "concurrency": 1}],
-            }
-            for name, variables in (
-                ("inherited", ""),
-                ("full", "CUDA_VISIBLE_DEVICES=0,1,2,3"),
-                ("masked", "CUDA_VISIBLE_DEVICES=0,1"),
-            )
-        ],
+        "server_configs": server_configs,
     }
     uploaded, error = perf_sanity_caller(
-        [
-            _ttft_history(s_test_case_name=f"{name}-con1")
-            for name in ("inherited", "full", "masked")
-        ],
+        [_ttft_history(s_test_case_name=f"{server['name']}-con1") for server in server_configs],
         config=config,
         worker_device_count=device_count,
     )
     assert set(queried_masks) == set(visible_counts)
-    assert len(uploaded) == 3
+    assert len(uploaded) == len(server_configs)
+    eligible_names = {
+        "full-con1",
+        "inline-omitted-masked-con1",
+        "external-omitted-masked-con1",
+        "inline-null-full-con1",
+        "external-null-full-con1",
+    }
     for row in uploaded:
         name = row["s_test_case_name"]
         assert _metric_comparison(row, "d_mean_ttft") == pytest.approx((125.0, 100.0))
         assert row["l_gpus"] == row["l_gpus_per_node"] == 4
-        assert row["b_is_regression"] is (name == "full-con1")
-        assert (f"Regression in {name}:" in str(error)) is (name == "full-con1")
+        assert row["b_is_regression"] is (name in eligible_names)
+        assert (f"Regression in {name}:" in str(error)) is (name in eligible_names)
     assert error is not None
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2"
+    assert "LATENCY_TEST_RENDERED" not in os.environ
 
 
 def test_ttft_caller_respects_ray_node_capacity(
-    perf_sanity_caller: Callable, tmp_path: Path
+    perf_sanity_caller: Callable, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ray's worker rule uses TP as node capacity even with an explicit larger value."""
+    """Server and rendered Ray environments use TP even with an explicit larger capacity."""
+    monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
     worker_path = tmp_path / "worker.yaml"
-    worker_path.write_text(
-        yaml.safe_dump({"tensor_parallel_size": 2, "pipeline_parallel_size": 2, "gpus_per_node": 4})
-    )
-    config = {
-        "metadata": {"model_name": "latency-control"},
-        "hardware": {"gpus_per_node": 4},
-        "server_configs": [
-            {
-                "name": "plain",
-                "extra_llm_api_config_path": str(worker_path),
-                "server_env_var": "RAY_LOCAL_WORLD_SIZE=4",
-                "client_configs": [{"name": "con1", "concurrency": 1}],
-            }
-        ],
-    }
-    uploaded, error = perf_sanity_caller(
-        [_ttft_history(s_runtime="multi_node_aggr_server")], config=config
-    )
-    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
-    assert uploaded[0]["b_is_regression"] is False
-    assert error is None
+
+    def unexpected_probe(environment: dict[str, str]) -> int:
+        pytest.fail("Explicit or Ray worker capacity must not query CUDA")
+
+    for source in ("server", "worker"):
+        worker_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "gpus_per_node": 4,
+        }
+        server = {
+            "name": "plain",
+            "extra_llm_api_config_path": str(worker_path),
+            "client_configs": [{"name": "con1", "concurrency": 1}],
+        }
+        if source == "server":
+            server["server_env_var"] = "RAY_LOCAL_WORLD_SIZE=4"
+        else:
+            worker_config["env_overrides"] = {"RAY_LOCAL_WORLD_SIZE": 4}
+        worker_path.write_text(yaml.safe_dump(worker_config))
+        config = {
+            "metadata": {"model_name": "latency-control"},
+            "hardware": {"gpus_per_node": 4},
+            "server_configs": [server],
+        }
+        uploaded, error = perf_sanity_caller(
+            [_ttft_history(s_runtime="multi_node_aggr_server")],
+            config=config,
+            worker_device_count=unexpected_probe,
+        )
+        assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert uploaded[0]["b_is_regression"] is False
+        assert error is None
+    assert "RAY_LOCAL_WORLD_SIZE" not in os.environ
 
 
 @pytest.mark.parametrize(
