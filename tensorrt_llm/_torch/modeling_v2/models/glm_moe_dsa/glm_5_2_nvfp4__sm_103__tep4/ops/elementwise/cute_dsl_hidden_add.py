@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The residual add of hidden-width (6144) bf16 rows, one CuTe DSL launch."""
+"""The residual add of hidden-width (6144) bf16 rows, one CuTe DSL launch; and `hidden_add`,
+that launch with `torch.add` as its fallback."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -11,6 +13,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.common import hidden_rmsnorm_add_h6144_bf16 as _kernel
+from .._build import Count, build_or_reason
 
 HIDDEN = _kernel.HIDDEN
 
@@ -63,3 +66,41 @@ class CuteDslHiddenAdd(OpWrapper):
 
 
 cute_dsl_hidden_add = CuteDslHiddenAdd()
+
+
+@dataclass(frozen=True)
+class HiddenAddHandle:
+    """What `hidden_add` launches: the compiled kernel (None: not built, `missing` says why)
+    and the route counter (`hidden_add`)."""
+
+    compiled: Callable | None
+    count: Count
+    missing: str = ""
+
+
+def build(count: Count, enabled: bool = True) -> HiddenAddHandle:
+    """Compile the kernel into `hidden_add`'s handle; one that fails keeps `torch.add`.
+    `enabled=False` builds nothing."""
+    if not enabled:
+        return HiddenAddHandle(None, count, "not built")
+    compiled, missing = build_or_reason("hidden add", compile)
+    return HiddenAddHandle(compiled, count, missing)
+
+
+class HiddenAdd(OpWrapper):
+    """A residual add of hidden-width rows: `cute_dsl_hidden_add` where the handle's kernel
+    built and takes the pair, else `torch.add`. Counted as `hidden_add`."""
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor, handle: HiddenAddHandle) -> torch.Tensor:
+        hit = handle.compiled is not None and takes(a, b)
+        handle.count("hidden_add", hit)
+        if hit:
+            return cute_dsl_hidden_add(a, b, handle.compiled)
+        return torch.add(a, b)
+
+    def reference(self, a: torch.Tensor, b: torch.Tensor, handle: HiddenAddHandle) -> torch.Tensor:
+        """`torch.add`. `handle` is ignored."""
+        return torch.add(a, b)
+
+
+hidden_add = HiddenAdd()

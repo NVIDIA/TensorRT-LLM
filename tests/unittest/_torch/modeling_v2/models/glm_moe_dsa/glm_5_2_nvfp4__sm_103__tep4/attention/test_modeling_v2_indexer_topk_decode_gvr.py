@@ -137,8 +137,8 @@ def _core(width: int, gvr, built=()):
     core._dec_topk_gvr_live = gvr is not None
     core._ix_topk_dec_compiled = {n: _Ours(f"ours{n}") for n in built}
     core.op = SimpleNamespace(
-        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core), attn=F.Attn(core),
-        indexer=F.Indexer(core), mlp=F.Mlp(core), moe=F.Moe(core), mtp=F.Mtp(core),
+        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core),
+        indexer=F.Indexer(core), moe=F.Moe(core), mtp=F.Mtp(core),
     )  # fmt: skip
     return core
 

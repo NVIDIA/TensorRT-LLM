@@ -11,8 +11,8 @@ accepted row), and draft steps 1.. copy it instead of scoring and selecting. Wha
 * the stash is the engine's own rows (`Indexer._mtp_last_accepted_rows` plus the context last
   rows), with and without accepted counts, decode and mixed steps;
 * the target's MTP layer (`DecodeTarget.mtp_forward`), over a whole draft loop on a fake core
-  whose ops record the indexer front (the real `Attn.qkv_gen` and the real share stash / load
-  around them): with the flag on, step 0 runs the indexer and stashes, steps 1.. run no
+  whose ops record the indexer front (the Target's own attention calls and the real share
+  stash / load around them): with the flag on, step 0 runs the indexer and stashes, steps 1.. run no
   q side / scorer / top-k, still project and append their keys, and attend over the stashed
   rows; with it off, every step runs the indexer as before (the same calls, in the same
   order); the two give the same outputs when the indexer would select step 0's rows again,
@@ -30,6 +30,9 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    decode as D,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     forward_ops as F,
 )
@@ -130,7 +133,7 @@ def test_stash_is_the_engine_rows(ctx_lens, seqs, gen_p, accepted) -> None:
 class _Loop:
     """A fake core and a draft loop's metadata. `fresh(step)` is the selection the indexer
     would make at `step` (one row per query row); `calls` records the indexer front, `slots`
-    the selection each step's attention reads (`Attn.draft_slots`)."""
+    the selection each step's attention reads (the MTP layer's pool-row conversion)."""
 
     def __init__(self, share: bool, max_draft_len: int, seqs: int, fresh, skip_gen=False):
         self.calls: list[tuple] = []
@@ -138,7 +141,12 @@ class _Loop:
         self.fresh = fresh
         self.step = 0
         self.topk_buf = None
-        attn = SimpleNamespace(norm1=None, norm2=None, o=None)
+        attn = SimpleNamespace(
+            **dict.fromkeys(("norm1", "norm2", "o", "qkva", "qkva8", "ix_fold_w", "q_norm")),
+            **dict.fromkeys(("kv_norm", "qb", "qb_dec8", "k_b", "k_b_nk", "v_b_t", "v_b_nk")),
+            # The stacked q_b | wq_b weight: the fold is asked for where the step selects.
+            qbix_w="qbix_w",
+        )
         core = SimpleNamespace(
             num_layers=NUM_LAYERS,
             max_draft_len=max_draft_len,
@@ -155,29 +163,30 @@ class _Loop:
             heads=1,
             v_dim=1,
             kv_lora=1,
+            eps=1e-5,
+            # The handles the MTP layer's close passes to its ops (recorded as identities in
+            # `run`).
+            w={"embed": None},
+            _embedding=None,
+            _rows=SimpleNamespace(norm=None, add=None),
+            _proj_h=SimpleNamespace(o_proj=None),
+            _comm=None,
+            _shared_h=None,
             route_hits={},
             route_misses={},
+            idx_topk=TOPK,
+            _qb_pre={NUM_LAYERS: False},
+            _vb_pre={NUM_LAYERS: False},
+            _attn_h=SimpleNamespace(
+                **dict.fromkeys(("qkva_fold", "norm", "q_b_fold", "fmha", "k_b", "rope", "v_b"))
+            ),
         )
         core._count = lambda name, hit: core.route_hits.__setitem__(
             name, core.route_hits.get(name, 0) + 1
         )
-        # The indexer front's ops record; `Attn.qkv_gen` and the share stash / load are the
-        # target's own.
-        gemm = SimpleNamespace(
-            qkva_ix_fold=lambda ph, x, i, rows: None,
-            qb_ixqb_runner=lambda ph, i, rows: self.calls.append(("qb_ixqb", rows)) or None,
-        )
-        attn_op = F.Attn(core)
-        attn_op.qkv = lambda ph, x, a, q_b=True, qkva=None: ("q", "q_a", "latent", None)
-
-        def draft_slots(md, req_idx, buf, stride, pool_layer):
-            self.slots.append(buf.clone())
-            return buf, "global", None
-
-        attn_op.draft_slots = draft_slots
-        attn_op.gen_query = lambda *a: (None, None, None, None)
-        attn_op.sparse_decode = lambda *a: None
-        attn_op.v_b = lambda *a: False
+        # The indexer front's ops record (the attention's in `run`); the share stash / load are
+        # the target's own.
+        gemm = SimpleNamespace()
         indexer = F.Indexer(core)
         indexer.topk_buf = lambda md, rows, tc, skip_ctx, skip_gen: self.topk_buf
 
@@ -201,11 +210,9 @@ class _Loop:
         gemm.project = lambda ph, name, x, *a, **k: x
         core.op = SimpleNamespace(
             rows=SimpleNamespace(embed=same, rmsnorm=same, add=same, add_rmsnorm=same),
-            comm=SimpleNamespace(reduce=same, reduce_norm=same),
+            comm=SimpleNamespace(reduce=same),
             gemm=gemm,
-            attn=attn_op,
             indexer=indexer,
-            mlp=SimpleNamespace(shared=lambda ph, o, *a, **k: o),
             mtp=SimpleNamespace(
                 front=lambda ph, e, h, rows: h,
                 moe=lambda ph, o, rows, exact=False: o,
@@ -224,6 +231,7 @@ class _Loop:
             ),
             host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
             tokens_per_block=64,
+            block_table=None,
             req_idx_per_token=torch.zeros(64, dtype=torch.int32),
             skip_indexer_for_gen_reqs=skip_gen,
             num_seqs=seqs,
@@ -234,6 +242,37 @@ class _Loop:
     def run(self, accepted: list[int]) -> None:
         """The engine's loop: step 0 at `max_draft_len + 1` rows per request, then 1 row, each
         a call of the MTP layer's decode forward."""
+        with pytest.MonkeyPatch.context() as mp:
+            # The MTP layer's front, o_proj, collectives, shared expert and adds: identities.
+            for name in ("embed", "hidden_rmsnorm", "hidden_add", "allreduce"):
+                mp.setattr(D, name, lambda x, *a, **k: x)
+            mp.setattr(D, "projection", lambda ph, x, *a, **k: x)
+            mp.setattr(D, "allreduce_add_rmsnorm", lambda x, *a, **k: (x, None))
+            mp.setattr(D, "shared_gate_up_swiglu", lambda ph, o, *a, **k: (o, False))
+            mp.setattr(D, "shared_down", lambda ph, act, *a, **k: act)
+            # The attention: the q_b | wq_b fold records where it is asked for (a step that
+            # selects), the pool-row conversion records the selection it reads.
+            mp.setattr(D, "qkva_ix_fold", lambda ph, x, *a: (x, None))
+            mp.setattr(D, "qkv_a_rmsnorm", lambda qkva, *a: ("q_a", "latent", None, False))
+
+            def q_b_ix_wq_b(ph, q_a, w, w_fold, *a):
+                if w_fold is not None:
+                    self.calls.append(("qb_ixqb", int(self.topk_buf.shape[0])))
+                return "q", None
+
+            def convert(req_idx, block_table, buf, *a):
+                self.slots.append(buf.clone())
+                return buf
+
+            mp.setattr(D, "q_b_ix_wq_b", q_b_ix_wq_b)
+            mp.setattr(D, "convert_req_index_to_global", convert)
+            mp.setattr(D, "k_b_q_base", lambda *a: None)
+            mp.setattr(D, "mla_rope", lambda *a: (None, None, None, None))
+            mp.setattr(D, "sparse_mla_decode", lambda *a: None)
+            mp.setattr(D, "v_b", lambda *a: False)
+            self._run(accepted)
+
+    def _run(self, accepted: list[int]) -> None:
         md, d = self.md, self.core.max_draft_len
         md.mtp_num_accepted = torch.tensor(accepted, dtype=torch.int32)
         for step in range(d):

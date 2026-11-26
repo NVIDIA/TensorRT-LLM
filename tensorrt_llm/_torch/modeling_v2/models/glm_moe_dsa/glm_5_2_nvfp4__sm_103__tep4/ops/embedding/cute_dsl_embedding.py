@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.2's token embedding gather, in one CuTe DSL launch."""
+"""GLM-5.2's token embedding gather, in one CuTe DSL launch; and `embed`, the gather of a step
+of any row count in slices the kernel takes."""
 
 from __future__ import annotations
 
@@ -93,3 +94,31 @@ class CuteDslEmbedding(OpWrapper):
 
 
 cute_dsl_embedding = CuteDslEmbedding()
+
+
+#: The kernel's widest row count. A step above it (a `max_num_tokens` past 8192) gathers in
+#: slices.
+MAX_ROWS = 8192
+
+
+class Embed(OpWrapper):
+    """The embedding rows for `input_ids` of any count: `cute_dsl_embedding` on slices of up
+    to `MAX_ROWS` ids, concatenated. `runner` is `build`'s."""
+
+    def __call__(
+        self, input_ids: torch.Tensor, weight: torch.Tensor, runner: Runner
+    ) -> torch.Tensor:
+        if input_ids.shape[0] <= MAX_ROWS:
+            return cute_dsl_embedding(input_ids, weight, runner)
+        return torch.cat(
+            [cute_dsl_embedding(ids, weight, runner) for ids in input_ids.split(MAX_ROWS)]
+        )
+
+    def reference(
+        self, input_ids: torch.Tensor, weight: torch.Tensor, runner: Runner
+    ) -> torch.Tensor:
+        """`cute_dsl_embedding`'s reference over all the ids."""
+        return cute_dsl_embedding.reference(input_ids, weight, runner)
+
+
+embed = Embed()

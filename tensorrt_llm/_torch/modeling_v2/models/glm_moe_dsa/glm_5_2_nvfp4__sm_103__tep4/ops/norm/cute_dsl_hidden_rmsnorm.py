@@ -1,16 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""RMSNorm of hidden-width (6144) bf16 rows outside the fused all-reduce, one CuTe DSL launch."""
+"""RMSNorm of hidden-width (6144) bf16 rows outside the fused all-reduce, one CuTe DSL launch;
+and `hidden_rmsnorm`, that launch with FlashInfer's RMSNorm as its fallback."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 
 from ...kernels.common import hidden_rmsnorm_add_h6144_bf16 as _kernel
+from .._build import Count, build_or_reason
 
 HIDDEN = _kernel.HIDDEN
 
@@ -82,3 +86,45 @@ class CuteDslHiddenRmsnorm(OpWrapper):
 
 
 cute_dsl_hidden_rmsnorm = CuteDslHiddenRmsnorm()
+
+
+@dataclass(frozen=True)
+class HiddenRmsnormHandle:
+    """What `hidden_rmsnorm` launches: the compiled kernel (None: not built, `missing` says
+    why) and the route counter (`hidden_norm`)."""
+
+    compiled: Callable | None
+    count: Count
+    missing: str = ""
+
+
+def build(count: Count, enabled: bool = True) -> HiddenRmsnormHandle:
+    """Compile the kernel into `hidden_rmsnorm`'s handle; one that fails keeps FlashInfer's
+    norm. `enabled=False` builds nothing (every call then takes the fallback)."""
+    if not enabled:
+        return HiddenRmsnormHandle(None, count, "not built")
+    compiled, missing = build_or_reason("hidden RMSNorm", compile)
+    return HiddenRmsnormHandle(compiled, count, missing)
+
+
+class HiddenRmsnorm(OpWrapper):
+    """RMSNorm of hidden-width rows: `cute_dsl_hidden_rmsnorm` where the handle's kernel built
+    and takes the operands (`takes`), else FlashInfer's RMSNorm. Counted as `hidden_norm`."""
+
+    def __call__(
+        self, x: torch.Tensor, weight: torch.Tensor, eps: float, handle: HiddenRmsnormHandle
+    ) -> torch.Tensor:
+        hit = handle.compiled is not None and takes(x, weight)
+        handle.count("hidden_norm", hit)
+        if hit:
+            return cute_dsl_hidden_rmsnorm(x, weight, eps, handle.compiled)
+        return flashinfer_rmsnorm(x, weight, eps)
+
+    def reference(
+        self, x: torch.Tensor, weight: torch.Tensor, eps: float, handle: HiddenRmsnormHandle
+    ) -> torch.Tensor:
+        """`cute_dsl_hidden_rmsnorm`'s reference. `handle` is ignored."""
+        return cute_dsl_hidden_rmsnorm.reference(x, weight, eps, None)
+
+
+hidden_rmsnorm = HiddenRmsnorm()

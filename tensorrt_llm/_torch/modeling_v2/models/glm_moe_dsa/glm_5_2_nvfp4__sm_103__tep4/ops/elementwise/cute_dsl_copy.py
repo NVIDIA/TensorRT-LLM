@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""`dst.copy_(src)` for 2-D row blocks, with dtype conversion, one CuTe DSL launch."""
+"""`dst.copy_(src)` for 2-D row blocks, with dtype conversion, one CuTe DSL launch; and
+`row_copy`, that launch with `Tensor.copy_` as its fallback."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.elementwise import tensor_copy_convert_2d as _kernel
+from .._build import Count, build_or_reason
 
 
 @dataclass(frozen=True)
@@ -123,3 +125,43 @@ class CuteDslCopy(OpWrapper):
 
 
 cute_dsl_copy = CuteDslCopy()
+
+
+@dataclass(frozen=True)
+class RowCopyHandle:
+    """What `row_copy` launches: the compiled pairs (None: not built, `missing` says why) and
+    the route counter (`copy`)."""
+
+    compiled: CompiledCopy | None
+    count: Count
+    missing: str = ""
+
+
+def build(count: Count, enabled: bool = True) -> RowCopyHandle:
+    """Compile every pair into `row_copy`'s handle; one that fails keeps `Tensor.copy_`.
+    `enabled=False` builds nothing."""
+    if not enabled:
+        return RowCopyHandle(None, count, "not built")
+    compiled, missing = build_or_reason("copy/convert", compile)
+    return RowCopyHandle(compiled, count, missing)
+
+
+class RowCopy(OpWrapper):
+    """`dst.copy_(src)`: `cute_dsl_copy` for the pairs it takes (`takes`) where the handle's
+    kernels built, else `Tensor.copy_`. Returns `dst`. Counted as `copy`."""
+
+    def __call__(self, dst: torch.Tensor, src: torch.Tensor, handle: RowCopyHandle) -> torch.Tensor:
+        hit = handle.compiled is not None and takes(dst, src)
+        handle.count("copy", hit)
+        if hit:
+            return cute_dsl_copy(dst, src, handle.compiled)
+        return dst.copy_(src)
+
+    def reference(
+        self, dst: torch.Tensor, src: torch.Tensor, handle: RowCopyHandle
+    ) -> torch.Tensor:
+        """`Tensor.copy_` into a clone of `dst`. `handle` is ignored."""
+        return dst.clone().copy_(src)
+
+
+row_copy = RowCopy()

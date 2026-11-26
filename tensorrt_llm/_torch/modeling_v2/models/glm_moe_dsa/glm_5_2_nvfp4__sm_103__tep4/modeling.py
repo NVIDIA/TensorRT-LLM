@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 
@@ -38,73 +39,52 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.speculative import (
     MTPEagleWorker,
     get_spec_worker,
     should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
 from .decode import DecodeTarget
-from .forward_ops import (
-    _DECODE_MAX_ROWS,
-    _MLA_ROPE_MTP_WIDTH,
-    _MOE_DECODE_WIDTHS,
-    _MOE_MAX_T,
-    _MOE_SF_VEC,
-    _MOE_TOP_K,
-    DRAFT,
-    PREFILL,
-    Attn,
-    Comm,
-    Ctx,
-    Gemm,
-    Indexer,
-    Mlp,
-    Moe,
-    Mtp,
-    Rows,
-)
 from .kernels.common import cuda_stream as _cuda_stream
 from .kernels.moe import moe_fc1_kblock as _fc1_kblock
-from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
+from .ops._build import try_build as _try_build
 from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
-from .ops.attention import cute_dsl_mha_kv_gather_mxf8 as _kv_gather8_op
+from .ops.attention import ctx_mha as _ctx_mha
+from .ops.attention import ctx_rope as _ctx_rope
+from .ops.attention import ctx_sparse_mla as _ctx_sparse_mla
 from .ops.attention import cute_dsl_mha_prefill as _mha_pre_op
 from .ops.attention import cute_dsl_mha_prefix_gather as _mha_prefix_op
 from .ops.attention import cute_dsl_mla_rope_append_prefill as _ctx_rope_op
-from .ops.attention import cute_dsl_mla_rope_generation as _mla_rope_op
 from .ops.attention import cute_dsl_sparse_mla_decode as _fmha_dec_op
 from .ops.attention import cute_dsl_sparse_mla_decode_union as _fmha_union_op
 from .ops.attention import cute_dsl_sparse_mla_prefill as _fmha_pre_op
-from .ops.attention.cute_dsl_indexer_k_cache_update import build as build_ix_k_cache
-from .ops.attention.cute_dsl_indexer_q_side_fused import build as build_ix_q_side
-from .ops.attention.cute_dsl_indexer_q_side_k_cache import build as build_ix_qk
-from .ops.attention.cute_dsl_indexer_topk_decode import build as build_ix_topk_decode
-from .ops.attention.cute_dsl_indexer_topk_prefill import build as build_ix_topk_prefill
+from .ops.attention import indexer as _ix
+from .ops.attention import mla_rope as _mla_rope
+from .ops.attention import sparse_mla as _sparse_mla
 from .ops.attention.cute_dsl_req_index_to_base import build as build_req_index_to_base
 from .ops.attention.cute_dsl_req_index_to_global import build as build_req_index_to_global
 from .ops.comm import cute_dsl_allgather_widen as _allgather_op
+from .ops.comm import cute_dsl_allreduce as _ar_op
+from .ops.comm import cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 as _ar_quant_op
 from .ops.comm._lamport import build_workspace as build_lamport_workspace
 from .ops.comm.cute_dsl_allgather_widen import cute_dsl_allgather_widen
 from .ops.elementwise import cute_dsl_copy as _copy_op
 from .ops.elementwise import cute_dsl_hidden_add as _hidden_add_op
 from .ops.elementwise import cute_dsl_rows_select as _rows_sel_op
+from .ops.elementwise import order_fence as _fence_op
 from .ops.embedding import cute_dsl_hidden_row_gather as _row_gather_op
 from .ops.embedding.cute_dsl_embedding import build as build_embedding
 from .ops.embedding.cute_dsl_hidden_row_gather import cute_dsl_hidden_row_gather
+from .ops.gemm import absorbed_bmm as _absorbed_bmm
+from .ops.gemm import ctx_k_b as _ctx_k_b
 from .ops.gemm import cute_dsl_absorbed_bmm as _absorbed_bmm_op
-from .ops.gemm import cute_dsl_dense_up_swiglu_mxf8 as _dense_up8_op
-from .ops.gemm import cute_dsl_indexer_pre_proj_split as _ix_pre_split_op
 from .ops.gemm import cute_dsl_mtp_eh_proj as _mtp_eh
 from .ops.gemm import cute_dsl_projection as _projection_op
 from .ops.gemm import cute_dsl_projection_mxf8 as _mxf8_op
@@ -113,36 +93,43 @@ from .ops.gemm import cute_dsl_q_b_ix_wq_b as _qbix_op
 from .ops.gemm import cute_dsl_qkva_ix_fold as _ix_fold_op
 from .ops.gemm import cute_dsl_shared_gate_up_swiglu as _shared_gu_swiglu_op
 from .ops.gemm import cute_dsl_shared_up_swiglu_mxf8 as _shared_up8_op
+from .ops.gemm import dense_mlp as _dense_mlp
+from .ops.gemm import indexer_fold as _ix_fold
+from .ops.gemm import indexer_pre_proj as _ix_pre
+from .ops.gemm import mtp_eh_proj as _mtp_eh_proj
+from .ops.gemm import projection as _proj
+from .ops.gemm import q_b_e4m3 as _q_b_e4m3
+from .ops.gemm import shared_mlp as _shared_mlp
 from .ops.gemm.cute_dsl_projection import cute_dsl_projection
-from .ops.moe import cute_dsl_moe_l2_prefetch as _l2pf_op
-from .ops.moe import cute_dsl_moe_merge as _moe_merge_op
-from .ops.moe import cute_dsl_moe_nvfp4_experts as _moe_experts_op
-from .ops.moe import cute_dsl_moe_prefill_topk_routing_rep as _moe_topk_pre_rep_op
-from .ops.moe import cute_dsl_moe_router as _moe_router_op
-from .ops.moe import cute_dsl_moe_routing as _moe_routing_op
 from .ops.moe import cute_dsl_moe_sigmoid_topk as _topk_rows_op
-from .ops.moe import cute_dsl_moe_topk_routing as _moe_topk_op
-from .ops.moe import cute_dsl_moe_topk_routing_rep as _moe_topk_rep_op
-from .ops.moe import cute_dsl_moe_topk_routing_wide_rep as _moe_topk_wide_rep_op
-from .ops.moe import cute_dsl_moe_zero as _moe_zero_op
-from .ops.moe import cute_dsl_mtp_moe_experts as _mtp_experts_op
+from .ops.moe import routed_moe as _routed_moe
+from .ops.moe.routed_moe import moe_experts, moe_quantize_first, moe_router, moe_topk
 from .ops.norm import cute_dsl_hidden_add_rmsnorm as _hidden_add_norm_op
 from .ops.norm import cute_dsl_hidden_rmsnorm as _hidden_norm_op
 from .ops.norm import cute_dsl_mtp_eh_norm_cat_mxf8 as _eh8_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm_q8 as _qkv_a_norm8_op
+from .ops.norm import qkv_a_rmsnorm as _qkv_a_norm
+from .ops.norm.cute_dsl_hidden_rmsnorm import hidden_rmsnorm
 from .ops.norm.cute_dsl_mtp_norm_shard import compile as compile_mtp_norm_shard
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import compile as compile_qkv_a_rmsnorm
 from .ops.quantization import cute_dsl_act_quant_mxf8_rows as _aq_rows_op
-from .ops.quantization import cute_dsl_moe_quantize_nvfp4 as _moe_quant_op
 from .ops.sampling import cute_dsl_argmax as _argmax_op
 from .prefill import PrefillTarget
 from .spec_worker import Glm52MTPEagleWorker
+from .step import DRAFT, PREFILL
 from .wide_decode import WideDecodeTarget
 
 _QUANT_MODE_FP8_KV = 128
 # How often rank 0 logs the route counters, in decode forwards (eager forwards and graph
 # captures: a replay does not re-enter Python). Context steps always report.
 _ROUTE_REPORT_EVERY = 16
+# The widest step the routed experts' and the indexer's context kernels are built for.
+_MOE_MAX_T = 8192
+# The MTP width the specialised MLA rope kernel and the base-row index kind are built for at
+# MTP1; MTP3 / MTP5 add max_draft_len + 1 (`mtp_widths`).
+_MLA_ROPE_MTP_WIDTH = 2
+# The decode kernels' widest compiled row count (`projection.DECODE_MAX_ROWS`).
+_DECODE_MAX_ROWS = _proj.DECODE_MAX_ROWS
 
 # The fp8 context attention's dequantization scales are powers of two from strict bounds on
 # its operands (`_mha_fp8_scales`); the bound's margin covers bf16 rounding of the normalized
@@ -165,38 +152,11 @@ _FMHA_BMM1_SCALE = (0.0625, 0.09016843885183334)
 _FMHA_BMM2_SCALE = (1.0,)
 # The indexer's LayerNorm epsilon, which is not the model's rms_norm_eps.
 _INDEXER_K_NORM_EPS = 1e-6
-# `head_dim + 4`: the fused write needs the fp8 key and its fp32 scale in one slot.
-_INDEXER_PER_TOKEN_MIN = 132
-# The context indexer projection's fp32 output row: 128 key columns, then 32 head weights.
-_IX_PROJ_COLS = 160
 # The fused shared-expert gate|up + SwiGLU kernel is compiled for one row count per runner
 # (`_shared_gu_swiglu_op`): an MTP3 / MTP5 engine also builds it at its decode row counts of
 # 1..`_SHARED_FUSED_UP_SEQS` sequences without a cell (MTP5 6 / 12 / 18, MTP3 12), served
-# where `Gemm.cell_up` holds. Wider counts take the two-launch path on the projection cells.
+# where `projection.cell_up` holds. Wider counts take the two-launch path on the projection cells.
 _SHARED_FUSED_UP_SEQS = 3
-# The decode logits width (the engine's max_seq_len) at or below which the generation rows keep our
-# decode top-k although the engine's config asks for GVR (`_dec_topk_gvr`;
-# `TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE`). Single-B300 CUDA graph of 20 calls (us per call, ours /
-# GVR, every set exact): GVR's tuning is frozen from the width, so on a 16384-wide engine at 192
-# rows (MTP5 x 32) it costs 5.2 / 12.5 at KV 2k / 4k against our 1.5 / 5.5, where a realtext
-# step (ISL 1k + OSL 8k) spends most of its decode; at 172032 GVR takes 8-17 (42 at 192 rows)
-# against our 58-95 at KV 160k. Only the width and the row count are fixed at capture.
-_DEC_TOPK_GVR_ABOVE = 16384
-
-
-# MTP draft-loop index share: the engine's DSA indexer semantics (`Indexer.sparse_attn_indexer`
-# with `mtp_index_share`), for the MTP layer's indexer, the only one a draft step runs.
-#
-# The engine's MTP-Eagle linear draft loop marks the metadata `in_mtp_draft_loop`, hands it the
-# trunk's accepted counts (`mtp_num_accepted`) and sets `indexer_skip_topk` from the second draft
-# step on (`eagle3._forward_linear_draft_loop`); it does so for every DSA metadata, and each
-# indexer's own `mtp_index_share` decides whether to act. With it on, draft step 0 stashes one
-# selection row per request in `shared_topk_indices` (a context request's last row, a generation
-# request's last accepted row), and the later steps copy those rows instead of scoring and
-# selecting. After step 0 the loop rewrites the metadata in place to one row per request in
-# request order (`num_contexts = 0`), so stash row `r` is request `r`'s: contexts first, then
-# generations. The keys still project and append on every step: the engine's
-# `pre_indexer_proj` and `_update_k_cache` run unconditionally.
 
 
 def _engine_sparse_params(model_config: ModelConfig, layer_idx: int | None):
@@ -211,57 +171,15 @@ def _engine_sparse_params(model_config: ModelConfig, layer_idx: int | None):
 
 
 def _engine_mtp_index_share(model_config: ModelConfig) -> bool:
-    """The engine's `mtp_index_share` for the MTP layer's indexer: its sparse params, i.e. the
-    LLM arg `index_share_for_mtp_iteration`, else the checkpoint's field of that name (GLM-5.2
-    NVFP4's config.json sets it true)."""
+    """The engine's `mtp_index_share` for the MTP layer's indexer (`ops/attention/
+    mtp_index_share.py`): its sparse params, i.e. the LLM arg `index_share_for_mtp_iteration`,
+    else the checkpoint's field of that name (GLM-5.2 NVFP4's config.json sets it true)."""
     cfg = getattr(model_config, "pretrained_config", None)
     params = _engine_sparse_params(model_config, getattr(cfg, "num_hidden_layers", None))
     return bool(getattr(params, "mtp_index_share", False))
 
 
-def _dec_topk_gvr_serves(max_seq_len: int) -> bool:
-    """Whether the GVR decode top-k serves an engine of this logits width (`max_seq_len`, fixed
-    at capture): wider than `_DEC_TOPK_GVR_ABOVE` (`TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE`)."""
-    above = int(os.environ.get("TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE", str(_DEC_TOPK_GVR_ABOVE)))
-    return max_seq_len > above
-
-
-def _dec_topk_gvr_choice(
-    params, index_topk: int, *, sm_version: int, dsl_available: bool, env: str | None
-) -> bool | None:
-    """The decode top-k engine of the generation rows: `gvr_deterministic_topk` where they take
-    the stock engine's self-sampling GVR top-k, None where they keep ours.
-
-    Ours by default, under the engine's GVR config too: on long engines our decode top-k splits
-    each long row across a CTA cluster, which matches GVR at 64k-160k KV and keeps our one-CTA
-    speed at short KV, where GVR's tuning frozen from the engine width is 2-3x slower.
-    `TRTLLM_GLM52_DEC_TOPK_GVR=1` (`env`) restores the stock engine's self-sampling GVR top-k
-    where the stock DSA indexer would run it on this checkpoint's layers: the engine's
-    `enable_heuristic_topk` with the self-sampling engine (`use_self_sampling_gvr`: its
-    `use_self_sampling_topk`, CuTe DSL, sm_100 / sm_103, `index_topk` 2048 here, compress ratio
-    1). The temporal-hint engine (`use_self_sampling_topk=False`) needs the previous step's
-    selection as caller-owned state, which this target does not keep: ours there."""
-    if env != "1" or params is None or not getattr(params, "enable_heuristic_topk", False):
-        return None
-    if index_topk != 2048 or not use_self_sampling_gvr(
-        enable_heuristic_topk=True,
-        use_self_sampling_topk=bool(getattr(params, "use_self_sampling_topk", True)),
-        index_topk=index_topk,
-        compress_ratio=1,
-        is_cute_dsl_available=dsl_available,
-        sm_version=sm_version,
-    ):
-        return None
-    return bool(getattr(params, "gvr_deterministic_topk", False))
-
-
 _SHARED_INTER = 512
-# The widest wide decode step that takes the expert replicas (`_build_moe_wide_rep`): the wide
-# top-k's 65..128 range. 4-GPU decode chain with the real all-reduce on real routing (two trunk
-# MoE layers with replicas): -6.5 / -5.8 us per step at 128 rows (MTP3), -8.1 / -6.4 / -4.2 us at
-# 68 / 96 / 126; at 192 rows (MTP5) -2.7 / +2.8 / +0.4 us over 320 / 800 / 1600 replays a side,
-# no gain past the replica top-k's +0.7 us, so 129..256 keep the wide top-k.
-_WIDE_REP_MAX_ROWS = 128
 
 
 def _pow2_ceil(x: torch.Tensor) -> torch.Tensor:
@@ -276,15 +194,6 @@ def _fold_pow2(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     if not torch.equal(out.float() * s, w.float()):
         raise ValueError("fp8 context attention: a power-of-two weight scale was not exact")
     return out
-
-
-def _try_build(what: str, build):
-    """`build()`, or None with a warning: the caller's call sites then keep the stock op."""
-    try:
-        return build()
-    except Exception as e:  # noqa: BLE001 -- that op stays on the stock path
-        logger.warning(f"modeling_v2 GLM-5.2: {what} build failed ({e}); using the stock op")
-        return None
 
 
 class GlmMoeDsaTep4ModelingV2(DecoderModel):
@@ -350,7 +259,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self.indexer_is_neox = not getattr(cfg, "indexer_rope_interleave", False)
 
         self.dense_layers = cfg.first_k_dense_replace
-        # Each dense layer's MXF8 gate|up and down (`Mlp.dense`); set by `_build_proj_mxf8`.
+        # Each dense layer's MXF8 gate|up and down (`dense_gate_up_swiglu`); set by
+        # `_build_mlp_mxf8`.
         self._dense_w8: list = [None] * self.dense_layers
         self.num_experts = cfg.n_routed_experts
         self.topk = cfg.num_experts_per_tok
@@ -424,44 +334,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._mtp_out_normed = self.max_draft_len > 1
         # The engine's draft-loop index share for the MTP layer's indexer (`_engine_mtp_index_share`;
         # the GLM-5.2 checkpoint turns it on): draft steps after the first reuse draft step 0's
-        # selection (`_mtp_share_*`). Only a loop of more than one draft step reads the stash.
+        # selection (`mtp_share_load` / `mtp_share_store`). Only a loop of more than one draft
+        # step reads the stash.
         self.mtp_index_share = self.mtp_enabled and _engine_mtp_index_share(model_config)
         self._mtp_share_stash = self.mtp_index_share and self.max_draft_len > 1
         # With TRTLLM_GLM52_DEC_TOPK_GVR=1 and the engine's sparse config asking for the GVR
-        # decode top-k (`enable_heuristic_topk`, `_dec_topk_gvr_choice`), the generation rows'
-        # top-k runs the stock engine's self-sampling GVR engine through its `TopK` module, as
-        # the stock DSA indexer does; otherwise (None) ours, the cluster split on long engines.
-        # `_derive_first_step` keeps ours on engines no wider than `_DEC_TOPK_GVR_ABOVE`
-        # (`_dec_topk_gvr_serves`) and warms GVR's launchers.
-        gvr_det = _dec_topk_gvr_choice(
-            _engine_sparse_params(model_config, 0),
-            self.idx_topk,
-            sm_version=get_sm_version(),
-            dsl_available=IS_CUTLASS_DSL_AVAILABLE,
-            env=os.environ.get("TRTLLM_GLM52_DEC_TOPK_GVR"),
-        )
-        # Whether it serves this engine's width (`_derive_first_step`).
-        self._dec_topk_gvr_live = False
-        self._dec_topk_gvr = (
-            None
-            if gvr_det is None
-            else TopK(
-                self.idx_topk,
-                decode_implementation=TopKImplementation.CUTE_DSL_GVR,
-                gvr_self_sampling=True,
-                gvr_deterministic=gvr_det,
-            )
-        )
+        # decode top-k (`indexer.gvr_choice`), the generation rows' top-k runs the stock
+        # engine's self-sampling GVR engine through its `TopK` module, as the stock DSA indexer
+        # does; otherwise (None) ours, the cluster split on long engines. The first forward
+        # keeps ours on engines no wider than `indexer.DEC_TOPK_GVR_ABOVE` and warms GVR's
+        # launchers (`indexer.compile_for_engine`).
+        self._dec_topk_gvr = _ix.build_gvr(_engine_sparse_params(model_config, 0), self.idx_topk)
+        # The indexer's state across steps (`indexer.IndexerState`).
+        self._ix_state = _ix.IndexerState()
         # An MTP3 / MTP5 decode step's rows above 64 (verify and draft step 0 carry 32 x
         # (max_draft_len + 1)) are decode rows (`WideDecodeTarget`). Its rows without an MTP
         # cell of their own (a batch of fewer than 32 sequences: 65..191 rows, 96 / 144 at 24
-        # requests) run on the next cell up at their exact row count (`Gemm.wide_cell`); False
-        # sends them to the bf16 fallbacks instead.
+        # requests) run on the next cell up at their exact row count (`projection.wide_cells`);
+        # False sends them to the bf16 fallbacks instead.
         self._wide_bucket = True
         # TRTLLM_GLM52_DEC_CELL_UP (default 1; 0 restores cuBLAS there): an MTP3 / MTP5
         # decode step's (`Phase.wide`, graph-captured) row counts up to 64 without a decode
         # cell of their own (MTP5 at 1-3 requests: 6 / 12 / 18; MTP3 at 3: 12) take the same
-        # rule as an eager draft step (`Gemm.cell_up`): the next cell up at their exact rows.
+        # rule as an eager draft step (`projection.cell_up`): the next cell up at their exact rows.
         # Measured at MTP5 b=2 (12 rows): the indexer projection there ran as `x.float()`
         # + an fp32 SIMT cuBLAS GEMM + split-K reduce + copies (27 us per indexer layer).
         self._dec_cell_up = os.environ.get("TRTLLM_GLM52_DEC_CELL_UP", "1") == "1"
@@ -483,13 +378,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # TRTLLM_GLM52_MOE_ACC_PADDED (default 1; 0 restores the add after FC2): at a decode
         # width up to 64 that routing pads to a power of two (MTP5 at 1-3 requests: 6 / 12 /
         # 18 -> 8 / 16 / 32) the shared expert also writes the routed slot's first rows and
-        # FC2 accumulates onto them (`Moe.begin_layer`), as at the power-of-two widths: no
+        # FC2 accumulates onto them (`routed_moe.moe_open`), as at the power-of-two widths: no
         # clear, and no separate shared + routed add on the critical chain after FC2.
         self._moe_acc_padded = os.environ.get("TRTLLM_GLM52_MOE_ACC_PADDED", "1") == "1"
         # TRTLLM_GLM52_MOE_DEC_UNPAD (default 1; 0 restores the padding): a trunk MoE layer at a
         # decode width up to 64 that is not a power of two (MTP5 at 1-3 requests: 6 / 12 / 18)
         # runs its grouped GEMMs on the fused top-k's own maps at the exact row count
-        # (`Moe.dec_unpadded`), as the power-of-two widths do. Padding it cost seven launches
+        # (`routed_moe.dec_unpadded`), as the power-of-two widths do. Padding it cost seven launches
         # per layer between the top-k and FC1 (two id / weight fills and cats, two staging
         # copies, the routing kernel: 8.3 us of the critical chain at 12 rows on B300)
         # and dropped the decode replicas' maps for the routing kernel's home mapping.
@@ -503,20 +398,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._moe_l2_prefetch = os.environ.get("TRTLLM_GLM52_MOE_L2_PREFETCH", "1") == "1"
         # The fused shared-expert cells at those row counts (`_SHARED_FUSED_UP_SEQS`).
         self._shared_gu_swiglu_up: dict = {}
-        self._ix_pre_split_rag = None
         # The MTP3 / MTP5 decode cells' K-B writing the e4m3 q-base beside the rope kernel
-        # (`Attn.gen_query`), by row count; empty keeps the bf16 K-B and the full rope there.
+        # (`k_b_q_base`), by row count; empty keeps the bf16 K-B and the full rope there.
         self._kb8_mtp: dict = {}
         # TRTLLM_GLM52_WIDE_IX_FOLD (default 1): on an MTP3 / MTP5 engine an indexer layer's
         # wide decode step (rows above 64) runs the qkva projection and the indexer's key /
         # head-weight projection as one GEMM over the two weights stacked in one buffer
-        # (`Gemm.qkva_ix_fold`); 0 keeps the two GEMMs. Set up in `post_load_weights`: the
+        # (`qkva_ix_fold`); 0 keeps the two GEMMs. Set up in `post_load_weights`: the
         # stacked weights by layer and the fold cells by row count; empty keeps the two.
         self._ix_fold_on = os.environ.get("TRTLLM_GLM52_WIDE_IX_FOLD", "1") == "1"
         self._ix_fold_w: dict[int, torch.Tensor] = {}
         self._qkva_ix_mtp: dict = {}
         # TRTLLM_GLM52_WIDE_QB_IXQB (default 1): likewise q_b and the indexer's wq_b (both read
-        # q_a) as one GEMM over their two weights stacked `[2, 4096, 2048]` (`Gemm.qb_ixqb`), where
+        # q_a) as one GEMM over their two weights stacked `[2, 4096, 2048]` (`q_b_ix_wq_b`), where
         # the step runs the indexer; 0 keeps the two GEMMs. Stacked weights by layer, cells by
         # row count, both set up in `post_load_weights`.
         self._qbix_on = os.environ.get("TRTLLM_GLM52_WIDE_QB_IXQB", "1") == "1"
@@ -525,9 +419,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # TRTLLM_GLM52_WIDE_IX_QK (default 1): there, too, the indexer's q side (rope + e4m3
         # pack of its q, the head weights) and this step's K-cache update run as one launch
         # (`cute_dsl_indexer_q_side_k_cache`: each kernel's CTAs in one grid, the same bytes);
-        # 0 keeps the two launches. Both pool layouts' launchers, built with the K update's.
+        # 0 keeps the two launches. Both pool layouts' launchers, built with the K update's
+        # (`indexer.compile_for_engine`).
         self._ix_qk_on = os.environ.get("TRTLLM_GLM52_WIDE_IX_QK", "1") == "1"
-        self._ix_qk_compiled: dict = {}
 
         self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
 
@@ -538,10 +432,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._idx_cos_sin: torch.Tensor | None = None
         self._pool_layer_id: list[int] = []
         self._stride_factor = 0
+        # The selection's conversions to pool rows, built per KV cache manager.
+        self._req_global_compiled = None
+        self._req_base_compiled = None
         self._max_ctx_len = 0
         self._mtp: dict | None = None
         self._ctx_rope_compiled: _ctx_rope_op.CompiledMlaRopeAppendPrefill | None = None
-        # The non-absorbed context attention (`PrefillTarget._attn_mha`): its MHA, its
+        # The non-absorbed context attention (`ops/attention/ctx_mha.py`): its MHA, its
         # cached-prefix gather and the two kv_b expansion runners; empty or None keeps every
         # context step on the absorbed path.
         self._mha_pre: _mha_pre_op.CompiledMhaPrefill | None = None
@@ -561,25 +458,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._fmha_dec_wide: _fmha_dec_op.CompiledSparseMlaDecode | None = None
         # MTP3 / MTP5 pure decode: the union decode attention's handle (None: per-row only).
         self._fmha_union: _fmha_union_op.CompiledSparseMlaDecodeUnion | None = None
-        # The ops the Targets call (`forward_ops`). They read the weights and the kernels this
-        # core builds at load, and keep the per-step state the kernels share across calls: the
-        # routed experts' operand slots alternate per layer (trunk) or per call (MTP).
-        self.op = SimpleNamespace(
-            rows=Rows(self),
-            comm=Comm(self),
-            gemm=Gemm(self),
-            attn=Attn(self),
-            indexer=Indexer(self),
-            mlp=Mlp(self),
-            moe=Moe(self),
-            mtp=Mtp(self),
-            ctx=Ctx(self),
-        )
+        # The logits head's bucket runners re-pinned to a row count without a bucket of its own
+        # (`logits`), by row count. Filled at the first use of a count: the re-pin compiles
+        # nothing, so a first one inside a CUDA-graph capture is safe.
+        self._lm_head_at_rows: dict = {}
         # Context steps on the dense-causal context attention, and the others by reason.
         self.dense_causal_steps = 0
         self.dense_causal_misses: dict[str, int] = {}
-        # The dense-causal group table's sync-free uploader, built at first use.
-        self._dc_uploader = None  # `PrefillTarget._dense_causal_absorbed`
         # The row ops outside the fused kernels and the logits head's local GEMM, built in
         # `post_load_weights` and `build_logits_head`; None keeps a call site's stock op.
         self._rows = SimpleNamespace(
@@ -601,7 +486,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # replaced: the load-time builds above only fill in what they point at.
         self.route_hits: dict[str, int] = {}
         # Context steps on which the MTP layer computed every row, by reason
-        # (`PrefillTarget._mtp_last_plan`).
+        # (`context_plan.mtp_last_plan`).
         self.mtp_last_declines: dict[str, int] = {}
         self.route_misses: dict[str, int] = {}
         self._forwards = 0
@@ -666,6 +551,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # qkva / o_proj in MXF8 for the context rows, set in `post_load_weights`.
             qkva8=None,
             o8=None,
+            # The stacked qkva + indexer key / head-weight weight and q_b + wq_b weight of an
+            # indexer layer on an engine that folds them (`indexer_fold`), else None.
+            ix_fold_w=self._ix_fold_w.get(i),
+            qbix_w=self._qbix_w.get(i),
             # Decode rows' q_b / o_proj on MXF8 weights (`_build_dec_mxf8`), and the power-of-two
             # Q scale folded into `qb8`.
             qb_dec8=None,
@@ -693,7 +582,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         """The context rows' qkva and o_proj as MXF8 GEMMs: e4m3 operands with e8m0 1x32
         block scales, fp32 accumulation, bf16 out. Each trunk layer's two weights are
         quantized once here (3.3 GB per rank beside the bf16 copies, which the decode cells
-        keep); `Gemm.project` quantizes the activation with one launch per call. On B300 at
+        keep); `projection` quantizes the activation with one launch per call. On B300 at
         T ~ 7-8k quant + GEMM takes 0.61-0.76x the bf16 prefill GEMM. Decode cells (rows
         <= 64) and the MTP layer stay bf16; an entry that fails to build keeps the bf16
         prefill GEMM."""
@@ -703,60 +592,33 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 _mxf8_op.quantize_weight(getattr(self._attn[i], attr).t())
                 for i in range(self.num_layers)
             ]
-            runner = _try_build(f"MXF8 {name}", lambda name=name, w=wq[0]: _mxf8_op.build(name, w))
+            runner = _proj.build_mxf8(name, wq[0])
             if runner is None:
                 continue
             for i, w in enumerate(wq):
                 setattr(self._attn[i], f"{attr}8", w)
             self._proj_mxf8[name] = runner
         self._build_mlp_mxf8()
-        # Each dense layer's MXF8 gate|up and down (`Mlp.dense`), None where they did not build.
-        self._dense_w8 = (
-            list(self._dense8) if self._dense8 is not None else [None] * self.dense_layers
-        )
 
     def _build_mlp_mxf8(self) -> None:
         """The context rows' MLPs on MXF8 GEMMs, their weights quantized once here.
 
-        Dense layers: gate|up, the SwiGLU writing the down GEMM's operand
-        (`cute_dsl_swiglu_mxf8`), down (+0.17 GB per rank). At 7-8k rows 0.82 against 1.61 ms
-        per context step in bf16. MoE layers: the shared expert's gate|up with the SwiGLU in
-        the GEMM's epilogue (`cute_dsl_shared_up_swiglu_mxf8`, +0.47 GB per rank), on the
-        operand the pre-MoE all-reduce writes; its down stays bf16 (the MXF8 down moved the
-        output distribution more than the accuracy budget allows). Either part that fails to
-        build keeps its bf16 path."""
+        Dense layers: the MXF8 trio (`dense_mlp.build_mxf8`, +0.17 GB per rank): gate|up, the
+        SwiGLU writing the down GEMM's operand, down. MoE layers: the shared expert's gate|up
+        with the SwiGLU in the GEMM's epilogue (`shared_mlp.build_mxf8`, +0.47 GB per rank), on
+        the operand the pre-MoE all-reduce writes. Either part that fails to build keeps its
+        bf16 path."""
         dev = torch.cuda.current_device()
-        self._dense8: list | None = None
         dense = range(self.dense_layers)
-        wq = {
-            name: [_mxf8_op.quantize_weight(self.w[f"l{i}_mlp_{key}"]) for i in dense]
-            for name, key in (("dense_gate_up", "gu"), ("dense_down", "dn"))
-        }
-        runners = {
-            name: _try_build(f"MXF8 {name}", lambda name=name: _mxf8_op.build(name, wq[name][0]))
-            for name in wq
-        }
-        swiglu = _try_build("SwiGLU into MXF8", lambda: _swiglu8_op.compile(dev))
-        if swiglu is not None and all(runners.values()):
-            self._proj_mxf8.update(runners)
-            self._swiglu8 = swiglu
-            self._dense8 = list(zip(wq["dense_gate_up"], wq["dense_down"]))
-            # TRTLLM_GLM52_CTX_DENSE_SWIGLU_EPI (default 1): gate|up with the SwiGLU into the
-            # down GEMM's MXF8 operand in its epilogue (`cute_dsl_dense_up_swiglu_mxf8`, its own
-            # interleaved weight, +0.11 GB per rank): one launch instead of two and no bf16
-            # [T, 6144].
-            dense_sw = (
-                _try_build("dense gate|up + SwiGLU MXF8", lambda: _dense_up8_op.compile(dev))
-                if os.environ.get("TRTLLM_GLM52_CTX_DENSE_SWIGLU_EPI", "1") == "1"
-                else None
-            )
-            if dense_sw is not None:
-                self._dense_sw8 = dense_sw
-                self._dense8 = [
-                    (gu8, dn8, _dense_up8_op.prepare_weight(self.w[f"l{i}_mlp_gu"]))
-                    for i, (gu8, dn8) in zip(dense, self._dense8)
-                ]
-        self._shared8 = _try_build("shared gate|up MXF8", lambda: _shared_up8_op.compile(dev))
+        self._dense_mxf8 = _dense_mlp.build_mxf8(
+            [self.w[f"l{i}_mlp_gu"] for i in dense], [self.w[f"l{i}_mlp_dn"] for i in dense], dev
+        )
+        # Each dense layer's MXF8 weights (`dense_gate_up_swiglu`), None where they did not build.
+        self._dense_w8 = [None] * self.dense_layers
+        if self._dense_mxf8 is not None:
+            self._proj_mxf8.update(self._dense_mxf8.runners)
+            self._dense_w8 = list(self._dense_mxf8.weights)
+        self._shared8 = _shared_mlp.build_mxf8(dev)
         self._shared_w8 = [
             _shared_up8_op.prepare_weight(self.w[f"l{i}_mlp_gu"])
             if self._shared8 is not None and i >= self.dense_layers
@@ -768,7 +630,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._mtp_eh8 = None
         if self.mtp_enabled:
             w8 = _mxf8_op.quantize_weight(self._mtp["eh"].t())
-            runner = _try_build("MXF8 mtp_eh", lambda: _mxf8_op.build("mtp_eh", w8))
+            runner = _proj.build_mxf8("mtp_eh", w8)
             norm = _try_build("MTP input norms into MXF8", lambda: _eh8_op.compile(dev))
             if runner is not None and norm is not None:
                 self._proj_mxf8["mtp_eh"] = runner
@@ -790,8 +652,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         MTP3 / MTP5 (`max_draft_len > 1`): the trunk o_proj's decode rows above 64 (up to
         192) on the wide decode MXF8 GEMM (`_dec8w`, `_dec8_op.build_wide`), its operand
         written by the MTP group's V-B side output (`_vb8w`). Same e4m3 operands and K order
-        as the context MXF8 GEMM those rows took before (`Gemm.mxf8_takes`): bitwise its output,
-        without the act-quant launch, the weight streamed before the PDL wait.
+        as the context MXF8 GEMM those rows took before (`projection.mxf8_takes`): bitwise its
+        output, without the act-quant launch, the weight streamed before the PDL wait.
         TRTLLM_GLM52_WIDE_OPROJ_DEC8=0 keeps those rows on the context MXF8 GEMM."""
         self._dec8: dict = {}
         self._vb8: dict = {}
@@ -799,9 +661,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._vb8w: dict = {}
         trunk = range(self.num_layers)
         if "o_proj" in self._proj_mxf8:
-            runner = _try_build(
-                "decode MXF8 o_proj", lambda: _dec8_op.build("o_proj", self._attn[0].o8)
-            )
+            runner = _proj.build_dec8("o_proj", self._attn[0].o8)
             if runner is not None:
                 self._dec8["o_proj"] = runner
                 for i in trunk:
@@ -814,7 +674,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 direct = _mxf8_op.quantize_weight(self._attn[i].qb.t())
                 same = torch.equal(direct.q, shifted.q) and torch.equal(direct.sf, shifted.sf)
                 weights.append(shifted if same else direct)
-            runner = _try_build("decode MXF8 q_b", lambda: _dec8_op.build("q_b", weights[0]))
+            runner = _proj.build_dec8("q_b", weights[0])
             if runner is not None:
                 self._dec8["q_b"] = runner
                 for i, w in enumerate(weights):
@@ -836,10 +696,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             and self.wide_cells
             and os.environ.get("TRTLLM_GLM52_WIDE_OPROJ_DEC8", "1") == "1"
         ):
-            runner = _try_build(
-                "wide decode MXF8 o_proj",
-                lambda: _dec8_op.build_wide("o_proj", self._attn[0].o8),
-            )
+            runner = _proj.build_dec8_wide("o_proj", self._attn[0].o8)
             if runner is not None:
                 self._dec8w["o_proj"] = runner
                 vb8 = _try_build(
@@ -921,7 +778,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         mxf8 = "qkva" in self._proj_mxf8
         q_extra = _MHA_FP8_Q_MXF8 if mxf8 else 1.0
         h, nope, rope, v, lora = self.heads, self.nope, self.rope_dim, self.v_dim, self.kv_lora
-        kvb8 = self._build_kvb8(dev) if mxf8 else None
+        kvb8 = _ctx_mha.build_kv_mxf8(dev, h, self.qk_dim, v, self.lat_dim, lora) if mxf8 else None
         if kvb8 is not None and kvb8.merged is not None:
             mha_s = _try_build(
                 "context MHA fp8 on strided K / V",
@@ -1023,48 +880,6 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )
         return True
 
-    def _build_kvb8(self, dev) -> SimpleNamespace | None:
-        """The MXF8 K / V expansion's gather and its two GEMM runners (built against zero
-        weights: the runners take each layer's weight per call), or None if a part fails."""
-        gather = _try_build("MXF8 K/V gather", lambda: _kv_gather8_op.compile(dev))
-        if gather is None:
-            return None
-        h, qk, v, lat, lora = self.heads, self.qk_dim, self.v_dim, self.lat_dim, self.kv_lora
-        bf = dict(dtype=torch.bfloat16, device=torch.device("cuda", dev))
-        runners = {
-            "k": _try_build(
-                "MXF8 K expansion",
-                lambda: _mxf8_op.build(
-                    "kv_b_k8", _mxf8_op.quantize_weight(torch.zeros(h * qk, lat, **bf))
-                ),
-            ),
-            "v": _try_build(
-                "MXF8 V expansion",
-                lambda: _mxf8_op.build(
-                    "kv_b_v8", _mxf8_op.quantize_weight(torch.zeros(h * v, lora, **bf))
-                ),
-            ),
-        }
-        if not all(runners.values()):
-            return None
-        # Both in one launch (`kv_b_kv8`); None keeps the two launches.
-        merged = _try_build(
-            "MXF8 K | V expansion in one launch",
-            lambda: _mxf8_op.build(
-                "kv_b_kv8", _mxf8_op.quantize_weight(torch.zeros(h * (qk + v), lat, **bf))
-            ),
-        )
-        d = torch.device("cuda", dev)
-        # The gather's pool / index / table operands on a step without a cached prefix: read
-        # by nothing (no cached rows, new rows in order), but they must be valid tensors.
-        idle = (
-            torch.zeros(1, lat, dtype=torch.uint8, device=d),
-            torch.zeros(1, dtype=torch.int64, device=d),
-            torch.zeros(1, dtype=torch.int32, device=d),
-            torch.zeros(1, 1, dtype=torch.int32, device=d),
-        )
-        return SimpleNamespace(gather=gather, runners=runners, merged=merged, idle=idle)
-
     def _mha_fp8_scales(
         self, i: int, q_extra: float, kv_extra: float = 1.0
     ) -> tuple[float, torch.Tensor, torch.Tensor]:
@@ -1116,7 +931,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         (`_ix_fold_op.stack_weight`: qkva, 64 zero rows, the indexer rows), the two
         parameters re-pointed at their rows of it -- the same bytes in the same row-major
         layout, so every other reader is unchanged, and the old storage is freed. Returns the
-        buffers by layer (`Gemm.qkva_ix_fold`'s weight)."""
+        buffers by layer (`qkva_ix_fold`'s weight)."""
         stacked = {}
         for i in layers:
             if f"l{i}_ix_fused_bf16" not in self.w:
@@ -1133,7 +948,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         one `[2, 4096, 2048]` buffer (`_qbix_op.stack_weight`), the two parameters re-pointed
         at its two halves (the same bytes and row-major layout: every other reader, the MXF8
         copies included, is unchanged; the old storage is freed). Returns the buffers by
-        layer (`Gemm.qb_ixqb`'s weight)."""
+        layer (`q_b_ix_wq_b`'s weight)."""
         stacked = {}
         for i in layers:
             if f"l{i}_ix_qb" not in self.w:
@@ -1148,7 +963,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
     def _build_qbix(self, dev: int) -> dict:
         """The q_b | wq_b cells (`_qbix_op.build_all`), kept only where they match both
         projections' MTP cells row for row: then they serve exactly the rows those cells would
-        (`Gemm.wide_cell`), with their bytes. Empty (the two GEMMs) otherwise or on a failed
+        (`projection.wide_cell`), with their bytes. Empty (the two GEMMs) otherwise or on a failed
         build."""
         cells = _try_build("q_b | wq_b fold", lambda: _qbix_op.build_all(dev))
         want = set(self._proj_mtp.get("q_b", {}))
@@ -1164,8 +979,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
     def _build_qkva_ix_fold(self, dev: int) -> dict:
         """The fold cells (`_ix_fold_op.build_all`), kept only where they match the qkva
         projection's MTP cells row for row: the fold then serves exactly the rows the qkva
-        cells would (`Gemm.wide_cell`), with their bytes. Empty (the two GEMMs) otherwise or if
-        the build fails."""
+        cells would (`projection.wide_cell`), with their bytes. Empty (the two GEMMs) otherwise
+        or if the build fails."""
         cells = _try_build("qkva indexer fold", lambda: _ix_fold_op.build_all(dev))
         if not cells or set(cells) != set(self._proj_mtp.get("qkva", {})):
             if cells:
@@ -1323,10 +1138,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         dev = torch.cuda.current_device()
         layers = range(self.num_layers + (1 if self.mtp_enabled else 0))
         # Before any view of the two weights is taken: an MTP3 / MTP5 engine's indexer layers
-        # hold their qkva and indexer key / head-weight rows in one buffer (`Gemm.qkva_ix_fold`).
+        # hold their qkva and indexer key / head-weight rows in one buffer (`qkva_ix_fold`).
         if self.wide_cells and self._ix_fold_on:
             self._ix_fold_w = self._stack_ix_fold_weights(layers)
-        # The same for q_b and the indexer's wq_b (`Gemm.qb_ixqb`).
+        # The same for q_b and the indexer's wq_b (`q_b_ix_wq_b`).
         if self.wide_cells and self._qbix_on:
             self._qbix_w = self._stack_qbix_weights(layers)
         self._attn = [self._derive_attention(i) for i in layers]
@@ -1348,7 +1163,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         first_idx = next(i for i in range(self.num_layers) if self._idx[i] is not None)
         # One runner per (projection, compiled row count), built against one layer's row-major
         # weight, and one prefill GEMM per projection for the context row counts above
-        # _DECODE_MAX_ROWS; `Gemm.project` sends a row count with neither to cuBLAS.
+        # _DECODE_MAX_ROWS; `projection` sends a row count with neither to cuBLAS.
         proj_weights = {
             "qkva": self._attn[0].qkva,
             "q_b": self._attn[0].qb,
@@ -1366,7 +1181,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             for name, w_colmajor in proj_weights.items()
         }
         if self._ctx_host_diet:
-            # A mixed step's generation rows take q_b's decode cells eagerly (`Gemm.project_tail`);
+            # A mixed step's generation rows take q_b's decode cells eagerly (`projection_tail`);
             # the persistent cells among them (up to 16 rows) launch through a TVM-FFI twin of
             # the same kernel. Captured decode graphs keep the cells' own launchers.
             qb_w = proj_weights["q_b"].t()
@@ -1419,7 +1234,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             else {}
         )
         # An MTP3 / MTP5 engine's decode row counts of 1..3 sequences without a cell
-        # (`_SHARED_FUSED_UP_SEQS`), each its own compile; taken where `Gemm.cell_up` holds.
+        # (`_SHARED_FUSED_UP_SEQS`), each its own compile; taken where `projection.cell_up`
+        # holds.
         up_rows = sorted(
             {
                 (self.max_draft_len + 1) * seqs
@@ -1457,7 +1273,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             "fp8 q-base K-B", lambda: _absorbed_bmm_op.build_prefill_fp8_q_base(dev)
         )
         # The decode cells' K-B writing the e4m3 q-base and releasing the rope kernel at
-        # once, so the two run concurrently (`Attn.gen_query`); empty keeps the bf16 K-B.
+        # once, so the two run concurrently (`k_b_q_base`); empty keeps the bf16 K-B.
         self._kb8: dict = {}
         for group in _absorbed_bmm_op.GROUPS:
             runner = _try_build(
@@ -1478,50 +1294,25 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
             if runner is not None:
                 self._kb8_mtp.update(dict.fromkeys(runner.rows, runner))
-        self._ix_pre_split = _ix_pre_split_op.compile_all(dev)
-        self._ix_pre_split_mtp = (
-            _ix_pre_split_op.compile_all(dev, _ix_pre_split_op.MTP_ROWS) if wide else {}
-        )
-        # The same kernel on a symbolic row count, for the decode row counts in 65..191
-        # without a handle above (`Indexer.project`). None keeps them on the prefill split.
-        self._ix_pre_split_rag = (
-            _try_build("indexer split at runtime M", lambda: _ix_pre_split_op.compile_ragged(dev))
-            if wide
-            else None
-        )
-        # Runners re-pinned from the cells built above, if a load ran before (`wide_cell`).
-        self.op.gemm._wide_rag = {}
-        # The same split at the context row counts, on the prefill GEMM against the decode
-        # handles' bf16 weight; every indexer layer shares it. None keeps the fp32 projection.
-        try:
-            self._ix_pre_split_pre = _ix_pre_split_op.build_prefill(self._idx[first_idx].fused_bf16)
-        except Exception as e:  # noqa: BLE001 -- the context rows take the fp32 projection
-            logger.warning(
-                f"modeling_v2 GLM-5.2: indexer prefill split build failed ({e}); using fp32"
-            )
-            self._ix_pre_split_pre = None
-        self._ix_qside_compiled = build_ix_q_side(dev, is_neox=self.indexer_is_neox)
-        # TRTLLM_GLM52_CTX_IX_NOSPLIT (default 1; 0 restores the split): a context step's
-        # indexer projection is not split into bf16 keys + packed head weights; the K write and
-        # the q side read their columns of the fp32 [T, 160] output in place (pitch-160
-        # launchers), the K write rounding the keys to bf16 on load as the split does. Same
-        # bytes, one launch fewer per indexer layer.
-        self._ix_nosplit = (
-            self._ix_pre_split_pre is not None
-            and os.environ.get("TRTLLM_GLM52_CTX_IX_NOSPLIT", "1") == "1"
-        )
-        self._ix_qside_compiled_p160 = (
-            build_ix_q_side(dev, is_neox=self.indexer_is_neox, wq_pitch=_IX_PROJ_COLS)
-            if self._ix_nosplit
-            else None
-        )
-        self._ix_topk_pre_compiled = build_ix_topk_prefill(
-            dev, top_k=self.idx_topk, max_columns=_MOE_MAX_T
+        # The indexer's key / head-weight split GEMM (`indexer_pre_proj`), against any indexer
+        # layer's bf16 weight (every layer shares the build). TRTLLM_GLM52_CTX_IX_NOSPLIT
+        # (default 1; 0 restores the split): a context step's projection is not split into
+        # bf16 keys + packed head weights; the K write and the q side read their columns of the
+        # fp32 [T, 160] output in place (pitch-160 launchers), the K write rounding the keys to
+        # bf16 on load as the split does. Same bytes, one launch fewer per indexer layer.
+        self._ix_pre_kernels = _ix_pre.compile_cells(dev, wide, self._idx[first_idx].fused_bf16)
+        # The logits head's runners re-pinned on an earlier load.
+        self._lm_head_at_rows = {}
+        # The indexer's q side and prefill top-k; the rest at the first forward.
+        self._ix_kernels = _ix.compile_at_load(
+            dev, self.idx_topk, self.indexer_is_neox, self._ix_pre_kernels.unsplit, _MOE_MAX_T
         )
         # The MLA rope kernel is keyed by the block-table width, an engine value, and the MTP
         # width: built per pair in `_derive_first_step` (the trunk's) and at the first eager use
         # of another.
-        self._mla_rope_compiled: dict[tuple[int, int], _mla_rope_op.CompiledMlaRopeGeneration] = {}
+        self._mla_rope_cells = _mla_rope.MlaRopeCells(
+            self.heads, self.qk_dim, self.q_lora, self.lat_dim, bool(self._kb8)
+        )
         # The context kernel in both modes and its two scale arrays, built here because a
         # first compile inside a CUDA-graph capture is a broken graph.
         self._fmha_pre_compiled = _fmha_pre_op.compile(device_index=dev)
@@ -1567,338 +1358,382 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # The row ops the fused kernels leave over: layer 0's input norm, the MTP module's
         # norms and output adds, the logits rows' lookup, the forward's copies, routing and
         # SwiGLU at row counts the fused front end has no kernel for, and the greedy picks.
-        # Each is independent: one that fails to build keeps its call sites on the stock op.
-        self._rows = SimpleNamespace(
-            norm=_try_build("hidden RMSNorm", _hidden_norm_op.compile),
-            add=_try_build("hidden add", _hidden_add_op.compile),
-            # The MTP module's residual add + head norm in one launch (`Rows.add_rmsnorm`): only an
-            # engine drafting more than one token returns the module's output normed.
-            add_norm=(
-                _try_build("hidden add + RMSNorm", _hidden_add_norm_op.compile)
-                if self.max_draft_len > 1
-                else None
-            ),
-            gather=_try_build("hidden row gather", _row_gather_op.compile),
-            topk=_try_build("sigmoid top-k", _topk_rows_op.compile),
-            swiglu=_try_build("SwiGLU rows", _swiglu_rows_op.compile),
-            copy=_try_build("copy/convert", _copy_op.compile),
-            argmax=_try_build("argmax", _argmax_op.compile),
-        )
+        self._rows = self._build_row_ops()
         # The MTP module's context steps run attention-to-output on the draft head's rows only
-        # (`PrefillTarget._mtp_last_plan`): the row gather / scatter they need.
+        # (`context_plan.mtp_last_plan`): the row gather / scatter they need.
         self._rows_sel = (
             _try_build("row gather / scatter", _rows_sel_op.compile) if self.mtp_enabled else None
         )
         if self.tp_rank == 0:
-            built = " ".join(f"{k}={v is not None}" for k, v in vars(self._rows).items())
+            built = " ".join(
+                f"{k}={getattr(v, 'compiled', v) is not None}" for k, v in vars(self._rows).items()
+            )
             logger.info(
                 f"modeling_v2 GLM-5.2 row ops built: {built} "
                 f"logits_gather={self._lamport.gather is not None}"
             )
+        self._build_op_handles()
         if self.max_draft_len > 1:
             self._warm_draft_rows()
 
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
         self._wide = WideDecodeTarget(self)
+        # Each Target decides its cross-op handoffs from the handles built above.
+        for target in (self._prefill, self._decode, self._wide):
+            target.on_load()
 
     def _build_moe(self, dev) -> None:
-        """The routed experts' buffers and compiled kernels, trunk and MTP.
-
-        Every operand handed to these kernels lives in a buffer allocated here, in two slots
-        alternating per layer. The engine allocates its tensors inside the CUDA-graph
-        capture; handed to these kernels directly, replays routed as though every id were
-        zero. And the kernels launch with PDL, so a layer's kernel can start while the
-        previous layer's is still reading: one slot measured every layer but the last at
-        cosine 0.64-0.93. The NVFP4 input (`xq` / `xsf`) is one buffer, written by the
-        closing collective or the quantize launch and read by FC1 in the same layer.
-
-        A decode kernel that fails to build raises: those steps have no stock path for the
-        packed weights. A prefill kernel that fails to build is None, and its call site
-        takes the stock op (the decode grouped GEMMs for the prefill pair).
-        """
-        hidden, inter, experts = self.w["embed"].shape[1], self.moe_inter, self.local_experts
-        rows = _MOE_MAX_T
-        bf16 = {"dtype": torch.bfloat16, "device": dev}
-        f32 = {"dtype": torch.float32, "device": dev}
-        u8 = {"dtype": torch.uint8, "device": dev}
-
-        def optional(build, what: str = "MoE prefill kernel"):
-            try:
-                return build()
-            except Exception as e:  # noqa: BLE001 -- that launch takes its stock op at the call site
-                logger.warning(f"modeling_v2 GLM-5.2: {what} build failed ({e}); using stock op")
-                return None
-
-        def slot(mtp: bool) -> SimpleNamespace:
-            counts, barrier = _moe_routing_op.allocate_workspace(dev)
-            widths = _MOE_DECODE_WIDTHS if mtp else range(1, _DECODE_MAX_ROWS + 1)
-            ns = SimpleNamespace(
-                # The routed output is returned to the caller, so it alternates too: one
-                # buffer would be overwritten by the next layer before the caller used it.
-                out=torch.zeros((rows, hidden), **bf16),
-                x=torch.zeros((rows, hidden), **bf16),
-                w=torch.zeros((rows, _MOE_TOP_K), **f32),
-                sel=torch.empty(rows * _MOE_TOP_K, dtype=torch.int32, device=dev),
-                # Context replicas: one more partial tile per replica slot (trunk only).
-                maps=_moe_routing_op.allocate_maps(
-                    rows, dev, replicas=0 if mtp else self.ctx_replicas
-                ),
-                counts=counts,
-                barrier=barrier,
-                router_out=torch.zeros((_DECODE_MAX_ROWS, self.num_experts), **f32),
-                router_partials=torch.zeros(
-                    (_DECODE_MAX_ROWS, _moe_router_op.SPLIT_K, self.num_experts), **f32
-                ),
-                # The fused top-k checks its outputs against the exact row count: one set
-                # per width; with decode expert replicas the push widths' sets hold the
-                # replica top-k's `64 + replicas` tiles.
-                topk_out={
-                    w: _moe_topk_rep_op.allocate_outputs(w, self.dec_replicas, dev)
-                    if not mtp and self.dec_replicas and _moe_topk_rep_op.uses_rep_path(w)
-                    else _moe_topk_op.allocate_decode_outputs(w, dev)
-                    for w in widths
-                },
-            )
-            if mtp:
-                ns.c = _mtp_experts_op.allocate_c(rows, inter, dev)
-                return ns
-            ns.c = _moe_experts_op.allocate_decode_c(rows, inter, dev)
-            ns.sfc = _moe_experts_op.allocate_sfc(rows, inter, dev, self.ctx_replicas)
-            ns.router_x = torch.zeros((_DECODE_MAX_ROWS, hidden), **bf16)
-            if self.wide_cells:
-                # The wide decode router's `[rows, 4, 256]` partials (`wide_cells` only).
-                ns.router_wide_out = torch.zeros(
-                    _moe_router_op.output_shape(_moe_router_op.WIDE_MAX_ROWS, wide=True), **f32
-                )
-            ns.logits = torch.zeros((rows, 1, self.num_experts), **f32)
-            ns.topk_scratch = _moe_topk_op.allocate_prefill_scratch(dev)
-            if self.ctx_replicas:
-                ns.topk_rep_scratch = _moe_topk_pre_rep_op.allocate_scratch(self.ctx_replicas, dev)
-            return ns
-
-        self._moe_slots = [slot(False) for _ in range(2)]
-        # One byte per element, as the kernels' entries allocate: cute counts the shape in
-        # elements and reads half as many bytes.
-        self._moe_xq = torch.zeros((rows, hidden // 2), **u8)
-        self._moe_xsf = torch.zeros((rows, hidden // _MOE_SF_VEC), **u8)
-        # The prefill shared expert's SwiGLU output. One is enough: up and down run back to
-        # back on the shared branch's stream, which forks again only after this layer's reduce.
-        self._moe_mid = torch.zeros((rows, _SHARED_INTER), **bf16)
-        s0 = self._moe_slots[0]
-        k = SimpleNamespace()
-        # One routing function per schedule bucket any step reaches, shared with the MTP
-        # layer: a bucket compiled on first use would compile inside a step.
-        k.routing = _moe_routing_op.build(_moe_routing_op.ROW_COUNTS, dev)
-        k.experts = _moe_experts_op.build_decode(
-            c=s0.c,
-            sfc=s0.sfc,
-            maps=s0.maps,
-            xq=self._moe_xq,
-            xsf=self._moe_xsf,
-            out=s0.out,
+        """The routed experts' buffers and compiled kernels, trunk (`routed_moe.build_kernels`)
+        and, where the MTP layer's experts did not quantize to NVFP4, its bf16 pair
+        (`routed_moe.build_mtp_bf16`); the slot parities the Targets pass to the routed ops;
+        and the shared expert's prefill pair and SwiGLU buffer."""
+        hidden, inter = self.w["embed"].shape[1], self.moe_inter
+        k = _routed_moe.build_kernels(
             hidden=hidden,
             inter=inter,
-            # The decode expert replicas' slots follow this rank's 64 (0 when off).
-            experts=experts + self.dec_replicas,
-            max_rows=rows,
+            local_experts=self.local_experts,
+            num_experts=self.num_experts,
+            num_layers=self.num_layers,
+            dec_replicas=self.dec_replicas,
+            ctx_replicas=self.ctx_replicas,
+            dec_hot=self.dec_hot,
+            wide_cells=self.wide_cells,
+            wide_dec_replicas=self.wide_dec_replicas,
+            wide_topk_schedule=self.wide_topk_schedule,
             fc1_kblk=self.fc1_kblk,
             fc2_kblk=self.fc2_kblk,
-            # One FC2 tile counter per MoE call site: the trunk layers and the MTP layer.
-            dyn_slots=self.num_layers + 1,
+            l2_prefetch=self._moe_l2_prefetch,
+            dec_unpad_signal=self._moe_dec_unpad and self._moe_dec_unpad_signal,
+            max_draft_len=self.max_draft_len,
+            dev=dev,
         )
-        k.pair = optional(
-            lambda: _moe_experts_op.build_prefill_pair(
-                hidden, inter, experts, dev, fc1_kblk=self.fc1_kblk, fc2_kblk=self.fc2_kblk
-            )
-        )
-        if k.pair is not None:
-            for sl in self._moe_slots:
-                sl.pc = _moe_experts_op.allocate_pair_c(rows, inter, dev, self.ctx_replicas)
-        # Context replicas: the replica top-k and the prefill pair on the `64 + R` deep
-        # stacks, both or neither (the replica maps address slots past 64).
-        k.topk_pre_rep = k.pair_rep = None
-        self._ctx_hot_ids = {}
-        if self.ctx_replicas and k.pair is not None:
-            rep = optional(
-                lambda: (
-                    _moe_topk_pre_rep_op.build_prefill(self.ctx_replicas, dev),
-                    _moe_experts_op.build_prefill_pair(
-                        hidden,
-                        inter,
-                        experts + self.ctx_replicas,
-                        dev,
-                        fc1_kblk=self.fc1_kblk,
-                        fc2_kblk=self.fc2_kblk,
-                    ),
-                )
-            )
-            k.topk_pre_rep, k.pair_rep = rep if rep is not None else (None, None)
-            self._ctx_hot_ids = {
-                i: torch.tensor(ids[: self.ctx_replicas], dtype=torch.int32, device=dev)
-                for i, ids in self.dec_hot.items()
-                if len(ids) >= self.ctx_replicas
-            }
-        # The maps the replica top-k wrote last (`Moe.topk`); `Moe.experts` runs them on the
-        # replica pair.
-        self.op.moe._rep_maps = None
-        k.router_pre = optional(lambda: _moe_router_op.build_prefill(dev))
-        k.topk_pre = optional(lambda: _moe_topk_op.build_prefill(dev))
-        k.quant_pre = optional(lambda: _moe_quant_op.build_prefill(dev))
-        k.zero_pre = optional(lambda: _moe_zero_op.build_prefill(dev))
-        k.merge = optional(lambda: _moe_merge_op.build(dev))
-        # The shared expert's prefill pair, both or neither: up writes the SwiGLU output down
-        # reads. Built against the first MoE layer's weights; each call passes its own.
-        shared = optional(
-            lambda: (
-                _shared_gu_swiglu_op.build_prefill(self._shared_gu_il[self.dense_layers]),
-                _projection_op.build_shared_down_prefill(self._mlp[self.dense_layers][1].t()),
-            )
-        )
-        k.shared_up_pre, k.shared_down_pre = shared if shared is not None else (None, None)
-        k.quant = {w: _moe_quant_op.build_decode(w, dev) for w in _MOE_DECODE_WIDTHS}
-        k.zero = {w: _moe_zero_op.build_decode(w, dev) for w in _MOE_DECODE_WIDTHS}
-        # The fused top-k releases FC1 early only at a power of two: other widths are padded
-        # and run the routing kernel next, which does not wait for the ids; released early it
-        # reads them mid-write (a 3-request step hung that way).
-        # The decode L2 prefetch of the routed FC1 weights: forked at a decode MoE layer's
-        # o_proj end, ranked by the counts the same layer's previous decode step's top-k wrote
-        # into its row of `hist` (one row per MoE call site, the MTP layer's included).
-        self._pf = None
-        pf = (
-            _try_build("decode MoE L2 prefetch", lambda: _l2pf_op.compile(dev))
-            if self._moe_l2_prefetch
-            else None
-        )
-        if pf is not None:
-            self._pf = SimpleNamespace(
-                compiled=pf,
-                hist=torch.zeros((self.num_layers + 1, 64), dtype=torch.int32, device=dev),
-                stream=torch.cuda.Stream(device=dev),
-                pending=None,
-            )
-        k.topk = {
-            w: _moe_topk_op.build_decode(
-                w,
-                _moe_router_op.decode_splits(w),
-                dev,
-                signal_gg1=(w & (w - 1)) == 0,
-                expert_hist=self._pf is not None and _moe_topk_op.uses_push_path(w),
-            )
-            for w in range(1, _DECODE_MAX_ROWS + 1)
-        }
-        # Decode expert replicas: the push widths select on the replica top-k, with each
-        # trunk layer's hot ids (the MTP layer passes all -1: the home mapping).
-        k.topk_rep = {}
-        if self.dec_replicas:
-            k.topk_rep = {
-                w: _moe_topk_rep_op.build_decode(
-                    w,
-                    _moe_router_op.decode_splits(w),
-                    self.dec_replicas,
-                    dev,
-                    signal_gg1=(w & (w - 1)) == 0,
-                    expert_hist=self._pf is not None,
-                )
-                for w in range(1, _DECODE_MAX_ROWS + 1)
-                if _moe_topk_rep_op.uses_rep_path(w)
-            }
-            self._dec_hot_ids = {
-                i: torch.tensor(ids, dtype=torch.int32, device=dev)
-                for i, ids in self.dec_hot.items()
-            }
-            self._dec_hot_none = torch.full((self.dec_replicas,), -1, dtype=torch.int32, device=dev)
-        # Early-release top-k handles for the unpadded trunk decode widths that are not powers
-        # of two (`TRTLLM_GLM52_MOE_DEC_UNPAD_SIGNAL`): the decode step widths of an MTP3 /
-        # MTP5 engine, `requests * (max_draft_len + 1)` up to 64 rows. Trunk only: the MTP
-        # layer pads those widths and runs the routing kernel after its top-k, which must not
-        # be released early (it does not wait for the ids).
-        k.topk_sig = {}
-        if self._moe_dec_unpad and self._moe_dec_unpad_signal and self.max_draft_len > 1:
-            step = self.max_draft_len + 1
-            sig_widths = [w for w in range(step, _DECODE_MAX_ROWS + 1, step) if w & (w - 1)]
-
-            def build_sig(w):
-                if w in k.topk_rep:
-                    return _moe_topk_rep_op.build_decode(
-                        w,
-                        _moe_router_op.decode_splits(w),
-                        self.dec_replicas,
-                        dev,
-                        signal_gg1=True,
-                        expert_hist=self._pf is not None,
-                    )
-                return _moe_topk_op.build_decode(
-                    w,
-                    _moe_router_op.decode_splits(w),
-                    dev,
-                    signal_gg1=True,
-                    expert_hist=self._pf is not None and _moe_topk_op.uses_push_path(w),
-                )
-
-            built = _try_build(
-                "MoE unpadded decode early-release top-k",
-                lambda: {w: build_sig(w) for w in sig_widths},
-            )
-            k.topk_sig = built or {}
-        # The MTP3 / MTP5 decode widths' front end (`Moe.decode_exact`, 65..256 rows): the
-        # wide decode router's split-K partials, and the fused top-k summing them, one handle
-        # per row range, writing the L2 prefetch's counts. MTP1 and no speculation build
-        # neither. The partials need the wide top-k: without it the router is dropped too
-        # (the prefill router and top-k serve those steps); without the router the top-k
-        # reads the prefill router's one plane.
-        k.router_wide = None
-        k.topk_wide = {}
-        if self.wide_cells and k.topk_pre is not None:
-            k.router_wide = optional(
-                lambda: _moe_router_op.build_wide(dev), "wide decode MoE router"
-            )
-            splits = _moe_router_op.SPLIT_K if k.router_wide is not None else 1
-            wide = optional(
-                lambda: {
-                    r: _moe_topk_op.build_wide(
-                        r[1],
-                        splits,
-                        dev,
-                        expert_hist=self._pf is not None,
-                        cluster=self.wide_topk_schedule[0],
-                        trim=self.wide_topk_schedule[1],
-                    )
-                    for r in _moe_topk_op.WIDE_RANGES
-                },
-                "wide decode MoE top-k",
-            )
-            if wide is None:
-                k.router_wide = None
-            k.topk_wide = wide or {}
-        self._build_moe_wide_rep(k, dev)
-        # Shared with the MTP layer's front end: the same compiled kernel per row count.
-        k.router = _moe_router_op.build_all(dev)
         self._moe_k = k
+        # The routed experts' NVFP4 input, which the pre-MoE collective writes.
+        self._moe_xq, self._moe_xsf = k.xq, k.xsf
+        # The prefill shared expert's SwiGLU output. One is enough: up and down run back to
+        # back on the shared branch's stream, which forks again only after this layer's reduce.
+        self._moe_mid = torch.zeros(
+            (_routed_moe.MAX_ROWS, _SHARED_INTER), dtype=torch.bfloat16, device=dev
+        )
+        # The shared expert's prefill pair, both or neither (`shared_mlp.build_prefill`).
+        self._shared_pre = _shared_mlp.build_prefill(
+            self._shared_gu_il[self.dense_layers], self._mlp[self.dense_layers][1].t()
+        )
+        # Which buffer slot the next routed call takes: the trunk layers alternate, and the MTP
+        # layer shares the trunk's slots on the NVFP4 path, else alternates over its own.
+        self._moe_parity = _routed_moe.SlotParity()
+        self._mtp_parity = self._moe_parity
+        self._mtp_bf16 = None
         if self.mtp_enabled and self._mtp_fp4 is None:
             mw = self._mtp
-            self._mtp_slots = [slot(True) for _ in range(2)]
-            m0 = self._mtp_slots[0]
-            self._mtp_k = SimpleNamespace(
-                experts=_mtp_experts_op.build(
-                    x=m0.x,
-                    c=m0.c,
-                    out=m0.out,
-                    topk_w=m0.w,
-                    maps=m0.maps,
-                    fc1_w=mw["fc1"],
-                    fc2_w=mw["fc2"],
-                    max_rows=rows,
-                ),
-                # No quantize launch on the bf16 path to carry the output clear, so the top-k
-                # clears it; every MTP width is a power of two, so it always releases FC1.
-                topk={
-                    w: _moe_topk_op.build_decode(
-                        w, _moe_router_op.decode_splits(w), dev, signal_gg1=True, fuse_zero=True
-                    )
-                    for w in _MOE_DECODE_WIDTHS
-                },
+            self._mtp_bf16 = _routed_moe.build_mtp_bf16(
+                k,
+                fc1=mw["fc1"],
+                fc2=mw["fc2"],
+                hidden=hidden,
+                inter=inter,
+                num_experts=self.num_experts,
+                dev=dev,
             )
+            self._mtp_parity = _routed_moe.SlotParity()
+
+    def _build_moe_handles(self) -> None:
+        """The routed ops' handles: the trunk's (`_moe_h`) and the MTP layer's (`_mtp_moe_h`,
+        with its bf16 pair where its experts did not quantize to NVFP4), the MTP layer's routed
+        weights as the ops take them (`_mtp_moe`), and the MTP front end's (`_mtp_eh_h`).
+        Compiles nothing."""
+        self._moe_h = _routed_moe.build(
+            self._moe_k,
+            expert_offset=self.expert_offset,
+            routed_scale=self.routed_scale,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            topk=self.topk,
+            num_layers=self.num_layers,
+            wide_cells=self.wide_cells,
+            dec_unpad=self._moe_dec_unpad,
+            acc_padded=self._moe_acc_padded,
+            router_proj=self._proj_h.router,
+            route=self._rows.topk,
+            copy=self._rows.copy,
+            add=self._rows.add,
+            count=self._count,
+        )
+        self._mtp_moe_h = self._mtp_moe = self._mtp_eh_h = None
+        if not self.mtp_enabled:
+            return
+        mw = self._mtp
+        self._mtp_moe_h = replace(self._moe_h, mtp_bf16=self._mtp_bf16)
+        self._mtp_moe = self._mtp_fp4
+        if self._mtp_fp4 is None:
+            self._mtp_moe = SimpleNamespace(
+                router=mw["router"],
+                router_t=mw["router_t"],
+                router_bias=mw["router_bias"],
+                fc1=mw["fc1"],
+                fc2=mw["fc2"],
+            )
+        self._mtp_eh_h = _mtp_eh_proj.build(
+            ehproj=mw["ehproj"],
+            eh_local=mw["eh_local"],
+            norm_shard=mw["norm_shard"],
+            tp_rank=self.tp_rank,
+            enorm=mw["enorm"],
+            hnorm=mw["hnorm"],
+            eh=mw["eh"],
+            eps=self.eps,
+            eh8=self._mtp_eh8,
+            proj=self._proj_h.mtp_eh,
+            norm=self._rows.norm,
+            copy=self._rows.copy,
+            comm=self._comm,
+            wide_bucket=self._wide_bucket,
+            count=self._count,
+        )
+
+    def _build_row_ops(self, compile: bool = True) -> SimpleNamespace:
+        """The row ops' handles (`hidden_rmsnorm`, `hidden_add`, `hidden_add_rmsnorm`,
+        `row_copy`, `sigmoid_topk`, `swiglu_rows`), and the logits head's row gather and the
+        spec worker's argmax kernels (`gather`, `argmax`, None where not built). Each is
+        independent: one that fails to build keeps its call sites on the stock op. The
+        residual add + head norm in one launch only where the MTP module returns its output
+        normed (`_mtp_out_normed`: an engine drafting more than one token). `compile=False`
+        builds nothing: every op then runs its fallback."""
+        count = self._count
+        norm = _hidden_norm_op.build(count, compile)
+        add = _hidden_add_op.build(count, compile)
+        return SimpleNamespace(
+            norm=norm,
+            add=add,
+            add_norm=_hidden_add_norm_op.build(
+                add, norm, count, compile and self.max_draft_len > 1
+            ),
+            gather=_try_build("hidden row gather", _row_gather_op.compile) if compile else None,
+            topk=_topk_rows_op.build(count, compile),
+            swiglu=_swiglu_rows_op.build(count, compile),
+            copy=_copy_op.build(count, compile),
+            argmax=_try_build("argmax", _argmax_op.compile) if compile else None,
+        )
+
+    def _build_op_handles(self) -> None:
+        """The handles of the ops the Targets call, over the kernels built above; each Target
+        decides its cross-op handoffs from them (`on_load`). Compiles nothing: re-run it (and
+        the Targets' `on_load`) after replacing any of the runner tables it reads."""
+        count = self._count
+        self._comm = _ar_op.build(self._lamport, count)
+        self._ar_quant = _ar_quant_op.build(self._comm, self._moe_xq, self._moe_xsf)
+        self._build_gemm_handles()
+        self._build_attn_handles()
+        self._build_ix_handle()
+        self._build_moe_handles()
+        self._shared_fence = _fence_op.build(self._moe_mid.device, "moe_shared_after_ar", count)
+
+    def _build_attn_handles(self) -> None:
+        """The attention ops' handles (`_attn_h`), over the kernels built at load and, once the
+        first forward derived them (`_derive_first_step`, which re-runs this), the engine's
+        decode attention, its selection conversions and the rope table. Compiles nothing."""
+        count = self._count
+        wide_bucket = self._wide_bucket
+        proj = self._proj_h
+        absorb = SimpleNamespace(
+            **{
+                kind: _absorbed_bmm.build(
+                    kind,
+                    cells=self._absorb.get(kind, {}),
+                    mtp_cells=self._absorb_mtp.get(kind, {}),
+                    prefill=self._absorb_pre.get(kind),
+                    wide_bucket=wide_bucket,
+                    count=count,
+                )
+                for kind in ("k_b", "v_b")
+            }
+        )
+        widths = _mla_rope.widths(self.mtp_widths, self.max_draft_len)
+        self._attn_h = SimpleNamespace(
+            qkva_fold=_ix_fold.build_qkva(self._qkva_ix_mtp, proj.qkva, wide_bucket, count),
+            q_b_fold=_ix_fold.build_q_b(self._qbix_mtp, proj.q_b, wide_bucket, count),
+            norm=_qkv_a_norm.build(
+                self._qkv_a_norm, self._qkv_a_norm8, self._dec8.get("q_b"), self.eps, count
+            ),
+            absorb=absorb,
+            k_b=_absorbed_bmm.build_k_b(
+                cells=self._kb8,
+                mtp_cells=self._kb8_mtp,
+                bf16=absorb.k_b,
+                widths=widths,
+                count=count,
+            ),
+            v_b=_absorbed_bmm.build_v_b(
+                o8_cells=self._vb8,
+                o8_mtp=self._vb8w,
+                o_proj=proj.o_proj,
+                bf16=absorb.v_b,
+                count=count,
+            ),
+            rope=_mla_rope.MlaRopeHandle(
+                cells=self._mla_rope_cells,
+                cos_sin=None if self._rope is None else self._rope["rotary_cos_sin"],
+                quant_mode=self.quant_mode,
+                heads=self.heads,
+                q_lora=self.q_lora,
+                kv_lora=self.kv_lora,
+                nope=self.nope,
+                rope_dim=self.rope_dim,
+                count=count,
+            ),
+            fmha=_sparse_mla.SparseMlaHandle(
+                grid=self._fmha_dec_compiled,
+                wide=self._fmha_dec_wide,
+                union=self._fmha_union,
+                req_global=self._req_global_compiled,
+                req_base=self._req_base_compiled,
+                stride_factor=self._stride_factor,
+                widths=frozenset(self.mtp_widths),
+                count=count,
+            ),
+            q_b_e4m3=_q_b_e4m3.QbE4m3Handle(self._q8, self.heads * self.qk_dim),
+        )
+        self._build_ctx_handles()
+
+    def _build_ctx_handles(self) -> None:
+        """The context attention ops' handles (`_ctx_h`, `PrefillTarget`), over the kernels
+        built at load and, once the first forward derived them, the context rope kernel, the
+        rope table and the pool stride. Compiles nothing. Besides the handles: `qa8` whether
+        the fp8 MHA route's q_a norm writes `q_b_e4m3`'s MXF8 operand (its q_b is the MXF8
+        GEMM), the row select of the MTP layer's selected rows (None: no such plan), the
+        mixed step's generation-row stream and whether their o_proj quantize runs there,
+        CTX-HOST-DIET and TRTLLM_GLM52_MIXED_BASE."""
+        count = self._count
+        kv8, q8 = self._kvb8, self._mha_q8
+        self._ctx_h = SimpleNamespace(
+            rope=_ctx_rope.CtxRopeHandle(
+                compiled=self._ctx_rope_compiled,
+                cos_sin=None if self._rope is None else self._rope["rotary_cos_sin"],
+                heads=self.heads,
+                kv_lora=self.kv_lora,
+                rope_dim=self.rope_dim,
+                quant_mode=self.quant_mode,
+                copy=self._rows.copy,
+                count=count,
+            ),
+            k_b=_ctx_k_b.CtxKbHandle(
+                fp8=self._kb_fp8_pre,
+                bf16=self._attn_h.absorb.k_b,
+                heads=self.heads,
+                nope=self.nope,
+                rope_dim=self.rope_dim,
+                kv_lora=self.kv_lora,
+                count=count,
+            ),
+            fmha=_ctx_sparse_mla.CtxSparseMlaHandle(
+                index=self._fmha_pre_compiled,
+                dense_causal=self._fmha_pre_dc_compiled,
+                bmm1=self._fmha_bmm1,
+                bmm2=self._fmha_bmm2,
+                stride_factor=self._stride_factor,
+            ),
+            mha=_ctx_mha.CtxMhaHandle(
+                expand=dict(self._kvb_expand),
+                fp8=self._mha_fp8,
+                mha=self._mha_pre,
+                mha_q8=None if q8 is None else q8.mha,
+                q8_rows=None if q8 is None else q8.rows,
+                prefix=self._mha_prefix,
+                gather8=None if kv8 is None else kv8.gather,
+                merged=None if kv8 is None else kv8.merged,
+                idle=() if kv8 is None else kv8.idle,
+                stride_factor=self._stride_factor,
+                heads=self.heads,
+                qk_dim=self.qk_dim,
+                v_dim=self.v_dim,
+                kv_lora=self.kv_lora,
+                lat_dim=self.lat_dim,
+                count=count,
+            ),
+            qa8=isinstance(self._q8, _mxf8_op.Mxf8ProjectionRunner),
+            rows_select=self._rows_sel,
+            gen_stream=self._gen_stream,
+            gen_side_quant=self._gen_side_quant,
+            diet=self._ctx_host_diet,
+            mixed_base=self._mixed_base,
+        )
+
+    def _build_gemm_handles(self) -> None:
+        """The projections' handles (`_proj_h`, by projection name) and the dense and shared
+        MLPs' (`_dense_h`, `_shared_h`), over the runner tables built above. Compiles
+        nothing."""
+        count = self._count
+        self._proj_h = SimpleNamespace(
+            **{
+                name: _proj.build(
+                    name,
+                    cells=self._proj.get(name, {}),
+                    mtp_cells=self._proj_mtp.get(name, {}),
+                    prefill=self._proj_pre.get(name),
+                    mxf8=self._proj_mxf8.get(name),
+                    dec8=self._dec8.get(name),
+                    dec8w=self._dec8w.get(name),
+                    wide_bucket=self._wide_bucket,
+                    copy=self._rows.copy,
+                    count=count,
+                )
+                for name in _proj.NAMES
+            }
+        )
+        dense = self._dense_mxf8
+        self._dense_h = _dense_mlp.build(
+            self._proj_h.dense_gate_up,
+            self._proj_h.dense_down,
+            fused=dense.fused if dense is not None else None,
+            swiglu8=dense.swiglu8 if dense is not None else None,
+            swiglu=self._dense_swiglu,
+            count=count,
+        )
+        up_pre, down_pre = self._shared_pre
+        self._shared_h = _shared_mlp.build(
+            cells=self._shared_gu_swiglu,
+            mtp_cells=self._shared_gu_swiglu_mtp,
+            up_cells=self._shared_gu_swiglu_up,
+            up_pre=up_pre,
+            down_pre=down_pre,
+            mid=self._moe_mid,
+            mxf8=self._shared8,
+            gate_up=self._proj_h.shared_gate_up,
+            down=self._proj_h.shared_down,
+            swiglu=self._rows.swiglu,
+            wide_bucket=self._wide_bucket,
+            count=count,
+        )
+
+    def _build_ix_handle(self) -> None:
+        """The indexer ops' handle (`_ix_h`, `ops/attention/indexer.py`), over the kernels
+        built at load and, once the first forward compiled them (`_derive_first_step`, which
+        re-runs this), the engine's, with the rope table. Compiles nothing."""
+        count = self._count
+        self._ix_h = _ix.build(
+            self._ix_kernels,
+            pre_proj=_ix_pre.build(
+                self._ix_pre_kernels,
+                self._proj_h.ix_fused,
+                self.idx_dim,
+                self.idx_heads,
+                self._wide_bucket,
+                self._rows.copy,
+                count,
+            ),
+            ix_qb=self._proj_h.ix_qb,
+            cos_sin=self._idx_cos_sin,
+            weight_scale=self.idx_weight_scale,
+            is_neox=self.indexer_is_neox,
+            rope_dim=self.rope_dim,
+            heads=self.idx_heads,
+            dim=self.idx_dim,
+            top_k=self.idx_topk,
+            max_ctx_len=self._max_ctx_len,
+            copy=self._rows.copy,
+            count=count,
+        )
 
     def _warm_draft_rows(self) -> None:
         """MTP3 / MTP5, at load: launch once on zeros what an eager draft step runs at a
@@ -1909,10 +1744,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         - The MTP layer's routed experts at every count 1..64: the top-k per count; routing,
           quantize and clear per power of two. Same path, handles and buffers as the step
           (the FC2 tile counters reset at each launch's end).
-        - The eh_proj K-split instances up to 64 rows (`Mtp.front`).
+        - The eh_proj K-split instances up to 64 rows (`mtp_eh_proj`).
         - The shared expert's gate|up at the counts no runtime-M cell serves (33..63 but 48:
           the 48 / 64 cells are compiled for their own M, and the fused MTP cells take 65
-          rows and up): `Gemm.project` itself on the step's operand shape, so cuBLAS loads the
+          rows and up): `projection` itself on the step's operand shape, so cuBLAS loads the
           kernels it picks for those shapes here.
         The slot parity, the MTP layer's L2 prefetch counts and the route counters are
         restored after."""
@@ -1932,17 +1767,22 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     runner.forward_rows(eh, m)
             for rows in range(1, _DECODE_MAX_ROWS + 1):
                 if rows not in self._shared_gu_swiglu:
-                    self.op.gemm.project(DRAFT, "shared_gate_up", x[:rows], self._mlp[j][0])
+                    _proj.projection(DRAFT, x[:rows], self._mlp[j][0], self._proj_h.shared_gate_up)
         if self._mtp_fp4 is not None:
-            slot = self.op.moe.slot
-            hist = self._pf.hist[j].clone() if self._pf is not None else None
+            h, m, parity = self._mtp_moe_h, self._mtp_moe, self._mtp_parity
+            slot = parity.slot
+            pf = self._moe_k.pf
+            hist = pf.hist[j].clone() if pf is not None else None
             for rows in range(1, _DECODE_MAX_ROWS + 1):
-                self.op.moe.routed(
-                    PREFILL, x[:rows], self._mtp_fp4, rows, False, None, False, False, j
-                )
-            self.op.moe.slot = slot
+                xr = x[:rows]
+                s = parity.take()
+                pre = moe_quantize_first(xr, m, False, h)
+                logits, in_slot = moe_router(PREFILL, xr, m, s, False, h)
+                sel = moe_topk(logits, in_slot, m, s, j, False, h)
+                moe_experts(xr, sel, m, pre, s, None, None, None, j, False, h)
+            parity.slot = slot
             if hist is not None:
-                self._pf.hist[j].copy_(hist)
+                pf.hist[j].copy_(hist)
         torch.cuda.synchronize()
         self.route_hits.clear()
         self.route_hits.update(hits)
@@ -2034,28 +1874,20 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # The decode scorer's column count is frozen at capture, so it is an engine constant:
         # a replay whose sequences outgrew a batch maximum would read unwritten columns.
         self._max_ctx_len = md.max_seq_len
-        # A width with no handle takes the trtllm op: max_seq_len <= index_topk, or a failed build.
-        # The 1-row steps, MTP1's 2, and MTP3 / MTP5's max_draft_len + 1.
-        self._ix_topk_dec_compiled = {}
-        for next_n in (1, *self.mtp_widths):
-            try:
-                self._ix_topk_dec_compiled[next_n] = build_ix_topk_decode(
-                    dev, max_columns=md.max_seq_len, top_k=self.idx_topk, next_n=next_n
-                )
-            except Exception as e:  # noqa: BLE001 -- that width takes the trtllm op
-                logger.warning(
-                    f"modeling_v2 GLM-5.2: indexer top-k decode build failed for next_n={next_n} "
-                    f"({e}); using the trtllm op"
-                )
-        # GVR only where it serves this engine's width, warmed ahead of any capture.
-        self._dec_topk_gvr_live = self._dec_topk_gvr is not None and _dec_topk_gvr_serves(
-            int(md.max_seq_len)
+        # The indexer's K-cache update and fused q side by pool layout, its decode top-k at the
+        # 1-row steps, MTP1's 2 and MTP3 / MTP5's max_draft_len + 1, and GVR where it serves.
+        _ix.compile_for_engine(
+            self._ix_kernels,
+            md,
+            top_k=self.idx_topk,
+            is_neox=self.indexer_is_neox,
+            widths=self.mtp_widths,
+            q_side_k=self.wide_cells and self._ix_qk_on,
+            gvr=self._dec_topk_gvr,
         )
-        if self._dec_topk_gvr_live:
-            self._warm_dec_topk_gvr(md)
         if self.mtp_enabled:
             # MTP3 / MTP5 also width 1: the MTP layer's 1-token draft steps
-            # (`Attn.mtp_rope_specialised`). A separate draft pool's block-table width compiles at
+            # (`mla_rope.RopeWidths`). A separate draft pool's block-table width compiles at
             # the first eager draft step, as width max_draft_len + 1 does.
             for p in self.mtp_widths + ((1,) if self.max_draft_len > 1 else ()):
                 self._mla_rope_handle(int(md.kv_cache_block_offsets.shape[-1]), dev, p)
@@ -2069,37 +1901,6 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 f"modeling_v2 GLM-5.2: context rope/append build failed ({e}); using stock op"
             )
             self._ctx_rope_compiled = None
-        k_pool = md.kv_cache_manager.get_indexer_k_cache_buffers(0)
-        assert (
-            k_pool.dtype == torch.uint8
-            and k_pool.ndim == 4
-            and k_pool.shape[2] == 1
-            and k_pool.shape[3] >= _INDEXER_PER_TOKEN_MIN
-        ), f"the fused indexer k write needs a [blocks, block, 1, >=132] uint8 pool: {k_pool.shape}"
-        # Both pool layouts: the trunk's per-layer views are strided and a separate draft pool's
-        # may not be, and a layout first met inside a capture cannot compile there.
-        self._ix_k_compiled = {
-            contiguous: build_ix_k_cache(
-                dev,
-                is_neox=self.indexer_is_neox,
-                cache_contiguous=contiguous,
-                f32_input=self._ix_nosplit,
-            )
-            for contiguous in (False, True)
-        }
-        if self.wide_cells and self._ix_qk_on:
-            self._ix_qk_compiled = (
-                _try_build(
-                    "indexer q side + K update",
-                    lambda: {
-                        contiguous: build_ix_qk(
-                            dev, is_neox=self.indexer_is_neox, cache_contiguous=contiguous
-                        )
-                        for contiguous in (False, True)
-                    },
-                )
-                or {}
-            )
         # Every split-K variant the decode attention selects for 1..max_batch_size sequences,
         # both index kinds. `max_num_requests` is the engine's max_batch_size, in every
         # metadata it hands over (a CUDA-graph copy keeps it): no step schedules more
@@ -2138,31 +1939,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     f"{_fmha_dec_op.LAYER_ROW_STRIDE} (got {int(md.tokens_per_block)}); "
                     "pure decode steps keep the per-row decode attention"
                 )
+        self._build_attn_handles()
+        self._build_ix_handle()
         self._derive_pending = False
         self._derived_for = md.kv_cache_manager
-
-    def _warm_dec_topk_gvr(self, md) -> None:
-        """Compile the GVR decode top-k's launchers for every row count a decode step of this
-        engine can carry (1..max_batch_size sequences at each generation width), as the
-        engine's `warmup_selfsampling_topk` does for its own `next_n`: a launcher is keyed by the
-        exact row count and the logits row stride, and one first met inside a capture cannot
-        compile there (that graph then keeps ours, `Indexer.decode`). The scorer's rows are
-        the DSL paged-MQA arena's, `max_seq_len` rounded up to 256 columns."""
-        from tensorrt_llm._torch.kernels.blackwell.top_k import (
-            gvr_topk_decode_self_sampling_host as gvr_host,
-        )
-
-        seqs = int(md.max_num_requests)
-        for next_n in (1, *self.mtp_widths):
-            gvr_host.warmup_varlen(
-                self.idx_topk,
-                int(md.max_seq_len),
-                compress_ratio=1,
-                next_n=next_n,
-                num_rows_list=tuple(next_n * b for b in range(1, seqs + 1)),
-                row_stride=(int(md.max_seq_len) + 255) // 256 * 256,
-                deterministic=self._dec_topk_gvr.gvr_deterministic,
-            )
 
     # ---- blocks both targets run ----
 
@@ -2230,11 +2010,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             padded = min((m for m in self._lm_head_runners if m > rows), default=rows)
             runner = self._lm_head_runners.get(padded) if padded <= 256 else None
             if runner is not None and self._wide_bucket:
-                key = ("lm_head", rows)
-                if key not in self.op.gemm._wide_rag:
-                    self.op.gemm._wide_rag[key] = _projection_op.at_rows(runner, rows)
-                if self.op.gemm._wide_rag[key] is not None:
-                    runner, padded = self.op.gemm._wide_rag[key], rows
+                if rows not in self._lm_head_at_rows:
+                    self._lm_head_at_rows[rows] = _projection_op.at_rows(runner, rows)
+                if self._lm_head_at_rows[rows] is not None:
+                    runner, padded = self._lm_head_at_rows[rows], rows
                     self._count("logits_at_rows", True)
         if (
             runner is not None
@@ -2268,75 +2047,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return cute_dsl_hidden_row_gather(hidden, rows, handle)
         return nn.functional.embedding(rows, hidden)
 
-    def _mla_rope_handle(
-        self, width: int, dev: int, p: int = _MLA_ROPE_MTP_WIDTH
-    ) -> "_mla_rope_op.CompiledMlaRopeGeneration":
+    def _mla_rope_handle(self, width: int, dev: int, p: int = _MLA_ROPE_MTP_WIDTH):
         """The MLA rope kernels for a block table `width` columns wide and `p` new tokens per
-        sequence (one of `mtp_widths`, or 1 for MTP3 / MTP5's 1-token draft steps,
-        `Attn.mtp_rope_specialised`). The operand layout is this target's: `q_pe` the rope
-        half of the `[T, heads, qk_dim]` q_b output, the latent the tail of the
-        `[T, q_lora + lat_dim]` kv_a output. A pair not seen yet compiles here, which is the
-        first eager forward that uses it (the trunk's are built in `_derive_first_step`).
-        Both q-base variants are built: a step whose rows a decode K-B cell serves (2..64)
-        takes the q-base from that GEMM, any wider one (MTP3 / MTP5's 128 / 192 rows: the
-        prefill K-B) has the rope kernel emit it."""
-        handle = self._mla_rope_compiled.get((width, p))
-        if handle is None:
-            handle = _mla_rope_op.compile(
-                max_blocks_per_seq=width,
-                q_pe_head_stride=self.qk_dim,
-                q_pe_token_stride=self.heads * self.qk_dim,
-                latent_row_stride=self.q_lora + self.lat_dim,
-                device_index=dev,
-                predicted_tokens_per_seq=p,
-                q_base_from_kb=bool(self._kb8),
-            )
-            self._mla_rope_compiled[(width, p)] = handle
-        return handle
-
-    # ---- the trunk's routed experts ----
-
-    def _build_moe_wide_rep(self, k, dev) -> None:
-        """The MTP3 / MTP5 wide decode steps' expert replicas: `k.topk_wide_rep`, one handle per
-        wide row range (keyed as `k.topk_wide`).
-
-        At 65..256 decode rows the prefill pair streams one expert's weights per active local
-        expert, so a rank's routed time follows its count of distinct active experts and the
-        post-MoE all-reduce waits for the busiest rank (real routing, 75 layers: 2.66 / 2.09
-        experts above the mean at 128 / 192 rows). The wide replica top-k moves each active hot
-        expert whole to the EP rank with the fewest active experts (the decode replicas'
-        greedy), on the context replicas' slots: the `64 + R` deep prefill pair (`k.pair_rep`)
-        and each trunk layer's hot ids (`_ctx_hot_ids`); the MTP layer has none and keeps the
-        wide top-k. Built only with the wide top-k (MTP3 / MTP5), the context replicas and
-        `wide_dec_replicas`, and only for the ranges up to `_WIDE_REP_MAX_ROWS` (65..128); a
-        failed build leaves every step on the wide top-k."""
-        k.topk_wide_rep = {}
-        if not (
-            self.wide_dec_replicas
-            and k.topk_wide
-            and k.pair_rep is not None
-            and self.ctx_replicas
-            and self._ctx_hot_ids
-        ):
-            return
-        splits = next(iter(k.topk_wide.values())).logit_splits
-        built = _try_build(
-            "MoE wide decode replica top-k",
-            lambda: {
-                r: _moe_topk_wide_rep_op.build_wide_rep(
-                    r[1],
-                    splits,
-                    self.ctx_replicas,
-                    dev,
-                    expert_hist=h.expert_hist,
-                    cluster=h.cluster,
-                    trim=h.trim,
-                )
-                for r, h in k.topk_wide.items()
-                if r[1] <= _WIDE_REP_MAX_ROWS
-            },
-        )
-        k.topk_wide_rep = built or {}
+        sequence (`mla_rope.MlaRopeCells.get`): one of `mtp_widths`, or 1 for MTP3 / MTP5's
+        1-token draft steps."""
+        return self._mla_rope_cells.get(width, dev, p)
 
 
 class MTPLayer:
@@ -2366,7 +2081,7 @@ class MTPLayer:
         if core._mtp_out_normed:
             x = hidden_states
         else:
-            x = core.op.rows.rmsnorm(hidden_states, core._mtp["head_norm"])
+            x = hidden_rmsnorm(hidden_states, core._mtp["head_norm"], core.eps, core._rows.norm)
         if return_context_logits:
             return core.logits(x, lm_head, self.logits_processor, attn_metadata)
         return self.logits_processor.forward(x, lm_head, attn_metadata, return_context_logits)

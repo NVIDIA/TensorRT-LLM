@@ -192,8 +192,8 @@ def _slot(dev) -> SimpleNamespace:
 def _attach_ops(core) -> SimpleNamespace:
     """The core's ops, as its `__init__` builds them (`core.op`)."""
     return SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
-        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
+        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
     )  # fmt: skip
 
 
@@ -217,10 +217,10 @@ def state() -> SimpleNamespace:
     core._moe_acc_padded = True
     core._moe_dec_unpad = True
     core._moe_dec_unpad_signal = True
-    core._rows = SimpleNamespace(
-        norm=None, add=_add_op.compile(), gather=None, topk=None, swiglu=None,
-        copy=_copy_op.compile(), argmax=None,
-    )  # fmt: skip
+    # The row ops' handles, none compiled but the ones the MoE path launches.
+    core._rows = core._build_row_ops(compile=False)
+    core._rows.add = _add_op.build(core._count)
+    core._rows.copy = _copy_op.build(core._count)
     core._side_stream = torch.cuda.Stream(device=dev)
     core._moe_slots = [_slot(dev) for _ in range(2)]
     rows = _ops._MOE_MAX_T

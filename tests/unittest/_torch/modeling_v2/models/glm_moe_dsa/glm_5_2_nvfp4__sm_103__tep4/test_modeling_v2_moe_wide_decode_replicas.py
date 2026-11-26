@@ -47,6 +47,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     cute_dsl_copy as _copy_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
+    order_fence as _fence_op,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_nvfp4_experts as _experts_op,
 )
@@ -226,10 +229,10 @@ def state() -> SimpleNamespace:
     core.fc1_kblk, core.fc2_kblk = FC1_KBLK, FC2_KBLK
     core.ctx_replicas = NREP
     core.wide_dec_replicas = True
-    core._rows = SimpleNamespace(
-        norm=None, add=None, gather=None, topk=None, swiglu=None, copy=_copy_op.compile(),
-        argmax=None,
-    )  # fmt: skip
+    # The row ops' handles, none compiled but the ones the MoE path launches.
+    core._rows = core._build_row_ops(compile=False)
+    core._rows.copy = _copy_op.build(core._count)
+    core._shared_fence = _fence_op.build(dev, "moe_shared_after_ar", core._count)
     core._side_stream = torch.cuda.Stream(device=dev)
     core._moe_slots = [_slot(dev) for _ in range(2)]
     rows = _ops._MOE_MAX_T
@@ -240,8 +243,8 @@ def state() -> SimpleNamespace:
     core._dec_hot_ids = {}
     core._pf = None
     core.op = SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
-        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
+        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
     )  # fmt: skip
     k = SimpleNamespace(
         routing=None,
@@ -293,7 +296,7 @@ def moe_layer(core, x, partial, m, rows: int, layer: int):
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        op.mlp.shared_after_collective(exact)
+        _fence_op.order_fence(exact, core._shared_fence)
         op.rows.copy(acc, partial)
     routed = op.moe.routed(
         _ops.Phase(wide=True), x, m, rows, False, side, began, True, layer, exact

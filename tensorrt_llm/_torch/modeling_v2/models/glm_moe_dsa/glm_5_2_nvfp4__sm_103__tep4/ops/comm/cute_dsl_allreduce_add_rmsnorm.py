@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""TP4 all-reduce fused with the residual add and RMSNorm that consume it."""
+"""TP4 all-reduce fused with the residual add and RMSNorm that consume it; and
+`allreduce_add_rmsnorm`, the same at any row count, writing its consumer's MXF8 operand where
+that consumer reads one."""
 
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ._lamport import QUANT_TWOSHOT_ABOVE, TWOSHOT_ABOVE, LamportWorkspace, check_rows, tail
+from .cute_dsl_allreduce import CommHandle, check_budget
 
 
 class CuteDslAllreduceAddRmsnorm(OpWrapper):
@@ -146,3 +149,79 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
 
 
 cute_dsl_allreduce_add_rmsnorm = CuteDslAllreduceAddRmsnorm()
+
+
+def _reduce_norm(partial, residual, weight, workspace: LamportWorkspace) -> torch.Tensor:
+    """The plain launch, in slices of the token budget above it: row slices of a contiguous
+    `residual` are views, so the in-place add still lands."""
+    n = workspace.max_rows
+    if partial.shape[0] > n:
+        return torch.cat(
+            [
+                _reduce_norm(p, r, weight, workspace)
+                for p, r in zip(partial.split(n), residual.split(n))
+            ]
+        )
+    check_budget(partial, workspace)
+    out = torch.empty_like(partial)
+    return cute_dsl_allreduce_add_rmsnorm(partial, residual, weight, out, workspace)
+
+
+class AllreduceAddRmsnorm(OpWrapper):
+    """All-reduce, add into `residual` in place, RMS norm: every trunk collective and the
+    MTP layer's pre-MoE one. Returns `(out, x8)`.
+
+    `x8` (a load-time constant of the call site: its consumer takes the MXF8 GEMM, see
+    `PrefillTarget.on_load`) asks for the normalized rows' MXF8 operand as well.
+    It is written where the collective runs two-shot (above `TWOSHOT_ABOVE` rows, within the
+    budget), the workspace built that epilogue, and the call is not being captured: then
+    `x8` is `(q8, sf)` and the bf16 rows are the plain two-shot's bytes (counted `ar_x8`).
+    Anywhere else `x8` is None and the consumer quantizes `out` itself."""
+
+    def __call__(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        handle: CommHandle,
+        x8: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        ws = handle.workspace
+        rows = int(partial.shape[0])
+        if (
+            x8
+            and ws.fused_twoshot_x8 is not None
+            and TWOSHOT_ABOVE < rows <= ws.max_rows
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            check_budget(partial, ws)
+            out = torch.empty_like(partial)
+            n = int(partial.shape[1])
+            operand = (
+                torch.empty([rows, n], dtype=torch.uint8, device=partial.device),
+                torch.empty(
+                    (rows + 127) // 128 * 128 * (n // 32), dtype=torch.uint8, device=partial.device
+                ),
+            )
+            cute_dsl_allreduce_add_rmsnorm(partial, residual, weight, out, ws, x8=operand)
+            handle.count("ar_x8", True)
+            return out, operand
+        return _reduce_norm(partial, residual, weight, ws), None
+
+    def reference(
+        self,
+        partials: Sequence[torch.Tensor],
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        handle: CommHandle,
+        x8: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`cute_dsl_allreduce_add_rmsnorm`'s reference `(norm, new_residual)`: the group's
+        partials in rank order. `x8` is ignored (its bytes are the activation quant of the
+        norm)."""
+        return cute_dsl_allreduce_add_rmsnorm.reference(
+            partials, residual, weight, None, handle.workspace
+        )
+
+
+allreduce_add_rmsnorm = AllreduceAddRmsnorm()

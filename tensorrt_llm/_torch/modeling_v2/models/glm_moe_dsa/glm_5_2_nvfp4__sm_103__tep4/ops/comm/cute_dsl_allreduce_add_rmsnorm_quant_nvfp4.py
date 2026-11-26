@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""TP4 all-reduce, residual add and RMSNorm, plus the NVFP4 quantize of the norm."""
+"""TP4 all-reduce, residual add and RMSNorm, plus the NVFP4 quantize of the norm; and
+`allreduce_add_rmsnorm_quant`, that launch at the row counts whose routed experts read the
+quantized rows, `allreduce_add_rmsnorm` at the others."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -12,7 +15,8 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 
 from ._lamport import QUANT_TWOSHOT_ABOVE, LamportWorkspace, check_rows, tail
-from .cute_dsl_allreduce_add_rmsnorm import cute_dsl_allreduce_add_rmsnorm
+from .cute_dsl_allreduce import CommHandle, check_budget
+from .cute_dsl_allreduce_add_rmsnorm import allreduce_add_rmsnorm, cute_dsl_allreduce_add_rmsnorm
 
 #: NVFP4: one e4m3 scale per 16 elements.
 SF_VEC = 16
@@ -168,3 +172,81 @@ class CuteDslAllreduceAddRmsnormQuantNvfp4(OpWrapper):
 
 
 cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 = CuteDslAllreduceAddRmsnormQuantNvfp4()
+
+
+#: The decode widths (1..64 rows); a quantized call above them is a wide decode step's.
+DECODE_ROWS = 64
+
+
+@dataclass(frozen=True)
+class AllreduceQuantHandle:
+    """What `allreduce_add_rmsnorm_quant` takes: the collectives' handle and the routed
+    experts' NVFP4 input buffers (`xq` `[max_rows, hidden/2]`, `xsf` `[max_rows,
+    hidden/16]` uint8), which the launch writes and the routed experts' FC1 reads."""
+
+    comm: CommHandle
+    xq: torch.Tensor
+    xsf: torch.Tensor
+
+
+def build(comm: CommHandle, xq: torch.Tensor, xsf: torch.Tensor) -> AllreduceQuantHandle:
+    """The handle over the collectives' workspace and the routed experts' input buffers."""
+    return AllreduceQuantHandle(comm, xq, xsf)
+
+
+class AllreduceAddRmsnormQuant(OpWrapper):
+    """The pre-MoE collective of a trunk MoE layer: `(out, x8, prequant)`.
+
+    Up to `quant_rows` rows (a load-time constant of the calling Target: the decode widths,
+    and on a wide decode step whose routed experts run its exact rows the quant entry's
+    widest certified cell, see the Targets' `on_load`) the launch also writes
+    the routed experts' NVFP4 input into the handle's `xq` / `xsf`, exactly the rows they
+    would quantize: `prequant` is those `(xq, xsf)` rows and the routed experts skip their
+    stage copy and quantize (above 64 rows counted `moe_dec_prequant`). Above `quant_rows` it
+    is `allreduce_add_rmsnorm` with `x8` (the shared expert's MXF8 operand where that reads
+    one), `prequant` None, and the routed experts quantize themselves."""
+
+    def __call__(
+        self,
+        partial: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: torch.Tensor,
+        handle: AllreduceQuantHandle,
+        quant_rows: int,
+        x8: bool = False,
+    ):
+        rows = int(partial.shape[0])
+        if rows > quant_rows:
+            out, operand = allreduce_add_rmsnorm(partial, residual, weight, handle.comm, x8)
+            return out, operand, None
+        ws = handle.comm.workspace
+        check_budget(partial, ws)
+        xq, xsf = handle.xq[:rows], handle.xsf[:rows]
+        out = torch.empty_like(partial)
+        out = cute_dsl_allreduce_add_rmsnorm_quant_nvfp4(
+            partial, residual, weight, global_scale, out, xq, xsf, ws
+        )
+        if rows > DECODE_ROWS:
+            handle.comm.count("moe_dec_prequant", True)
+        return out, None, (xq, xsf)
+
+    def reference(
+        self,
+        partials: Sequence[torch.Tensor],
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: torch.Tensor,
+        handle: AllreduceQuantHandle,
+        quant_rows: int,
+        x8: bool = False,
+    ):
+        """`cute_dsl_allreduce_add_rmsnorm_quant_nvfp4`'s reference `(norm, new_residual,
+        fp4, scales)`: the group's partials in rank order. Above `quant_rows` only the first
+        two are what the op computes. `x8` is ignored."""
+        return cute_dsl_allreduce_add_rmsnorm_quant_nvfp4.reference(
+            partials, residual, weight, global_scale, None, None, None, handle.comm.workspace
+        )
+
+
+allreduce_add_rmsnorm_quant = AllreduceAddRmsnormQuant()

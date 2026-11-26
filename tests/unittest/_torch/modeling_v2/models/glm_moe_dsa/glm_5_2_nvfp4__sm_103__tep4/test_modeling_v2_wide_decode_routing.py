@@ -33,13 +33,46 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    decode as DT,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     forward_ops as F,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    prefill as PT,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     wide_decode as W,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.activation import (  # noqa: E402, E501
+    cute_dsl_swiglu_rows as SR,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+    mla_rope as MR,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
+    cute_dsl_allreduce as AR,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
+    cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 as ARQ,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
+    order_fence as FENCE,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    absorbed_bmm as AB,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    indexer_fold as IF,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    projection as P,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    shared_mlp as SM,
 )
 
 BF16 = torch.bfloat16
@@ -79,20 +112,26 @@ def core_for(monkeypatch):
         return entry
 
     projection = record(lambda x, w, out, r: r.tag)
-    monkeypatch.setattr(F, "cute_dsl_projection", projection)
-    # The logits head (on the core) launches the projection kernel itself.
+    monkeypatch.setattr(P, "cute_dsl_projection", projection)
+    # The shared expert's prefill down GEMM, and the logits head (on the core), launch the
+    # projection kernel themselves.
+    monkeypatch.setattr(SM, "cute_dsl_projection", projection)
     monkeypatch.setattr(M, "cute_dsl_projection", projection)
     # A cell re-pinned to fewer rows (`_projection_op.at_rows`): the cell's tag plus the rows.
+    # Read when the handles are built (`_build_gemm_handles`, by `_step`).
     monkeypatch.setattr(F._projection_op, "at_rows", lambda r, rows: _runner(f"{r.tag}@{rows}"))
-    monkeypatch.setattr(F, "cute_dsl_projection_mxf8", record(lambda *a, **k: "mxf8"))
+    for mod in (P, F):
+        monkeypatch.setattr(mod, "cute_dsl_projection_mxf8", record(lambda *a, **k: "mxf8"))
     monkeypatch.setattr(
-        F, "cute_dsl_projection_mxf8_decode", record(lambda x, w, out, r, pre=False: r.tag)
+        P, "cute_dsl_projection_mxf8_decode", record(lambda x, w, out, r, pre=False: r.tag)
     )
-    monkeypatch.setattr(F, "cublas_mm", lambda x, w, b, d: calls.append("cublas") or x)
-    monkeypatch.setattr(F, "cute_dsl_absorbed_bmm", record(lambda a, w, out, r: r.tag))
-    monkeypatch.setattr(F, "bmm_out", record(lambda *a: "bmm_out"))
+    monkeypatch.setattr(P, "cublas_mm", lambda x, w, b, d: calls.append("cublas") or x)
+    monkeypatch.setattr(AB, "cute_dsl_absorbed_bmm", record(lambda a, w, out, r: r.tag))
+    monkeypatch.setattr(AB, "bmm_out", record(lambda *a: "bmm_out"))
+    # A fold's plain-projection fallback (`indexer_fold`): the fold tests see only the fold.
+    monkeypatch.setattr(IF, "projection", lambda *a, **k: None)
     monkeypatch.setattr(F, "cute_dsl_indexer_pre_proj_split", record(lambda x, w, kb, wq, h: h.tag))
-    monkeypatch.setattr(F, "cute_dsl_shared_gate_up_swiglu", record(lambda x, w, o, r: r.tag))
+    monkeypatch.setattr(SM, "cute_dsl_shared_gate_up_swiglu", record(lambda x, w, o, r: r.tag))
     monkeypatch.setattr(F, "cute_dsl_mtp_norm_shard", record(lambda *a: "norm_shard"))
     monkeypatch.setattr(
         F, "cute_dsl_mtp_eh_proj", lambda local, w, r: calls.append("ksplit" if r is None else r)
@@ -104,7 +143,7 @@ def core_for(monkeypatch):
     monkeypatch.setattr(F._eh8_op, "operand", lambda rows, dev: (None, None))
     # A new contiguous tensor, as the real SwiGLU returns (the down GEMM's paths check it).
     monkeypatch.setattr(
-        F, "flashinfer_silu_and_mul", lambda t: t[:, : t.shape[1] // 2].contiguous()
+        SR, "flashinfer_silu_and_mul", lambda t: t[:, : t.shape[1] // 2].contiguous()
     )
 
     def build(max_draft_len: int):
@@ -121,7 +160,7 @@ def core_for(monkeypatch):
         core.route_hits, core.route_misses = {}, {}
         core.tp_rank, core.eps = 0, 1e-5
         core.idx_heads, core.idx_dim = 32, 128
-        core._rows = SimpleNamespace(swiglu=None, norm=None, copy=None, add=None)
+        core._rows = core._build_row_ops(compile=False)
         core.op = _ops(core)
         core.op.comm.reduce = lambda t: t
         core.op.rows.rmsnorm = lambda x, w: x
@@ -151,8 +190,9 @@ def core_for(monkeypatch):
         core._ix_pre_split_mtp = {m: _runner(f"ix_split@{m}:mtp") for m in MTP_ROWS}
         core._ix_pre_split_pre = _runner("ix_split:prefill")
         core._ix_pre_split_rag = _runner("ix_split:rag", max_m=192)
-        core._moe_k = SimpleNamespace(shared_down_pre=_runner("shared_down:shared_pre"))
-        core._moe_k.shared_up_pre = _runner("shared_up:prefill")
+        core._shared_pre = (_runner("shared_up:prefill"), _runner("shared_down:shared_pre"))
+        core._shared8 = None
+        core._dense_mxf8, core._dense_swiglu = None, None
         core._moe_mid = _aligned(256, 512)
         core._shared_gu_swiglu = {64: _runner("shared_gu@64")}
         core._shared_gu_swiglu_mtp = {m: _runner(f"shared_gu@{m}:mtp") for m in MTP_ROWS}
@@ -167,10 +207,37 @@ def core_for(monkeypatch):
 def _ops(core) -> SimpleNamespace:
     """The core's ops, as its `__init__` builds them (`core.op`)."""
     return SimpleNamespace(
-        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core), attn=F.Attn(core),
-        indexer=F.Indexer(core), mlp=F.Mlp(core), moe=F.Moe(core), mtp=F.Mtp(core),
-        ctx=F.Ctx(core),
+        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core),
+        indexer=F.Indexer(core), moe=F.Moe(core), mtp=F.Mtp(core), ctx=F.Ctx(core),
     )  # fmt: skip
+
+
+def _absorb(core, kind: str) -> AB.AbsorbedBmmHandle:
+    """`kind`'s absorbed-BMM handle over the core's runner tables, as `_build_attn_handles`
+    builds it."""
+    return AB.build(
+        kind,
+        cells=core._absorb.get(kind, {}),
+        mtp_cells=core._absorb_mtp.get(kind, {}),
+        prefill=core._absorb_pre.get(kind),
+        wide_bucket=core._wide_bucket,
+        count=core._count,
+    )
+
+
+def _qkva_fold(core, ph, x, i: int):
+    """`qkva_ix_fold` on layer `i`'s stacked weight over the core's fold cells, as the Targets
+    call it: `(qkva, key, head_weights)` where the fold serves, else None (the plain
+    projection, stubbed out by `core_for`)."""
+    h = IF.build_qkva(core._qkva_ix_mtp, None, core._wide_bucket, core._count)
+    qkva, kw = IF.qkva_ix_fold(ph, x, None, None, None, core._ix_fold_w.get(i), h)
+    return None if kw is None else (qkva, *kw)
+
+
+def _qbix_cell(core, ph, i: int, rows: int):
+    """The q_b | wq_b fold cell `q_b_ix_wq_b` launches for layer `i`'s `rows`, or None."""
+    h = IF.build_q_b(core._qbix_mtp, None, core._wide_bucket, core._count)
+    return IF._fold_cell(ph, rows, core._qbix_w.get(i), h, "qb_ixqb")
 
 
 def _wide(max_draft_len: int, decode: bool, rows: int) -> bool:
@@ -181,7 +248,9 @@ def _step(core, decode: bool, rows: int) -> F.Phase:
     """Route a step of `rows` rows the way the engine's forward does (`_select_target`: a
     context step to prefill, an MTP3 / MTP5 decode step above 64 rows to the wide decode
     Target, any other decode step to the decode Target), and return the `Phase` the chosen
-    Target runs its ops at."""
+    Target runs its ops at. Builds the core's projection and MLP handles first, from its
+    runner tables as the test left them."""
+    core._build_gemm_handles()
     core._prefill, core._decode, core._wide = "prefill", "decode", "wide"
     target = core._select_target(SimpleNamespace(num_contexts=0 if decode else 2), rows)
     want = "wide" if _wide(core.max_draft_len, decode, rows) else "decode" if decode else "prefill"
@@ -291,7 +360,7 @@ def test_dense_mlp_and_bmm_and_indexer_split(core_for, max_draft_len, decode, ro
 
     calls.clear()
     a = torch.zeros(16, rows, 8, dtype=BF16)
-    core.op.gemm.absorbed_bmm(ph, "k_b", a, None, None, a)
+    AB.absorbed_bmm(ph, a, None, None, a, _absorb(core, "k_b"))
     # The K-B object of the 128 / 192 cells launches at any row count above 64 itself.
     want = "k_b@64" if rows <= 64 else f"k_b@{cell}:mtp" if cell else "k_b:prefill"
     assert calls == [want], calls
@@ -308,6 +377,12 @@ def test_dense_mlp_and_bmm_and_indexer_split(core_for, max_draft_len, decode, ro
     assert calls == [want], calls
 
 
+def _shared(core, ph, x, gu, dn, trunk: bool):
+    """The shared expert as the Targets call it: gate|up + SwiGLU, then down."""
+    act, prefill = SM.shared_gate_up_swiglu(ph, x, gu, None, None, None, core._shared_h, trunk)
+    return SM.shared_down(ph, act, dn, core._shared_h, None, prefill)
+
+
 @pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("trunk", [True, False], ids=["trunk", "mtp_layer"])
@@ -322,7 +397,7 @@ def test_shared_expert(core_for, max_draft_len, decode, trunk, rows, bucket) -> 
     x = _aligned(rows, 16)
     gu = torch.zeros(16, 1024, dtype=BF16)
     dn = torch.zeros(512, 8, dtype=BF16)
-    core.op.mlp.shared(ph, x, gu, None, dn, trunk=trunk)
+    _shared(core, ph, x, gu, dn, trunk)
     if rows <= 64:
         want = ["shared_gu@64", "shared_down@64"]
     elif cell == rows:
@@ -384,6 +459,7 @@ def test_draft_eager_rows(core_for, monkeypatch, max_draft_len, draft, rows, own
             lambda r, rows: None if r.tag.endswith("@64") else _runner(f"{r.tag}@{rows}"),
         )
     # Off a draft step: a context step's rows (no cell-up rule).
+    core._build_gemm_handles()
     ph = F.DRAFT if draft else _step(core, False, rows)
     eager = draft and rows != 64
     x = _aligned(rows, 160)
@@ -425,8 +501,8 @@ def test_captured_decode_rows_without_a_cell(
 ) -> None:
     """An MTP3 / MTP5 decode step (graph-captured, `DecodeTarget` at `Phase(up="decode")`) at a
     row count up to 64 without a decode cell -- MTP5 at 1-3 requests: 6 / 12 / 18 -- takes the
-    eager draft step's rule (`Gemm.cell_up`): each projection the next cell up at its exact rows (the MTP cell
-    where the decode cell is compiled for its own M), the indexer split the runtime-M handle
+    eager draft step's rule (`projection.cell_up`): each projection the next cell up at its
+    exact rows (the MTP cell where the decode cell is compiled for its own M), the indexer split the runtime-M handle
     (not `x.float()` + cuBLAS), eh_proj the next K-split instance, the shared expert its fused
     cell built at that count. 64 (a cell) is the control. No speculation, MTP1, context steps
     and `TRTLLM_GLM52_DEC_CELL_UP=0` keep cuBLAS / the two-launch path there."""
@@ -452,12 +528,13 @@ def test_captured_decode_rows_without_a_cell(
     # dense_down's cells, as the other projections' (the fixture builds none for it).
     core._proj["dense_down"] = {64: _runner("dense_down@64")}
     core._proj_mtp["dense_down"] = {m: _runner(f"dense_down@{m}:mtp") for m in MTP_ROWS}
+    core._build_gemm_handles()
     for name in ("qkva", "q_b", "ix_qb", "dense_gate_up", "dense_down"):
         calls.clear()
         core.op.gemm.project(ph, name, x, w)
         if rows == 64:
             want = f"{name}@64"
-        elif not up or name in F._CELL_UP_KEEPS_CUBLAS:
+        elif not up or name in P.CELL_UP_KEEPS_CUBLAS:
             # ix_qb and dense_down keep cuBLAS: there it is faster than their next cell up.
             want = "cublas"
         elif name == "q_b" and rows < 16:
@@ -485,7 +562,7 @@ def test_captured_decode_rows_without_a_cell(
     xs = _aligned(rows, 16)
     gu = torch.zeros(16, 1024, dtype=BF16)
     dn = torch.zeros(512, 8, dtype=BF16)
-    core.op.mlp.shared(ph, xs, gu, None, dn, trunk=True)
+    _shared(core, ph, xs, gu, dn, True)
     if rows == 64:
         want = ["shared_gu@64", "shared_down@64"]
     elif up and rows in core._shared_gu_swiglu_up:
@@ -516,7 +593,7 @@ def test_absorbed_bmm_at_decode_rows_without_a_cell(
 ) -> None:
     """K-B / V-B at an MTP3 / MTP5 decode step's 12 / 18 rows (9..64 without a cell) take the
     M >= 16 group's object, which launches at them, instead of the prefill BMM; so do the fp8
-    q-base K-B and the V-B that writes o_proj's MXF8 operand (`Gemm.absorb_cell`). 6 rows is below
+    q-base K-B and the V-B that writes o_proj's MXF8 operand (`decode_cell`). 6 rows is below
     that group (the prefill BMM as before); 16 is a cell (control). No speculation, MTP1,
     context steps and `TRTLLM_GLM52_DEC_CELL_UP=0` keep the prefill BMM there."""
     core, calls = core_for(max_draft_len)
@@ -530,11 +607,11 @@ def test_absorbed_bmm_at_decode_rows_without_a_cell(
     up = decode and max_draft_len > 1 and cell_up and 9 <= rows <= 64
     calls.clear()
     a = torch.zeros(16, rows, 8, dtype=BF16)
-    core.op.gemm.absorbed_bmm(ph, "k_b", a, None, None, a)
+    AB.absorbed_bmm(ph, a, None, None, a, _absorb(core, "k_b"))
     want = "k_b@16..64" if rows == 16 or up else "k_b:prefill"
     assert calls == [want], calls
     for cells, tag in ((core._kb8, "k_b8@16..64"), (core._vb8, "v_b8@16..64")):
-        got = core.op.gemm.absorb_cell(ph, cells, rows)
+        got = AB.decode_cell(ph, cells, rows, core._count)
         assert (got.tag if got is not None else None) == (tag if rows == 16 or up else None), (
             tag,
             rows,
@@ -578,14 +655,14 @@ def test_logits_rows(core_for, monkeypatch, max_draft_len, rows, bucket) -> None
     assert calls == want, calls
 
 
-def _moe_close_core(max_draft_len: int):
+def _moe_close_core(max_draft_len: int, monkeypatch):
     """A one-MoE-layer core whose Targets run on recorders: every op the MoE-layer close calls
     (o_proj, the collectives, the shared expert, the routed experts, the adds and norms) is
     logged with the stream it was issued on ("side" / "main"). The ops that decide the close's
-    path keep their own logic: `Comm.reduce_norm_moe` (which collective), `Moe.wide_exact` /
-    `Moe.open_layer` / `Moe.combine`, `Mtp.wide_exact` / `Mtp.moe`, and
-    `Mlp.shared_after_collective` (logged as "cut" where it launches). The attention ahead of
-    o_proj is a stub."""
+    path keep their own logic: `allreduce_add_rmsnorm_quant` (which collective, at the window
+    the Target passes), `Moe.wide_exact` / `Moe.open_layer` / `Moe.combine`,
+    `Mtp.wide_exact` / `Mtp.moe`, and `order_fence` (logged as "cut" where it launches). The
+    attention ahead of o_proj is a stub."""
     core = object.__new__(M.GlmMoeDsaTep4ModelingV2)
     core.max_draft_len = max_draft_len
     core.wide_cells = core.max_draft_len > 1
@@ -594,29 +671,34 @@ def _moe_close_core(max_draft_len: int):
     core.route_hits, core.route_misses = {}, {}
     core.num_layers = 1
     core.heads, core.v_dim, core.kv_lora = 1, 8, 8
+    core.idx_topk = 2048
+    core.eps = 1e-5
+    core.w, core._embedding = {"embed": None}, None
     core._side_stream = torch.cuda.Stream()
     log = []
 
-    def on(tag):
+    def on(tag, ret=lambda out: out):
         def rec(*a, **k):
             where = "side" if torch.cuda.current_stream() == core._side_stream else "main"
             log.append((tag, where))
             rows = next((t.shape[0] for t in a if isinstance(t, torch.Tensor)), 1)
-            out = torch.zeros(rows, 8, dtype=BF16)
-            if tag == "ar_quant":
-                return out, True
-            return (out, None) if tag == "ar_x8" else out
+            return ret(torch.zeros(rows, 8, dtype=BF16))
 
         return rec
 
-    attn = SimpleNamespace(o=None, o8=None, o_dec8=None, norm1=None, norm2=None, qkva8=None)
+    attn = SimpleNamespace(
+        **dict.fromkeys(
+            ("o", "o8", "o_dec8", "norm1", "norm2", "qkva", "qkva8", "ix_fold_w", "q_norm"),
+        ),
+        **dict.fromkeys(("kv_norm", "qb", "qbix_w", "qb_dec8", "k_b", "k_b_nk", "v_b_t", "v_b_nk")),
+    )
     core._attn = [attn, attn]
     core._idx = [None, None]
     core._pool_layer_id = [0]
     core._mlp = [(None, None), (None, None)]
     core._moe = [SimpleNamespace(g1=None)]
     core._moe_k = SimpleNamespace(topk_pre=object(), pair=object(), merge=None)
-    core._dense8 = None
+    core._dense_w8 = []
     core._shared_w8 = [None, None]
     core._shared_gu_il = [None, None]
     core._next_norm = [None]
@@ -624,38 +706,62 @@ def _moe_close_core(max_draft_len: int):
     core._mtp_out_normed = False
     core._mtp = {"head_norm": None}
     core.mtp_index_share = False
+    # The handles the Targets pass: o_proj's (the recorder logs its name), the collectives'
+    # (the quant op's own window logic runs on them), the order fence's, and the handoffs.
+    core._proj_h = SimpleNamespace(o_proj=SimpleNamespace(name="o_proj"))
+    core._comm = AR.build(SimpleNamespace(max_rows=8192), core._count)
+    core._ar_quant = ARQ.build(core._comm, torch.zeros(256, 1), torch.zeros(256, 1))
+    core._shared_fence = FENCE.build("cpu", "moe_shared_after_ar", core._count)
+    core._dense_h = core._shared_h = None
+    core._rows = core._build_row_ops(compile=False)
+    core._mlp_x8, core._close_x8 = [False], [False]
+    core._qb_pre, core._vb_pre = [False, False], [False, False]
+    core._attn_h = SimpleNamespace(
+        **dict.fromkeys(("qkva_fold", "norm", "q_b_fold", "fmha", "k_b", "rope", "v_b"))
+    )
+    core._quant_rows, core._quant_rows_wide = core._prequant_rows(False), core._prequant_rows(True)
     core.op = _ops(core)
     op = core.op
+    # The pre-MoE collective's two kernels inside `allreduce_add_rmsnorm_quant`.
+    monkeypatch.setattr(ARQ, "cute_dsl_allreduce_add_rmsnorm_quant_nvfp4", on("ar_quant"))
+    monkeypatch.setattr(ARQ, "allreduce_add_rmsnorm", on("ar_x8", lambda out: (out, None)))
+    real_fence = FENCE.order_fence
+
+    def fence(launch, handle):
+        if launch:
+            on("cut")()
+        real_fence(launch, handle)
+
+    for mod in (DT, W, PT):
+        monkeypatch.setattr(mod, "embed", lambda ids, w, runner: ids)
+        monkeypatch.setattr(mod, "hidden_rmsnorm", on("norm"))
+        monkeypatch.setattr(mod, "hidden_add", on("add"))
+        monkeypatch.setattr(mod, "allreduce_add_rmsnorm", on("ar", lambda out: (out, None)))
+        monkeypatch.setattr(mod, "allreduce", on("ar_close"))
+        monkeypatch.setattr(mod, "projection", lambda ph, x, w, h, *a, **k: on(h.name)(x))
+        monkeypatch.setattr(mod, "shared_gate_up_swiglu", on("shared", lambda out: (out, False)))
+        monkeypatch.setattr(mod, "shared_down", lambda ph, act, *a, **k: act)
+    monkeypatch.setattr(W, "order_fence", fence)
     op.rows.embed = lambda ids: ids
     op.rows.rmsnorm = on("norm")
     op.rows.add = on("add")
     op.rows.add_rmsnorm = on("add_norm")
-    op.comm.reduce_norm_quant = on("ar_quant")
-    op.comm.reduce_norm_x8 = on("ar_x8")
-    op.comm.reduce_norm = on("ar")
-    op.comm.reduce = on("ar_close")
-    op.gemm.project = lambda ph, name, x, *a, **k: on(name)(x)
     op.indexer.topk_buf = lambda *a: None
-    stub = SimpleNamespace(layer=lambda buf, fresh, layer_id: (None, "global", None))
-    op.attn.decode_slots = lambda md, req_idx, gen_p: stub
-    op.attn.draft_slots = lambda *a: (None, "global", None)
-    op.attn.qkv_gen = lambda ph, x, a, i, select: (x, x, x, None, None)
-    op.attn.gen_query = lambda *a: (None, None, None, None)
-    op.attn.sparse_decode = lambda *a: None
-    op.attn.v_b = lambda *a: False
+    # The attention ahead of o_proj: its ops pass `x` through and launch nothing.
+    for mod in (DT, W):
+        monkeypatch.setattr(mod, "qkva_ix_fold", lambda ph, x, *a: (x, None))
+        monkeypatch.setattr(mod, "qkv_a_rmsnorm", lambda qkva, *a: (qkva, qkva, None, False))
+        monkeypatch.setattr(mod, "q_b_ix_wq_b", lambda ph, q_a, *a: (q_a, None))
+        monkeypatch.setattr(mod, "decode_slots", lambda *a: (None, "global", None))
+        monkeypatch.setattr(mod, "convert_req_index_to_global", lambda *a: None)
+        monkeypatch.setattr(mod, "k_b_q_base", lambda *a: None)
+        monkeypatch.setattr(mod, "mla_rope", lambda *a: (None, None, None, None))
+        monkeypatch.setattr(mod, "sparse_mla_decode", lambda *a: None)
+        monkeypatch.setattr(mod, "v_b", lambda *a: False)
     op.mtp.front = lambda ph, e, h, rows: h
     op.moe.pf_fork = lambda *a, **k: None
     op.moe.begin_layer = lambda rows, exact=False: torch.zeros(rows, 8, dtype=BF16)
     op.moe.routed = on("routed")
-    op.mlp.shared = on("shared")
-    real_cut = op.mlp.shared_after_collective
-
-    def cut(exact):
-        if exact:
-            on("cut")()
-        real_cut(exact)
-
-    op.mlp.shared_after_collective = cut
     core._prefill = M.PrefillTarget(core)
     core._decode = M.DecodeTarget(core)
     core._wide = W.WideDecodeTarget(core)
@@ -683,6 +789,7 @@ def _close(core, close: str, decode: bool, rows: int) -> None:
         num_contexts=0, num_tokens=rows, num_seqs=1, skip_indexer_for_gen_reqs=False,
         req_idx_per_token=torch.zeros(rows, dtype=torch.int32),
         host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32), tokens_per_block=64,
+        block_table=None,
         kv_cache_manager=SimpleNamespace(layer_offsets={core.num_layers: 0}),
     )  # fmt: skip
     pos = torch.zeros(rows, dtype=torch.int32)
@@ -700,19 +807,20 @@ def _from_o_proj(log: list) -> list:
 @pytest.mark.parametrize("rows", (64, 96, 128, 192))
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
 @pytest.mark.parametrize("max_draft_len", ENGINES)
-def test_moe_close_shared_after_collective(max_draft_len, decode, rows) -> None:
+def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypatch) -> None:
     """On an MTP3 / MTP5 decode step's exact rows (`Moe.decode_exact`, `WideDecodeTarget`) a
     trunk MoE layer and the MTP layer put one plain kernel on the side stream right after its
-    fork, ahead of the shared expert (`Mlp.shared_after_collective`: the shared GEMM then
+    fork, ahead of the shared expert (`order_fence`: the shared GEMM then
     cannot launch off the pre-MoE collective's PDL release ahead of the router). Nowhere else:
     MTP1, no speculation and context steps issue exactly the calls they did."""
     exact = decode and max_draft_len > 1 and rows > 64
     for close in ("trunk", "mtp"):
-        core, log = _moe_close_core(max_draft_len)
-        _close(core, close, decode, rows)
+        with monkeypatch.context() as mp:
+            core, log = _moe_close_core(max_draft_len, mp)
+            _close(core, close, decode, rows)
         if close == "trunk":
             # The pre-MoE collective writes the routed experts' NVFP4 input at decode widths
-            # and on the exact wide rows (`Comm.prequant`), else it is the plain AR + norm.
+            # and on the exact wide rows (`_quant_rows_wide`), else the plain AR + norm.
             prequant = rows <= 64 or exact
             first = [("o_proj", "main"), ("ar_quant" if prequant else "ar_x8", "main")]
         else:
@@ -727,13 +835,13 @@ def test_moe_close_shared_after_collective(max_draft_len, decode, rows) -> None:
 @pytest.mark.parametrize("rows", (32, 64, 128, 192))
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
 @pytest.mark.parametrize("max_draft_len", ENGINES)
-def test_mtp_close_output_add_and_head_norm(max_draft_len, decode, rows) -> None:
+def test_mtp_close_output_add_and_head_norm(max_draft_len, decode, rows, monkeypatch) -> None:
     """The MTP layer's output: routed + shared, the closing all-reduce, then the residual add.
     On an MTP3 / MTP5 decode step (its 1-token draft steps' 32 rows included) the residual
     add and the head norm are one launch (`Rows.add_rmsnorm`, bit for bit the pair: the op's
     own test); those engines' context steps keep the two launches, and MTP1 / no speculation
     return the un-normed sum as before."""
-    core, log = _moe_close_core(max_draft_len)
+    core, log = _moe_close_core(max_draft_len, monkeypatch)
     core._mtp_out_normed = max_draft_len > 1
     _close(core, "mtp", decode, rows)
     exact = decode and max_draft_len > 1 and rows > 64
@@ -759,7 +867,10 @@ def test_mtp_layer_rope_widths(max_draft_len) -> None:
     core.max_draft_len = max_draft_len
     core.wide_cells = core.max_draft_len > 1
     core.mtp_widths = (2,) + ((max_draft_len + 1,) if max_draft_len > 1 else ())
-    taken = {p for p in range(1, 9) if F.Attn(core).mtp_rope_specialised(p)}
+    widths = MR.widths(core.mtp_widths, max_draft_len)
+    taken = {p for p in range(1, 9) if widths.takes("mtp", p)}
+    assert {p for p in range(1, 9) if widths.takes("trunk", p)} == set(core.mtp_widths)
+    assert not any(widths.takes("stock", p) for p in range(1, 9))
     want = set(core.mtp_widths) | ({1} if max_draft_len > 1 else set())
     assert taken == want, (taken, want)
 
@@ -770,7 +881,7 @@ def test_mtp_layer_rope_widths(max_draft_len) -> None:
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
 @pytest.mark.parametrize("max_draft_len", ENGINES)
 def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket, built) -> None:
-    """The qkva + indexer key / head-weight fold (`Gemm.qkva_ix_fold`) serves exactly where the qkva
+    """The qkva + indexer key / head-weight fold (`qkva_ix_fold`) serves exactly where the qkva
     projection would take its bf16 MTP cell -- an MTP3 / MTP5 decode step above 64 rows, at the
     cell or (buckets on) the next cell up on the exact rows -- on a layer whose weights were
     stacked, with the fold cells built (`TRTLLM_GLM52_WIDE_IX_FOLD`, on by default); everywhere
@@ -782,20 +893,20 @@ def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket
     core._ix_fold_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
     core._qkva_ix_mtp = {m: _runner(f"fold@{m}") for m in MTP_ROWS} if built else {}
     monkeypatch.setattr(
-        F._ix_fold_op,
+        IF._ix_fold_op,
         "at_rows",
         lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
     )
     for m, r in core._qkva_ix_mtp.items():
         r.rows = m
     monkeypatch.setattr(
-        F, "cute_dsl_qkva_ix_fold", lambda x, w, out, r: calls.append(r.tag) or (out, None, None)
+        IF, "cute_dsl_qkva_ix_fold", lambda x, w, out, r: calls.append(r.tag) or (out, None, None)
     )
     ph = _step(core, decode, rows)
     cell = _cell(max_draft_len, decode, rows, bucket)
     x = _aligned(rows, 16)
     calls.clear()
-    got = core.op.gemm.qkva_ix_fold(ph, x, 0, rows)
+    got = _qkva_fold(core, ph, x, 0)
     serves = built and max_draft_len > 1 and cell is not None
     if serves:
         assert calls == [f"fold@{cell}" if cell == rows else f"fold@{cell}@{rows}"], calls
@@ -804,7 +915,7 @@ def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket
         assert got is None and calls == [], (got, calls)
     # A layer without stacked weights (no indexer, or a stack the build skipped): the two GEMMs.
     calls.clear()
-    assert core.op.gemm.qkva_ix_fold(ph, x, 1, rows) is None and calls == []
+    assert _qkva_fold(core, ph, x, 1) is None and calls == []
     # Keys and head weights from the caller: no split, no fp32 projection.
     ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None)
     kb = torch.zeros(rows, 128, dtype=BF16)
@@ -820,7 +931,7 @@ def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
 @pytest.mark.parametrize("max_draft_len", ENGINES)
 def test_q_b_ix_wq_b(core_for, monkeypatch, max_draft_len, decode, rows, bucket, built) -> None:
-    """The q_b | wq_b fold (`Gemm.qb_ixqb_runner`) serves exactly where q_b and ix_qb would take
+    """The q_b | wq_b fold (`q_b_ix_wq_b`) serves exactly where q_b and ix_qb would take
     their bf16 MTP cells -- an MTP3 / MTP5 decode step above 64 rows, at the cell or (buckets
     on) the next cell up -- on a layer whose weights were stacked, with the cells built
     (`TRTLLM_GLM52_WIDE_QB_IXQB`); elsewhere None and the two GEMMs run. With the caller's
@@ -830,20 +941,20 @@ def test_q_b_ix_wq_b(core_for, monkeypatch, max_draft_len, decode, rows, bucket,
     core._qbix_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
     core._qbix_mtp = {m: _runner(f"qbix@{m}", rows=m) for m in MTP_ROWS} if built else {}
     monkeypatch.setattr(
-        F._qbix_op,
+        IF._qbix_op,
         "at_rows",
         lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
     )
     ph = _step(core, decode, rows)
     cell = _cell(max_draft_len, decode, rows, bucket)
-    got = core.op.gemm.qb_ixqb_runner(ph, 0, rows)
+    got = _qbix_cell(core, ph, 0, rows)
     if built and max_draft_len > 1 and cell is not None:
         assert got is not None and got.tag == (
             f"qbix@{cell}" if cell == rows else f"qbix@{cell}@{rows}"
         )
     else:
         assert got is None
-    assert core.op.gemm.qb_ixqb_runner(ph, 1, rows) is None
+    assert _qbix_cell(core, ph, 1, rows) is None
     calls.clear()
     x = _aligned(rows, 16)
     ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None, qb=None)
@@ -920,7 +1031,7 @@ def test_indexer_nosplit_beside_wide_decode(
     """The context indexer projection's no-split read (`TRTLLM_GLM52_CTX_IX_NOSPLIT`, default
     on: the prefill handle's fp32 `[T, 160]` output read in place by the pitch-160 q side and
     the K write's fp32-key launchers) beside the MTP3 / MTP5 wide decode indexer front, in the
-    order the targets call it (decode: `Gemm.qkva_ix_fold` (in `Attn.qkv_gen`), then
+    order the targets call it (decode: `qkva_ix_fold`, then
     `Indexer.project` with the layer's cache, then `Indexer.write_k` unless the keys were
     written; context and mixed: `Indexer.project`, then `Indexer.write_k`).
 
@@ -959,12 +1070,12 @@ def test_indexer_nosplit_beside_wide_decode(
 
     monkeypatch.setattr(F._ix_pre_split_op, "project_unsplit", unsplit)
     monkeypatch.setattr(
-        F._ix_fold_op,
+        IF._ix_fold_op,
         "at_rows",
         lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
     )
     monkeypatch.setattr(
-        F,
+        IF,
         "cute_dsl_qkva_ix_fold",
         lambda x, w, out, r: calls.append(r.tag) or (out, fold_kb, fold_wq),
     )
@@ -990,7 +1101,7 @@ def test_indexer_nosplit_beside_wide_decode(
     pool = torch.zeros(4, 32, 1, 132, dtype=torch.uint8)
     calls.clear()
     if decode:
-        got = core.op.gemm.qkva_ix_fold(ph, x, 0, rows)
+        got = _qkva_fold(core, ph, x, 0)
         kw = None if got is None else got[1:]
         _, _, k_pre = core.op.indexer.project(
             ph, x, x, None, ix, rows, True, kw=kw, ixq=ixq, kc=(md, pool)

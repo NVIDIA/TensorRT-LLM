@@ -20,8 +20,8 @@ discarded for the routing kernel's, the output cleared and the shared expert mer
 the wide decode top-k's maps used as written, the shared expert accumulated by FC2;
 `exact_pre` the same on the prefill top-k (the wide one not built). `exact_prequant`: `exact`
 with the routed experts' NVFP4 input written ahead of the layer, as the pre-MoE collective
-writes it on those steps (`Comm.prequant`): the routed experts then neither stage nor
-quantize. One GPU has no collective, so the routed experts' own prefill quantize stands in
+writes it on those steps (`allreduce_add_rmsnorm_quant`): the routed experts then neither
+stage nor quantize. One GPU has no collective, so the routed experts' own prefill quantize stands in
 for it; the 4-GPU comm matrix proves the collective's bytes equal that quantize's bit for bit.
 """
 
@@ -46,8 +46,20 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
+    cute_dsl_allreduce as _ar_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
+    cute_dsl_allreduce_add_rmsnorm as _arn_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E402, E501
+    cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 as _arq_op,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     cute_dsl_copy as _copy_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
+    order_fence as _fence_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_merge as _merge_op,
@@ -212,10 +224,10 @@ def state() -> SimpleNamespace:
     core.wide_cells = core.max_draft_len > 1
     core.fc1_kblk = FC1_KBLK
     core.fc2_kblk = FC2_KBLK
-    core._rows = SimpleNamespace(
-        norm=None, add=None, gather=None, topk=None, swiglu=None, copy=_copy_op.compile(),
-        argmax=None,
-    )  # fmt: skip
+    # The row ops' handles, none compiled but the ones the MoE path launches.
+    core._rows = core._build_row_ops(compile=False)
+    core._rows.copy = _copy_op.build(core._count)
+    core._shared_fence = _fence_op.build(dev, "moe_shared_after_ar", core._count)
     core._side_stream = torch.cuda.Stream(device=dev)
     core._moe_slots = [_slot(dev) for _ in range(2)]
     rows = _ops._MOE_MAX_T
@@ -253,8 +265,8 @@ def state() -> SimpleNamespace:
         router={},
     )
     core.op = SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core), attn=_ops.Attn(core),
-        indexer=_ops.Indexer(core), mlp=_ops.Mlp(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
+        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
     )  # fmt: skip
     stacks = _experts()
     st = SimpleNamespace(core=core, layers=[_layer_weights(i, stacks) for i in LAYERS])
@@ -278,8 +290,8 @@ def moe_layer(
     (no decode L2 prefetch), as the wide decode target (`decode`: `WideDecodeTarget.forward`)
     or the prefill target (`PrefillTarget._mlp_and_close`) runs it. `prequant`: the
     collective also wrote the routed experts' NVFP4 input (an exact decode step,
-    `Comm.prequant`); otherwise it wrote none. The shared expert's result is `partial`, copied
-    on the side stream into the buffer its GEMM writes: the routed output when
+    `allreduce_add_rmsnorm_quant`); otherwise it wrote none. The shared expert's result is
+    `partial`, copied on the side stream into the buffer its GEMM writes: the routed output when
     `Moe.open_layer` hands one out, else a fresh tensor that `Moe.combine` merges after.
     Returns `(mlp_out, slot)`."""
     op = core.op
@@ -291,7 +303,7 @@ def moe_layer(
     side = core._side_stream
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        op.mlp.shared_after_collective(exact)
+        _fence_op.order_fence(exact, core._shared_fence)
         shared = acc if acc is not None else torch.empty_like(partial)
         op.rows.copy(shared, partial)
     routed = op.moe.routed(
@@ -405,7 +417,7 @@ PATHS = {
     "exact_pre": (True, "none", False),
     "exact_topk1": (True, "topk1", False),
     "exact": (True, "full", False),
-    # The step's NVFP4 input written ahead of each layer (`Comm.prequant`).
+    # The step's NVFP4 input written ahead of each layer (`allreduce_add_rmsnorm_quant`).
     "exact_prequant": (True, "full", True),
 }
 
@@ -458,7 +470,7 @@ def test_capture_replays_match_eager(rows: int, path: str, monkeypatch) -> None:
     assert exact == decode, "every row count here is a wide decode width at MTP3"
     # `exact` without the prequant is the target's path for exact rows past
     # `_MOE_PREQUANT_WIDE_MAX` (257..512), and what MTP3 / MTP5 ran before it widened.
-    assert not prequant or core.op.comm.prequant(rows, exact), "the gate refuses this path"
+    assert not prequant or rows <= core._prequant_rows(exact), "the gate refuses this path"
     if exact:
         monkeypatch.setattr(_ops, "cute_dsl_moe_routing", _refuse)
         monkeypatch.setattr(_ops, "cute_dsl_moe_zero", _refuse)
@@ -535,18 +547,19 @@ def test_prequant_matches_the_quantizing_path(rows: int, monkeypatch) -> None:
 def test_prequant_only_on_decode_widths_and_wide_decode_steps() -> None:
     """The collective writes the routed experts' NVFP4 input at 1..64 rows in every
     configuration, as before; above 64 only on an MTP3 / MTP5 decode step's exact rows up to
-    256 (the call `WideDecodeTarget.forward` makes). MTP1, no speculation and every context
-    step keep the plain collective above 64 rows."""
+    256 (the window `WideDecodeTarget.forward` passes, `_quant_rows_wide`). MTP1, no
+    speculation and every context step keep the plain collective above 64 rows."""
     core = state().core
     try:
         for draft_len in (0, 1, 3, 5):
             core.max_draft_len = draft_len
             core.wide_cells = core.max_draft_len > 1
             for decode in (False, True):
+                # The Target the step routes to (`_select_target`) and the window it passes.
                 got = [
                     r
                     for r in range(1, _ops._MOE_MAX_T + 1)
-                    if core.op.comm.prequant(r, decode and core.op.moe.decode_exact(r))
+                    if r <= core._prequant_rows(decode and core.wide_cells and r > 64)
                 ]
                 wide = list(range(65, 257)) if decode and draft_len > 1 else []
                 assert got == list(range(1, 65)) + wide, (draft_len, decode)
@@ -556,10 +569,10 @@ def test_prequant_only_on_decode_widths_and_wide_decode_steps() -> None:
 
 
 def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypatch) -> None:
-    """`Comm.reduce_norm_quant` calls the quant entry exactly where `Comm.prequant` admits the row
-    count, into the first `rows` rows of the routed experts' `xq` / `xsf` (the buffers FC1
-    reads), and the plain entry everywhere else. The entries are recorded, not run: one
-    GPU has no collective."""
+    """`allreduce_add_rmsnorm_quant` calls the quant entry exactly up to the window its Target
+    passes (`_prequant_rows`: 64, or 256 on a wide decode step's exact rows), into the first
+    `rows` rows of the routed experts' `xq` / `xsf` (the buffers FC1 reads), and the plain
+    entry everywhere else. The entries are recorded, not run: one GPU has no collective."""
     core = state().core
     calls = []
 
@@ -571,10 +584,10 @@ def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypat
         calls.append(("plain",))
         return out
 
-    monkeypatch.setattr(_ops, "cute_dsl_allreduce_add_rmsnorm_quant_nvfp4", quant)
-    monkeypatch.setattr(_ops, "cute_dsl_allreduce_add_rmsnorm", plain)
+    monkeypatch.setattr(_arq_op, "cute_dsl_allreduce_add_rmsnorm_quant_nvfp4", quant)
+    monkeypatch.setattr(_arn_op, "cute_dsl_allreduce_add_rmsnorm", plain)
     lamport = SimpleNamespace(max_rows=_ops._MOE_MAX_T, fused_twoshot_x8=None)
-    monkeypatch.setattr(core, "_lamport", lamport, raising=False)
+    handle = _arq_op.build(_ar_op.build(lamport, core._count), core._moe_xq, core._moe_xsf)
     bf = {"dtype": torch.bfloat16, "device": "cuda"}
     weight = torch.ones(HIDDEN, **bf)
     g1 = torch.ones(1, dtype=torch.float32, device="cuda")
@@ -586,8 +599,10 @@ def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypat
     for rows, exact, want in cases:
         calls.clear()
         partial, residual = torch.zeros(rows, HIDDEN, **bf), torch.zeros(rows, HIDDEN, **bf)
-        _, prequantized = core.op.comm.reduce_norm_quant(partial, residual, weight, g1, rows, exact)
-        assert prequantized == want, (rows, exact)
+        _, x8, pre = _arq_op.allreduce_add_rmsnorm_quant(
+            partial, residual, weight, g1, handle, core._prequant_rows(exact)
+        )
+        assert (pre is not None) == want and x8 is None, (rows, exact)
         if not want:
             assert calls == [("plain",)], (rows, exact, calls)
             continue

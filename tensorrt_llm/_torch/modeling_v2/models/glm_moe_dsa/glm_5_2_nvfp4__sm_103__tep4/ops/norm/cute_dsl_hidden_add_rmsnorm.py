@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Residual add then RMSNorm of hidden-width (6144) bf16 rows, one CuTe DSL launch: the
-MTP module's output on an MTP3 / MTP5 decode step, bit for bit the two launches it fuses."""
+MTP module's output on an MTP3 / MTP5 decode step, bit for bit the two launches it fuses; and
+`hidden_add_rmsnorm`, that launch with the two launches as its fallback."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -12,6 +14,9 @@ import torch
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.common import hidden_rmsnorm_add_h6144_bf16 as _kernel
+from .._build import Count, build_or_reason
+from ..elementwise.cute_dsl_hidden_add import HiddenAddHandle, hidden_add
+from .cute_dsl_hidden_rmsnorm import HiddenRmsnormHandle, hidden_rmsnorm
 
 HIDDEN = _kernel.HIDDEN
 
@@ -115,3 +120,64 @@ class CuteDslHiddenAddRmsnorm(OpWrapper):
 
 
 cute_dsl_hidden_add_rmsnorm = CuteDslHiddenAddRmsnorm()
+
+
+@dataclass(frozen=True)
+class HiddenAddRmsnormHandle:
+    """What `hidden_add_rmsnorm` launches: the fused kernel (None: not built, `missing` says
+    why), the handles of the two launches it fuses (its fallback), and the route counter
+    (`hidden_add_norm`)."""
+
+    compiled: Callable | None
+    add: HiddenAddHandle
+    norm: HiddenRmsnormHandle
+    count: Count
+    missing: str = ""
+
+
+def build(
+    add: HiddenAddHandle, norm: HiddenRmsnormHandle, count: Count, enabled: bool = True
+) -> HiddenAddRmsnormHandle:
+    """Compile the fused kernel into `hidden_add_rmsnorm`'s handle. It serves only where both
+    launches it fuses built their kernels (the pair it is bit for bit); otherwise, or with
+    `enabled=False`, nothing is compiled and every call runs the two launches."""
+    if not enabled:
+        return HiddenAddRmsnormHandle(None, add, norm, count, "not built")
+    if add.compiled is None or norm.compiled is None:
+        return HiddenAddRmsnormHandle(None, add, norm, count, "the add or the norm did not build")
+    compiled, missing = build_or_reason("hidden add + RMSNorm", compile)
+    return HiddenAddRmsnormHandle(compiled, add, norm, count, missing)
+
+
+class HiddenAddRmsnorm(OpWrapper):
+    """`rmsnorm(add(a, b), weight)`; the sum is not kept. One `cute_dsl_hidden_add_rmsnorm`
+    launch where the handle's kernel built and takes the operands, else `hidden_add` then
+    `hidden_rmsnorm`. Counted as `hidden_add_norm`."""
+
+    def __call__(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        handle: HiddenAddRmsnormHandle,
+    ) -> torch.Tensor:
+        hit = handle.compiled is not None and takes(a, b, weight)
+        handle.count("hidden_add_norm", hit)
+        if hit:
+            return cute_dsl_hidden_add_rmsnorm(a, b, weight, eps, handle.compiled)
+        return hidden_rmsnorm(hidden_add(a, b, handle.add), weight, eps, handle.norm)
+
+    def reference(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        handle: HiddenAddRmsnormHandle,
+    ) -> torch.Tensor:
+        """`cute_dsl_hidden_add_rmsnorm`'s reference. `handle` is ignored."""
+        return cute_dsl_hidden_add_rmsnorm.reference(a, b, weight, eps, None)
+
+
+hidden_add_rmsnorm = HiddenAddRmsnorm()
