@@ -2931,9 +2931,13 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     public port delegates to it.
     """
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+    from tensorrt_llm.serve.coordinator_tls import CoordinatorTLS
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    tls = CoordinatorTLS.from_env()
+    coord_host = public_host if tls is not None else "127.0.0.1"
+    coord_scheme = "https" if tls is not None else "http"
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2942,6 +2946,9 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
+    if tls is not None and not use_uds and public_host in ("", "0.0.0.0", "::"):
+        raise ValueError("Configure a hostname covered by the coordinator TLS "
+                         "certificate, or enable the local fleet Unix socket")
     # Set before the try so that its finally also cleans up after a failed
     # startup.
     coord_socket = None
@@ -2954,7 +2961,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                      if coord_uds_dir is not None else None)
         # Fleet points at the UDS when enabled; the TCP port stays up for health.
         coord_url = f"unix:{coord_uds}" if coord_uds else \
-            f"http://{public_host}:{coord_port}"
+            f"{coord_scheme}://{coord_host}:{coord_port}"
 
         # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
         # hostname, so this listener starts the same way as the standalone server and
@@ -2966,11 +2973,10 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            coord_socket.bind((public_host, coord_port))
+            coord_socket.bind((coord_host, coord_port))
         except OSError as e:
             coord_socket.close()
-            raise _bind_failure("coordinator", public_host, coord_port,
-                                e) from e
+            raise _bind_failure("coordinator", coord_host, coord_port, e) from e
 
         # 1. Launch the delegating fleet pointed at the implicit coordinator we start
         #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -2999,14 +3005,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
             metadata_config=metadata_server_cfg,
             server_start_timeout_secs=server_start_timeout,
             request_timeout_secs=request_timeout)
-        logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+        logger.info(f"Coordinator serving on {coord_host}:{coord_port} "
                     f"(uds={coord_uds}) (fleet on public port {public_port})")
         set_lifecycle_phase("serving")
 
         async def _serve_and_monitor():
             server_task = asyncio.create_task(
                 CoordinatorServer(coordinator)(
-                    public_host,
+                    coord_host,
                     coord_port,
                     uds=coord_uds,
                     keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,

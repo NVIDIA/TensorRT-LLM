@@ -308,7 +308,7 @@ A single disaggregated server process is itself a single-threaded orchestrator a
 
 The two roles split as follows:
 
-- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/renew`, `/cluster_info`, `/health`, `/version`, and `/output_length` for [output-length prediction](#generation-admission-by-predicted-output-length)). The API has no authentication: any client that reaches the coordinator's port can reserve and release servers, and through `/output_length` record arbitrary in-range reply lengths, with or without a conversation ID. Such records change the named conversation's later predictions and also train the global models (median, ridge, trees) that predict every request, so they change the generation priority of all clients' requests, and the effect outlasts them (the ridge statistics cover all history). Keep the port reachable only from the fleet workers.
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/renew`, `/cluster_info`, `/health`, `/version`, and `/output_length` for [output-length prediction](#generation-admission-by-predicted-output-length)). The control API is local by default. Cross-node clients, including health probes, use the coordinator's mutual TLS listener.
 - **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
 
 This is controlled by two fields in the disaggregated config:
@@ -374,6 +374,8 @@ Clients still send requests to the public endpoint (`localhost:8000`); the fleet
 
 #### Example: external coordinator
 
+By default the coordinator accepts local connections. To share it across nodes, configure mutual TLS on the coordinator and each fleet worker. Set `TRTLLM_DISAGG_COORDINATOR_TLS_CA` to a dedicated CA bundle, `TRTLLM_DISAGG_COORDINATOR_TLS_CERT` to that node's certificate, and `TRTLLM_DISAGG_COORDINATOR_TLS_KEY` to its private key. Issue client certificates only to authorized fleet nodes. The coordinator certificate must cover the hostname in the HTTPS URL. A co-located fleet uses its private Unix socket by default.
+
 To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set `disagg_coordinator_url` and omit the coordinator from this process:
 
 ```yaml
@@ -381,7 +383,7 @@ hostname: localhost
 port: 8000
 backend: pytorch
 num_workers: 4
-disagg_coordinator_url: "http://coordinator-host:7999"
+disagg_coordinator_url: "https://coordinator-host:7999"
 context_servers:
   num_instances: 2
   urls:

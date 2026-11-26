@@ -1071,7 +1071,7 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
 
     for url, connector_name in (
         ("unix:/tmp/trtllm_disagg_coord_8333.sock", "UnixConnector"),
-        ("http://coordinator:8332", "TCPConnector"),
+        ("http://127.0.0.1:8332", "TCPConnector"),
     ):
         with (
             patch.object(dc.aiohttp, connector_name) as connector,

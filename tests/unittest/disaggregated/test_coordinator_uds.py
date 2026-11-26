@@ -20,10 +20,13 @@ The tests run the real ``_serve_coordinator_and_fleet`` with the real
 the fleet processes are stand-ins.
 """
 
+import asyncio
 import os
 import shutil
 import socket
+import ssl
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -237,3 +240,90 @@ def test_coordinator_socket_directory_fits_unix_socket_address(monkeypatch, tmp_
         uds_dir.cleanup()
     assert list(long_tmpdir.iterdir()) == []
     assert not os.path.exists(uds_dir.name)
+
+
+def test_coordinator_accepts_fleet_certificate(monkeypatch, tmp_path):
+    """A fleet session can reach an actual TCP listener with mutual TLS."""
+
+    def openssl(*args):
+        subprocess.run(["openssl", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    openssl(
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=Fleet Test CA",
+        "-keyout",
+        "ca.key",
+        "-out",
+        "ca.crt",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+    )
+    openssl(
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-keyout",
+        "node.key",
+        "-out",
+        "node.csr",
+    )
+    (tmp_path / "extensions").write_text(
+        "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth,clientAuth\n"
+    )
+    openssl(
+        "x509",
+        "-req",
+        "-in",
+        "node.csr",
+        "-CA",
+        "ca.crt",
+        "-CAkey",
+        "ca.key",
+        "-CAcreateserial",
+        "-days",
+        "1",
+        "-extfile",
+        "extensions",
+        "-out",
+        "node.crt",
+    )
+    for field, name in (("CA", "ca.crt"), ("CERT", "node.crt"), ("KEY", "node.key")):
+        monkeypatch.setenv("TRTLLM_DISAGG_COORDINATOR_TLS_" + field, str(tmp_path / name))
+    monkeypatch.setenv(serve.DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, "0")
+    run = _CoordinatorRun(monkeypatch)
+
+    async def ready():
+        url = f"https://127.0.0.1:{run.coord_port}"
+        async with disagg_coordinator.make_coordinator_session(url) as session:
+            try:
+                async with session.get(url + "/health") as response:
+                    return response.status == 200
+            except OSError:
+                return False
+
+    try:
+        run.start()
+        run.wait_for(lambda: asyncio.run(ready()))
+        assert run.fleet_urls == [f"https://127.0.0.1:{run.coord_port}"]
+        # An independent TLS client trusts the server CA but has no fleet certificate.
+        anonymous = ssl.create_default_context(cafile=str(tmp_path / "ca.crt"))
+        with socket.create_connection(("127.0.0.1", run.coord_port), timeout=5) as raw:
+            try:
+                with anonymous.wrap_socket(raw, server_hostname="127.0.0.1") as connection:
+                    response = _http_get(connection, "/health")
+            except (ssl.SSLError, ConnectionError):
+                response = b""
+        assert response == b""
+        assert asyncio.run(ready())
+    finally:
+        run.stop()
