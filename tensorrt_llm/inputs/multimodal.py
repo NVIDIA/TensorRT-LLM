@@ -9,6 +9,7 @@ current forward. `MultimodalInput` carries the executor boundary representation.
 Processor registration and encoder execution live outside this module.
 """
 
+from collections.abc import Mapping as _Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import partial
@@ -1360,9 +1361,26 @@ class MultimodalParams:
         return bool(self.multimodal_input or self.multimodal_data)
 
 
+def _validate_media_io_kwargs(media_io_kwargs: Optional[_Mapping]) -> None:
+    """Check every modality before loading media or merging overrides."""
+    if not isinstance(media_io_kwargs, _Mapping):
+        return
+    for modality, options in media_io_kwargs.items():
+        if isinstance(options, _Mapping):
+            for key in ("format", "device"):
+                if key in options:
+                    raise ValueError(
+                        f"media_io_kwargs.{modality}.{key} is unsupported. "
+                        "Remove this key to use the default media representation."
+                    )
+
+
 @dataclass
 class MultimodalServerConfig():
     media_io_kwargs: Optional[dict] = None
+
+    def __post_init__(self) -> None:
+        _validate_media_io_kwargs(self.media_io_kwargs)
 
 
 def _update_hash(hasher, item: object) -> None:

@@ -91,7 +91,7 @@ def create_dataset_from_stream(
     model_dir: str = None,
     model_type: str = None,
     modality: str = None,
-    image_data_format: str = "pt",
+    image_data_format: str | None = None,
     data_device: str = "cpu",
     max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:

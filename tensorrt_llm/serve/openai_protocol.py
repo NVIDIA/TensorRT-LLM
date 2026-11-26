@@ -54,6 +54,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.inputs.multimodal import _validate_media_io_kwargs
 from tensorrt_llm.kv_hints import KvHintsEnvelope
 from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
@@ -1416,7 +1417,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "Per-request override for the server's `--media_io_kwargs`. "
             "Shape: `{modality: {kwarg: value}}` with modality in "
             "{\"image\", \"video\", \"audio\"}; unknown modality keys are "
-            "rejected. Per modality, request kwargs are shallow-merged "
+            "rejected. The keys `format` and `device` are unsupported. "
+            "Per modality, request kwargs are shallow-merged "
             "onto the server defaults (request wins per key). For "
             "`video`, overriding only one of `fps`/`num_frames` drops "
             "the other from the server default so the loader's built-in "
@@ -1520,6 +1522,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @field_validator("media_io_kwargs")
+    @classmethod
+    def _check_media_io_kwargs(cls, value):
+        _validate_media_io_kwargs(value)
+        return value
 
     @model_validator(mode='before')
     @classmethod
