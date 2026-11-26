@@ -28,7 +28,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from _torch.attention.multi_gpu.helix_test_utils import CACHE_TYPE_SELFKONLY, setup_kv_and_metadata
+from _torch.attention.multi_gpu.helix_test_utils import (
+    CACHE_TYPE_SELFKONLY,
+    setup_kv_and_metadata,
+    setup_kv_cache,
+)
 from _torch.modeling.kimi_k3_mla_reference import KimiMLAAttention
 from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from _torch.modeling.test_kimi_k3_mla import _assert_matches_reference, _checkpoint_weights
@@ -200,7 +204,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         num_layers=1,
         kv_cache_dtype=torch.bfloat16,
     )
-    manager, metadata = setup_kv_and_metadata(
+    manager = setup_kv_cache(
         cache_scenario,
         mapping,
         cache_type=CACHE_TYPE_SELFKONLY,
@@ -247,7 +251,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
             )
 
         half = context_length // 2
-        chunked_modes = (True,) if scenario.cp_size == 2 else (False, True)
+        chunked_modes = (True,) if mapping.has_cp_helix() else (False, True)
         for chunked in chunked_modes:
             print(f"Checking cached context: CP={scenario.cp_size}, chunked={chunked}", flush=True)
             metadata = get_attention_backend("TRTLLM").Metadata(
