@@ -12,6 +12,7 @@ from transformers.activations import ACT2FN
 from transformers.models.pixtral.modeling_pixtral import apply_rotary_pos_emb
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.inputs.evs import compute_retention_mask
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from .decoder import rms_norm
@@ -20,6 +21,20 @@ from .manifest import load_unquantized, row_window
 _VISION_PREFIX = "model.vision_tower."
 _PROJECTOR_PREFIX = "model.multi_modal_projector."
 _PIXTRAL_EPS = 1e-5
+
+
+def fuse_video_template(projected, grid, merge_size, rate, template, text_embedding):
+    """Keep row ends and timestamp text in their true positions after spatial pruning."""
+    mask = compute_retention_mask(projected, grid, merge_size, rate)
+    ids = torch.tensor(template, device=projected.device)
+    # The template begins at the first patch and ends at the last frame terminator.
+    patches_in_text = ids == ids[0]
+    keep = torch.ones_like(patches_in_text)
+    keep[patches_in_text] = mask
+    retained_ids = ids[keep]
+    fused = text_embedding(retained_ids)
+    fused[retained_ids == ids[0]] = projected[mask]
+    return fused
 
 
 def merge_order_positions(rows: int, cols: int, side: int, merge: int) -> np.ndarray:
@@ -255,12 +270,17 @@ class ShortcutVisionFrontend(nn.Module):
         hidden = F.linear(merged, self.w["merge"])
         return F.linear(self.act(F.linear(hidden, self.w["proj_1"])), self.w["proj_2"])
 
-    def _video_rows(self, patches, size):
+    def _video_rows(self, patches, size, template, rate, text_embedding):
         height, width = (edge // self.patch for edge in size)
         frames = patches.split(height * width)
-        return torch.cat([self.project(self.encode_tower(frame, size)) for frame in frames])
+        projected = torch.cat([self.project(self.encode_tower(frame, size)) for frame in frames])
+        if not template:
+            return projected
+        return fuse_video_template(
+            projected, (len(frames), height, width), self.merge_size, rate, template, text_embedding
+        )
 
-    def forward(self, params: Sequence[MultimodalParams]) -> torch.Tensor:
+    def forward(self, params: Sequence[MultimodalParams], text_embedding=None) -> torch.Tensor:
         rows = []
         for request in params:
             metadata = request.item_metadata
@@ -278,7 +298,15 @@ class ShortcutVisionFrontend(nn.Module):
                         self.project(self.encode_tower(patches, data["image_sizes"][index]))
                     )
                 else:
-                    rows.append(self._video_rows(patches, data["frame_sizes"][index]))
+                    rows.append(
+                        self._video_rows(
+                            patches,
+                            data["frame_sizes"][index],
+                            data["templates"][index],
+                            data["pruning_rate"],
+                            text_embedding,
+                        )
+                    )
         if not rows:
             raise ValueError("The vision frontend requires at least one image or video.")
         return torch.cat(rows)

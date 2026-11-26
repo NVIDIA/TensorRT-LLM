@@ -25,6 +25,34 @@ from tensorrt_llm.tokenizer import TransformersTokenizer
 pytestmark = pytest.mark.cpu_only
 
 
+def test_video_retention_preserves_timestamps_and_empty_rows():
+    from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.vision import fuse_video_template
+
+    # Only the bottom right patch changes in frame two. The first frame survives intact.
+    projected = torch.tensor([[1.0, 0.0]] * 7 + [[-1.0, 0.0]])
+    text = torch.arange(18, dtype=torch.float32).reshape(9, 2)
+    patch, row_end, frame_end, timestamp = 1, 2, 3, 4
+    frame = [patch, patch, row_end, patch, patch, frame_end]
+    result = fuse_video_template(
+        projected, (2, 4, 4), 2, 0.375, [*frame, timestamp, *frame], text.__getitem__
+    )
+    expected = torch.stack(
+        [
+            projected[0],
+            projected[1],
+            text[row_end],
+            projected[2],
+            projected[3],
+            text[frame_end],
+            text[timestamp],
+            text[row_end],
+            projected[7],
+            text[frame_end],
+        ]
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
 @pytest.fixture
 def processor(tmp_path: Path) -> ShortcutInputProcessor:
     tags = ["<nemo:img>", "<row>", "<end>"]

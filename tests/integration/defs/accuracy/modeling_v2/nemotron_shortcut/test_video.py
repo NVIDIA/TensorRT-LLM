@@ -28,7 +28,7 @@ def test_decoded_video_frames(model_root, precision, tmp_path):
     if not model.is_dir():
         pytest.skip(f"Checkpoint unavailable: {model}")
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    processor = create_input_processor(str(model), tokenizer)
+    processor = create_input_processor(str(model), tokenizer, video_pruning_rate=0.5)
     text = {"prompt": "A photo of"}
     assert processor({**text, "multi_modal_data": {"video": []}}, SamplingParams()) == processor(
         text, SamplingParams()
@@ -53,13 +53,19 @@ def test_decoded_video_frames(model_root, precision, tmp_path):
         "multi_modal_data": {"video": [decoded]},
     }
     options = SamplingParams(add_special_tokens=False)
-    ids, extra = create_input_processor_with_hash(processor)(request, options)
-    prompt = tokenizer.decode(ids, skip_special_tokens=False)
+    plain = create_input_processor(str(model), tokenizer)
+    raw_ids, _ = create_input_processor_with_hash(plain)(request, options)
+    prompt = tokenizer.decode(raw_ids, skip_special_tokens=False)
     for n, index in enumerate(indices, 1):
         assert f"Frame {n} sampled at {index / 4:.2f} seconds" in prompt
 
+    ids, extra = create_input_processor_with_hash(processor)(request, options)
     data = extra["multimodal_data"]["video"]
-    assert ids.count(processor.config.image_token_id) == 16
+    patch = processor.config.image_token_id
+    template = data["templates"][0]
+    # Four 2x2 frames contribute 16 projected patches. EVS keeps half.
+    assert template.count(patch) == 16
+    assert ids.count(patch) == len(template) - 8
     patches = data["patches"].reshape(4, 16, -1)
     for actual, frame in zip(patches, decoded.frames, strict=True):
         expected, _ = processor.preprocess_image(frame)
@@ -68,11 +74,13 @@ def test_decoded_video_frames(model_root, precision, tmp_path):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("precision", ["nvfp4"])
-def test_conditioned_video(model_root, precision, record_property):
+@pytest.mark.parametrize("rate", [0.0, 0.5], ids=["unpruned", "evs"])
+def test_evs_conditioned_video(model_root, precision, rate, record_property):
     model = model_root / precision
     with shortcut_text_engine(
         model,
         disable_mm_encoder=False,
+        multimodal_config={"video_pruning_rate": rate},
         max_batch_size=1,
         max_seq_len=2048,
         max_num_tokens=2048,

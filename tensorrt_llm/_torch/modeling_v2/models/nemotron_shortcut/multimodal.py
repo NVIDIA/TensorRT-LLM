@@ -57,7 +57,7 @@ class ShortcutMedia:
         return self.dtype
 
     def encode_multimodal_inputs(self, multimodal_params):
-        return self.vision(multimodal_params)
+        return self.vision(multimodal_params, self.text_embedding_layer)
 
     def load_weights(self, weights, *args, **kwargs):
         super().load_weights(weights, *args, **kwargs)

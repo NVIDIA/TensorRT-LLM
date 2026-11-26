@@ -109,7 +109,9 @@ so image requests for this model need that package too.
 
 For video, use the checkpoint's chat template with a video content item.
 TensorRT-LLM samples video frames uniformly (by default, 2 FPS and up to 64 frames).
-The model adds timestamps from the source frame indices to the prompt and keeps every visual token.
+The model adds timestamps from the source frame indices to the prompt. Set
+`multimodal_config.video_pruning_rate` to `0.0` to keep all visual tokens or
+`0.5` to prune half of them.
 
 ## Adding a Model
 

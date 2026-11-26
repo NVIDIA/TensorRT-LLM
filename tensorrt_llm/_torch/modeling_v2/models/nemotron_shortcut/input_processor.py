@@ -16,6 +16,7 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrai
 
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.data import TextPrompt, TokensPrompt
+from tensorrt_llm.inputs.evs import compute_retained_tokens_from_tubelet_budget
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -119,8 +120,7 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         **kwargs: Any,
     ) -> None:
         super().__init__(model_path, config, tokenizer, trust_remote_code, **kwargs)
-        if video_pruning_rate:
-            raise ValueError("Video token pruning is unavailable.")
+        self.video_pruning_rate = video_pruning_rate or 0.0
         # The executor passes a flattened media config. Read the checkpoint's video capability.
         config_path = Path(model_path) / "config.json"
         temporal_patch_size = getattr(config, "video_temporal_patch_size", None)
@@ -129,6 +129,8 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 "video_temporal_patch_size"
             )
         self._supports_video = temporal_patch_size == 1
+        if self.video_pruning_rate and "video" not in self.supported_modalities:
+            raise ValueError("EVS requires a checkpoint with a single-frame video processor.")
         spec = json.loads((Path(model_path) / "processor_config.json").read_text())
         img = spec["image_processor"]
         self.patch = int(spec["patch_size"])
@@ -217,7 +219,26 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             [float(i) / fps for i in indices], temporal_patch_size=1, frame_size=size
         )
         height, width = (edge // self.unit for edge in size)
-        return frames, size, text, len(frames) * height * (width + 1)
+        if not self.video_pruning_rate:
+            return frames, size, text, [], len(frames) * height * (width + 1)
+        # The text between the first and last patch includes row ends and timestamps.
+        # Its actual positions depend on the encoder's retention mask. Reserve the
+        # exact final length and fuse these text embeddings with surviving patches.
+        left = text.index(self.image_token)
+        right = text.rindex(self.image_end) + len(self.image_end)
+        template = self.tokenizer.encode(text[left:right], add_special_tokens=False)
+        num_patches = len(frames) * height * width
+        retained = compute_retained_tokens_from_tubelet_budget(
+            len(frames), height * width, self.video_pruning_rate
+        )
+        count = len(template) - num_patches + retained
+        return (
+            frames,
+            size,
+            text[:left] + self.image_token * count + text[right:],
+            template,
+            count,
+        )
 
     def get_num_tokens_per_video(self, *, video, video_metadata=None, **kwargs) -> int:
         return self._video_layout(video, video_metadata)[-1]
@@ -226,13 +247,13 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         pieces = prompt.split(_VIDEO_PLACEHOLDER)
         if len(pieces) != len(videos) + 1 or self.image_token in prompt:
             raise ValueError("Each video requires one video placeholder and no image placeholders.")
-        expanded, patches, sizes, costs, outputs = [pieces[0]], [], [], [], []
+        expanded, patches, sizes, templates, costs, outputs = [pieces[0]], [], [], [], [], []
         for video, suffix in zip(videos, pieces[1:], strict=True):
             if not isinstance(video, VideoData):
                 raise ValueError(
                     "Video inputs require VideoData with decoded frames and source FPS."
                 )
-            frames, size, text, _ = self._video_layout(video.frames, video.metadata)
+            frames, size, text, template, count = self._video_layout(video.frames, video.metadata)
             for frame in frames:
                 patch_rows, frame_size = self.preprocess_image(frame)
                 if frame_size != size:
@@ -240,15 +261,20 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 patches.append(patch_rows)
             cost = len(frames) * (size[0] // self.patch) * (size[1] // self.patch)
             costs.append(cost)
-            outputs.append(cost // self.merge**2)
+            outputs.append(count if template else cost // self.merge**2)
             expanded.extend((text, suffix))
             sizes.append(size)
+            templates.append(template)
         ids = self._encode_media_prompt(expanded, sampling_params)
         if ids.count(self._token_ids[0]) != sum(outputs):
             raise ValueError("The tokenized prompt must retain all video embedding positions.")
-        return {"multimodal_data": self._video_payload(torch.cat(patches), sizes, costs, outputs)}
+        return ids, {
+            "multimodal_data": self._video_payload(
+                torch.cat(patches), sizes, templates, costs, outputs
+            )
+        }
 
-    def _video_payload(self, patches, sizes, costs, outputs):
+    def _video_payload(self, patches, sizes, templates, costs, outputs):
         metadata = MultimodalItemMetadata(
             [("video", i) for i in range(len(sizes))],
             encoder_token_lengths=costs,
@@ -257,6 +283,8 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 "video": {
                     "patches": MultimodalItemPartition(item_lengths=tuple(costs)),
                     "frame_sizes": MultimodalItemPartition(),
+                    "templates": MultimodalItemPartition(),
+                    "pruning_rate": MultimodalItemPartition(item_axis=None),
                 }
             },
         )
@@ -264,6 +292,8 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "video": {
                 "patches": patches,
                 "frame_sizes": sizes,
+                "templates": templates,
+                "pruning_rate": self.video_pruning_rate,
             },
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
         }
@@ -392,6 +422,10 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return {key: min(cap, budget) for key, cap in caps.items()} if budget else {}
 
     def get_max_mm_encoder_output_embeddings(self, max_num_encoder_tokens: int) -> int | None:
+        if self.video_pruning_rate:
+            # The retained sequence includes variable-length timestamp labels. The checkpoint's
+            # inline encoder uses exact item lengths and does not use item scheduling.
+            return None
         return max_num_encoder_tokens // self.merge**2
 
     def get_mm_encoder_attention_metadata_capacity(self, max_num_tokens: int) -> dict[str, int]:
@@ -431,4 +465,13 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         sizes = [(size, size)] * count
         if not mm_counts.get("video"):
             return self._payload(rows, sizes)
-        return self._video_payload(rows, sizes, [frames * cost] * count, [frames * edge**2] * count)
+        template, output = [], frames * edge**2
+        if self.video_pruning_rate:
+            frame = Image.new("RGB", (size, size))
+            _, _, _, template, output = self._video_layout(
+                [frame] * frames,
+                {"fps": _DEFAULT_VIDEO_FPS},
+            )
+        return self._video_payload(
+            rows, sizes, [template] * count, [frames * cost] * count, [output] * count
+        )
