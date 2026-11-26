@@ -384,13 +384,14 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     }
     constexpr int kSenders = 3; // total agents = 1 receiver + 3 senders
     std::string const recvName = "mnAgentR";
+    auto const writerName = [](int index) { return "mnAgentS" + std::to_string(index); };
 
     std::string skipMsg;
     auto recv = tryMakeAgent(makeBounceConfig(recvName), skipMsg);
     std::vector<std::unique_ptr<kvc::NixlTransferAgent>> senders;
-    for (int i = 1; recv && i <= kSenders; ++i)
+    for (int i = 0; recv && i < kSenders; ++i)
     {
-        auto s = tryMakeAgent(makeBounceConfig("mnAgentS" + std::to_string(i)), skipMsg);
+        auto s = tryMakeAgent(makeBounceConfig(writerName(i)), skipMsg);
         if (!s)
         {
             break;
@@ -416,10 +417,14 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     for (int i = 0; i < kSenders; ++i)
     {
         bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(100 + i)));
-        routes.push_back({senders[i].get(), recv.get(), "mnAgentS" + std::to_string(i), recvName});
+        routes.push_back({senders[i].get(), recv.get(), writerName(i), recvName});
     }
 
     EXPECT_EQ(runConcurrentFlows(routes, bufs), kSenders) << "not all senders completed to the shared receiver";
+    for (auto const& sender : senders)
+    {
+        EXPECT_EQ(sender->getBounceSubmitCount(), 1U);
+    }
     for (auto const& x : bufs)
     {
         EXPECT_TRUE(verifyXferBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
