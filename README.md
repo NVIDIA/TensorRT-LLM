@@ -22,7 +22,7 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
-* [11/25] KVCacheManagerV2: Redesigning KV Cache Management in TensorRT LLM
+* [11/26] KVCacheManagerV2: Redesigning KV Cache Management in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog38_KVCacheManagerV2_Redesigning_KV_Cache_Management_in_TensorRT-LLM.md)
 
 * [11/24] TensorRT LLM for Reinforcement Learning: Powering the Fastest MLPerf Training v6.1 Qwen3.5 397B GRPO Result on NVIDIA Vera Rubin
