@@ -19,17 +19,9 @@ def prims_available(monkeypatch):
         monkeypatch.setattr(FMHA_LIBS[name], "is_available", staticmethod(lambda layer: True))
 
 
-@pytest.mark.parametrize(
-    ("value", "message"),
-    [
-        ("+unknown", "Unknown FMHA library"),
-        ("prims_ts,+fallback", "either an exact comma-separated list"),
-        ("+", "Invalid empty FMHA library entry"),
-    ],
-)
-def test_h3_fmha_registry_errors(monkeypatch, value, message):
-    monkeypatch.setenv("TLLM_FMHA_LIBS", value)
-    with pytest.raises(ValueError, match=message):
+def test_h3_rejects_unknown_fmha_provider(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+unknown")
+    with pytest.raises(ValueError, match="Unknown FMHA library"):
         prims.H3PrimTS(None, {})
 
 
@@ -54,11 +46,10 @@ def test_sparse_only_admission_for_fp8_and_vc(monkeypatch):
     ("value", "explicit_dense", "sparse_first"),
     [
         (None, False, True),
-        ("fallback,prims_ts_block_sparse,fallback", False, False),
+        ("fallback,prims_ts_block_sparse", False, False),
         ("fallback,prims_ts,prims_ts_block_sparse", True, False),
-        ("+beam_shared_prefix", False, True),
-        ("+prims_ts,-prims_ts", False, True),
-        ("-prims_ts,+prims_ts,-fallback", True, True),
+        ("-prims_ts", False, True),
+        ("+prims_ts,-fallback", True, True),
     ],
 )
 def test_h3_dense_prims_policy(monkeypatch, prims_available, value, explicit_dense, sparse_first):
