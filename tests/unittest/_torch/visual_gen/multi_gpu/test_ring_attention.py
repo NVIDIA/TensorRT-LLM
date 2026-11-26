@@ -42,6 +42,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.backends import RingAttention, UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd as _fa4_fwd,
@@ -445,6 +446,55 @@ class TestRingAttention:
 
     def test_ring_invalid_mask_raises(self):
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_invalid_mask, use_cuda=True)
+
+
+def _logic_ring_cudnn_vs_standard(rank, world_size):
+    """Ring with the BF16 cuDNN inner backend matches SDPA.
+
+    Ring merges blocks by cuDNN's LSE read as [B, H, S]; peaked logits make each block's
+    output differ, so a mis-laid-out LSE gives a visibly wrong merge.
+    """
+    batch, num_heads, head_dim = 2, 8, 128
+    seq_per_rank = 128
+    seq_full = seq_per_rank * world_size
+    device = torch.device(f"cuda:{rank}")
+    ring_pg, _ = _cp_ulysses_mesh_groups(world_size, 1)
+    attn = RingAttention(CuDNNAttention(num_heads=num_heads, head_dim=head_dim), ring_pg)
+
+    g = torch.Generator(device=device).manual_seed(42)
+
+    def randn(scale=1.0):
+        """Seeded [B, S, H, D] BF16 tensor, equal on every rank."""
+        shape = (batch, seq_full, num_heads, head_dim)
+        return (torch.randn(shape, device=device, generator=g) * scale).bfloat16()
+
+    q_full, k_full, v_full = randn(3.0), randn(), randn()
+    lo, hi = _seq_shard_bounds(rank, world_size, seq_full)
+    ring_out = attn(
+        q_full[:, lo:hi].contiguous(),
+        k_full[:, lo:hi].contiguous(),
+        v_full[:, lo:hi].contiguous(),
+        batch_size=batch,
+    )
+    ref = F.scaled_dot_product_attention(
+        q_full.transpose(1, 2).float(),
+        k_full.transpose(1, 2).float(),
+        v_full.transpose(1, 2).float(),
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        ring_out.float(),
+        ref[:, lo:hi],
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"Rank {rank}: Ring cuDNN differs from SDPA reference",
+    )
+
+
+class TestRingAttentionCuDNN:
+    """Ring with the BF16 cuDNN inner backend."""
+
+    def test_ring_cudnn_vs_standard(self):
+        run_test_in_distributed(world_size=4, test_fn=_logic_ring_cudnn_vs_standard, use_cuda=True)
 
 
 class TestRingAttentionFlashAttn4:
