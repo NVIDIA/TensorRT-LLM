@@ -173,6 +173,8 @@ class ServingRender:
         except ValidationError as error:
             raise RenderRequestError(400, str(error)) from error
         resources = self._resources_factory()
+        if request.prompt_embeds is not None:
+            raise RenderRequestError(400, "prompt_embeds is not supported by prompt rendering.")
         results: List[RenderedRequest] = []
         request_id = f"cmpl-{uuid.uuid4().hex}"
         for index, prompt in enumerate(_normalize_completion_prompts(request.prompt)):

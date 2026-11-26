@@ -796,7 +796,8 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None) -> None:
+        runtime_control_api_key: Optional[str] = None,
+        enable_prompt_embeds: bool = False) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -956,7 +957,8 @@ def launch_server(
                     runtime_control_api_key=runtime_control_api_key,
                     multi_frontend_serving=multi_frontend_serving,
                     graceful_shutdown_timeout=llm.args.
-                    serve_graceful_shutdown_timeout_s)
+                    serve_graceful_shutdown_timeout_s,
+                    enable_prompt_embeds=enable_prompt_embeds)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -1650,6 +1652,15 @@ def launch_visual_gen_server(
     "Only enable this for trusted clients.",
     status="prototype")
 @stability_option(
+    "--enable_prompt_embeds",
+    is_flag=True,
+    default=False,
+    help="Accept precomputed input embeddings (prompt_embeds) on "
+    "/v1/completions and as chat content parts. Payloads are torch.save "
+    "files of one tensor, decoded without unpickling; only enable this for "
+    "trusted clients.",
+    status="prototype")
+@stability_option(
     "--middleware",
     multiple=True,
     type=str,
@@ -1785,6 +1796,7 @@ def serve(
     custom_module_dirs: list[Path],
     chat_template: Optional[str],
     allow_request_chat_template: bool,
+    enable_prompt_embeds: bool,
     middleware: tuple[str, ...],
     grpc: bool,
     grpc_protocol: str,
@@ -2058,6 +2070,8 @@ def serve(
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "enable_prompt_embeds":
+                enable_prompt_embeds if enable_prompt_embeds else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -2137,6 +2151,7 @@ def serve(
                 num_media_load_workers=num_media_load_workers,
                 internal_disagg_auth_key=internal_disagg_auth_key,
                 report_addr=report_addr,
+                enable_prompt_embeds=enable_prompt_embeds,
                 enable_runtime_control_endpoints=enable_sleep_mode,
                 runtime_control_api_key=runtime_control_api_key)
 

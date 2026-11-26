@@ -240,6 +240,8 @@ def _derive_prompt_fields(inputs: Any, tokenizer: TransformersTokenizer) -> tupl
             return list(inputs["prompt_token_ids"]), None
         if inputs.get("prompt") is not None:  # TextPrompt
             return list(tokenizer.encode(inputs["prompt"])), inputs["prompt"]
+        if inputs.get("prompt_embeds") is not None:  # EmbedsPrompt: placeholder ids
+            return [0] * int(inputs["prompt_embeds"].shape[0]), None
     if isinstance(inputs, str):
         return list(tokenizer.encode(inputs)), inputs
     if isinstance(inputs, Sequence) and all(isinstance(t, int) for t in inputs):

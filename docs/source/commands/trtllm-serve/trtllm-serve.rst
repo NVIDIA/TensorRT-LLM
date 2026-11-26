@@ -157,6 +157,33 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+Precomputed Prompt Embeddings
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A server started with ``--enable_prompt_embeds`` accepts precomputed input embeddings in place of prompt tokens, on decoder models that support ``prompt_embeds`` in ``LLM.generate``. A payload is the base64 encoding of ``torch.save`` applied to one ``[num_tokens, hidden_size]`` float16, bfloat16 or float32 tensor whose rows equal the output of the model's input embedding module. The server never unpickles a payload: it accepts only an uncompressed, little-endian ``torch.save`` archive of one tensor, builds the tensor from its checked fields, and limits the decoded bytes of one request to ``TRTLLM_PROMPT_EMBEDS_MAX_BYTES`` (default 256 MiB). Enable the flag only for trusted clients.
+
+The Completions API takes ``prompt_embeds`` as one payload or a list of payloads. Each payload is a whole prompt, and these prompts are served before any ``prompt`` entries of the same request. ``echo`` and ``truncate_prompt_tokens`` are not supported with ``prompt_embeds``:
+
+.. code-block:: python
+
+    import base64, io, torch
+
+    buf = io.BytesIO()
+    torch.save(embeds, buf)  # [num_tokens, hidden_size]
+    client.completions.create(model=model, prompt=None, max_tokens=32,
+                              extra_body={"prompt_embeds": base64.b64encode(buf.getvalue()).decode()})
+
+The Chat API takes a ``prompt_embeds`` content part. The chat template renders the message as usual and the part's rows take the place where the part appears; text parts of the same message are joined with newlines, as they are without embeddings:
+
+.. code-block:: json
+
+    {"role": "user", "content": [
+        {"type": "text", "text": "Summarize:"},
+        {"type": "prompt_embeds", "prompt_embeds": {"data": "{embeddings_base64}"}}
+    ]}
+
+Chat requests with ``prompt_embeds`` parts cannot also carry multimodal parts, ``prompt_token_ids`` or ``truncate_prompt_tokens``. Disaggregated serving does not support ``prompt_embeds`` yet.
+
 
 More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
