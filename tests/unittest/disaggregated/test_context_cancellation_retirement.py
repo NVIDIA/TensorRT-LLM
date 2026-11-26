@@ -413,11 +413,14 @@ def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
     assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
 
 
+@pytest.mark.parametrize("local_abort", [False, True], ids=["protocol-cancel", "local-abort"])
 @pytest.mark.parametrize("peer_failed", [True, False], ids=["peer-backend-error", "cancel-only"])
 def test_cancelled_partial_send_counts_a_peer_backend_error_on_every_rank(
-    monkeypatch: pytest.MonkeyPatch, peer_failed: bool
+    monkeypatch: pytest.MonkeyPatch, peer_failed: bool, local_abort: bool
 ) -> None:
-    """A send that one rank failed and the client then cancelled counts one error each.
+    """A send that one rank failed before it was cancelled counts one error on each rank.
+
+    The cancellation comes from the generation peer, with or without a later client abort.
 
     The send has no transfer-manager entry yet, as for an intermediate pipelined chunk,
     so only the request keeps the agreed cause.
@@ -450,16 +453,22 @@ def test_cancelled_partial_send_counts_a_peer_backend_error_on_every_rank(
         ranks.append(harness)
         requests.append(request)
 
+    expected = (0, 1, 0) if peer_failed else (0, 0, 0)
     for _ in range(2):
         group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+        # The reaper settles the agreed cause; the generation peer's cancel needs no
+        # local client abort to be counted.
+        for harness in ranks:
+            assert harness.coordinator.transfer_outcomes == expected
     for harness, request in zip(ranks, requests):
         assert not harness.transceiver._send_sessions
         assert not harness.transfers.requests_in_transfer()
         assert request.py_kv_transfer_committed_cause == ("error" if peer_failed else None)
-        # The client abort then finishes the request at the cancellation boundary.
-        harness.coordinator.record_cancelled_transfer_outcome(request)
-        harness.coordinator.record_cancelled_transfer_outcome(request)
-        assert harness.coordinator.transfer_outcomes == ((0, 1, 0) if peer_failed else (0, 0, 0))
+        if local_abort:
+            # A later client abort reaches the cancellation boundary without a second count.
+            harness.coordinator.record_cancelled_transfer_outcome(request)
+            harness.coordinator.record_cancelled_transfer_outcome(request)
+        assert harness.coordinator.transfer_outcomes == expected
         harness.effects.fail_requests.assert_not_called()
 
     assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]

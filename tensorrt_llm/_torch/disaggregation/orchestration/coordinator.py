@@ -1158,6 +1158,14 @@ class DisaggTransferCoordinator:
         failed_req_ids -= self._context_cancellation_drains
 
         requests_in_transfer = self._transfers.requests_in_transfer()
+        untracked_cancelled = cancelled_ids - requests_in_transfer.keys()
+        if self._transfer_outcomes is not None and untracked_cancelled:
+            # A send cancelled before the transfer manager holds its request,
+            # for example by the generation peer, may never reach a local
+            # cancellation boundary. Count its agreed cause while it is known.
+            for request in self._registry.active_requests():
+                if get_unique_rid(request) in untracked_cancelled:
+                    self.record_cancelled_transfer_outcome(request)
         for request_id in completed_req_ids:
             if request_id not in requests_in_transfer:
                 if request_id in failed_req_ids and request_id not in cancelled_ids:
