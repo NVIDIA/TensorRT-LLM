@@ -107,10 +107,12 @@ def test_cublas_mm_fp32_ignores_torch_tf32():
         output = torch.ops.trtllm.cublas_mm(x, w.t(), bias=None, out_dtype=None)
     finally:
         torch.backends.cuda.matmul.fp32_precision = previous_precision
-    assert not torch.allclose(torch_out, ref, **tol), (
-        "precondition: PyTorch's matmul did not run in TF32"
-    )
     torch.testing.assert_close(output, ref, **tol)
+    if torch.allclose(torch_out, ref, **tol):
+        pytest.skip(
+            "PyTorch's FP32 matmul did not use TF32 (e.g. NVIDIA_TF32_OVERRIDE=0), so the test cannot "
+            "tell TF32 from FP32"
+        )
 
 
 if __name__ == "__main__":
