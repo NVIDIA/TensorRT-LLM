@@ -16,6 +16,7 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype
+accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4 TIMEOUT (90)
 accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
