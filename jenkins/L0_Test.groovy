@@ -5661,12 +5661,45 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
+// Downloads the wheel at wheel_path under UPLOAD_PATH to a file on this node and checks it with
+// check_pip_install.py, which installs that file and downloads no wheel. The shared library
+// (trtllm-jenkins-shared-lib@main) publishes wheels to the primary location, artifactory.nvidia.com
+// ("aws") unless LLM_ARTIFACTS_PRIMARY says "urm", and aws needs a credential to read: an
+// unauthenticated wget of the urm URL gets HTTP 404. Port of the read side of main's #22195.
 def checkPipInstall(pipeline, wheel_path)
 {
-    def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
+    def primary = env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    def wheelUrl = trtllm_utils.llmArtifactsUrl(primary, "${UPLOAD_PATH}/${wheel_path}")
+    def readDir = "${pipeline.pwd(tmp: true)}/pip-install-wheel-${UUID.randomUUID().toString()}"
+    def wheelFile = "${readDir}/${wheel_path.tokenize('/').last()}"
+    def netrcPath = "${readDir}/artifactory-netrc"
+    pipeline.sh "mkdir -p '${readDir}'"
+    try {
+        def netrcOption = ""
+        if (primary == "aws") {
+            trtllm_utils.writeArtifactoryNetrc(netrcPath)
+            netrcOption = "--netrc-file '${netrcPath}'"
+        }
+        echo "Downloading ${wheelUrl} to ${wheelFile}"
+        // -q keeps curl from reading a curlrc. The header asks Artifactory to send the file itself
+        // rather than redirect to its CDN, which can reject the redirected download (HTTP 403).
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+            command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y curl)
+            curl -q --fail --silent --show-error --location --connect-timeout 30 \
+                --speed-limit 1 --speed-time 300 ${netrcOption} \
+                -H 'X-JFrog-Download-Redirect-To: None' \
+                --output '${wheelFile}' '${wheelUrl}'
+            """)
+    } finally {
+        // No Artifactory credential stays on the node once code from the wheel runs.
+        pipeline.sh "rm -f '${netrcPath}'"
+    }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: """
         cd ${LLM_ROOT}/tests/unittest && \
-        python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
+        python3 check_pip_install.py --wheel_path '${wheelFile}'
         """)
 }
 
