@@ -75,7 +75,9 @@ def _load_inputs(llm: LLM, prompt: str, images: list[str]) -> dict:
     return inputs
 
 
-def _attached_inputs(encoder: MultimodalEncoder, raw_inputs: dict, images: list[str]) -> dict:
+def _attached_inputs(
+    encoder: MultimodalEncoder, raw_inputs: dict, images: list[str], device: str
+) -> dict:
     """The raw request with the encoder's outputs attached in place of its images."""
     (output,) = encoder.generate([raw_inputs])
     handles = output.disaggregated_params.multimodal_embedding_handles
@@ -87,7 +89,9 @@ def _attached_inputs(encoder: MultimodalEncoder, raw_inputs: dict, images: list[
     attachments = [
         {
             # A tensor received over CUDA IPC cannot be shared again, so attach a copy.
-            "mm_embeddings": SharedTensorContainer.from_dict(handle).get_local_view().clone(),
+            "mm_embeddings": SharedTensorContainer.from_dict(handle)
+            .get_local_view()
+            .to(device, copy=True),
             "image_grid_thw": grid,
         }
         for handle, grid in zip(handles, grids)
@@ -119,7 +123,8 @@ def test_chunked_long_attachment_matches_unchunked(
         ("Describe the image in detail.", "What colors are in this picture?")
     ):
         raw_inputs = _load_inputs(llm, prompt, media)
-        inputs = _attached_inputs(encoder, raw_inputs, media)
+        # A host attachment reaches the GPU one chunk's rows at a time.
+        inputs = _attached_inputs(encoder, raw_inputs, media, "cpu")
         rows = inputs["multi_modal_embeddings"]["image"][0]["mm_embeddings"].shape[0]
         assert rows > 3 * _CHUNK_TOKENS
         expected = llm.generate(raw_inputs, params)
@@ -146,7 +151,7 @@ def test_sequences_above_the_old_attachment_bound_are_served(
     _, chunked_llm, encoder = engines
     prompt = "Describe the image."
     raw_inputs = _load_inputs(chunked_llm, prompt, [images["larger"]])
-    inputs = _attached_inputs(encoder, raw_inputs, [images["larger"]])
+    inputs = _attached_inputs(encoder, raw_inputs, [images["larger"]], "cuda")
     rows = inputs["multi_modal_embeddings"]["image"][0]["mm_embeddings"].shape[0]
     num_sequences = 3
     assert num_sequences * rows > _old_attachment_bound_rows()
