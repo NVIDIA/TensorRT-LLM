@@ -13,21 +13,20 @@
 # limitations under the License.
 """Resolve which post-merge CBTS touch DBs to use.
 
-Candidates are recent builds of `<ARTIFACT_BASE>` with a final coverage report
-or both early x86 and SBSA tarballs. The newest complete build wins. A squashed PR commit must
+Candidates are recent builds of `<ARTIFACT_BASE>` with a final coverage report.
+The newest complete build wins. A squashed PR commit must
 cherry-pick cleanly for Tier 2's residual paths at that DB's revision;
 otherwise Tier 2 declines. Revision
 metadata comes from the forge compare API and needs `GITHUB_API_TOKEN`, the
 anonymous quota being per-IP and exhausted by shared CI egress.
 
-The selected DBs are merged locally through the compact coverage
-schema, producing the one DB consumed by `cbts.command main`.
+The selected report supplies the compact DB consumed by `cbts.command main`.
 
 Four entry points. `--resolve-pin FILE` reuses or creates the stable build pin
 for a PR head. `--resolve-build` prints the newest (or explicitly pinned) build
 metadata without checking or downloading the PR diff. `--print-selection` also
 checks diff compatibility and stops. `--prepare DIR` downloads, unpacks, and
-merges the winner, drops that JSON beside it, and prints the two paths consumed
+validates its DB, drops that JSON beside it, and prints the two paths consumed
 by CBTS.
 """
 
@@ -49,14 +48,10 @@ from typing import Literal, NoReturn, Optional
 
 import click
 
-from cbts.coverage.collection.compact_db import merge_databases
+from cbts.coverage.collection.compact_db import validate_database
 
 # Merged-artifact base for the main-branch L0_PostMerge job.
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
-ARCH_TARBALL_NAMES = (
-    "cbts_pystart_report_x86_64.tar.gz",
-    "cbts_pystart_report_SBSA.tar.gz",
-)
 FULL_TARBALL_NAME = "cbts_pystart_report.tar.gz"
 # sqlite at the tar root, and the selection JSON `prepare` drops beside it.
 DB_NAME = "cbts_touchmap.sqlite"
@@ -271,23 +266,13 @@ def _coverage_archive_location(
 
 
 def _coverage_archive_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[list[str]]:
-    """Prefer final coverage, or the complete early architecture pair when it is absent.
-
-    An archive that is absent or cannot be read ends the check, so the ones after it are not read.
+    """Return the final report URL, or None when it is absent.
 
     Raises:
         ArtifactError: As `_coverage_archive_location` raises it.
     """
-    full = _coverage_archive_location(build, FULL_TARBALL_NAME, artifact_base)
-    if full is not None:
-        return [full]
-    urls = []
-    for name in ARCH_TARBALL_NAMES:
-        url = _coverage_archive_location(build, name, artifact_base)
-        if url is None:
-            return None
-        urls.append(url)
-    return urls
+    url = _coverage_archive_location(build, FULL_TARBALL_NAME, artifact_base)
+    return [url] if url is not None else None
 
 
 def _download_coverage_archive(
@@ -650,7 +635,7 @@ def select_tarball(
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[dict]:
-    """Newest final report or complete early pair with measurable PR-base topology.
+    """Newest final report with measurable PR-base topology.
 
     A build is skipped when one of its coverage archives is absent, or when reading one fails in
     transfer, as it is when reading its `build_info.txt` fails.
@@ -715,7 +700,7 @@ def select_tarball(
         skips.append(f"{unknown_commits} skipped: commit unknown")
     skipped = f" ({'; '.join(skips)})" if skips else ""
     print(
-        "[artifact] no complete x86/SBSA coverage pair with a known commit in the last "
+        "[artifact] no final coverage report with a known commit in the last "
         f"{max_probe} builds{skipped}",
         file=sys.stderr,
     )
@@ -744,7 +729,7 @@ def select_build(
         print(f"[artifact] pinned build {build}: coverage archive unreadable", file=sys.stderr)
         return None
     if urls is None:
-        print(f"[artifact] pinned build {build}: coverage pair is incomplete", file=sys.stderr)
+        print(f"[artifact] pinned build {build}: final coverage report is absent", file=sys.stderr)
         return None
     commit = build_commit(build, artifact_base)
     if not commit:
@@ -819,7 +804,7 @@ def prepare(
     build: Optional[int] = None,
     expected_commit: Optional[str] = None,
 ) -> Optional[dict]:
-    """Resolve, download, and merge selected DBs; `{path, meta}` or None on failure.
+    """Resolve and validate the final report's DB; `{path, meta}` or None on failure.
 
     `meta` is the selection JSON on disk, which `cbts.command main --coverage-db-meta` reads.
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
@@ -860,38 +845,28 @@ def prepare(
     db = dest / DB_NAME
     with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
         temp = Path(temp_dir)
-        source_dbs = []
-        for index, url in enumerate(sel["urls"]):
-            name = url.rsplit("/", 1)[-1]
-            try:
-                tarball = _download_coverage_archive(sel["build"], name, temp)
-            except ArtifactTransferError as e:
-                # The helper's message above says why.
-                print(f"[artifact] {e}", file=sys.stderr)
-                pinned = "pinned " if build is not None else ""
-                print(
-                    f"[artifact] {pinned}build {sel['build']}: coverage archive unreadable",
-                    file=sys.stderr,
-                )
-                return None
-            artifact_dir = temp / str(index)
-            artifact_dir.mkdir()
-            if tarball is None or not extract(tarball, artifact_dir):
-                return None
-            source_db = artifact_dir / DB_NAME
-            if not source_db.is_file():
-                print(
-                    f"[artifact] {DB_NAME} not in {_coverage_archive_path(sel['build'], name)}",
-                    file=sys.stderr,
-                )
-                return None
-            source_dbs.append(source_db)
         try:
-            connection = merge_databases(source_dbs, db)
-        except (OSError, sqlite3.Error, ValueError) as e:
-            print(f"[artifact] merge failed: {e}", file=sys.stderr)
+            tarball = _download_coverage_archive(sel["build"], FULL_TARBALL_NAME, temp)
+        except ArtifactTransferError as e:
+            print(f"[artifact] {e}", file=sys.stderr)
+            pinned = "pinned " if build is not None else ""
+            print(
+                f"[artifact] {pinned}build {sel['build']}: coverage archive unreadable",
+                file=sys.stderr,
+            )
             return None
-        connection.close()
+        if tarball is None or not extract(tarball, temp):
+            return None
+        source_db = temp / DB_NAME
+        if not source_db.is_file():
+            print(f"[artifact] {DB_NAME} missing from final coverage report", file=sys.stderr)
+            return None
+        try:
+            validate_database(source_db)
+            source_db.replace(db)
+        except (OSError, sqlite3.Error, ValueError) as e:
+            print(f"[artifact] final coverage DB preparation failed: {e}", file=sys.stderr)
+            return None
 
     return {"path": str(db), "meta": str(meta)}
 
@@ -943,7 +918,7 @@ def _load_paths_json(path: Optional[str]) -> Optional[list[str]]:
     "prepare_dir",
     metavar="DIR",
     default=None,
-    help="resolve, validate, download and merge the architecture DBs into DIR, then "
+    help="resolve, download and validate the final report DB into DIR, then "
     "print {path, meta} as JSON",
 )
 @click.option(
