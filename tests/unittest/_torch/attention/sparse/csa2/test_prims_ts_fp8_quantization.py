@@ -247,3 +247,44 @@ def test_small_m_rope_e4m3_query_matches_rope_then_staging(rows: int, heads: int
     plan.run(roped2.view(rows, 1, heads, 512), expected)
     graph.replay()
     assert torch.equal(q8.view(torch.uint8), expected.view(rows, -1).view(torch.uint8))
+
+
+@pytest.mark.parametrize("exponent", [-3, 2])
+@torch.inference_mode()
+def test_scaled_query_bytes(exponent: int) -> None:
+    """A Q scale of 2**e rounds E4M3(q / 2**e): the power-of-two scale moves the saturation
+    point to 448 * 2**e and is exact for every other value."""
+    q = _query()
+    q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    plan = UnitScaleQuery.plan(q.device, q.shape[0], q.shape[2], q8, scale_exponent=exponent)
+    plan.run(q, q8)
+    expected = (q.float() * 2.0**-exponent).clamp(-448, 448).to(torch.float8_e4m3fn)
+    assert torch.equal(q8.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("exponent", [-2, 3])
+@torch.inference_mode()
+def test_small_m_rope_e4m3_query_at_a_q_scale(exponent: int) -> None:
+    """The small-step RoPE writes the bytes of the RoPE followed by staging at the Q scale."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        gptj_rope_e4m3_small_m,
+        gptj_rope_small_m,
+    )
+
+    rows, heads = 6, 16
+    device = torch.device("cuda", torch.cuda.current_device())
+    g = torch.Generator(device=device).manual_seed(4107)
+    q = (torch.randn(rows, heads, 512, device=device, generator=g) * 64 * 2.0**exponent).bfloat16()
+    q[0, 0, -4:] = torch.tensor([2000.0, -2000.0, 2.0**-12, 0.0])
+    positions = torch.randint(0, 4096, (rows,), device=device, generator=g, dtype=torch.int32)
+    angle = torch.rand(4096, 32, device=device, generator=g) * 6.2831853
+    cos_sin = torch.cat((angle.cos(), angle.sin()), 1).view(4096, 2, 32).contiguous()
+    roped = q.clone()
+    gptj_rope_small_m(roped, positions, cos_sin)
+    expected = torch.empty_like(roped.view(rows, 1, heads, 512), dtype=torch.float8_e4m3fn)
+    UnitScaleQuery.plan(device, rows, heads, expected, scale_exponent=exponent).run(
+        roped.view(rows, 1, heads, 512), expected
+    )
+    q8 = torch.empty(rows, heads * 512, device=device, dtype=torch.float8_e4m3fn)
+    gptj_rope_e4m3_small_m(q, positions, cos_sin, q8, scale_exponent=exponent)
+    assert torch.equal(q8.view(torch.uint8), expected.view(rows, -1).view(torch.uint8))

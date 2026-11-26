@@ -3701,8 +3701,12 @@ def _cache_kernels():
         cache_format: cutlass.Constexpr,
         valid,
         result,
+        scale_exponent: cutlass.Constexpr = 0,
     ):
-        """Decode channels ``first_channel .. +4`` of one packed row into ``result`` (FP32)."""
+        """Decode channels ``first_channel .. +4`` of one packed row into ``result`` (FP32).
+
+        swa_fp8 rows hold E4M3(x / 2**scale_exponent).
+        """
         bytes_t = tensor1d(pool, Int64(2**62))
         for j in cutlass.range_constexpr(4):
             channel = first_channel + j
@@ -3711,6 +3715,8 @@ def _cache_kernels():
                 if cutlass.const_expr(cache_format == "swa_fp8"):
                     payload = Int32(bytes_t[row_base + Int64(channel)]) & 255
                     value = e4m3_to_f32(payload)
+                    if cutlass.const_expr(scale_exponent != 0):
+                        value = mul_rn(value, Float32(2.0**scale_exponent))
                 elif cutlass.const_expr(cache_format == "swa"):
                     payload = Int32(bytes_t[row_base + Int64(channel)]) & 255
                     scale_byte = (
@@ -3785,11 +3791,18 @@ def _cache_kernels():
         return [Uint32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(5)]
 
     @cute.jit
-    def decode_channels_x16(words, scale_byte: Int32, cache_format: cutlass.Constexpr, result):
+    def decode_channels_x16(
+        words,
+        scale_byte: Int32,
+        cache_format: cutlass.Constexpr,
+        result,
+        scale_exponent: cutlass.Constexpr = 0,
+    ):
         """Decode sixteen channels loaded by ``load_row_x16`` into ``result``.
 
         Hardware pair conversions; SWA values are rounded to BF16, and main values
-        (E2M1 times an E4M3 scale) are exact in BF16.
+        (E2M1 times an E4M3 scale) are exact in BF16. swa_fp8 rows hold
+        E4M3(x / 2**scale_exponent); that power-of-two product is exact in BF16.
         """
         if cutlass.const_expr(cache_format in ("swa", "swa_fp8")):
             if cutlass.const_expr(cache_format == "swa"):
@@ -3799,6 +3812,9 @@ def _cache_kernels():
                 if cutlass.const_expr(cache_format == "swa"):
                     a = Float32(cutlass.BFloat16(mul_rn(a, factor)))
                     b = Float32(cutlass.BFloat16(mul_rn(b, factor)))
+                elif cutlass.const_expr(scale_exponent != 0):
+                    a = mul_rn(a, Float32(2.0**scale_exponent))
+                    b = mul_rn(b, Float32(2.0**scale_exponent))
                 result[2 * pair] = a
                 result[2 * pair + 1] = b
         else:
@@ -3944,9 +3960,11 @@ def _cache_kernels():
         result,
         packed,
         swa_cache_format: cutlass.Constexpr,
+        swa_scale_exponent: cutlass.Constexpr = 0,
     ):
         """Convert one row's sixteen loaded channels to the bank format and store them at
-        ``element`` of ``target``; ``quant_state`` comes from ``staging_quant``."""
+        ``element`` of ``target``; ``quant_state`` comes from ``staging_quant``. swa_fp8 rows
+        hold E4M3(x / 2**swa_scale_exponent)."""
         quant, quant_exponent, quant_pow2, quant_pair = quant_state
         generic = cutlass.Boolean(True)
         if cutlass.const_expr(fp8):
@@ -3960,10 +3978,19 @@ def _cache_kernels():
                         )
             elif kind == 1:
                 if cutlass.const_expr(swa_cache_format == "swa_fp8"):
-                    if quant_pow2:
-                        generic = cutlass.Boolean(False)
-                        for word in cutlass.range_constexpr(4):
-                            packed[word] = scaled_e4m3x4(words[word], quant_pair)
+                    if cutlass.const_expr(swa_scale_exponent == 0):
+                        if quant_pow2:
+                            generic = cutlass.Boolean(False)
+                            for word in cutlass.range_constexpr(4):
+                                packed[word] = scaled_e4m3x4(words[word], quant_pair)
+                    else:
+                        # As a scaled SWA row whose every group byte is 127 + e.
+                        exponent = Int32(swa_scale_exponent) + quant_exponent
+                        if quant_pow2 & (exponent >= -24) & (exponent <= 15):
+                            generic = cutlass.Boolean(False)
+                            scale = f16x2_splat(Float32(2.0**swa_scale_exponent) * quant)
+                            for word in cutlass.range_constexpr(4):
+                                packed[word] = scaled_e4m3x4(words[word], scale)
                 else:
                     exponent = scale_byte - 127 + quant_exponent
                     if (
@@ -3981,7 +4008,7 @@ def _cache_kernels():
             for j in cutlass.range_constexpr(16):
                 result[j] = Float32(0.0)
             if kind == 1:
-                decode_channels_x16(words, scale_byte, swa_cache_format, result)
+                decode_channels_x16(words, scale_byte, swa_cache_format, result, swa_scale_exponent)
             elif kind == 2:
                 decode_channels_x16(words, scale_byte, "main", result)
             if cutlass.const_expr(fp8):
@@ -4646,6 +4673,10 @@ def _cache_kernels():
                             x[2 * k + 1] = Float32(cutlass.BFloat16(fma_rn(sn, a, mul_rn(c, b))))
                 if cutlass.const_expr(job.cache_format == "swa_fp8"):
                     if active:
+                        if cutlass.const_expr(job.scale_exponent != 0):
+                            # The power-of-two storage scale is exact before E4M3 rounding.
+                            for j in cutlass.range_constexpr(4):
+                                x[j] = mul_rn(x[j], Float32(2.0**-job.scale_exponent))
                         word = f32x2_to_e4m3x2(x[0], x[1]) | (
                             f32x2_to_e4m3x2(x[2], x[3]) << Uint32(16)
                         )
@@ -5001,7 +5032,10 @@ def _cache_kernels():
                         scaled[j] = mul_rn(x[j], inv_scale)
                 destination = pool.toint() + data_base
                 if cutlass.const_expr(job.cache_format == "swa_fp8"):
-                    # Unit-scale E4M3 rows carry no scale footer.
+                    # E4M3(x / 2**e) rows carry no scale footer; a power-of-two scale is exact.
+                    if cutlass.const_expr(job.scale_exponent != 0):
+                        for j in cutlass.range_constexpr(16):
+                            x[j] = mul_rn(x[j], Float32(2.0**-job.scale_exponent))
                     words = []
                     for quad in cutlass.range_constexpr(4):
                         words.append(
@@ -5047,10 +5081,11 @@ def _cache_kernels():
     class GatherDequantKernel:
         """Gather packed rows by slot and decode them into BF16 (``gather_dequant_rows``)."""
 
-        def __init__(self, cache_format: str, head_dim: int):
+        def __init__(self, cache_format: str, head_dim: int, scale_exponent: int = 0):
             _format_geometry(cache_format, head_dim)
             self.cache_format = cache_format
             self.head_dim = head_dim
+            self.scale_exponent = scale_exponent
             self.threads = max(32, -(-(head_dim // 4) // 32) * 32)
 
         @cute.jit
@@ -5104,7 +5139,14 @@ def _cache_kernels():
             if first < self.head_dim:
                 result = cute.make_rmem_tensor((4,), Float32)
                 decode_channels(
-                    pool, slot * pool_stride, first, self.head_dim, self.cache_format, valid, result
+                    pool,
+                    slot * pool_stride,
+                    first,
+                    self.head_dim,
+                    self.cache_format,
+                    valid,
+                    result,
+                    self.scale_exponent,
                 )
                 store_bf16x4(output, index * Int64(self.head_dim) + Int64(first), result)
 
@@ -5630,6 +5672,7 @@ def _cache_kernels():
             self.q_fixup = q_fixup
             _format_geometry(swa_cache_format, 512)
             self.swa_cache_format = swa_cache_format
+            self.swa_scale_exponent = _swa_scale_exponent(swa_cache_format)
             self.swa_aligned = swa_aligned
             self.fp8 = fp8
             self.rows_per_cta = rows_per_cta
@@ -5907,6 +5950,7 @@ def _cache_kernels():
                         result,
                         packed,
                         self.swa_cache_format,
+                        self.swa_scale_exponent,
                     )
 
         @cute.jit
@@ -6566,6 +6610,7 @@ def _cache_kernels():
             _format_geometry(swa_cache_format, 512)
             _format_geometry("main", 512)
             self.swa_cache_format = swa_cache_format
+            self.swa_scale_exponent = _swa_scale_exponent(swa_cache_format)
             self.swa_aligned = swa_aligned
             self.fp8 = fp8
 
@@ -6837,6 +6882,7 @@ def _cache_kernels():
                         result,
                         packed,
                         self.swa_cache_format,
+                        self.swa_scale_exponent,
                     )
 
     class SharedRowScaleKernel(SharedDecodeKernel):
@@ -6950,6 +6996,7 @@ def _cache_kernels():
         def __init__(self, swa_cache_format: str = "swa"):
             _format_geometry(swa_cache_format, _STAGE_HEAD_DIM)
             self.swa_cache_format = swa_cache_format
+            self.swa_scale_exponent = _swa_scale_exponent(swa_cache_format)
             self.limits = (_SCALE_BYTE_LIMITS["swa"], _SCALE_BYTE_LIMITS["main"])
             self.indices = (_SCALE_SOURCE_SLOTS["swa"], _SCALE_SOURCE_SLOTS["main"])
 
@@ -7069,7 +7116,7 @@ def _cache_kernels():
                     )
                     if slot >= 0:
                         if cutlass.const_expr(self.swa_cache_format == "swa_fp8"):
-                            largest[0] = Int32(127)
+                            largest[0] = Int32(127 + self.swa_scale_exponent)
                         else:
                             largest[0] = largest_scale_byte(
                                 swa_pool, slot * swa_stride + 512, 4, self.limits[0]
@@ -7132,6 +7179,7 @@ def _cache_kernels():
             self.cached_main = cached_main
             self.mapped = mapped
             self.pdl = pdl
+            self.swa_scale_exponent = _swa_scale_exponent(swa_cache_format)
             # Per format: scale tail offset, its 4-byte words and the exclusive byte limit.
             self.geometry = {}
             for source, cache_format in (("swa", swa_cache_format), ("main", "main")):
@@ -7253,8 +7301,8 @@ def _cache_kernels():
                     )
                 if (slot >= 0) & (slot < capacity):
                     if cutlass.const_expr(words == 0):
-                        # Ordinary SWA has a unit ceiling, but no scale bytes.
-                        largest = Int32(127)
+                        # Ordinary SWA has no scale bytes; its ceiling is its storage scale.
+                        largest = Int32(127 + self.swa_scale_exponent)
                     else:
                         largest = largest_scale_byte(
                             pool, slot * pool_stride + scale_base, words, limit
@@ -7601,6 +7649,8 @@ class QuantizeJobSpec:
     identity: bool = False  # row ``r`` writes destination ``r``; no slot array
     norm: bool = False
     rope_dim: int = 0
+    # swa_fp8 rows store E4M3(x / 2**scale_exponent) (``_swa_scale_exponent``).
+    scale_exponent: int = 0
 
     def __post_init__(self):
         group, data_bytes, scale_bytes = _format_geometry(self.cache_format, self.head_dim)
@@ -7608,6 +7658,8 @@ class QuantizeJobSpec:
             self.cache_format == "swa_fp8" and self.mode != "row"
         ):
             raise ValueError("Unsupported CSA2 scatter mode")
+        if self.scale_exponent and self.cache_format != "swa_fp8":
+            raise ValueError("Only swa_fp8 rows take a storage scale")
         if self.rope_dim < 0 or self.rope_dim > self.head_dim or self.rope_dim % 4:
             raise ValueError("CSA2 RoPE width must be a multiple of four channels")
         object.__setattr__(self, "group", group)
@@ -7625,9 +7677,17 @@ def _job_spec(
     identity: bool = False,
     norm: bool = False,
     rope_dim: int = 0,
+    scale_exponent: int = 0,
 ) -> QuantizeJobSpec:
     """Interned job specs: they are immutable, and building one validates its geometry."""
-    return QuantizeJobSpec(cache_format, head_dim, mode, identity, norm, rope_dim)
+    return QuantizeJobSpec(cache_format, head_dim, mode, identity, norm, rope_dim, scale_exponent)
+
+
+def _swa_scale_exponent(cache_format: str) -> int:
+    """Storage-scale exponent ``e`` of ``cache_format`` rows: swa_fp8 rows hold E4M3(x / 2**e)."""
+    from .params import swa_scale_exponent
+
+    return swa_scale_exponent(cache_format)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7717,7 +7777,14 @@ def row_job(
         values, norm, rope
     )
     return QuantizeJob(
-        _job_spec(cache_format, head_dim, "row", norm=has_norm, rope_dim=rope_dim),
+        _job_spec(
+            cache_format,
+            head_dim,
+            "row",
+            norm=has_norm,
+            rope_dim=rope_dim,
+            scale_exponent=_swa_scale_exponent(cache_format),
+        ),
         (
             _ptr(pool, align=1),
             _ptr(pool, align=1),
@@ -7906,9 +7973,10 @@ def gather_dequant_rows(
     else:
         columns, row_stride, col_stride = slots.shape[1], slots.stride(0), slots.stride(1)
     ns = _cache_kernels()
+    exponent = _swa_scale_exponent(cache_format)
     _launch(
-        ("gather", cache_format, head_dim, pool.device.index),
-        lambda: ns.GatherDequantKernel(cache_format, head_dim),
+        ("gather", cache_format, head_dim, exponent, pool.device.index),
+        lambda: ns.GatherDequantKernel(cache_format, head_dim, exponent),
         _ptr(pool, align=1),
         _ptr(slots, align=8),
         _ptr(output, align=8),
@@ -8278,6 +8346,7 @@ def derive_stage_kv_scales(
                 q_cached,
                 pdl,
                 swa_cache_format,
+                _swa_scale_exponent(swa_cache_format),
                 device.index,
             ),
             lambda: ns.StageScalesKernel(
@@ -8316,6 +8385,7 @@ def derive_stage_kv_scales(
                 cached,
                 pdl,
                 swa_cache_format,
+                _swa_scale_exponent(swa_cache_format),
                 device.index,
             ),
             lambda: ns.StageScalesKernel(
@@ -8561,6 +8631,7 @@ def stage_selected_rows(
         (
             "stage_dequant",
             swa_cache_format,
+            _swa_scale_exponent(swa_cache_format),
             swa_aligned,
             fp8,
             rows_per_cta,
@@ -8832,7 +8903,7 @@ def stage_shared_rows(
         q, q_shared, minimum, maximum = scale
         bitmap = metadata._csa2_stage_scale_bitmap
         _launch(
-            ("shared_scale", swa_cache_format, device.index),
+            ("shared_scale", swa_cache_format, _swa_scale_exponent(swa_cache_format), device.index),
             lambda: ns.SharedScaleKernel(swa_cache_format),
             *row_args,
             _ptr(bitmap),
@@ -8850,7 +8921,14 @@ def stage_shared_rows(
             maximum=maximum,
         )
     _launch(
-        ("shared_decode", swa_cache_format, swa_aligned, fp8, device.index),
+        (
+            "shared_decode",
+            swa_cache_format,
+            _swa_scale_exponent(swa_cache_format),
+            swa_aligned,
+            fp8,
+            device.index,
+        ),
         lambda: ns.SharedDecodeKernel(fp8, swa_cache_format, swa_aligned),
         *row_args,
         _ptr(bank, align=8),
@@ -9212,6 +9290,7 @@ def _packed_attention_kernel_type():
     class PackedAttention:
         def __init__(self, swa_cache_format: str = "swa") -> None:
             self.swa_cache_format = swa_cache_format
+            self.swa_scale_exponent = _swa_scale_exponent(swa_cache_format)
 
         @cute.jit
         def __call__(
@@ -9310,6 +9389,8 @@ def _packed_attention_kernel_type():
                             if cutlass.const_expr(self.swa_cache_format == "swa"):
                                 exponent = cutlass.Int32(swa[slot, 512 + d // 32]) - 127
                                 value = value * cute.exp2(cutlass.Float32(exponent))
+                            elif cutlass.const_expr(self.swa_scale_exponent != 0):
+                                value = value * cutlass.Float32(2.0**self.swa_scale_exponent)
                     elif column < si.shape[1] + mi.shape[1]:
                         slot = cutlass.Int64(mi[row, column - si.shape[1]])
                         if (slot >= 0) & (slot < main.shape[0]):
@@ -9520,6 +9601,7 @@ def packed_sparse_attention(
     key = (
         q.device.index,
         swa_cache_format,
+        _swa_scale_exponent(swa_cache_format),
         tuple(None if t is None else (tuple(t.shape), tuple(t.stride()), t.dtype) for t in tensors),
     )
     views = tuple(None if t is None else from_dlpack(t.detach(), assumed_align=1) for t in tensors)

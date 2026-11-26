@@ -915,12 +915,14 @@ def _gptj_rope_e4m3_small_m_kernel(
     BLOCK_H: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     PDL: tl.constexpr,
+    SCALE: tl.constexpr = 1.0,
 ):
-    """One token's ``BLOCK_H`` heads: GPT-J RoPE of the last 64 channels, then unit-scale E4M3.
+    """One token's ``BLOCK_H`` heads: GPT-J RoPE of the last 64 channels, then E4M3(q * SCALE).
 
     The rotated channels round to BF16 exactly as ``_gptj_rope_small_m_kernel`` stores them; every
-    BF16 value then converts with ``cvt.rn.satfinite.e4m3x2.f32``, the conversion PrimTS's own
-    query staging applies, so ``Q8`` holds the bytes that staging would write.
+    BF16 value then takes the power-of-two ``SCALE`` exactly and converts with
+    ``cvt.rn.satfinite.e4m3x2.f32``, the conversion PrimTS's own query staging applies, so
+    ``Q8`` holds the bytes that staging would write.
     """
     token = tl.program_id(0)
     heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -938,6 +940,9 @@ def _gptj_rope_e4m3_small_m_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     rotated = tl.join(tl.fma(cosine, x, -(sine * y)), tl.fma(sine, x, cosine * y))
     rotated = tl.reshape(rotated, (BLOCK_H, 64)).to(tl.bfloat16).to(tl.float32)
+    if SCALE != 1.0:
+        plain = plain * SCALE
+        rotated = rotated * SCALE
     # Pair p of a head holds channels 2p (low byte) and 2p + 1; the first HEAD_DIM / 2 - 32
     # pairs come from the loaded row, the last 32 from the rotated channels.
     pair_base = base // 2
@@ -966,13 +971,16 @@ def gptj_rope_e4m3_small_m(
     positions: torch.Tensor,
     cos_sin: torch.Tensor,
     q8: torch.Tensor,
+    *,
+    scale_exponent: int = 0,
 ) -> None:
-    """Write the unit-scale E4M3 query of the RoPE'd ``q`` into ``q8``, leaving ``q`` as is.
+    """Write the E4M3 query of the RoPE'd ``q`` into ``q8``, leaving ``q`` as is.
 
     ``q`` is the pre-RoPE BF16 ``[M, heads, D]`` projection output of a small decode step and
     ``q8`` a contiguous ``[M, heads * D]`` E4M3 tensor viewed as int16 pairs. The bytes equal
-    ``gptj_rope_small_m`` (``mla_rope_inplace``) followed by PrimTS's RN/satfinite query staging,
-    in one PDL launch of one program per token and four heads.
+    ``gptj_rope_small_m`` (``mla_rope_inplace``) followed by PrimTS's RN/satfinite query staging
+    at ``2**scale_exponent`` (E4M3(q / 2**e)), in one PDL launch of one program per token and
+    four heads.
     """
     rows, heads, depth = q.shape
     if (
@@ -1002,6 +1010,7 @@ def gptj_rope_e4m3_small_m(
         block_h,
         depth,
         pdl,
+        SCALE=2.0**-scale_exponent,
         num_warps=4,
         enable_fp_fusion=False,
         launch_pdl=pdl,

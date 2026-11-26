@@ -1176,7 +1176,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """Derive this forward's range-aware staging KV scale from the packed pools.
 
         Packed group scales bound decoded magnitudes, while ordinary FP8 SWA
-        has a unit persistent scale and needs no footer scan. Together with MAIN,
+        has one fixed power-of-two persistent scale and needs no footer scan. Together with MAIN,
         the selected sources determine a ceiling on the staging magnitude. The
         smallest power of two mapping that ceiling onto 448 avoids saturation
         without reading full payloads. These forward-local scales do not change

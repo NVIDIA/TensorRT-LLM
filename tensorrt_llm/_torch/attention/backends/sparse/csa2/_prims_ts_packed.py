@@ -54,7 +54,7 @@ from ...prims_ts.mla_decode import (
 from ._prims_ts_output import MXFP8OutputQuant, mxfp8_output_args
 from ._prims_ts_producer import PackedKvProducer, main_row_bytes
 from ._prims_ts_quantization import UnitScaleQuery
-from .params import PrimsTSMainFormat, SwaCacheFormat
+from .params import PrimsTSMainFormat, SwaCacheFormat, q_fp8_scale_exponent, swa_scale_exponent
 from .prims_ts import _validate_softmax_scale
 from .quantization import row_bytes
 
@@ -171,6 +171,10 @@ class _Plan:
     core: torch.Tensor | None
     lse_kernel: torch.Tensor
     dummy_main: torch.Tensor
+    # swa_fp8 rows hold E4M3(x / swa_scale), a power of two; 1.0 for scaled SWA records.
+    swa_scale: float = 1.0
+    # The E4M3 Q holds E4M3(q / q_scale), a power of two (``q_fp8_scale_exponent``).
+    q_scale: float = 1.0
 
 
 def _validate_geometry(rows: int, heads: int, max_topk: int, max_extra_topk: int) -> int:
@@ -634,6 +638,7 @@ def _resolve_launch(
         max_topk,
         max_extra_topk,
         swa_cache_format,
+        swa_scale_exponent(swa_cache_format),
         aligned_strides,
         main_cache_format,
         output_groups,
@@ -758,6 +763,7 @@ def _launch_kernels(
             aligned_strides=aligned_strides,
             main_cache_format=main_cache_format,
             raw_selections=raw_selections,
+            main_scale_exponent=swa_scale_exponent(swa_cache_format),
         ),
         # Compile the planned SWA + MAIN capacity; live lengths still arrive
         # with the metadata on every launch.
@@ -1245,7 +1251,9 @@ class PackedSparseMLA:
             gather=gather,
             nvfp4=nvfp4,
             query=(
-                UnitScaleQuery.plan(launch.device, rows, heads, buffers["q8"])
+                UnitScaleQuery.plan(
+                    launch.device, rows, heads, buffers["q8"], q_fp8_scale_exponent()
+                )
                 if rows <= _Q8_ARENA_ROWS
                 else None
             ),
@@ -1253,6 +1261,8 @@ class PackedSparseMLA:
             core=buffers["core"] if spec.has_workspace else None,
             lse_kernel=buffers["lse"].permute(2, 1, 0),
             dummy_main=dummy_main,
+            swa_scale=2.0 ** swa_scale_exponent(swa_cache_format),
+            q_scale=2.0 ** q_fp8_scale_exponent(),
         )
         self._packed = {}
         self._q8 = self._query = None
@@ -1320,7 +1330,9 @@ class PackedSparseMLA:
         if state.query is not None:
             return state.query
         if self._query is None:
-            self._query = UnitScaleQuery.plan(state.device, state.rows, state.heads, q8)
+            self._query = UnitScaleQuery.plan(
+                state.device, state.rows, state.heads, q8, round(math.log2(state.q_scale))
+            )
         return self._query
 
     @staticmethod
@@ -1526,7 +1538,8 @@ class PackedSparseMLA:
         is read.
 
         Q is contiguous BF16[rows,1,H,512], or E4M3 already rounded RN/satfinite
-        at unit scale, which is used as is; out is contiguous BF16 of that shape.
+        at the plan's Q scale, E4M3(q / 2**q_fp8_scale_exponent()), which is used as is;
+        out is contiguous BF16 of that shape.
         A plan with ``output_groups`` takes no ``out`` and requires instead
         ``output_quant = (data, scales, positions, cos_sin)``: E4M3 ``[groups, rows,
         D]`` and UINT8 ``groups * pad128(rows) * D / 32`` buffers receiving the grouped
@@ -1661,6 +1674,14 @@ class PackedSparseMLA:
         sparse_inputs = (lists, None, swa_lengths, extra_sparse_lens, sinks, None)
         sinks_or_none = state.buffers["no_sinks"] if sinks is None else sinks
         nvfp4 = state.nvfp4
+        # The E4M3 Q holds E4M3(q / q_scale), so every kernel scales Q.K by q_scale.
+        # swa_fp8 rows hold E4M3(x / s). The NVFP4 MAIN kernel takes s as its FP8 SWA pool's
+        # tensor scale. The gather and producer kernels read MAIN decoded into the same
+        # domain (``decode_main_*`` and ``PackedKvProducer.main_scale_exponent``) and scale
+        # Q.K and the output by s instead. All are exact for powers of two.
+        query_softmax_scale = softmax_scale * state.q_scale
+        folded_softmax_scale = query_softmax_scale * state.swa_scale
+        folded_output_scale = output_scale * state.swa_scale
         # An empty or omitted MAIN pool has no live rows under the prefix promise;
         # the native kernels still need a descriptor over one real record.
         main_bytes = main_row_bytes(state.main_cache_format)
@@ -1687,9 +1708,9 @@ class PackedSparseMLA:
                     swa_lengths,
                     extra_sparse_lens,
                     sinks_or_none,
-                    1.0,
+                    state.swa_scale,
                 ),
-                softmax_scale,
+                query_softmax_scale,
                 output_scale,
                 quant_args,
                 1,
@@ -1728,8 +1749,8 @@ class PackedSparseMLA:
                     sinks_or_none,
                     1.0,
                 ),
-                softmax_scale,
-                output_scale,
+                folded_softmax_scale,
+                folded_output_scale,
                 quant_args,
                 1,
                 0,
@@ -1751,8 +1772,8 @@ class PackedSparseMLA:
             swa_lengths,
             None,
             sparse_inputs,
-            softmax_scale,
-            output_scale,
+            folded_softmax_scale,
+            folded_output_scale,
             quant_args,
             1,
             0,

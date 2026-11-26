@@ -3575,3 +3575,123 @@ def test_vectorized_quantize_scatter_writes_the_same_bytes(monkeypatch, which):
         results.append([output.clone() for output in outputs])
     for index, (plain, vectorized) in enumerate(zip(*results)):
         assert torch.equal(plain, vectorized), f"output {index} differs"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "amax,exponent",
+    [(None, 0), ("448", 0), ("449", 1), ("896", 1), ("3584", 3), ("224", -1), ("1.75", -8)],
+)
+def test_swa_fp8_scale_exponent_from_amax(
+    monkeypatch: pytest.MonkeyPatch, amax: str | None, exponent: int
+) -> None:
+    """The swa_fp8 storage scale is the smallest power of two whose E4M3 range covers amax."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+        SWA_FP8_AMAX_ENV,
+        swa_fp8_scale_exponent,
+    )
+
+    if amax is None:
+        monkeypatch.delenv(SWA_FP8_AMAX_ENV, raising=False)
+    else:
+        monkeypatch.setenv(SWA_FP8_AMAX_ENV, amax)
+    swa_fp8_scale_exponent.cache_clear()
+    try:
+        assert swa_fp8_scale_exponent() == exponent
+    finally:
+        swa_fp8_scale_exponent.cache_clear()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("amax", ["3585", "0.875", "0", "-1", "inf", "nan", "large"])
+def test_swa_fp8_scale_exponent_rejects_unsupported_amax(
+    monkeypatch: pytest.MonkeyPatch, amax: str
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+        SWA_FP8_AMAX_ENV,
+        swa_fp8_scale_exponent,
+    )
+
+    monkeypatch.setenv(SWA_FP8_AMAX_ENV, amax)
+    swa_fp8_scale_exponent.cache_clear()
+    try:
+        with pytest.raises(ValueError, match=SWA_FP8_AMAX_ENV):
+            swa_fp8_scale_exponent()
+    finally:
+        swa_fp8_scale_exponent.cache_clear()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("exponent", [-3, 0, 2])
+def test_swa_fp8_rows_round_at_their_storage_scale(exponent: int) -> None:
+    """swa_fp8 rows hold E4M3(x / 2**e): the power-of-two scale moves E4M3's range, which
+    saturates at 448 * 2**e, and decoding multiplies the stored value back exactly."""
+    torch.manual_seed(1907)
+    scale = 2.0**exponent
+    x = torch.randn(64, 512) * 300 * scale
+    x[0, :4] = torch.tensor([3 * 448 * scale, -1e30, float("nan"), -0.0])
+    packed = pack_rows(x, "swa_fp8", scale_exponent=exponent)
+    expected = (x / scale).clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(packed, torch.where(torch.isnan(x), 127, expected))
+    decoded = unpack_rows(packed, 512, "swa_fp8", torch.float32, scale_exponent=exponent)
+    finite = ~torch.isnan(x)
+    assert torch.equal(decoded[finite], (packed.view(torch.float8_e4m3fn).float() * scale)[finite])
+    assert decoded[0, 0] == 448 * scale and decoded[0, 1] == -448 * scale
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("rows", [70, 12288], ids=["scalar", "vector"])
+@pytest.mark.parametrize("exponent", [-2, 3])
+@torch.inference_mode()
+def test_swa_fp8_publication_and_gather_at_storage_scale(
+    swa_fp8_storage_exponent, exponent: int, rows: int
+) -> None:
+    """Both quantize kernels store swa_fp8 rows as E4M3(x / 2**e), and the gather decodes them."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
+
+    swa_fp8_storage_exponent(exponent)
+    torch.manual_seed(1908)
+    values = (torch.randn(rows, 512, device="cuda") * 300 * 2.0**exponent).bfloat16()
+    pool = torch.zeros(rows + 9, 512, device="cuda", dtype=torch.uint8)
+    slots = torch.randperm(rows + 9, device="cuda")[:rows]
+    quantize_scatter_rows(pool, slots, values, "swa_fp8")
+    expected = pack_rows(values, "swa_fp8", scale_exponent=exponent)
+    torch.testing.assert_close(pool[slots], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        gather_rows(pool, slots, 512, "swa_fp8"),
+        unpack_rows(expected, 512, "swa_fp8", scale_exponent=exponent),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "amax,exponent", [(None, 0), ("448", 0), ("896", 1), ("114688", 8), ("100", -2)]
+)
+def test_q_fp8_scale_exponent_from_amax(
+    monkeypatch: pytest.MonkeyPatch, amax: str | None, exponent: int
+) -> None:
+    """PrimTS's Q scale is the smallest power of two whose E4M3 range covers the Q amax."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+        Q_FP8_AMAX_ENV,
+        q_fp8_scale_exponent,
+    )
+
+    if amax is None:
+        monkeypatch.delenv(Q_FP8_AMAX_ENV, raising=False)
+    else:
+        monkeypatch.setenv(Q_FP8_AMAX_ENV, amax)
+    q_fp8_scale_exponent.cache_clear()
+    try:
+        assert q_fp8_scale_exponent() == exponent
+    finally:
+        q_fp8_scale_exponent.cache_clear()
+    for rejected in ("114689", "0.875", "nan"):
+        monkeypatch.setenv(Q_FP8_AMAX_ENV, rejected)
+        q_fp8_scale_exponent.cache_clear()
+        try:
+            with pytest.raises(ValueError, match=Q_FP8_AMAX_ENV):
+                q_fp8_scale_exponent()
+        finally:
+            q_fp8_scale_exponent.cache_clear()

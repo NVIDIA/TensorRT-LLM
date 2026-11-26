@@ -111,10 +111,7 @@ def _bank_kernel() -> type:
     import cutlass.cute as cute
     from cutlass import Int32, Int64
 
-    from ...prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_transformed_kv import (
-        _cvt_e2m1_word_to_e4m3_words,
-    )
-    from ._prims_ts_producer import _load_packed_words
+    from ._prims_ts_producer import _load_packed_words, cvt_e2m1_word_to_e4m3_words_descaled
 
     class _MainBankDecode:
         """Decode bank rows; lane ``l`` converts channels ``[16 l, 16 l + 16)`` of a row.
@@ -131,11 +128,18 @@ def _bank_kernel() -> type:
         """
 
         def __init__(
-            self, page_size: int, marked: bool, readable: bool, direct: bool = False
+            self,
+            page_size: int,
+            marked: bool,
+            readable: bool,
+            direct: bool = False,
+            scale_exponent: int = 0,
         ) -> None:
             self.page_size = page_size
             self.marked = marked
             self.readable = readable
+            # Rows decode to E4M3(x / 2**scale_exponent), the domain of swa_fp8 SWA rows.
+            self.scale_exponent = scale_exponent
             # With ``direct``, ``pages`` is an INT32[rows, 1] list of each bank row's pool
             # record (negative for none) instead of a request page table.
             self.direct = direct
@@ -248,11 +252,11 @@ def _bank_kernel() -> type:
                         high = cutlass.select_(valid, high, Int32(0))
                         scale = cutlass.select_(valid, scale, Int32(0))
                         values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                        values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(
-                            Int32(low), Int32(scale)
+                        values[0], values[1] = cvt_e2m1_word_to_e4m3_words_descaled(
+                            Int32(low), Int32(scale), self.scale_exponent
                         )
-                        values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(
-                            Int32(high), Int32(scale)
+                        values[2], values[3] = cvt_e2m1_word_to_e4m3_words_descaled(
+                            Int32(high), Int32(scale), self.scale_exponent
                         )
                         destination = bank.iterator + Int64(first + sources[slot]) * Int64(
                             _BANK_ROW_BYTES
@@ -289,7 +293,12 @@ def _bank_kernel() -> type:
 
 @cache
 def _compiled(
-    page_dtype: torch.dtype, page_size: int, marked: bool, readable: bool, direct: bool = False
+    page_dtype: torch.dtype,
+    page_size: int,
+    marked: bool,
+    readable: bool,
+    direct: bool = False,
+    scale_exponent: int = 0,
 ) -> "Callable[..., object]":
     import cutlass
     import cutlass.cute as cute
@@ -318,7 +327,7 @@ def _compiled(
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile[cute.FrontendNext](
-        _bank_kernel()(page_size, marked, readable, direct),
+        _bank_kernel()(page_size, marked, readable, direct, scale_exponent),
         pool,
         pages,
         offsets,
@@ -337,6 +346,8 @@ def decode_main_bank(
     plan: "CSA2PrimsTSMainBank",
     bank: torch.Tensor,
     marks: torch.Tensor | None = None,
+    *,
+    scale_exponent: int = 0,
 ) -> None:
     """Decode each context request's MAIN rows into its bank rows on the current stream.
 
@@ -350,9 +361,11 @@ def decode_main_bank(
         marks: Optional contiguous CUDA UINT8[plan.rows] row marks. With them,
             only marked rows are decoded and their marks are cleared; other bank
             rows keep their contents.
+        scale_exponent: Rows decode to E4M3(x / 2**scale_exponent), the domain of the
+            swa_fp8 SWA rows attended with them (``swa_fp8_scale_exponent``).
 
-    Rows are rounded RN/satfinite to E4M3 at unit scale exactly as the PrimTS
-    producer decodes them, so attention over the bank reads the same operands.
+    Rows are rounded RN/satfinite to E4M3 exactly as the PrimTS producer decodes them,
+    so attention over the bank reads the same operands.
     """
     if (
         main_pool.dtype != torch.uint8
@@ -394,7 +407,7 @@ def decode_main_bank(
         raise ValueError("CSA2 MAIN bank marks must be contiguous CUDA UINT8[rows]")
     # Rows on 8-byte strides read their payloads as words, so any row can be read.
     readable = main_pool.shape[0] > 0 and main_pool.stride(0) % 8 == 0
-    _compiled(pages.dtype, plan.page_size, marks is not None, readable)(
+    _compiled(pages.dtype, plan.page_size, marks is not None, readable, False, scale_exponent)(
         main_pool,
         pages,
         offsets,
@@ -452,7 +465,12 @@ def main_records_storage(
 
 
 def decode_main_records(
-    main_pool: torch.Tensor, records: torch.Tensor, bank: torch.Tensor, arenas: dict
+    main_pool: torch.Tensor,
+    records: torch.Tensor,
+    bank: torch.Tensor,
+    arenas: dict,
+    *,
+    scale_exponent: int = 0,
 ) -> None:
     """Decode MAIN pool rows ``records[r, c]`` into bank rows ``r * width + c`` on the current stream.
 
@@ -463,6 +481,7 @@ def decode_main_records(
         bank: Contiguous CUDA UINT8[rows * width, 512] destination from
             :func:`main_records_storage`.
         arenas: The arenas that hold ``bank``.
+        scale_exponent: As for :func:`decode_main_bank`.
 
     Bank row ``r * width + c`` decodes record ``records[r, c]``; a negative or out-of-pool
     record leaves its bank row as it was, since no selection reads it. Rows convert exactly
@@ -492,7 +511,7 @@ def decode_main_records(
         return
     offsets = arenas[(_OFFSETS_CACHE_KEY, bank.device)]
     readable = main_pool.shape[0] > 0 and main_pool.stride(0) % 8 == 0
-    _compiled(torch.int32, 1, False, readable, True)(
+    _compiled(torch.int32, 1, False, readable, True, scale_exponent)(
         main_pool, records.view(rows, 1), offsets, bank, bank[0], 0, rows, 1
     )
 
@@ -570,9 +589,7 @@ def _records_kernel() -> type:
     import cutlass.cute as cute
     from cutlass import Int32, Int64
 
-    from ...prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_transformed_kv import (
-        _cvt_e2m1_word_to_e4m3_words,
-    )
+    from ._prims_ts_producer import cvt_e2m1_word_to_e4m3_words_descaled
 
     class _MainRecordsDecode:
         """Decode a selection bank's owned rows; lane ``l`` converts channels ``[16 l, 16 l + 16)``.
@@ -584,6 +601,10 @@ def _records_kernel() -> type:
         before converting any, exactly as :func:`decode_main_bank` converts them. Thread 0
         of block 0 advances the epoch for the next call.
         """
+
+        def __init__(self, scale_exponent: int = 0) -> None:
+            # Rows decode to E4M3(x / 2**scale_exponent), the domain of swa_fp8 SWA rows.
+            self.scale_exponent = scale_exponent
 
         @cute.kernel
         def kernel(
@@ -639,8 +660,12 @@ def _records_kernel() -> type:
                     if active[slot]:
                         low, high, scale = reads[slot]
                         values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                        values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(low, scale)
-                        values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(high, scale)
+                        values[0], values[1] = cvt_e2m1_word_to_e4m3_words_descaled(
+                            low, scale, self.scale_exponent
+                        )
+                        values[2], values[3] = cvt_e2m1_word_to_e4m3_words_descaled(
+                            high, scale, self.scale_exponent
+                        )
                         destination = bank.iterator + Int64(first + sources[slot]) * Int64(
                             _BANK_ROW_BYTES
                         )
@@ -671,7 +696,7 @@ def _records_kernel() -> type:
 
 
 @cache
-def _compiled_records() -> "Callable[..., object]":
+def _compiled_records(scale_exponent: int = 0) -> "Callable[..., object]":
     import cutlass
     import cutlass.cute as cute
 
@@ -692,7 +717,7 @@ def _compiled_records() -> "Callable[..., object]":
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile[cute.FrontendNext](
-        _records_kernel()(),
+        _records_kernel()(scale_exponent),
         pool,
         vector(cutlass.Int32, 4),
         vector(cutlass.Int64, 8),
@@ -712,6 +737,8 @@ def dedup_main_records(
     bank: torch.Tensor,
     arenas: dict,
     claimed: bool = False,
+    *,
+    scale_exponent: int = 0,
 ) -> None:
     """Decode each MAIN row a generation tile selects once, on the current stream.
 
@@ -730,6 +757,7 @@ def dedup_main_records(
         arenas: The arenas that hold ``bank`` and the owner slots.
         claimed: Whether ``prepare_prims_ts_metadata`` already claimed the owner slots of
             ``records`` (its ``claims``) since the previous call; else this call claims them.
+        scale_exponent: As for :func:`decode_main_bank`.
     """
     if (
         main_pool.dtype != torch.uint8
@@ -774,4 +802,6 @@ def dedup_main_records(
             BLOCK=_OWNER_BLOCK,
             SELECTION_BITS=OWNER_SELECTION_BITS,
         )
-    _compiled_records()(main_pool, flat, owners, epoch, bank_rows.view(-1), bank, count)
+    _compiled_records(scale_exponent)(
+        main_pool, flat, owners, epoch, bank_rows.view(-1), bank, count
+    )

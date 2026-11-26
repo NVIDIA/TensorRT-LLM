@@ -1880,3 +1880,150 @@ def test_prims_ts_selection_bank_attention_matches_packed(rows: int) -> None:
     for name in ("main_fp8", "dedup"):
         torch.testing.assert_close(outputs[name], outputs["main"], atol=0, rtol=0)
         torch.testing.assert_close(lses[name], lses["main"], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("exponent", [0, -3, 2])
+@torch.inference_mode()
+def test_prims_ts_main_records_decode_into_swa_fp8_domain(exponent: int) -> None:
+    """Selection-bank rows decode MAIN records to E4M3(x / 2**e), the domain of swa_fp8 rows
+    stored at that scale, rounding exactly as the reference conversion does."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        decode_main_records,
+        main_records_storage,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_rows,
+        unpack_rows,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    main = _pool("main", 288, 300)
+    generator = torch.Generator(device=device).manual_seed(1909)
+    records = torch.randint(0, 300, (8, 64), device=device, generator=generator, dtype=torch.int32)
+    records[:, -5:] = -1
+    arenas = {}
+    bank = main_records_storage(arenas, device, records.numel())
+    decode_main_records(main, records, bank, arenas, scale_exponent=exponent)
+    valid = (records >= 0).view(-1)
+    values = unpack_rows(main[records.view(-1)[valid].long()], 512, "main", torch.float32)
+    expected = pack_rows(values, "swa_fp8", scale_exponent=exponent)
+    torch.testing.assert_close(bank[valid], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("path", ["gather", "producer"])
+@pytest.mark.parametrize("has_main", [True, False])
+@torch.inference_mode()
+def test_prims_ts_swa_fp8_storage_scale_folds_into_the_scales(
+    path: Literal["gather", "producer"],
+    has_main: bool,
+    swa_fp8_storage_exponent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """swa_fp8 rows stored at 2**e attend as unit-scale rows of the same bytes with Q.K and
+    the output scaled by 2**e, bit for bit: the gather and producer kernels fold the storage
+    scale into both, and MAIN bank rows are decoded into the same domain."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    if path == "gather":
+        _force_gather(packed, monkeypatch)
+    case = _gather_case(
+        32, 64, has_main, True, _pool("swa_fp8", 512, 300), _pool("main_fp8", 512, 200)
+    )
+    rows, _, heads, _ = case["q"].shape
+    device = case["q"].device
+    max_extra_topk = case["extra_sparse_indices"].shape[1] if has_main else 0
+    inputs = {key: value for key, value in case.items() if key != "q"}
+
+    def run(exponent: int, softmax_scale: float, output_scale: float) -> tuple:
+        swa_fp8_storage_exponent(exponent)
+        size = packed.get_packed_sparse_mla_workspace_size(
+            device, rows, heads, max_topk=128, max_extra_topk=max_extra_topk
+        )
+        wrapper = packed.PackedSparseMLA(torch.empty(size, device=device, dtype=torch.uint8))
+        wrapper.plan(
+            device,
+            rows,
+            heads,
+            max_topk=128,
+            max_extra_topk=max_extra_topk,
+            has_sinks=True,
+            swa_cache_format="swa_fp8",
+            main_cache_format="main_fp8" if has_main else "main",
+            valid_prefix=path == "gather",
+        )
+        assert (wrapper._state.gather is not None) == (path == "gather")
+        assert wrapper._state.swa_scale == 2.0**exponent
+        out = torch.full_like(case["q"], torch.nan)
+        wrapper.run(
+            case["q"],
+            **inputs,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+            out=out,
+            validate=True,
+        )
+        if path == "gather":
+            assert not wrapper._packed
+        return out, wrapper._state.buffers["lse"].clone()
+
+    base = 512**-0.5
+    scaled, scaled_lse = run(2, base, 1.0)
+    unit, unit_lse = run(0, 4 * base, 4.0)
+    assert torch.isfinite(scaled).all()
+    torch.testing.assert_close(scaled, unit, atol=0, rtol=0)
+    torch.testing.assert_close(scaled_lse, unit_lse, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("path", ["gather", "producer", "nvfp4"])
+@torch.inference_mode()
+def test_prims_ts_q_scale_folds_into_the_softmax_scale(
+    path: Literal["gather", "producer", "nvfp4"],
+    q_fp8_exponent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E4M3 Q at a Q scale of 2**e attends as unit-scale Q of the same bytes with Q.K scaled
+    by 2**e, bit for bit, on every PrimTS kernel: the plan folds the Q scale into Q.K."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+
+    if path == "gather":
+        _force_gather(packed, monkeypatch)
+    nvfp4 = path == "nvfp4"
+    rows = 140 if nvfp4 else 32
+    main = _pool("main", 288, 200) if nvfp4 else _pool("main_fp8", 512, 200)
+    case = _gather_case(rows, 64, True, True, _pool("swa_fp8", 512, 300), main)
+    _, _, heads, _ = case["q"].shape
+    device = case["q"].device
+    q8 = case["q"].float().clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+    inputs = {key: value for key, value in case.items() if key != "q"}
+    max_extra_topk = case["extra_sparse_indices"].shape[1]
+
+    def run(exponent: int, softmax_scale: float) -> tuple:
+        q_fp8_exponent(exponent)
+        size = packed.get_packed_sparse_mla_workspace_size(
+            device, rows, heads, max_topk=128, max_extra_topk=max_extra_topk
+        )
+        wrapper = packed.PackedSparseMLA(torch.empty(size, device=device, dtype=torch.uint8))
+        wrapper.plan(
+            device,
+            rows,
+            heads,
+            max_topk=128,
+            max_extra_topk=max_extra_topk,
+            has_sinks=True,
+            swa_cache_format="swa_fp8",
+            main_cache_format="main" if nvfp4 else "main_fp8",
+            valid_prefix=path != "producer",
+        )
+        assert (wrapper._state.gather is not None) == (path == "gather")
+        assert (wrapper._state.nvfp4 is not None) == nvfp4
+        assert wrapper._state.q_scale == 2.0**exponent
+        out = torch.full_like(case["q"], torch.nan)
+        wrapper.run(q8, **inputs, softmax_scale=softmax_scale, out=out, validate=True)
+        return out, wrapper._state.buffers["lse"].clone()
+
+    base = 512**-0.5
+    scaled, scaled_lse = run(2, base)
+    unit, unit_lse = run(0, 4 * base)
+    assert torch.isfinite(scaled).all()
+    torch.testing.assert_close(scaled, unit, atol=0, rtol=0)
+    torch.testing.assert_close(scaled_lse, unit_lse, atol=0, rtol=0)

@@ -44,6 +44,7 @@ from .params import (
     CSA2Mode,
     CSA2Params,
     RowTransform,
+    q_fp8_scale_exponent,
 )
 
 # GB300, cold L2: the dense CuTe DSL GEMM beats every native config of O-B (5120 x 8192) from
@@ -908,7 +909,12 @@ class DeepseekV41Attention(nn.Module):
                     and not self.backend.sparse_params.use_packed_sparse_attention
                     and self._compute_helper is None
                 )
-                or (self.backend.compute_backend == "prims_ts" and self._compute_helper is not None)
+                or (
+                    self.backend.compute_backend == "prims_ts"
+                    and self._compute_helper is not None
+                    # The projection's E4M3 Q is unit-scale; a Q scale needs the BF16 Q.
+                    and q_fp8_scale_exponent() == 0
+                )
             )
             and positions.dtype in (torch.int32, torch.int64)
             and positions.is_contiguous()
@@ -1980,11 +1986,15 @@ class DeepseekV41Attention(nn.Module):
             quant_q = torch.empty(shape, dtype=torch.float8_e4m3fn, device=hidden_states.device)
             unwritten = _unwritten_rows(hidden_states.device, *shape)
             # A context-only batch run by PrimTS or the fused context kernel reads only the
-            # E4M3 Q, which then stays at unit scale; the BF16 Q is never written.
+            # E4M3 Q, which then stays at unit scale; the BF16 Q is never written. PrimTS
+            # with a Q scale (``q_fp8_scale_exponent``) rounds its BF16 Q itself instead.
             unit_q = (
                 getattr(self, "_unit_scale_context_query", False)
                 and attn_metadata.num_ctx_tokens == shape[0]
-                and (self.backend.compute_backend == "prims_ts" or native_context)
+                and (
+                    native_context
+                    or (self.backend.compute_backend == "prims_ts" and q_fp8_scale_exponent() == 0)
+                )
             )
             q = (
                 unwritten
@@ -2040,7 +2050,11 @@ class DeepseekV41Attention(nn.Module):
                 from .projection import gptj_rope_e4m3_small_m
 
                 gptj_rope_e4m3_small_m(
-                    q, positions.reshape(-1), self.rotary_emb.rotary_cos_sin, small_q
+                    q,
+                    positions.reshape(-1),
+                    self.rotary_emb.rotary_cos_sin,
+                    small_q,
+                    scale_exponent=q_fp8_scale_exponent(),
                 )
                 quant_q = small_q
             elif not fused_query and quant_q is None and not direct:

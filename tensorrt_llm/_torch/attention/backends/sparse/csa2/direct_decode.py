@@ -47,6 +47,8 @@ import torch
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm.math_utils import ceil_div, pad_up
 
+from .params import swa_fp8_scale_exponent
+
 #: Largest query-row count per rank the direct decode serves (a cluster of up to 8 CTAs per row).
 MAX_ROWS = 16
 HEAD_DIM = 512
@@ -1096,6 +1098,7 @@ def _kernel_type():
             rows_out: bool = False,
             rows_in: bool = False,
             swa_scaled: bool = True,
+            swa_scale_exponent: int = 0,
         ):
             self.q_heads = q_heads or heads
             self.heads = heads
@@ -1112,8 +1115,9 @@ def _kernel_type():
             # Widest load (bytes) every row's payload start is aligned to.
             self.swa_vec = swa_vec
             self.main_vec = main_vec
-            # SWA rows carry UE8M0 scales per 32 channels (528 B) or are unit-scale E4M3 (512 B).
+            # SWA rows carry UE8M0 scales per 32 channels (528 B) or are E4M3(x / 2**e) (512 B).
             self.swa_scaled = swa_scaled
+            self.swa_scale_exponent = 0 if swa_scaled else swa_scale_exponent
             self.inputs_ready = inputs_ready
             self.main_ready = main_ready and main_width > 0
             self.v2 = v2
@@ -1439,7 +1443,7 @@ def _kernel_type():
                 dst = k_addr + r * _KEY_ROW + 32 * lane
                 if const_expr(want & 1):
                     if kinds[i] == 1:
-                        s = Float32(1.0)
+                        s = Float32(2.0**self.swa_scale_exponent)
                         if const_expr(self.swa_scaled):
                             s = swa_scale(scale_byte[i])
                         o0, o1 = self._swa4(data[i, 0], s)
@@ -2780,6 +2784,7 @@ def direct_sparse_decode(
         rows_out is not None,
         rows_in is not None,
         swa_scaled,
+        0 if swa_scaled else swa_fp8_scale_exponent(),
     )
     key = (q.device.index, *config)
     swa_index_type = cutlass.Int64 if swa_index64 else cutlass.Int32

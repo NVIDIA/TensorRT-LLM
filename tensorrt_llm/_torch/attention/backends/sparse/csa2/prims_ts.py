@@ -17,7 +17,13 @@ from ._prims_ts_bank import (
     main_record_owners_reserved_rows,
     main_records_rows_limit,
 )
-from .params import CSA2BackendForwardArgs, PrimsTSMainFormat, SwaCacheFormat
+from .params import (
+    CSA2BackendForwardArgs,
+    PrimsTSMainFormat,
+    SwaCacheFormat,
+    q_fp8_scale_exponent,
+    swa_scale_exponent,
+)
 
 if TYPE_CHECKING:
     from .backend import CSA2TrtllmAttention
@@ -381,16 +387,21 @@ class CSA2PrimsTS:
         The fused Q projection rounds its RoPE'd BF16 Q RN/satfinite to E4M3 at unit scale,
         as the kernel's own quantization would. A context tile with
         ``projected_q_unit_scale`` gets no BF16 Q at all; a generation tile takes the
-        projection's E4M3 Q when it carries no amax word (no live rescale).
+        projection's E4M3 Q when it carries no amax word (no live rescale). With a Q scale
+        (``q_fp8_scale_exponent``) a context tile rounds its BF16 Q itself, since the fused
+        projection's Q is unit-scale; the module hands a generation tile only E4M3 Q at the
+        Q scale (``gptj_rope_e4m3_small_m``).
         """
         projected = raw.projected_quant_q
         generation = (
             forward_args.attention_input_type == AttentionInputType.generation_only
             and raw.projected_q_amax is None
         )
-        if projected is None or not (
-            forward_args.attention_input_type == AttentionInputType.context_only or generation
-        ):
+        context = (
+            forward_args.attention_input_type == AttentionInputType.context_only
+            and q_fp8_scale_exponent() == 0
+        )
+        if projected is None or not (context or generation):
             if raw.projected_q_unit_scale:
                 raise ValueError("CSA2 PrimTS unit-scale context Q requires its projected E4M3 Q")
             return q
@@ -450,6 +461,8 @@ class CSA2PrimsTS:
         scale = 1.0 / (self.attention.q_scaling * math.sqrt(_HEAD_DIM))
         _validate_softmax_scale(scale)
         swa_cache_format = raw.swa_cache_format or self.attention.swa_cache_format
+        # MAIN banks decode into the domain of the SWA rows attended with them.
+        main_exponent = swa_scale_exponent(swa_cache_format)
         # An eager context phase reads its MAIN rows from a bank decoded once per
         # row, not per selection: all of its requests' rows, or only the selected
         # ones when its queries select fewer rows than the requests own.
@@ -517,7 +530,9 @@ class CSA2PrimsTS:
                     marks = main_bank_marks(arenas, q.device, bank.rows)
                 else:
                     # After this layer's MAIN publication, on the stream that wrote it.
-                    decode_main_bank(inputs.main_pool, bank, main_source)
+                    decode_main_bank(
+                        inputs.main_pool, bank, main_source, scale_exponent=main_exponent
+                    )
             extra_indices = prepared.extra_indices
             arena = record["arena"]
             group = None if bank is not None else self._main_selection_group(inputs, q.shape[0])
@@ -581,10 +596,15 @@ class CSA2PrimsTS:
                         main_source,
                         arenas,
                         claimed=True,
+                        scale_exponent=main_exponent,
                     )
                 else:
                     decode_main_records(
-                        inputs.main_pool, prepared.extra_indices, main_source, arenas
+                        inputs.main_pool,
+                        prepared.extra_indices,
+                        main_source,
+                        arenas,
+                        scale_exponent=main_exponent,
                     )
                 arenas[_SELECTION_BANK_HOLDER_KEY] = bank_holder
 
@@ -623,7 +643,9 @@ class CSA2PrimsTS:
                 self._selection_done.wait()
             if marks is not None:
                 # The rows the compaction kept, after this layer's MAIN publication.
-                decode_main_bank(inputs.main_pool, bank, main_source, marks)
+                decode_main_bank(
+                    inputs.main_pool, bank, main_source, marks, scale_exponent=main_exponent
+                )
             if decodes and not early:
                 # The compacted MAIN records, after this layer's MAIN publication.
                 decode_selection_bank()

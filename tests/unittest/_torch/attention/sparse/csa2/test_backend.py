@@ -2748,6 +2748,90 @@ def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(
     assert error / reference.float().abs().amax().item() < 0.03
 
 
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize("main_kernel", ["decoded", "default"])
+@torch.inference_mode()
+def test_prims_ts_scales_keep_image_token_magnitudes(
+    main_kernel: str,
+    swa_fp8_storage_exponent,
+    q_fp8_exponent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q and KV of roughly an image token's magnitude, far past 448, through PrimTS on the fp8
+    KV cache: at unit scales its fp8 SWA rows, E4M3 Q and decoded MAIN operands clip at 448,
+    and with TRTLLM_CSA2_SWA_FP8_AMAX and TRTLLM_CSA2_Q_FP8_AMAX covering the magnitudes it
+    matches the unclipped reference as closely as native staging does
+    (``test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range``).
+
+    The reference keeps the SWA rows' E4M3 rounding at the covering scale, the MAIN records'
+    exact decode and the BF16 Q, so the error is the clipping plus PrimTS's own operand
+    rounding. ``q_scaling`` keeps the softmax away from a hard argmax at these magnitudes.
+    ``decoded`` keeps MAIN off the NVFP4 MAIN kernel, so its banks and the producer decode MAIN
+    at the SWA scale; ``default`` keeps MAIN inside 448, since the NVFP4 MAIN kernel, where it
+    admits the tile, decodes MAIN at unit scale.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_packed as packed
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_rows,
+        unpack_rows,
+    )
+
+    _forbid_prims_ts_staging(monkeypatch)
+    if main_kernel == "decoded":
+        monkeypatch.setattr(packed, "_select_nvfp4_profile", lambda *args, **kwargs: None)
+    torch.manual_seed(1910)
+    count, heads, magnitude = _prims_ts_query_count("inside"), 64, 600.0
+    main_magnitude = magnitude if main_kernel == "decoded" else 50.0
+    q_scaling = magnitude * magnitude
+    scale = 1.0 / (q_scaling * math.sqrt(512))
+    q = (torch.randn(count, heads, 512, device="cuda") * magnitude).bfloat16()
+    swa = (torch.randn(count, 128, 512, device="cuda") * magnitude).bfloat16()
+    main = (torch.randn(count, 512, 512, device="cuda") * main_magnitude).bfloat16()
+    swa_valid = torch.ones(count, 128, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(count, 512, device="cuda", dtype=torch.bool)
+    swa_valid[:, 1::11] = False
+    main_valid[:, 3::17] = False
+    sink = torch.linspace(-1.75, 2.25, heads, device="cuda")
+    # 448 * 2**3 covers every value drawn here.
+    covering = 3
+    exact_swa = unpack_rows(
+        pack_rows(swa.flatten(0, 1), "swa_fp8", scale_exponent=covering),
+        512,
+        "swa_fp8",
+        torch.float32,
+        scale_exponent=covering,
+    ).view(count, 128, 512)
+    exact_main = unpack_rows(pack_rows(main.flatten(0, 1), "main"), 512, "main", torch.float32)
+    exact_main = exact_main.view(count, 512, 512)
+    assert q.abs().amax().item() > 448 and exact_swa.abs().amax().item() > 448
+    assert max(q.abs().amax().item(), exact_swa.abs().amax().item()) <= 448 * 2.0**covering
+    assert (exact_main.abs().amax().item() > 448) == (main_kernel == "decoded")
+    reference = _reference(q, exact_swa, exact_main, swa_valid, main_valid, sink, scale=scale)
+    reference = reference.float()
+
+    def error(exponent: int) -> float:
+        swa_fp8_storage_exponent(exponent)
+        q_fp8_exponent(exponent)
+        attn = _backend(
+            heads, compute_backend="prims_ts", kv_cache_dtype="fp8", q_scaling=q_scaling
+        )
+        assert attn.swa_cache_format == "swa_fp8"
+        args = _inputs(
+            q, swa, main, swa_valid, main_valid, sink, swa_cache_format=attn.swa_cache_format
+        )
+        metadata = CSA2TrtllmMetadata.for_query_tile(q, 512, kv_input_mode="packed")
+        actual = _helper_forward(attn, q.flatten(1), metadata, args).view_as(q).float()
+        assert torch.isfinite(actual).all()
+        # As in the native test, the mean is the stable measure of sharp softmaxes.
+        return (actual - reference).abs().mean().item() / reference.abs().amax().item()
+
+    unit = error(0)
+    scaled = error(covering)
+    assert scaled < 0.03
+    assert unit > 3 * scaled
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("kv_dtype", ["fp8", "fp8_ds_mla", "auto"])
 @pytest.mark.parametrize("native_fp8", [False, True])

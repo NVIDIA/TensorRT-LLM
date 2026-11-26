@@ -57,7 +57,7 @@ caches as described below.
 
 `CSA2PrimsTS` passes persistent packed caches directly to the managed PrimTS
 sparse MLA kernel through its `kv_producer` extension. The CSA2 producer reads
-SWA `uint8[N,512]` for explicit `kv_cache_config.dtype="fp8"` (unit-scale E4M3),
+SWA `uint8[N,512]` for explicit `kv_cache_config.dtype="fp8"` (E4M3 at its storage scale),
 or `uint8[N,528]` for the legacy format (E4M3 plus group-32 UE8M0 scales), and
 MAIN `uint8[N,288]` (packed E2M1 plus group-16 E4M3 scales), including padded
 outer strides. The format is explicit; padding never determines its encoding.
@@ -67,7 +67,7 @@ it allocates no requantized KV bank, and captured context phases fill no decoded
 bank either. Each context query selects up to `index_topk` MAIN rows
 from its request's GLOBAL rows, so decoding selections converts the same records
 many times. An eager context phase instead reads its MAIN rows from a
-unit-scale E4M3 `uint8[rows,512]` bank laid out by the native shared tables'
+E4M3 `uint8[rows,512]` bank, at the SWA rows' storage scale, laid out by the native shared tables'
 main offsets, which `_prims_ts_bank.py` decodes with the producer's own
 conversion. A phase whose selections cover at least its requests' MAIN rows
 decodes all of them. One that selects fewer, such as a bounded-replay tile of a
@@ -94,7 +94,7 @@ whose selections are final before its projections keeps the selection bank below
 side stream beside the projections (below), and the gather kernel is faster than
 the NVFP4 MAIN kernel. Other tiles with FP8
 SWA whose gather schedule applies decode their selections into a selection bank
-instead, one unit-scale E4M3 `uint8[512]` row per compacted selection. Query rows of one request may select the same MAIN row: the
+instead, one E4M3 `uint8[512]` row per compacted selection, at the SWA rows' storage scale. Query rows of one request may select the same MAIN row: the
 compaction then also claims an epoch-tagged INT64 owner slot per kept pool row
 (never cleared, since each call claims with the next epoch), and
 `dedup_main_records` decodes each selected row once, into the bank row of its
@@ -406,8 +406,28 @@ scale bytes per 64-row page), so decode reads it in place through a block table
 derived from the GLOBAL page table, as the DeepSeek-V4 indexer reads its own
 index cache. The published layout uses 890 global bytes per original
 token, excluding SWA, compressor state and compute workspace. SWA uses 512-byte
-unit-scale E4M3 rows for explicit `fp8`, or legacy 528-byte MXFP8 rows for
+E4M3 rows for explicit `fp8`, or legacy 528-byte MXFP8 rows for
 `fp8_ds_mla`, `auto` and `bfloat16`. All formats include their RoPE channels.
+
+`fp8` SWA rows hold E4M3(x / 2**e) at one process-wide power-of-two storage scale.
+`TRTLLM_CSA2_SWA_FP8_AMAX` (default 448, so `e = 0`) is the largest SWA magnitude the
+rows must hold, and `e` is the smallest exponent with `448 * 2**e >= amax`, from -8 to 3
+(three binades are all native context staging spends). Every process that shares a
+cache, such as the context and generation workers of a disaggregated deployment, must
+set the same value: KV transfers copy the bytes. Writers divide by `2**e` before
+rounding, and native staging, the gather and the direct decode multiply it back exactly.
+PrimTS's NVFP4 MAIN kernel takes `2**e` as its FP8 SWA pool's tensor scale. Its gather
+and producer kernels instead decode MAIN into the SWA rows' domain (`decode_main_*` banks
+and `PackedKvProducer.main_scale_exponent`) and scale Q.K and the output by `2**e`. MAIN
+rows the NVFP4 MAIN kernel decodes still saturate at 448.
+
+PrimTS's E4M3 Q likewise holds E4M3(q / 2**e_q) at one process-wide power-of-two scale:
+`TRTLLM_CSA2_Q_FP8_AMAX` (default 448, so `e_q = 0`) is the largest query magnitude, and
+`e_q` ranges from -8 to 8. PrimTS's own Q rounding (`UnitScaleQuery`) and the small-step
+RoPE (`gptj_rope_e4m3_small_m`) write Q at that scale, and every PrimTS kernel scales Q.K
+by `2**e_q`. The projections' E4M3 Q stays unit-scale, so with `e_q != 0` a PrimTS module
+takes neither the FP8 decode Q projection nor a unit-scale context Q; a context batch the
+fused context kernel serves keeps its unit-scale Q, which native staging scales itself.
 These persistent formats are part of CSA2's cache contract and do not require
 a generic NVFP4 KV-cache flag. Projection precision and the selected attention
 compute path do not change the persistent main-cache encoding.

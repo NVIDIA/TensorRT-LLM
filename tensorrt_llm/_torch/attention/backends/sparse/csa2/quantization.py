@@ -15,9 +15,20 @@ from typing import Literal
 
 import torch
 
-from .params import SwaCacheFormat
+from .params import SwaCacheFormat, swa_fp8_scale_exponent
 
 CacheFormat = Literal["main", "index", "swa", "swa_fp8"]
+
+
+def _storage_exponent(cache_format: CacheFormat, scale_exponent: int | None) -> int:
+    """Exponent ``e`` of a format's storage scale: swa_fp8 rows hold E4M3(x / 2**e).
+
+    ``None`` takes the process's ``swa_fp8_scale_exponent()``; other formats carry their own
+    group scales and take none.
+    """
+    if cache_format != "swa_fp8":
+        return 0
+    return swa_fp8_scale_exponent() if scale_exponent is None else scale_exponent
 
 
 def row_bytes(head_dim: int, cache_format: CacheFormat) -> int:
@@ -38,14 +49,21 @@ def _fp4_levels(device: torch.device) -> torch.Tensor:
     )
 
 
-def pack_rows(x: torch.Tensor, cache_format: CacheFormat) -> torch.Tensor:
-    """Encode floating rows [..., head_dim] as uint8 [..., row_bytes]."""
+def pack_rows(
+    x: torch.Tensor, cache_format: CacheFormat, *, scale_exponent: int | None = None
+) -> torch.Tensor:
+    """Encode floating rows [..., head_dim] as uint8 [..., row_bytes].
+
+    swa_fp8 rows hold E4M3(x / 2**e), ``e`` from ``_storage_exponent``.
+    """
     dim = x.shape[-1]
     row_bytes(dim, cache_format)
     if cache_format == "swa_fp8":
-        # Native unit-scale E4M3 conversion saturates infinities and preserves
-        # signed zero, but canonicalizes either NaN sign to 0x7F.
-        values = x.float().clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+        # Native E4M3 conversion saturates infinities and preserves signed zero,
+        # but canonicalizes either NaN sign to 0x7F. The power-of-two scale is exact.
+        exponent = _storage_exponent(cache_format, scale_exponent)
+        stored = x.float() if exponent == 0 else x.float() * 2.0**-exponent
+        values = stored.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
         return torch.where(torch.isnan(x), 127, values)
     group = 16 if cache_format == "main" else 32
     blocks = x.float().reshape(*x.shape[:-1], dim // group, group)
@@ -84,12 +102,16 @@ def unpack_rows(
     head_dim: int,
     cache_format: CacheFormat,
     dtype: torch.dtype = torch.bfloat16,
+    *,
+    scale_exponent: int | None = None,
 ) -> torch.Tensor:
     """Decode uint8 rows after gathering from a paged or contiguous pool."""
     if rows.dtype != torch.uint8 or rows.shape[-1] != row_bytes(head_dim, cache_format):
         raise ValueError("CSA2 packed cache has the wrong row shape or dtype")
     if cache_format == "swa_fp8":
-        return rows.contiguous().view(torch.float8_e4m3fn).to(dtype)
+        exponent = _storage_exponent(cache_format, scale_exponent)
+        values = rows.contiguous().view(torch.float8_e4m3fn)
+        return values.to(dtype) if exponent == 0 else (values.float() * 2.0**exponent).to(dtype)
     data_bytes = head_dim if cache_format == "swa" else head_dim // 2
     data = rows[..., :data_bytes].contiguous()
     scale_bytes = rows[..., data_bytes:].contiguous()

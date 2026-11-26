@@ -54,6 +54,82 @@ from .quantization import row_bytes
 __all__ = ["PackedKvProducer", "main_row_bytes"]
 
 
+def f16x2_pow2(exponent: int) -> int:
+    """The F16x2 bits of ``2**exponent`` in both halves, for a normal F16 power of two."""
+    if not -14 <= exponent <= 15:
+        raise ValueError("The F16 power of two must be normal")
+    bits = (exponent + 15) << 10
+    return bits | (bits << 16)
+
+
+@cute.jit
+def cvt_e2m1_word_to_e4m3_words_scaled(
+    packed_word: Int32, sf_byte: Int32, factor_pair: Int32
+) -> tuple[Int32, Int32]:
+    """Scale eight dense-packed E2M1 values by an E4M3 group scale and a power-of-two factor.
+
+    As ``_cvt_e2m1_word_to_e4m3_words``, with each exact F16 product also multiplied by the
+    F16x2 ``factor_pair`` (``f16x2_pow2``) before the RN/satfinite E4M3 rounding. E2M1 times
+    an E4M3 scale has at most five significant bits and lies in [2**-10, 2688], so the
+    factor is exact unless the product overflows F16, which the rounding saturates.
+    """
+    sf_pair = (sf_byte & Int32(0xFF)) * Int32(0x101)
+    return cute.arch.inline_ptx(
+        """
+        {
+            .reg .b16 sf;
+            .reg .b32 sfFp16x2;
+            .reg .b32 factor;
+            .reg .b8 b0, b1, b2, b3;
+            .reg .b32 h0, h1, h2, h3;
+            .reg .b16 e0, e1, e2, e3;
+            mov.b32 {sf, _}, {$r1};
+            cvt.rn.f16x2.e4m3x2 sfFp16x2, sf;
+            mov.b32 factor, {$r2};
+            mov.b32 {b0, b1, b2, b3}, {$r0};
+            cvt.rn.f16x2.e2m1x2 h0, b0;
+            cvt.rn.f16x2.e2m1x2 h1, b1;
+            cvt.rn.f16x2.e2m1x2 h2, b2;
+            cvt.rn.f16x2.e2m1x2 h3, b3;
+            mul.rn.f16x2 h0, h0, sfFp16x2;
+            mul.rn.f16x2 h1, h1, sfFp16x2;
+            mul.rn.f16x2 h2, h2, sfFp16x2;
+            mul.rn.f16x2 h3, h3, sfFp16x2;
+            mul.rn.f16x2 h0, h0, factor;
+            mul.rn.f16x2 h1, h1, factor;
+            mul.rn.f16x2 h2, h2, factor;
+            mul.rn.f16x2 h3, h3, factor;
+            cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;
+            cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;
+            cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;
+            cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;
+            mov.b32 {$w0}, {e0, e1};
+            mov.b32 {$w1}, {e2, e3};
+        }
+        """,
+        write_only_types=[Int32, Int32],
+        read_only_args=[packed_word, sf_pair, factor_pair],
+    )
+
+
+@cute.jit
+def cvt_e2m1_word_to_e4m3_words_descaled(
+    packed_word: Int32, sf_byte: Int32, exponent: cutlass.Constexpr
+) -> tuple[Int32, Int32]:
+    """``_cvt_e2m1_word_to_e4m3_words`` of the decoded values divided by ``2**exponent``.
+
+    swa_fp8 SWA rows hold E4M3(x / 2**e); a MAIN source read with them in one softmax
+    decodes into the same domain with ``exponent = e``.
+    """
+    if cutlass.const_expr(exponent == 0):
+        words = _cvt_e2m1_word_to_e4m3_words(packed_word, sf_byte)
+    else:
+        words = cvt_e2m1_word_to_e4m3_words_scaled(
+            packed_word, sf_byte, Int32(f16x2_pow2(-exponent))
+        )
+    return words
+
+
 def main_row_bytes(main_format: PrimsTSMainFormat) -> int:
     """Row width of a MAIN source: a packed NVFP4 record or a decoded E4M3 bank row."""
     if main_format == "main":
@@ -456,6 +532,8 @@ class _PackedSmemKvResource(SmemKvResource):
     Operands carry the cache values at unit tensor scale: group scales are
     applied while decoding and the result is rounded RN/satfinite to E4M3.
     ``main_fp8`` MAIN rows already hold those operand bytes and are copied.
+    With ``main_scale_exponent`` NVFP4 MAIN records decode to E4M3(x / 2**e), the
+    domain of swa_fp8 rows stored at that scale.
     """
 
     swa: object = None
@@ -464,6 +542,7 @@ class _PackedSmemKvResource(SmemKvResource):
     swa_cache_format: SwaCacheFormat = "swa"
     main_cache_format: PrimsTSMainFormat = "main"
     aligned_strides: bool = True
+    main_scale_exponent: int = 0
 
     # Fetches only issue a chunk's global loads and return its scale byte (-1
     # for a masked row) and payload words as SSA values, never local arrays, so
@@ -520,6 +599,9 @@ class _PackedSmemKvResource(SmemKvResource):
                     values[word] = payload[word]
             else:
                 scale = _e4m3_scale(scale_byte)
+                if cutlass.const_expr(self.main_scale_exponent != 0):
+                    # Exact in FP32: the products below round once, to E4M3(x / 2**e).
+                    scale = scale * Float32(2.0**-self.main_scale_exponent)
                 for word in cutlass.range_constexpr(4):
                     pair = payload[word // 2] >> Int32((word % 2) * 16)
                     values[word] = _scale_bf16_pairs_to_e4m3(
@@ -816,8 +898,12 @@ class _PackedSmemKvResource(SmemKvResource):
             for step in cutlass.range_constexpr(first, first + batch):
                 payload, scale, valid = fetched[step]
                 values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-                values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(Int32(payload[0]), scale)
-                values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(Int32(payload[1]), scale)
+                values[0], values[1] = cvt_e2m1_word_to_e4m3_words_descaled(
+                    Int32(payload[0]), scale, self.main_scale_exponent
+                )
+                values[2], values[3] = cvt_e2m1_word_to_e4m3_words_descaled(
+                    Int32(payload[1]), scale, self.main_scale_exponent
+                )
                 for word in cutlass.range_constexpr(4):
                     values[word] = values[word] if valid else Int32(0)
                 offset = self._chunk_offset(
@@ -906,8 +992,12 @@ class _PackedSmemKvResource(SmemKvResource):
             chunk = chunks[owner]
             scale = Int32(chunk[2]) >> shift
             values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-            values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(Int32(chunk[0]), scale)
-            values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(Int32(chunk[1]), scale)
+            values[0], values[1] = cvt_e2m1_word_to_e4m3_words_descaled(
+                Int32(chunk[0]), scale, self.main_scale_exponent
+            )
+            values[2], values[3] = cvt_e2m1_word_to_e4m3_words_descaled(
+                Int32(chunk[1]), scale, self.main_scale_exponent
+            )
             words.data_ptr(slots[owner] // Int32(4)).store(values.load(0, 4), alignment=16)
 
     @cute.jit
@@ -1199,6 +1289,8 @@ class PackedKvProducer:
     ``raw_selections`` reads the selections as the layer publishes them instead of
     compacted INT32 physical rows: INT64 SWA slots and INT32 logical MAIN positions
     resolved through the owner's page table (see :class:`_RawKVIndices`).
+    ``main_scale_exponent`` decodes NVFP4 MAIN records to E4M3(x / 2**e), the domain of
+    swa_fp8 rows that hold E4M3(x / 2**e); the caller scales Q.K and the output by 2**e.
     """
 
     has_extra: bool
@@ -1206,6 +1298,7 @@ class PackedKvProducer:
     aligned_strides: bool = True
     main_cache_format: PrimsTSMainFormat = "main"
     raw_selections: bool = False
+    main_scale_exponent: int = 0
 
     def __post_init__(self) -> None:
         if self.swa_cache_format not in ("swa", "swa_fp8"):
@@ -1234,6 +1327,12 @@ class PackedKvProducer:
             self.has_extra,
             self.aligned_strides,
             ("i64_slots", "i32_logical_paged") if self.raw_selections else ("i32_physical",),
+            # Unit-scale producers keep their signature, and with it their cached kernels.
+            *(
+                (("main_descale_pow2", self.main_scale_exponent),)
+                if self.main_scale_exponent
+                else ()
+            ),
         )
 
     def pipeline_config(
@@ -1282,6 +1381,7 @@ class PackedKvProducer:
             swa_cache_format=self.swa_cache_format,
             main_cache_format=self.main_cache_format,
             aligned_strides=self.aligned_strides,
+            main_scale_exponent=self.main_scale_exponent,
             **kwargs,
         )
 

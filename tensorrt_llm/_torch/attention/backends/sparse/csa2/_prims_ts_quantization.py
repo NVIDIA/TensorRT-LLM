@@ -31,10 +31,16 @@ _BLOCK = 1024
 @triton.autotune(configs=[triton.Config({"BLOCK_SIZE": _BLOCK}, num_warps=4)], key=[])
 @triton.jit(do_not_specialize=["rows"])
 def _quantize_query(
-    q_ptr, q8_pairs, rows, QUERY_WIDTH: tl.constexpr, BLOCK_SIZE: tl.constexpr
+    q_ptr,
+    q8_pairs,
+    rows,
+    QUERY_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE: tl.constexpr = 1.0,
 ) -> None:
-    # Q8 = RN-satfinite(Q): each pair takes the PTX conversion of the native
-    # query converter, so out-of-range values saturate to +-448.
+    # Q8 = RN-satfinite(Q * SCALE): each pair takes the PTX conversion of the native
+    # query converter, so out-of-range values saturate to +-448. A power-of-two SCALE
+    # (``q_fp8_scale_exponent``) is exact.
     q_values = rows.to(tl.int64) * QUERY_WIDTH
     columns = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     pairs = tl.arange(0, BLOCK_SIZE // 2).to(tl.int64)
@@ -42,6 +48,8 @@ def _quantize_query(
     for tile in range(program, tl.cdiv(q_values, BLOCK_SIZE), tl.num_programs(0).to(tl.int64)):
         values = tile * BLOCK_SIZE + columns
         q = tl.load(q_ptr + values, values < q_values, other=0).to(tl.float32)
+        if SCALE != 1.0:
+            q = q * SCALE
         low, high = tl.split(tl.reshape(q, (BLOCK_SIZE // 2, 2)))
         packed = tl.inline_asm_elementwise(
             "cvt.rn.satfinite.e4m3x2.f32 $0, $2, $1;",
@@ -57,25 +65,31 @@ def _quantize_query(
 
 @dataclass(frozen=True)
 class UnitScaleQuery:
-    """Precompiled BF16 to E4M3 query staging at unit scale.
+    """Precompiled BF16 to E4M3 query staging at a power-of-two scale.
 
-    Q and the E4M3 destination remain live run-time arguments. The attention
-    kernel then reads Q8 with a Q descale of one, so the caller's host softmax
-    scale is the effective one.
+    Q and the E4M3 destination remain live run-time arguments. Q8 holds
+    E4M3(q / 2**scale_exponent), so the attention kernel takes the host softmax
+    scale times ``2**scale_exponent`` (unit scale by default).
     """
 
     kernel: CompiledKernel
     rows: int
     blocks: int
+    scale_exponent: int = 0
 
     @classmethod
     def plan(
-        cls, device: torch.device, rows: int, heads: int, q8: torch.Tensor
+        cls,
+        device: torch.device,
+        rows: int,
+        heads: int,
+        q8: torch.Tensor,
+        scale_exponent: int = 0,
     ) -> "UnitScaleQuery":
         """Precompile the converter, without reading inputs.
 
-        The kernel depends on the head count, not on ``rows``, so plans for other
-        row counts reuse the compiled kernel.
+        The kernel depends on the head count and scale, not on ``rows``, so plans for
+        other row counts reuse the compiled kernel.
         """
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         blocks = max(1, min(8 * sm_count, triton.cdiv(rows * heads * 512, _BLOCK)))
@@ -85,11 +99,13 @@ class UnitScaleQuery:
                 q8.view(torch.int16),
                 rows,
                 QUERY_WIDTH=heads * 512,
+                SCALE=2.0**-scale_exponent,
                 grid=(blocks,),
             )[0]
-        return cls(kernel, rows, blocks)
+        return cls(kernel, rows, blocks, scale_exponent)
 
     def run(self, q: torch.Tensor, q8: torch.Tensor) -> None:
-        """Write RN-satfinite E4M3 Q into ``q8`` without allocation or host reads."""
+        """Write RN-satfinite E4M3(Q / 2**scale_exponent) into ``q8`` without allocation or
+        host reads."""
         with torch.cuda.device(q.device):
             self.kernel[(self.blocks, 1, 1)](q, q8.view(torch.int16), self.rows)
