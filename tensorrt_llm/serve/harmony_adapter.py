@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
@@ -1593,7 +1594,8 @@ class HarmonyAdapter:
                 index=0,
                 delta=delta_message,
                 logprobs=None,
-                finish_reason="stop" if should_stop else None,
+                finish_reason=_determine_stream_finish_reason(
+                    stream_state, "stop") if should_stop else None,
                 stop_reason=None)
 
             stream_response = _create_stream_response(
@@ -1799,7 +1801,9 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
                     ChatCompletionResponseStreamChoice(
                         index=0,
                         delta=DeltaMessage(),
-                        finish_reason=output.finish_reason,
+                        finish_reason=_determine_stream_finish_reason(
+                            harmony_adapter.get_stream_state(request_id),
+                            output.finish_reason),
                         stop_reason=output.stop_reason)
                 ],
                 stream_response_id=stream_response_id,
@@ -1951,6 +1955,19 @@ def _determine_finish_reason(parsed_output: dict[str, Any],
         return "tool_calls"
     else:
         return reason
+
+
+def _determine_stream_finish_reason(stream_state: HarmonyStreamState | None,
+                                    reason: str | None) -> str | None:
+    """Determine the finish reason of a streamed turn.
+
+    A turn that streamed a tool call and stopped finishes with "tool_calls",
+    as the chat stream of other models reports it. ``stream_state.tool_calls``
+    holds only the tool calls that passed tool filtering, i.e. those streamed.
+    """
+    if reason == "stop" and stream_state is not None and stream_state.tool_calls:
+        return "tool_calls"
+    return reason
 
 
 def _create_usage_info(num_prompt_tokens,
