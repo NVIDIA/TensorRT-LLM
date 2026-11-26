@@ -353,10 +353,16 @@ def test_static_mtp_publishes_bounded_stride_before_attention_prepare():
     engine._prepare_attn_metadata(
         host, batch, None, metadata, None, config, enable_spec_decode=True, is_dummy=False
     )
-    engine._prepare_attn_metadata(
-        host, batch, None, metadata, None, None, enable_spec_decode=False, is_dummy=False
+    no_spec_metadata = SimpleNamespace(is_cuda_graph=True, runtime_tokens_per_gen_step=8)
+    no_spec_observed = []
+    no_spec_metadata.prepare = lambda: no_spec_observed.append(
+        no_spec_metadata.runtime_tokens_per_gen_step
     )
-    assert observed == [3, 8]
+    engine._prepare_attn_metadata(
+        host, batch, None, no_spec_metadata, None, None, enable_spec_decode=False, is_dummy=False
+    )
+    assert observed == [3]
+    assert no_spec_observed == [8]
 
 
 def test_attach_ragged_layout_refreshes_persistent_buffers_in_place() -> None:
