@@ -93,13 +93,15 @@ BASELINE = {
     ],
     "tests/unittest/llmapi/apps/test_anthropic_routes.py": [
         "_batch_client OpenAIServer",
-        "_chat_stream OpenAIServer",
         "_count_tokens_client OpenAIServer",
+        "_disagg_route_client OpenAIDisaggServer",
         "_handle OpenAIDisaggServer",
         "_make_route_client OpenAIDisaggServer",
         "_make_route_client OpenAIServer",
+        "_streaming_chat_server OpenAIServer",
         "test_await_disconnected_returns_immediately_for_a_synthetic_request OpenAIServer",
         "test_batch_routes_are_registered_on_the_standard_server OpenAIServer",
+        "test_batched_message_is_named_after_the_executor_client_id OpenAIServer",
         "test_count_tokens_honours_the_server_chat_template OpenAIServer",
         "test_create_batch_at_capacity_is_429_not_400 OpenAIServer",
         "test_results_of_an_unfinished_batch_are_400_not_404.scenario OpenAIServer",
@@ -108,6 +110,10 @@ BASELINE = {
     ],
     "tests/unittest/llmapi/apps/test_context_length_error.py": [
         "_disagg_server OpenAIDisaggServer",
+    ],
+    "tests/unittest/llmapi/apps/test_openai_server_graceful_shutdown.py": [
+        "_config_keywords OpenAIServer",
+        "_serve_never_finishing_handler OpenAIServer",
     ],
     "tests/unittest/llmapi/apps/test_openai_server_iteration_stats.py": [
         "_make_server OpenAIServer",

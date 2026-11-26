@@ -24,7 +24,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import Fp8BlockScaleWeightSliceCache
 
 
-def _make_linear(backend, bias):
+def _make_linear(backend, bias, small_m=False):
     torch.manual_seed(42)
     in_features, out_features = 512, 1152
     quantized = backend != "bf16"
@@ -52,6 +52,7 @@ def _make_linear(backend, bias):
         checkpoint["weight"] = weight.bfloat16()
     if bias:
         checkpoint["bias"] = torch.randn(out_features, dtype=torch.bfloat16, device="cuda")
+    linear.use_fp8_small_m_gemm = small_m
     linear.load_weights([checkpoint])
     linear.post_load_weights()
     return linear, checkpoint
@@ -120,10 +121,25 @@ def test_kimi_fp8_output_slice(start, end):
 def test_linear_output_slice_reload(backend):
     if get_sm_version() == 107 and backend == "fp8_deepgemm":
         pytest.skip("SM107 native FP8 slices are covered by fp8_cute")
-    linear, checkpoint = _make_linear(backend, False)
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import FP8BlockScaleGemmRunner
+
+    linear, checkpoint = _make_linear(backend, False, small_m=True)
     inputs = torch.randn(7, linear.in_features, dtype=torch.bfloat16, device="cuda")
     linear.prepare_output_slice(513, 1107)
     old_cache = linear._output_slice_cache
+    runner = FP8BlockScaleGemmRunner(torch.bfloat16)
+
+    def small_m():
+        operands = [inputs, linear.weight, linear.weight_scale, linear.weight_scale_block128]
+        return runner(operands, tactic=0)
+
+    # A small-M GEMM captured before the reload must read the reloaded weights and scales.
+    graph = None
+    if getattr(linear, "weight_scale_block128", None) is not None:
+        small_m()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = small_m()
     linear.pre_reload_weights()
     assert linear._output_slice_cache is None
     reloaded = {name: value.clone() for name, value in checkpoint.items()}
@@ -133,6 +149,9 @@ def test_linear_output_slice_reload(backend):
     actual = linear.forward_slice(inputs, 513, 1107)
     torch.testing.assert_close(actual, linear(inputs)[:, 513:1107], atol=0.005, rtol=0.03)
     assert linear._output_slice_cache is not old_cache
+    if graph is not None:
+        graph.replay()
+        torch.testing.assert_close(captured, small_m(), atol=0, rtol=0)
 
 
 @pytest.mark.cpu_only

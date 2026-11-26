@@ -189,13 +189,14 @@ def _create(
     real_dense_manager: bool = False,
     copy_mode: str | None = None,
     moe_backend: str = "CUTEDSL",
+    moe_tactic: str | None = None,
 ) -> tuple[list, object]:
     """Run ``create_py_executor`` with DWDP in ``mode``, start a forward of the executor it returns.
 
     Args:
         mode: ``"expert"`` (expert DWDP alone), ``"attached"`` (dense DWDP attached to it) or
             ``"standalone"`` (dense DWDP alone).
-        kv_cache: ``"estimated"``, ``"not_estimated"`` or ``"none"`` (a model without one).
+        kv_cache: ``"estimated"`` or ``"not_estimated"``.
         real_dense_manager: Standalone, the creator builds a real ``DenseDwdpManager``, whose
             setup only logs; the model engine logs the SM reserve it is built with.
         copy_mode: Standalone, ``dwdp_config.copy_mode``.
@@ -264,7 +265,6 @@ def _create(
         engine = _DummyModelEngine(
             attn_runtime_features=attn_runtime_features, kv_cache_quant_algo=QuantAlgo.NO_QUANT
         )
-        engine.model.model_config.is_generation = kv_cache != "none"
         return engine
 
     dense_mode = {"attached": DenseMode.ATTACHED, "standalone": DenseMode.STANDALONE}.get(mode)
@@ -277,7 +277,7 @@ def _create(
         create_py_executor_instance=create_py_executor_instance,
         create_py_executor_resources=create_py_executor_resources,
         ModelEngine=model_engine,
-        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None),
+        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None, True),
         _get_mapping=lambda _: Mapping(),
         dwdp_global_rank=lambda: 0,
         get_calibrator=_DummyCalibrator,
@@ -292,6 +292,7 @@ def _create(
         mem_get_info=lambda: (2 << 30, 4 << 30),
         empty_cache=lambda: None,
         reset_peak_memory_stats=lambda: None,
+        current_device=lambda: 0,
         memory_stats=lambda: {"allocated_bytes.all.current": 0},
         Stream=lambda: SimpleNamespace(cuda_stream=123),
     )
@@ -299,7 +300,7 @@ def _create(
         monkeypatch.setattr(py_executor_creator.torch.cuda, name, fake)
 
     llm_args = _make_llm_args()
-    llm_args.moe_config = SimpleNamespace(backend=moe_backend)
+    llm_args.moe_config = SimpleNamespace(backend=moe_backend, tactic=moe_tactic)
     if mode == "standalone":
         llm_args.dwdp_config = DwdpConfig(
             enable_experts=False, enable_dense=True, copy_mode=copy_mode
@@ -319,7 +320,7 @@ def _create(
     return log, manager
 
 
-@pytest.mark.parametrize("kv_cache", ["estimated", "not_estimated", "none"])
+@pytest.mark.parametrize("kv_cache", ["estimated", "not_estimated"])
 @pytest.mark.parametrize("mode", ["expert", "attached", "standalone"])
 def test_only_the_serving_phase_gets_the_manager(
     monkeypatch: pytest.MonkeyPatch, mode: str, kv_cache: str
@@ -347,7 +348,6 @@ def test_only_the_serving_phase_gets_the_manager(
             "rebind",
         ],
         "not_estimated": ["setup", final_kv_cache],
-        "none": ["setup"],
     }[kv_cache]
     if kv_cache != "estimated":
         expected.append(("executor", *given))
@@ -364,6 +364,24 @@ def test_expert_dwdp_refuses_an_moe_backend_without_dwdp(
     DWDP serves: the launch is refused before the model is built, with the setting to use."""
     with pytest.raises(ValueError, match="set moe_config.backend: CUTEDSL"):
         _create(monkeypatch, mode, "estimated", moe_backend=backend)
+
+
+@pytest.mark.parametrize("tactic", ["cutedsl.grouped_gemm.nvfp4", "fused_fc12", "b12x"])
+def test_expert_dwdp_accepts_a_tactic_naming_an_implementation_with_dwdp(
+    monkeypatch: pytest.MonkeyPatch, tactic: str
+) -> None:
+    """A tactic leaves moe_config.backend at AUTO, so the tactic is what the launch checks."""
+    log, _ = _create(monkeypatch, "expert", "not_estimated", moe_backend="AUTO", moe_tactic=tactic)
+
+    assert "setup" in log
+
+
+@pytest.mark.parametrize("tactic", ["cutlass", "trtllm_gen", "mega_moe"])
+def test_expert_dwdp_refuses_a_tactic_without_dwdp(
+    monkeypatch: pytest.MonkeyPatch, tactic: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"moe_config.tactic='{tactic}' matches .* none of which"):
+        _create(monkeypatch, "expert", "estimated", moe_backend="AUTO", moe_tactic=tactic)
 
 
 def test_a_standalone_gather_reserves_its_sms_before_the_model_is_built(

@@ -42,7 +42,9 @@ _INCLUDE = "**/*.py"
 
 
 def _command_env() -> dict[str, str]:
-    env = os.environ.copy()
+    # Inherited Git variables, such as GIT_INDEX_FILE from a commit hook, would point the
+    # temporary repositories at the outer repository's index.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -137,6 +139,66 @@ def _copy_python_sources(upstream: Path, consumer: Path) -> None:
         target = destination / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, target)
+
+
+def _make_work_tree_consumer(tmp_path: Path) -> Path:
+    consumer = tmp_path / "consumer"
+    consumer.mkdir()
+    _run(["git", "init", "--initial-branch=main", consumer], cwd=tmp_path)
+    return consumer
+
+
+def _discover_vendor(
+    consumer: Path,
+    *arguments: str | Path,
+    check: bool = True,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        [sys.executable, _VENDOR_SOURCES, *arguments],
+        cwd=consumer,
+        check=check,
+        env_overrides=env_overrides,
+    )
+
+
+def _source_arguments(upstream: Path, commit: str) -> list[str | Path]:
+    return [
+        "--url",
+        upstream.as_uri(),
+        "--commit",
+        commit,
+        "--source",
+        _SOURCE,
+        "--include",
+        _INCLUDE,
+        "--repo",
+        upstream,
+    ]
+
+
+def _create_in_scope(
+    consumer: Path,
+    upstream: Path,
+    commit: str,
+    name: str,
+    *,
+    scope: str,
+    destination: str,
+    adopt: str,
+) -> None:
+    _discover_vendor(
+        consumer,
+        "create",
+        name,
+        "--scope",
+        scope,
+        "--destination",
+        destination,
+        "--adopt",
+        adopt,
+        *_source_arguments(upstream, commit),
+    )
 
 
 def _create_vendor(
@@ -605,6 +667,7 @@ def test_git_subprocesses_ignore_ambient_repository_environment(tmp_path: Path) 
             "GIT_WORK_TREE": str(upstream),
             "GIT_INDEX_FILE": str(upstream / ".git" / "index"),
             "GIT_OBJECT_DIRECTORY": str(upstream / ".git" / "objects"),
+            "GIT_GLOB_PATHSPECS": "1",
         },
     )
 
@@ -2006,3 +2069,148 @@ def test_pin_interruption_after_lock_save_leaves_valid_lock_and_orphan_patch(
     assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_scoped_lock_lifecycle_in_discovery_mode(tmp_path: Path) -> None:
+    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 'upstream'\n"})
+    consumer = _make_work_tree_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    scope = consumer / "models" / "demo"
+    _write_files(scope, {"kernels/example/kernel.py": "VALUE = 'scoped'\n"})
+    scoped_kernel = scope / "kernels" / "example" / "kernel.py"
+    repo_lock = consumer / "3rdparty" / "vendor_sources.lock.yaml"
+    scoped_lock = scope / "3rdparty" / "vendor_sources.lock.yaml"
+    scoped_patch = scope / "3rdparty" / "vendor_patches" / "scoped-example.patch"
+
+    _create_in_scope(
+        consumer,
+        upstream,
+        commit,
+        "repo-example",
+        scope=".",
+        destination=_DESTINATION,
+        adopt="exact",
+    )
+    _git(consumer, "add", "-A")
+    _create_in_scope(
+        consumer / "models",
+        upstream,
+        commit,
+        "scoped-example",
+        scope="demo",
+        destination="kernels/example",
+        adopt="patched",
+    )
+    _git(consumer, "add", "-A")
+
+    scoped_vendors = _lock_data(scoped_lock)["vendors"]
+    assert isinstance(scoped_vendors, dict)
+    assert set(scoped_vendors) == {"scoped-example"}
+    assert scoped_vendors["scoped-example"]["destination"] == "kernels/example"
+    assert (
+        scoped_vendors["scoped-example"]["patch"] == "3rdparty/vendor_patches/scoped-example.patch"
+    )
+    assert scoped_patch.is_file()
+    repo_vendors = _lock_data(repo_lock)["vendors"]
+    assert isinstance(repo_vendors, dict)
+    assert set(repo_vendors) == {"repo-example"}
+
+    checked = _discover_vendor(consumer, "check")
+    assert "PASS-OFFLINE repo-example" in checked.stdout
+    assert "PASS-OFFLINE scoped-example" in checked.stdout
+
+    scoped_kernel.write_text("VALUE = 'scoped-v2'\n", encoding="utf-8")
+    _assert_failure(
+        _discover_vendor(consumer, "check", check=False),
+        "'scoped-example' destination digest mismatch",
+    )
+
+    repo_lock_bytes = repo_lock.read_bytes()
+    scoped_lock_bytes = scoped_lock.read_bytes()
+    _discover_vendor(consumer, "patch", "scoped-example", "refresh", "--repo", upstream)
+    assert repo_lock.read_bytes() == repo_lock_bytes
+    assert scoped_lock.read_bytes() != scoped_lock_bytes
+    assert b"+VALUE = 'scoped-v2'" in scoped_patch.read_bytes()
+    _discover_vendor(consumer, "check", "scoped-example", "--repo", upstream)
+
+    _discover_vendor(consumer, "remove", "scoped-example")
+    assert not (scope / "3rdparty").exists()
+    assert scoped_kernel.read_text(encoding="utf-8") == "VALUE = 'scoped-v2'\n"
+    _assert_failure(
+        _discover_vendor(consumer, "check", check=False),
+        "is in the Git index but missing from the work tree",
+    )
+    # The pre-commit hook of `git commit -a` gets a temporary index with the deletion staged.
+    commit_index = {"GIT_INDEX_FILE": str(tmp_path / "commit-index")}
+    shutil.copyfile(consumer / ".git" / "index", commit_index["GIT_INDEX_FILE"])
+    _run(["git", "add", "-A"], cwd=consumer, env_overrides=commit_index)
+    _discover_vendor(consumer, "check", env_overrides=commit_index)
+    _git(consumer, "add", "-A")
+    checked = _discover_vendor(consumer, "check")
+    assert "PASS-OFFLINE repo-example" in checked.stdout
+    assert "scoped-example" not in checked.stdout
+
+
+def test_discovery_rejects_conflicting_locks(tmp_path: Path) -> None:
+    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer = _make_work_tree_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_in_scope(
+        consumer,
+        upstream,
+        commit,
+        "repo-example",
+        scope=".",
+        destination=_DESTINATION,
+        adopt="exact",
+    )
+    _git(consumer, "add", "-A")
+    _discover_vendor(consumer, "check")
+    repo_vendors = _lock_data(consumer / "3rdparty" / "vendor_sources.lock.yaml")["vendors"]
+    assert isinstance(repo_vendors, dict)
+    entry = repo_vendors["repo-example"]
+    assert isinstance(entry, dict)
+
+    def assert_rejected(relative_lock: str, vendors: dict[str, object], message: str) -> None:
+        lock_path = consumer / relative_lock
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            yaml.safe_dump({"schema_version": 1, "vendors": vendors}, sort_keys=False),
+            encoding="utf-8",
+        )
+        _git(consumer, "add", "--", relative_lock)
+        result = _discover_vendor(consumer, "check", check=False)
+        _assert_failure(result, message)
+        assert relative_lock in result.stderr
+        _git(consumer, "rm", "-q", "--cached", "--", relative_lock)
+        lock_path.unlink()
+
+    assert_rejected(
+        "models/demo/3rdparty/vendor_sources.lock.yaml",
+        {"repo-example": {**entry, "destination": "kernels/example"}},
+        "defined in both",
+    )
+    assert_rejected(
+        "src/3rdparty/vendor_sources.lock.yaml",
+        {"nested-example": {**entry, "destination": "example/nested"}},
+        "destinations overlap",
+    )
+    assert_rejected(f"{_DESTINATION}/3rdparty/vendor_sources.lock.yaml", {}, "control files")
+    assert_rejected("models/demo/vendor_sources.lock.yaml", {}, "misplaced")
+    assert_rejected(
+        "models/demo/3rdparty/vendor_sources.lock.yaml",
+        {"bad-commit": {**entry, "commit": "x", "destination": "kernels/bad"}},
+        "full lowercase 40-hex sha",
+    )
+
+    unscoped_create = _discover_vendor(
+        consumer,
+        "create",
+        "unscoped",
+        "--destination",
+        "src/unscoped",
+        *_source_arguments(upstream, commit),
+        check=False,
+    )
+    _assert_failure(unscoped_create, "create needs --scope")
+    _discover_vendor(consumer, "check")

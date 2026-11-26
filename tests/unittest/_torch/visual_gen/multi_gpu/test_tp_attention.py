@@ -194,7 +194,7 @@ def _shard_tp_weights(ref_attn, tp_attn, tp_rank, tp_size, qkv_mode=QKVMode.FUSE
 # =============================================================================
 
 
-def _wb(module):
+def _wb(module) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return (weight, bias_or_None) for a Linear module."""
     return module.weight.data, (module.bias.data if module.bias is not None else None)
 

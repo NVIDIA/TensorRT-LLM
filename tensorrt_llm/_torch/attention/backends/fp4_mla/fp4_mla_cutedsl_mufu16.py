@@ -2,12 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import sys
-import threading
-from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -16,19 +12,62 @@ import cutlass as ctm
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import torch
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx as cute_inline_ptx
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental import cuda as cuda_tma
 from cutlass.experimental import primitives as prims
 
+from .call_cache import LruCache, class_defines_callables
+from .config import resolve_fp4_mla_lazy_anchor_rebase_log2
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
+from .cutedsl_common import (
+    CUDA_GRID_Z_MAX,
+    FP4_MLA_P_GLOBAL_SCALE,
+    INT32_MAX,
+    LOG2_6,
+    LOG2_E,
+    KvCache3DLayout,
+    _add_f16x2,
+    _as_shared_cta,
+    _ceil_div,
+    _compact_sfb_copy_cols_per_scale_chunk,
+    _compact_sfb_mma_cols_per_scale_chunk,
+    _compute_smem_p4_lazy_rebase_scale,
+    _cutlass_output_dtype,
+    _derive_qk_scale_burst_kblocks,
+    _fence_async_shared_cta,
+    _float_to_ordered_u32_for_atomic_max,
+    _lookup_physical_page,
+    _mapa_shared_cluster,
+    _mask_invalid_score,
+    _mbarrier_arrive_release_cta_shared_cluster,
+    _mma_block_scale_kind,
+    _mma_scale_format,
+    _mma_scale_vec_size_enum,
+    _mma_sf_ids_per_scale_atom,
+    _ordered_u32_to_float_after_atomic_max,
+    _p4_n256_prequant_rowsum_from_f16x2_psf,
+    _pack_e2m1x8_from_f16x2,
+    _pack_e4m3x4_natural,
+    _pack_e4m3x4_natural_from_f16x2,
+    _publish_p4_n256_atomic_rowmax,
+    _qk_compact_sfb_cols_per_scale_chunk,
+    _qk_sfb_smem_nchunks_per_cta,
+    _rescale_smem_p4_resident_o_in_tmem,
+    _scale_pack_e4m3x4_natural_from_f16x2,
+    _scale_words_for_k,
+    _sfa_tmem_cols_for_scale_chunks,
+    _softmax_exp2_pair_packed_f16x2,
+    _sum_p4_n256_psf_row_parts,
+    _tcgen05_ld_red_32x32b_x16_max_f32,
+    _unpack_f16x2_to_f32_pair,
+    _validate_output_dtype,
+    _validate_tensor_pointer_alignment,
+    nvvm_fma_packed_f32x2,
+    nvvm_mul_packed_f32x2,
+)
+from .cutedsl_common import _pack_p4_16_scores_with_sum as _pack_p4_16_scores_from_group
 
-nvvm_add_packed_f32x2 = partial(prims.add_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_mul_packed_f32x2 = partial(prims.mul_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-nvvm_fma_packed_f32x2 = partial(prims.fma_packed_f32x2, rnd=prims.FPRoundingMode.RN)
-PREPARED_BUFFER_ALIGNMENT_BYTES = 32
-CUDA_GRID_Z_MAX = 65535
 SUPPORTS_FOLDED_QUERIES = True
 # Packed decode rows: one batch entry per request holding [query token, head]
 # rows, KV split across grid.z tasks, per-row causal bounds (Helix per-token
@@ -38,179 +77,6 @@ SUPPORTS_PACKED_QUERIES = True
 PACKED_MAX_M = 1024
 # Balanced packed split: no task owns fewer KV tiles than this unless a request is shorter.
 PACKED_MIN_TILES_PER_TASK = 2
-INT32_MAX = (1 << 31) - 1
-
-
-@ctm.dsl_user_op
-def _as_shared_cta(address, *, loc=None, ip=None):
-    address_ir = address.ir_value() if hasattr(address, "ir_value") else address
-    address_space = llvm.PointerType(address_ir.type).address_space
-    if address_space == ctm.AddressSpace.dsmem:
-        return prims.cvta_to(address, prims.CvtaSpace.SHARED, loc=loc, ip=ip)
-    return address
-
-
-@ctm.dsl_user_op
-def _mapa_shared_cluster(address, rank, *, loc=None, ip=None):
-    return prims.mapa(_as_shared_cta(address, loc=loc, ip=ip), rank, loc=loc, ip=ip)
-
-
-@ctm.dsl_user_op
-def _mbarrier_arrive_release_cta_shared_cluster(mbar, count=1, *, loc=None, ip=None) -> None:
-    prims.mbarrier_arrive(
-        mbar,
-        count=count,
-        scope=prims.MemScope.CTA,
-        loc=loc,
-        ip=ip,
-    )
-
-
-def _scale_words_for_k(k_dim: int, sf_vec_size: int) -> int:
-    return (k_dim + sf_vec_size * 4 - 1) // (sf_vec_size * 4)
-
-
-def _sfa_tmem_cols_for_scale_chunks(scale_chunks: int, use_128dp_unique: bool) -> int:
-    if use_128dp_unique:
-        return (scale_chunks + 3) // 4 * 4
-    return scale_chunks * 4
-
-
-def _derive_qk_scale_burst_kblocks(
-    *,
-    qk_mma_kblocks: int,
-    qk_scale_burst_target_kblocks: int,
-    scale_a_col_offset: int,
-    num_tmem_alloc_cols: int,
-    qk_mma_m_dim: int,
-    mma_scale_chunks_per_kblock: int,
-    use_sfa_128dp_unique: bool,
-    qk_score_slot_n: int,
-    qk_compact_sfb_cols_per_scale_chunk: int = 0,
-) -> int:
-    target = max(1, qk_scale_burst_target_kblocks)
-    if qk_compact_sfb_cols_per_scale_chunk > 0:
-        sfb_cols_per_kblock = mma_scale_chunks_per_kblock * qk_compact_sfb_cols_per_scale_chunk
-    else:
-        sfb_cols_per_kblock = _qk_sfb_cols_per_kblock(
-            qk_mma_m_dim, qk_score_slot_n, mma_scale_chunks_per_kblock
-        )
-    best = 0
-    for burst_kblocks in range(1, target + 1):
-        if qk_mma_kblocks % burst_kblocks != 0:
-            continue
-        sfa_cols = _sfa_tmem_cols_for_scale_chunks(
-            burst_kblocks * mma_scale_chunks_per_kblock, use_sfa_128dp_unique
-        )
-        sfb_cols = burst_kblocks * sfb_cols_per_kblock
-        scale_b_col_offset = (scale_a_col_offset + sfa_cols + 15) // 16 * 16
-        qk_scale_feed_col_end = max(scale_a_col_offset + sfa_cols, scale_b_col_offset + sfb_cols)
-        if qk_scale_feed_col_end <= num_tmem_alloc_cols:
-            best = burst_kblocks
-    if best == 0:
-        raise ValueError(
-            "QK scale feed cannot fit even one K64 block in the TMEM tail; "
-            f"scale_a_col_offset={scale_a_col_offset}, "
-            f"num_tmem_alloc_cols={num_tmem_alloc_cols}"
-        )
-    return best
-
-
-def _compact_sfb_mma_cols_per_scale_chunk(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-        return 2 * ((n_dim + 127) // 128)
-    return 2 * ((n_dim + 63) // 64)
-
-
-def _compact_sfb_copy_cols_per_scale_chunk(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-        return 4 * ((n_dim + 127) // 128)
-    return _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_compact_sfb_cols_per_scale_chunk(m_dim: int, n_dim: int, warpx2_mode: int) -> int:
-    if warpx2_mode != 0 and m_dim == 128:
-        return _compact_sfb_mma_cols_per_scale_chunk(m_dim, n_dim)
-    return _compact_sfb_copy_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_sfb_cols_per_kblock(m_dim: int, n_dim: int, mma_scale_chunks_per_kblock: int) -> int:
-    return mma_scale_chunks_per_kblock * _compact_sfb_copy_cols_per_scale_chunk(m_dim, n_dim)
-
-
-def _qk_sfb_smem_nchunks_per_cta(m_dim: int, n_dim: int) -> int:
-    if m_dim == 128:
-        if n_dim > 256:
-            raise ValueError(f"Unsupported M=128 compact SFB N dimension {n_dim}")
-    return (n_dim + 127) // 128
-
-
-def _mma_sf_ids_per_scale_atom(k_dim: int, sf_vec_size: int) -> int:
-    return max(1, sf_vec_size * 4 // k_dim)
-
-
-def _mma_scale_vec_size_enum(sf_vec_size: int):
-    if sf_vec_size == 16:
-        return prims.Tcgen05MMAScaleVecSize.BLOCK16
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _mma_scale_format(sf_vec_size: int) -> int:
-    if sf_vec_size == 16:
-        return 0
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _mma_block_scale_kind(sf_vec_size: int):
-    if sf_vec_size == 16:
-        return prims.MMABlockScaleKind.MXF4NVF4
-    raise ValueError(f"Unsupported FP4 scale vector size {sf_vec_size}")
-
-
-def _initial_sf_vec_size_from_argv(options: Sequence[int], default: int) -> int:
-    args = sys.argv[1:]
-    for idx, arg in enumerate(args):
-        value_text: str | None = None
-        if arg == "--sf-vec-size":
-            if idx + 1 >= len(args):
-                raise ValueError("--sf-vec-size requires an integer value")
-            value_text = args[idx + 1]
-        elif arg.startswith("--sf-vec-size="):
-            value_text = arg.split("=", 1)[1]
-        if value_text is None:
-            continue
-        try:
-            value = int(value_text)
-        except ValueError as exc:
-            raise ValueError(f"--sf-vec-size must be an integer, got {value_text!r}") from exc
-        if value not in options:
-            raise ValueError(f"--sf-vec-size must be one of {options}, got {value}")
-        return value
-    return default
-
-
-def _initial_float_from_argv(option: str, default: float) -> float:
-    args = sys.argv[1:]
-    for idx, arg in enumerate(args):
-        value_text: str | None = None
-        if arg == option:
-            if idx + 1 >= len(args):
-                raise ValueError(f"{option} requires a floating-point value")
-            value_text = args[idx + 1]
-        elif arg.startswith(f"{option}="):
-            value_text = arg.split("=", 1)[1]
-        if value_text is None:
-            continue
-        try:
-            return float(value_text)
-        except ValueError as exc:
-            raise ValueError(f"{option} must be a float, got {value_text!r}") from exc
-    return default
-
 
 M_TILE = 256
 KV_TILE = 256
@@ -233,7 +99,7 @@ QK_PREFIX_DIM = TRTLLM_V_HEAD_DIM
 TRTLLM_QSF_EVEN_PRMT_SELECTOR = 25632
 TRTLLM_QSF_ODD_PRMT_SELECTOR = 30001
 SF_VEC_SIZE_OPTIONS = (16,)
-SF_VEC_SIZE = _initial_sf_vec_size_from_argv(SF_VEC_SIZE_OPTIONS, 16)
+SF_VEC_SIZE = 16
 MMA_KBLOCK_DIM = 64
 MMA_KBLOCK_IDESC_K_DIM = 0
 MMA_SCALE_CHUNK_K = SF_VEC_SIZE * 4
@@ -247,12 +113,6 @@ QK_TAIL_EFFECTIVE_MMA_KBLOCKS = QK_EFFECTIVE_MMA_KBLOCKS - QK_PREFIX_DIM // MMA_
 FIRST_ORDER_TAIL_A_LOCAL_KBLOCKS = (0, 1, 0)
 FIRST_ORDER_TAIL_B_LOCAL_KBLOCKS = (0, 0, 1)
 QK_SF_GROUPS = QK_PADDED_DIM // SF_VEC_SIZE
-LOG2_6 = math.log2(6.0)
-LOG2_E = 1.4426950408889634
-# Keep the PV-only P scale above E4M3's underflow range.  The matching output
-# normalization below cancels this factor without changing the attention math.
-FP4_MLA_E4M3_MAX_FINITE = 448.0
-FP4_MLA_P_GLOBAL_SCALE = FP4_MLA_E4M3_MAX_FINITE * 6.0
 SMEM_P4_PAGE_PLAN_PROFILE_KV = 160 * 1024
 SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT = 4
 SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT = SMEM_P4_RUNTIME_PROFILE_PAGE_ALIGNMENT * TRTLLM_PAGE_SIZE
@@ -261,16 +121,16 @@ SMEM_P4_RUNTIME_MAX_KV = (
     (INT32_MAX - (KV_TILE - 1)) // SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
 ) * SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
 SMEM_P4_PAGE_ID_PLAN_INTS = SMEM_P4_PAGE_PLAN_PROFILE_KV // TRTLLM_PAGE_SIZE
-SMEM_P4_PAGE_ID_PLAN_BYTES = SMEM_P4_PAGE_ID_PLAN_INTS * ctm.Int32.bytes
 # softmax scale, PV rescale, producer mask bound (Int32 bits), pad.
 SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS = 4
 SMEM_P4_RUNTIME_MASK_BOUND_WORD = 2
-SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float32.bytes
-SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv("--lazy-anchor-threshold-log2", 1.0)
-if not 0.0 <= SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 <= 8.0:
-    raise ValueError(
-        f"--lazy-anchor-threshold-log2 must be in [0, 8], got {SMEM_P4_LAZY_ANCHOR_REBASE_LOG2}"
-    )
+# Lazy-anchor rebase threshold (log2): a tile rescales the running O accumulator ("correction") only when the row
+# maximum grew by more than this since the current anchor. Every rebase drains the PV pipeline of all warps (and of
+# the whole 4-CTA cluster in the 4x kernel). Measured 2026-11-01 (DS-R1 shapes, logits scaled x1..x32): with 1.0,
+# realistic logits (x4) cost the 4x kernel 18-19 % and the 2x kernel 2-6 %; 4.0 removes the stalls up to x8 logits and
+# 6.0 up to ~x16 with FP32 cosine unchanged (the P scale saturates only above ~6.5 log2 at kv_gs 89.6; 8.0 breaks
+# accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it within [0, 8].
+SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = resolve_fp4_mla_lazy_anchor_rebase_log2(4.0)
 SMEM_P4_PIPELINE_DIRECT_TARGET_PAGE_SIZE = 128
 RUBIN_TMEM_CAPACITY_KB = 288
 TMEM_BYTES_PER_COL = 512
@@ -426,6 +286,12 @@ SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS = SMEM_P4_BMM1_M
 SMEM_P4_TMEM_SCORE_PIPELINE_STAGES = SMEM_P4_QK_PIPELINE_SLOTS
 SMEM_P4_MBAR_PARITY_PHASES = 2
 SMEM_P4_PAIR_CORR_MBAR_OFFSET = 0
+# The P4_READY and HALF1_ROWSUM_READY barriers are intentionally never initialized, and
+# nothing arrives on them or waits on them. Their slots stay counted in
+# SMEM_P4_PAIR_OVERLAP_MBAR_COUNT because the live offsets chain through these
+# definitions (SCORE_CONSUMED via ROWSUM_DONE, FINAL_PV_ISSUED, ROWMAX_READ_DONE). A
+# barrier taken into use again must first restore its mbarrier_init in
+# _run_mla_decode_body.
 SMEM_P4_PAIR_P4_READY_MBAR_OFFSET = (
     SMEM_P4_PAIR_CORR_MBAR_OFFSET + SMEM_P4_N_OUT_TILES * SMEM_P4_QK_PIPELINE_SLOTS
 )
@@ -438,6 +304,7 @@ SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET = (
 SMEM_P4_PAIR_P_HALF_READY_MBAR_OFFSET = (
     SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + SMEM_P4_P_HALF_COUNT * SMEM_P4_QK_PIPELINE_SLOTS
 )
+# Intentionally never initialized either; see the comment at the P4_READY offset above.
 SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET = SMEM_P4_PAIR_P_HALF_READY_MBAR_OFFSET
 SMEM_P4_PAIR_FINAL_PV_ISSUED_MBAR_OFFSET = (
     SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + SMEM_P4_QK_PIPELINE_SLOTS
@@ -470,15 +337,6 @@ SMEM_P4_PV_SFB_CP_GROUP_ONE = False
 SMEM_P4_QK_COMPLETION_MBARS = SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
 
 
-@dataclass(frozen=True)
-class KvCache3DLayout:
-    num_pages: int
-    packed_dim: int
-    stride_page: int
-    stride_token: int
-    stride_packed_dim: int
-
-
 SMEM_P4_PRODUCER_WARPS_PER_SCORE_SLOT = SMEM_P4_TMEM_WARP_M * SMEM_P4_TMEM_WARP_N
 SMEM_P4_COMPUTE_WARPS = SMEM_P4_PRODUCER_WARPS_PER_SCORE_SLOT
 SMEM_P4_CORRECTION_WARPS = SMEM_P4_PRODUCER_WARPS_PER_SCORE_SLOT
@@ -487,7 +345,6 @@ SMEM_P4_CORRECTION_WARP_ID_BEGIN = SMEM_P4_COMPUTE_WARP_ID_BEGIN + SMEM_P4_COMPU
 SMEM_P4_TOTAL_PRODUCER_WARPS = SMEM_P4_COMPUTE_WARPS + SMEM_P4_CORRECTION_WARPS
 SMEM_P4_STORE_WARPS = SMEM_P4_CORRECTION_WARPS
 SMEM_P4_COMPUTE_THREADS = 32 * SMEM_P4_COMPUTE_WARPS
-SMEM_P4_CORRECTION_THREADS = 32 * SMEM_P4_CORRECTION_WARPS
 SMEM_P4_SCORE_SLOT_PRODUCER_THREADS = SMEM_P4_COMPUTE_THREADS
 THREADS_PER_CTA = 32 * 12
 SMEM_P4_TMEM_ALLOC_EXCLUSIVE = True
@@ -605,22 +462,6 @@ SMEM_P4_KSF_COMPACT_RING_BYTES = SMEM_P4_QK_KTILE_RING_STAGES * SMEM_P4_KSF_COMP
 SMEM_P4_V_DATA_STAGE_BYTES = B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
 SMEM_P4_V_SFB_TMA_STAGE_BYTES = SFA_TMA_STAGE_BYTES * SMEM_P4_PV_SFB_N_CHUNKS * SMEM_P4_N_OUT_TILES
 SMEM_P4_V_TILE_TMA_BYTES = SMEM_P4_V_DATA_STAGE_BYTES + SMEM_P4_V_SFB_TMA_STAGE_BYTES
-SMEM_P4_CONTROL_MBAR_COUNT = (
-    SMEM_P4_QK_COMPLETION_MBARS
-    + SMEM_P4_QK_PIPELINE_SLOTS
-    + 1
-    + NUM_QK_Q_PIPELINE_STAGE * 2
-    + SMEM_P4_QK_BARRIER_STAGES * 2
-    + SMEM_P4_V_PIPELINE_STAGES * 2
-    + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES * 2
-    + SMEM_P4_P4_CONTROL_MBAR_STAGES * 2
-    + SMEM_P4_PAIR_OVERLAP_MBAR_COUNT
-    + SMEM_P4_QK_SCORE_RING_SLOTS
-    + 2
-    + SMEM_P4_QK_BULK_READY_MBARS
-)
-SMEM_P4_CONTROL_BYTES_RAW = SMEM_P4_CONTROL_MBAR_COUNT * 8 + 8
-SMEM_P4_CONTROL_AND_ALIGNMENT_BYTES = (SMEM_P4_CONTROL_BYTES_RAW + 127) // 128 * 128
 
 
 def _refresh_sf_vec_config(sf_vec_size: int) -> None:
@@ -750,32 +591,6 @@ def _refresh_sf_vec_config(sf_vec_size: int) -> None:
     stage_rowsum_tmem_cols = SMEM_P4_TMEM_BANKS * SMEM_P4_SCORE_SLOTS_PER_KV_TILE
     rowmeta_tmem_cols = stage_rowmax_tmem_cols + stage_rowsum_tmem_cols + running_rowmeta_tmem_cols
     rowmeta_tmem_col_offset = SMEM_P4_SCALE_FEED_TMEM_COLS[1]
-    q_compact_tile_bytes = SMEM_P4_QK_FULL_DATA_STAGES * QK_A_STAGE_BYTES + QK_TAIL_A_STAGE_BYTES
-    qsf_compact_tile_bytes = (
-        SMEM_P4_QK_FULL_DATA_STAGES * qk_sfa_stage_bytes + 512 * qk_tail_data_stage_sf_chunks
-    )
-    k_compact_slot_bytes = SMEM_P4_QK_FULL_DATA_STAGES * QK_B_STAGE_BYTES + QK_TAIL_B_STAGE_BYTES
-    ksf_compact_slot_bytes = (
-        SMEM_P4_QK_FULL_DATA_STAGES * qk_sfb_stage_bytes
-        + 512 * qk_k_tail_data_stage_sf_chunks * qk_sfb_n_chunks
-    )
-    static_smem_bytes = (
-        SMEM_P4_CONTROL_AND_ALIGNMENT_BYTES
-        + q_compact_tile_bytes
-        + SMEM_P4_QK_KTILE_RING_STAGES * k_compact_slot_bytes
-        + qsf_compact_tile_bytes
-        + SMEM_P4_QK_KTILE_RING_STAGES * ksf_compact_slot_bytes
-        + SMEM_P4_P4_SMEM_WORDS * 4
-        + SMEM_P4_V_PIPELINE_STAGES * B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
-        + SMEM_P4_P4_OWNER_SMEM_SF_MAILBOX_WORDS * 4
-        + SMEM_P4_V_PIPELINE_STAGES * sfa_tma_stage_bytes * pv_sfb_n_chunks * SMEM_P4_N_OUT_TILES
-        + SMEM_P4_STAGE_ROW_STATE_SMEM_FLOATS * 4
-        + SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS * 4
-        # Row maxima of the pipelined leading tiles, by tile parity.
-        + 2 * SMEM_P4_ATOMIC_RUNNING_ROWMAX_SMEM_ROWS * 4
-        + SMEM_P4_PAGE_ID_PLAN_BYTES
-        + SMEM_P4_RUNTIME_SCALE_PAIR_BYTES
-    )
     globals().update(
         SF_VEC_SIZE=sf_vec_size,
         MMA_SCALE_CHUNK_K=mma_scale_chunk_k,
@@ -900,7 +715,6 @@ def _refresh_sf_vec_config(sf_vec_size: int) -> None:
             SMEM_P4_QK_FULL_DATA_STAGES * qk_sfb_stage_bytes
             + 512 * qk_k_tail_data_stage_sf_chunks * qk_sfb_n_chunks
         ),
-        SMEM_P4_STATIC_SMEM_BYTES=static_smem_bytes,
         SMEM_P4_V_DATA_STAGE_BYTES=B_STAGE_BYTES * SMEM_P4_N_OUT_TILES,
         SMEM_P4_V_SFB_TMA_STAGE_BYTES=sfa_tma_stage_bytes * pv_sfb_n_chunks * SMEM_P4_N_OUT_TILES,
         SMEM_P4_V_TILE_TMA_BYTES=B_STAGE_BYTES * SMEM_P4_N_OUT_TILES
@@ -923,8 +737,6 @@ TMEM_BAR_ID = 1
 # TMEM allocation is published to the producers and the PV issue warp.
 TMEM_BAR_THREADS = 32 * (2 + SMEM_P4_TOTAL_PRODUCER_WARPS)
 O_STORE_BAR_ID = 2
-SMEM_P4_P4_SLOT0_BAR_ID = 6
-SMEM_P4_P4_SLOT1_BAR_ID = 7
 SMEM_P4_QK1_SPLIT_ARM_BAR_ID = 8
 SMEM_P4_QK1_SPLIT_ARM_BAR_THREADS = 32 * 2
 SMEM_P4_QSF_OWNER_BAR_ID = 9
@@ -933,10 +745,6 @@ SMEM_P4_DUAL_HALF_BAR_ID = SMEM_P4_P_SFA_OWNER_BAR_ID
 SMEM_P4_DUAL_HALF_BAR_THREADS = 32 * SMEM_P4_TOTAL_PRODUCER_WARPS
 O_STORE_BAR_THREADS = 32 * SMEM_P4_STORE_WARPS
 SMEM_P4_QSF_OWNER_BAR_THREADS = 32 * (SMEM_P4_COMPUTE_WARPS + 1)
-
-
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
 
 
 def _select_runtime_kv_profile(max_kv_len: int) -> int:
@@ -957,48 +765,6 @@ def _select_runtime_kv_profile(max_kv_len: int) -> int:
     profile_payload = max_kv_len - SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT
     profile_kv = (1 << (profile_payload - 1).bit_length()) + (SMEM_P4_RUNTIME_PROFILE_KV_ALIGNMENT)
     return min(profile_kv, SMEM_P4_RUNTIME_MAX_KV)
-
-
-def _validate_output_dtype(output_dtype: torch.dtype) -> None:
-    if output_dtype not in {torch.float16, torch.bfloat16}:
-        raise TypeError(f"output dtype must be torch.float16 or torch.bfloat16, got {output_dtype}")
-
-
-def _validate_tensor_pointer_alignment(
-    name: str,
-    tensor: torch.Tensor,
-    alignment_bytes: int = PREPARED_BUFFER_ALIGNMENT_BYTES,
-) -> None:
-    pointer = tensor.data_ptr()
-    if pointer % alignment_bytes != 0:
-        raise ValueError(
-            f"{name} data pointer must be {alignment_bytes}B aligned, got address remainder {pointer % alignment_bytes}"
-        )
-
-
-@cute.jit
-def _pack_e2m1x8(
-    p0: ctm.Float32,
-    p1: ctm.Float32,
-    p2: ctm.Float32,
-    p3: ctm.Float32,
-    p4: ctm.Float32,
-    p5: ctm.Float32,
-    p6: ctm.Float32,
-    p7: ctm.Float32,
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b8 b0, b1, b2, b3;\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b0, {$r1}, {$r0};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b1, {$r3}, {$r2};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b2, {$r5}, {$r4};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f32 b3, {$r7}, {$r6};\n"
-        "\tmov.b32 {$w0}, {b0, b1, b2, b3};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[p0, p1, p2, p3, p4, p5, p6, p7],
-    )
 
 
 @cute.jit
@@ -1492,21 +1258,6 @@ def _load_qk_qonly_kblock_stage(
             while not prims.mbarrier_try_wait_parity(q_tma_mbar, q_tma_phase, time_limit=10000000):
                 pass
         prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-
-
-@cute.jit
-def _lookup_physical_page(
-    mPageTable_pl: cute.Tensor,
-    logical_page: ctm.Int32,
-    batch: ctm.Int32,
-    page_begin: ctm.Int32,
-    page_count: ctm.Int32,
-) -> ctm.Int32:
-    has_pages = ctm.Int32(page_count > ctm.Int32(0))
-    last_logical_page = ctm.max(page_count - ctm.Int32(1), ctm.Int32(0))
-    safe_logical_page = ctm.min(logical_page, last_logical_page)
-    page_table_idx = (page_begin + safe_logical_page) * has_pages
-    return ctm.Int32(mPageTable_pl[page_table_idx])
 
 
 @cute.jit
@@ -2264,11 +2015,6 @@ def _load_v_tile_stage(
 
 
 @cute.jit
-def _fence_async_shared_cta() -> None:
-    prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-
-
-@cute.jit
 def _sleep_until_producer_slot_free(producer) -> ctm.Boolean:
     """Poll a load pipeline slot with a sleep between acquire attempts."""
     acquired = producer.try_acquire()
@@ -2331,82 +2077,6 @@ def _permute_raw_trtllm_q_tail_in_smem(sQ, local_warp_idx: ctm.Int32, lane_idx: 
 
 
 @cute.jit
-def _mask_invalid_score(
-    score: ctm.Float32, global_k_idx: ctm.Int32, valid_k: ctm.Int32
-) -> ctm.Float32:
-    masked = score
-    if global_k_idx >= valid_k:
-        masked = ctm.Float32(-ctm.Float32.inf)
-    return masked
-
-
-@cute.jit
-def _pack_e4m3x4_natural(
-    sf0: ctm.Float32, sf1: ctm.Float32, sf2: ctm.Float32, sf3: ctm.Float32
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
-        "\tcvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[sf0, sf1, sf2, sf3],
-    )
-
-
-@cute.jit
-def _pack_e4m3x4_natural_from_f16x2(pair01: ctm.Int32, pair23: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 lo, {$r0};\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 hi, {$r1};\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair01, pair23],
-    )
-
-
-@cute.jit
-def _scale_pack_e4m3x4_natural_from_f16x2(
-    pair01: ctm.Int32, pair23: ctm.Int32, scale: ctm.Float32
-) -> ctm.Int32:
-    """Scale two FP16x2 pairs and pack the PV-only E4M3 scale word."""
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .f16 scale_h;\n"
-        "\t.reg .b32 scale_h2, scaled01, scaled23;\n"
-        "\t.reg .b16 lo, hi;\n"
-        "\tcvt.rn.f16.f32 scale_h, {$r2};\n"
-        "\tmov.b32 scale_h2, {scale_h, scale_h};\n"
-        "\tmul.f16x2 scaled01, {$r0}, scale_h2;\n"
-        "\tmul.f16x2 scaled23, {$r1}, scale_h2;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 lo, scaled01;\n"
-        "\tcvt.rn.satfinite.e4m3x2.f16x2 hi, scaled23;\n"
-        "\tmov.b32 {$w0}, {lo, hi};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair01, pair23, scale],
-    )
-
-
-@cute.jit
-def _softmax_exp2_pair(
-    score0: ctm.Float32,
-    score1: ctm.Float32,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-) -> tuple:
-    shifted = nvvm_fma_packed_f32x2(
-        (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
-    )
-    return (cute.exp2(shifted[0], fastmath=True), cute.exp2(shifted[1], fastmath=True))
-
-
-@cute.jit
 def _bitcast_i32_to_f32(value: ctm.Int32) -> ctm.Float32:
     return ctm.Vector.from_elements((value,), dtype=ctm.Int32).bitcast(ctm.Float32)[0]
 
@@ -2426,177 +2096,6 @@ def _warp_uniform_f32(value: ctm.Float32) -> ctm.Float32:
     bits = ctm.Vector.from_elements((value,), dtype=ctm.Float32).bitcast(ctm.Int32)[0]
     uniform_bits = cute.arch.make_warp_uniform(bits)
     return ctm.Vector.from_elements((uniform_bits,), dtype=ctm.Int32).bitcast(ctm.Float32)[0]
-
-
-@cute.jit
-def _pack_f32_pair_to_f16x2(value0: ctm.Float32, value1: ctm.Float32) -> ctm.Int32:
-    return (
-        ctm.Vector.from_elements((value0, value1), dtype=ctm.Float32)
-        .to(ctm.Float16)
-        .bitcast(ctm.Int32)[0]
-    )
-
-
-@cute.jit
-def _softmax_exp2_pair_packed_f16x2(
-    score0: ctm.Float32,
-    score1: ctm.Float32,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-) -> ctm.Int32:
-    shifted = nvvm_fma_packed_f32x2(
-        (score0, score1), (softmax_scale_log2, softmax_scale_log2), (p_bias, p_bias)
-    )
-    shifted_h2 = _pack_f32_pair_to_f16x2(shifted[0], shifted[1])
-    return cute_inline_ptx(
-        "ex2.approx.f16x2 {$w0}, {$r0};",
-        write_only_types=[ctm.Int32],
-        read_only_args=[shifted_h2],
-    )
-
-
-@cute.jit
-def _add_f16x2(a: ctm.Int32, b: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "add.rn.f16x2 {$w0}, {$r0}, {$r1};",
-        write_only_types=[ctm.Int32],
-        read_only_args=[a, b],
-    )
-
-
-@cute.jit
-def _unpack_f16x2_to_f32_pair(packed: ctm.Int32) -> tuple:
-    """Widen one packed probability pair for the denominator only."""
-    values_f16 = ctm.Vector.from_elements((packed,), dtype=ctm.Int32).bitcast(ctm.Float16)
-    values_f32 = values_f16.to(ctm.Float32)
-    return (values_f32[0], values_f32[1])
-
-
-@cute.jit
-def _p4_n256_prequant_rowsum_from_f16x2_psf(
-    sf_h2_01: ctm.Int32,
-    sf_h2_23: ctm.Int32,
-    group_p_sums,
-) -> ctm.Float32:
-    """Weight FP32 P sums before the FP16 PSF values narrow to E4M3."""
-    sf_exact_0, sf_exact_1 = _unpack_f16x2_to_f32_pair(sf_h2_01)
-    sf_exact_2, sf_exact_3 = _unpack_f16x2_to_f32_pair(sf_h2_23)
-    row_sum_parts01 = nvvm_mul_packed_f32x2(
-        (sf_exact_0, sf_exact_1), (group_p_sums[0], group_p_sums[1])
-    )
-    row_sum_parts23 = nvvm_mul_packed_f32x2(
-        (sf_exact_2, sf_exact_3), (group_p_sums[2], group_p_sums[3])
-    )
-    return _sum_p4_n256_psf_row_parts(
-        row_sum_parts01[0],
-        row_sum_parts01[1],
-        row_sum_parts23[0],
-        row_sum_parts23[1],
-    )
-
-
-@cute.jit
-def _pack_e2m1x8_from_f16x2(
-    pair0: ctm.Int32, pair1: ctm.Int32, pair2: ctm.Int32, pair3: ctm.Int32
-) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b8 b0, b1, b2, b3;\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b0, {$r0};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b1, {$r1};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b2, {$r2};\n"
-        "\tcvt.rn.satfinite.e2m1x2.f16x2 b3, {$r3};\n"
-        "\tmov.b32 {$w0}, {b0, b1, b2, b3};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[pair0, pair1, pair2, pair3],
-    )
-
-
-@cute.jit
-def _horizontal_pack_two_f16x2_sums(group_sum0: ctm.Int32, group_sum1: ctm.Int32) -> ctm.Int32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .f16 g0lo, g0hi, g1lo, g1hi, sum0, sum1;\n"
-        "\tmov.b32 {g0lo, g0hi}, {$r0};\n"
-        "\tmov.b32 {g1lo, g1hi}, {$r1};\n"
-        "\tadd.rn.f16 sum0, g0lo, g0hi;\n"
-        "\tadd.rn.f16 sum1, g1lo, g1hi;\n"
-        "\tmov.b32 {$w0}, {sum0, sum1};\n"
-        "\t}\n",
-        write_only_types=[ctm.Int32],
-        read_only_args=[group_sum0, group_sum1],
-    )
-
-
-@cute.jit
-def _pack_p4_16_scores_from_group(
-    group_scores,
-    group_base: ctm.Int32,
-    valid_k: ctm.Int32,
-    group_valid: ctm.Boolean,
-    mask_valid_k: ctm.Constexpr,
-    use_mixed_imlp: ctm.Constexpr,
-    softmax_scale_log2: ctm.Float32,
-    p_bias: ctm.Float32,
-    elem_base: ctm.Constexpr,
-) -> tuple:
-    words = ctm.Array(ctm.Int32, 2, space=ctm.AddressSpace.rmem)
-    p_sum_pair = (ctm.Float32(0.0), ctm.Float32(0.0))
-    for word_part in ctm.range_constexpr(2):
-        packed_p0 = ctm.Float32(0.0)
-        packed_p1 = ctm.Float32(0.0)
-        packed_p2 = ctm.Float32(0.0)
-        packed_p3 = ctm.Float32(0.0)
-        packed_p4 = ctm.Float32(0.0)
-        packed_p5 = ctm.Float32(0.0)
-        packed_p6 = ctm.Float32(0.0)
-        packed_p7 = ctm.Float32(0.0)
-        for pair_idx in ctm.range_constexpr(4):
-            elem0: ctm.Constexpr = elem_base + word_part * 8 + pair_idx * 2
-            elem1: ctm.Constexpr = elem0 + 1
-            p0 = ctm.Float32(0.0)
-            p1 = ctm.Float32(0.0)
-            should_compute = ctm.Boolean(True)
-            if cutlass.const_expr(mask_valid_k):
-                should_compute = group_valid
-            if should_compute:
-                score0 = group_scores[elem0]
-                score1 = group_scores[elem1]
-                if cutlass.const_expr(mask_valid_k):
-                    global_k_idx0 = group_base + ctm.Int32(elem0)
-                    global_k_idx1 = group_base + ctm.Int32(elem1)
-                    score0 = _mask_invalid_score(score0, global_k_idx0, valid_k)
-                    score1 = _mask_invalid_score(score1, global_k_idx1, valid_k)
-                p0, p1 = _softmax_exp2_pair(score0, score1, softmax_scale_log2, p_bias)
-            if cutlass.const_expr(word_part == 0 and pair_idx == 0):
-                p_sum_pair = (p0, p1)
-            else:
-                p_sum_pair = nvvm_add_packed_f32x2(p_sum_pair, (p0, p1))
-            if cutlass.const_expr(pair_idx == 0):
-                packed_p0 = p0
-                packed_p1 = p1
-            elif cutlass.const_expr(pair_idx == 1):
-                packed_p2 = p0
-                packed_p3 = p1
-            elif cutlass.const_expr(pair_idx == 2):
-                packed_p4 = p0
-                packed_p5 = p1
-            else:
-                packed_p6 = p0
-                packed_p7 = p1
-        words[word_part] = _pack_e2m1x8(
-            packed_p0,
-            packed_p1,
-            packed_p2,
-            packed_p3,
-            packed_p4,
-            packed_p5,
-            packed_p6,
-            packed_p7,
-        )
-    p_sum = p_sum_pair[0] + p_sum_pair[1]
-    return (words[0], words[1], p_sum)
 
 
 @cute.jit
@@ -3570,28 +3069,6 @@ def _arrive_smem_p4_mapped_leader_mbar(leader_mbar) -> None:
 
 
 @cute.jit
-def _store_smem_p4_n256_rowsum_part(
-    sRowSumParts,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    bank_idx: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    value: ctm.Float32,
-) -> None:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    col_band = local_warp_idx >> ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    slot_idx = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE) + score_half_idx
-    row_state_offset = slot_idx * ctm.Int32(
-        SMEM_P4_SCORE_SLOT_ROW_STATE_STRIDE
-    ) + col_band * ctm.Int32(SMEM_P4_BMM1_M)
-    sRowSumParts[row_state_offset + local_row] = value
-
-
-@cute.jit
 def _smem_p4_qk_score_group_col(
     score_slot_idx: ctm.Constexpr, col_band: ctm.Int32, local_group_idx: ctm.Constexpr
 ) -> ctm.Int32:
@@ -3608,64 +3085,6 @@ def _smem_p4_p4_materialize_group_col(
     elif cutlass.const_expr(local_group_idx == 2):
         group_col = ctm.Int32(SMEM_P4_P4_SCORE_READ_GROUP2_COL)
     return group_col
-
-
-@cute.jit
-def _float_to_ordered_u32_for_atomic_max(value: ctm.Float32) -> ctm.Uint32:
-    bits = prims.mov_b32(value, target_type=ctm.Int32)
-    sign_mask = bits >> ctm.Int32(31) | ctm.Int32(2147483648)
-    encoded = bits ^ sign_mask
-    return prims.mov_b32(encoded, target_type=ctm.Uint32)
-
-
-@cute.jit
-def _ordered_u32_to_float_after_atomic_max(value: ctm.Uint32) -> ctm.Float32:
-    encoded = prims.mov_b32(value, target_type=ctm.Int32)
-    sign_mask = ~(encoded >> ctm.Int32(31)) | ctm.Int32(2147483648)
-    bits = encoded ^ sign_mask
-    return prims.mov_b32(bits, target_type=ctm.Float32)
-
-
-@cute.jit
-def _smem_atomic_max_ordered_u32(pointer, value: ctm.Uint32) -> None:
-    prims.atomicrmw(
-        prims.AtomicOp.MAX,
-        pointer,
-        value,
-        syncscope=prims.MemScope.CTA,
-        space=prims.SharedSpace.shared_cta,
-    )
-
-
-@cute.jit
-def _tcgen05_ld_red_32x32b_x16_max_f32(tmem) -> tuple:
-    tmem_addr = tmem.toint(ctm.Int32)
-    return cute_inline_ptx(
-        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
-        "{{$w0}, {$w1}, {$w2}, {$w3}, {$w4}, {$w5}, {$w6}, {$w7}, "
-        "{$w8}, {$w9}, {$w10}, {$w11}, {$w12}, {$w13}, {$w14}, {$w15}}, "
-        "{$w16}, [{$r0}];",
-        write_only_types=[ctm.Int32] * 17,
-        read_only_args=[tmem_addr],
-    )
-
-
-@cute.jit
-def _publish_p4_n256_atomic_rowmax(
-    sAtomicRunningRowMax,
-    tile_row_max: ctm.Float32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-) -> None:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    row_band = local_warp_idx & ctm.Int32(1)
-    local_row = row_band * ctm.Int32(32) + lane_idx
-    _smem_atomic_max_ordered_u32(
-        sAtomicRunningRowMax.data_ptr() + local_row,
-        _float_to_ordered_u32_for_atomic_max(tile_row_max),
-    )
 
 
 @cute.jit
@@ -3784,72 +3203,6 @@ def _load_p4_n256_score_half_from_tmem(
 
 
 @cute.jit
-def _runtime_load_final_p4_n256_score_half_from_tmem(
-    sAtomicRunningRowMax,
-    qk_full_mbar,
-    score_tmem_addresses,
-    producer_col_band: ctm.Int32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    kv_tile_idx: ctm.Int32,
-    valid_k: ctm.Int32,
-    tail_needs_mask: ctm.Boolean,
-    qk_phase: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-) -> tuple:
-    score_half_n: ctm.Constexpr = SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        score_half_n // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    score_value_count: ctm.Constexpr = score_half_groups_per_col_band * SF_VEC_SIZE
-    score_values = ctm.Vector.from_elements(
-        tuple((ctm.Float32(0.0) for _ in range(score_value_count))), dtype=ctm.Float32
-    )
-    group_max_values = ctm.Vector.from_elements(
-        tuple((ctm.Float32(-ctm.Float32.inf) for _ in range(score_half_groups_per_col_band))),
-        dtype=ctm.Float32,
-    )
-    group_valid_values = ctm.Vector.from_elements(
-        tuple((ctm.Boolean(False) for _ in range(score_half_groups_per_col_band))),
-        dtype=ctm.Boolean,
-    )
-    if tail_needs_mask:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar,
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=kv_tile_idx,
-            valid_k=valid_k,
-            mask_valid_k=True,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    else:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar,
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=kv_tile_idx,
-            valid_k=valid_k,
-            mask_valid_k=False,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    return (score_values, group_max_values, group_valid_values)
-
-
-@cute.jit
 def _load_p4_n256_atomic_running_rowmax(
     sAtomicRunningRowMax,
     warp_idx: ctm.Int32,
@@ -3917,16 +3270,6 @@ def _select_smem_p4_lazy_anchor_runtime(
     if ~has_previous_tile | lane_rebase:
         new_row_anchor = new_row_max
     return (new_row_anchor, lane_rebase, anchor_delta_log2)
-
-
-@cute.jit
-def _compute_smem_p4_lazy_rebase_scale(
-    lane_rebase: ctm.Boolean, anchor_delta_log2: ctm.Float32
-) -> ctm.Float32:
-    rebase_scale = ctm.Float32(1.0)
-    if lane_rebase:
-        rebase_scale = cute.exp2(-anchor_delta_log2, fastmath=True)
-    return rebase_scale
 
 
 @cute.jit
@@ -4199,133 +3542,6 @@ def _finalize_p4_n256_score_half_psf_source(
 
 
 @cute.jit
-def _runtime_finalize_final_p4_n256_score_half_psf_source(
-    sPSF,
-    group_max_values,
-    group_valid_values,
-    group_p_sums,
-    new_row_max: ctm.Float32,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    softmax_scale_log2: ctm.Float32,
-    pv_psf_rescale: ctm.Float32,
-    tail_needs_mask: ctm.Boolean,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-    use_mixed_imlp: ctm.Constexpr,
-) -> tuple:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    score_half_n: ctm.Constexpr = SMEM_P4_BMM1_N // SMEM_P4_N256_SCORE_HALVES
-    score_half_groups_per_col_band: ctm.Constexpr = (
-        score_half_n // SF_VEC_SIZE // SMEM_P4_TMEM_WARP_N
-    )
-    sf_bias = -new_row_max * softmax_scale_log2 - ctm.Float32(LOG2_6)
-    if cutlass.const_expr(score_half_groups_per_col_band != 4):
-        raise ValueError("packed P_SFA conversion requires four groups per col band")
-    denominator_sf_word = ctm.Int32(0)
-    pv_sf_word = ctm.Int32(0)
-    prequant_row_sum = ctm.Float32(0.0)
-    if tail_needs_mask:
-        sf_exact_0 = ctm.Float32(0.0)
-        sf_exact_1 = ctm.Float32(0.0)
-        sf_exact_2 = ctm.Float32(0.0)
-        sf_exact_3 = ctm.Float32(0.0)
-        for local_group_idx in ctm.range_constexpr(score_half_groups_per_col_band):
-            group_valid = group_valid_values[local_group_idx]
-            sf_exact = ctm.Float32(0.0)
-            if group_valid:
-                sf_exact = cute.exp2(
-                    group_max_values[local_group_idx] * softmax_scale_log2 + sf_bias,
-                    fastmath=True,
-                )
-                prequant_row_sum += sf_exact * group_p_sums[local_group_idx]
-            if cutlass.const_expr(local_group_idx == 0):
-                sf_exact_0 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 1):
-                sf_exact_1 = sf_exact
-            elif cutlass.const_expr(local_group_idx == 2):
-                sf_exact_2 = sf_exact
-            else:
-                sf_exact_3 = sf_exact
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-    elif cutlass.const_expr(use_mixed_imlp):
-        sf_h2_01 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[0], group_max_values[1], softmax_scale_log2, sf_bias
-        )
-        sf_h2_23 = _softmax_exp2_pair_packed_f16x2(
-            group_max_values[2], group_max_values[3], softmax_scale_log2, sf_bias
-        )
-        denominator_sf_word = _pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23)
-        pv_sf_word = _scale_pack_e4m3x4_natural_from_f16x2(sf_h2_01, sf_h2_23, pv_psf_rescale)
-        prequant_row_sum = _p4_n256_prequant_rowsum_from_f16x2_psf(sf_h2_01, sf_h2_23, group_p_sums)
-    else:
-        sf_args_01 = nvvm_fma_packed_f32x2(
-            (group_max_values[0], group_max_values[1]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_args_23 = nvvm_fma_packed_f32x2(
-            (group_max_values[2], group_max_values[3]),
-            (softmax_scale_log2, softmax_scale_log2),
-            (sf_bias, sf_bias),
-        )
-        sf_exact_0 = cute.exp2(sf_args_01[0], fastmath=True)
-        sf_exact_1 = cute.exp2(sf_args_01[1], fastmath=True)
-        sf_exact_2 = cute.exp2(sf_args_23[0], fastmath=True)
-        sf_exact_3 = cute.exp2(sf_args_23[1], fastmath=True)
-        denominator_sf_word = _pack_e4m3x4_natural(sf_exact_0, sf_exact_1, sf_exact_2, sf_exact_3)
-        pv_sf_word = _pack_e4m3x4_natural(
-            sf_exact_0 * pv_psf_rescale,
-            sf_exact_1 * pv_psf_rescale,
-            sf_exact_2 * pv_psf_rescale,
-            sf_exact_3 * pv_psf_rescale,
-        )
-        row_sum_parts01 = nvvm_mul_packed_f32x2(
-            (sf_exact_0, sf_exact_1), (group_p_sums[0], group_p_sums[1])
-        )
-        row_sum_parts23 = nvvm_mul_packed_f32x2(
-            (sf_exact_2, sf_exact_3), (group_p_sums[2], group_p_sums[3])
-        )
-        prequant_row_sum = _sum_p4_n256_psf_row_parts(
-            row_sum_parts01[0],
-            row_sum_parts01[1],
-            row_sum_parts23[0],
-            row_sum_parts23[1],
-        )
-    psf_source_word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    sPSF[psf_source_word_offset] = pv_sf_word
-    prims.fence_proxy(kind=prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-    return (denominator_sf_word, prequant_row_sum)
-
-
-@cute.jit
-def _reload_p4_n256_owned_psf_word_after_ready(
-    sPSF,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    producer_warp_base: ctm.Int32,
-    score_half_idx: ctm.Int32,
-    bank_idx: ctm.Int32,
-) -> ctm.Int32:
-    local_warp_idx = warp_idx - producer_warp_base
-    lane_idx = tidx & ctm.Int32(31)
-    word_offset = _smem_p4_n256_psf_source_word_offset(
-        bank_idx, score_half_idx, local_warp_idx, lane_idx
-    )
-    return sPSF[word_offset]
-
-
-@cute.jit
 def _make_p4_n256_psf_bank_to_tmem_desc(
     sPSF, base_col_id: ctm.Int32, base_row_id: ctm.Int32, bank_idx: ctm.Int32
 ) -> tuple:
@@ -4354,41 +3570,6 @@ def _issue_p4_n256_psf_bank_to_tmem_from_desc(desc_psf_s2t, p_sfa_tmem) -> None:
             group=prims.CTAGroup.CTA_2,
             multicast=psf_s2t_multicast,
         )
-
-
-@cute.jit
-def _sum_p4_n256_psf_row_parts(
-    row_sum_part0: ctm.Float32,
-    row_sum_part1: ctm.Float32,
-    row_sum_part2: ctm.Float32,
-    row_sum_part3: ctm.Float32,
-) -> ctm.Float32:
-    row_sum = row_sum_part0 + row_sum_part1
-    row_sum = row_sum + row_sum_part2
-    return row_sum + row_sum_part3
-
-
-@cute.jit
-def _p4_n256_rowsum_from_packed_psf_word(sf_word: ctm.Int32, packed_group_sums) -> ctm.Float32:
-    return cute_inline_ptx(
-        "{\n"
-        "\t.reg .b16 sf01, sf23;\n"
-        "\t.reg .b32 sf_h2_01, sf_h2_23, weighted_h2;\n"
-        "\t.reg .f16 weighted_lo, weighted_hi;\n"
-        "\t.reg .f32 weighted_lo_f32, weighted_hi_f32;\n"
-        "\tmov.b32 {sf01, sf23}, {$r0};\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_01, sf01;\n"
-        "\tcvt.rn.f16x2.e4m3x2 sf_h2_23, sf23;\n"
-        "\tmul.f16x2 weighted_h2, {$r1}, sf_h2_01;\n"
-        "\tfma.rn.f16x2 weighted_h2, {$r2}, sf_h2_23, weighted_h2;\n"
-        "\tmov.b32 {weighted_lo, weighted_hi}, weighted_h2;\n"
-        "\tcvt.f32.f16 weighted_lo_f32, weighted_lo;\n"
-        "\tcvt.f32.f16 weighted_hi_f32, weighted_hi;\n"
-        "\tadd.f32 {$w0}, weighted_lo_f32, weighted_hi_f32;\n"
-        "\t}\n",
-        write_only_types=[ctm.Float32],
-        read_only_args=[sf_word, packed_group_sums[0], packed_group_sums[1]],
-    )
 
 
 @cute.jit
@@ -4517,28 +3698,6 @@ def _issue_smem_p4_pv_score_slot_from_base(
         a_sf_layout=SMEM_P4_P_SFA_LAYOUT,
         a_collector_op=a_collector_op,
     )
-
-
-@cute.jit
-def _rescale_smem_p4_resident_o_in_tmem(o_acc_tmem, old_scale: ctm.Float32) -> None:
-    scaled_accum = ctm.Array(ctm.Float32, 128, space=ctm.AddressSpace.rmem)
-    c_rmem = prims.tcgen05_ld(prims.Tcgen05LdStShape.SHAPE_32X32B, o_acc_tmem, num=128)
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-    old_scale_f32x2 = (old_scale, old_scale)
-    for pair_idx in ctm.range_constexpr(64):
-        elem_idx: ctm.Constexpr = pair_idx * 2
-        scaled_pair = nvvm_mul_packed_f32x2(
-            (c_rmem[elem_idx], c_rmem[elem_idx + 1]), old_scale_f32x2
-        )
-        scaled_accum[elem_idx] = scaled_pair[0]
-        scaled_accum[elem_idx + 1] = scaled_pair[1]
-    prims.tcgen05_st(
-        prims.Tcgen05LdStShape.SHAPE_32X32B,
-        o_acc_tmem,
-        scaled_accum.load(0, 128, alignment=32),
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
 @cute.jit
@@ -5190,369 +4349,6 @@ def _runtime_t336_prepare_p_source(
 
 
 @cute.jit
-def _runtime_t336_producer_tile(
-    sAtomicRunningRowMax,
-    sP,
-    sPSF,
-    sScoreSlotRowMax,
-    sRowScaleRing,
-    qk_full_mbar,
-    pair_overlap_sync_mbars,
-    leader_pair_overlap_sync_mbars,
-    leader_pair_overlap_sync_mbars_dsmem,
-    p4_smem_slot0_producer,
-    p4_smem_slot0_mbar_ptr,
-    tmem_score_slot0_consumer,
-    tmem_score_slot0_mbar_ptr,
-    pv_full_mbar,
-    corr_o_acc_tmem,
-    warp_idx: ctm.Int32,
-    tidx: ctm.Int32,
-    p4_tmem_base_col_id: ctm.Int32,
-    p4_tmem_base_row_id: ctm.Int32,
-    valid_k_for_l: ctm.Int32,
-    softmax_scale_log2: ctm.Float32,
-    pv_psf_rescale: ctm.Float32,
-    running_row_max: ctm.Float32,
-    running_row_anchor: ctm.Float32,
-    carried_dq1024: ctm.Int32,
-    carried_old_scale: ctm.Float32,
-    stream_li_idx: ctm.Int32,
-    has_previous_tile: ctm.Constexpr,
-    tail_needs_mask: ctm.Boolean,
-    is_final_tile: ctm.Constexpr,
-    use_mixed_imlp: ctm.Constexpr,
-) -> tuple:
-    bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
-    qk_phase = (
-        stream_li_idx
-        // ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-        % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-    )
-    rowsum_full_mbar = pair_overlap_sync_mbars.subview(SMEM_P4_PAIR_P4_READY_MBAR_OFFSET + bank_idx)
-    pair_rowmax_read_done_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_ROWMAX_READ_DONE_MBAR_OFFSET + bank_idx
-    )
-    direct_p_ready_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_DIRECT_P_READY_MBAR_OFFSET + bank_idx
-    )
-    leader_pair_p_source_ready_mbar = leader_pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + bank_idx
-    )
-    leader_pair_p_source_ready_dsmem_mbar = leader_pair_overlap_sync_mbars_dsmem.subview(
-        SMEM_P4_PAIR_P_SOURCE_READY_MBAR_OFFSET + bank_idx
-    )
-    qk_score_chunk_col_offset = ctm.Int32(SMEM_P4_QK_ACC_COL_OFFSET) + bank_idx * ctm.Int32(
-        SMEM_P4_QK_PIPELINE_SLOT_STRIDE
-    )
-    p_stage_base = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE)
-    score_half_idx = warp_idx >> ctm.Int32(2)
-    producer_warp_base = score_half_idx << ctm.Int32(2)
-    producer_local_warp_idx = warp_idx & ctm.Int32(3)
-    producer_row_band = producer_local_warp_idx & ctm.Int32(1)
-    producer_col_band = producer_local_warp_idx >> ctm.Int32(1)
-    is_compute_warp = score_half_idx == ctm.Int32(0)
-    score_tmem_addresses = _prepare_p4_n256_score_half_tmem_addresses(
-        warp_idx, p4_tmem_base_col_id, p4_tmem_base_row_id, qk_score_chunk_col_offset
-    )
-    next_running_row_max = running_row_max
-    next_running_row_anchor = running_row_anchor
-    next_carried_dq1024 = carried_dq1024
-    next_carried_old_scale = carried_old_scale
-    if is_compute_warp:
-        tmem_score_slot0_consumer.wait()
-    if cutlass.const_expr(is_final_tile):
-        score_values, group_max_values, group_valid_values = (
-            _runtime_load_final_p4_n256_score_half_from_tmem(
-                sAtomicRunningRowMax,
-                qk_full_mbar.subview(bank_idx),
-                score_tmem_addresses,
-                producer_col_band,
-                warp_idx,
-                tidx,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                tail_needs_mask=tail_needs_mask,
-                qk_phase=qk_phase,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-            )
-        )
-    else:
-        score_values, group_max_values, group_valid_values = _load_p4_n256_score_half_from_tmem(
-            sAtomicRunningRowMax,
-            qk_full_mbar.subview(bank_idx),
-            score_tmem_addresses,
-            producer_col_band,
-            warp_idx,
-            tidx,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            mask_valid_k=False,
-            qk_phase=qk_phase,
-            wait_for_qk_full=True,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-        )
-    packed_p4_words = ctm.Vector.from_elements(
-        tuple((ctm.Int32(0) for _ in range(8))), dtype=ctm.Int32
-    )
-    group_p_sums = ctm.Vector.from_elements(
-        tuple((ctm.Float32(0.0) for _ in range(4))), dtype=ctm.Float32
-    )
-    if cutlass.const_expr(is_final_tile):
-        # ``tail_needs_mask`` is CTA-uniform.  Keep the NaN-safe validity path
-        # for a genuinely partial final tile, but do not execute its per-SF16
-        # predicates for a full final tile.  Both cases remain in one runtime-KV
-        # binary; no request-dependent valid_k value enters the JIT key.
-        if tail_needs_mask:
-            packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-                score_values,
-                group_max_values,
-                group_valid_values,
-                warp_idx,
-                softmax_scale_log2,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-                mask_valid_k=True,
-                use_mixed_imlp=use_mixed_imlp,
-            )
-        else:
-            packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-                score_values,
-                group_max_values,
-                group_valid_values,
-                warp_idx,
-                softmax_scale_log2,
-                kv_tile_idx=stream_li_idx,
-                valid_k=valid_k_for_l,
-                producer_warp_base=producer_warp_base,
-                score_half_idx=score_half_idx,
-                mask_valid_k=False,
-                use_mixed_imlp=use_mixed_imlp,
-            )
-    else:
-        packed_p4_words, group_p_sums = _prepack_p4_n256_score_half_before_rowmax(
-            score_values,
-            group_max_values,
-            group_valid_values,
-            warp_idx,
-            softmax_scale_log2,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            mask_valid_k=False,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    if is_compute_warp:
-        p4_smem_slot0_producer.acquire()
-    prims.barrier(
-        barrier_id=SMEM_P4_DUAL_HALF_BAR_ID,
-        number_of_threads=SMEM_P4_DUAL_HALF_BAR_THREADS,
-    )
-    new_row_max = running_row_max
-    new_row_valid = ctm.Boolean(True)
-    if cutlass.const_expr(is_final_tile):
-        if tail_needs_mask:
-            new_row_max, new_row_valid = _load_p4_n256_atomic_running_rowmax_with_validity(
-                sAtomicRunningRowMax,
-                warp_idx,
-                tidx,
-                producer_warp_base=producer_warp_base,
-            )
-        else:
-            new_row_max = _load_p4_n256_atomic_running_rowmax(
-                sAtomicRunningRowMax,
-                warp_idx,
-                tidx,
-                producer_warp_base=producer_warp_base,
-            )
-    else:
-        new_row_max = _load_p4_n256_atomic_running_rowmax(
-            sAtomicRunningRowMax, warp_idx, tidx, producer_warp_base=producer_warp_base
-        )
-    if is_compute_warp:
-        if prims.elect_sync():
-            prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
-    lane_rebase = ctm.Boolean(False)
-    anchor_delta_log2 = ctm.Float32(0.0)
-    if cutlass.const_expr(is_final_tile):
-        if tail_needs_mask:
-            next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-                _select_smem_p4_lazy_anchor_with_validity(
-                    new_row_max,
-                    new_row_valid,
-                    running_row_anchor,
-                    softmax_scale_log2,
-                )
-            )
-        else:
-            next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-                _select_smem_p4_lazy_anchor_runtime(
-                    new_row_max,
-                    running_row_anchor,
-                    softmax_scale_log2,
-                    has_previous_tile,
-                )
-            )
-    _store_prepacked_p4_n256_score_half_to_direct_a(
-        sP,
-        packed_p4_words,
-        warp_idx,
-        tidx,
-        producer_warp_base=producer_warp_base,
-        p_stage_base=p_stage_base,
-        score_half_idx=score_half_idx,
-    )
-    if prims.elect_sync():
-        prims.mbarrier_arrive(direct_p_ready_mbar)
-    if cutlass.const_expr(not is_final_tile):
-        next_running_row_anchor, lane_rebase, anchor_delta_log2 = (
-            _select_smem_p4_lazy_anchor_runtime(
-                new_row_max, running_row_anchor, softmax_scale_log2, has_previous_tile
-            )
-        )
-    current_old_scale = ctm.Float32(1.0)
-    warp_rebase = cute.arch.vote_any_sync(lane_rebase)
-    next_running_row_max = new_row_max
-    if cutlass.const_expr(is_final_tile):
-        owned_psf_word, prequant_row_sum = _runtime_finalize_final_p4_n256_score_half_psf_source(
-            sPSF,
-            group_max_values,
-            group_valid_values,
-            group_p_sums,
-            next_running_row_anchor,
-            warp_idx,
-            tidx,
-            softmax_scale_log2,
-            pv_psf_rescale,
-            tail_needs_mask=tail_needs_mask,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            bank_idx=bank_idx,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    else:
-        owned_psf_word, prequant_row_sum = _finalize_p4_n256_score_half_psf_source(
-            sPSF,
-            group_max_values,
-            group_p_sums,
-            next_running_row_anchor,
-            warp_idx,
-            tidx,
-            softmax_scale_log2,
-            pv_psf_rescale,
-            kv_tile_idx=stream_li_idx,
-            valid_k=valid_k_for_l,
-            mask_valid_k=False,
-            producer_warp_base=producer_warp_base,
-            score_half_idx=score_half_idx,
-            bank_idx=bank_idx,
-            use_mixed_imlp=use_mixed_imlp,
-        )
-    if has_previous_tile:
-        common_source_ready_pred = prims.elect_sync() & ~warp_rebase
-        if common_source_ready_pred:
-            prims.mbarrier_arrive(
-                leader_pair_p_source_ready_dsmem_mbar,
-                count=1,
-                scope=prims.MemScope.CLUSTER,
-                relaxed=True,
-            )
-        if warp_rebase:
-            pv_done_li_idx = stream_li_idx - ctm.Int32(1)
-            pv_done_slot = pv_done_li_idx % ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-            pv_done_phase = (
-                pv_done_li_idx
-                // ctm.Int32(SMEM_P4_QK_PIPELINE_SLOTS)
-                % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-            )
-            while not prims.mbarrier_try_wait_parity(
-                pv_full_mbar.subview(pv_done_slot), pv_done_phase, time_limit=10000000
-            ):
-                pass
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-            current_old_scale = _compute_smem_p4_lazy_rebase_scale(lane_rebase, anchor_delta_log2)
-            _rescale_smem_p4_resident_o_in_tmem(corr_o_acc_tmem, current_old_scale)
-            if prims.elect_sync():
-                _arrive_smem_p4_mapped_leader_mbar(leader_pair_p_source_ready_mbar)
-    elif prims.elect_sync():
-        _arrive_smem_p4_mapped_leader_mbar(leader_pair_p_source_ready_mbar)
-    if is_compute_warp:
-        if cutlass.const_expr(not is_final_tile):
-            while not prims.mbarrier_try_wait_parity(
-                direct_p_ready_mbar, qk_phase, time_limit=10000000
-            ):
-                pass
-            cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
-                cutlass.Int32(0),
-            )
-            p4_smem_slot0_producer.advance()
-            cute.arch.mbarrier_arrive(
-                tmem_score_slot0_mbar_ptr
-                + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.current_handle().index,
-                cutlass.Int32(0),
-            )
-            tmem_score_slot0_consumer.advance()
-    if is_compute_warp:
-        prims.barrier(
-            barrier_id=SMEM_P4_P4_SLOT0_BAR_ID,
-            number_of_threads=SMEM_P4_SCORE_SLOT_PRODUCER_THREADS,
-        )
-    else:
-        prims.barrier(
-            barrier_id=SMEM_P4_P4_SLOT1_BAR_ID,
-            number_of_threads=SMEM_P4_CORRECTION_THREADS,
-        )
-    row_sum = prequant_row_sum
-    rowsum_empty_mbar = pair_overlap_sync_mbars.subview(
-        SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + bank_idx
-    )
-    if stream_li_idx >= ctm.Int32(SMEM_P4_TMEM_BANKS):
-        previous_rowsum_phase = (
-            (stream_li_idx - ctm.Int32(SMEM_P4_TMEM_BANKS))
-            // ctm.Int32(SMEM_P4_TMEM_BANKS)
-            % ctm.Int32(SMEM_P4_MBAR_PARITY_PHASES)
-        )
-        while not prims.mbarrier_try_wait_parity(
-            rowsum_empty_mbar, previous_rowsum_phase, time_limit=10000000
-        ):
-            pass
-    _store_smem_p4_n256_rowsum_part(
-        sScoreSlotRowMax,
-        warp_idx,
-        tidx,
-        producer_warp_base=producer_warp_base,
-        bank_idx=bank_idx,
-        score_half_idx=score_half_idx,
-        value=row_sum,
-    )
-    if is_compute_warp & (producer_col_band == ctm.Int32(0)):
-        row_state_local_row = producer_row_band * ctm.Int32(32) + (tidx & ctm.Int32(31))
-        sRowScaleRing[bank_idx * ctm.Int32(SMEM_P4_BMM1_M) + row_state_local_row] = (
-            current_old_scale
-        )
-    if prims.elect_sync():
-        prims.mbarrier_arrive(rowsum_full_mbar)
-    if not is_compute_warp:
-        while not prims.mbarrier_try_wait_parity(
-            pair_rowmax_read_done_mbar, qk_phase, time_limit=10000000
-        ):
-            pass
-    return (
-        next_running_row_max,
-        next_running_row_anchor,
-        next_carried_dq1024,
-        next_carried_old_scale,
-    )
-
-
-@cute.jit
 def _issue_pipelined_score_loads(
     qk_full_mbar: ctm.Array,
     stream_li_idx: ctm.Int32,
@@ -5709,9 +4505,18 @@ def _finalize_pipelined_tile(
 ) -> tuple:
     """Finish tile ``stream_li_idx`` from its prepacked P words.
 
-    Same steps as ``_runtime_t336_prepare_p_source`` from the dual-half barrier on followed by the
-    tail of ``_runtime_t336_producer_tile_v23``: row anchor, P and PSF stores, lazy O rescale and
-    the P_SOURCE_READY arrive.
+    Follows ``_runtime_t336_prepare_p_source`` from the dual-half barrier on and the tail of
+    ``_runtime_t336_producer_tile_v23`` (row anchor, P and PSF stores, lazy O rescale and the
+    P_SOURCE_READY arrive), except that it reads the parity-indexed ``sPipelinedRowMax``, never
+    masks K, and does not wait on ``pair_rowmax_read_done``.
+
+    The skipped wait is safe because ``sPipelinedRowMax`` is double-buffered per tile parity:
+    this tile reads the half ``stream_li_idx & 1``, the tile pipelined one step ahead
+    publishes into the other half, and the next writer of this half runs two tiles later.
+    ``_runtime_t336_prepare_p_source`` needs the wait (and the second dual-half barrier
+    before its arrive) only because both score halves read one shared
+    ``sAtomicRunningRowMax``. Do not remove the parity double buffer without restoring
+    the wait.
     """
     bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
     p_stage_base = bank_idx * ctm.Int32(SMEM_P4_SCORE_SLOTS_PER_KV_TILE)
@@ -6199,26 +5004,6 @@ def _packed_query_bound(
 
 
 @cute.jit
-def _packed_request_tiles(
-    mValidK_l: cute.Tensor,
-    mHelixKvBounds_l: cute.Tensor,
-    request_idx: ctm.Int32,
-    query_len_per_seq: ctm.Constexpr,
-    use_helix_kv_bounds: ctm.Constexpr,
-) -> ctm.Int32:
-    """KV tiles a packed request spans (its last query token's bound), at least one."""
-    bound = _packed_query_bound(
-        mHelixKvBounds_l,
-        request_idx,
-        ctm.Int32(query_len_per_seq - 1),
-        ctm.Int32(mValidK_l[request_idx]),
-        query_len_per_seq,
-        use_helix_kv_bounds,
-    )
-    return ctm.max((bound + ctm.Int32(KV_TILE - 1)) // ctm.Int32(KV_TILE), ctm.Int32(1))
-
-
-@cute.jit
 def _run_mla_decode_body(
     mPageTable_pl: cute.Tensor,
     mPageIndptr_s: cute.Tensor,
@@ -6481,7 +5266,7 @@ def _run_mla_decode_body(
         space=ctm.AddressSpace.smem,
         alignment=128,
     )
-    sScoreSlotRowMax = ctm.Array(
+    sRowSumParts = ctm.Array(
         ctm.Float32,
         SMEM_P4_STAGE_ROW_STATE_SMEM_FLOATS,
         space=ctm.AddressSpace.smem,
@@ -6580,18 +5365,6 @@ def _run_mla_decode_body(
             for pv_full_mbar_idx in ctm.range_constexpr(SMEM_P4_QK_PIPELINE_SLOTS):
                 prims.mbarrier_init(pv_full_mbar.subview(pv_full_mbar_idx), 1)
             for pair_slot_idx in ctm.range_constexpr(SMEM_P4_QK_PIPELINE_SLOTS):
-                prims.mbarrier_init(
-                    pair_overlap_sync_mbars.subview(
-                        SMEM_P4_PAIR_P4_READY_MBAR_OFFSET + pair_slot_idx
-                    ),
-                    SMEM_P4_TOTAL_PRODUCER_WARPS,
-                )
-                prims.mbarrier_init(
-                    pair_overlap_sync_mbars.subview(
-                        SMEM_P4_PAIR_HALF1_ROWSUM_READY_MBAR_OFFSET + pair_slot_idx
-                    ),
-                    1,
-                )
                 prims.mbarrier_init(
                     pair_overlap_sync_mbars.subview(
                         SMEM_P4_PAIR_FINAL_PV_ISSUED_MBAR_OFFSET + pair_slot_idx
@@ -7376,7 +6149,7 @@ def _run_mla_decode_body(
         part_local_warp_idx = warp_idx & ctm.Int32(3)
         part_idx = (warp_idx >> ctm.Int32(2)) * ctm.Int32(2) + (part_local_warp_idx >> ctm.Int32(1))
         part_row = (part_local_warp_idx & ctm.Int32(1)) * ctm.Int32(32) + (tidx & ctm.Int32(31))
-        sScoreSlotRowMax[part_idx * ctm.Int32(SMEM_P4_BMM1_M) + part_row] = running_part_sum
+        sRowSumParts[part_idx * ctm.Int32(SMEM_P4_BMM1_M) + part_row] = running_part_sum
         prims.barrier(
             barrier_id=SMEM_P4_DUAL_HALF_BAR_ID,
             number_of_threads=SMEM_P4_DUAL_HALF_BAR_THREADS,
@@ -7384,11 +6157,11 @@ def _run_mla_decode_body(
         if is_correction_warp:
             final_row_state_local_row = corr_row_band * ctm.Int32(32) + (tidx & ctm.Int32(31))
             final_anchor_row_sum = (
-                sScoreSlotRowMax[final_row_state_local_row]
-                + sScoreSlotRowMax[ctm.Int32(2 * SMEM_P4_BMM1_M) + final_row_state_local_row]
+                sRowSumParts[final_row_state_local_row]
+                + sRowSumParts[ctm.Int32(2 * SMEM_P4_BMM1_M) + final_row_state_local_row]
             ) + (
-                sScoreSlotRowMax[ctm.Int32(SMEM_P4_BMM1_M) + final_row_state_local_row]
-                + sScoreSlotRowMax[ctm.Int32(3 * SMEM_P4_BMM1_M) + final_row_state_local_row]
+                sRowSumParts[ctm.Int32(SMEM_P4_BMM1_M) + final_row_state_local_row]
+                + sRowSumParts[ctm.Int32(3 * SMEM_P4_BMM1_M) + final_row_state_local_row]
             )
             # Packed rows may be empty while their tile is not (Helix tokens
             # whose KV lives on another rank); judge emptiness per row.
@@ -7643,13 +6416,6 @@ def kernel(
         )
 
 
-def _cutlass_output_dtype(output_dtype: torch.dtype):
-    _validate_output_dtype(output_dtype)
-    if output_dtype == torch.bfloat16:
-        return cutlass.BFloat16
-    return cutlass.Float16
-
-
 def _make_fused_ptrs(
     q_data_ptr: int,
     k_data_ptr: int,
@@ -7813,58 +6579,10 @@ class _PreparedFusedCall:
         return self.executor.run_compiled_program(self.execution_args)
 
 
-_PREPARED_FUSED_CALL_CACHE: OrderedDict[tuple[object, ...], _PreparedFusedCall] = OrderedDict()
-_FUSED_EXECUTOR_CACHE: OrderedDict[tuple[object, ...], Any] = OrderedDict()
-_PREPARED_FUSED_CALL_CACHE_LOCK = threading.Lock()
-
-
-def _class_defines_callables(value: object, *names: str) -> bool:
-    value_type = type(value)
-    return all((callable(getattr(value_type, name, None)) for name in names))
-
-
-def _get_fused_executor(cache_key: tuple[object, ...]) -> Any | None:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        executor = _FUSED_EXECUTOR_CACHE.get(cache_key)
-        if executor is not None:
-            _FUSED_EXECUTOR_CACHE.move_to_end(cache_key)
-        return executor
-
-
-def _get_prepared_fused_call(
-    cache_key: tuple[object, ...],
-) -> _PreparedFusedCall | None:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        prepared = _PREPARED_FUSED_CALL_CACHE.get(cache_key)
-        if prepared is not None:
-            _PREPARED_FUSED_CALL_CACHE.move_to_end(cache_key)
-        return prepared
-
-
-def _cache_prepared_fused_call(
-    cache_key: tuple[object, ...], candidate: _PreparedFusedCall
-) -> _PreparedFusedCall:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        prepared = _PREPARED_FUSED_CALL_CACHE.get(cache_key)
-        if prepared is not None:
-            _PREPARED_FUSED_CALL_CACHE.move_to_end(cache_key)
-            return prepared
-        _PREPARED_FUSED_CALL_CACHE[cache_key] = candidate
-        if len(_PREPARED_FUSED_CALL_CACHE) > _PREPARED_FUSED_CALL_CACHE_CAPACITY:
-            _PREPARED_FUSED_CALL_CACHE.popitem(last=False)
-        return candidate
-
-
-def _cache_fused_executor(cache_key: tuple[object, ...], candidate: Any) -> Any:
-    with _PREPARED_FUSED_CALL_CACHE_LOCK:
-        executor = _FUSED_EXECUTOR_CACHE.get(cache_key)
-        if executor is not None:
-            _FUSED_EXECUTOR_CACHE.move_to_end(cache_key)
-            return executor
-        _FUSED_EXECUTOR_CACHE[cache_key] = candidate
-        if len(_FUSED_EXECUTOR_CACHE) > _FUSED_EXECUTOR_CACHE_CAPACITY:
-            _FUSED_EXECUTOR_CACHE.popitem(last=False)
-        return candidate
+_PREPARED_FUSED_CALL_CACHE: LruCache[_PreparedFusedCall] = LruCache(
+    _PREPARED_FUSED_CALL_CACHE_CAPACITY
+)
+_FUSED_EXECUTOR_CACHE: LruCache[Any] = LruCache(_FUSED_EXECUTOR_CACHE_CAPACITY)
 
 
 def _compile_fused(
@@ -8499,7 +7217,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         packed_query_heads=packed_query_heads,
         row_state_align=row_state_align,
     )
-    supports_prepared = _class_defines_callables(
+    supports_prepared = class_defines_callables(
         fused, "to", "generate_execution_args", "run_compiled_program"
     )
     prepared_key = (
@@ -8546,7 +7264,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         use_consecutive_page_pair,
     )
     if supports_prepared:
-        prepared = _get_prepared_fused_call(prepared_key)
+        prepared = _PREPARED_FUSED_CALL_CACHE.get(prepared_key)
         if prepared is not None:
             prepared.run()
             return
@@ -8598,7 +7316,7 @@ def run_trtllm_fp4_mla_decode_page_native(
         fused(*runtime_args)
         return
     executor_key = (fused, device_index, int(current_context))
-    executor = _get_fused_executor(executor_key)
+    executor = _FUSED_EXECUTOR_CACHE.get(executor_key)
     if executor is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -8606,14 +7324,14 @@ def run_trtllm_fp4_mla_decode_page_native(
                 "compiled kernel, device, and CUDA context."
             )
         candidate = fused.to(device_index)
-        if not _class_defines_callables(
+        if not class_defines_callables(
             candidate, "generate_execution_args", "run_compiled_program"
         ):
             fused(*runtime_args)
             return
-        executor = _cache_fused_executor(executor_key, candidate)
+        executor = _FUSED_EXECUTOR_CACHE.put(executor_key, candidate)
     execution_args, adapted_args = executor.generate_execution_args(*runtime_args)
-    prepared = _cache_prepared_fused_call(
+    prepared = _PREPARED_FUSED_CALL_CACHE.put(
         prepared_key,
         _PreparedFusedCall(
             executor=executor,

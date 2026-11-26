@@ -9,16 +9,20 @@ left intact.
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 __extra_import_path__ = ["../../../comm"]
-import _rank_job  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _rank_job
+else:
+    import _rank_job  # noqa: E402
 import pytest
 import torch
 
 assert torch.cuda.is_available(), "the Kimi K3 target's decode collectives require CUDA devices"
 
 if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-    # The target is certified on sm_100 (GB200) only, as are the catalog entries it calls.
+    # Runs on sm_100 and sm_103, the architectures the K3 decode kernels are certified on; others skip.
     pytest.skip("K3 decode-path kernels require SM100 or SM103", allow_module_level=True)
 
 if torch.cuda.device_count() < _rank_job.WORLD_SIZE:

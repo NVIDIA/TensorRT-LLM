@@ -6,7 +6,7 @@ silu_and_mul at its defaults, over every bf16 gate and every bf16 up pattern."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_silu import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_silu import (  # noqa: E501
     m3_draft_silu as op,
 )
 

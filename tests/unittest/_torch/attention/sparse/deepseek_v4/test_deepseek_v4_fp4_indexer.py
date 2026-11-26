@@ -39,6 +39,8 @@ from tensorrt_llm.llmapi.llm_args import (
     DeepSeekV4SparseAttentionConfig,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------------
 # Pydantic config validators
 # ---------------------------------------------------------------------------

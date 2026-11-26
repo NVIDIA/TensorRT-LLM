@@ -23,10 +23,9 @@ from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
 from ..agents.roles import ROLES
 from ..checks import accuracy_policy
-from ..infra.compute.environment import EnvironmentError, check_tmpdir
+from ..infra.compute.environment import EnvironmentError, check_tmpdir, gpus_per_node
 from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
-from ..tune.schema import validate_perf_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
 
@@ -92,18 +91,27 @@ SPECULATORS: frozenset[str] = frozenset(
 # modules OR DSpark stages and never both.
 MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 
-# `accuracy.disagg`: the tree's own disaggregated-serving accuracy test for this target
-# (checks/disagg.py), the one check the `disagg` feature owes. The run writes it beside the
-# tree's tests that serve through `trtllm-serve disaggregated`.
+# `accuracy.disagg`: the one check the `disagg` feature owes (checks/disagg.py). Either the
+# tree's three files of a deployment, which the flow serves:
 #
-#   test     REQUIRED with the disagg feature: its repository-relative pytest node id, e.g.
+#   config      the proxy's (`trtllm-serve disaggregated -c`)
+#   context     every context server's `trtllm-serve --config`; `generation` likewise
+#
+# or the tree's own kind of test, which the run writes beside the tree's tests that serve
+# through `trtllm-serve disaggregated`:
+#
+#   test     its repository-relative pytest node id, e.g.
 #            `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_y`
 #   tests    optional refinements of test, each run as a separate native job
 #   devices  the devices it starts its engines on (default two engines at the member's width)
+#   nodes    nodes that run one pytest process each
 #   timeout  seconds (default 7200)
-#   env      the environment the test runs under (`LLM_MODELS_ROOT`, ...)
+#   env      the environment the servers or the test run under (`LLM_MODELS_ROOT`, ...)
 DISAGG_FEATURE = "disagg"
-DISAGG_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes", "timeout", "env")
+DISAGG_SIDES: tuple[str, ...] = ("context", "generation")
+DISAGG_FILES: tuple[str, ...] = ("config", *DISAGG_SIDES)
+DISAGG_TEST_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes")
+DISAGG_KEYS: tuple[str, ...] = (*DISAGG_FILES, *DISAGG_TEST_KEYS, "timeout", "env")
 
 # Workload and field documentation lives in task.example.yaml. These key sets
 # close the accepted blocks; cross-field constraints are validated below.
@@ -118,16 +126,10 @@ ACCEPTANCE_WORKLOAD_KEYS: tuple[str, ...] = (
     "dataset_config",
     "max_tokens",
     "min_draft_iterations",
-    "min_prompts",
 )
-# The paired t-test against the previous tree's verdict, at the block's top
-# level only: `alpha` (one-sided, default 0.05), `min_effect` (accepted tokens
-# per iteration, default 0.1). A drop must be both significant and at least
-# `min_effect` to fail.
-ACCEPTANCE_REGRESSION_KEYS: tuple[str, ...] = ("alpha", "min_effect")
-ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "regression", "timeout")
+ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "timeout")
 # What one unit's entry in `accuracy.acceptance` may carry:
-#   min_absolute        the absolute floor used when the `=off` leg cannot run
+#   min_absolute        the absolute floor its acceptance is held to
 #   measured_reference  what a reference drafter measured on this workload; the
 #                       floor is this x 0.95 when `min_absolute` is not given
 #   floor_source        where that measurement was taken. A floor with neither
@@ -156,7 +158,8 @@ RUNTIME_SWITCHES: dict[str, bool] = {
     "cuda_graph": True,
     "chunked_prefill": False,
     "overlap_scheduler": True,
-    "kv_cache_reuse": True,
+    # Block reuse is a non-core feature: off unless asked for, proven by a variant.
+    "kv_cache_reuse": False,
 }
 
 # Scopes a target may be built at. ``text_only`` is the useful one: a
@@ -179,22 +182,16 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     NOTES_FIELD,
     AGENTS_FIELD,
     COMMIT_POLICY_FIELD,
-    "perf",
     VARIANTS_FIELD,
-    "coverage",
     "profile",
 )
-#: ``coverage.accept``: the requested feature@member cells the contract may leave uncovered.
-COVERAGE_FIELD = "coverage"
-COVERAGE_KEYS: tuple[str, ...] = ("accept",)
 #: ``profile``: how much the contract owes, for the run or per unit (a mapping
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
 #: unit's boot only; ``bringup`` gates each unit at its cheapest member, and no
 #: configuration variant and no delivery check. A run whose every unit is one of
 #: the two owes no CI files either (``completion.CI_DELIVERY_CHECKS``);
 #: ``standard`` is the contract as the spec states it; ``certified`` also turns on
-#: boot boundary phases and the serve gate. A switch the spec sets itself keeps
-#: its value.
+#: the serve gate. A switch the spec sets itself keeps its value.
 PROFILE_FIELD = "profile"
 PROFILE_SMOKE = "smoke"
 PROFILE_BRINGUP = "bringup"
@@ -217,9 +214,8 @@ TARGET_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 TARGET_NAME_KEYS: tuple[str, ...] = ("family", "checkpoint_segment")
 
 ACCURACY_KEYS: tuple[str, ...] = (
-    # The absolute `acceptance_length` floor a unit falls back to when the
-    # `=off` leg cannot exist. Also the acceptance gate's declared workload;
-    # see `ACCEPTANCE_WORKLOAD_KEYS`.
+    # The `acceptance_length` floor a unit is held to, and the acceptance
+    # gate's declared workload; see `ACCEPTANCE_WORKLOAD_KEYS`.
     "acceptance",
     "benchmark",
     "reference_yaml",
@@ -228,9 +224,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "timeout",
     "dataset_path",
     "llm_api_options",
-    # A reference's first-token log-probs per prompt, and the bounds a divergence from
-    # them is recorded past (``checks/divergence.py``): never a failure by itself.
-    "reference_logits",
     # Which ROW of reference_yaml this run anchors to. The references key a
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
@@ -244,7 +237,6 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "benchmark_args",
     "floor",
     "boot",
-    "envelope",
     "serve",
     # The benchmark's sample count, scalar or per unit, for the standard
     # error behind the statistical floor.
@@ -271,43 +263,23 @@ ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 #   every    (default) at every member.
 #   <member> at that member (`dep4`, ...), for each unit that has it.
 BENCHMARK_MEMBERS_EVERY = "every"
-#: The concurrencies a perf campaign measures when nothing says: low latency, middle, high
-#: throughput. An attention-DP member measures only the last. A concurrency, like a batch
-#: size, is the global total across the ranks (``check_config.share_batch``).
-DEFAULT_PERF_CONCURRENCY: tuple[int, ...] = (1, 32, 128)
 BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 
-# Boot workloads allow run-wide keys and per-unit overlays. Keywords match
-# generated text, never logs; absent multimodal images use the repository asset.
-BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
-# How long one boot gate, or one acceptance leg, may run: `timeout` at either level of
+# Boot workloads allow run-wide keys and per-unit overlays. Absent multimodal images use
+# the repository asset.
+BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
+# How long one boot gate, or one acceptance gate, may run: `timeout` at either level of
 # `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
 # changes no verdict, only how long a slow load is waited for.
 GATE_TIMEOUT_KEY = "timeout"
-BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
+BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
-
-# Optional runtime-boundary phases of ordinary boot (checks/boot.py).
-# Disabled by default; certified enables them unless explicitly disabled.
-# timeout bounds the complete boot invocation, not a second engine launch.
-ENVELOPE_KEYS: tuple[str, ...] = (
-    "enabled",
-    "max_tokens",
-    "agree_tokens",
-    "long_prompts",
-    "probes",
-    "timeout",
-    # Nats within which two tokens a probe's legs part on are a near-tie, which passes.
-    "tie_margin",
-    # The members whose boot runs the phases; default one per unit (checks/boot.py).
-    "members",
-)
 
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
 SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
 
-# Floor computation and systematic-shift findings are owned by checks/stats.py.
-FLOOR_KEYS: tuple[str, ...] = ("rule", "k", "shift_min_members", "acknowledge")
+# The floor itself is computed in checks/accuracy_policy.py.
+FLOOR_KEYS: tuple[str, ...] = ("rule", "k")
 
 ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
@@ -315,17 +287,15 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "env",
     "spool",
     # The image the GPU jobs run in, if any, and how host paths appear inside it
-    # (`host:inside`): the intake lint checks the run's paths through them.
+    # (`host:inside`).
     "container_image",
     "mounts",
     "time_limit",
     "gpus_per_node",
-    # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
+    # The site's `srun` words that enter the session's container on a step across nodes.
+    "step_args",
+    # Each device's memory, GiB: engines and disaggregation are sized by it.
     "gpu_memory_gib",
-    # A checkpoint the STOCK modeling path already supports, used by
-    # `preflight.substrate_gate` when the run's own checkpoint has an
-    # architecture that path has never heard of.
-    "substrate_checkpoint",
     # The compute sessions the run stands on.
     "sessions",
     # How long the orchestrator waits for a gate session that stopped
@@ -446,23 +416,6 @@ def derive_checkpoint_segment(checkpoint_path: str | Path) -> str:
     # as `qwen3_30_b_a3_b`.
     name = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
-
-
-def _validate_coverage(block: Any, errors: list[str]) -> None:
-    """``coverage``: a mapping whose ``accept`` lists ``<feature>@<member>`` or ``<feature>@*``."""
-    if block is None:
-        return
-    if not isinstance(block, dict):
-        errors.append(f"'{COVERAGE_FIELD}' must be a mapping, got {type(block).__name__}")
-        return
-    reject_unknown_keys(block, COVERAGE_KEYS, errors, where=COVERAGE_FIELD)
-    raw = block.get("accept")
-    if raw is not None and (
-        not isinstance(raw, list) or not all(isinstance(x, str) and "@" in x for x in raw)
-    ):
-        errors.append(
-            f"'{COVERAGE_FIELD}.accept' must be a list of '<feature>@<member>' or '<feature>@*'"
-        )
 
 
 def _validate_target(block: Any, errors: list[str]) -> None:
@@ -652,24 +605,15 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     ):
         errors.append(f"'{ENVIRONMENT_FIELD}.mounts' must be a list of strings")
 
+    words = block.get("step_args")
+    if words is not None and not (
+        isinstance(words, list) and all(isinstance(w, str) and w.startswith("-") for w in words)
+    ):
+        errors.append(f"'{ENVIRONMENT_FIELD}.step_args' must be a list of `srun` options")
+
     memory = block.get("gpu_memory_gib")
     if memory is not None and not (_number(memory) and memory > 0):
         errors.append(f"'{ENVIRONMENT_FIELD}.gpu_memory_gib' must be a positive number of GiB")
-
-    proxy = block.get("substrate_checkpoint")
-    if proxy is not None:
-        if not isinstance(proxy, str) or not proxy.strip():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' must be a path to a "
-                f"checkpoint directory the stock modeling path supports"
-            )
-        elif not Path(proxy).exists():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' does not exist: {proxy}. "
-                f"The substrate gate falls back to it only after the run's own "
-                f"checkpoint has already failed, so a missing proxy turns the "
-                f"longest step in preflight into two failures instead of one."
-            )
 
     if kind == "session_spool":
         spool = block.get("spool")
@@ -725,13 +669,28 @@ def _validate_fields(
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _validate_disagg_files(block: Mapping[str, Any], where: str, errors: list[str]) -> None:
+    """A stated deployment: the tree's three files, and nothing of the test form."""
+    stated = [key for key in DISAGG_FILES if block.get(key) is not None]
+    if not stated:
+        return
+    for key in DISAGG_FILES:
+        path = block.get(key)
+        if not isinstance(path, str) or not Path(path).is_file():
+            errors.append(f"'{where}.{key}' must be an existing YAML file, got {path!r}")
+    used = [key for key in DISAGG_TEST_KEYS if block.get(key) is not None]
+    if used:
+        errors.append(f"'{where}' states a deployment and {', '.join(used)}: state one of the two")
+
+
 def _validate_disagg(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.disagg``: the disaggregated-serving test the run writes and names."""
+    """Validate ``accuracy.disagg``: a stated deployment, or the test the run writes and names."""
     where = f"{ACCURACY_FIELD}.disagg"
     if not isinstance(block, dict):
         errors.append(f"'{where}' must be a mapping")
         return
     reject_unknown_keys(block, DISAGG_KEYS, errors, where=where)
+    _validate_disagg_files(block, where, errors)
     test = block.get("test")
     if test is not None and (
         not isinstance(test, str) or "::" not in test or Path(test).is_absolute()
@@ -852,26 +811,12 @@ def _validate_acceptance_workload(entry: Mapping[str, Any], errors: list[str], w
     _validate_fields(
         entry,
         dict.fromkeys(
-            ("max_tokens", "min_draft_iterations", "num_prompts", "min_prompts", GATE_TIMEOUT_KEY),
+            ("max_tokens", "min_draft_iterations", "num_prompts", GATE_TIMEOUT_KEY),
             _POS_INT,
         ),
         errors,
         where,
     )
-
-
-def _validate_acceptance_regression(block: Any, errors: list[str], where: str) -> None:
-    """Validate ``accuracy.acceptance.regression``."""
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping with keys {list(ACCEPTANCE_REGRESSION_KEYS)}")
-        return
-    reject_unknown_keys(block, ACCEPTANCE_REGRESSION_KEYS, errors, where=where)
-    alpha = block.get("alpha")
-    if alpha is not None and (not _number(alpha) or not 0 < alpha < 1):
-        errors.append(f"'{where}.alpha' must be a probability in (0, 1), got {alpha!r}")
-    effect = block.get("min_effect")
-    if effect is not None and (not _number(effect) or effect < 0):
-        errors.append(f"'{where}.min_effect' must be a number >= 0, got {effect!r}")
 
 
 def _validate_acceptance(block: Any, errors: list[str]) -> None:
@@ -889,8 +834,6 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
         )
         return
     _validate_acceptance_workload(block, errors, where)
-    if block.get("regression") is not None:
-        _validate_acceptance_regression(block["regression"], errors, f"{where}.regression")
     for unit, entry in block.items():
         if unit in ACCEPTANCE_BLOCK_KEYS:
             continue
@@ -939,24 +882,14 @@ def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str
                 reject_unknown_keys(entry, BOOT_PROMPT_KEYS, errors, where=at)
                 if not isinstance(entry.get("prompt"), str) or not entry["prompt"].strip():
                     errors.append(f"'{at}.prompt' is required and must be a non-empty string")
-                _validate_fields(
-                    entry,
-                    dict.fromkeys(("keywords", "keywords_any", "images"), _NONEMPTY_STRINGS),
-                    errors,
-                    at,
-                )
+                _validate_fields(entry, {"images": _NONEMPTY_STRINGS}, errors, at)
                 if entry.get("render") is not None and entry["render"] not in BOOT_RENDERS:
                     errors.append(f"'{at}.render' must be one of {BOOT_RENDERS}")
     prompts_file = level.get("prompts_file")
     if prompts_file is not None:
         if not isinstance(prompts_file, str) or not Path(prompts_file).is_file():
             errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
-    _validate_fields(
-        level,
-        {"keywords": _STRINGS, "max_tokens": _POS_INT, GATE_TIMEOUT_KEY: _POS_INT},
-        errors,
-        where,
-    )
+    _validate_fields(level, {"max_tokens": _POS_INT, GATE_TIMEOUT_KEY: _POS_INT}, errors, where)
 
 
 def _validate_boot(block: Any, errors: list[str]) -> None:
@@ -1078,18 +1011,6 @@ def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
         k = floor.get("k")
         if k is not None and (not _number(k) or k <= 0):
             errors.append(f"'{where}.k' must be a number > 0, got {k!r}")
-        members = floor.get("shift_min_members")
-        if members is not None and not _positive_int(members):
-            errors.append(f"'{where}.shift_min_members' must be an integer >= 1, got {members!r}")
-        acknowledge = floor.get("acknowledge")
-        if acknowledge is not None and (
-            not isinstance(acknowledge, dict)
-            or not all(isinstance(v, str) and v.strip() for v in acknowledge.values())
-        ):
-            errors.append(
-                f"'{where}.acknowledge' must map a unit to the reason its systematic shift "
-                f"is accepted, as a non-empty string"
-            )
     else:
         floor = {}
 
@@ -1126,50 +1047,6 @@ def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
             )
 
 
-def _validate_envelope(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.envelope``."""
-    where = f"{ACCURACY_FIELD}.envelope"
-    if not isinstance(block, dict):
-        errors.append(f"'{where}' must be a mapping")
-        return
-    reject_unknown_keys(block, ENVELOPE_KEYS, errors, where=where)
-    _validate_fields(
-        block,
-        {
-            "enabled": _FLAG,
-            "max_tokens": _POS_INT,
-            "agree_tokens": _POS_INT,
-            "timeout": _POS_INT,
-            "long_prompts": (
-                lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
-                "must be an integer >= 0",
-            ),
-            "probes": (
-                lambda v: bool(v) and _nonempty_strings(v),
-                "must be a non-empty list of prompts",
-            ),
-            "tie_margin": (
-                lambda v: _number(v) and v >= 0,
-                "must be a number of nats >= 0",
-            ),
-            "members": (
-                lambda v: (
-                    bool(v)
-                    and _nonempty_strings(v)
-                    and all(PARALLEL_PATTERN.match(str(m)) for m in v)
-                ),
-                "must be a non-empty list of members (tp<N>, tep<N>, dep<N>)",
-            ),
-        },
-        errors,
-        where,
-    )
-    max_tokens = block.get("max_tokens") or 16
-    agree_tokens = block.get("agree_tokens") or 4
-    if _positive_int(max_tokens) and _positive_int(agree_tokens) and agree_tokens > max_tokens:
-        errors.append(f"'{where}.agree_tokens' must not exceed max_tokens")
-
-
 def _validate_serve(block: Any, errors: list[str]) -> None:
     """Validate ``accuracy.serve``."""
     where = f"{ACCURACY_FIELD}.serve"
@@ -1204,18 +1081,17 @@ def _bounds_server_length(accuracy: Mapping[str, Any]) -> bool:
 def _profile_defaults(profile: Any, accuracy: dict[str, Any]) -> None:
     """The switches the run's ``profile`` sets where ``accuracy`` leaves them unsaid, in place.
 
-    ``certified`` turns on boot boundary phases and the serve gate; ``bringup``
-    and ``smoke`` turn them off. ``standard`` sets nothing.
+    ``certified`` turns on the serve gate; ``bringup`` and ``smoke`` turn it off.
+    ``standard`` sets nothing.
     """
     if profile not in (PROFILE_SMOKE, PROFILE_BRINGUP, PROFILE_CERTIFIED):
         return
     on = profile == PROFILE_CERTIFIED
-    for key in ("envelope", "serve"):
-        block = accuracy.get(key)
-        if block is None:
-            accuracy[key] = {"enabled": on}
-        elif isinstance(block, dict):
-            block.setdefault("enabled", on)
+    block = accuracy.get("serve")
+    if block is None:
+        accuracy["serve"] = {"enabled": on}
+    elif isinstance(block, dict):
+        block.setdefault("enabled", on)
 
 
 def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
@@ -1335,27 +1211,10 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
 
-    reference = block.get("reference_logits")
-    if reference is not None:
-        where = f"{ACCURACY_FIELD}.reference_logits"
-        if not isinstance(reference, dict) or not _text(reference.get("path")):
-            errors.append(f"'{where}' must be a mapping with a `path` to the reference's file")
-        else:
-            from ..checks.divergence import REFERENCE_KEYS
-
-            reject_unknown_keys(reference, REFERENCE_KEYS, errors, where=where)
-            for key in ("tie_margin", "max_js", "min_cosine"):
-                value = reference.get(key)
-                if value is not None and (not _number(value) or value < 0):
-                    errors.append(f"'{where}.{key}' must be a number >= 0")
-
     _validate_floor(block, errors)
 
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
-
-    if block.get("envelope") is not None:
-        _validate_envelope(block["envelope"], errors)
 
     if block.get("disagg") is not None:
         _validate_disagg(block["disagg"], errors)
@@ -1431,6 +1290,40 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
         )
 
 
+def _unit_names(data: Mapping[str, Any]) -> set[str]:
+    """The names a per-unit key may use: ``default``, ``core``, each feature and each variant."""
+    named = {"default", "core"}
+    if isinstance(data.get(FEATURES_FIELD), list):
+        named.update(str(f) for f in data[FEATURES_FIELD])
+    if isinstance(data.get(VARIANTS_FIELD), Mapping):
+        named.update(str(v) for v in data[VARIANTS_FIELD])
+    return named
+
+
+def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
+    """A unit's entry under ``accuracy.acceptance`` or ``accuracy.boot`` names a unit of this spec.
+
+    Every key there that is not a key of the block is read as a unit's name: a
+    misspelt unit, or a key that is gone, would otherwise be kept and never read.
+    """
+    accuracy = data.get(ACCURACY_FIELD)
+    if not isinstance(accuracy, Mapping):
+        return
+    named = _unit_names(data)
+    # `accuracy.acceptance` reads a `default` entry; `accuracy.boot` reads a unit's own only.
+    for block, keys, units in (
+        ("acceptance", ACCEPTANCE_BLOCK_KEYS, named),
+        ("boot", (*BOOT_KEYS, GATE_TIMEOUT_KEY), named - {"default"}),
+    ):
+        entries = accuracy.get(block)
+        for unit in entries if isinstance(entries, Mapping) else ():
+            if unit not in keys and unit not in units:
+                errors.append(
+                    f"'{ACCURACY_FIELD}.{block}.{unit}' names no unit or variant of this spec "
+                    f"({sorted(units)})"
+                )
+
+
 def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
     """``profile``: one of :data:`PROFILES`, or a mapping from unit, variant or ``default`` to one."""
     profile = data.get(PROFILE_FIELD)
@@ -1440,11 +1333,7 @@ def _validate_profile(data: Mapping[str, Any], errors: list[str]) -> None:
         if profile not in PROFILES:
             errors.append(f"'{PROFILE_FIELD}' must be one of {list(PROFILES)}, or a mapping")
         return
-    named = {"default", "core"}
-    if isinstance(data.get(FEATURES_FIELD), list):
-        named.update(str(f) for f in data[FEATURES_FIELD])
-    if isinstance(data.get(VARIANTS_FIELD), Mapping):
-        named.update(str(v) for v in data[VARIANTS_FIELD])
+    named = _unit_names(data)
     for unit, value in profile.items():
         if unit not in named:
             errors.append(
@@ -1470,29 +1359,19 @@ def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) ->
             )
 
 
-def gpus_per_node(data: Mapping[str, Any]) -> int | None:
-    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
-    env = data.get(ENVIRONMENT_FIELD) or {}
-    sizes = [env.get("gpus_per_node")] + [
-        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
-    ]
-    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
-    return max(sizes) if sizes else None
-
-
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
-    """The ``disagg`` feature names the test that proves it: nothing else crosses the hop."""
+    """The ``disagg`` feature states what proves it: nothing else crosses the hop."""
     features = data.get(FEATURES_FIELD)
     if not isinstance(features, list) or DISAGG_FEATURE not in features:
         return
     accuracy = data.get(ACCURACY_FIELD)
     block = accuracy.get("disagg") if isinstance(accuracy, dict) else None
-    if not isinstance(block, dict) or not block.get("test"):
+    if not isinstance(block, dict) or not (block.get("test") or block.get(DISAGG_FILES[0])):
         errors.append(
-            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg.test': the node id of the "
-            f"disaggregated-serving accuracy test the run writes beside the tree's own (they "
-            f"serve through `trtllm-serve disaggregated`); boot and accuracy run one aggregated "
-            f"engine and never cross the hop."
+            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg': the deployment the flow "
+            f"serves (`config`, `context`, `generation`), or 'accuracy.disagg.test', the node id "
+            f"of the disaggregated-serving accuracy test the run writes beside the tree's own; "
+            f"boot and accuracy run one aggregated engine and never cross the hop."
         )
 
 
@@ -1524,6 +1403,10 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
     elif options is not None:
         accuracy["llm_api_options"] = absolute(options)
+    disagg = accuracy.get("disagg")
+    for key in DISAGG_FILES if isinstance(disagg, dict) else ():
+        if key in disagg:
+            disagg[key] = absolute(disagg[key])
 
     # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
     # a relative path, so it is resolved only when the spec's directory holds it.
@@ -1592,8 +1475,12 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     validate_commit_policy_block(data.get(COMMIT_POLICY_FIELD), errors)
 
-    errors.extend(validate_perf_block(data))
-    reject_unknown_keys(data, TOP_LEVEL_KEYS, errors)
+    if "perf" in data:
+        errors.append(
+            "'perf' is not read: the flow has no tuning stage, and performance work runs "
+            "outside it on the delivered target; drop the block"
+        )
+    reject_unknown_keys({k: v for k, v in data.items() if k != "perf"}, TOP_LEVEL_KEYS, errors)
     errors.extend(validate_agents(data, ROLES))
 
     for name in REQUIRED_PATH_FIELDS:
@@ -1673,8 +1560,8 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             errors=errors,
         )
 
-    _validate_coverage(data.get(COVERAGE_FIELD), errors)
     _validate_profile(data, errors)
+    _require_named_units(data, errors)
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(
@@ -1754,14 +1641,11 @@ __all__ = [
     "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
     "gpus_per_node",
-    "COVERAGE_FIELD",
-    "COVERAGE_KEYS",
     "resolve_gate_timeout",
     "resolve_per_unit",
     "resolve_samples",
     "BENCHMARK_MEMBERS",
     "BENCHMARK_MEMBERS_EVERY",
-    "DEFAULT_PERF_CONCURRENCY",
     "derive_gate_defaults",
     "DISAGG_FEATURE",
     "DISAGG_KEYS",

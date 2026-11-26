@@ -19,14 +19,26 @@ import signal
 import sys
 import threading
 import time
+import weakref
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
-from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
+from tensorrt_llm._utils import (
+    ENABLE_MULTI_DEVICE,
+    global_mpi_size,
+    mpi_comm,
+    mpi_disabled,
+    print_all_stacks,
+)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from mpi4py import MPI
+
+    from tensorrt_llm.mapping import Mapping
+
+    from ..distributed import Distributed
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
@@ -376,6 +388,16 @@ class RankCrashKillWatchdog(threading.Thread):
         )
 
 
+#: Watchdogs armed in this process, so work that would delay the error the
+#: grace period exists to deliver can tell that a kill is pending.
+_armed_watchdogs: "weakref.WeakSet[RankCrashKillWatchdog]" = weakref.WeakSet()
+
+
+def rank_crash_kill_pending() -> bool:
+    """Whether an armed rank-crash watchdog may still kill this process."""
+    return any(w.is_alive() and not w.cancelled for w in list(_armed_watchdogs))
+
+
 def start_rank_crash_kill_watchdog(
     world_size: int,
     error_delivered: Optional[threading.Event] = None,
@@ -407,10 +429,62 @@ def start_rank_crash_kill_watchdog(
             return None
         watchdog = RankCrashKillWatchdog(world_size, grace, error_delivered)
         watchdog.start()
+        _armed_watchdogs.add(watchdog)
         return watchdog
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
         _best_effort_log_error(f"failed to arm rank-crash kill watchdog (ignored): {e!r}")
         return None
+
+
+@contextmanager
+def distributed_warmup_guard(dist: "Distributed", mapping: "Mapping") -> Iterator[None]:
+    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
+
+    Warmup runs from the executor's ``__init__`` (``PyExecutor`` or
+    ``ScheduledEncoderExecutor``), before the executor loop and so before the
+    loop's wrapper arms this watchdog itself. A rank that
+    raises here leaves every peer blocked in a warmup collective it will
+    never join, until that peer's own HangDetector times out.
+
+    The watchdog's grace period is what keeps the failure diagnosable: the
+    worker's setup/RPC error path reports the exception before the abort
+    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
+
+    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
+    the loop wrappers leave them unarmed: they are teardown signals
+    the launcher is already acting on, and an MPI_Abort on top would turn a
+    clean Ctrl-C into exit 137.
+
+    A SYMMETRIC crash -- every rank raising out of warmup, e.g. an OOM every
+    rank hits at the same allocation -- arms no watchdog at all: the
+    ``all_ranks_crashed`` probe proves nobody is stranded in a collective, so
+    the error can propagate through the worker's setup/RPC path and the serve
+    front end can tear the world down cleanly. This matters because the kill
+    armed here (``error_delivered=None``) cannot be suppressed, and in the
+    launcher-spawned (mgmn) deployment the rank processes host a persistent
+    MPI task loop that legitimately outlives a failed engine.
+
+    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
+    peers live only in the latter, while a TorchDist launch can have several
+    model ranks in a single-process MPI world. The symmetric-crash probe only
+    trusts a communicator that spans the whole peer count, so a DWDP mismatch
+    falls back to arming the watchdog.
+    """
+    try:
+        yield
+    except Exception:
+        if dist.world_size > 1 or mapping.dwdp_enabled:
+            world = max(dist.world_size, global_mpi_size())
+            if all_ranks_crashed(world):
+                logger.error(
+                    f"Warmup failed on all {world} ranks (symmetric crash): "
+                    "no peer is stranded in a collective, so the cross-rank "
+                    "hard kill is not armed and the error propagates to a "
+                    "clean shutdown."
+                )
+            else:
+                start_rank_crash_kill_watchdog(world, error_delivered=None)
+        raise
 
 
 class HangDetector:

@@ -580,9 +580,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_perf_result(self, outputs: List[str]) -> float:
+    def get_perf_result(self, outputs: List[str]) -> float | None:
         """
-        Get the perf result (latency) from the output logs of each command.
+        Get the measured value, or None when the metric is unavailable.
         """
         raise NotImplementedError()
 
@@ -779,6 +779,14 @@ class AbstractPerfScriptTestClass(abc.ABC):
                     if isinstance(commands, PerfServeScriptTestCmds):
                         commands.print_server_log_tail()
                     raise
+
+                # An unavailable metric is not a failed command. Keep cached
+                # logs so the remaining metrics can still be recorded.
+                if self._perf_result is None:
+                    print_info(
+                        f"Skip writing unavailable perf metric {full_test_name}."
+                    )
+                    return outputs
 
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()

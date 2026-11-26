@@ -190,8 +190,11 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
-    TLLM_CHECK_WITH_INFO(residual_dim >= 0 && residual_dim <= qk_rope_head_dim && residual_dim % 16 == 0,
-        "MLA KV residual_dim must be a multiple of 16 in [0, qk_rope_head_dim], got %ld", residual_dim);
+    // residual_dim == 2 * qk_rope_head_dim selects the inline-scale record with E4M3 RoPE.
+    TLLM_CHECK_WITH_INFO((residual_dim >= 0 && residual_dim <= qk_rope_head_dim && residual_dim % 16 == 0)
+            || residual_dim == 2 * qk_rope_head_dim,
+        "MLA KV residual_dim must be a multiple of 16 in [0, qk_rope_head_dim] or 2 * qk_rope_head_dim, got %ld",
+        residual_dim);
     TORCH_CHECK(helix_tensor_params.size() == 2 || helix_tensor_params.size() == 3,
         "Expecting 2 or 3 tensors for helix_tensor_params: helix_position_offsets, helix_is_inactive_rank "
         "and optionally helix_local_slots (per-token KV write slots for speculative verify groups).");
@@ -276,8 +279,10 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     auto& kv_cache_buffer = kv_cache_buffers.kvCacheBuffer;
     if (kv_cache_quant_mode.hasFp4KvCache())
     {
-        TLLM_CHECK_WITH_INFO(
-            kv_cache_buffers.kvScaleCacheBuffer.data != nullptr, "NVFP4 MLA cache requires a block-scale pool.");
+        // The inline-scale record keeps its block scales in the data pool.
+        bool const record_layout = residual_dim == 2 * qk_rope_head_dim;
+        TLLM_CHECK_WITH_INFO(record_layout || kv_cache_buffers.kvScaleCacheBuffer.data != nullptr,
+            "NVFP4 MLA cache requires a block-scale pool.");
         TLLM_CHECK_WITH_INFO(kv_only || quant_q_buffer.has_value(), "NVFP4 MLA decode requires an FP8 query buffer.");
     }
 

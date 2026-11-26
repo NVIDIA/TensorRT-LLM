@@ -660,3 +660,24 @@ if __name__ == "__main__":
     if mode != "attached":
         assert not owned_path.exists()
         assert os.environ.get("PROMETHEUS_MULTIPROC_DIR") == previous
+
+
+@pytest.mark.cpu_only
+def test_collect_once_exposes_iteration_and_rank():
+    import threading
+    from unittest.mock import Mock
+
+    from tensorrt_llm.grpc.openengine.metrics import OpenEngineMetrics
+
+    owner = SimpleNamespace(
+        _llm=SimpleNamespace(get_stats=Mock(return_value=[{"iter": 7, "attentionDpRank": 2}])),
+        _stopping=threading.Event(),
+        collector=Mock(),
+        _record_error=Mock(),
+    )
+    OpenEngineMetrics._collect_once(owner)
+    owner.collector.emit.assert_called_once()
+    record = owner.collector.emit.call_args.args[0]
+    assert record.per_iter["iter"] == 7
+    assert record.per_iter["attentionDpRank"] == 2
+    owner._record_error.assert_not_called()

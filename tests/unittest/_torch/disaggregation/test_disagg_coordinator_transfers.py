@@ -18,8 +18,10 @@ from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -161,6 +163,42 @@ def test_fast_completion_of_an_active_request_stages_its_response_first() -> Non
     assert h.effects.terminated == []
     assert h.active == []
     assert not h.in_transfer(req)
+
+
+def test_fast_completion_publishes_current_sampler_counters() -> None:
+    h = _Harness()
+    request = LlmRequest(
+        request_id=1,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=SamplingConfig(1),
+        is_streaming=True,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+        context_phase_params=ContextPhaseParams([4], 1, None, None, None, None),
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [7, 8]
+    request.py_per_pos_drafted[0] = 2
+    request.py_per_pos_accepted[0] = 1
+    request.py_total_draft_tokens = 2
+    request.py_total_accepted_draft_tokens = 1
+    assert request.decoding_iter == 0
+    h.active.append(request)
+    h.send(request)
+    h.transceiver.finish_send(request)
+
+    h.coordinator.reap_context_sends(0)
+
+    ((request_id, response, terminate_after_publish),) = h.effects.staged_responses
+    assert request_id == request.py_request_id
+    assert terminate_after_publish is request
+    assert response.result.get_result().decoding_iter == 1
+    assert request.draft_tokens == [7, 8]
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.per_pos_accepted[0] == 1
+    assert response.result.spec_dec_totals == (1, 2)
 
 
 def test_fast_completion_without_a_response_terminates_immediately() -> None:
@@ -516,6 +554,48 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
     h.coordinator.handle_timeouts_synced()
     assert h.dist.tp_allgather_int64.call_args_list[-1].args == ([False],)
     assert len(h.effects.failed) == 1
+
+
+def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
+    """Failing a cancelled receive ends its in-progress state.
+
+    A receive that completed after its deadline keeps its state.
+    """
+    h = _Harness()
+    cancelled = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    completed_late = _Request(
+        2,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    )
+
+    h.coordinator.fail_timed_out([cancelled, completed_late])
+
+    assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [
+        ("Request 1 timed out", [cancelled], False),
+        ("Request 2 timed out", [completed_late], False),
+    ]
+
+
+def test_fail_timed_out_ends_the_receive_state_before_the_adp_buffer() -> None:
+    """Under multi-rank ADP the state ends when the request is buffered, not at the synced drain."""
+    h = _Harness(enable_attention_dp=True, world_size=2)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+
+    h.coordinator.fail_timed_out([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
 
 
 def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> None:
@@ -891,6 +971,7 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
             can_share_inflight_prefix=False,
             tokens_per_block=16,
             _has_cp_helix=False,
+            max_beam_width=1,
             inforward_snapshot_rows=0,
             has_cache_tier_below_gpu=False,
             kv_connector_manager=None,

@@ -19,10 +19,10 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel needs an sm_103 GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     cute_dsl_sparse_mla_decode as row_entry,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     cute_dsl_sparse_mla_decode_union as entry,
 )
 
@@ -307,10 +307,44 @@ def test_union_launcher_refuses_padded_cu_q_seqlens_and_strided_output() -> None
     )
     padded = torch.cat([cu, cu[-1:]])
     with pytest.raises(ValueError, match="cu_q_seqlens must have 3 entries"):
-        entry._union_kernel.prepare_union_runner(*head, out, padded, lens, **kw)
+        (
+            call_quant_q_buffer,
+            call_kv_pool_view,
+            call_topk_positions,
+            call_block_table,
+            call_req_ids,
+        ) = head
+        entry._union_kernel.prepare_union_runner(
+            call_quant_q_buffer,
+            call_kv_pool_view,
+            call_topk_positions,
+            call_block_table,
+            call_req_ids,
+            out,
+            padded,
+            lens,
+            **kw,
+        )
     strided = torch.empty(out.shape[::-1], dtype=out.dtype, device=out.device).t()
     with pytest.raises(ValueError, match="output must be contiguous"):
-        entry._union_kernel.prepare_union_runner(*head, strided, cu, lens, **kw)
+        (
+            call_quant_q_buffer,
+            call_kv_pool_view,
+            call_topk_positions,
+            call_block_table,
+            call_req_ids,
+        ) = head
+        entry._union_kernel.prepare_union_runner(
+            call_quant_q_buffer,
+            call_kv_pool_view,
+            call_topk_positions,
+            call_block_table,
+            call_req_ids,
+            strided,
+            cu,
+            lens,
+            **kw,
+        )
 
 
 @pytest.mark.parametrize("batch", list(range(12, 33)) + [1, 3])

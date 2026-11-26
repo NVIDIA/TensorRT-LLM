@@ -82,10 +82,10 @@ SITU = {
 
 def _ops():
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
         op,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
         op as _op,  # noqa: F401
     )
 
@@ -93,9 +93,7 @@ def _ops():
 
 
 def _ctm():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import op
 
     return op
 
