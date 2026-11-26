@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
 
+from tensorrt_llm._torch.model_config import hf_remote_code_lock
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.data import TextPrompt, TokensPrompt
 from tensorrt_llm.inputs.evs import compute_retained_tokens_from_tubelet_budget
@@ -121,14 +122,7 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     ) -> None:
         super().__init__(model_path, config, tokenizer, trust_remote_code, **kwargs)
         self.video_pruning_rate = video_pruning_rate or 0.0
-        # The executor passes a flattened media config. Read the checkpoint's video capability.
-        config_path = Path(model_path) / "config.json"
-        temporal_patch_size = getattr(config, "video_temporal_patch_size", None)
-        if temporal_patch_size is None and config_path.is_file():
-            temporal_patch_size = json.loads(config_path.read_text()).get(
-                "video_temporal_patch_size"
-            )
-        self._supports_video = temporal_patch_size == 1
+        self._supports_video = getattr(config, "video_temporal_patch_size", None) == 1
         if self.video_pruning_rate and "video" not in self.supported_modalities:
             raise ValueError("EVS requires a checkpoint with a single-frame video processor.")
         spec = json.loads((Path(model_path) / "processor_config.json").read_text())
@@ -201,9 +195,11 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     @cached_property
     def _video_prompt_processor(self):
-        return AutoProcessor.from_pretrained(
-            self.model_path, trust_remote_code=self._trust_remote_code
-        )
+        # The first load publishes the checkpoint's remote code into the shared HF module cache.
+        with hf_remote_code_lock():
+            return AutoProcessor.from_pretrained(
+                self.model_path, trust_remote_code=self._trust_remote_code
+            )
 
     def _video_layout(self, frames, metadata):
         fps = (metadata or {}).get("fps")
@@ -214,6 +210,8 @@ class ShortcutInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         indices = metadata.get("frames_indices", range(len(frames)))
         if len(frames) == 0 or len(indices) != len(frames):
             raise ValueError("Video frames and their source indices must be nonempty and aligned.")
+        if len(frames) > _MAX_VIDEO_FRAMES:
+            raise ValueError(f"A video accepts at most {_MAX_VIDEO_FRAMES} frames.")
         size = self._resized(frames[0])
         text = self._video_prompt_processor.get_video_prompt(
             [float(i) / fps for i in indices], temporal_patch_size=1, frame_size=size

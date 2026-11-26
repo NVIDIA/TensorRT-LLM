@@ -117,6 +117,12 @@ def test_patch_order_follows_learned_merge(processor: ShortcutInputProcessor) ->
     assert patches[0, :4].tolist() == [0, 1 / 64, 8 / 64, 9 / 64]
 
 
+def test_video_frame_limit(processor: ShortcutInputProcessor) -> None:
+    frames = [Image.new("RGB", (4, 4))] * 65
+    with pytest.raises(ValueError, match="at most 64 frames"):
+        processor.get_num_tokens_per_video(video=frames, video_metadata={"fps": 2})
+
+
 def test_chat_placeholder_and_disabled_encoder(processor: ShortcutInputProcessor) -> None:
     path = Path(processor.model_path)
     config = NemotronShortcutConfig(vision_config={}, dtype="bfloat16", image_token_id=1)
