@@ -76,31 +76,49 @@ since the history window then no longer reaches back past it.
 - A metric is regressive if the new value breaches `baseline * (1 +/- threshold)`
 - Default thresholds: **5%** for post-merge, **10%** for pre-merge (can be overridden per-metric via embedded `d_threshold_*` fields from history)
 
-**Pre-merge exemption when `main` has already regressed**
+### Pre-merge exemptions against matched history
 
-Both pipelines compare against the same baseline, so a regression that lands on
-`main` makes every subsequent PR measure the same regressed value and fail a
-test it did not break — blocking all PRs until a fix merges and everyone
-rebases. To prevent that, a pre-merge case may be exempt when the latest
-post-merge record for the same case misses the pre-merge gate, under its rule:
+Both pipelines compare against the same baseline, so a regression already present
+in matched post-merge history can make a subsequent PR fail a test it did not
+break. A pre-merge case may therefore be exempt when the latest matched
+post-merge record misses the pre-merge gate, under the rule below.
+
+When `s_branch` is a match key, pre-merge lookup selects `PERF_BASELINE_BRANCH`
+(`main` by default). For callers without that match key, this setting adds no
+branch filter: the latest matched post-merge record can belong to another branch.
+The generic exemption rule refers to the record selected by the caller's keys,
+not an unconditional guarantee about its branch.
 
 - The latest post-merge **value** is re-evaluated here, against the same baseline
   and the same **pre-merge** threshold (10%) used for the pre-merge verdict. The
   `b_is_regression` recorded by the post-merge run is *not* consulted, because it
   was computed at the tighter post-merge threshold (5%).
-- That makes the exemption exactly as wide as the failure it prevents. If `main`
-  sits within the pre-merge threshold, a PR reproducing `main`'s value does not
-  fail the gate, so there is nothing to exempt and the gate stays armed.
-- Cases with a `regression_metrics_by_cmd_idx` override require **every currently
-  regressive metric** to already miss that same gate on `main`. A prior miss in
-  one metric cannot excuse a new regression in another. Perf-sanity uses these
-  overrides only for its additional TTFT-eligible clients.
-- Cases without an override retain the **whole-case exemption**: **any gated
-  metric** already missing on `main` exempts the row, including when that metric
-  recovers on the PR. Other callers' existing behavior is unchanged.
+- That makes the exemption exactly as wide as the failure it prevents. If the
+  matched record sits within the pre-merge threshold, a PR reproducing its value
+  does not fail the gate, so there is nothing to exempt and the gate stays armed.
+- `regression_metrics_by_cmd_idx` only replaces the selected gates for a row; it
+  does not choose the exemption policy.
+- `independent_regression_metrics_by_cmd_idx` explicitly identifies independent
+  gates for each row. **Every currently regressive independent gate** must already
+  miss its own gate in the matched record. Perf-sanity marks only its additional
+  `d_mean_ttft` gate independent, and only for TTFT-eligible clients.
+- The **remaining selected gates form one group**: a current loss in that group
+  is exempt when **any gate in the matched record's group** already misses,
+  including when that particular metric recovers on the PR. Thus the two throughput gates remain
+  grouped even when their stored baselines or tolerances differ. A TTFT miss alone
+  cannot excuse throughput, and throughput alone cannot excuse TTFT.
+- A row is exempt only when both its independent losses and any grouped losses
+  qualify. With no independent gates, this is the **whole-case exemption**.
 - Anything unusable in that record — metric absent, null, non-numeric, or
-  non-positive — does **not** exempt, so a broken post-merge document leaves the
-  gate armed rather than silently disarming it.
+  non-positive — cannot supply a qualifying miss for that metric. Other usable
+  matched metrics still follow the independent/grouped rule above. Diagnostics
+  distinguish known new misses from misses whose prior value is unknown; an
+  unusable prior value is not evidence that a loss is new. The prior-miss list
+  covers only metrics compared in the current run, not absent current measurements.
+  These diagnostics apply after baseline construction succeeds. Non-numeric
+  history can still raise during fallback baseline calculation, including when
+  a different metric lacks a stored override; that earlier path does not sanitize
+  malformed measurements.
 - The pre-merge document still uploads `b_is_regression` exactly as measured and
   keeps the full metric detail in `s_regression_info`; only the `RuntimeError` is
   suppressed, and an explanatory line is appended. No new field is written.
@@ -109,11 +127,9 @@ post-merge record for the same case misses the pre-merge gate, under its rule:
 
 Consequences worth knowing:
 
-- Within a metric's exempt band, further worsening of that same metric still
-  passes. For per-case overrides, independent regressive metrics still fail;
-  without an override, the entire case remains exempt and a new loss in another
-  metric can pass. The comparison uses the shared baseline rather than the latest
-  value on `main`.
+- Within an exempt independent metric or group, further worsening still passes;
+  a new loss in another metric of an exempt group can pass too. The comparison
+  uses the shared baseline rather than the value in the latest matched record.
 - It **self-clears**, which also hides the regression. Nothing seeds
   `d_baseline_*` automatically, so the effective baseline is the rolling
   P95/P5 window; within a few days it drifts down to the regressed level, the
@@ -217,9 +233,10 @@ process_and_upload_test_results(
 | `maximize_metrics` | `List[str]` | Metrics where larger is better (baseline = P95) |
 | `minimize_metrics` | `List[str]` | Metrics where smaller is better (baseline = P5) |
 | `regression_metrics` | `List[str]` | Subset of `maximize_metrics + minimize_metrics` checked for pass/fail regression. Raises `ValueError` if any entry is not in those lists |
-| `regression_metrics_by_cmd_idx` | `Dict[int, List[str]]` or `None` | Optional per-case metric replacements with an exemption only if every current regressive metric already misses its gate on main. Metric names are validated against the same definitions. Cases not listed retain the default gates and whole-case mainline exemption |
+| `regression_metrics_by_cmd_idx` | `Dict[int, List[str]]` or `None` | Optional per-case metric replacements, independent of exemption policy. Unlisted cases use `regression_metrics`. Invalid metric names identify the parameter and case index in the error |
+| `independent_regression_metrics_by_cmd_idx` | `Dict[int, List[str]]` or `None` | Optional per-case independent gates, using the exemption rule above. Other selected gates remain grouped. Names are validated against the maximize/minimize definitions |
 | `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
-| `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
+| `upload_to_db` | `bool` | Whether to post to OpenSearch; history lookup and regression verdicts still run when false |
 | `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |
 | `metric_history_floors_ms` | `dict` or `None` | Metric -> epoch-ms `ts_created` floor; older history is ignored for that metric's baseline |
 

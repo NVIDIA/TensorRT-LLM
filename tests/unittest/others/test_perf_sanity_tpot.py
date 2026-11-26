@@ -18,9 +18,12 @@ import ast
 import importlib
 import importlib.util
 import json
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import redirect_stdout
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -83,6 +86,7 @@ def perf_sanity_caller(
     monkeypatch.syspath_prepend(str(repo_root))
     monkeypatch.delenv("PERF_BASELINE_BRANCH", raising=False)
     monkeypatch.delenv("BOLT_ITER_MULT", raising=False)
+    monkeypatch.delenv("RAY_LOCAL_WORLD_SIZE", raising=False)
     monkeypatch.setenv("AGG_CONFIG_FOLDER", str(tmp_path))
     monkeypatch.setenv("DISAGG_CONFIG_FOLDER", str(tmp_path))
     monkeypatch.setenv("OPEN_SEARCH_DB_BASE_URL", "https://example.test/unused")
@@ -98,7 +102,7 @@ def perf_sanity_caller(
     performance.__path__ = [str(_PERF_DIR)]
     configuration = ModuleType("defs.conftest")
     configuration.get_llm_root = lambda: str(repo_root)
-    configuration.get_device_count = unused_boundary
+    configuration.get_device_count = lambda: 4
     configuration.llm_models_root = unused_boundary
     common = ModuleType("defs.common")
     common.wait_for_reported_addr = unused_boundary
@@ -141,20 +145,43 @@ def perf_sanity_caller(
     try:
         harness = importlib.import_module("defs.perf.test_perf_sanity")
         database = importlib.import_module("defs.perf.open_search_db_utils")
-        monkeypatch.setattr(database, "time", SimpleNamespace(time=lambda: 1767398400.0))
-        monkeypatch.setattr(
-            harness.subprocess, "check_output", lambda *args, **kwargs: "Product Name : B200\n"
-        )
 
         def replay(
-            history: list[dict],
+            history: list[dict] | None,
             *,
-            ttft: float = 125.0,
+            ttft: float | str = 125.0,
             throughput: float = 100.0,
             is_post_merge: bool = False,
             config: dict | None = None,
             test_case: str = "aggr_upload-latency_control",
+            after_launch: Callable[[], None] | None = None,
+            launches: list[tuple[Path, dict]] | None = None,
+            worker_device_count: Callable[[dict[str, str]], int] | None = None,
+            probe_timeouts: list[float | None] | None = None,
+            warmup_only: bool = False,
+            expect_upload: bool = True,
         ) -> tuple[list[dict], RuntimeError | None]:
+            def check_output(command, *args, **kwargs) -> str:
+                if isinstance(command, str):
+                    return "Product Name : B200\n"
+                assert command[:2] == [sys.executable, "-c"]
+                if probe_timeouts is not None:
+                    probe_timeouts.append(kwargs.get("timeout"))
+                cuda_module = ModuleType("torch.cuda")
+                cuda_module.device_count = lambda: (
+                    worker_device_count(kwargs["env"]) if worker_device_count is not None else 4
+                )
+                torch_module = ModuleType("torch")
+                torch_module.__path__ = []
+                torch_module.cuda = cuda_module
+                output = StringIO()
+                with monkeypatch.context() as query_context, redirect_stdout(output):
+                    query_context.setitem(sys.modules, "torch", torch_module)
+                    query_context.setitem(sys.modules, "torch.cuda", cuda_module)
+                    exec(command[2], {})
+                return output.getvalue()
+
+            monkeypatch.setattr(harness.subprocess, "check_output", check_output)
             configuration_data = config or {
                 "metadata": {"model_name": "latency-control"},
                 "hardware": {"gpus_per_node": 1},
@@ -200,10 +227,21 @@ def perf_sanity_caller(
             )
 
             def run_cmd(commands, server_idx: int) -> list[str]:
+                if launches is not None:
+                    command = commands.server_cmds[server_idx]
+                    config_path = Path(command[command.index("--config") + 1])
+                    launches.append((config_path, yaml.safe_load(config_path.read_text())))
+                if after_launch is not None:
+                    after_launch()
                 return [output for _ in commands.client_cmds[server_idx]]
 
             monkeypatch.setattr(harness.AggrTestCmds, "run_cmd", run_cmd)
             monkeypatch.setattr(harness.DisaggTestCmds, "run_cmd", run_cmd)
+
+            def cold_warmup(*args, **kwargs) -> None:
+                harness.record_warmup_time(args[4], args[5], args[6], 1.0)
+
+            monkeypatch.setattr(harness, "run_cold_warmup", cold_warmup)
             uploaded = []
             monkeypatch.setattr(
                 database.OpenSearchDB,
@@ -212,16 +250,19 @@ def perf_sanity_caller(
             )
 
             def post_to_database(values: list[dict], project: str) -> bool:
+                assert expect_upload, "This caller must not write results to the database"
                 uploaded.extend(deepcopy(values))
                 return True
 
             monkeypatch.setattr(database.OpenSearchDB, "postToOpenSearchDB", post_to_database)
             regression_error = None
             try:
-                harness.test_e2e(str(tmp_path / "output"), test_case)
+                runner = harness.test_warmup if warmup_only else harness.test_e2e
+                runner(str(tmp_path / "output"), test_case)
             except RuntimeError as error:
                 regression_error = error
-            assert uploaded, f"test_e2e did not reach the upload/verdict path: {regression_error}"
+            if expect_upload:
+                assert uploaded, f"Caller did not reach the upload/verdict path: {regression_error}"
             return uploaded, regression_error
 
         yield replay
@@ -274,11 +315,18 @@ def test_ttft_caller_default_tolerances(perf_sanity_caller: Callable, is_post_me
     assert uploaded[0]["b_is_regression"] is is_post_merge
 
 
-def test_ttft_caller_configured_tolerance(perf_sanity_caller: Callable) -> None:
+@pytest.mark.parametrize("tolerance", [0.2, 0.3])
+def test_ttft_caller_configured_tolerance(perf_sanity_caller: Callable, tolerance: float) -> None:
     """The selected latency gate honors the case's stored pre-merge tolerance."""
-    uploaded, error = perf_sanity_caller([_ttft_history(d_threshold_pre_merge_mean_ttft=0.3)])
-    assert error is None
-    assert uploaded[0]["b_is_regression"] is False
+    uploaded, error = perf_sanity_caller([_ttft_history(d_threshold_pre_merge_mean_ttft=tolerance)])
+    should_fail = tolerance < 0.25
+    assert (error is not None) is should_fail
+    assert uploaded[0]["b_is_regression"] is should_fail
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    if should_fail:
+        info = uploaded[0]["s_regression_info"]
+        assert "new gated misses: (d_mean_ttft)" in info
+        assert "unknown prior values: (none)" in info
 
 
 @pytest.mark.parametrize("has_ttft_history", [True, False], ids=["healthy-history", "no-history"])
@@ -326,6 +374,12 @@ def test_ttft_caller_selects_each_client(perf_sanity_caller: Callable) -> None:
                 "tensor_parallel_size": 8,
                 "client_configs": [{"name": "con1", "concurrency": 1}],
             },
+            {
+                "name": "throughput-only",
+                "tensor_parallel_size": 4,
+                "server_env_var": "LATENCY_CONTROL_SERVER=throughput-only",
+                "client_configs": [{"name": "con64", "concurrency": 64}],
+            },
         ],
     }
     expected = {
@@ -334,6 +388,7 @@ def test_ttft_caller_selects_each_client(perf_sanity_caller: Callable) -> None:
         "partial-node-con1": True,
         "speculative-con1": False,
         "multi-node-con1": False,
+        "throughput-only-con64": False,
     }
     history = [
         _ttft_history(
@@ -344,7 +399,12 @@ def test_ttft_caller_selects_each_client(perf_sanity_caller: Callable) -> None:
         )
         for name in expected
     ]
-    uploaded, error = perf_sanity_caller(history, config=config)
+
+    def device_count(environment: dict[str, str]) -> int:
+        assert environment.get("LATENCY_CONTROL_SERVER") != "throughput-only"
+        return 4
+
+    uploaded, error = perf_sanity_caller(history, config=config, worker_device_count=device_count)
     for row in uploaded:
         assert _metric_comparison(row, "d_mean_ttft") == pytest.approx((125.0, 100.0))
     assert {row["s_test_case_name"]: row["b_is_regression"] for row in uploaded} == expected
@@ -352,9 +412,571 @@ def test_ttft_caller_selects_each_client(perf_sanity_caller: Callable) -> None:
     assert "Regression in plain-con1:" in str(error)
 
 
+@pytest.mark.parametrize("speculative", [False, True], ids=["plain", "speculative"])
+def test_ttft_caller_reads_external_server_config(
+    perf_sanity_caller: Callable, tmp_path: Path, speculative: bool
+) -> None:
+    """Eligibility follows the effective worker config, including external files."""
+    config_path = tmp_path / "worker.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"speculative_config": {"decoding_type": "MTP"}} if speculative else {})
+    )
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": [
+            {
+                "name": "plain",
+                "extra_llm_api_config_path": str(config_path),
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller([_ttft_history()], config=config)
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    assert uploaded[0]["b_eos"] is False
+    assert uploaded[0]["b_is_regression"] is not speculative
+    assert (error is None) is speculative
+
+
+@pytest.mark.parametrize(
+    "initial_speculation,replacement,concurrency",
+    [
+        pytest.param(True, False, 1, id="speculative-to-plain"),
+        pytest.param(False, True, 1, id="plain-to-speculative"),
+        pytest.param(True, None, 1, id="remove-speculative-source"),
+        pytest.param(False, None, 2, id="remove-ineligible-source"),
+    ],
+)
+def test_ttft_caller_preserves_rendered_configuration(
+    perf_sanity_caller: Callable,
+    tmp_path: Path,
+    initial_speculation: bool,
+    replacement: bool | None,
+    concurrency: int,
+) -> None:
+    """Completed measurements use the rendered launch, not a later source file."""
+    config_path = tmp_path / "worker.yaml"
+
+    def write_config(speculative: bool) -> None:
+        config_path.write_text(
+            yaml.safe_dump({"speculative_config": {"decoding_type": "MTP"}} if speculative else {})
+        )
+
+    write_config(initial_speculation)
+
+    def change_source() -> None:
+        if replacement is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            write_config(replacement)
+
+    client_name = f"con{concurrency}"
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": [
+            {
+                "name": "plain",
+                "extra_llm_api_config_path": str(config_path),
+                "client_configs": [{"name": client_name, "concurrency": concurrency}],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(s_test_case_name=f"plain-{client_name}")],
+        config=config,
+        after_launch=change_source,
+    )
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    should_gate = concurrency == 1 and not initial_speculation
+    assert uploaded[0]["b_is_regression"] is should_gate
+    assert (error is not None) is should_gate
+
+
+@pytest.mark.parametrize("speculative_first", [True, False])
+def test_ttft_caller_isolates_duplicate_server_names(
+    perf_sanity_caller: Callable, tmp_path: Path, speculative_first: bool
+) -> None:
+    """Unnamed servers keep their case identities and distinct launch configurations."""
+    server_name = "latency-control_tp1_ep1_pp1_cp1_bs512_attnTRTLLM_moe"
+    servers = []
+    for name, speculative in (("first", speculative_first), ("second", not speculative_first)):
+        worker_path = tmp_path / f"{name}.yaml"
+        worker_path.write_text(
+            yaml.safe_dump({"speculative_config": {"decoding_type": "MTP"}} if speculative else {})
+        )
+        servers.append(
+            {
+                "extra_llm_api_config_path": str(worker_path),
+                "client_configs": [{"name": name, "concurrency": 1}],
+            }
+        )
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": servers,
+    }
+    launches = []
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(s_test_case_name=f"{server_name}-{name}") for name in ("first", "second")],
+        config=config,
+        launches=launches,
+    )
+    assert len(launches) == 2
+    assert launches[0][0] != launches[1][0]
+    assert [bool(worker.get("speculative_config")) for _, worker in launches] == [
+        speculative_first,
+        not speculative_first,
+    ]
+    assert [row["s_server_name"] for row in uploaded] == [server_name, server_name]
+    assert all(row["b_eos"] is False for row in uploaded)
+    for row, name, speculative in zip(
+        uploaded, ("first", "second"), (speculative_first, not speculative_first)
+    ):
+        assert row["s_test_case_name"] == f"{server_name}-{name}"
+        assert _metric_comparison(row, "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert row["b_is_regression"] is not speculative
+        assert (f"Regression in {server_name}-{name}:" in str(error)) is not speculative
+    assert error is not None
+
+
+@pytest.mark.parametrize(
+    "worker,hardware_gpus_per_node,should_gate",
+    [
+        pytest.param({"tensor_parallel_size": 8}, 4, False, id="tensor-multi-node"),
+        pytest.param(
+            {"tensor_parallel_size": 2, "pipeline_parallel_size": 2, "context_parallel_size": 2},
+            4,
+            False,
+            id="combined-parallelism-multi-node",
+        ),
+        pytest.param(
+            {"tensor_parallel_size": 4, "moe_expert_parallel_size": 4},
+            4,
+            True,
+            id="expert-parallelism-does-not-multiply-world-size",
+        ),
+        pytest.param({"tensor_parallel_size": 4}, 0, True, id="detected-node-size"),
+    ],
+)
+def test_ttft_caller_resolves_launch_topology(
+    perf_sanity_caller: Callable,
+    tmp_path: Path,
+    worker: dict,
+    hardware_gpus_per_node: int,
+    should_gate: bool,
+) -> None:
+    """Equivalent inline and external workers share eligibility, not legacy metadata."""
+    worker = {"checkpoint_io_policy": "auto", **worker}
+    worker_path = tmp_path / "worker.yaml"
+    worker_path.write_text(yaml.safe_dump(worker))
+    launches = []
+    for inline in (True, False):
+        server = worker if inline else {"extra_llm_api_config_path": str(worker_path)}
+        config = {
+            "metadata": {"model_name": "latency-control"},
+            "hardware": {"gpus_per_node": hardware_gpus_per_node},
+            "server_configs": [
+                {**server, "name": "plain", "client_configs": [{"name": "con1", "concurrency": 1}]}
+            ],
+        }
+        legacy_gpus = (
+            server.get("tensor_parallel_size", 1)
+            * server.get("pipeline_parallel_size", 1)
+            * server.get("context_parallel_size", 1)
+        )
+        legacy_node_size = hardware_gpus_per_node or legacy_gpus
+        runtime = "aggr_server" if legacy_gpus == legacy_node_size else "multi_node_aggr_server"
+        uploaded, error = perf_sanity_caller(
+            [_ttft_history(s_runtime=runtime)], config=config, launches=launches
+        )
+        assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert uploaded[0]["b_is_regression"] is should_gate
+        assert (error is not None) is should_gate
+        assert uploaded[0]["l_gpus"] == legacy_gpus
+        assert uploaded[0]["l_gpus_per_node"] == legacy_node_size
+        assert uploaded[0]["l_tp"] == server.get("tensor_parallel_size", 1)
+        assert uploaded[0]["l_pp"] == server.get("pipeline_parallel_size", 1)
+        assert uploaded[0]["l_cp"] == server.get("context_parallel_size", 1)
+        assert uploaded[0]["s_runtime"] == runtime
+    assert len(launches) == 2
+    assert launches[0][1] == launches[1][1]
+
+
+def test_ttft_caller_uses_worker_node_size(perf_sanity_caller: Callable, tmp_path: Path) -> None:
+    """An explicit worker node size governs topology without rewriting matching fields."""
+    worker_path = tmp_path / "worker.yaml"
+    worker_path.write_text(yaml.safe_dump({"tensor_parallel_size": 4, "gpus_per_node": 2}))
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 4},
+        "server_configs": [
+            {
+                "name": "plain",
+                "extra_llm_api_config_path": str(worker_path),
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(s_runtime="multi_node_aggr_server")], config=config
+    )
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    assert uploaded[0]["l_gpus_per_node"] == 4
+    assert uploaded[0]["l_gpus"] == 1
+    assert uploaded[0]["b_is_regression"] is False
+    assert error is None
+
+
+@pytest.mark.parametrize(
+    "worker,should_gate",
+    [
+        pytest.param({"tensor_parallel_size": "4", "gpus_per_node": 4}, True, id="quoted-tp"),
+        pytest.param({"tensor_parallel_size": 4, "gpus_per_node": "4"}, True, id="quoted-node"),
+        pytest.param(
+            {"tensor_parallel_size": "16", "gpus_per_node": "8"},
+            False,
+            id="lexical-order-is-not-node-order",
+        ),
+        pytest.param(
+            {
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": "2",
+                "context_parallel_size": "2",
+                "gpus_per_node": "4",
+            },
+            False,
+            id="quoted-pipeline-and-context",
+        ),
+        pytest.param(
+            {"tensor_parallel_size": "4.0", "gpus_per_node": "4.0"},
+            True,
+            id="worker-integer-coercion",
+        ),
+    ],
+)
+@pytest.mark.parametrize("inline", [True, False], ids=["inline", "external"])
+def test_ttft_caller_normalizes_rendered_topology(
+    perf_sanity_caller: Callable, tmp_path: Path, worker: dict, should_gate: bool, inline: bool
+) -> None:
+    """Inline and external quoted sizes agree with numeric verdicts and metadata."""
+    worker_path = tmp_path / "worker.yaml"
+    numeric = {key: int(float(value)) for key, value in worker.items()}
+    for configuration in (numeric, worker):
+        worker_path.write_text(yaml.safe_dump(configuration))
+        server = configuration if inline else {"extra_llm_api_config_path": str(worker_path)}
+        node_size = numeric["gpus_per_node"]
+        gpus = (
+            (
+                numeric.get("tensor_parallel_size", 1)
+                * numeric.get("pipeline_parallel_size", 1)
+                * numeric.get("context_parallel_size", 1)
+            )
+            if inline
+            else 1
+        )
+        config = {
+            "metadata": {"model_name": "latency-control"},
+            "hardware": {"gpus_per_node": configuration["gpus_per_node"]},
+            "server_configs": [
+                {**server, "name": "plain", "client_configs": [{"name": "con1", "concurrency": 1}]}
+            ],
+        }
+        runtime = "aggr_server" if gpus == node_size else "multi_node_aggr_server"
+        uploaded, error = perf_sanity_caller(
+            [_ttft_history(s_runtime=runtime)],
+            config=config,
+            worker_device_count=lambda environment: node_size,
+        )
+        assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert uploaded[0]["b_is_regression"] is should_gate
+        assert (error is not None) is should_gate
+        for field, key in (
+            ("l_tp", "tensor_parallel_size"),
+            ("l_pp", "pipeline_parallel_size"),
+            ("l_cp", "context_parallel_size"),
+        ):
+            assert uploaded[0][field] == (numeric.get(key, 1) if inline else 1)
+        assert uploaded[0]["l_gpus"] == gpus
+        assert uploaded[0]["l_gpus_per_node"] == node_size
+
+
+def test_ttft_caller_normalizes_inline_gpu_hints(perf_sanity_caller: Callable) -> None:
+    """Quoted harness GPU hints are normalized before topology comparisons."""
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": "4"},
+        "server_configs": [
+            {
+                "name": "plain",
+                "tensor_parallel_size": "4",
+                "gpus": "4",
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller([_ttft_history()], config=config)
+    assert error is not None and uploaded[0]["b_is_regression"] is True
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    assert uploaded[0]["l_tp"] == uploaded[0]["l_gpus"] == uploaded[0]["l_gpus_per_node"] == 4
+
+
+@pytest.mark.parametrize(
+    ("ttft", "throughput", "regression_metric"),
+    [
+        (125.0, 100.0, "d_mean_ttft"),
+        (100.0, 75.0, "d_token_throughput"),
+        (100.0, 100.0, None),
+    ],
+    ids=["ttft-loss", "throughput-loss", "healthy"],
+)
+def test_ttft_caller_checks_read_only_history(
+    perf_sanity_caller: Callable,
+    ttft: float,
+    throughput: float,
+    regression_metric: str | None,
+) -> None:
+    """Matched history still gates read-only runs without posting any results."""
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(d_threshold_pre_merge_mean_ttft=0.1)],
+        ttft=ttft,
+        throughput=throughput,
+        test_case="aggr-latency_control",
+        expect_upload=False,
+    )
+    assert not uploaded
+    assert (error is not None) is (regression_metric is not None)
+    if error is not None:
+        record = {"s_regression_info": str(error)}
+        assert _metric_comparison(record, "d_mean_ttft") == pytest.approx((ttft, 100.0))
+        assert _metric_comparison(record, "d_token_throughput") == pytest.approx(
+            (throughput, 100.0)
+        )
+
+
+@pytest.mark.parametrize("mode", ["aggr", "aggr_upload"])
+def test_ttft_caller_skips_offline_capacity_probes(
+    perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Offline measurements need no capacity probe when history cannot be read."""
+    monkeypatch.delenv("OPEN_SEARCH_DB_BASE_URL", raising=False)
+    launches = []
+    timeouts = []
+
+    def failing_query(environment: dict[str, str]) -> int:
+        raise subprocess.TimeoutExpired("offline CUDA query", 30)
+
+    uploaded, error = perf_sanity_caller(
+        None,
+        test_case=f"{mode}-latency_control",
+        launches=launches,
+        worker_device_count=failing_query,
+        probe_timeouts=timeouts,
+        expect_upload=False,
+    )
+    assert error is None and not uploaded
+    assert len(launches) == 1
+    assert not timeouts
+
+
+def test_ttft_caller_skips_unused_capacity_probes(perf_sanity_caller: Callable) -> None:
+    """Accuracy-only clients have no TTFT verdict and need no capacity query."""
+    client = {
+        "name": "con1",
+        "concurrency": 1,
+        "only_run_accuracy": True,
+        "accuracy_config": {
+            "enable_accuracy_test": True,
+            "tasks": {"control-task": {}},
+        },
+    }
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": [{"name": "plain", "client_configs": [client]}],
+    }
+
+    def unexpected_query(environment: dict[str, str]) -> int:
+        raise AssertionError("This path cannot use a TTFT capacity query")
+
+    uploaded, error = perf_sanity_caller(
+        [],
+        config=config,
+        worker_device_count=unexpected_query,
+        expect_upload=False,
+    )
+    assert not uploaded and error is None
+
+
+def test_ttft_caller_skips_warmup_capacity_probes(perf_sanity_caller: Callable) -> None:
+    """The real warmup entrypoint uploads warmup data without a TTFT capacity query."""
+
+    def unexpected_query(environment: dict[str, str]) -> int:
+        raise AssertionError("Warmup-only runs cannot use a TTFT capacity query")
+
+    uploaded, error = perf_sanity_caller([], warmup_only=True, worker_device_count=unexpected_query)
+    assert error is None and len(uploaded) == 1
+    assert uploaded[0]["b_warmup_only"] is True
+    assert uploaded[0]["s_test_case_name"] == "plain-warmup"
+    assert uploaded[0]["d_warmup_time"] == 1.0
+
+
+@pytest.mark.parametrize("failure", ["timeout", "process-error"])
+def test_ttft_caller_reports_capacity_probe_failure(
+    perf_sanity_caller: Callable, failure: str
+) -> None:
+    """Necessary probes receive a finite bound and failures retain server context."""
+    timeouts = []
+
+    def failing_query(environment: dict[str, str]) -> int:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("worker CUDA query", 30)
+        raise subprocess.CalledProcessError(2, "worker CUDA query")
+
+    uploaded, error = perf_sanity_caller(
+        [],
+        worker_device_count=failing_query,
+        probe_timeouts=timeouts,
+        expect_upload=False,
+    )
+    assert not uploaded and error is not None
+    assert "plain" in str(error) and "CUDA capacity probe" in str(error)
+    assert timeouts and all(
+        timeout is not None and 0 < timeout < float("inf") for timeout in timeouts
+    )
+    expected = subprocess.TimeoutExpired if failure == "timeout" else subprocess.CalledProcessError
+    assert isinstance(error.__cause__, expected)
+
+
+def test_ttft_caller_uses_worker_visible_devices(
+    perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default capacity follows each worker's inherited or overridden CUDA visibility."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
+    monkeypatch.setenv("LATENCY_TEST_PARENT", "inherited")
+    queried_masks = []
+    visible_counts = {"0,1,2": 3, "0,1,2,3": 4, "0,1": 2}
+
+    def device_count(environment: dict[str, str]) -> int:
+        assert environment["LATENCY_TEST_PARENT"] == "inherited"
+        mask = environment["CUDA_VISIBLE_DEVICES"]
+        queried_masks.append(mask)
+        return visible_counts[mask]
+
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "server_configs": [
+            {
+                "name": name,
+                "tensor_parallel_size": 4,
+                "server_env_var": variables,
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            }
+            for name, variables in (
+                ("inherited", ""),
+                ("full", "CUDA_VISIBLE_DEVICES=0,1,2,3"),
+                ("masked", "CUDA_VISIBLE_DEVICES=0,1"),
+            )
+        ],
+    }
+    uploaded, error = perf_sanity_caller(
+        [
+            _ttft_history(s_test_case_name=f"{name}-con1")
+            for name in ("inherited", "full", "masked")
+        ],
+        config=config,
+        worker_device_count=device_count,
+    )
+    assert set(queried_masks) == set(visible_counts)
+    assert len(uploaded) == 3
+    for row in uploaded:
+        name = row["s_test_case_name"]
+        assert _metric_comparison(row, "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert row["l_gpus"] == row["l_gpus_per_node"] == 4
+        assert row["b_is_regression"] is (name == "full-con1")
+        assert (f"Regression in {name}:" in str(error)) is (name == "full-con1")
+    assert error is not None
+
+
+def test_ttft_caller_respects_ray_node_capacity(
+    perf_sanity_caller: Callable, tmp_path: Path
+) -> None:
+    """Ray's worker rule uses TP as node capacity even with an explicit larger value."""
+    worker_path = tmp_path / "worker.yaml"
+    worker_path.write_text(
+        yaml.safe_dump({"tensor_parallel_size": 2, "pipeline_parallel_size": 2, "gpus_per_node": 4})
+    )
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 4},
+        "server_configs": [
+            {
+                "name": "plain",
+                "extra_llm_api_config_path": str(worker_path),
+                "server_env_var": "RAY_LOCAL_WORLD_SIZE=4",
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(s_runtime="multi_node_aggr_server")], config=config
+    )
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    assert uploaded[0]["b_is_regression"] is False
+    assert error is None
+
+
+@pytest.mark.parametrize("prior_state", ["missing", "invalid", "nonpositive"])
+def test_ttft_caller_distinguishes_unknown_prior_with_complete_baselines(
+    perf_sanity_caller: Callable, prior_state: str
+) -> None:
+    """After baseline resolution, unusable prior values do not establish a new loss."""
+    latest = _ttft_history(
+        d_baseline_seq_throughput=1.0,
+        d_baseline_user_throughput=1.0,
+        d_baseline_mean_e2el=1.0,
+        d_baseline_median_e2el=1.0,
+        d_baseline_p99_e2el=1.0,
+    )
+    if prior_state == "missing":
+        latest.pop("d_mean_ttft")
+    else:
+        latest["d_mean_ttft"] = "not-a-number" if prior_state == "invalid" else 0.0
+    older = _ttft_history(
+        **{
+            "@timestamp": "2026-01-01T00:00:00.000Z",
+            "ts_created": 1767225600000,
+            "d_mean_ttft": 125.0,
+        }
+    )
+    uploaded, error = perf_sanity_caller([older, latest])
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+    assert uploaded[0]["b_is_regression"] is True
+    assert error is not None
+    info = uploaded[0]["s_regression_info"]
+    assert "new gated misses: (none)" in info
+    assert "unknown prior values: (d_mean_ttft)" in info
+    assert "Not failing this stage" not in info
+
+
+def test_ttft_caller_qualifies_unmeasured_prior_metrics(perf_sanity_caller: Callable) -> None:
+    """The prior-miss diagnostic describes only metrics compared by the current run."""
+    uploaded, error = perf_sanity_caller(
+        [_ttft_history(d_mean_ttft=125.0)], ttft="N/A", throughput=75.0
+    )
+    assert "d_mean_ttft" not in uploaded[0]
+    assert _metric_comparison(uploaded[0], "d_token_throughput") == pytest.approx((75.0, 100.0))
+    assert uploaded[0]["b_is_regression"] is True
+    assert error is not None
+    info = uploaded[0]["s_regression_info"]
+    assert "Latest matched post-merge gated misses among current comparisons: (none)" in info
+    assert "new gated misses: (d_token_throughput)" in info
+
+
 @pytest.mark.parametrize("mode", ["e2e", "ctx_only"])
 def test_ttft_caller_preserves_other_modes(perf_sanity_caller: Callable, mode: str) -> None:
-    """Disaggregated e2e and context-only cases retain their throughput gates."""
+    """Disaggregated e2e and context-only TTFT remains diagnostic, not a gate."""
     config = {
         "metadata": {"model_name": "latency-control"},
         "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
@@ -375,31 +997,42 @@ def test_ttft_caller_preserves_other_modes(perf_sanity_caller: Callable, mode: s
 
 
 def test_ttft_caller_preserves_legacy_exemption(perf_sanity_caller: Callable) -> None:
-    """An excluded speculative client retains the whole-case mainline exemption."""
+    """Mixed batches choose independent TTFT and whole-case exemptions per client."""
     config = {
         "metadata": {"model_name": "latency-control"},
         "hardware": {"gpus_per_node": 1},
         "server_configs": [
+            {"name": "plain", "client_configs": [{"name": "con1", "concurrency": 1}]},
             {
                 "name": "speculative",
                 "speculative_config": {"decoding_type": "MTP"},
                 "client_configs": [{"name": "con1", "concurrency": 1}],
-            }
+            },
         ],
     }
-    history = _ttft_history(
-        s_test_case_name="speculative-con1",
-        d_al=1.5,
-        d_baseline_al=2.0,
-        b_is_regression=True,
-    )
-    uploaded, error = perf_sanity_caller([history], ttft=100.0, throughput=75.0, config=config)
-    assert uploaded[0]["b_is_regression"] is True
-    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((100.0, 100.0))
-    assert _metric_comparison(uploaded[0], "d_al") == pytest.approx((2.0, 2.0))
-    assert _metric_comparison(uploaded[0], "d_token_throughput") == pytest.approx((75.0, 100.0))
-    assert error is None
-    assert "Not failing this stage" in uploaded[0]["s_regression_info"]
+    history = [
+        _ttft_history(d_token_throughput=75.0),
+        _ttft_history(
+            s_test_case_name="speculative-con1",
+            d_al=1.5,
+            d_baseline_al=2.0,
+            b_is_regression=True,
+        ),
+    ]
+    uploaded, error = perf_sanity_caller(history, throughput=75.0, config=config)
+    plain, speculative = uploaded
+    for row in uploaded:
+        assert row["b_is_regression"] is True
+        assert _metric_comparison(row, "d_mean_ttft") == pytest.approx((125.0, 100.0))
+        assert _metric_comparison(row, "d_token_throughput") == pytest.approx((75.0, 100.0))
+    assert _metric_comparison(speculative, "d_al") == pytest.approx((2.0, 2.0))
+    assert error is not None
+    assert "Regression in plain-con1:" in str(error)
+    assert "Regression in speculative-con1:" not in str(error)
+    assert "Not failing this stage" not in plain["s_regression_info"]
+    assert "Not failing this stage" in speculative["s_regression_info"]
+    assert "exempt as a whole" in speculative["s_regression_info"]
+    assert "predates the change" not in speculative["s_regression_info"]
 
 
 @pytest.mark.parametrize(
@@ -410,6 +1043,8 @@ def test_ttft_caller_preserves_legacy_exemption(perf_sanity_caller: Callable) ->
         pytest.param(100.0, 75.0, 125.0, 75.0, True, id="inherited-throughput-new-ttft"),
         pytest.param(125.0, 100.0, 125.0, 100.0, False, id="inherited-ttft"),
         pytest.param(100.0, 75.0, 100.0, 75.0, False, id="inherited-throughput"),
+        pytest.param(125.0, 75.0, 125.0, 100.0, False, id="both-inherited-only-ttft-misses"),
+        pytest.param(125.0, 75.0, 100.0, 75.0, False, id="both-inherited-only-throughput-misses"),
     ],
 )
 def test_ttft_caller_keeps_independent_regressions(
@@ -420,30 +1055,124 @@ def test_ttft_caller_keeps_independent_regressions(
     throughput: float,
     should_fail: bool,
 ) -> None:
-    """Main only exempts a row when every current regressive metric already misses its gate."""
+    """TTFT and grouped throughput losses cannot excuse each other."""
     latest = _ttft_history(d_mean_ttft=main_ttft, d_token_throughput=main_throughput)
     older = _ttft_history(**{"@timestamp": "2026-01-01T00:00:00.000Z", "ts_created": 1767225600000})
     uploaded, error = perf_sanity_caller([older, latest], ttft=ttft, throughput=throughput)
     assert uploaded[0]["b_is_regression"] is True
     assert (error is not None) is should_fail
+    info = uploaded[0]["s_regression_info"]
     if should_fail:
-        assert "Not failing this stage" not in str(error)
+        assert "Not failing this stage" not in info
+        assert "Latest matched post-merge gated misses among current comparisons:" in info
+        assert "new gated misses:" in info
     else:
-        assert "Not failing this stage" in uploaded[0]["s_regression_info"]
+        warning = next(line for line in info.splitlines() if "Not failing this stage" in line)
+        excusing_metric = "d_mean_ttft" if ttft > 110.0 else "d_token_throughput"
+        assert f"({excusing_metric})" in warning
 
 
+def test_ttft_caller_groups_throughput_exemptions(perf_sanity_caller: Callable) -> None:
+    """Different stored throughput gates retain their shared mainline exemption."""
+    latest = _ttft_history(
+        d_token_throughput=75.0,
+        d_total_token_throughput=1150.0,
+        d_baseline_total_token_throughput=1200.0,
+    )
+    older = _ttft_history(
+        **{
+            "@timestamp": "2026-01-01T00:00:00.000Z",
+            "ts_created": 1767225600000,
+            "d_baseline_total_token_throughput": 1200.0,
+        }
+    )
+    uploaded, error = perf_sanity_caller([older, latest], ttft=100.0, throughput=75.0)
+    assert _metric_comparison(uploaded[0], "d_total_token_throughput") == pytest.approx(
+        (1000.0, 1200.0)
+    )
+    assert uploaded[0]["b_is_regression"] is True
+    assert error is None
+    warning = next(
+        line
+        for line in uploaded[0]["s_regression_info"].splitlines()
+        if "Not failing this stage" in line
+    )
+    assert "(d_token_throughput)" in warning
+
+
+def test_metric_override_does_not_change_exemption_policy(
+    regression_utils: ModuleType,
+    metric_lists: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the default gates explicitly must preserve whole-case exemptions."""
+    latest = _ttft_history(d_token_throughput=75.0, d_total_token_throughput=1150.0)
+    baseline = _ttft_history(d_baseline_total_token_throughput=1200.0)
+    monkeypatch.setattr(regression_utils, "get_job_info", lambda: {"b_is_post_merge": False})
+    monkeypatch.setattr(
+        regression_utils,
+        "get_history_data",
+        lambda *args: ({0: latest}, {0: baseline}, {}),
+    )
+    new_data = {0: {"d_token_throughput": 75.0, "d_total_token_throughput": 1000.0}}
+    regression_utils.process_and_upload_test_results(
+        new_data_dict=new_data,
+        match_keys=[],
+        maximize_metrics=metric_lists["MAXIMIZE_METRICS"],
+        minimize_metrics=metric_lists["MINIMIZE_METRICS"],
+        regression_metrics=metric_lists["REGRESSION_METRICS"],
+        regression_metrics_by_cmd_idx={0: metric_lists["REGRESSION_METRICS"]},
+        upload_to_db=False,
+    )
+    assert new_data[0]["b_is_regression"] is True
+    assert "Not failing this stage" in new_data[0]["s_regression_info"]
+
+
+def test_branchless_exemption_describes_matched_record(
+    regression_utils: ModuleType,
+    metric_lists: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A branchless caller must not attribute a matched record to the baseline branch."""
+    monkeypatch.setenv("PERF_BASELINE_BRANCH", "main")
+    latest = _ttft_history(s_branch="release/example", d_token_throughput=75.0)
+    monkeypatch.setattr(
+        regression_utils, "get_job_info", lambda: {"b_is_post_merge": False, "s_branch": "feature"}
+    )
+    monkeypatch.setattr(
+        regression_utils, "get_history_data", lambda *args: ({0: latest}, {0: latest}, {})
+    )
+    data = {0: {"s_test_case_name": "plain-con1", "d_token_throughput": 75.0}}
+    regression_utils.process_and_upload_test_results(
+        new_data_dict=data,
+        match_keys=["s_test_case_name"],
+        maximize_metrics=metric_lists["MAXIMIZE_METRICS"],
+        minimize_metrics=metric_lists["MINIMIZE_METRICS"],
+        regression_metrics=metric_lists["REGRESSION_METRICS"],
+        upload_to_db=False,
+    )
+    assert data[0]["b_is_regression"] is True
+    info = data[0]["s_regression_info"]
+    assert "Not failing this stage" in info
+    assert "latest matched post-merge record" in info
+    assert "baseline branch" not in info
+
+
+@pytest.mark.parametrize(
+    "parameter", ["regression_metrics_by_cmd_idx", "independent_regression_metrics_by_cmd_idx"]
+)
 def test_per_case_regression_metrics_are_validated(
-    regression_utils: ModuleType, metric_lists: dict[str, list[str]]
+    regression_utils: ModuleType, metric_lists: dict[str, list[str]], parameter: str
 ) -> None:
     """Per-case overrides must use the same metric definitions as default gates."""
-    with pytest.raises(ValueError, match="d_unknown_metric"):
+    with pytest.raises(ValueError, match=rf"{parameter}\[0\].*d_unknown_metric"):
         regression_utils.process_and_upload_test_results(
             new_data_dict={0: {}},
             match_keys=[],
             maximize_metrics=metric_lists["MAXIMIZE_METRICS"],
             minimize_metrics=metric_lists["MINIMIZE_METRICS"],
             regression_metrics=metric_lists["REGRESSION_METRICS"],
-            regression_metrics_by_cmd_idx={0: ["d_unknown_metric"]},
+            **{parameter: {0: ["d_unknown_metric"]}},
         )
 
 

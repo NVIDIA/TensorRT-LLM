@@ -28,20 +28,49 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 |------|-------|----------|
 | `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
 | `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
-| `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+| `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. Eligible clients also gate `d_mean_ttft` per client. `d_al` is appended at runtime when any client runs spec decoding. |
 
-Plain, non-speculative, single-node aggregated clients at concurrency one also
-gate `d_mean_ttft`. This selection is per client, including in mixed batches;
-higher-concurrency, speculative, multi-node, disaggregated and context-only
-clients keep their existing metric gates. Mean TTFT uses the matched case's
-latency baseline and configured pre-merge or post-merge tolerance (10% and 5%
-by default). Without a stored TTFT baseline override, healthy TTFT history can
-still supply the baseline; without either, TTFT remains ungated. For these
-TTFT-eligible rows, an existing mainline regression exempts a pre-merge row only
-when every currently regressive metric already misses the same gate on main,
-so an old TTFT miss cannot excuse a new throughput loss (or vice versa). All
-other rows retain their whole-case exemption when any gated mainline metric
-misses the pre-merge threshold.
+Regular `aggr-<config>[-<server>]` and `aggr_upload-<config>[-<server>]` clients
+also gate `d_mean_ttft` when
+the worker's resolved TP × PP × CP uses at most `gpus_per_node` GPUs,
+the client concurrency is one,
+and the effective worker configuration has no enabled speculative decoding.
+The effective configuration merges the perf YAML over `extra_llm_api_config_path`,
+so speculation in either source excludes the client. Eligibility is captured from
+the rendered worker configuration before launch. TP, PP, CP and node capacity
+use the worker's integer coercion, including quoted integers. Inline TP, PP, CP
+and harness GPU hints are normalized before GPU arithmetic or comparisons, so
+quoted and numeric forms produce the same integer topology metadata. Node capacity is
+the worker's explicit `gpus_per_node`, otherwise `torch.cuda.device_count()` in
+a fresh process inheriting the server's effective environment, including its
+`CUDA_VISIBLE_DEVICES` override. With `RAY_LOCAL_WORLD_SIZE` set, the worker
+uses TP as node capacity. The hardware inventory and uploaded topology fields
+do not replace these worker rules.
+Only the measured `test_e2e` path requests this snapshot, and only for regular
+aggregated servers with a measured concurrency-one client and a configured
+`OPEN_SEARCH_DB_BASE_URL` history endpoint. With that endpoint configured,
+read-only `aggr` runs still query matched history and enforce regression verdicts;
+disabling result writes does not disable TTFT eligibility. Without the endpoint,
+offline `aggr` and `aggr_upload` runs measure without a CUDA capacity query or
+database writes. Higher-concurrency-only servers,
+accuracy-only clients, command-only callers and cold-start `test_warmup` runs
+do not need a CUDA capacity probe.
+An otherwise necessary query has a 30-second timeout; a timeout or failed child
+raises with the server's name and the underlying error rather than guessing capacity.
+Each server command receives a distinct worker file even when server names match;
+existing integer case names and topology fields retain their definitions.
+Changing or removing the source file after measurement does not change the
+verdict. Partially occupied nodes qualify even though their uploaded
+`s_runtime` is `multi_node_aggr_server`.
+Higher-concurrency, speculative and genuinely multi-node clients, disaggregated
+`e2e`/`gen_only`, and aggregated `ctx_only`/`gen_only_no_context` modes do not gain
+this gate. Selection is per client, including in mixed batches.
+
+Mean TTFT uses the matched case's baseline and configured pre-merge or post-merge
+tolerance (10% and 5% by default). Without a stored override, matched post-merge
+TTFT history supplies a calculated baseline; without either, TTFT remains
+ungated. For pre-merge history, the baseline branch is `PERF_BASELINE_BRANCH`
+(`main` by default). See the pre-merge gating section below for exemptions.
 
 TPOT is time per output token, so lower values are better. Its reported delta is
 negative when latency exceeds the selected baseline. A stored `d_baseline_*`
@@ -522,19 +551,13 @@ Post-merge perf-sanity stages (stages whose names contain both `PerfSanity` and 
 
 By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
 
-**A pre-merge case may be exempt when `main` has already regressed.** Both pipelines
-compare against the same post-merge baseline, so once a regression lands on `main`
-every PR measures the same regressed value and every PR fails a test it did not
-break — blocking the whole queue until a fix merges and everyone rebases. To avoid
-that, `prepare_regressive_test_cases` checks the **latest post-merge document** for
-the same test case, comparing against the same baseline and pre-merge threshold
-(10% by default):
-
-- Plain, non-speculative, single-node aggregated concurrency-one clients receive
-  the additional TTFT gate. They are exempt only when **every currently regressive
-  metric** already misses its corresponding gate on `main`.
-- All other clients retain the existing **whole-case exemption** when **any gated
-  metric** already misses on `main`, including when that metric recovers on the PR.
+**A pre-merge case may be exempt when its baseline branch has already regressed.**
+`prepare_regressive_test_cases` checks the **latest post-merge document** for the
+same case on `PERF_BASELINE_BRANCH` (`main` by default), against the same baseline
+and pre-merge threshold (10% by default). For the eligible clients defined above,
+TTFT is independent of the grouped throughput gates. All other selected gates
+use a whole-case exemption. The full rule is defined once in
+[README_perf_regression_system.md](README_perf_regression_system.md#pre-merge-exemptions-against-matched-history).
 
 Exempt cases are reported as warnings without raising. Functional failures still
 fail the stage as usual.
@@ -547,10 +570,9 @@ value never fails the 10% gate, so the gate stays armed.
 
 Two things to be aware of when you see that warning:
 
-- For TTFT-eligible clients, further worsening of an already regressive metric
-  remains exempt, but a new regression in a different metric still fails. Other
-  clients remain exempt **entirely** after any qualifying mainline miss: even a
-  new regression in a different metric can pass. Their existing policy is unchanged.
+- A new loss within an exempt throughput group can pass, while an independent
+  TTFT loss needs its own qualifying mainline miss. Cases with only grouped gates
+  can be exempt even when a different metric in that group recovers on the PR.
 - The exemption clears itself as the rolling baseline absorbs the regression, which
   also means the regression stops being reported. If you land the fix, the baseline
   recovers and the gate re-arms at the original level; if nobody does, it re-arms at
