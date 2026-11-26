@@ -245,6 +245,14 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         ]
 
     @torch.inference_mode()
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        if _is_mm_disagg() and (
+            mm_data.get("multimodal_embedding") is not None
+            or mm_data.get("image", {}).get("pixel_values") is not None
+            or mm_data.get("video", {}).get("pixel_values_videos") is not None
+        ):
+            raise ValueError("EXAONE4.5-VL requires a local encoder for multimodal requests")
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,

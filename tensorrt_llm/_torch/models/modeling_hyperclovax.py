@@ -1086,6 +1086,13 @@ class HCXVisionForCausalLM(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
     @torch.inference_mode()
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        if DISAGG and (mm_data.get("multimodal_embedding") is not None or any(
+                mm_data.get(key) is not None
+                for key in ("image", "video", "audio"))):
+            raise ValueError(
+                "This model requires a local encoder for multimodal requests")
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,

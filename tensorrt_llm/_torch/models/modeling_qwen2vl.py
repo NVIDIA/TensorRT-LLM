@@ -2645,6 +2645,20 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         logger.debug(f'output shape: {output_prob.shape}')
         return output_prob
 
+    def validate_request(self, request) -> None:
+        mm_data = request.py_multimodal_data
+        if self.mm_encoder is not None or request.is_generation_only_request or not mm_data:
+            return
+        has_embeddings = mm_data.get("multimodal_embedding") is not None
+        has_media = (mm_data.get("image", {}).get("pixel_values") is not None
+                     or mm_data.get("video",
+                                    {}).get("pixel_values_videos") is not None)
+        if (has_media or has_embeddings) and not (getattr(
+                self, "support_mm_disagg", False) and has_embeddings):
+            raise ValueError(
+                "This worker requires supported precomputed multimodal embeddings"
+            )
+
     def _get_requests_with_mm_data(self, multimodal_params):
         mm_multimodal_params = []
         for multimodal_param in multimodal_params:
