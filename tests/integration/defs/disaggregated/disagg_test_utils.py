@@ -536,13 +536,14 @@ def _stop_etcd(proc: subprocess.Popen, data_dir: str) -> None:
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
-def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> None:
+def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> bool:
     deadline = time.monotonic() + ETCD_READY_TIMEOUT_S
     with requests.Session() as session:
+        # Avoid proxies and redirects so health reflects the local etcd endpoint.
         session.trust_env = False
         while True:
             if proc.poll() is not None:
-                raise RuntimeError(f"etcd exited during startup with code {proc.returncode}")
+                return False
             try:
                 response = session.get(
                     f"{client_url}/health",
@@ -550,12 +551,13 @@ def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> None:
                     allow_redirects=False,
                 )
                 if response.status_code == 200:
-                    return
+                    # A foreign service can answer if etcd lost a bind race and exited.
+                    return proc.poll() is None
             except requests.RequestException:
                 pass
             if time.monotonic() >= deadline:
                 if proc.poll() is not None:
-                    raise RuntimeError(f"etcd exited during startup with code {proc.returncode}")
+                    return False
                 raise TimeoutError(
                     f"Timed out after {ETCD_READY_TIMEOUT_S}s waiting for etcd to become healthy"
                 )
@@ -563,7 +565,14 @@ def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> None:
 
 
 def _start_etcd(work_dir: str) -> tuple[subprocess.Popen, str, str]:
-    for attempt in range(1, ETCD_START_ATTEMPTS + 1):
+    """Start healthy etcd, retrying bind-race exits with fresh ports and data.
+
+    Port selection releases each probe socket before etcd can bind it, so another
+    process can claim the selected port and make etcd exit during startup.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
         client_port = get_free_port()
         peer_port = get_free_port()
@@ -587,23 +596,22 @@ def _start_etcd(work_dir: str) -> tuple[subprocess.Popen, str, str]:
             ]
         )
         try:
-            _wait_for_etcd_ready(proc, client_url)
-            return proc, f"etcd://127.0.0.1:{client_port}", data_dir
-        except RuntimeError:
-            exited_early = proc.poll() is not None
-            _stop_etcd(proc, data_dir)
-            if exited_early and attempt < ETCD_START_ATTEMPTS:
-                logger.warning(
-                    f"etcd exited before becoming healthy on client={client_port} "
-                    f"peer={peer_port} (attempt {attempt}/{ETCD_START_ATTEMPTS}); "
-                    "retrying with fresh ports."
-                )
-                continue
-            raise
+            ready = _wait_for_etcd_ready(proc, client_url)
         except BaseException:
             _stop_etcd(proc, data_dir)
             raise
-    raise AssertionError("unreachable")
+        if ready:
+            return proc, f"etcd://127.0.0.1:{client_port}", data_dir
+        exit_code = proc.returncode
+        _stop_etcd(proc, data_dir)
+        if attempt < ETCD_START_ATTEMPTS:
+            logger.warning(
+                f"etcd exited before becoming healthy on client={client_port} "
+                f"peer={peer_port} (attempt {attempt}/{ETCD_START_ATTEMPTS}); "
+                "retrying with fresh ports."
+            )
+            continue
+        raise RuntimeError(f"etcd exited during startup with code {exit_code}")
 
 
 @pytest.fixture
