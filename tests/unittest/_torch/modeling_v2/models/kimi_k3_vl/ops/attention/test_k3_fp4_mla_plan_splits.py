@@ -140,6 +140,91 @@ def test_ull_plan_uses_its_metadata_workspace(monkeypatch, is_cuda_graph):
     assert plan.plan.data_ptr() == metadata.fp4_mla_state.workspaces[decode._PLAN_WS].data_ptr()
 
 
+def test_ull_run_packed_decode_uses_metadata_workspaces(monkeypatch) -> None:
+    decode = importlib.import_module(f"{_FAMILY}.ops.attention._fp4_mla_decode_ull")
+    seen: dict[str, tuple[torch.Tensor, ...]] = {}
+
+    def fake_decode(*args, split_kv_buffers, **kwargs) -> None:
+        seen["buffers"] = split_kv_buffers
+
+    def fake_reduce(partial, maxima, sums, *args, **kwargs) -> None:
+        seen["reduced"] = (partial, maxima, sums)
+
+    module = SimpleNamespace(
+        packed_query_rows=lambda heads, qlen: (heads * qlen, 128),
+        FP4_MLA_P_GLOBAL_SCALE=1.0,
+        LAUNCH_DEPENDENTS_EPILOGUE=False,
+        SPLIT_PARTIAL_DTYPES=(),
+        run_trtllm_fp4_mla_decode_packed=fake_decode,
+    )
+    reduce = SimpleNamespace(
+        UllDeferredPackedReduce=SimpleNamespace(active=lambda: None),
+        reduce_packed_splits=fake_reduce,
+    )
+    monkeypatch.setattr(decode, "_reduce_module", lambda: reduce)
+    monkeypatch.setattr(decode, "_get_sm_count", lambda device: _SM_COUNT)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    metadata = _metadata(1, is_cuda_graph=True)
+    metadata.forward_scratch_buffers = {}
+    metadata.get_empty = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("packed decode workspaces must stay metadata-owned (shared=False)")
+    )
+    plan = torch.zeros(32, dtype=torch.int32)
+    plan_geometry = decode.PackedPlanGeometry(
+        num_requests=1,
+        query_len=1,
+        splits=2,
+        wave_tasks=4,
+        profile_tiles=1,
+        task_capacity=4,
+        split_kv_len=128,
+        helix_kv_bounds=None,
+        plan=plan,
+        key=("matched",),
+        lpt_m_tiles=0,
+        lpt_wave_clusters=0,
+        wave_plan=False,
+    )
+    metadata.fp4_mla_state.packed_plan_key = plan_geometry.key
+    empty = torch.empty(1, dtype=torch.float32)
+    output = torch.empty((1, 8, 512), dtype=torch.bfloat16)
+
+    decode._run_packed_decode(
+        module,
+        metadata,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        output,
+        num_heads=8,
+        query_len=1,
+        num_requests=1,
+        rows_per_seq=128,
+        sm_scale=1.0,
+        v_page_offset=0,
+        helix_kv_bounds=None,
+        softmax_stats_tensor=None,
+        plan_geometry=plan_geometry,
+        metadata_launches=0,
+    )
+
+    partial, maxima, sums = seen["buffers"]
+    assert seen["reduced"] == seen["buffers"]
+    ws = metadata.fp4_mla_state.workspaces
+    assert partial.data_ptr() == ws[decode._PARTIAL_WS].data_ptr()
+    assert maxima.data_ptr() == ws[decode._MAXIMA_WS].data_ptr()
+    assert sums.data_ptr() == ws[decode._SUMS_WS].data_ptr()
+
+
 def test_kv_update_plans_with_the_family_geometry():
     decode = importlib.import_module(f"{_FAMILY}.ops.attention._fp4_mla_decode")
     append = importlib.import_module(f"{_FAMILY}.kernels.k3r_fp4_mla.fp4_mla_kv_append")
