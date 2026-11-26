@@ -1,5 +1,5 @@
 # Multi-node inference with Ray orchestrator
-TensorRT-LLM supports a prototype [Ray orchestrator](../README.md) as an alternative to MPI. The following example shows how to start a Ray cluster for multi-node inference.
+TensorRT-LLM supports the [Ray orchestrator](../README.md) as an alternative to MPI. The following example shows how to start a Ray cluster for multi-node inference.
 
 
 ## Quick Start
@@ -38,6 +38,3 @@ TensorRT-LLM supports a prototype [Ray orchestrator](../README.md) as an alterna
     # You can change this script to a model and parallel settings effective for multi-node inference (e.g., TP8 or TP4PP4).
     >> python examples/ray_orchestrator/llm_inference_async_ray.py
     ```
-
-## Disclaimer
-The code is a prototype and subject to change. Currently, there are no guarantees regarding functionality, performance, or stability.

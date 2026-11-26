@@ -25,6 +25,7 @@ from .mmlu import MMLU
 from .nemo_skills_eval import (AALCR, HLE, ArenaHard, GPQANemoSkills, IFBench,
                                SciCode)
 from .visual_gen.image_generation_eval import ImageGenerationEval
+from .visual_gen.video_generation_eval import VideoGenerationEval
 
 __all__ = [
     "CnnDailymail",
@@ -36,6 +37,7 @@ __all__ = [
     "GPQAExtended",
     "JsonModeEval",
     "ImageGenerationEval",
+    "VideoGenerationEval",
     "MMMU",
     "MMMUPro",
     "CoVoST2",

@@ -21,7 +21,7 @@
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
 #   Top-K                     			  @NVIDIA/trt-llm-topk-devs
-#   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
+#   VisualGen (AIGV)         			  @NVIDIA/trt-llm-visualgen-devs
 #   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: Triton backend, Dynamo.  Governance/legal: unchanged.
 #
@@ -83,6 +83,7 @@
 # ===== AGENT =====
 /.claude @NVIDIA/trt-llm-agent-devs
 /.codex @NVIDIA/trt-llm-agent-devs
+/skills @NVIDIA/trt-llm-agent-devs
 /AGENTS.md @NVIDIA/trt-llm-agent-devs
 /CLAUDE.md @NVIDIA/trt-llm-agent-devs
 /agent-flow @NVIDIA/trt-llm-agent-devs
@@ -181,7 +182,7 @@
 /tensorrt_llm/_torch/modules/linear.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
-/tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-qa-function
+/tests/integration/defs/accuracy/ @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-qa-function
 /tests/unittest/_torch/modeling @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/models @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
@@ -364,6 +365,7 @@
 /tests/microbenchmarks/compare_moe_comm.py @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
+/tests/test_common/moe_tactics.py @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs
 
@@ -375,20 +377,20 @@
 /tests/unittest/_torch/modules/test_top_k.py @NVIDIA/trt-llm-topk-devs
 
 # ===== VisualGen / AIGV =====
-/cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-torch-visual-gen-devs
-/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/scripts/visualgen_eval @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen/attention @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/cpp/tensorrt_llm/thop/*lysses* @NVIDIA/trt-llm-torch-visual-gen-devs
-/cpp/tensorrt_llm/kernels/ulysses* @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/media @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs @NVIDIA/trt-llm-runtime-devs
-/tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/integration/defs/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-visualgen-devs
+/examples/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/scripts/visualgen_eval @NVIDIA/trt-llm-visualgen-devs
+/tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tensorrt_llm/_torch/visual_gen/attention @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-visualgen-devs
+/cpp/tensorrt_llm/thop/*lysses* @NVIDIA/trt-llm-visualgen-devs
+/cpp/tensorrt_llm/kernels/ulysses* @NVIDIA/trt-llm-visualgen-devs
+/tensorrt_llm/media @NVIDIA/trt-llm-visualgen-devs
+/tensorrt_llm/visual_gen @NVIDIA/trt-llm-visualgen-api-devs
+/tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/integration/defs/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/unittest/visual_gen @NVIDIA/trt-llm-visualgen-devs
 
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
@@ -436,8 +438,8 @@
 # together with the modules themselves.
 /tensorrt_llm/_torch/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/visual_gen/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
+/tensorrt_llm/_torch/visual_gen/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-visualgen-devs
+/tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-visualgen-devs
 /tensorrt_llm/_ray_utils.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
@@ -458,6 +460,7 @@
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/scripts/check_cpp_licenses.py @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
 /requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
 /requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
@@ -466,6 +469,7 @@
 /scripts/vendor/ @NVIDIA/trt-llm-oss-compliance
 /setup.py @NVIDIA/trt-llm-oss-compliance
 /tensorrt_llm/_torch/attention/backends/prims_ts/** @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
+/tensorrt_llm/_torch/attention/backends/_cute_dsl_compat.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
 /triton_kernels/** @NVIDIA/trt-llm-oss-compliance
@@ -529,10 +533,10 @@
 /tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/ @dongfengy @Tabrizian @xwang233
 
-# GLM-5.3-Flash (glm5_next)
-/tensorrt_llm/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia
+# GLM-5.3-Flash (glm5_next): routing, targets with their native code, and tests
+/tensorrt_llm/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @kaiyux
+/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @kaiyux
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia @kaiyux
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

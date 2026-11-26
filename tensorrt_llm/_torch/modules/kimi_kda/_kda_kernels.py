@@ -214,7 +214,13 @@ _PREFILL_MODULE: Optional[ModuleType] = None
 _PREFILL_IMPORT_ERROR: Optional[Exception] = None
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+# The per-request vectors are the generation rows of whole-batch tensors, sliced
+# from row ``num_contexts`` (``update_mamba_states``), so their alignment follows
+# the batch, as ``num_requests`` does; neither is part of the compile key.
+@triton.jit(
+    do_not_specialize=["num_requests"],
+    do_not_specialize_on_alignment=["state_indices_ptr", "num_accepted_ptr", "is_dummy_ptr"],
+)
 def _record_kda_replay_acceptance_kernel(
     prev_num_accepted_ptr,
     prev_num_accepted_stride,

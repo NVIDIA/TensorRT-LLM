@@ -1,11 +1,7 @@
-# Ray Orchestrator (Prototype)
-
-```{note}
-This project is under active development and currently in a prototype stage. The current focus is on core functionality, with performance optimization coming soon. While we strive for correctness, there are currently no guarantees regarding functionality, stability, or reliability.
-```
+# Ray Orchestrator
 
 ## Motivation
-The **Ray orchestrator** uses [Ray](https://docs.ray.io/en/latest/index.html) instead of MPI to manage workers for single- and multi-node inference. It’s a first step toward making TensorRT-LLM a better fit for Reinforcement Learning from Human Feedback (RLHF) workflows. For RLHF, Ray can dynamically spawn and reconnect distributed inference actors, each with its own parallelism strategy. This feature is a prototype and under active development. MPI remains the default in TensorRT-LLM.
+The **Ray orchestrator** uses [Ray](https://docs.ray.io/en/latest/index.html) instead of MPI to manage workers for single- and multi-node inference. It’s a first step toward making TensorRT-LLM a better fit for Reinforcement Learning from Human Feedback (RLHF) workflows. For RLHF, Ray can dynamically spawn and reconnect distributed inference actors, each with its own parallelism strategy. MPI remains the default in TensorRT-LLM.
 
 
 ## Basic Usage

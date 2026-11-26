@@ -130,24 +130,6 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "the run ends at the ceiling",
         ),
     ),
-    "tuner": (
-        Decision(
-            "CANDIDATE",
-            "a change is committed on its branch with its correctness tests and micro-bench",
-            "the orchestrator measures it end to end and keeps it only on its own gate",
-        ),
-        Decision(
-            "DROPPED",
-            "the micro-bench numbers that killed the hypothesis",
-            "the campaign moves on",
-        ),
-        Decision(
-            "BLOCKED",
-            "what is broken, with job receipts, or the runtime change or native rebuild "
-            "the candidate needs, with its evidence",
-            "the campaign records it",
-        ),
-    ),
 }
 
 
@@ -181,7 +163,7 @@ DECISION_REMINDER = "Before ending your turn, write your decision file to the pa
 #: The closed enum each role's decision file is validated against: its row of the
 #: decision table (``agents/decisions.py``).
 DECISIONS_BY_AGENT: dict[str, tuple[str, ...]] = {
-    role: names(role) for role in (*PLAN_ROLES, "kernel_writer", "assembler", "tuner")
+    role: names(role) for role in (*PLAN_ROLES, "kernel_writer", "assembler")
 }
 
 #: The keys besides ``summary`` and ``decision`` a role's decision file carries for the
@@ -195,6 +177,8 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # target serves: the planner hears it with the task's end.
     # `macro` is a landed entry that composes native PyTorch calls, nothing better existing:
     # what it composes and where its writer looked.
+    # `satisfies` (either role) is the task's, as the worker answers it: the contract
+    # checks what the work changed can affect, which run when it lands.
     "kernel_writer": (
         "entry",
         "receipt",
@@ -202,13 +186,11 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
         "engine_defect",
         "uncertified",
         "macro",
+        "satisfies",
     ),
     # `uncertified` names the calls a unit makes, correct, outside their entries'
     # CELLS: the planner hears them with the task's end and adds the certification.
-    "assembler": ("blocked_reason", "missing_entry", "uncertified"),
-    # The orchestrator re-reads the candidate's own decision file for the rest
-    # (micro-bench table, projection).
-    "tuner": ("slug", "kind", "worktree", "branch", "commits", "projection"),
+    "assembler": ("blocked_reason", "missing_entry", "uncertified", "satisfies"),
 }
 
 

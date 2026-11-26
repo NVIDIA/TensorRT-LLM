@@ -6,13 +6,14 @@ The table's rows are cut into `CHUNKS` fixed chunks (`chunk_rows`); a rank of a 
 `world` ranks is responsible for chunks `[rank * CHUNKS / world, (rank + 1) * CHUNKS / world)`.
 `PLE_HOST_TABLE_ENV` picks how the rows are stored and looked up:
 
-* `rank` (default): every rank holds the whole table in private host memory.
+* `rank`: every rank holds the whole table in private host memory.
 * `server`: under attention TP every rank holds only the rows of its chunks; the n-gram gather
   reads those rows and writes zeros for the others (`window`), and the caller sums the gathered
   rows over the attention-TP group (`needs_sum`). One copy per server, no inter-process state.
   Exact: every element has one nonzero term.
-* `node`: every chunk is one CUDA VMM allocation on host NUMA memory, shared by every process of
-  the host through `chunk_broker`; every rank maps all chunks back to back and gathers locally.
+* `node` (default): every chunk is one CUDA VMM allocation on host NUMA memory, shared by every
+  process of the host through `chunk_broker`; every rank maps all chunks back to back and gathers
+  locally.
   A rank fills the chunks it is responsible for and attaches to the others. One copy per node.
   Processes share a chunk when their tables have one `table_identity`: the bytes of a strided
   sample of every chunk's rows, whatever directory the checkpoint was read from. A rank that
@@ -26,9 +27,11 @@ mode that does not run is a warning, once per process.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import math
 import os
+import weakref
 from typing import Callable, Optional
 
 import torch
@@ -41,7 +44,7 @@ from tensorrt_llm.logger import logger
 
 from . import chunk_broker as _broker
 
-#: `rank`, `server` or `node` (see the module docstring); default `rank`.
+#: `rank`, `server` or `node` (see the module docstring); default `node`.
 PLE_HOST_TABLE_ENV = "TRTLLM_MODELING_V2_PLE_HOST_TABLE"
 RANK = "rank"
 SERVER = "server"
@@ -69,7 +72,7 @@ Private = Callable[[int, int, torch.dtype, torch.device], tuple]
 
 def host_table_mode() -> str:
     """The requested mode from `PLE_HOST_TABLE_ENV`."""
-    value = os.environ.get(PLE_HOST_TABLE_ENV, RANK).strip().lower() or RANK
+    value = os.environ.get(PLE_HOST_TABLE_ENV, NODE).strip().lower() or NODE
     if value not in _MODES:
         raise ValueError(f"{PLE_HOST_TABLE_ENV}={value!r}: expected one of {', '.join(_MODES)}")
     return value
@@ -88,7 +91,8 @@ def _warn_fallback(requested: str, running: str, why: str) -> None:
 
 def chunk_rows(rows: int, cols: int, align: int = CHUNK_ALIGN) -> int:
     """Rows of one chunk: an even split of `rows` over `CHUNKS`, rounded up so a chunk's bytes
-    (`cols` one-byte columns a row) are a multiple of `align`."""
+    are a multiple of `align` for any whole-byte element size. The element count is aligned,
+    so the row partition is independent of dtype."""
     unit = align // math.gcd(align, cols)
     per = -(-rows // CHUNKS)
     return -(-per // unit) * unit
@@ -272,6 +276,13 @@ class _VmmChunks:
                 raise
             desc.flags = D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
             _cu(D.cuMemSetAccess(address, self.chunk_bytes, [desc], 1))
+        if not read_only:
+            # The CPU fills the chunks this process creates (`PleHostTable.fill`).
+            host = D.CUmemAccessDesc()
+            host.location.type = D.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+            host.location.id = self.node
+            host.flags = D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            _cu(D.cuMemSetAccess(address, self.chunk_bytes, [host], 1))
 
     def create(self, k: int) -> None:
         handle = _cu(cuda_driver.cuMemCreate(self.chunk_bytes, self._prop(self.node), 0))
@@ -311,8 +322,9 @@ class _VmmChunks:
 
     def view(self, rows: int, cols: int, dtype, device) -> torch.Tensor:
         index = device.index if device.index is not None else torch.cuda.current_device()
-        flat = pack_strided_memory(self.va, rows * cols, rows * cols, 1, torch.uint8, index)
-        return flat.view(rows, cols).view(dtype)
+        nbytes = rows * cols * torch.empty(0, dtype=dtype).element_size()
+        flat = pack_strided_memory(self.va, nbytes, nbytes, 1, torch.uint8, index)
+        return flat.view(dtype).view(rows, cols)
 
     def resident_on_host(self) -> bool:
         host = cuda_driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
@@ -332,6 +344,28 @@ class _VmmChunks:
             self.va = 0
 
 
+class _NodeShare:
+    """This process's part in a `node` table: the chunks it owns and serves (`segments`, whose
+    broker threads run until closed), their exported descriptors (`fds`) and the mapped chunks
+    (`vmm`)."""
+
+    def __init__(self) -> None:
+        self.segments: dict[int, _broker.OwnedSegment] = {}
+        self.fds: list[int] = []
+        self.vmm: Optional[_VmmChunks] = None
+
+    def close(self) -> None:
+        for segment in self.segments.values():
+            segment.close()
+        self.segments.clear()
+        for fd in self.fds:
+            os.close(fd)
+        self.fds.clear()
+        if self.vmm is not None:
+            self.vmm.close()
+            self.vmm = None
+
+
 def _all_agree(ok: bool) -> bool:
     """Whether every rank of the server reports `ok` (a collective: every rank calls it)."""
     from tensorrt_llm._utils import mpi_allgather, mpi_disabled
@@ -349,7 +383,7 @@ def _all_agree(ok: bool) -> bool:
 
 
 class PleHostTable:
-    """One rank's storage of the PLE n-gram table (`rows` x `cols` one-byte elements).
+    """One rank's storage of the PLE n-gram table (`rows` x `cols` elements of `dtype`).
 
     After `fill`: `table` is the view the gather reads, `window` its `row_window` (None for the
     whole table), `needs_sum` whether the caller sums the gathered rows over the attention-TP
@@ -374,7 +408,7 @@ class PleHostTable:
         log: Callable[[str], None] = logger.info,
     ) -> None:
         assert mode in _MODES, mode
-        assert torch.empty(0, dtype=dtype).element_size() == 1, dtype
+        self.itemsize = torch.empty(0, dtype=dtype).element_size()
         self.requested = mode
         self.rows, self.cols, self.dtype, self.device = rows, cols, dtype, device
         self.rank, self.world, self.dp = rank, world, dp
@@ -386,9 +420,9 @@ class PleHostTable:
         self.window: Optional[tuple[int, int, int]] = None
         self.table: Optional[torch.Tensor] = None
         self._owner = None
-        self._vmm: Optional[_VmmChunks] = None
-        self._segments: dict[int, _broker.OwnedSegment] = {}
-        self._fds: list[int] = []
+        # Released by `close`, or when the table is collected (not at interpreter exit).
+        self._node = _NodeShare()
+        weakref.finalize(self, self._node.close).atexit = False
         self._node_error: Optional[str] = None
         self._attached = 0
         if device.type != "cuda":
@@ -436,20 +470,20 @@ class PleHostTable:
             self._node_error = "no table identity"
             return
         try:
-            chunk_bytes = chunk_rows(self.rows, self.cols, self.align) * self.cols
+            chunk_bytes = chunk_rows(self.rows, self.cols, self.align) * self.cols * self.itemsize
             node = device_numa_node(self.device)
             index = (
                 self.device.index if self.device.index is not None else torch.cuda.current_device()
             )
-            self._vmm = _VmmChunks(index, chunk_bytes, CHUNKS, 0 if node is None else node)
+            self._node.vmm = _VmmChunks(index, chunk_bytes, CHUNKS, 0 if node is None else node)
             if CHUNKS % self.world == 0:
                 for k in owned_chunks(self.rank, self.world):
                     segment = _broker.try_own(self._key(k))
                     if segment is not None:
                         # Recorded first: if `create` fails, `_abort_node` closes it, and the
                         # processes waiting on it take the chunk over.
-                        self._segments[k] = segment
-                        self._vmm.create(k)
+                        self._node.segments[k] = segment
+                        self._node.vmm.create(k)
         except (RuntimeError, OSError) as error:
             self._node_error = str(error)
             self._abort_node()
@@ -458,14 +492,15 @@ class PleHostTable:
 
     def fill(self, copy: Copy, read: Read) -> None:
         """Fill (and in `node`, share and gather) the rows this rank stores; ends with `table`,
-        `window` and `mode` set. Every rank of the server calls it."""
+        `window` and `mode` set. Every rank of the server calls it. Host memory is written by the
+        CPU through its own mapping of the pages (`_host_table`), not by a device copy."""
         if self.device.type != "cuda":
             copy(self.table, 0, self.rows, 0)
             return
         if self.requested != NODE:
             lo, hi, base = self.window or (0, self.rows, 0)
             if hi > lo:
-                copy(self.table, lo, hi, base)
+                copy(self._host_table(), lo, hi, base)
             return
         ok = self._node_error is None and self._fill_node(copy, read)
         if _all_agree(ok):
@@ -484,22 +519,35 @@ class PleHostTable:
         self._declare_private()
         lo, hi, base = self.window or (0, self.rows, 0)
         if hi > lo:
-            copy(self.table, lo, hi, base)
+            copy(self._host_table(), lo, hi, base)
+
+    def _host_table(self) -> torch.Tensor:
+        """`table` as a CPU tensor over the same host pages: the VMM chunks at their own address,
+        which this process's CPU may write once it creates them, or the registered private
+        allocation at its host address."""
+        if self._node.vmm is not None:
+            address = self._node.vmm.va
+        else:
+            (attributes,) = CUASSERT(cudart.cudaPointerGetAttributes(self.table.data_ptr()))
+            address = int(attributes.hostPointer)
+        pages = (ctypes.c_uint8 * (self.table.numel() * self.itemsize)).from_address(address)
+        return torch.frombuffer(pages, dtype=torch.uint8).view(self.dtype).view(self.table.shape)
 
     def _fill_node(self, copy: Copy, read: Read) -> bool:
-        vmm = self._vmm
+        vmm = self._node.vmm
         self.table = vmm.view(self.rows, self.cols, self.dtype, self.device)
+        host = self._host_table()
         try:
-            for k in list(self._segments):
-                self._fill_and_publish(k, copy)
+            for k in list(self._node.segments):
+                self._fill_and_publish(k, copy, host)
             for k in range(CHUNKS):
-                if k in self._segments:
+                if k in self._node.segments:
                     continue
                 got = _broker.acquire(self._key(k), _ATTACH_TIMEOUT_S, self._log)
                 if got[0] == _broker.OWNER:
-                    self._segments[k] = got[1]
+                    self._node.segments[k] = got[1]
                     vmm.create(k)
-                    self._fill_and_publish(k, copy)
+                    self._fill_and_publish(k, copy, host)
                     continue
                 _, fd, meta = got
                 try:
@@ -516,14 +564,13 @@ class PleHostTable:
             return False
         return vmm.complete()
 
-    def _fill_and_publish(self, k: int, copy: Copy) -> None:
+    def _fill_and_publish(self, k: int, copy: Copy, host: torch.Tensor) -> None:
         lo, hi = chunk_range(k, self.rows, self.cols, self.align)
         if hi > lo:
-            copy(self.table, lo, hi, 0)
-        torch.cuda.synchronize(self.device)
-        fd = self._vmm.export(k)
-        self._fds.append(fd)
-        self._segments[k].publish(fd, {"chunk": k, "chunk_bytes": self._vmm.chunk_bytes})
+            copy(host, lo, hi, 0)
+        fd = self._node.vmm.export(k)
+        self._node.fds.append(fd)
+        self._node.segments[k].publish(fd, {"chunk": k, "chunk_bytes": self._node.vmm.chunk_bytes})
 
     def _check_chunk(self, k: int, read: Read) -> None:
         """An attached chunk holds the checkpoint's bytes at its phase-1 sample, rows the key does
@@ -539,23 +586,15 @@ class PleHostTable:
             raise RuntimeError(f"shared chunk {k} differs from the checkpoint at row {first}")
 
     def _abort_node(self) -> None:
-        for segment in self._segments.values():
-            segment.close()
-        self._segments.clear()
-        for fd in self._fds:
-            os.close(fd)
-        self._fds.clear()
-        if self._vmm is not None:
-            self._vmm.close()
-            self._vmm = None
+        self._node.close()
         self.table = None
 
     # ----------------------------------------------------------------- inspection --
 
     def resident_on_host(self) -> bool:
         """Whether the table's pages are host memory, from the driver."""
-        if self._vmm is not None:
-            return self._vmm.resident_on_host()
+        if self._node.vmm is not None:
+            return self._node.vmm.resident_on_host()
         if self.table is None or self.table.numel() == 0:
             return True
         (attributes,) = CUASSERT(cudart.cudaPointerGetAttributes(self.table.data_ptr()))
@@ -564,8 +603,8 @@ class PleHostTable:
     def describe(self) -> str:
         if self.mode == NODE:
             return (
-                f"{NODE}: {CHUNKS} shared chunks, this process created {len(self._segments)} and "
-                f"attached {self._attached}"
+                f"{NODE}: {CHUNKS} shared chunks, this process created "
+                f"{len(self._node.segments)} and attached {self._attached}"
             )
         if self.mode == SERVER:
             lo, hi, _ = self.window

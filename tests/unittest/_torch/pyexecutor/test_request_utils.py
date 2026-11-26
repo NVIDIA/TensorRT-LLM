@@ -5,7 +5,8 @@
 
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
-- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
+- Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request,
+  drain_queued_items)
 - Rank-0 clock piggyback in RequestBroadcaster
 
 """
@@ -15,7 +16,7 @@ import gc
 import pickle
 import sys
 import weakref
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import cloudpickle
@@ -24,13 +25,17 @@ import pytest
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest, PythonRequestInputs
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
+    drain_queued_items,
     executor_request_to_llm_request,
     get_from_waiting_queue,
     merge_helix_requests,
@@ -1602,7 +1607,7 @@ def test_get_from_waiting_queue():
     # Add items to waiting queue
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     # Get 3 items
     result = get_from_waiting_queue(
@@ -1631,7 +1636,7 @@ def test_get_from_waiting_queue_edge_cases(
     waiting_queue = FCFSWaitingQueue()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
-        waiting_queue.extend(items)
+        waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue, request_count, enable_attention_dp=False, max_num_active_requests=16
@@ -1646,7 +1651,7 @@ def test_get_from_waiting_queue_with_attention_dp(
 ):
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -1676,7 +1681,7 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     )  # No scheduling params
 
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend([req1, req2, req3])
+    waiting_queue.add_requests([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8
@@ -1693,6 +1698,31 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     assert req2 in result
     assert req3 in result
     assert req1 not in result
+
+
+def test_drain_takes_waiting_then_incoming_items_and_skips_shutdown():
+    dist = Mock(rank=0)
+    request_queue = ExecutorRequestQueue(
+        dist, max_batch_size=4, enable_iter_perf_stats=False, batch_wait_timeout_ms=0
+    )
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests([RequestQueueItem(1), RequestQueueItem(2)])
+    request_queue.request_queue.put(RequestQueueItem(3))
+    request_queue.enqueue_cancel_request(1)
+    request_queue.enqueue_shutdown_request()
+    request_queue.request_queue.put(RequestQueueItem(4))
+
+    drained = list(drain_queued_items(waiting_queue, request_queue))
+
+    assert [(item.id, item.is_canceled_request) for item in drained] == [
+        (1, False),
+        (2, False),
+        (3, False),
+        (1, True),
+        (4, False),
+    ]
+    assert not waiting_queue
+    assert request_queue.get_request_queue().empty()
 
 
 def test_can_process_attention_dp_request(attention_dp_config):
@@ -2160,3 +2190,223 @@ def test_owner_prompt_delivery_matches_full_broadcast(mpi_pool_executor) -> None
     for rank in full:
         for request_id, tokens, prompt_len in rank:
             assert tokens == prompts[request_id] and prompt_len == len(tokens)
+
+
+@pytest.mark.parametrize("beam_width", [1, 2])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_prepared_response_keeps_outputs_and_metadata_stable(
+    beam_width: int, overlap: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(beam_width=beam_width),
+        is_streaming=True,
+        return_log_probs=True,
+        return_generation_logits=True,
+        return_context_logits=True,
+        return_logits_device_memory=False,
+        exclude_last_generation_logits=overlap,
+        additional_outputs=["hidden"],
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_decoding_iter = 1
+    request.py_draft_tokens = [7, 8]
+    request.py_per_pos_drafted[0] = 2
+    request.py_per_pos_accepted[0] = 1
+    request.py_total_draft_tokens = 2
+    request.py_total_accepted_draft_tokens = 1
+    request.py_disaggregated_params = SimpleNamespace(ctx_usage={"prompt_tokens": 3})
+    request.py_ctx_computed_tokens = 3
+    request.py_ctx_first_begin = 0
+    request.py_ctx_num_chunks = 2
+    request.add_new_tokens([4] * beam_width)
+    first_probs = [[{4: Logprob(-0.5)}] for _ in range(beam_width)]
+    request.py_result.set_log_probs(first_probs, [-0.5] * beam_width)
+    first_logits = torch.arange(beam_width * 4, dtype=torch.float32).reshape(1, beam_width, 4)
+    request.py_result.append_generation_logits(first_logits)
+    request.py_result.append_context_logits(torch.ones(3, 1, 4))
+    first_prompt_rows = torch.arange(6, dtype=torch.float64).reshape(2, 3)
+    request.py_result.append_prompt_logprobs(first_prompt_rows)
+    request.py_result.append_additional_context_outputs("hidden", torch.ones(3, 2))
+    request.py_result.append_additional_generation_outputs("hidden", torch.ones(1, 2))
+    response = prepare_response(request, publish_metadata=True, include_latest_logits=overlap)
+    assert response is not None
+    assert request.decoding_iter == 1
+    assert request.draft_tokens == [7, 8]
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.spec_dec_totals == (1, 2)
+    assert response.result.ctx_computed_tokens == 3
+    assert response.result.ctx_first_begin == 0
+    assert response.result.ctx_num_chunks == 2
+
+    second_probs = [[{5: Logprob(-1.0)}] for _ in range(beam_width)]
+    request.py_result.append_log_probs(second_probs)
+    expected_history = (
+        [first + second for first, second in zip(first_probs, second_probs)]
+        if beam_width > 1
+        else second_probs
+    )
+    assert request.py_result.log_probs == expected_history
+    assert request.py_result.cum_log_probs == [-1.5] * beam_width
+    request.py_result.append_generation_logits(first_logits + 10)
+    request.py_result.append_prompt_logprobs(torch.ones(1, 3, dtype=torch.float64))
+    request.py_result.append_additional_context_outputs("hidden", torch.zeros(1, 2))
+    request.py_result.append_additional_generation_outputs("hidden", torch.zeros(1, 2))
+    request.py_per_pos_drafted[0] = 9
+    request.py_per_pos_accepted[0] = 7
+    request.py_total_draft_tokens = 9
+    request.py_disaggregated_params.ctx_usage["prompt_tokens"] = 99
+    request.py_result.set_exclude_last_generation_logits(False)
+
+    assert response.result.log_probs == first_probs
+    assert response.result.cum_log_probs == [-0.5] * beam_width
+    assert len(request.py_result.context_prompt_logprob_rows) == 2
+    assert len(response.result.context_prompt_logprob_rows) == 1
+    assert response.result.context_prompt_logprob_rows[0] is first_prompt_rows
+    torch.testing.assert_close(response.result.generation_logits, first_logits.transpose(0, 1))
+    torch.testing.assert_close(response.result.context_logits, torch.ones(3, 4))
+    torch.testing.assert_close(
+        response.result.additional_context_outputs["hidden"], torch.ones(3, 2)
+    )
+    torch.testing.assert_close(
+        response.result.additional_generation_outputs["hidden"], torch.ones(1, 2)
+    )
+    assert response.result.per_pos_drafted[0] == 2
+    assert response.result.per_pos_accepted[0] == 1
+    assert response.result.spec_dec_totals == (1, 2)
+    assert response.result.ctx_usage == {"prompt_tokens": 3}
+
+
+def test_prepared_response_preserves_excluded_generation_logits() -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_generation_logits=True,
+        return_logits_device_memory=False,
+        exclude_last_generation_logits=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    chunk_a = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+    chunk_b = torch.full((1, 1, 4), 10.0)
+    chunk_c = torch.full((1, 1, 4), 20.0)
+    request.py_result.append_generation_logits(chunk_a)
+    request.py_result.append_generation_logits(chunk_b)
+    response = prepare_response(request)
+    assert response is not None
+
+    request.py_result.append_generation_logits(chunk_c)
+    request.py_result.set_exclude_last_generation_logits(False)
+    torch.testing.assert_close(request.py_result.generation_logits, chunk_c.transpose(0, 1))
+    torch.testing.assert_close(response.result.generation_logits, chunk_a.transpose(0, 1))
+
+
+@pytest.mark.parametrize("output_kind", ["context", "generation"])
+@pytest.mark.parametrize("serializer", [pickle, cloudpickle])
+def test_response_bounds_additional_outputs(output_kind: str, serializer: ModuleType) -> None:
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        additional_outputs=["hidden", "single", "empty"],
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    if output_kind == "context":
+        append = request.py_result.append_additional_context_outputs
+    else:
+        append = request.py_result.append_additional_generation_outputs
+    first = torch.ones(1, 2)
+    append("hidden", first)
+    append("hidden", first * 2)
+    append("single", first)
+    response = request.create_response()
+    assert response is not None
+    snapshot = response.result._py_result
+    assert not hasattr(snapshot, "diff")
+    assert request.py_result.diff is not None
+    if output_kind == "context":
+        assert snapshot._additional_context_outputs is request.py_result._additional_context_outputs
+    else:
+        assert (
+            snapshot._additional_generation_outputs
+            is request.py_result._additional_generation_outputs
+        )
+
+    # Each name has its own boundary, including outputs first populated later.
+    append("hidden", first * 3)
+    append("single", first * 4)
+    append("empty", first * 5)
+    if output_kind == "context":
+        live_outputs = request.py_result._additional_context_outputs
+    else:
+        live_outputs = request.py_result._additional_generation_outputs
+    live_outputs.setdefault("routed_experts", [])
+    append("routed_experts", first * 6)
+    restored = serializer.loads(serializer.dumps(response))
+    assert restored.result._py_result._additional_context_output_lengths is None
+    assert restored.result._py_result._additional_generation_output_lengths is None
+    assert snapshot._additional_context_output_lengths is not None
+    assert snapshot._additional_generation_output_lengths is not None
+    diff = request.py_result.get_diff()
+    chunks = (
+        diff.additional_context_outputs_list
+        if output_kind == "context"
+        else diff.additional_generation_outputs_list
+    )
+    assert len(chunks) == 7
+    for result in (response.result, restored.result):
+        if output_kind == "context":
+            outputs = result.additional_context_outputs
+        else:
+            outputs = result.additional_generation_outputs
+        assert set(outputs) == {"hidden", "single"}
+        torch.testing.assert_close(outputs["hidden"], torch.cat([first, first * 2]))
+        torch.testing.assert_close(outputs["single"], first)
+    if output_kind == "context":
+        stored = restored.result._py_result._additional_context_outputs
+    else:
+        stored = restored.result._py_result._additional_generation_outputs
+    assert {name: len(chunks) for name, chunks in stored.items()} == {
+        "hidden": 2,
+        "single": 1,
+        "empty": 0,
+    }
+    assert not hasattr(restored.result._py_result, "diff")
+
+
+def test_suppressed_response_preserves_pending_logprobs() -> None:
+    from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
+
+    request = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=4,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_log_probs=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    first = [{4: Logprob(-0.5)}]
+    request.py_result.append_log_probs([first])
+    assert prepare_response(request) is not None
+    pending = [{5: Logprob(-0.25)}]
+    request.py_result.append_log_probs([pending])
+    assert prepare_response(request) is None
+    assert request.py_result.log_probs == [pending]
+    request.add_new_tokens([5])
+    response = prepare_response(request)
+    assert response.result.log_probs == [pending]
+    assert response.result.cum_log_probs == [-0.75]

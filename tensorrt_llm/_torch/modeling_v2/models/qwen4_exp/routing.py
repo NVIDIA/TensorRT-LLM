@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing for Qwen4ExpForConditionalGeneration.
 
-Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__default` at one
-of the layouts in `_LAYOUTS`, and Qwen3.8-Flash-Next-FP8 (FP8_BLOCK_SCALES) on
-`qwen3_8_flash_next_fp8__sm_103__unified` at one of `_FP8_LAYOUTS`, each with one-model
-MTP-Eagle (not at dep2) or no speculative decoding. The target's `check_deployment` then
-declines the checkpoints and engine choices it does not run, so `auto` falls back to the
-built-in implementation instead of failing in the build.
+On the GPUs in `archs.SERVED`, Qwen3.8-Flash-Next-NVFP4 lands on
+`qwen3_8_flash_next_nvfp4__sm_10x__default` and Qwen3.8-Flash-Next-FP8 (FP8_BLOCK_SCALES) on
+`qwen3_8_flash_next_fp8__sm_10x__default`, at one of the layouts in `_LAYOUTS` or, across nodes,
+at dep8, each with one-model MTP-Eagle or no speculative
+decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
+does not run, so `auto` falls back to the built-in implementation instead of failing in the build.
 """
 
 from __future__ import annotations
@@ -18,36 +18,34 @@ from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget, routes
+from . import archs
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.mapping import Mapping
 
-# The GPU the targets are certified on.
-_SM = (10, 3)
-
-# (world size, attention DP, MoE TP, MoE EP) -> the target's layout, each in one node. tp1 holds
-# everything on one rank; tp4 splits the routed experts by intermediate, tep4 and dep4 by
-# expert; dep2 is attention DP with two 256-expert windows. MTP runs at every layout but dep2,
-# where no draft acceptance was measured.
+# (world size, attention DP, MoE TP, MoE EP) -> the target's layout in one node. tp1 holds
+# everything on one rank; tp2 and tp4 split the routed experts by intermediate, tep2, tep4 and
+# dep4 by expert; dep2 is attention DP with two 256-expert windows.
 _LAYOUTS = {
     (1, False, 1, 1): "tp1",
+    (2, False, 2, 1): "tp2",
+    (2, False, 1, 2): "tep2",
+    (2, True, 1, 2): "dep2",
     (4, False, 4, 1): "tp4",
     (4, False, 1, 4): "tep4",
     (4, True, 1, 4): "dep4",
-    (2, True, 1, 2): "dep2",
 }
 
-# The FP8 target also runs tp2 and tep2.
-_FP8_LAYOUTS = {**_LAYOUTS, (2, False, 2, 1): "tp2", (2, False, 1, 2): "tep2"}
 
+def layout(mapping: Mapping) -> Optional[str]:
+    """The layout ``mapping`` describes, or None.
 
-def layout(mapping: Mapping, layouts: dict = _LAYOUTS) -> Optional[str]:
-    """The layout ``mapping`` describes in ``layouts``, or None.
-
-    Attention runs TP over the whole world, or DP with the LM head whole. Pipeline and context
-    parallelism, MoE clusters and a world spanning nodes are other forwards.
+    Attention runs TP over the whole world, or DP with the LM head whole. Across nodes only
+    attention DP with the routed experts split by expert over the whole world is served
+    over eight ranks (dep8), the width that was run. Pipeline and context parallelism and MoE
+    clusters are other forwards.
     """
     if mapping.enable_attention_dp:
         attention_as_built = not mapping.enable_lm_head_tp_in_adp
@@ -57,10 +55,13 @@ def layout(mapping: Mapping, layouts: dict = _LAYOUTS) -> Optional[str]:
         not attention_as_built
         or mapping.tp_size != mapping.world_size
         or (mapping.pp_size, mapping.cp_size, mapping.moe_cluster_size) != (1, 1, 1)
-        or mapping.is_multi_node()
     ):
         return None
-    return layouts.get(
+    if mapping.is_multi_node():
+        expert_split = mapping.moe_tp_size == 1 and mapping.moe_ep_size == mapping.world_size
+        dep8 = mapping.world_size == 8 and mapping.enable_attention_dp and expert_split
+        return "dep8" if dep8 else None
+    return _LAYOUTS.get(
         (mapping.world_size, mapping.enable_attention_dp, mapping.moe_tp_size, mapping.moe_ep_size)
     )
 
@@ -74,16 +75,14 @@ def route(
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits."""
     mapping, spec = model_config.mapping, model_config.spec_config
     fp8 = getattr(model_config.quant_config, "quant_algo", None) == QuantAlgo.FP8_BLOCK_SCALES
-    member = layout(mapping, _FP8_LAYOUTS if fp8 else _LAYOUTS)
-    if compute_capability != _SM or member is None:
+    member = layout(mapping)
+    if not archs.served(compute_capability) or member is None:
         raise NoTarget(
             f"compute capability {compute_capability}, world_size={mapping.world_size} "
             f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size}, "
             f"attention_dp={mapping.enable_attention_dp}, moe_tp={mapping.moe_tp_size}, "
-            f"moe_ep={mapping.moe_ep_size}); the qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 "
-            "on sm103 in one node: tp1, tp4 (experts split by intermediate), tep4, dep4 "
-            "(attention DP) or dep2 (attention DP, experts EP2); Qwen3.8-Flash-Next-FP8's also "
-            "tp2 or tep2"
+            f"moe_ep={mapping.moe_ep_size}); the qwen4_exp targets serve {archs.served_names()} "
+            f"at {', '.join(_LAYOUTS.values())} in one node, or dep8 across nodes"
         )
     if spec is not None and not (
         isinstance(spec, MTPDecodingConfig) and spec.spec_dec_mode.is_mtp_eagle_one_model()
@@ -92,21 +91,16 @@ def route(
             f"speculative decoding {spec.spec_dec_mode.name}; the target runs one-model "
             "MTP-Eagle or no speculative decoding"
         )
-    if spec is not None and member == "dep2":
-        raise NoTarget(
-            "speculative decoding with attention DP (dep2): no draft acceptance was measured at "
-            "this layout; MTP under attention DP is admitted at dep4"
-        )
     if fp8:
-        from .qwen3_8_flash_next_fp8__sm_103__unified.modeling import (
-            ModelingV2Qwen38FlashNextFp8Sm103Unified,
+        from .qwen3_8_flash_next_fp8__sm_10x__default.modeling import (
+            ModelingV2Qwen38FlashNextFp8Sm10xDefault,
         )
 
-        ModelingV2Qwen38FlashNextFp8Sm103Unified.check_deployment(model_config, llm_args, member)
-        return ModelingV2Qwen38FlashNextFp8Sm103Unified
-    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import (
-        ModelingV2Qwen38FlashNextNvfp4Sm103Default,
+        ModelingV2Qwen38FlashNextFp8Sm10xDefault.check_deployment(model_config, llm_args, member)
+        return ModelingV2Qwen38FlashNextFp8Sm10xDefault
+    from .qwen3_8_flash_next_nvfp4__sm_10x__default.modeling import (
+        ModelingV2Qwen38FlashNextNvfp4Sm10xDefault,
     )
 
-    ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
-    return ModelingV2Qwen38FlashNextNvfp4Sm103Default
+    ModelingV2Qwen38FlashNextNvfp4Sm10xDefault.check_deployment(model_config, llm_args, member)
+    return ModelingV2Qwen38FlashNextNvfp4Sm10xDefault
