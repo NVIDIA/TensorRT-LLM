@@ -3425,7 +3425,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             if kv_cache_config.host_cache_bind_to_gpu_numa_node:
                 host_tier_numa_node = _host_tier_numa_node(int(host_quota), mapping)
-            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
+            cache_tiers.append(
+                HostCacheTierConfig(
+                    quota=int(host_quota),
+                    free_reserve_fraction=kv_cache_config.host_cache_free_reserve_fraction,
+                )
+            )
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path

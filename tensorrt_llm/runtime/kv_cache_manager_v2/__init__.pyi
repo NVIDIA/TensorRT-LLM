@@ -280,6 +280,9 @@ class HostCacheTierConfig:
     max_quota: int | None = None
     # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
+    # Share of each pool group's slots, 0 to 0.25, that evictions keep free ahead of need while a tier
+    # below takes them. No effect on the last tier.
+    free_reserve_fraction: float = 0.0
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...

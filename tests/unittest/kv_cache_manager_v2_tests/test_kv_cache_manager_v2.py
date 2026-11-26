@@ -606,6 +606,8 @@ def create_config(
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
     disk_tier_options: dict | None = None,
+    manager_options: dict | None = None,
+    host_tier_options: dict | None = None,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -623,11 +625,12 @@ def create_config(
     assert gpu_quota > 0
     cache_tiers = [
         GpuCacheTierConfig(quota=gpu_quota),
-        HostCacheTierConfig(quota=host_quota),
+        HostCacheTierConfig(quota=host_quota, **(host_tier_options or {})),
         DiskCacheTierConfig(quota=disk_quota, path=disk_path, **(disk_tier_options or {})),
     ]
     cache_tiers = [t for t in cache_tiers if t.quota > 0]
     return KVCacheManagerConfig(
+        **(manager_options or {}),
         tokens_per_block=tokens_per_block,
         cache_tiers=[t for t in cache_tiers if t.quota > 0],
         layers=[
@@ -5881,6 +5884,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
     disk_tier_options: dict = {}
+    manager_options: dict = {}
+    host_tier_options: dict = {}
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -5929,6 +5934,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
             kv_buf_size,
             block_quant_buf_size,
             disk_tier_options=self.disk_tier_options,
+            manager_options=self.manager_options,
+            host_tier_options=self.host_tier_options,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -12303,6 +12310,88 @@ class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
         first, req_ids = self._push_first_request_to_disk()
         self._wait_for_flushes()
         self._restore_prefix(first, req_ids)
+        self.manager.clear_reusable_blocks()
+
+
+class TestNoBatchingDiskCopyPathOptions(TestNoBatchingDiskOptions):
+    """The disk-option tests again with host copy threads and busy-stream skipping on, plus the host free reserve.
+
+    Both are process-wide, and the first manager that sets one keeps it for the process, so setUp sets them through the
+    testing hooks as well and tearDown restores the defaults: the order of the test classes does not matter. With the
+    async I/O pool running, host <-> disk pieces stay on the pool; what the copy threads run here are the copies no
+    pool takes. Skipping hands each migration an idle stream, and the restores still pass refcheck.
+    """
+
+    manager_options = {"host_copy_threads": 16, "copy_stream_busy_skip": 4096}
+
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+        self.assertGreater(_introspection.set_host_copy_threads_for_testing(16), 1)
+        _introspection.set_copy_stream_busy_skip_for_testing(4096)
+
+    def tearDown(self) -> None:
+        _introspection.set_host_copy_threads_for_testing(1)
+        _introspection.set_copy_stream_busy_skip_for_testing(0)
+        super().tearDown()
+
+    def test_restores_skip_streams_still_busy_with_delayed_writes(self) -> None:
+        # Background writes are delayed, so the write-through copies keep their streams busy. A pooled stream goes
+        # back to the pool as soon as its copy is submitted; a later migration skips the busy ones and the prefix,
+        # restored meanwhile, still passes refcheck.
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.host_copy_threads, 16)
+        self.assertEqual(self.cfg.copy_stream_busy_skip, 4096)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        skipped = _introspection.busy_copy_streams_skipped_for_testing()
+        _introspection.delay_background_disk_writes_for_testing(2.0)
+        try:
+            for _ in range(4):
+                self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+            prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+            reuse = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32
+            )
+            self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+            self._run_and_close(reuse)
+        finally:
+            _introspection.delay_background_disk_writes_for_testing(0.0)
+        counters = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(counters["write_through_pages"], 0)
+        # Not an exact count: whether a stream is still busy when it comes up again depends on timing.
+        self.assertGreaterEqual(_introspection.busy_copy_streams_skipped_for_testing(), skipped)
+        self.manager.clear_reusable_blocks()
+
+    def test_host_free_reserve_evicts_ahead_of_need(self) -> None:
+        # With a reserve, every pass that pages fall into the host tier through evicts until a quarter of each host
+        # pool group is free again, so the next pages falling to host take slots whose disk write has finished.
+        # Restores through the tiers still pass refcheck.
+        self.host_tier_options = {"free_reserve_fraction": 0.25}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.cache_tiers[1].free_reserve_fraction, 0.25)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        for stats in self.manager.get_storage_statistics(CacheLevel(1)):
+            self.assertGreaterEqual(stats.free, int(stats.total * 0.25), stats)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
         self.manager.clear_reusable_blocks()
 
 

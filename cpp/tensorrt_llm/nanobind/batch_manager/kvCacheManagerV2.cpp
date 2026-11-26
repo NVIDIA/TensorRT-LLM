@@ -1772,11 +1772,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
-            nb::arg("allow_remote_numa_fallback") = true)
+        .def(nb::init<size_t, std::optional<size_t>, bool, float>(), nb::arg("quota"),
+            nb::arg("max_quota") = nb::none(), nb::arg("allow_remote_numa_fallback") = true,
+            nb::arg("free_reserve_fraction") = 0.0F)
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
         .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
         .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
+        .def_rw("free_reserve_fraction", &kv::HostCacheTierConfig::freeReserveFraction,
+            "Share of each pool group's slots, 0 to 0.25, that evictions keep free ahead of need while a tier below "
+            "takes them (0: evict only what is needed). No effect on the last tier.")
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 

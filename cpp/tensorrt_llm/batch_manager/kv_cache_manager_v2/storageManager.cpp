@@ -695,8 +695,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
     mProtectedCopyFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 1.0F);
     mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mFreeReserveFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 0.0F);
     for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
+        if (auto const* host = std::get_if<HostCacheTierConfig>(&config.cacheTiers[level]))
+        {
+            mFreeReserveFractionAt[level] = host->freeReserveFraction;
+        }
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
             mKeepCopyAfterRestoreAt[level] = disk->keepCopyAfterRestore;
@@ -2307,7 +2312,18 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         SlotCount const oldFree = isFailed ? 0 : freeSlots(pgIdx);
         SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx, domainFilter);
         SlotCount const required = goal + fallen;
-        SlotCount const shortage = required > oldFree ? required - oldFree : 0;
+        SlotCount shortage = required > oldFree ? required - oldFree : 0;
+        if (!isLast && !isFailed && lvlId != kHotLevel && mFreeReserveFractionAt.at(lvlId) > 0.0F)
+        {
+            // Free-slot reserve of a middle tier: evict one reserve ahead of need, so incoming pages take slots whose
+            // write-out to the tier below has finished.
+            auto const reserve = static_cast<SlotCount>(
+                static_cast<double>(storage.numSlots(pgIdx)) * static_cast<double>(mFreeReserveFractionAt.at(lvlId)));
+            if (reserve > 0 && oldFree < required + reserve)
+            {
+                shortage = required + reserve - oldFree;
+            }
+        }
         numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
 
         SlotCount fallenHeld = 0;

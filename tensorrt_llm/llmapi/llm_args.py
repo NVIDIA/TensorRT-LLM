@@ -6630,6 +6630,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the GPU reports no host NUMA node or that node cannot hold the tiers of all "
         "co-located ranks. Only used by KV cache manager v2 in the PyTorch backend.",
         status="prototype")
+    host_cache_free_reserve_fraction: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.25,
+        status="prototype",
+        description=
+        "Share of the host cache tier, 0 to 0.25, that evictions to the disk cache keep free ahead of need. A host "
+        "block freed by an eviction is usable only once it has been copied to disk, so on a full host tier every "
+        "block evicted from GPU, and the restore waiting for the GPU block it frees, waits for a disk write. With a "
+        "reserve, evictions run that far ahead of need. 0 evicts only what is needed. Requires a disk cache. Only "
+        "used by KV cache manager v2.")
     host_copy_threads: PositiveInt = Field(
         default=1,
         le=64,
@@ -7271,6 +7282,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 ("disk_protected_copy_fraction",
                  self.disk_protected_copy_fraction != 1.0),
                 ("disk_write_behind_mib", self.disk_write_behind_mib > 0),
+                ("host_cache_free_reserve_fraction",
+                 self.host_cache_free_reserve_fraction > 0.0),
             ) if value
         ]
         if disk_options:

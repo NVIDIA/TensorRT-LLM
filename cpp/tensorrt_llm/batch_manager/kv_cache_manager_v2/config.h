@@ -73,6 +73,17 @@ struct HostCacheTierConfig
     //! host memory's placement strict; the tier itself does not read it.
     bool allowRemoteNumaFallback = true;
 
+    //! Upper bound of freeReserveFraction, matching KvCacheConfig.host_cache_free_reserve_fraction.
+    static constexpr float kMaxFreeReserveFraction = 0.25F;
+
+    //! Share of each pool group's slots, 0 to kMaxFreeReserveFraction, that evictions keep free ahead of need while a
+    //! tier below this one takes them. A slot freed by an eviction is usable only once its page has been copied to
+    //! the tier below, so on a full tier every incoming page (a GPU -> host eviction, and the restore waiting for the
+    //! GPU slot it frees) waits for a write-out. With a reserve, each eviction pass evicts enough to leave the
+    //! reserve free again: evictions keep their size but run one reserve ahead, and incoming pages take slots whose
+    //! write-out has finished. 0 (default): evict only what is needed. No effect on the last tier.
+    float freeReserveFraction = 0.0F;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
@@ -84,6 +95,8 @@ struct HostCacheTierConfig
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
         if (maxQuota.has_value() && *maxQuota < quota)
             throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
+        if (!(freeReserveFraction >= 0.0F && freeReserveFraction <= kMaxFreeReserveFraction)) // also rejects NaN
+            throw std::invalid_argument("HostCacheTierConfig: freeReserveFraction must be between 0 and 0.25");
     }
 };
 

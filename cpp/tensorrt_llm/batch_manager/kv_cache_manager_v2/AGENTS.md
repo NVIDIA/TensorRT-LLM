@@ -492,6 +492,11 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   `cuStreamQuery` reports busy; they go back to the pool's tail, which creates a
   stream when it runs empty. Events, not stream identity, order every copy, so
   skipping changes no dependency.
+- Host free reserve (`host_cache_free_reserve_fraction` ->
+  `HostCacheTierConfig::freeReserveFraction`, per manager): at a middle tier,
+  `_prepareFreeSlots` evicts until that share of each pool group is free again,
+  one reserve ahead of need, so pages falling into the tier take slots whose
+  write-out to the tier below has finished.
 
 ### Remote cache levels
 

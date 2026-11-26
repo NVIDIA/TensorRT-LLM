@@ -3073,6 +3073,35 @@ def test_KvCacheConfig_copy_stream_busy_skip():
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_host_cache_free_reserve(tmp_path):
+    assert KvCacheConfig().host_cache_free_reserve_fraction == 0.0
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    config = KvCacheConfig(**disk, host_cache_free_reserve_fraction=0.02)
+    assert config.host_cache_free_reserve_fraction == 0.02
+    KvCacheConfig(**disk, host_cache_free_reserve_fraction=0.25)
+    for fraction in (-0.01, 0.26):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, host_cache_free_reserve_fraction=fraction)
+    # The reserve frees host blocks by evicting them to disk, so it needs a disk cache.
+    with pytest.raises(
+            ValidationError,
+            match="host_cache_free_reserve_fraction requires disk_cache_size"):
+        KvCacheConfig(host_cache_free_reserve_fraction=0.02)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import HostCacheTierConfig
+
+    tier = HostCacheTierConfig(4 << 20)
+    assert tier.free_reserve_fraction == 0.0
+    HostCacheTierConfig(4 << 20, free_reserve_fraction=0.25).validate()
+    for fraction in (-0.5, 0.3, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="freeReserveFraction must be between 0 and 0.25"):
+            HostCacheTierConfig(4 << 20,
+                                free_reserve_fraction=fraction).validate()
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

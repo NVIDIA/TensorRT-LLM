@@ -743,6 +743,7 @@ private:
 
     TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;   // per level: keepCopyAfterRestore of that disk tier
     TypedVec<CacheLevel, float> mProtectedCopyFractionAt; // per level: protectedCopyFraction of that disk tier
+    TypedVec<CacheLevel, float> mFreeReserveFractionAt;   // per level: freeReserveFraction of that host tier
     //! Retained copies the pool group may hold ahead of pages whose only copy is at \p level.
     [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
     // Oldest first.
