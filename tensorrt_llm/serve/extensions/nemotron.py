@@ -21,7 +21,7 @@ from tensorrt_llm.serve.serving_extensions import (
 )
 
 
-@register_serving_extension(model_types=("nemotron_h", "nemotron_h_omni"))
+@register_serving_extension(model_types=("nemotron_h", "nemotron_h_omni", "nemotron4"))
 class NemotronServingExtension(ServingExtension):
     """Use mandatory tool-call grammars for native Nemotron chat requests."""
 

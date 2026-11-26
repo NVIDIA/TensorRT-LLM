@@ -37,6 +37,7 @@ pytestmark = pytest.mark.cpu_only
         ("kimi_k3", "template"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
+        ("nemotron4", "grammar"),
         ("qwen3", None),
         ("qwen3_next", None),
         ("unknown", None),
@@ -88,6 +89,7 @@ class TestRequiredToolChoiceDispatch:
 
 
 class TestStructuredOutputDispatch:
+
     def test_registered_parser_returns_bound_hook(self, scratch_extension) -> None:
         hook = structured_output_format_for(scratch_extension.parser_key)
         content = {"type": "json_schema", "json_schema": {"type": "object"}}

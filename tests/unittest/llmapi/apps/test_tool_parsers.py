@@ -4803,6 +4803,15 @@ class TestNemotron35SuperVLToolParserFactory:
 
         assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
 
+    def test_auto_detect_nemotron_shortcut(self, tmp_path):
+        """The `nemotron4` model type has its own row for the same parser."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "nemotron4"}))
+
+        assert resolve_auto_tool_parser(str(tmp_path)) == "qwen3_coder"
+
 
 # ============================================================================
 # Integration Tests

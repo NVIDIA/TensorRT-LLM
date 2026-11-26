@@ -51,6 +51,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     # the Qwen3-Coder <tool_call><function=...><parameter=...> XML shape,
     # not JSON, so it shares that parser.
     "nemotron_h_omni": "qwen3_coder",
+    # This chat template emits the same Qwen3-Coder XML shape.
+    "nemotron4": "qwen3_coder",
 }
 
 
