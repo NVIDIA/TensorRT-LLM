@@ -24,17 +24,15 @@
 <line x1="64.0" x2="876.0" y1="504.0" y2="504.0" stroke="#c3c2b7" stroke-width="1"/>
 <text x="470.0" y="546.0" font-size="13" fill="#52514e" text-anchor="middle">Interactivity: 1000 / P90 ITL (tok/s/user)</text>
 <text transform="translate(16,284.0) rotate(-90)" font-size="13" fill="#52514e" text-anchor="middle">Total throughput per GPU (tok/s/GPU)</text>
-<polyline points="75.5,292.7 177.1,333.9 193.1,335.5 281.5,399.3 293.4,401.5 349.5,430.2 418.3,445.5" fill="none" stroke="#898781" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 5"/>
-<circle cx="75.5" cy="292.7" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<text x="85.5" y="282.7" font-size="12" fill="#52514e" text-anchor="start">EP4 c32 (17, 24k)</text>
-<circle cx="177.1" cy="333.9" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="193.1" cy="335.5" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<text x="187.1" y="357.5" font-size="12" fill="#52514e" text-anchor="end">EP1 c16 (191, 19.2k)</text>
-<circle cx="281.5" cy="399.3" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="293.4" cy="401.5" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="349.5" cy="430.2" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<circle cx="418.3" cy="445.5" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<text x="428.3" y="449.5" font-size="12" fill="#52514e" text-anchor="start">EP1 c1 (524, 6.6k)</text>
+<polyline points="90.2,230.9 151.4,341.1 237.0,402.9 257.9,435.1 378.9,449.1" fill="none" stroke="#898781" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6 5"/>
+<circle cx="90.2" cy="230.9" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="100.2" y="220.9" font-size="12" fill="#52514e" text-anchor="start">EP1 c32 (39, 31k)</text>
+<circle cx="151.4" cy="341.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="143.4" y="361.1" font-size="12" fill="#52514e" text-anchor="end">EP1 c16 (129, 18.5k)</text>
+<circle cx="237.0" cy="402.9" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="257.9" cy="435.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="378.9" cy="449.1" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
+<text x="388.9" y="453.1" font-size="12" fill="#52514e" text-anchor="start">EP1 c1 (465, 6.2k)</text>
 <polyline points="132.7,103.7 423.9,317.6 433.7,320.4 521.2,366.3 657.6,418.3 791.6,437.0" fill="none" stroke="#2a78d6" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
 <circle cx="132.7" cy="103.7" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
 <text x="142.7" y="107.7" font-size="12" fill="#52514e" text-anchor="start">EP4 c32 (102, 45.5k)</text>
@@ -47,9 +45,9 @@
 <text x="791.6" y="461.0" font-size="12" fill="#52514e" text-anchor="end">EP1 c1 (1075, 7.6k)</text>
 <line x1="576.0" x2="604.0" y1="72" y2="72" stroke="#898781" stroke-width="2" stroke-linecap="round" stroke-dasharray="6 5"/>
 <circle cx="590.0" cy="72" r="5" fill="#898781" stroke="#fcfcfb" stroke-width="2"/>
-<text x="614.0" y="76" font-size="13" fill="#0b0b0b">Modeling V1: built-in implementation</text>
+<text x="614.0" y="76" font-size="13" fill="#0b0b0b">Modeling V1: before the standalone engine</text>
 <line x1="576.0" x2="604.0" y1="94" y2="94" stroke="#2a78d6" stroke-width="3" stroke-linecap="round"/>
 <circle cx="590.0" cy="94" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
 <text x="614.0" y="98" font-size="13" fill="#0b0b0b">Modeling V2: NVFP4 TP4 ModelCore</text>
-<text x="8" y="564" font-size="12" fill="#898781">Pareto frontier of EP1 and EP4 configurations (label: layout and concurrency). Same serving config and MTP acceptance length.</text>
+<text x="8" y="564" font-size="12" fill="#898781">Pareto frontier of each side's measured layouts (label: layout and concurrency). Same workload and MTP acceptance length.</text>
 </svg>
