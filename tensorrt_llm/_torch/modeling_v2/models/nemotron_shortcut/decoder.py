@@ -15,11 +15,13 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, al
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 
 from .attention_metadata import attention_step_args
 from .gdp import gdp_mixer
 from .indexer import IndexState
+from .lora import ShortcutLoraOwner
 from .moe import clamped_relu2, grouped_experts, routing_weights
 
 _CALL_CONSTANTS = dict(
@@ -235,6 +237,29 @@ class ShortcutDecoder(DecoderModel):
         w["final_norm"] = P(H)
         w["embed"] = P(cfg.vocab_size, H)
 
+        self.adapters = nn.ModuleDict()
+        if model_config.lora_config is not None:
+            for i, kind in enumerate(self.kinds):
+                if kind == _ATTN_MOE:
+                    slots = {
+                        "q": (LoraModuleType.ATTENTION_Q, self.heads_q * self.head_dim),
+                        "k": (LoraModuleType.ATTENTION_K, self.heads_kv * self.head_dim),
+                        "v": (LoraModuleType.ATTENTION_V, self.heads_kv * self.head_dim),
+                        "o": (LoraModuleType.ATTENTION_DENSE, H),
+                    }
+                elif kind == _MLP:
+                    slots = {
+                        "up": (LoraModuleType.MLP_H_TO_4H, self.inter),
+                        "down": (LoraModuleType.MLP_4H_TO_H, H),
+                    }
+                else:
+                    continue
+                group = nn.ModuleDict(
+                    {name: LoraLayer([module], [size]) for name, (module, size) in slots.items()}
+                )
+                group.layer_idx = i
+                self.adapters[str(i)] = group
+
         self.w = w
         self._layers = None
         self._kv_layer = {}
@@ -409,6 +434,13 @@ class ShortcutDecoder(DecoderModel):
             **self.allreduce_args,
         )
 
+    def _adapted_mm(self, x, weight, name, layer, lora_params):
+        if not lora_params:
+            return self.mm(x, weight)
+        return LoraLayer.forward_with_base(
+            lambda: self.mm(x, weight), (self.adapters[str(layer)][name],), x, lora_params, layer
+        )
+
     def attention(
         self,
         local_layer: int,
@@ -419,9 +451,20 @@ class ShortcutDecoder(DecoderModel):
         tp_reduce,
         plan=None,
         layer=None,
+        lora_params=None,
     ) -> torch.Tensor:
         """Store every index key and use the selected causal keys on sparse steps."""
         qkv = self.mm(x, p["qkv"])
+        if lora_params:
+            adapters = self.adapters[str(layer)]
+            start = 0
+            for name in ("q", "k", "v"):
+                adapter = adapters[name]
+                width = adapter.output_hidden_sizes[0]
+                delta = adapter(x, lora_params, layer)
+                if delta is not None:
+                    qkv[:, start : start + width].add_(delta)
+                start += width
         iq = None
         if plan is not None:
             iq, ik = self.mm(x, p["idx"]).split(self.index_dim, dim=-1)
@@ -445,11 +488,11 @@ class ShortcutDecoder(DecoderModel):
                 plan.attend(qkv, out, plan.select(layer, iq), args)
             else:
                 thop_attention(q=qkv, output=out, **args)
-        return tp_reduce(self.mm(out, p["o"]))
+        return tp_reduce(self._adapted_mm(out, p["o"], "o", layer, lora_params))
 
-    def _mlp(self, x, up, down, tp_reduce):
-        h = clamped_relu2(self.mm(x, up), self.clamp)
-        return tp_reduce(self.mm(h, down))
+    def _mlp(self, x, up, down, tp_reduce, layer=None, lora_params=None):
+        h = clamped_relu2(self._adapted_mm(x, up, "up", layer, lora_params), self.clamp)
+        return tp_reduce(self._adapted_mm(h, down, "down", layer, lora_params))
 
     def _dp_sizes(self, all_rank_num_tokens, rows: int) -> list[int] | None:
         """Per-rank token counts for the attention-DP exchange, or None when
@@ -551,7 +594,7 @@ class ShortcutDecoder(DecoderModel):
                 if kind == _GDP:
                     u = tp_reduce(self.mm(gdp_mixer(self, p, x, md, i), p["gdp_out"]))
                 else:
-                    u = self._mlp(x, p["up"], p["down"], tp_reduce)
+                    u = self._mlp(x, p["up"], p["down"], tp_reduce, i, lora_params)
                 pending = (u, p["res_write"], p["res_retain"])
             else:
                 # The router reads the block input, before the mixer writes.
@@ -563,7 +606,7 @@ class ShortcutDecoder(DecoderModel):
                 )
                 if kind == _ATTN_MOE:
                     u = self.attention(
-                        self._kv_layer[i], p, x, step, md, tp_reduce, plan, i
+                        self._kv_layer[i], p, x, step, md, tp_reduce, plan, i, lora_params
                     )
                 else:
                     u = tp_reduce(self.mm(gdp_mixer(self, p, x, md, i), p["gdp_out"]))
@@ -596,6 +639,11 @@ class ShortcutForCausalLM(DecoderModelForCausalLM):
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
+        )
+        self.lora_owner = ShortcutLoraOwner(
+            module_path="model",
+            head_size=self.model.head_dim,
+            attention_tp=self.model.tp_size,
         )
         self.draft_model = None
         self.spec_worker = None

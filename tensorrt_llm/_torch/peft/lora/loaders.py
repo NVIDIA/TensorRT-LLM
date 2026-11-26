@@ -172,6 +172,8 @@ def iterate_hf_lora(
             saved_module = re.search(r"(?:^|\.)(?:lm_head|embed_tokens)(?:\.|$)", key)
             if saved_module is not None:
                 _validate_owner_prefix(key, key[: saved_module.start()], owner, "HF", layered=False)
+                if owner.strict_hf_targets:
+                    raise ValueError(f"Only decoder LoRA projections are supported, found '{key}'")
                 continue
             _validate_unparsed_key_owner(key, owner, "HF")
             raise KeyError(f"unsupported key {key} from HF LoRA weights")
@@ -188,6 +190,11 @@ def iterate_hf_lora(
         else:
             module_name = m.group(4)
             hf_module = m.group(3) + "." + module_name
+        # A leaf like q_proj can name both the decoder attention and its indexer.
+        if owner.strict_hf_targets and hf_module not in hf_modules:
+            raise ValueError(
+                f"Unsupported decoder LoRA projection in '{key}'; expected {sorted(hf_modules)}"
+            )
         if hf_module not in hf_modules:
             hf_module = module_name
 
@@ -270,6 +277,8 @@ def get_all_hf_lora_weights(
     """
 
     def iter_fn(layer_idx, hf_module, expert_idx, inout, weights):
+        # Prepare the decoder's row layout before the PEFT cache splits adapter weights across ranks.
+        weights = owner.prepare_hf_weight(hf_module, inout, weights)
         if expert_idx is None:
             all_weights[layer_idx][hf_module][inout] = weights
         else:

@@ -41,7 +41,10 @@ def route(model_config, llm_args, compute_capability):
     if compute_capability != (10, 3):
         raise NoTarget("The text decoder requires SM103.")
     if model_config.lora_config is not None:
-        raise NoTarget("The text target requires base weights.")
+        if mapping.enable_attention_dp:
+            raise NoTarget("The decoder's LoRA projections use tensor-parallel weight shards.")
+        if model_config.lora_config.lora_ckpt_source != "hf":
+            raise NoTarget("The decoder requires Hugging Face PEFT adapters.")
     spec = model_config.spec_config
     if spec is not None:
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig

@@ -2318,7 +2318,8 @@ class ModelConfig(Generic[TConfig]):
         # For hybrid models (e.g., Nemotron-H with Mamba + Attention), LoRA can be applied
         # to non-attention layers (e.g., Mamba in_proj/out_proj). Set num_lora_layers to
         # total layers so the C++ LoRA validation accepts all layer indices.
-        if is_nemotron_hybrid(self.pretrained_config):
+        if is_nemotron_hybrid(self.pretrained_config) or is_nemotron_shortcut(
+                self.pretrained_config):
             model_config_cpp.set_num_lora_layers(num_layers)
 
         mlp_hidden_size = None

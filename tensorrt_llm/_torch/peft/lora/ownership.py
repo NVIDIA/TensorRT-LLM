@@ -15,8 +15,11 @@
 
 from dataclasses import dataclass
 from inspect import getattr_static
+from typing import ClassVar
 
-from torch import nn
+from torch import Tensor, nn
+
+from .config import LoraConfig
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,16 @@ class DecoderLoraOwner:
         "language_model.encoder.layers",
         "decoder.layers",
     )
+
+    # Some decoders have distinct projections with the same HF leaf name.
+    strict_hf_targets: ClassVar[bool] = False
+
+    def configure_hf_targets(self, config: LoraConfig) -> None:
+        """Apply decoder-specific target mappings before the PEFT cache loads adapters."""
+
+    def prepare_hf_weight(self, projection: str, direction: str, weight: Tensor) -> Tensor:
+        """Return the HF adapter weight in the layout expected by this decoder's PEFT cache."""
+        return weight
 
     def __post_init__(self) -> None:
         if not isinstance(self.module_path, str) or (
