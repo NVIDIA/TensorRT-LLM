@@ -23,6 +23,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import KVCacheManager
+from .orchestration.cancellation import ReceiveCancellation
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -37,6 +38,11 @@ _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
+
+
+def is_gen_only_no_context_benchmark() -> bool:
+    """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
+    return getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
 
 
 def is_disagg_inflight_cancel_enabled() -> bool:
@@ -310,6 +316,10 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    def has_cancelling_gen_pages(self) -> bool:
+        """Whether a receive cancellation still holds a rank-local KV allocation."""
+        return False
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
@@ -440,21 +450,55 @@ class KvCacheTransceiver(ABC):
     def cancel_gen_logically(
             self,
             req: LlmRequest,
-            ready: Optional["torch.cuda.Event"] = None) -> bool:
-        """Accept logical GEN cancellation without authorizing memory release.
+            ready: Optional["torch.cuda.Event"] = None,
+            *,
+            prior_failure: bool = False) -> ReceiveCancellation:
+        """Close GEN publication and return its logical cancellation disposition.
 
         Args:
             req: Model-idle generation request to cancel.
             ready: Unpublished destination's outstanding admission fence, if any.
+            prior_failure: An executor failure that preceded cancellation.
 
         Returns:
-            Whether cancellation was accepted under a qualified retirement policy.
-            The caller must still use cancel_request to establish safe retirement.
-            Under that policy, the transceiver retains a passed ready fence until
-            cancel_request returns True, even if an earlier failure makes this
-            method return False. Unsupported implementations return False without
-            taking ownership of ready.
+            NOT_HANDLED leaves ready with the caller. PENDING, CANCELLED and
+            FAILED retain it under the runtime's physical-retirement policy.
+            Repeated calls preserve a committed result, including prior failure.
+            The caller must use cancel_request separately for release permission.
+            The receive owner alone writes py_kv_receive_cancel_outcome, once
+            after successful owner closure, as a duplicate-call tombstone. That
+            field is not independent access-end evidence. Only the executor
+            applies this disposition to LlmRequest.state.
         """
+        return ReceiveCancellation.NOT_HANDLED
+
+    def supports_group_receive_cancellation(self) -> bool:
+        """Whether this runtime binds owned access, immutable IDs and shared progress.
+
+        This rank-uniform capability permits cancellation agreement in the
+        existing receive-progress collective. It does not qualify a new profile.
+        """
+        return False
+
+    def supports_no_context_gen_cancellation(self, req: LlmRequest) -> bool:
+        """Whether this GEN request can cancel without a receive-progress poll."""
+        return False
+
+    def take_receive_cancellation_intents(self) -> dict[int, bool]:
+        """Take peer intent observed by the existing receive-progress exchange.
+
+        Returns:
+            Immutable transfer IDs mapped to prior failure, not release evidence.
+            The coordinator must close local publication and supply a real local
+            cancellation vote, including any unpublished readiness fence it owns.
+        """
+        return {}
+
+    def wake_gen_cancellation_poll(self) -> None:
+        """Resume receive-status polling on every rank after a shared cancellation vote."""
+
+    def has_pending_gen_cancellation_vote(self) -> bool:
+        """Whether this rank must enter the shared receive poll, even without a client abort."""
         return False
 
     def supports_inflight_request_cancellation(self) -> bool:

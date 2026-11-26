@@ -17,6 +17,7 @@ from unittest.mock import Mock, call
 import pytest
 from fake_dist import FakeDistGroup, FakeDistRank
 
+from tensorrt_llm._torch.disaggregation.orchestration.cancellation import ReceiveCancellation
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
@@ -93,6 +94,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.gather_all_responses = False
     engine.enable_iter_perf_stats = False
     engine.enable_attention_dp = False
+    engine.enable_iter_perf_stats = False
     engine.kv_connector_manager = None
     engine.previous_batch = None
     engine.inflight_req_ids = set()
@@ -118,6 +120,8 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
             "request_logical_context_cancellation",
             "has_retiring_gen_receives",
             "cancel_gen_logically",
+            "supports_group_receive_cancellation",
+            "needs_post_poll_gen_cancellation",
             "defer_gen_termination",
             "request_cancellation",
             "inflight_cancel_active",
@@ -127,7 +131,9 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.disagg.supports_logical_context_cancellation.return_value = True
     engine.disagg.request_logical_context_cancellation.return_value = True
     engine.disagg.has_retiring_gen_receives = False
-    engine.disagg.cancel_gen_logically.return_value = False
+    engine.disagg.cancel_gen_logically.return_value = ReceiveCancellation.NOT_HANDLED
+    engine.disagg.supports_group_receive_cancellation = False
+    engine.disagg.needs_post_poll_gen_cancellation = False
     engine.disagg.defer_gen_termination.return_value = False
     engine.disagg.request_cancellation.return_value = False
     engine.disagg.inflight_cancel_active.return_value = False

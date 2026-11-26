@@ -36,6 +36,7 @@ pytestmark = pytest.mark.cpu_only
 
 def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
     tc = object.__new__(KvCacheTransceiverV2)
+    tc._init_receive_cancellation_state()
     tc._mapping = mapping
     tc._dist = dist
     tc._init_sync_policy()

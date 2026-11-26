@@ -1040,6 +1040,15 @@ def test_pace_idle_observes_off_list_receive_retirement(monkeypatch: pytest.Monk
     sleep.assert_called_once_with(0.001)
 
     h.coordinator._retiring_gen_receives.clear()
+    # A FAILED receive can still need a poll even on a vote-only rank.
+    failed = _Request(2, is_context_only_request=False, state=LlmRequestState.DISAGG_TRANS_ERROR)
+    h.active.append(failed)
+    h.transceiver.has_inflight_transfer = Mock(return_value=True)
+    sleep.reset_mock()
+    h.coordinator.pace_idle()
+    sleep.assert_called_once_with(0.001)
+    h.transceiver.has_inflight_transfer.assert_called_once_with(failed)
+    h.transceiver.has_inflight_transfer.return_value = False
     sleep.reset_mock()
     h.coordinator.pace_idle()
     sleep.assert_not_called()
