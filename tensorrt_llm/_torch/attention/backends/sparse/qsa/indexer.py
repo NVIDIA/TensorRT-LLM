@@ -22,6 +22,7 @@ from .constants import (
     QSA_INDEX_K_CACHE_DTYPE,
     QSA_POSITION_COORDINATE_AXES,
 )
+from .index_plane_layout import require_plain_pages
 from .params import QSASparseParams
 
 if TYPE_CHECKING:
@@ -309,6 +310,7 @@ class QSAIndexer(nn.Module):
         )
         coordinates = _position_coordinates(position_ids, num_tokens)
 
+        require_plain_pages(metadata.kv_cache_manager)
         index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
         position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
         if index_cache is None or position_cache is None:
@@ -380,6 +382,7 @@ class QSAIndexer(nn.Module):
         req_idx = metadata.qsa_req_idx_per_token[:num_tokens]
         logical = metadata.qsa_logical_positions[:num_tokens]
         pages, within = _logical_to_pages(metadata, req_idx, logical)
+        require_plain_pages(metadata.kv_cache_manager)
         index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
         position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
         if index_cache is None or position_cache is None:

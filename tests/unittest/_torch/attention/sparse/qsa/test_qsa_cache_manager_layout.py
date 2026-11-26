@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.qsa import index_plane_layout
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     QSA_INDEX_POSITION,
     QSA_SIDE_PLANES,
@@ -318,3 +319,30 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
         assert roles == {str(Role.INDEX_KEY), str(QSA_INDEX_POSITION)}
     else:
         assert roles == {str(QSA_SIDE_PLANES)}
+
+
+def test_the_compact_layout_shrinks_the_index_pages_and_refuses_plain_page_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under `TRTLLM_QSA_INDEX_PLANE_COMPACT=1` an index page holds its compressed keys and two
+    sets of raw rows (14 rows at 32 tokens and groups of 4) and the position page follows the
+    last index page unchanged. The built-in QSA path addresses an index page by
+    `pos % tokens_per_block`, so it is refused rather than written past a page; so is a pool
+    whose side planes are not packed (bf16)."""
+    monkeypatch.setenv(index_plane_layout.COMPACT_ENV, "1")
+    cm = _manager(DataType.FP8, draft=False)
+    try:
+        rows = _TPB // 4 + 2 * (4 - 1)
+        index_page = _INDEX_PAGE // _TPB * rows
+        assert cm.qsa_side_planes_size == len(_QSA_LAYERS) * index_page + _POSITION_PAGE
+        index = cm.get_index_k_buffer(_QSA_LAYERS[-1])
+        position = cm.get_qsa_position_buffer()
+        assert index.shape[1:] == (rows, 1, 128)
+        assert position.shape[1:] == (_TPB, 3)
+        assert position.data_ptr() - index.data_ptr() == index_page
+        with pytest.raises(RuntimeError, match=index_plane_layout.COMPACT_ENV):
+            index_plane_layout.require_plain_pages(cm)
+    finally:
+        cm.shutdown()
+    with pytest.raises(ValueError, match=index_plane_layout.COMPACT_ENV):
+        _manager(DataType.BF16, draft=False)
