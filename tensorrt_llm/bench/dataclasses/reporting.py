@@ -210,6 +210,10 @@ class StatsKeeper:
         global_acceptance_length = sum(
             output_tokens) / total_decoding_iterations
         queue_time_total = last_queue_time - start_time
+        # Requests issued per nanosecond: N requests issued between the first
+        # and the last start timestamp span N - 1 inter-issue intervals.
+        issue_rate_ns = ((num_requests - 1) /
+                         queue_time_total if queue_time_total > 0 else 0.0)
 
         num_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_draft_tokens) if num_draft_tokens else None
@@ -253,7 +257,7 @@ class StatsKeeper:
             generation_latency_percentiles=PercentileStats.from_iterable(
                 generation_latencies),
             token_percentiles=PercentileStats.from_iterable(output_tokens),
-            issue_rate_ns=queue_time_total / num_requests,
+            issue_rate_ns=issue_rate_ns,
             acceptance_length=global_acceptance_length,
             num_draft_tokens_percentiles=num_draft_tokens_percentiles,
             num_accepted_draft_tokens_percentiles=
@@ -689,7 +693,7 @@ class ReportUtility:
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"
             f"Scheduling Policy:      {world_info['scheduling_policy']}\n"
             f"KV Memory Percentage:   {kv_cache_percentage}\n"
-            f"Issue Rate (req/sec):   {world_info['issue_rate']:.4E}\n"
+            f"Issue Rate (req/sec):   {world_info['issue_rate']:.4f}\n"
             f"\n")
 
         req_lat_info = "\n".join(

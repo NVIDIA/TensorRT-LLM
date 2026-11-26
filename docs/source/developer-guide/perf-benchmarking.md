@@ -220,7 +220,7 @@ Max Runtime Batch Size: 2048
 Max Runtime Tokens:     4096
 Scheduling Policy:      Guaranteed No Evict
 KV Memory Percentage:   90.00%
-Issue Rate (req/sec):   7.6753E+14
+Issue Rate (req/sec):   1302.4464
 
 ===========================================================
 = PERFORMANCE OVERVIEW
@@ -407,7 +407,7 @@ Max Runtime Batch Size: 4
 Max Runtime Tokens:     12288
 Scheduling Policy:      GUARANTEED_NO_EVICT
 KV Memory Percentage:   90.00%
-Issue Rate (req/sec):   1.4117E+17
+Issue Rate (req/sec):   6.3753
 
 ===========================================================
 = PERFORMANCE OVERVIEW

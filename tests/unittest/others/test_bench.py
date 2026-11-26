@@ -412,23 +412,45 @@ def test_mismatched_weights_length_raises():
         PercentileStats.from_iterable([1.0, 2.0, 3.0], weights=[1.0, 2.0])
 
 
-def _perf_item(rid, num_out, decoding_iteration):
+def _perf_item(rid, num_out, decoding_iteration, start_ns=0):
     """Build a final PerfItemTuple for a single request.
 
     ``num_total_output_tokens`` is ``len(tokens)``, so ``tokens`` is sized to
     ``num_out``; ``decoding_iteration`` maps onto ``RequestRecord.decode_iteration``.
+    ``start_ns`` is the issue timestamp in nanoseconds.
     """
     return PerfItemTuple(
-        start_timestamp=0,
-        end_timestamp=1000,
+        start_timestamp=start_ns,
+        end_timestamp=start_ns + 1000,
         request_id=rid,
         num_input_tokens=8,
         response_is_final=True,
         error=False,
         tokens=list(range(num_out)),
         decoding_iteration=decoding_iteration,
-        time_on_first_token=100,
+        time_on_first_token=start_ns + 100,
     )
+
+
+@pytest.mark.parametrize(
+    "start_times_ns, expected_req_per_s",
+    [
+        # Three requests issued 0.5 s apart: two intervals in one second.
+        ([0, 500_000_000, 1_000_000_000], 2.0),
+        # A single request spans no interval, so no rate can be measured.
+        ([0], 0.0),
+    ],
+)
+def test_issue_rate_is_requests_per_second(start_times_ns, expected_req_per_s):
+    keeper = StatsKeeper()
+    for rid, start_ns in enumerate(start_times_ns):
+        keeper.register_request_perf_item(
+            _perf_item(rid, num_out=4, decoding_iteration=3, start_ns=start_ns)
+        )
+
+    stats = keeper.generate_statistics_summary(max_draft_tokens=0, batch_size=1)
+
+    assert ReportUtility.convert_rate_to_s(stats.issue_rate_ns) == pytest.approx(expected_req_per_s)
 
 
 def test_acceptance_length_weighted_by_iterations():
