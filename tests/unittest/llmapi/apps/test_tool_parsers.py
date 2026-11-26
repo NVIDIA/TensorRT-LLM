@@ -6319,15 +6319,23 @@ class TestForcedToolCallStreamingFinishReason:
         chunks = chat_stream_post_processor(self._rsp(' "Rome"}', "stop"), args)
         assert self._finish_reasons(chunks) == ["tool_calls"]
 
-    def test_checks_json_only_when_object_can_finish(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "before_end,closing,expected_decodes",
+        [
+            pytest.param(['  ', '{"notes":"', 'text with }', ' yet more text',
+                          '","nested":{"ok":true}'], '}', 3, id="object"),
+            pytest.param(['["a', ']b",', '2'], ']', 2, id="array"),
+            pytest.param(['"hel', 'lo'], '"', 3, id="string"),
+        ],
+    )
+    def test_streams_until_root_value_ends(self, monkeypatch, before_end,
+                                           closing, expected_decodes):
         from tensorrt_llm.serve import postprocess_handlers as handlers
 
         decode = Mock(wraps=handlers.forced_tool_arguments_end)
         monkeypatch.setattr(handlers, "forced_tool_arguments_end", decode)
         args = self._args()
-        before_end = ['  ', '{"notes":"', 'text with }', ' yet more text',
-                      '","nested":{"ok":true}']
-        chunks = before_end + ['} trailing text', 'after the call']
+        chunks = before_end + [closing + ' trailing text', 'after the call']
         output = []
         for text in chunks:
             for event in handlers.chat_stream_post_processor(
@@ -6336,8 +6344,8 @@ class TestForcedToolCallStreamingFinishReason:
                 for call in delta.get("tool_calls", []):
                     output.append(call["function"]["arguments"])
 
-        assert output == before_end + ["}"]
-        assert decode.call_count == 3
+        assert output == before_end + [closing]
+        assert decode.call_count == expected_decodes
 
 
 if __name__ == "__main__":
