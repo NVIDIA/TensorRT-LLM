@@ -225,8 +225,8 @@ def globalVars = [
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
 BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "96Gi"
+BUILD_MEMORY_REQUEST = "24Gi"
+BUILD_MEMORY_LIMIT = "64Gi"
 BUILD_JOBS = "8"
 
 // FailureClassifier catalog ids that make a failed wheel build worth retrying.
@@ -258,6 +258,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
     switch(type)
     {
     case "build":
+        // The Debug build uses more memory than the other wheel builds.
+        def buildMemoryRequest = stageName == "Build With Build Type Debug" ? "48Gi" : BUILD_MEMORY_REQUEST
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
@@ -270,7 +272,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
                     resources:
                       requests:
                         cpu: ${BUILD_CORES_REQUEST}
-                        memory: ${BUILD_MEMORY_REQUEST}
+                        memory: ${buildMemoryRequest}
                         ephemeral-storage: 200Gi
                       limits:
                         cpu: ${BUILD_CORES_LIMIT}
@@ -349,12 +351,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:

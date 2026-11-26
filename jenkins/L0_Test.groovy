@@ -231,22 +231,29 @@ def BUILD_CONFIGS = [
 ]
 
 // TODO: Move common variables to an unified location
-BUILD_CORES_REQUEST = "8"
-BUILD_CORES_LIMIT = "8"
-BUILD_MEMORY_REQUEST = "48Gi"
-BUILD_MEMORY_LIMIT = "96Gi"
+BUILD_CORES_REQUEST = "6"
+BUILD_CORES_LIMIT = "6"
+BUILD_MEMORY_REQUEST = "16Gi"
+BUILD_MEMORY_LIMIT = "32Gi"
 BUILD_JOBS = "4"
 
-SLURM_CORES_REQUEST = "1"
-SLURM_CORES_LIMIT = "1"
-SLURM_MEMORY_REQUEST = "8Gi"
-SLURM_MEMORY_LIMIT = "12Gi"
+SLURM_CORES_REQUEST = "500m"
+SLURM_CORES_LIMIT = "500m"
+SLURM_MEMORY_REQUEST = "4Gi"
+SLURM_MEMORY_LIMIT = "4Gi"
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
+// Single-GPU test pods of these GPU types use the values below instead of
+// TESTER_CORES / TESTER_MEMORY, so that the pod fits on the smallest nodes of the type.
+TESTER_RESOURCE_OVERRIDES = [
+    "a10": [memory: "56Gi"],
+    "a30": [memory: "56Gi"],
+    "b100-ts2": [cpu: "6"],
+]
 
 // Whole-core budget shared by pod CPU limits and CPU-only pytest thread limits.
-TESTER_CPU_ONLY_CORES = "2"
+TESTER_CPU_ONLY_CORES = "4"
 TESTER_CPU_ONLY_MEMORY = "12Gi"
 
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
@@ -4900,11 +4907,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                       requests:
                         cpu: ${TESTER_CPU_ONLY_CORES}
                         memory: ${TESTER_CPU_ONLY_MEMORY}
-                        ephemeral-storage: 300Gi
+                        ephemeral-storage: 150Gi
                       limits:
                         cpu: ${TESTER_CPU_ONLY_CORES}
                         memory: ${TESTER_CPU_ONLY_MEMORY}
-                        ephemeral-storage: 300Gi
+                        ephemeral-storage: 150Gi
                     imagePullPolicy: Always
                     volumeMounts:
                     - name: dshm
@@ -4923,10 +4930,11 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
         break
     default:
         def hasMultipleGPUs = (gpuCount > 1)
-        def memorySize = "${TESTER_MEMORY}"
+        def overrides = TESTER_RESOURCE_OVERRIDES[type] ?: [:]
+        def memorySize = overrides.memory ?: "${TESTER_MEMORY}"
         def storageSize = "300Gi"
         def driverVersion = REQUIRED_OPEN_DRIVER_TYPES.any { type.contains(it) } ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
-        def cpuCount = "${TESTER_CORES}"
+        def cpuCount = overrides.cpu ?: "${TESTER_CORES}"
 
         if (hasMultipleGPUs)
         {
@@ -5152,12 +5160,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelEx
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 10Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:

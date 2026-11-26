@@ -241,12 +241,12 @@ def createKubernetesPodConfig(image, arch = "amd64")
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                       limits:
-                        cpu: '2'
-                        memory: 5Gi
+                        cpu: '1'
+                        memory: 4Gi
                         ephemeral-storage: 25Gi
                 volumes:
                 - name: sw-tensorrt-pvc
