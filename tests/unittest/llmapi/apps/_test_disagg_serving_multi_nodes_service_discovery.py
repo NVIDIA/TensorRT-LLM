@@ -11,16 +11,13 @@ Rank zero owns the router and etcd; each task owns its node's worker.
 
 import os
 import platform
-import shutil
 import socket
-import subprocess
-import tempfile
 import time
-import uuid
 
 import openai
 import pytest
 from test_common import cluster_env
+from test_common.etcd_utils import running_etcd
 from test_common.http_utils import wait_for_endpoint_down, wait_for_endpoint_ready
 from test_common.socket_utils import recv_exact
 
@@ -245,26 +242,12 @@ def service_discovery(request, disagg_host: str):
     elif not is_rank_zero():
         yield None, etcd_uri
     else:
-        work_dir = tempfile.mkdtemp()
-        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(
-            [
-                "etcd",
-                "--data-dir",
-                data_dir,
-                "--listen-client-urls",
-                f"http://0.0.0.0:{ETCD_CLIENT_PORT}",
-                "--advertise-client-urls",
-                f"http://{disagg_host}:{ETCD_CLIENT_PORT}",
-            ]
-        )
-        yield etcd, etcd_uri
-        try:
-            etcd.kill()
-            etcd.wait(timeout=10)
-            shutil.rmtree(data_dir)
-        except Exception:
-            pass
+        with running_etcd(
+            client_port=ETCD_CLIENT_PORT,
+            listen_client_host="0.0.0.0",
+            advertise_client_host=disagg_host,
+        ) as etcd:
+            yield etcd.process, etcd.uri
 
 
 @pytest.fixture
