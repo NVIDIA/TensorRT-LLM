@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
+                                       is_nemotron_shortcut,
                                        match_nemotron_h_layer_types)
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
@@ -958,6 +959,10 @@ def update_spec_config_from_model_config(spec_config,
             num_nextn_predict_layers = getattr(model_config,
                                                "mtp_num_hidden_layers", None)
         if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = 1
+        if (num_nextn_predict_layers > 0 and is_nemotron_shortcut(model_config)
+                and getattr(model_config, "mtp_use_repeated_layer", False)):
+            # Each prediction depth reuses the same physical checkpoint layer.
             num_nextn_predict_layers = 1
     if (draft_nextn is None and num_nextn_predict_layers == 0
             and spec_config.uses_replacement_heads):

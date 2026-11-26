@@ -41,8 +41,27 @@ def route(model_config, llm_args, compute_capability):
         raise NoTarget("The text decoder requires SM103.")
     if model_config.lora_config is not None:
         raise NoTarget("The text target requires base weights.")
-    if model_config.spec_config is not None:
-        raise NoTarget("The text target requires ordinary decoding.")
+    spec = model_config.spec_config
+    if spec is not None:
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
+        if (
+            not isinstance(spec, MTPDecodingConfig)
+            or not spec.spec_dec_mode.is_mtp_eagle_one_model()
+            or spec.use_dynamic_tree
+            or spec.speculative_model is not None
+            or not getattr(cfg, "mtp_use_repeated_layer", False)
+            or not getattr(cfg, "moe_shortcut_disable_mtp", False)
+            or not getattr(cfg, "num_nextn_predict_layers", 0)
+        ):
+            raise NoTarget("The checkpoint requires linear MTP with a shared prediction layer.")
+        if spec.draft_lm_head_dtype != "auto" or spec.draft_moe_dtype != "auto":
+            raise NoTarget("MTP uses the checkpoint dtypes for the shared head and draft experts.")
+        if spec.moe_backend not in (None, "AUTO"):
+            raise NoTarget("MTP uses the decoder's expert backend.")
+        if spec.use_rejection_sampling:
+            # The sampler pads the rejected suffix with -1; the draft embeds every input row.
+            raise NoTarget("The repeated prediction layer requires token IDs in every draft row.")
     if model_config.torch_dtype != torch.bfloat16:
         raise NoTarget("The text decoder requires BF16 activations.")
     quant = model_config.quant_config.quant_algo

@@ -215,7 +215,7 @@ def _check_keys(core, weights):
             for expert in experts:
                 module = part.module(expert)
                 keys.update(module + "." + suffix for suffix in part.suffixes)
-    check_checkpoint_keys(weights, keys)
+    check_checkpoint_keys(weights, keys, mtp_enabled=core.mtp_enabled)
     return kv_scale_keys
 
 

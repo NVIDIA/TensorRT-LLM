@@ -24,7 +24,7 @@ class Nvfp4Decoder(ShortcutDecoder):
         used = {"lm_head"}
         for parts in self.projections.values():
             used.update(part.source.rsplit(".", 1)[0] for part in parts)
-        ignored = excluded_prefixes()
+        ignored = excluded_prefixes(self.mtp_enabled)
         extra = {key for key in self.recipe if not key.startswith(ignored)} - used
         if extra:
             raise ValueError(f"Unexpected ModelOpt text projection rules: {sorted(extra)[:8]}")

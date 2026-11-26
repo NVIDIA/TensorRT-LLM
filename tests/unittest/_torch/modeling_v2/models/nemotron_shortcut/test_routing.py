@@ -9,7 +9,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.routing import route
 from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -97,6 +97,12 @@ def test_rejects_unsupported_attention_head_size():
 def test_rejects_explicit_incompatible_mxfp8_scale_block():
     with pytest.raises(NoTarget, match="32-element scale blocks"):
         _route(QuantAlgo.MXFP8, 4, 2, group_size=64)
+
+
+def test_rejects_mtp_sampler_with_negative_padding_ids():
+    spec = MTPDecodingConfig(max_draft_len=2, use_rejection_sampling=True)
+    with pytest.raises(NoTarget, match="token IDs in every draft row"):
+        _route(None, 4, 2, spec=spec)
 
 
 @pytest.mark.parametrize("state,stochastic", [("bfloat16", False), ("float32", True)])

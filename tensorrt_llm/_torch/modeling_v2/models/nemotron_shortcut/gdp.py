@@ -9,6 +9,8 @@ from torch.nn import functional as F
 
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
+from .attention_metadata import generation_width
+
 
 @triton.jit
 def _decode_update(
@@ -20,8 +22,13 @@ def _decode_update(
     POOL,
     SLOTS,
     OUT,
+    INTERMEDIATE,
+    ROWS,
     SLOT_STRIDE: tl.constexpr,
     HEAD_STRIDE: tl.constexpr,
+    INTER_ROW_STRIDE: tl.constexpr,
+    INTER_TOKEN_STRIDE: tl.constexpr,
+    TOKENS: tl.constexpr,
     M: tl.constexpr,
     H: tl.constexpr,
     DK: tl.constexpr,
@@ -36,20 +43,49 @@ def _decode_update(
     address = POOL + slot * SLOT_STRIDE + head * HEAD_STRIDE + v_row[:, None] * DK + k_col[None, :]
     live = (slot >= 0) & (v_row < DV)
     state = tl.load(address, mask=live[:, None], other=0.0).to(tl.float32)
-    state *= tl.load(DECAY + seq * H + head)
-    for j in tl.static_range(M):
-        offset = (seq * M + j) * H + head
-        key = tl.load(K + offset * DK + k_col).to(tl.float32)
-        key *= tl.rsqrt(tl.sum(key * key, axis=0) + 1e-6)
-        value = tl.load(V + offset * DV + v_row, v_row < DV, 0.0).to(tl.float32)
-        beta = tl.load(BETA + offset).to(tl.float32)
-        delta = (value - tl.sum(state * key[None, :], axis=1)) * beta
-        state += delta[:, None] * key[None, :]
-    tl.store(address, state, mask=live[:, None])
-    query = tl.load(Q + (seq * H + head) * DK + k_col).to(tl.float32)
-    query *= tl.rsqrt(tl.sum(query * query, axis=0) + 1e-6) * (DK**-0.5)
-    value = tl.sum(state * query[None, :], axis=1)
-    tl.store(OUT + (seq * H + head) * DV + v_row, value, mask=v_row < DV)
+    if TOKENS > 1:
+        row = tl.load(ROWS + seq).to(tl.int64)
+        scratch = INTERMEDIATE + row * INTER_ROW_STRIDE + head * DV * DK
+        scratch += v_row[:, None] * DK + k_col[None, :]
+    for t in tl.static_range(TOKENS):
+        token_head = (seq * TOKENS + t) * H + head
+        state *= tl.load(DECAY + token_head)
+        for j in tl.static_range(M):
+            offset = ((seq * TOKENS + t) * M + j) * H + head
+            key = tl.load(K + offset * DK + k_col).to(tl.float32)
+            key *= tl.rsqrt(tl.sum(key * key, axis=0) + 1e-6)
+            value = tl.load(V + offset * DV + v_row, v_row < DV, 0.0).to(tl.float32)
+            beta = tl.load(BETA + offset).to(tl.float32)
+            delta = (value - tl.sum(state * key[None, :], axis=1)) * beta
+            state += delta[:, None] * key[None, :]
+        if TOKENS > 1:
+            tl.store(scratch + t * INTER_TOKEN_STRIDE, state, mask=live[:, None])
+        else:
+            tl.store(address, state, mask=live[:, None])
+        query = tl.load(Q + token_head * DK + k_col).to(tl.float32)
+        query *= tl.rsqrt(tl.sum(query * query, axis=0) + 1e-6) * (DK**-0.5)
+        value = tl.sum(state * query[None, :], axis=1)
+        tl.store(OUT + token_head * DV + v_row, value, mask=v_row < DV)
+
+
+def _verify_conv(raw, weight, cache, slots, intermediate_rows, width):
+    """Keep the committed window intact until the executor selects an accepted candidate."""
+    batch, channels = slots.numel(), raw.shape[-1]
+    windows = cache.conv.index_select(0, slots.clamp_min(0).long())
+    local = torch.arange(batch, device=slots.device, dtype=slots.dtype)
+    local = torch.where(slots >= 0, local, -1)
+    rows = intermediate_rows.long()
+    candidates = raw.reshape(batch, width, channels)
+    outputs = []
+    for step in range(width):
+        # causal_conv1d_update overwrites its input with the convolved result.
+        token = candidates[:, step].clone(memory_format=torch.contiguous_format)
+        torch.ops.trtllm.causal_conv1d_update(
+            token.unsqueeze(-1), windows, weight, None, True, None, local, -1
+        )
+        cache.intermediate_conv_window[:, step].index_copy_(0, rows, windows)
+        outputs.append(token)
+    return torch.stack(outputs, dim=1).flatten(0, 1)
 
 
 def _prefill(q, k, v, log_decay, beta, pool, slots, resumed, bounds):
@@ -95,8 +131,7 @@ def gdp_mixer(core, layer, x, md, layer_idx):
     meta = md.mamba_metadata
     slots = meta.state_indices[: md.seq_lens.shape[0]]
     decodes = slots.shape[0] - contexts
-    if ctx_tokens + decodes != x.shape[0]:
-        raise ValueError("GDP expects exactly one token per decode request.")
+    tokens_per_decode = generation_width(x.shape[0] - ctx_tokens, decodes)
     rows = raw
     if contexts:
         offsets = meta.query_start_loc[: contexts + 1]
@@ -117,18 +152,28 @@ def gdp_mixer(core, layer, x, md, layer_idx):
         rows = convolved
     if decodes:
         tail = raw[ctx_tokens:]
-        torch.ops.trtllm.causal_conv1d_update(
-            tail.unsqueeze(-1),
-            cache.conv,
-            layer["gdp_conv"],
-            None,
-            True,
-            None,
-            slots[contexts:],
-            -1,
-        )
-        if contexts:
-            rows = torch.cat((convolved, tail))
+        if tokens_per_decode > 1:
+            intermediate_rows = md.kv_cache_manager.intermediate_state_indices[:decodes]
+            tail = _verify_conv(
+                tail,
+                layer["gdp_conv"],
+                cache,
+                slots[contexts:],
+                intermediate_rows,
+                tokens_per_decode,
+            )
+        else:
+            torch.ops.trtllm.causal_conv1d_update(
+                tail.unsqueeze(-1),
+                cache.conv,
+                layer["gdp_conv"],
+                None,
+                True,
+                None,
+                slots[contexts:],
+                -1,
+            )
+        rows = torch.cat((convolved, tail)) if contexts else tail
     h, m, dv, dk = core.gdp_heads, core.m, core.gdp_dv, core.gdp_dk
     # The family runs one key group per value head.
     v, k, q = rows.split((m * h * dv, m * h * dk, h * dk), dim=-1)
@@ -153,6 +198,7 @@ def gdp_mixer(core, layer, x, md, layer_idx):
         )
     if decodes:
         state = cache.temporal
+        intermediate = cache.intermediate_ssm if tokens_per_decode > 1 else None
         _decode_update[(decodes, h, triton.cdiv(dv, 8))](
             q[ctx_tokens:].contiguous(),
             k[ctx_tokens:].contiguous(),
@@ -162,8 +208,13 @@ def gdp_mixer(core, layer, x, md, layer_idx):
             state,
             slots[contexts:],
             out[ctx_tokens:],
+            intermediate,
+            intermediate_rows if tokens_per_decode > 1 else None,
             state.stride(0),
             state.stride(1),
+            intermediate.stride(0) if intermediate is not None else 0,
+            intermediate.stride(1) if intermediate is not None else 0,
+            tokens_per_decode,
             m,
             h,
             dk,

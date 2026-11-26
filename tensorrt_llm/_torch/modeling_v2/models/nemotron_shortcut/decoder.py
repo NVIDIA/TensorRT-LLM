@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed text decoder with wide residual connections, GDP and shortcut MoE."""
 
+from functools import partial
 
 import torch
 from torch import nn
@@ -94,6 +95,13 @@ def rms_norm(x, weight, eps):
     return normalized.to(x.dtype) * weight
 
 
+def _apply_candidate_rows(num_ctx, width, op, x, *args):
+    """Run a row-local operation at ordinary decode batch size for each MTP position."""
+    candidates = x[num_ctx:].unflatten(0, (-1, width)).unbind(1)
+    rows = torch.stack([op(group, *args) for group in candidates], dim=1).flatten(0, 1)
+    return torch.cat((op(x[:num_ctx], *args), rows)) if num_ctx else rows
+
+
 class ShortcutDecoder(DecoderModel):
     # Sparse prefill constructs per-request plans from host context lengths.
     supports_prefill_cuda_graph = False
@@ -119,6 +127,8 @@ class ShortcutDecoder(DecoderModel):
         self.dp_rank = mapping.tp_rank
         self.kinds = list(cfg.block_types)
         self.num_layers = len(self.kinds)
+        spec = getattr(model_config, "spec_config", None)
+        self.mtp_enabled = spec is not None and spec.spec_dec_mode.is_mtp_eagle_one_model()
         self.hidden = cfg.hidden_size
         self.eps = cfg.rms_norm_eps
         self.streams = cfg.wide_residual_num_streams
@@ -164,6 +174,8 @@ class ShortcutDecoder(DecoderModel):
         self.moe_ep_rank = mapping.moe_ep_rank
 
         attention_layers = [i for i, kind in enumerate(self.kinds) if kind == _ATTN_MOE]
+        if self.mtp_enabled:
+            attention_layers.append(self.num_layers)
         self.index = (
             IndexState(
                 self.index_topk,
@@ -206,6 +218,12 @@ class ShortcutDecoder(DecoderModel):
                 w[f"l{i}_shortcut_read"] = P(self.streams, dtype=f32)
                 w[f"l{i}_shortcut_norm"] = P(H)
                 self._declare_moe(w, f"l{i}_", P)
+        if self.mtp_enabled:
+            for name in ("enorm", "hnorm", "norm_in", "final_norm"):
+                w["mtp_" + name] = P(H)
+            self._declare_matrix(w, "mtp_eh", (H, 2 * H), P)
+            self._declare_attention(w, "mtp_", P)
+            self._declare_moe(w, "mtp_", P)
         w["readout"] = P(self.streams, dtype=f32)
         w["final_norm"] = P(H)
         w["embed"] = P(cfg.vocab_size, H)
@@ -274,6 +292,13 @@ class ShortcutDecoder(DecoderModel):
             layers.append(p)
         self._layers = layers
         self._readout = torch.sigmoid(w["readout"])
+        if self.mtp_enabled:
+            self.mtp = {
+                name: w["mtp_" + name] for name in ("enorm", "hnorm", "norm_in", "final_norm")
+            }
+            self.mtp["eh"] = self._matrix_view("mtp_eh")
+            self.mtp.update(self._attention_views("mtp_"))
+            self.mtp.update(self._moe_views("mtp_"))
 
     def _attention_views(self, prefix: str) -> dict:
         views = {"qkv": self._matrix_view(f"{prefix}qkv"), "o": self._matrix_view(f"{prefix}o")}
@@ -473,6 +498,14 @@ class ShortcutDecoder(DecoderModel):
         decode = md.num_contexts == 0
         step = attention_step_args(md, n_rows=embedding.shape[0], decode=decode)
         read_streams, tp_reduce = self._read_streams, self.tp_reduce
+        width = step["predicted_tokens_per_seq"]
+        if self.nvfp4_kv and width > 1:
+            # Both the FP32 stream contraction and the NCCL sum can change their
+            # reduction order with row count. Match ordinary decode before KV quantization.
+            per_candidate = partial(_apply_candidate_rows, step["num_ctx_tokens"], width)
+            read_streams = partial(per_candidate, read_streams)
+            if self.tp_size > 1:
+                tp_reduce = partial(per_candidate, tp_reduce)
         streams = embedding.float()[:, None, :].expand(-1, self.streams, -1)
         plan = None
         if self.index is not None:
@@ -533,6 +566,69 @@ class ShortcutForCausalLM(DecoderModelForCausalLM):
             config=model_config,
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
+        )
+        self.draft_model = None
+        self.spec_worker = None
+        if self.model.mtp_enabled:
+            from tensorrt_llm._torch.speculative import (
+                get_spec_worker,
+                should_use_separate_draft_kv_cache,
+            )
+
+            from .mtp import DraftModel
+
+            spec = model_config.spec_config
+            self.draft_model = DraftModel(self.model, self.lm_head, self.logits_processor)
+            self.spec_worker = get_spec_worker(
+                spec,
+                model_config,
+                model_config.mapping,
+                use_separate_draft_kv_cache=should_use_separate_draft_kv_cache(spec),
+            )
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids=None,
+        position_ids=None,
+        inputs_embeds=None,
+        return_context_logits=False,
+        spec_metadata=None,
+        lora_params=None,
+        **kwargs,
+    ):
+        if self.spec_worker is None:
+            return super().forward(
+                attn_metadata,
+                input_ids,
+                position_ids,
+                inputs_embeds,
+                return_context_logits,
+                spec_metadata,
+                lora_params,
+                **kwargs,
+            )
+        if spec_metadata is None:
+            raise ValueError("MTP requires speculative decoding metadata.")
+        hidden = self.model(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            lora_params=lora_params,
+        )
+        logits = self.logits_processor(
+            hidden[spec_metadata.gather_ids], self.lm_head, attn_metadata, True
+        )
+        return self.spec_worker(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=kwargs.get("resource_manager"),
         )
 
     def load_weights(self, weights, *args, **kwargs):

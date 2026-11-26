@@ -4,6 +4,7 @@
 
 import torch
 
+from tensorrt_llm._torch.modules.mamba.cache_manager import Mamba2State
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     build_mamba_kv_cache_params,
     get_nemotron_shortcut_layer_masks,
@@ -60,6 +61,10 @@ class NemotronShortcutCacheManager(MambaHybridCacheManagerV2):
             **kwargs,
         )
 
+    def _initialize_spec_state(self):
+        # GDP records a complete convolution window and recurrent state per
+        # candidate. The executor promotes the accepted pair for each request.
+        return Mamba2State() if self.spec_config is not None else None
 
     @classmethod
     def _estimate_attention_cache_cost(cls, model_config, mapping, **kwargs):

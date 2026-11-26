@@ -11,6 +11,7 @@ from safetensors.torch import save_file
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.configs.nemotron_shortcut import NemotronShortcutTextConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.checkpoints.hf.nemotron_h_weight_mapper import (
@@ -417,6 +418,17 @@ def test_nemotron_embedded_multimodal_mtp_uses_language_config() -> None:
     assert spec_config.spec_dec_mode.is_mtp_vanilla()
     assert spec_config.max_draft_len == 2
     assert not spec_config.uses_replacement_heads
+
+
+@pytest.mark.cpu_only
+def test_mtp_two_draft_tokens_share_one_checkpoint_layer() -> None:
+    # This checkpoint records draft depth even though it stores a single set of weights.
+    text = NemotronShortcutTextConfig(num_nextn_predict_layers=2, mtp_use_repeated_layer=True)
+    spec = MTPDecodingConfig(max_draft_len=2)
+    update_spec_config_from_model_config(spec, text)
+    assert spec.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec.num_nextn_predict_layers == 1
+    assert spec.max_draft_len == spec.max_total_draft_tokens == text.num_nextn_predict_layers == 2
 
 
 @pytest.mark.cpu_only

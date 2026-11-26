@@ -12,9 +12,55 @@ from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__def
 )
 from tensorrt_llm._torch.modeling_v2.models.nemotron_shortcut.nvfp4__sm_103__default.weights import (
     Projection,
+    _kv_scale_keys,
+    _load_kv_scales,
     _load_projection,
     projection_parts,
 )
+
+
+@pytest.mark.cpu_only
+def test_mtp_kv_calibration_on_excluded_projections():
+    prefix = "model.language_model.mtp.layers.0.block.self_attn."
+    entries = [(prefix + f"{axis}_proj.weight", None, None, None) for axis in "qkv"]
+    k, v = prefix + "k_proj.k_scale", prefix + "v_proj.v_scale"
+    weights = {k: torch.tensor([0.25]), v: torch.tensor(0.5)}
+    scales, inverse = torch.empty(3), torch.empty(3)
+
+    def refit():
+        keys = _kv_scale_keys(entries, weights, required=False)
+        _load_kv_scales(scales, inverse, keys, weights)
+
+    refit()
+    torch.testing.assert_close(scales, torch.tensor([1.0, 0.25, 0.5]), rtol=0, atol=0)
+    torch.testing.assert_close(inverse, torch.tensor([1.0, 4.0, 2.0]), rtol=0, atol=0)
+    del weights[k]
+    with pytest.raises(ValueError, match=r"Missing KV calibration: .*k_proj\.k_scale"):
+        refit()
+    del weights[v]
+    refit()
+    torch.testing.assert_close(scales, torch.ones(3), rtol=0, atol=0)
+    torch.testing.assert_close(inverse, torch.ones(3), rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_unquantized_mtp_experts_use_per_expert_tp_windows():
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    prefix = "model.language_model.mtp.layers.0.block.moe.experts"
+    excluded = QuantConfig(
+        exclude_modules=["model.language_model.mtp*"]
+    ).is_module_excluded_from_quantization
+    eager = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    checkpoint = {f"{prefix}.{expert}.down_proj.weight": eager + expert * 12 for expert in (1, 3)}
+    entries = [(f"{prefix}.down_proj", ([3, 1], slice(None), slice(2, 4)), None, None)]
+    (part,) = projection_parts("mtp_experts_down", (2, 3, 2), entries, {}, excluded)
+    target = {}
+    part.declare(target, lambda *shape: torch.empty(shape, dtype=torch.bfloat16))
+    _load_projection(part, target, checkpoint)
+    expected = torch.stack([checkpoint[f"{prefix}.{i}.down_proj.weight"][:, 2:] for i in (3, 1)])
+    torch.testing.assert_close(part.view(target), expected)
+    assert part.suffixes == ("weight",)
 
 
 @pytest.mark.skipif(

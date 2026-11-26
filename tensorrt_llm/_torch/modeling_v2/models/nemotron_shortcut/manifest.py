@@ -3,10 +3,12 @@
 """Rank-local tensor windows shared by the text decoder weight loaders."""
 
 _PREFIX = "model.language_model."
+_MTP_PREFIX = _PREFIX + "mtp.layers.0."
 
 
-def excluded_prefixes():
-    return ("model.vision_tower.", "model.multi_modal_projector.", _PREFIX + "mtp.")
+def excluded_prefixes(mtp_enabled):
+    prefixes = ("model.vision_tower.", "model.multi_modal_projector.")
+    return prefixes if mtp_enabled else (*prefixes, _PREFIX + "mtp.")
 
 
 def _fp32(tensor):
@@ -53,8 +55,8 @@ def output_head_entry(core, head):
     ]
 
 
-def check_checkpoint_keys(weights, expected):
-    ignored = excluded_prefixes()
+def check_checkpoint_keys(weights, expected, *, mtp_enabled):
+    ignored = excluded_prefixes(mtp_enabled)
     provided = {key for key in weights if not key.startswith(ignored)}
     if expected != provided:
         missing, extra = sorted(expected - provided), sorted(provided - expected)
@@ -221,6 +223,17 @@ def build_manifest(core):
             out[f"l{i}_shortcut_norm"] = [(p + "shortcut_input_layernorm.weight", None, None, None)]
             out.update(moe(f"l{i}_", p))
 
+    if core.mtp_enabled:
+        for name, key in (
+            ("enorm", "enorm"),
+            ("hnorm", "hnorm"),
+            ("eh", "eh_proj"),
+            ("norm_in", "block.input_layernorm"),
+            ("final_norm", "final_layernorm"),
+        ):
+            out[f"mtp_{name}"] = [(_MTP_PREFIX + key + ".weight", None, None, None)]
+        out.update(attention("mtp_", _MTP_PREFIX + "block.self_attn."))
+        out.update(moe("mtp_", _MTP_PREFIX + "block."))
     out["readout"] = [(_PREFIX + "residual_readout.logit", None, None, None)]
     out["final_norm"] = [(_PREFIX + "norm.weight", None, None, None)]
     out["embed"] = [(_PREFIX + "embed_tokens.weight", None, None, None)]

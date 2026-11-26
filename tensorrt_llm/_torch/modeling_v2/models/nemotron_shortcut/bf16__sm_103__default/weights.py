@@ -26,7 +26,7 @@ def load(model, weights):
     manifest["lm_head"] = output_head_entry(core, head)
 
     needed = {key for entries in manifest.values() for key, _, _, _ in entries}
-    check_checkpoint_keys(weights, needed)
+    check_checkpoint_keys(weights, needed, mtp_enabled=core.mtp_enabled)
 
     for name, entries in manifest.items():
         load_unquantized(parameters[name], entries, weights)

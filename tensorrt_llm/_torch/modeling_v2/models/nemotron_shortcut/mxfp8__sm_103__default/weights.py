@@ -59,7 +59,7 @@ def load(model, weights):
             needed.add(key)
             if name in core.mxfp8_shapes:
                 needed.add(key + "_scale")
-    check_checkpoint_keys(weights, needed)
+    check_checkpoint_keys(weights, needed, mtp_enabled=core.mtp_enabled)
     for name, entries in manifest.items():
         if name in core.mxfp8_shapes:
             _load_projection(
