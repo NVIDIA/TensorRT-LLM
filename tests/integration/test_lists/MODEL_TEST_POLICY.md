@@ -92,12 +92,15 @@ Startup usually dominates instead:
 - A PR that adds a pre-merge model entry states the model or feature, the
   configuration it covers, its measured time × GPUs, and why post-merge is not
   enough.
+- Before writing a new entry for a priority model, look for a case in the QA
+  lists that already covers the configuration. Such a case moves to pre-merge
+  after one passing run on the GPU type of the target stage.
 - Before moving an entry to post-merge, confirm that a running stage selects
   the destination block: `scripts/test_to_stage_mapping.py` does not check GPU
   counts, so also check that the block's existing entries ran recently.
 - Review the lists periodically for: entries of models off the priority list,
-  the same case on several GPU types, single-GPU cases in multi-GPU stages,
-  costly entries without real failures, and entries that fail often for
-  infrastructure reasons.
+  priority-model configurations that run only in QA, the same case on several
+  GPU types, single-GPU cases in multi-GPU stages, costly entries without real
+  failures, and entries that fail often for infrastructure reasons.
 - When post-merge catches a regression that a pre-merge entry would have
   caught, move that entry, or a cheaper equivalent, back to pre-merge.
