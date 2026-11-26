@@ -1057,6 +1057,19 @@ def modeling_v2_cohort_real_rule() -> CbtsTestsDefRule:
     )
 
 
+def test_communicator_profiler_change_selects_mpi_wrapper(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule,
+) -> None:
+    path = "tests/unittest/_torch/distributed/test_communicator_profiler.py"
+    result = modeling_v2_cohort_real_rule.apply(PRInputs(changed_files=[path], diffs={}))
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert _entries_by_stem(result)["l0_cpu"] == {
+        "unittest/_torch/distributed",
+        "test_unittests.py::test_mpi_profiler",
+    }
+
+
 def test_modeling_v2_cohort_real_glm_gemm_excludes_rubin_moe(
     modeling_v2_cohort_real_rule: CbtsTestsDefRule,
 ) -> None:

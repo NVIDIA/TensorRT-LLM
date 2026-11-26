@@ -760,6 +760,9 @@ class TestsDefRule(Rule):
                 ]
                 if whole_file:
                     anchors = list(dict.fromkeys([*anchors, *group_anchors]))
+                if git_path == "tests/unittest/_torch/distributed/test_communicator_profiler.py":
+                    # The two-rank smoke test only runs inside the MPI wrapper.
+                    anchors.append("test_unittests.py::test_mpi_profiler")
                 file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
                 if group_anchors and not whole_file:
                     group_bf, _ = lookup_paths_into_block_filters(self.yaml_index, group_anchors)
