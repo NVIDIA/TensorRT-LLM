@@ -912,7 +912,7 @@ struct FusedSchedulerArgs
  * consumers run in the default one, so the release is system-scope. Balanced
  * issuers read placement fields already published by the planner before workers
  * materialize routes. READY joins every CTA after both routes and copies finish. */
-__global__ void __launch_bounds__(512, 1)
+__global__ void __launch_bounds__(tensorrt_llm::kernels::kHaloQThreads, 1)
     halo_q_tma_fused_kernel(FusedSchedulerArgs const scheduler, GpuDirectStorage const direct, int warps,
         int total_slots, unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation,
         unsigned long long* route_epoch, unsigned long long route_target, uint64_t const* replay_generation)
@@ -989,7 +989,7 @@ namespace
 {
 
 // Every fused launch has one HALO-Q CTA of this size per SM.
-constexpr int kFusedThreads = 512;
+constexpr int kFusedThreads = tensorrt_llm::kernels::kHaloQThreads;
 // The largest thread block cluster the hardware co-schedules.
 constexpr int kMaxClusterCtas = 8;
 
