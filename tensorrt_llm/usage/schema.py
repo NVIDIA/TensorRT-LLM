@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.7"
+EVENT_SCHEMA_VER = "0.8"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -98,6 +98,11 @@ class _LlmCounterSnapshot(BaseModel):
     )
 
     model_config = {"populate_by_name": True}
+
+
+# Bucket lower bounds of the local consecutive startup failure count.
+PriorStartupFailures = Literal[0, 1, 2, 3, 10, 30, 100, 300, 1000]
+StartupStateStatus = Literal["", "persisted", "new", "unavailable"]
 
 
 class TrtllmInitialReport(_LlmCounterSnapshot):
@@ -187,6 +192,24 @@ class TrtllmInitialReport(_LlmCounterSnapshot):
         description="Identifier used to correlate a disaggregated deployment.",
     )
 
+    # Local consecutive startup failure count of this launch
+    prior_startup_failures: PriorStartupFailures = Field(
+        default=0,
+        alias="priorStartupFailures",
+        description=(
+            "Consecutive failed starts of the same launch before this session, as a "
+            "bucket lower bound."
+        ),
+    )
+    startup_state_status: StartupStateStatus = Field(
+        default="",
+        alias="startupStateStatus",
+        description=(
+            "persisted if the local startup state was read, new if it was missing or "
+            "corrupt, unavailable if it could not be read or written; empty if not consulted."
+        ),
+    )
+
     # Legacy feature summary and sanitized opt-in LLM API config capture.
     features_json: str = Field(default="{}", alias="featuresJson")
     llm_api_config_json: str = Field(default="{}", alias="llmApiConfigJson")
@@ -255,6 +278,17 @@ TerminationComponent = Literal[
     "unknown",
 ]
 ReportingSource = Literal["self", "supervisor", "executor_proxy"]
+# Category of a startup failure, from ``tensorrt_llm._errors.ERROR_CATEGORIES``;
+# "" when the session did not fail during startup.
+ErrorCategory = Literal[
+    "",
+    "config_input",
+    "resource",
+    "unsupported",
+    "model_load",
+    "runtime_init",
+    "other",
+]
 
 
 class TrtllmExitReport(_LlmCounterSnapshot):
@@ -321,6 +355,30 @@ class TrtllmExitReport(_LlmCounterSnapshot):
         max_length=_SHORT_STR,
         alias="deploymentId",
         description="Identifier used to correlate a disaggregated deployment.",
+    )
+    error_category: ErrorCategory = Field(
+        default="",
+        alias="errorCategory",
+        description=(
+            "Category of the startup failure that ended the session; empty if the "
+            "session did not fail during startup."
+        ),
+    )
+    prior_startup_failures: PriorStartupFailures = Field(
+        default=0,
+        alias="priorStartupFailures",
+        description=(
+            "Consecutive failed starts of the same launch before this session, as a "
+            "bucket lower bound."
+        ),
+    )
+    startup_state_status: StartupStateStatus = Field(
+        default="",
+        alias="startupStateStatus",
+        description=(
+            "persisted if the local startup state was read, new if it was missing or "
+            "corrupt, unavailable if it could not be read or written; empty if not consulted."
+        ),
     )
 
     model_config = {"populate_by_name": True}

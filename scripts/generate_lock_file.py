@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +56,7 @@ project_constraints = {
 }
 
 target_env = {
-    "python_version": 310,
+    "python_version": 312,
     "platform_system": "",
     "platform_machine": "x86_64",
     "sys_platform": "linux",
@@ -87,6 +87,83 @@ def get_project_info(path: str):
             else:
                 name = matches.group(2)
     return {"name": name, "version": version}
+
+
+def _normalize_name(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _find_unresolvable_spec(output, specs):
+    """Return the index of the spec that Poetry blames for a failed resolution.
+
+    Poetry ends a failed resolution with
+    "So, because <project> depends on <pkg> (<constraint>), version solving
+    failed." (or "... on both <a> (..) and <b> (..)", or "Could not find a
+    matching version of package <pkg>"). When several packages are named, the
+    one listed last in `specs` is blamed, so that earlier entries win, as when
+    adding one by one. Returns None if no listed package can be identified.
+    """
+    names = set()
+    match = re.search(
+        r"So, because .*? depends on (.*?), version solving failed", output,
+        re.S)
+    if match:
+        names.update(
+            _normalize_name(n) for n in re.findall(
+                r"([A-Za-z0-9][A-Za-z0-9_.\-]*)(?:\[[^\]]*\])? \(",
+                match.group(1)))
+    match = re.search(r"Could not find a matching version of package (\S+)",
+                      output)
+    if match:
+        names.add(_normalize_name(match.group(1)))
+    indexes = []
+    for i, spec in enumerate(specs):
+        match = re.match(r"[A-Za-z0-9][A-Za-z0-9_.\-]*", spec)
+        if match and _normalize_name(match.group(0)) in names:
+            indexes.append(i)
+    return max(indexes) if indexes else None
+
+
+def _is_resolution_failure(output):
+    """Whether Poetry's output reports a dependency-resolution failure.
+
+    Only such failures justify skipping a spec. Anything else (network or index
+    errors, auth problems, a Poetry crash) says nothing about the spec itself.
+    """
+    return bool(
+        re.search(
+            r"version solving failed|"
+            r"Could not find a matching version of package", output))
+
+
+def poetry_add(specs, cwd):
+    specs = list(specs)
+    while specs:
+        result = subprocess.run(["poetry", "add", "--lock", *specs],
+                                cwd=cwd,
+                                capture_output=True,
+                                text=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode == 0:
+            return
+        output = result.stdout + result.stderr
+        if not _is_resolution_failure(output):
+            raise RuntimeError(
+                f"'poetry add' failed in {cwd} (exit code {result.returncode}) "
+                "for a reason other than dependency resolution; refusing to "
+                "produce an incomplete lock file")
+        culprit = _find_unresolvable_spec(output, specs)
+        if culprit is None:
+            if len(specs) == 1:
+                print(f"Skipping {specs[0]}: dependency resolution failed")
+                return
+            mid = len(specs) // 2
+            poetry_add(specs[:mid], cwd)
+            poetry_add(specs[mid:], cwd)
+            return
+        print(f"Skipping {specs[culprit]}: dependency resolution failed")
+        del specs[culprit]
 
 
 def generate_metadata_json():
@@ -145,7 +222,7 @@ if __name__ == "__main__":
         name = project_info["name"]
         author = '"TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"'
         version = project_info["version"]
-        py_version = '">=3.10,<3.13"'
+        py_version = '">=3.12,<3.13"'
         poetry_init_cmd = f'poetry init --no-interaction --name {name} --author {author} --python {py_version}'
         if name == "tensorrt-llm":
             poetry_init_cmd += " -l Apache-2.0"
@@ -158,11 +235,10 @@ if __name__ == "__main__":
                                 shell=True,
                                 capture_output=True,
                                 text=True).stdout
-        for constraint in project_constraints.get(
-                str(Path(file_path).relative_to(curr_path)), []):
-            subprocess.run(f"poetry add '{constraint}'",
-                           shell=True,
-                           cwd=save_path)
+        # Constraints go first so they steer the resolver for the whole batch.
+        specs = list(
+            project_constraints.get(str(Path(file_path).relative_to(curr_path)),
+                                    []))
         packages = output.split('\n')
 
         if packages[-1] == '':  # last entry is newline
@@ -174,7 +250,7 @@ if __name__ == "__main__":
             if not package or \
                 package.startswith('#') or \
                 '-f' in package or \
-                package.startswith('--'):
+                package.startswith('-'):
                 continue
 
             curr_env = None
@@ -201,7 +277,6 @@ if __name__ == "__main__":
                 package_name = data[0].replace(" ", "")
                 if (not package_name.startswith("tensorrt_llm")
                         and not package_name.startswith("3rdparty")):
-                    poetry_cmd = f"poetry add '{package_name}'"
-                    if package_name in url_mapping:
-                        poetry_cmd = f"poetry add '{url_mapping[package_name]}'"
-                    subprocess.run(poetry_cmd, shell=True, cwd=save_path)
+                    specs.append(url_mapping.get(package_name, package_name))
+
+        poetry_add(list(dict.fromkeys(specs)), save_path)

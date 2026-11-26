@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 
 namespace tensorrt_llm::runtime
 {
@@ -166,20 +167,37 @@ void NumaHugePagePoolAllocator::shutdown()
     munmap(mMmapBasePtr, kReservedVirtualMemorySize + kHugePageSize);
 }
 
+namespace
+{
+
+//! Whether the host can access device-resident managed memory directly, without page faults or migration.
+//! This holds on hardware-coherent platforms such as Grace-based GB200/GB300, including when GPU memory is not
+//! exposed as a NUMA node (CDMM mode).
+bool isHostDirectManagedAccessSupported()
+{
+    int deviceId = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
+    int directAccess = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&directAccess, cudaDevAttrDirectManagedMemAccessFromHost, deviceId));
+    return directAccess != 0;
+}
+
+} // namespace
+
 bool HostAccessibleDeviceAllocator::mAllowManagedFallback = false;
 
 bool HostAccessibleDeviceAllocator::isSupported()
 {
-    if (!tensorrt_llm::common::getEnvEplbForceGdrcopy()
-        && TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
+    bool const forceGdrcopy = tensorrt_llm::common::getEnvEplbForceGdrcopy();
+    if (!forceGdrcopy && TopologyDetector::getInstance().getCurrentGpuMemoryNumaId() >= 0)
     {
         // we are on systems that GPU memory is also a NUMA node.
         return true;
     }
     if (!tensorrt_llm::runtime::gdrcopy::isInitialized() && !tensorrt_llm::runtime::gdrcopy::initialize())
     {
-        // system don't support GDRCopy.
-        return mAllowManagedFallback;
+        // System doesn't support GDRCopy, managed memory still works if the host can access it directly.
+        return mAllowManagedFallback || (!forceGdrcopy && isHostDirectManagedAccessSupported());
     }
     return true;
 }
@@ -207,6 +225,7 @@ void HostAccessibleDeviceAllocator::init()
         mGpuMemNumaId = TopologyDetector::getInstance().getCurrentGpuMemoryNumaId();
     }
 
+    mHostDirectManagedAccess = false;
     if (mGpuMemNumaId < 0)
     {
         // We only use GDRCopy when there is no NUMA node for GPU memory.
@@ -218,6 +237,13 @@ void HostAccessibleDeviceAllocator::init()
         if (gdrCopyInitedSuccess)
         {
             mGdrHandle = tensorrt_llm::runtime::gdrcopy::open();
+        }
+        else if (!tensorrt_llm::common::getEnvEplbForceGdrcopy() && isHostDirectManagedAccessSupported())
+        {
+            mHostDirectManagedAccess = true;
+            TLLM_LOG_WARNING(
+                "GPU memory is not a NUMA node and GDRCopy is not available, using managed memory with direct host "
+                "access as host accessible device memory.");
         }
     }
     mIsInited = true;
@@ -349,6 +375,18 @@ void HostAccessibleDeviceAllocator::memcpyToDevice(void* dst, void const* src, s
     }
 }
 
+char const* HostAccessibleDeviceAllocator::nativeMemoryLabel(bool gdr) const
+{
+    // Only the GDRCopy path is plain device memory. The NUMA path maps the GPU's memory as a host NUMA node and the
+    // fallback is managed memory; neither is reliably in the device's per-process usage, so they are kept apart.
+    namespace label = tensorrt_llm::common::nativeMemoryLabels;
+    if (gdr)
+    {
+        return label::kEplbDevice;
+    }
+    return mGpuMemNumaId >= 0 ? label::kEplbGpuNuma : label::kEplbManaged;
+}
+
 void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
 {
     int currentDevId = -1;
@@ -372,14 +410,22 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
     }
     else
     {
-        TLLM_CHECK_WITH_INFO(
-            mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
+        TLLM_CHECK_WITH_INFO(mAllowManagedFallback || mHostDirectManagedAccess,
+            "HostAccessibleDeviceAllocator is not supported on the current system.");
         TLLM_CUDA_CHECK(cudaMallocManaged(&devPtr, memorySize));
         TLLM_CUDA_CHECK(cudaMemAdvise(devPtr, memorySize, cudaMemAdviseSetPreferredLocation,
             cudaMemLocation{cudaMemLocationTypeDevice, {currentDevId}}));
+        if (mHostDirectManagedAccess)
+        {
+            // Keep the device-resident pages mapped for the host, so host accesses neither fault nor migrate them.
+            TLLM_CUDA_CHECK(cudaMemAdvise(
+                devPtr, memorySize, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeHost, {0}}));
+        }
         hostPtr = devPtr;
     }
     recordAllocation(devPtr, memorySize, hostPtr, memDesc);
+    tensorrt_llm::common::recordNativeAllocation(
+        nativeMemoryLabel(memDesc != nullptr), currentDevId, static_cast<std::int64_t>(memorySize));
     return devPtr;
 }
 
@@ -390,6 +436,8 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
     if (it != mDeviceAllocations.end())
     {
         auto const& allocInfo = it->second;
+        // The ledger reports memory that is still mapped, so only the paths that return the memory record a release.
+        bool released = true;
         if (allocInfo.memDesc)
         {
             gdrcopy::gdrCudaFree(allocInfo.memDesc, mGdrHandle);
@@ -397,13 +445,20 @@ void HostAccessibleDeviceAllocator::free(void* ptr)
         else if (mGpuMemNumaId >= 0)
         {
             // TopologyDetector::getInstance().freeCurrentGpuNumaMemory(const_cast<void*>(it->first), allocInfo.size);
+            // The huge-page pool does not unmap freed blocks, so the memory stays in use until the process exits.
             NumaHugePagePoolAllocator::getInstance().free(const_cast<void*>(it->first));
+            released = false;
         }
         else
         {
-            TLLM_CHECK_WITH_INFO(
-                mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
+            TLLM_CHECK_WITH_INFO(mAllowManagedFallback || mHostDirectManagedAccess,
+                "HostAccessibleDeviceAllocator is not supported on the current system.");
             TLLM_CUDA_CHECK(cudaFree(ptr));
+        }
+        if (released)
+        {
+            tensorrt_llm::common::recordNativeRelease(
+                nativeMemoryLabel(allocInfo.memDesc != nullptr), mDevId, static_cast<std::int64_t>(allocInfo.size));
         }
         void* hostPtr = it->second.hostPtr;
         TLLM_CHECK_WITH_INFO(mHostAllocations.count(hostPtr) == 1, "host pointer not recorded.");

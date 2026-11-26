@@ -25,7 +25,7 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the vendored CuTe DSL kernel needs an sm_103 GPU", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     cute_dsl_sparse_mla_prefill as entry,
 )
 
@@ -383,3 +383,45 @@ def test_is_valid_refuses_a_prepared_step_handed_other_bounds(compiled_dc) -> No
     args["cu_seqlen_ke"] = args["cu_seqlen_ke"].clone()
     with pytest.raises(AssertionError, match="cu_seqlen_ke is not the tensor"):
         op.is_valid(**args, compiled=handle)
+
+
+@pytest.mark.parametrize("all_valid", [False, True], ids=["masked", "all-valid"])
+def test_full_topk_specializations(all_valid, compiled) -> None:
+    """Both sparse builds compute attention over a full, shuffled top-k prefix."""
+    args, rows = _build(dict(new=[1, 2], cached=[2047, 4095]), seed=23)
+    handle = (
+        entry.compile(device_index=torch.cuda.current_device(), all_sparse_indices_valid=True)
+        if all_valid
+        else compiled
+    )
+    assert bool((rows >= 0).all())
+    op.is_valid(**args, compiled=handle)
+    out = op(**args, compiled=handle)
+    torch.cuda.synchronize()
+    assert out is args["output"]
+    assert out.shape == (3, HEADS * V_DIM)
+    assert out.dtype == torch.bfloat16
+    ref = op.reference(**args, compiled=handle)
+    _compare(out, ref, _band(args["quant_q_buffer"], args["kv_pool_view"], rows, BMM1[0]))
+
+
+@pytest.mark.parametrize("all_sparse_indices_valid", [False, True], ids=["masked", "all_valid"])
+def test_full_topk_validity_specializations(
+    all_sparse_indices_valid,
+    certifying,  # noqa: F811
+) -> None:
+    certifying(op)
+    args, rows = _build(dict(new=[2, 3], cached=[TOP_K - 1, TOP_K + 33]), seed=17)
+    assert bool((rows >= 0).all())
+    total_q = args["quant_q_buffer"].shape[0]
+    valid_counts = args["cu_seqlen_ke"][:total_q] - args["cu_seqlen_ks"][:total_q]
+    assert int(valid_counts[0]) == TOP_K
+    assert bool((valid_counts[1:] > TOP_K).all())
+    handle = entry.compile(
+        device_index=torch.cuda.current_device(),
+        all_sparse_indices_valid=all_sparse_indices_valid,
+    )
+    out = op(**args, compiled=handle)
+    torch.cuda.synchronize()
+    ref = op.reference(**args, compiled=handle)
+    _compare(out, ref, _band(args["quant_q_buffer"], args["kv_pool_view"], rows, BMM1[0]))

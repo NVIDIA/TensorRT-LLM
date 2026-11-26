@@ -21,6 +21,8 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 )
 from tensorrt_llm._torch.pyexecutor._util import get_indexer_mqa_logits_workspace_reserve
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_workspace_bytes_match_runtime_element_budget(monkeypatch):
     monkeypatch.setenv("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", "1024")
@@ -47,5 +49,5 @@ def test_workspace_reserve_covers_full_cap(kv_cache_memory, workspace_memory, ex
 
 @pytest.mark.parametrize("kv_cache_memory", [2, 4])
 def test_workspace_reserve_rejects_exhausting_the_kv_budget(kv_cache_memory):
-    with pytest.raises(ValueError, match="whole KV cache budget"):
+    with pytest.raises(RuntimeError, match="whole KV cache budget"):
         get_indexer_mqa_logits_workspace_reserve(kv_cache_memory, 4)

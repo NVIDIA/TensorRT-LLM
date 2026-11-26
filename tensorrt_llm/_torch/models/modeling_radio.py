@@ -166,7 +166,6 @@ class ViTPatchGenerator(nn.Module):
                 bias=patch_bias,
                 temporal_patch_size=temporal_patch_size,
             )
-        self._video_embedder_loaded = False
 
         self.pos_embed = None
         if abs_pos:
@@ -221,11 +220,6 @@ class ViTPatchGenerator(nn.Module):
             Embedded patches with temporal compression applied,
             shape [num_tubelets, seq_per_tubelet, embed_dim].
         """
-        if not self._video_embedder_loaded:
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) requires "
-                "video_embedder weights, but they were never loaded. "
-                "Ensure the checkpoint was trained with temporal compression.")
         T = self.temporal_patch_size
         input_size = x.shape[2:]
 
@@ -1304,6 +1298,12 @@ class RADIOVisionModel(PreTrainedModel):
             unexpected_keys.remove("input_conditioner.norm_std")
         # Partial model.blocks weights will loaded in the following step.
         for m in missing_keys:
+            if m.startswith('model.patch_generator.video_embedder.'):
+                raise ValueError(
+                    f"Missing key: {m}. Temporal compression "
+                    "(video_temporal_patch_size > 1) requires video_embedder "
+                    "weights. Ensure the checkpoint was trained with temporal "
+                    "compression.")
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
@@ -1316,14 +1316,6 @@ class RADIOVisionModel(PreTrainedModel):
                     'model.patch_generator.video_embedder',
             )):
                 raise ValueError(f"Unexpected key: {u}")
-
-        # Mark video_embedder as loaded only when the submodule exists and its weights were actually
-        # present in the checkpoint (i.e. not reported as unexpected).
-        patch_gen = self.radio_model.model.patch_generator
-        if (getattr(patch_gen, 'video_embedder', None) is not None
-                and 'model.patch_generator.video_embedder.weight'
-                not in unexpected_keys):
-            patch_gen._video_embedder_loaded = True
 
         # Load weights for vision transformer module.
         model_weights = {

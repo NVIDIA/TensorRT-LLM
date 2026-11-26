@@ -241,12 +241,12 @@ def _tiny_cached_model(hidden=32):
 def test_frozen_constant_cache_fills_from_either_loader_walk(stage):
     """Both loader walks must reach both cache owners.
 
-    `ModelLoader` has two post-load walks and they look up *different* names
-    (`pyexecutor/model_loader.py`):
+    The model loader has two post-load walks and they look up *different*
+    names (`models/checkpoints/model_hooks.py`):
 
-    * `_walk_full_post_load` looks up `post_load_weights`. This is the
+    * `walk_full_post_load` looks up `post_load_weights`. This is the
       branch the ordinary load takes.
-    * `_walk_cache_state` looks up `cache_derived_state`. This is the branch
+    * `walk_cache_state` looks up `cache_derived_state`. This is the branch
       the GPU-memory-service read-only reader and the staged-receiver path take;
       an RO rank never calls the MuseSparkOpen weight mapper at all, it zero-copy
       imports weights another rank committed and then runs exactly this stage.
@@ -802,35 +802,29 @@ def test_missing_in_range_keys_reports_a_dropped_tensor():
 # Residual join
 #
 # A decoder layer joins each branch as `gated_add(residual, rmsnorm(branch))`
-# over the FP32 residual stream.
+# over the FP32 residual stream. On CUDA the join is a fused kernel, checked
+# against this composition in test_musespark_open_boundary_fusion.py.
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("device", ["cpu", DEVICE])
-def test_residual_join_is_the_gated_add_of_the_normed_branch(device):
-    """The join equals the gated add of the normalized branch, to the last bit.
+def test_residual_join_is_the_gated_add_of_the_normed_branch():
+    """Off CUDA, the join equals the gated add of the normalized branch, to the last bit.
 
     Checked on both sides of the layer: the weight-first FFN norm and the
     weightless attention norm.
     """
     hidden, eps, tokens = 256, 1e-6, 8
     gen = torch.Generator().manual_seed(3)
-    residual = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32).to(device)
-    branch = (
-        torch.randn(tokens, hidden, generator=gen, dtype=torch.float32)
-        .to(torch.bfloat16)
-        .to(device)
-    )
+    residual = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32)
+    branch = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32).to(torch.bfloat16)
     gate = MuseSparkOpenGatedResidual(hidden, torch.bfloat16)
     with torch.no_grad():
         gate.gate.normal_(0, 0.5, generator=gen)
-    gate = gate.to(device)
     gate.cache_derived_state()
 
     norm = MuseSparkOpenRMSNormWeightFirst(hidden, eps, torch.bfloat16)
     with torch.no_grad():
         norm.weight.normal_(0, 0.3, generator=gen)
-    norm = norm.to(device)
     norm.cache_derived_state()
 
     def weightless_norm(x):

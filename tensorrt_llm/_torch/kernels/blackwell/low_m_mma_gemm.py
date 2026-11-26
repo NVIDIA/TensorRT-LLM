@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Warp-MMA GEMM for decode-sized M (<= 64 rows) over per-tensor FP8 (W8A8) and BF16 weights.
+"""Warp-MMA GEMM for decode-sized M (<= ``MAX_ROWS`` rows) over per-tensor FP8 (W8A8) and BF16 weights.
 
 ``C[M, :] = A[M, K] @ W.T`` with register-prefetched weights in two segments, each a whole number of CTAs:
 
@@ -49,6 +49,8 @@ except ImportError:  # older CuTe DSL
 
 CHUNK = 64  # K elements per lane quad (16 per lane)
 N_TILE = 8
+# Most rows of one launch: loops, epilogue and shared memory scale with the row tiles.
+MAX_ROWS = 128
 FP8_ACTS = ("fp8", "quant", "bf16")
 
 
@@ -291,7 +293,7 @@ def _g2r_atom(dtype, streaming: bool):
 
 
 class LowMMmaGemmKernel:
-    """``num_rows`` (<= 64) x K GEMM over an FP8 and a BF16 weight segment."""
+    """``num_rows`` (<= ``MAX_ROWS``) x K GEMM over an FP8 and a BF16 weight segment."""
 
     def __init__(
         self,
@@ -334,8 +336,10 @@ class LowMMmaGemmKernel:
             raise ValueError(f"ksplit={ksplit} must be 1, 2, 4 or 8")
         if k_extent % (CHUNK * k_warps * ksplit):
             raise ValueError(f"K={k_extent} must be a multiple of {CHUNK * k_warps * ksplit}")
-        if not 1 <= num_rows <= 64:
-            raise ValueError(f"num_rows={num_rows} must be in [1, 64]")
+        # Tactics are filtered on shared memory (a launch limit); 4 x n_tiles x row_tiles FP32 accumulators per thread
+        # can only spill, which the race times.
+        if not 1 <= num_rows <= MAX_ROWS:
+            raise ValueError(f"num_rows={num_rows} must be in [1, {MAX_ROWS}]")
         for tiles in (n_tiles, n_tiles_bf16):
             if tiles not in (1, 2, 4):
                 raise ValueError(f"n_tiles={tiles} must be 1, 2 or 4")

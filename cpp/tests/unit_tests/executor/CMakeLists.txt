@@ -74,8 +74,20 @@ add_tllm_gtest(
   tllm::executor_values
   LABELS
   "unit;executor;gpu")
-add_tllm_gtest(serializeUtilsTest SOURCES serializeUtilsTest.cpp FULL_STACK
-               LABELS "unit;full-stack;host")
+add_tllm_gtest(
+  serializeUtilsTest
+  OWNER
+  executor
+  SOURCES
+  serializeUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  tllm::executor_memory_desc
+  tllm::batch_request_info
+  tllm::runtime_distributed
+  ${Python3_LIBRARIES}
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(
   loraConfigTest
   OWNER
@@ -96,20 +108,44 @@ add_tllm_gtest(
   tllm::executor_transfer_agent
   LABELS
   "unit;executor;host")
-add_tllm_gtest(genUniqueAgentNameTest SOURCES genUniqueAgentNameTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
-target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
+add_tllm_gtest(
+  genUniqueAgentNameTest
+  OWNER
+  executor
+  SOURCES
+  genUniqueAgentNameTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_agent_name
+  Threads::Threads
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  transferAgentMetadataTest
+  OWNER
+  executor
+  SOURCES
+  transferAgentMetadataTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_transfer_agent
+  LABELS
+  "unit;executor;host")
 add_tllm_gtest(
   ucxCommTest
+  OWNER
+  executor
   SOURCES
   ucxCommTest.cpp
-  FULL_STACK
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  ${CMAKE_DL_LIBS}
+  ${Python3_LIBRARIES}
   LABELS
-  "unit;full-stack;gpu"
+  "unit;executor;ucx;integration;gpu"
   TIMEOUT
   60)
-target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
-target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
+if(TARGET tensorrt_llm_ucx_wrapper)
+  target_link_libraries(ucxCommTest PRIVATE tensorrt_llm_ucx_wrapper)
+endif()
 
 # NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
 # (mirrors the source layout under nixl_utils/bounce/). It self-gates on zmq and
@@ -123,15 +159,31 @@ if(EXISTS "/etc/redhat-release")
 endif()
 
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
-  add_tllm_gtest(agentCommTest SOURCES agentCommTest.cpp FULL_STACK LABELS
-                 "unit;full-stack;gpu")
-  add_tllm_gtest(transferAgentTest SOURCES transferAgentTest.cpp FULL_STACK
-                 LABELS "unit;full-stack;gpu")
+  add_tllm_gtest(
+    agentCommTest
+    OWNER
+    executor
+    SOURCES
+    agentCommTest.cpp
+    LINK_LIBRARIES
+    tllm::executor_agent_connection
+    LABELS
+    "unit;executor;agent;integration;gpu")
+  add_tllm_gtest(
+    transferAgentTest
+    OWNER
+    executor
+    SOURCES
+    transferAgentTest.cpp
+    LINK_LIBRARIES
+    tllm::executor_transfer_agent
+    tllm::executor_values
+    LABELS
+    "unit;executor;transfer;gpu")
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
-    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper
-                                                ${Python3_LIBRARIES})
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper)
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
 
@@ -142,8 +194,7 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   if(MOONCAKE_ROOT)
     target_link_libraries(transferAgentTest
                           PRIVATE tensorrt_llm_mooncake_wrapper)
-    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_mooncake_wrapper
-                                                ${Python3_LIBRARIES})
+    target_link_libraries(agentCommTest PRIVATE tensorrt_llm_mooncake_wrapper)
     target_compile_definitions(transferAgentTest
                                PRIVATE TEST_MOONCAKE_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_MOONCAKE_BACKEND=1)

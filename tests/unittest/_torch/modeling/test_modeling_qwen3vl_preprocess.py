@@ -25,7 +25,7 @@ The tests bind ``_preprocess`` to a stand-in object so they exercise the
 control flow without constructing a real HF processor.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,7 +45,11 @@ def _fake_video(metadata, *, n_frames=8):
 
 def _call_preprocess(mm_data, mm_processor_kwargs):
     fake_processor = MagicMock(return_value={})
-    fake_self = SimpleNamespace(processor=fake_processor)
+    # Device normalization is off by default, so these tests cover the host processor call.
+    fake_self = SimpleNamespace(processor=fake_processor, _vision_gpu_normalize=False)
+    fake_self._get_vision_normalization = MethodType(
+        Qwen3VLInputProcessorBase._get_vision_normalization, fake_self
+    )
     Qwen3VLInputProcessorBase._preprocess(
         fake_self,
         "the prompt",

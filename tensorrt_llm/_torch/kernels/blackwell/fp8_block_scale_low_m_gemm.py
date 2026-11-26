@@ -43,19 +43,46 @@ Mid-M path (``low_m_max_for(N, K) < M <= MAX_M``):
   ``st.async`` into the owner's DSMEM mailbox, and writes BF16 rows through a token-major
   shared staging buffer with 16-byte stores.
 
+Prequantized input (:func:`run_low_m_gemm_prequantized`): the mid-M path's GEMM kernel on an
+MXFP8 activation a producer quantized with the low-M kernel's arithmetic (E4M3 codes and UE8M0
+1x32 scales in the R128c4 layout, see :func:`mxfp8_quantize_reference`), with the weight block
+scale folded into the activation scales and the low-M kernel's tiling, split-K and reduction
+order, so the output is bitwise the low-M kernel's on the BF16 activation.
+
+Low-M kernel variants for output-gated and gate projections, bitwise equal to the separate
+PyTorch ops followed / preceded by the plain kernel at the same tactic:
+
+* gated: ``out = bf16(x * gate) @ W^T``. The activation producer loads a BF16 gate tile next
+  to each activation tile (same barrier) and the quantization warps multiply with PyTorch's
+  BF16 rounding before quantizing.
+* sigmoid: ``out = torch.sigmoid(x @ W^T)`` on the BF16 output (:func:`sigmoid_bf16`).
+
+NVFP4 output (:func:`run_low_m_gemm_nvfp4`, either kernel, whole 128-row weight tiles):
+instead of storing BF16, the owner of each token chunk stages its BF16 rows token-major in the
+dead activation ring and writes their NVFP4 quantization with the arithmetic of
+``fp4_quantize(out, global_sf, 16)`` (E4M3 scale per 16 outputs, linear layout). At the same
+tactic it is bitwise the BF16 kernel followed by ``fp4_quantize``; it produces an NVFP4 MoE
+input straight from the projection that feeds it. A per-architecture route
+(:func:`nvfp4_out_tactic`, :func:`nvfp4_out_max_m_for`) declares where callers select it and
+which kernel and split-K serve each M (:func:`split_tactic`).
+
 Both kernels launch one non-persistent grid (``N/128`` weight tiles x ``split_k`` cluster
-ranks). Tactics, the low-/mid-M cut-over and the largest M for which this GEMM is selected
-(:func:`max_m_for`, the measured cross-over against the architecture's default FP8
-block-scale GEMM) come from per-architecture tables keyed by ``(N, K)``; shapes without an
-entry use a heuristic split-K and a conservative M limit. On SM107, whose default GEMM reads
-the weight scale in the CuTe MXFP8 layout, :func:`pack_block_scale_from_mxfp8_layout` derives
-the DeepGEMM-packed scale this GEMM reads.
+ranks). Selection is deterministic, so every variant runs the plain GEMM's tactic: tactics
+(:func:`default_tactic`, :func:`default_mid_tactic`) and the low-/mid-M cut-over
+(:func:`low_m_max_for`) follow a rule over the weight tiles, K tiles, token tile and SM count;
+the largest M for which callers select this GEMM (:func:`max_m_for`) is its measured cross-over
+with the architecture's default FP8 block-scale GEMM, or a conservative limit for other shapes
+whose grid fits in one wave. Per-architecture tables keyed by ``(N, K)`` hold these limits and,
+where measured, tactics that override the rule. On SM107, whose default GEMM reads the weight
+scale in the CuTe MXFP8 layout, :func:`pack_block_scale_from_mxfp8_layout` derives the
+DeepGEMM-packed scale this GEMM reads.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -70,7 +97,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: K extent of one pipeline stage (one 128x128 FP8 weight block).
 CTA_K = 128
@@ -132,8 +159,11 @@ class LowMTactic:
     quant_groups: int = 4
 
 
-def smem_bytes(n: int, k: int, tactic: LowMTactic) -> int:
-    """Conservative host-side mirror of the low-M kernel's shared-memory footprint."""
+def smem_bytes(n: int, k: int, tactic: LowMTactic, gated: bool = False) -> int:
+    """Conservative host-side mirror of the low-M kernel's shared-memory footprint.
+
+    ``gated`` adds the gate ring of the gated kernel (one BF16 gate tile per activation stage).
+    """
     kt_max = _ceil_div(k // CTA_K, tactic.split_k)
     a_st = min(tactic.a_stages, kt_max)
     x_st = min(tactic.x_stages, kt_max)
@@ -148,10 +178,12 @@ def smem_bytes(n: int, k: int, tactic: LowMTactic) -> int:
     total = _align_up(total, 128) + max(x_st * tactic.mma_n * CTA_K * 2, mbox)
     total = _align_up(total, 128) + 512
     total = _align_up(total, 128) + b_st * 512
+    if gated:
+        total = _align_up(total, 128) + x_st * tactic.mma_n * CTA_K * 2
     return total + 1024  # allocator slack
 
 
-def validate_tactic(n: int, k: int, tactic: LowMTactic) -> None:
+def validate_tactic(n: int, k: int, tactic: LowMTactic, gated: bool = False) -> None:
     if tactic.mma_n not in SUPPORTED_MMA_N:
         raise ValueError(f"mma_n must be one of {SUPPORTED_MMA_N}, got {tactic.mma_n}")
     if n % N_ALIGN or k % CTA_K:
@@ -174,17 +206,33 @@ def validate_tactic(n: int, k: int, tactic: LowMTactic) -> None:
         stages = getattr(tactic, name)
         if stages < kt_max and stages % groups:
             raise ValueError(f"{name}={stages} must be a multiple of quant_groups={groups}")
-    need = smem_bytes(n, k, tactic)
+    need = smem_bytes(n, k, tactic, gated)
     if need > _SMEM_CAPACITY:
         raise ValueError(f"tactic {tactic} needs {need} B of SMEM > {_SMEM_CAPACITY} B")
 
 
-def max_a_stages(n: int, k: int, tactic: LowMTactic) -> int:
+def validate_nvfp4_out_tactic(n: int, k: int, tactic: "LowMTactic | MidMTactic") -> None:
+    """Raise unless the NVFP4-output variant runs ``tactic``: whole 128-row weight tiles (an
+    NVFP4 group never straddles a tile) and, for the low-M kernel, a quantized-activation ring
+    that holds the ``mma_n x 128`` BF16 output tile it stages (the mid-M kernel sizes its
+    staging buffer for it)."""
+    if n % MMA_M:
+        raise ValueError(f"the NVFP4 output needs N={n} to be a multiple of {MMA_M}")
+    if isinstance(tactic, MidMTactic):
+        validate_mid_tactic(n, k, tactic)
+        return
+    validate_tactic(n, k, tactic)
+    b_stages = min(tactic.b_stages, _ceil_div(k // CTA_K, tactic.split_k))
+    if b_stages * tactic.mma_n * CTA_K < tactic.mma_n * MMA_M * 2:
+        raise ValueError("the NVFP4 output stages its BF16 tile in >= 2 b_stages")
+
+
+def max_a_stages(n: int, k: int, tactic: LowMTactic, gated: bool = False) -> int:
     """Largest weight-ring depth that fits next to the other buffers."""
     kt_max = _ceil_div(k // CTA_K, tactic.split_k)
     best = 1
     for a in range(1, kt_max + 1):
-        if smem_bytes(n, k, dataclasses.replace(tactic, a_stages=a)) <= _SMEM_CAPACITY:
+        if smem_bytes(n, k, dataclasses.replace(tactic, a_stages=a), gated) <= _SMEM_CAPACITY:
             best = a
     return best
 
@@ -208,8 +256,27 @@ def _asm(res, operands, text, constraints, *, loc=None, ip=None):
     )
 
 
+def _asm_pure(res, operands, text, constraints, *, loc=None, ip=None):
+    """Inline PTX without side effects (arithmetic the compiler may schedule freely)."""
+    return llvm.inline_asm(
+        res,
+        operands,
+        text,
+        constraints,
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def _iv(value, *, loc=None, ip=None):
     return Int32(value).ir_value(loc=loc, ip=ip)
+
+
+def _fv(value, *, loc=None, ip=None):
+    return cutlass.Float32(value).ir_value(loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -271,7 +338,7 @@ def _abs_max_bf16x32(words, *, loc=None, ip=None):
     """|x| max of 32 BF16 values (16 packed words) as two packed BF16 magnitudes.
 
     ``max.xorsign.abs`` returns ``max(|a|, |b|)`` with a garbage sign bit, which
-    ``_ue8m0_of_amax`` masks off.
+    ``ue8m0_of_amax`` masks off.
     """
     body = "".join(f"max.xorsign.abs.bf16x2 m{i}, ${2 * i + 1}, ${2 * i + 2};\n" for i in range(8))
     body += (
@@ -296,7 +363,7 @@ def _abs_max_bf16x32(words, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
+def ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
     """Biased exponent of ``2^ceil(log2(amax / 448))`` from two packed BF16 magnitudes.
 
     For ``amax = 2^E * (1 + f)``: ``amax / 448 <= 2^(E - 8)`` iff ``1 + f <= 1.75``,
@@ -329,7 +396,7 @@ def _ue8m0_of_amax(packed_amax, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
+def bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
     """Packed BF16x2 ``2^(127 - ue8m0)``."""
     return Int32(
         _asm(
@@ -350,7 +417,7 @@ def _bf16x2_inv_scale(ue8m0, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
+def quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
     """Scale eight BF16 values by the packed BF16x2 ``inv_scale`` and round to E4M3.
 
     The scale is a power of two, so the BF16 multiply is exact and the only rounding
@@ -381,6 +448,69 @@ def _quant_bf16x8_to_e4m3(w0, w1, w2, w3, inv_scale, *, loc=None, ip=None):
         Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
         Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
     )
+
+
+@dsl_user_op
+def _gate_mul_bf16x8(x0, x1, x2, x3, g0, g1, g2, g3, *, loc=None, ip=None):
+    """Eight BF16 products ``bf16(float(x) * float(g))`` as four packed words.
+
+    The same arithmetic as PyTorch's BF16 ``x * g`` (FP32 multiply, round to nearest even),
+    so the gated activation is bit-identical to the one a separate multiply would produce.
+    """
+    body = ""
+    for i in range(4):
+        body += (
+            f"shl.b32 xl, ${i + 4}, 16;\n"
+            f"and.b32 xh, ${i + 4}, 0xffff0000;\n"
+            f"shl.b32 gl, ${i + 8}, 16;\n"
+            f"and.b32 gh, ${i + 8}, 0xffff0000;\n"
+            "mov.b32 fxl, xl;\n"
+            "mov.b32 fxh, xh;\n"
+            "mov.b32 fgl, gl;\n"
+            "mov.b32 fgh, gh;\n"
+            "mul.rn.f32 fxl, fxl, fgl;\n"
+            "mul.rn.f32 fxh, fxh, fgh;\n"
+            f"cvt.rn.bf16x2.f32 ${i}, fxh, fxl;\n"
+        )
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_iv(v, loc=loc, ip=ip) for v in (x0, x1, x2, x3, g0, g1, g2, g3)],
+        "{\n.reg .b32 xl, xh, gl, gh;\n.reg .f32 fxl, fxh, fgl, fgh;\n" + body + "}",
+        "=r,=r,=r,=r,r,r,r,r,r,r,r,r",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _div_rn_f32(a, b, *, loc=None, ip=None):
+    """IEEE ``a / b`` (``div.rn.f32``)."""
+    return cutlass.Float32(
+        _asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "div.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def sigmoid_bf16(value):
+    """``torch.sigmoid`` of a BF16 value, bit for bit: ``bf16(1 / (1 + expf(-float(v))))``.
+
+    PyTorch evaluates the BF16 sigmoid in FP32 with the accurate ``expf`` (libdevice
+    ``__nv_expf``) and an IEEE division, then rounds to nearest even; ``cute.math.exp`` without
+    ``fastmath`` lowers to the same libdevice function.
+    """
+    g = value.to(cutlass.Float32)
+    e = cute.math.exp(-g, fastmath=False)
+    return _div_rn_f32(cutlass.Float32(1.0), cutlass.Float32(1.0) + e).to(cutlass.BFloat16)
 
 
 @dsl_user_op
@@ -488,15 +618,292 @@ def _s2t_partition_sf(sSF: cute.Tensor, tSF: cute.Tensor):
 
 
 # ---------------------------------------------------------------------------
+# The low-M kernel's MXFP8 quantization, for producers of a prequantized operand: per 1x32
+# group, the UE8M0 exponent of ``2^ceil(log2(amax / 448))`` (amax floored at ~1e-4) and the
+# E4M3 codes ``satfinite_rn(x * 2^(127 - e))``.
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def amax_bf16x8(w0, w1, w2, w3, *, loc=None, ip=None):
+    """|x| max of eight BF16 values (four packed words) as a packed BF16 pair (garbage sign,
+    which :func:`ue8m0_of_amax` masks off)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(w, loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .b32 m0, m1;\n"
+            "max.xorsign.abs.bf16x2 m0, $1, $2;\n"
+            "max.xorsign.abs.bf16x2 m1, $3, $4;\n"
+            "max.xorsign.abs.bf16x2 $0, m0, m1;\n}",
+            "=r,r,r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def amax_pair(a, b, *, loc=None, ip=None):
+    """|x| max of two packed BF16 pairs."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(a, loc=loc, ip=ip), _iv(b, loc=loc, ip=ip)],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def mxfp8_quantize_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference of the MXFP8 quantization above: ``(xq, xs)`` of a BF16 ``[M, K]``
+    activation, E4M3 ``xq [M, K]`` and row-major UE8M0 exponents ``xs [M, K / 32]``."""
+    m, k = x.shape
+    g = x.view(m, k // SF_VEC, SF_VEC)
+    bits = g.abs().view(torch.int16).to(torch.int32) & 0x7FFF
+    amax = bits.amax(dim=-1).clamp_min(_AMAX_FLOOR_BF16)
+    e = (amax >> 7) - 8 + ((amax & 0x7F) > 0x60).to(torch.int32)
+    inv = torch.pow(2.0, (127 - e).float()).to(torch.bfloat16)
+    scaled = (g * inv.unsqueeze(-1)).float()
+    xq = scaled.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(m, k)
+    return xq, e.to(torch.uint8)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 output quantization, with the arithmetic of ``fp4_quantize`` (``cvt_warp_fp16_to_fp4``
+# with an E4M3 scale per 16 elements): ``sf = e4m3(gsf * (amax * rcp(6)))``, ``out_scale =
+# amax != 0 ? rcp(f32(sf) * rcp(gsf)) : 0`` and ``e2m1(x * out_scale)``, where ``rcp`` is
+# ``rcp.approx.ftz.f32`` and every multiply rounds to nearest.
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def _stg_u16(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "st.global.u16 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _rcp_approx_ftz(x, *, loc=None, ip=None):
+    return cutlass.Float32(
+        _asm_pure(
+            T.f32(), [_fv(x, loc=loc, ip=ip)], "rcp.approx.ftz.f32 $0, $1;", "=f,f", loc=loc, ip=ip
+        )
+    )
+
+
+@dsl_user_op
+def _bf16x2_to_f32x2(word, *, loc=None, ip=None):
+    """The two BF16 halves of ``word`` (low half first) widened to FP32 (exact)."""
+    res = _asm_pure(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [_iv(word, loc=loc, ip=ip)],
+        "{\n"
+        ".reg .b32 lo, hi;\n"
+        "shl.b32 lo, $2, 16;\n"
+        "and.b32 hi, $2, 0xffff0000;\n"
+        "mov.b32 $0, lo;\n"
+        "mov.b32 $1, hi;\n"
+        "}",
+        "=f,=f,r",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(2)
+    )
+
+
+@dsl_user_op
+def _abs_max_f32x16(vals, *, loc=None, ip=None):
+    """``max |v|`` of 16 FP32 values."""
+    body = "".join(f"abs.f32 t{i}, ${i + 1};\n" for i in range(16))
+    for step in (8, 4, 2, 1):
+        body += "".join(f"max.f32 t{i}, t{i}, t{i + step};\n" for i in range(step))
+    body += "mov.f32 $0, t0;\n"
+    return cutlass.Float32(
+        _asm_pure(
+            T.f32(),
+            [_fv(v, loc=loc, ip=ip) for v in vals],
+            "{\n.reg .f32 " + ", ".join(f"t{i}" for i in range(16)) + ";\n" + body + "}",
+            "=f," + ",".join(["f"] * 16),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6, *, loc=None, ip=None):
+    """E4M3 scales and output scales of two 16-element groups with maxima ``amax0``/``amax1``.
+
+    Returns the two scale bytes packed in 16 bits (group 0 in the low byte) and the two output
+    scales (``rgsf = rcp(gsf)``, ``rcp6 = rcp(6)``).
+    """
+    res = _asm_pure(
+        llvm.StructType.get_literal([T.i32(), T.f32(), T.f32()]),
+        [_fv(x, loc=loc, ip=ip) for x in (amax0, amax1, gsf, rgsf, rcp6)],
+        "{\n"
+        ".reg .f32 s0, s1, f0, f1;\n"
+        ".reg .b16 h, l16, h16;\n"
+        ".reg .b32 hw;\n"
+        ".reg .pred z0, z1;\n"
+        "mul.rn.f32 s0, $3, $7;\n"
+        "mul.rn.f32 s1, $4, $7;\n"
+        "mul.rn.f32 s0, $5, s0;\n"
+        "mul.rn.f32 s1, $5, s1;\n"
+        "cvt.rn.satfinite.e4m3x2.f32 h, s1, s0;\n"
+        "cvt.rn.f16x2.e4m3x2 hw, h;\n"
+        "mov.b32 {l16, h16}, hw;\n"
+        "cvt.f32.f16 f0, l16;\n"
+        "cvt.f32.f16 f1, h16;\n"
+        "mul.rn.f32 f0, f0, $6;\n"
+        "mul.rn.f32 f1, f1, $6;\n"
+        "rcp.approx.ftz.f32 f0, f0;\n"
+        "rcp.approx.ftz.f32 f1, f1;\n"
+        "setp.eq.f32 z0, $3, 0f00000000;\n"
+        "setp.eq.f32 z1, $4, 0f00000000;\n"
+        "selp.f32 $1, 0f00000000, f0, z0;\n"
+        "selp.f32 $2, 0f00000000, f1, z1;\n"
+        "cvt.u32.u16 $0, h;\n"
+        "}",
+        "=r,=f,=f,f,f,f,f,f",
+        loc=loc,
+        ip=ip,
+    )
+    sf = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+    o0 = llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)
+    o1 = llvm.extractvalue(T.f32(), res, [2], loc=loc, ip=ip)
+    return Int32(sf), cutlass.Float32(o0), cutlass.Float32(o1)
+
+
+@dsl_user_op
+def _e2m1x8(vals, scale, *, loc=None, ip=None):
+    """Scale eight FP32 values (``mul.rn``) and pack them as E2M1 into 32 bits, element 0 in
+    the lowest nibble."""
+    body = "".join(f"mul.rn.f32 t{i}, ${i + 1}, $9;\n" for i in range(8))
+    body += "".join(
+        f"cvt.rn.satfinite.e2m1x2.f32 b{j}, t{2 * j + 1}, t{2 * j};\n" for j in range(4)
+    )
+    body += "mov.b32 $0, {b0, b1, b2, b3};\n"
+    return Int32(
+        _asm_pure(
+            T.i32(),
+            [_fv(v, loc=loc, ip=ip) for v in vals] + [_fv(scale, loc=loc, ip=ip)],
+            "{\n.reg .f32 t0, t1, t2, t3, t4, t5, t6, t7;\n.reg .b8 b0, b1, b2, b3;\n" + body + "}",
+            "=r," + ",".join(["f"] * 9),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
 
 
-class Fp8BlockScaleLowMGemmKernel:
-    """Swap-AB MXFP8 GEMM with in-kernel activation quantization and cluster split-K."""
+class _Nvfp4OutputMixin:
+    """NVFP4 output stores shared by the low-M and mid-M kernels (``nvfp4_out``).
 
-    def __init__(self, n: int, k: int, tactic: LowMTactic, use_pdl: bool):
-        validate_tactic(n, k, tactic)
+    Both kernels stage the BF16 result of their 128-row weight tile token-major as rows of
+    ``MMA_M`` BF16 values in their dead activation ring before :meth:`_store_nvfp4` runs.
+    """
+
+    @cute.jit
+    def _store_nvfp4(
+        self,
+        stage_base: Int32,
+        nrows: Int32,
+        rank: Int32,
+        m: Int32,
+        n_tile: Int32,
+        q: Int32,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        mGSF: cute.Tensor,
+    ):
+        """NVFP4 stores of the BF16 token rows this CTA owns, staged token-major as rows of
+        ``MMA_M`` BF16 values (``stage_base + t * 2 * MMA_M``).
+
+        Work row ``r < nrows`` is token ``r`` (``split_k == 1``) or the ``r``-th token this
+        cluster rank owns (chunk ``rank + (r // 4) * split_k``, 4 tokens per chunk). One work
+        item is 32 columns of one token: two 16-element NVFP4 groups, one 16-byte code store
+        and one 2-byte scale store.
+        """
+        n = self.n
+        col0 = n_tile * MMA_M
+        codes_base = mCodes.iterator.toint()
+        sf_base = mSF.iterator.toint()
+        gsf = mGSF[0]
+        rgsf = _rcp_approx_ftz(gsf)
+        rcp6 = _rcp_approx_ftz(cutlass.Float32(6.0))
+        for p in cutlass.range(q, nrows * 4, MMA_M, unroll=1):
+            r = p >> 2
+            t = r
+            if cutlass.const_expr(self.split_k > 1):
+                t = 4 * (rank + (r >> 2) * self.split_k) + (r & 3)
+            g = p & 3
+            if t < m:
+                src = stage_base + t * (MMA_M * 2) + g * 64
+                vals = []
+                for v in cutlass.range_constexpr(4):
+                    words = _lds_v4_b32(src + v * 16)
+                    for i in cutlass.range_constexpr(4):
+                        lo, hi = _bf16x2_to_f32x2(words[i])
+                        vals.extend((lo, hi))
+                amax0 = _abs_max_f32x16(vals[:16])
+                amax1 = _abs_max_f32x16(vals[16:])
+                sf2, os0, os1 = _nvfp4_scales_x2(amax0, amax1, gsf, rgsf, rcp6)
+                col = col0 + g * 32
+                _stg_v4_b32(
+                    codes_base + Int64(t) * (n // 2) + Int64(col // 2),
+                    _e2m1x8(vals[0:8], os0),
+                    _e2m1x8(vals[8:16], os0),
+                    _e2m1x8(vals[16:24], os1),
+                    _e2m1x8(vals[24:32], os1),
+                )
+                _stg_u16(sf_base + Int64(t) * (n // 16) + Int64(col // 16), sf2)
+
+
+class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin):
+    """Swap-AB MXFP8 GEMM with in-kernel activation quantization and cluster split-K.
+
+    ``gated`` builds the gated variant (:meth:`call_gated`): the activation producer also
+    loads a BF16 gate tile per stage, and the quantization warps quantize ``bf16(x * gate)``
+    instead of ``x``. ``sigmoid`` stores ``sigmoid_bf16`` of each BF16 output instead of the
+    output. ``nvfp4_out`` builds the NVFP4-output variant (:meth:`call_nvfp4`): the epilogue
+    stages the BF16 output tile token-major in the dead quantized-activation ring and stores
+    its NVFP4 quantization instead.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        tactic: LowMTactic,
+        use_pdl: bool,
+        gated: bool = False,
+        sigmoid: bool = False,
+        nvfp4_out: bool = False,
+    ):
+        validate_tactic(n, k, tactic, gated)
+        if nvfp4_out:
+            validate_nvfp4_out_tactic(n, k, tactic)
+            if gated or sigmoid:
+                raise ValueError("the NVFP4 output is not combined with gated / sigmoid")
+        self.gated = gated
+        self.sigmoid = sigmoid
+        self.nvfp4_out = nvfp4_out
         self.n = n
         self.k = k
         self.mma_n = tactic.mma_n
@@ -533,6 +940,55 @@ class Fp8BlockScaleLowMGemmKernel:
         m: Int32,
         stream: cuda.CUstream,
     ):
+        self._launch(w_ptr, x_ptr, None, None, ws_ptr, out_ptr, None, None, m, stream)
+
+    @cute.jit
+    def call_nvfp4(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        codes_ptr: cute.Pointer,
+        scales_ptr: cute.Pointer,
+        gsf_ptr: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
+        """NVFP4-output launch: E2M1 codes ``uint8 [m, N / 2]`` and linear E4M3 scales ``uint8
+        [m * N / 16]`` of the BF16 output, quantized with the FP32 global scale at
+        ``gsf_ptr``."""
+        self._launch(w_ptr, x_ptr, None, None, ws_ptr, codes_ptr, scales_ptr, gsf_ptr, m, stream)
+
+    @cute.jit
+    def call_gated(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        g_ptr: cute.Pointer,
+        g_ld: Int32,
+        ws_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
+        """Gated launch: ``out = bf16(x * g) @ W^T`` with ``g`` a BF16 ``[m, K]`` tensor of
+        row stride ``g_ld`` elements (a multiple of 8)."""
+        self._launch(w_ptr, x_ptr, g_ptr, g_ld, ws_ptr, out_ptr, None, None, m, stream)
+
+    @cute.jit
+    def _launch(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        g_ptr,
+        g_ld,
+        ws_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        scales_ptr,
+        gsf_ptr,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
         n, k = self.n, self.k
         mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
         mX = cute.make_tensor(x_ptr, cute.make_layout((m, k), stride=(k, 1)))
@@ -545,7 +1001,14 @@ class Fp8BlockScaleLowMGemmKernel:
                 stride=(MMA_M * 4, (1, 4 * n)),
             ),
         )
-        mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
+        mSF, mGSF = None, None
+        if cutlass.const_expr(self.nvfp4_out):
+            # E2M1 codes (two per byte), linear E4M3 scales and the FP32 global scale.
+            mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n // 2), stride=(n // 2, 1)))
+            mSF = cute.make_tensor(scales_ptr, cute.make_layout((m, n // 16), stride=(n // 16, 1)))
+            mGSF = cute.make_tensor(gsf_ptr, cute.make_layout(1))
+        else:
+            mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             cutlass.Float8E4M3FN,
@@ -588,6 +1051,16 @@ class Fp8BlockScaleLowMGemmKernel:
             cute.slice_(x_layout, (None, None, 0)),
             (self.mma_n, CTA_K),
         )
+        tma_atom_g, tma_tensor_g = None, None
+        if cutlass.const_expr(self.gated):
+            mG = cute.make_tensor(g_ptr, cute.make_layout((m, k), stride=(g_ld, 1)))
+            tma_atom_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mG,
+                cute.slice_(x_layout, (None, None, 0)),
+                (self.mma_n, CTA_K),
+            )
+        g_ring_bytes = self.x_stages * self.x_stage_bytes if self.gated else 128
 
         @cute.struct
         class SharedStorage:
@@ -623,7 +1096,13 @@ class Fp8BlockScaleLowMGemmKernel:
                 cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(sfb_layout)], 128
             ]
 
-        self.shared_storage = SharedStorage
+        @cute.struct
+        class GatedSharedStorage:
+            base: SharedStorage
+            # Gate ring (gated kernel): one BF16 gate tile per activation stage.
+            sG: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, g_ring_bytes], 128]
+
+        self.shared_storage = GatedSharedStorage if self.gated else SharedStorage
 
         self.kernel(
             tiled_mma,
@@ -639,6 +1118,10 @@ class Fp8BlockScaleLowMGemmKernel:
             sfa_layout,
             sfb_layout,
             x_layout,
+            tma_atom_g,
+            tma_tensor_g,
+            mSF,
+            mGSF,
         ).launch(
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self.threads, 1, 1),
@@ -665,6 +1148,10 @@ class Fp8BlockScaleLowMGemmKernel:
         sfa_layout: cute.Layout,
         sfb_layout: cute.Layout,
         x_layout: cute.Layout,
+        tma_atom_g: Optional[cute.CopyAtom],
+        mGt: Optional[cute.Tensor],
+        mSF: Optional[cute.Tensor],
+        mGSF: Optional[cute.Tensor],
     ):
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -688,6 +1175,11 @@ class Fp8BlockScaleLowMGemmKernel:
                 kt_start = kt_start + kt_rem
 
         storage = utils.SmemAllocator().allocate(self.shared_storage)
+        if cutlass.const_expr(self.gated):
+            g_smem = storage.sG.data_ptr()
+            storage = storage.base
+        else:
+            g_smem = storage.sXM.data_ptr()  # unused
         a_full = storage.a_full.data_ptr()
         a_empty = storage.a_empty.data_ptr()
         x_full = storage.x_full.data_ptr()
@@ -704,6 +1196,8 @@ class Fp8BlockScaleLowMGemmKernel:
         if warp_idx == _TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_x)
+            if cutlass.const_expr(self.gated):
+                cpasync.prefetch_descriptor(tma_atom_g)
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(self.a_stages):
                     cute.arch.mbarrier_init(a_full + i, 1)
@@ -768,18 +1262,39 @@ class Fp8BlockScaleLowMGemmKernel:
                 cute.group_modes(sX, 0, 2),
                 cute.group_modes(gX, 0, 2),
             )
+            tGsG, tGgG = None, None
+            if cutlass.const_expr(self.gated):
+                # Each gate tile is loaded with the activation tile it multiplies, on the
+                # same barrier, so it is also read only after the wait above.
+                sG = cute.make_tensor(cute.recast_ptr(g_smem, dtype=cutlass.BFloat16), x_layout)
+                gG = cute.local_tile(mGt, (self.mma_n, CTA_K), (0, None))
+                tGsG, tGgG = cpasync.tma_partition(
+                    tma_atom_g,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sG, 0, 2),
+                    cute.group_modes(gG, 0, 2),
+                )
+            stage_tx = self.x_stage_bytes * 2 if self.gated else self.x_stage_bytes
             for kt in cutlass.range(kt_count, unroll=1):
                 stage = kt % self.x_stages
                 if kt >= self.x_stages:
                     cute.arch.mbarrier_wait(x_empty + stage, ((kt // self.x_stages) & 1) ^ 1)
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(x_full + stage, self.x_stage_bytes)
+                    cute.arch.mbarrier_arrive_and_expect_tx(x_full + stage, stage_tx)
                 cute.copy(
                     tma_atom_x,
                     tXgX[(None, kt_start + kt)],
                     tXsX[(None, stage)],
                     tma_bar_ptr=x_full + stage,
                 )
+                if cutlass.const_expr(self.gated):
+                    cute.copy(
+                        tma_atom_g,
+                        tGgG[(None, kt_start + kt)],
+                        tGsG[(None, stage)],
+                        tma_bar_ptr=x_full + stage,
+                    )
         elif warp_idx == _MMA_WARP:
             self.mma_warp(
                 tiled_mma,
@@ -802,6 +1317,7 @@ class Fp8BlockScaleLowMGemmKernel:
             q = tidx - _QUANT_WARP0 * 32
             self.quantize_activations(
                 storage,
+                g_smem,
                 mWS,
                 q,
                 n_tile,
@@ -830,6 +1346,8 @@ class Fp8BlockScaleLowMGemmKernel:
                     tiled_mma,
                     storage,
                     mOut,
+                    mSF,
+                    mGSF,
                     m,
                     q,
                     n_tile,
@@ -936,6 +1454,7 @@ class Fp8BlockScaleLowMGemmKernel:
     def quantize_activations(
         self,
         storage,
+        g_smem: cute.Pointer,
         mWS: cute.Tensor,
         q: Int32,
         n_tile: Int32,
@@ -951,7 +1470,8 @@ class Fp8BlockScaleLowMGemmKernel:
         K tiles are dealt round-robin to ``quant_groups`` groups of warps, so several tiles
         are in flight at once; ring slot ``kt % stages`` is then always served by the same
         group. Within a tile, one work item is one (row, 32-element K group): four 16-byte
-        loads, one UE8M0 scale, 32 E4M3 bytes, split evenly over the group's lanes.
+        loads, one UE8M0 scale, 32 E4M3 bytes, split evenly over the group's lanes. The gated
+        kernel first replaces the 32 values by their BF16 products with the gate.
         """
         nthr = self.quant_threads
         w_exp = storage.w_exp.get_tensor(cute.make_layout(self.kt_max))
@@ -960,6 +1480,7 @@ class Fp8BlockScaleLowMGemmKernel:
         cute.arch.barrier(barrier_id=_QUANT_BARRIER_ID, number_of_threads=nthr)
 
         x_base = storage.sXM.data_ptr().toint()
+        g_base = g_smem.toint()
         b_base = storage.sB.data_ptr().toint()
         sf_base = storage.sSFB.data_ptr().toint()
         group_threads = 32 * self.warps_per_group
@@ -984,14 +1505,18 @@ class Fp8BlockScaleLowMGemmKernel:
                 ws = []
                 for v in cutlass.range_constexpr(4):
                     ws.append(_lds_v4_b32(xrow + ((v + rot) & 3) * 16))
+                if cutlass.const_expr(self.gated):
+                    grow = g_base + x_stage * self.x_stage_bytes + r * (CTA_K * 2) + g * 64
+                    for v in cutlass.range_constexpr(4):
+                        ws[v] = _gate_mul_bf16x8(*ws[v], *_lds_v4_b32(grow + ((v + rot) & 3) * 16))
                 amax = _abs_max_bf16x32([w for quad in ws for w in quad])
-                e_a = _ue8m0_of_amax(amax)
-                inv = _bf16x2_inv_scale(e_a)
+                e_a = ue8m0_of_amax(amax)
+                inv = bf16x2_inv_scale(e_a)
                 brow = bs + r * CTA_K
                 swz = r & 7
                 for v in cutlass.range_constexpr(4):
                     sub = (v + rot) & 3
-                    p0, p1 = _quant_bf16x8_to_e4m3(*ws[v], inv)
+                    p0, p1 = quant_bf16x8_to_e4m3(*ws[v], inv)
                     unit = g * 2 + (sub >> 1)
                     _sts_v2_b32(brow + ((unit ^ swz) << 4) + (sub & 1) * 8, p0, p1)
                 _sts_scale(ss + (r & 31) * 16 + (r >> 5) * 4 + g, e_a, e_w)
@@ -1001,12 +1526,21 @@ class Fp8BlockScaleLowMGemmKernel:
                 cute.arch.mbarrier_arrive(x_empty + x_stage)
                 cute.arch.mbarrier_arrive(b_full + b_stage)
 
+    def _out_value(self, acc):
+        """The stored BF16 value of one FP32 accumulator."""
+        out = acc.to(cutlass.BFloat16)
+        if self.sigmoid:
+            out = sigmoid_bf16(out)
+        return out
+
     @cute.jit
     def epilogue(
         self,
         tiled_mma: cute.TiledMma,
         storage,
         mOut: cute.Tensor,
+        mSF: Optional[cute.Tensor],
+        mGSF: Optional[cute.Tensor],
         m: Int32,
         q: Int32,
         n_tile: Int32,
@@ -1053,11 +1587,24 @@ class Fp8BlockScaleLowMGemmKernel:
             row0, _ = tTR_cAcc[0]
             if n_base + row0 >= self.n:
                 m_store = Int32(0)
+        # NVFP4 output: BF16 token rows staged in the quantized-activation ring, which is dead
+        # once the accumulator is complete.
+        stage_out = storage.sB.data_ptr().toint()
         if cutlass.const_expr(S == 1):
-            for i in cutlass.range_constexpr(nchunks * 4):
-                row, col = tTR_cAcc[i]
-                if col < m_store:
-                    mOut[col, n_base + row] = rAcc[i].to(cutlass.BFloat16)
+            if cutlass.const_expr(self.nvfp4_out):
+                for i in cutlass.range_constexpr(nchunks * 4):
+                    row, col = tTR_cAcc[i]
+                    if col < m:
+                        _sts_u16(
+                            stage_out + col * (MMA_M * 2) + row * 2, _f32_to_bf16_bits(rAcc[i])
+                        )
+                cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
+                self._store_nvfp4(stage_out, m, rank, m, n_tile, q, mOut, mSF, mGSF)
+            else:
+                for i in cutlass.range_constexpr(nchunks * 4):
+                    row, col = tTR_cAcc[i]
+                    if col < m_store:
+                        mOut[col, n_base + row] = self._out_value(rAcc[i])
         else:
             # Reduce-scatter over 4-column chunks: chunk c is owned by rank c % S. Every
             # thread holds one accumulator row. Partials for each owner are staged in the
@@ -1124,8 +1671,18 @@ class Fp8BlockScaleLowMGemmKernel:
                                 rAcc[4 * c + 3] = rAcc[4 * c + 3] + v3
                             for j in cutlass.range_constexpr(4):
                                 row, col = tTR_cAcc[4 * c + j]
-                                if col < m_store:
-                                    mOut[col, n_base + row] = rAcc[4 * c + j].to(cutlass.BFloat16)
+                                if cutlass.const_expr(self.nvfp4_out):
+                                    if col < m:
+                                        _sts_u16(
+                                            stage_out + col * (MMA_M * 2) + row * 2,
+                                            _f32_to_bf16_bits(rAcc[4 * c + j]),
+                                        )
+                                else:
+                                    if col < m_store:
+                                        mOut[col, n_base + row] = self._out_value(rAcc[4 * c + j])
+                if cutlass.const_expr(self.nvfp4_out):
+                    cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
+                    self._store_nvfp4(stage_out, my_chunks * 4, rank, m, n_tile, q, mOut, mSF, mGSF)
             if q == 0:
                 # The staging buffer must stay valid until the copies have read it.
                 _bulk_wait_read()
@@ -1146,7 +1703,8 @@ _MID_SMEM_CAPACITY = _SMEM_CAPACITY - 2048
 
 @dataclasses.dataclass(frozen=True)
 class MidMTactic:
-    """One mid-M specialization: ``mma_n`` padded tokens, cluster ``split_k``, ring depths."""
+    """One specialization of :class:`Fp8BlockScaleMidMGemmKernel`: ``mma_n`` padded tokens,
+    cluster ``split_k``, weight ring ``a_stages`` and activation ring ``b_stages``."""
 
     mma_n: int
     split_k: int
@@ -1165,39 +1723,52 @@ def _mid_mailbox_bytes(tactic: MidMTactic) -> int:
     return (tactic.split_k - 1) * _ceil_div(tactic.mma_n // 4, tactic.split_k) * MMA_M * 16
 
 
-def mid_smem_bytes(n: int, k: int, tactic: MidMTactic) -> int:
-    """Conservative host-side mirror of the mid-M kernel's shared-memory footprint."""
+def _mid_smem_capacity(fold_weight_scale: bool) -> int:
+    # The prequantized kernel follows the activation's producer, not a quantization kernel.
+    return _SMEM_CAPACITY if fold_weight_scale else _MID_SMEM_CAPACITY
+
+
+def mid_smem_bytes(n: int, k: int, tactic: MidMTactic, fold_weight_scale: bool = False) -> int:
+    """Conservative host-side mirror of the TMA-fed kernel's shared-memory footprint."""
     kt_max = _ceil_div(k // CTA_K, tactic.split_k)
     a_st = min(tactic.a_stages, kt_max)
     b_st = min(tactic.b_stages, kt_max)
     total = 8 * (2 * (a_st + b_st) + 5) + 4
     # The split-K mailbox reuses the weight ring once the mainloop is done.
     total = _align_up(total, 1024) + max(a_st * MMA_M * CTA_K, _mid_mailbox_bytes(tactic))
-    total = _align_up(total, 1024) + b_st * tactic.mma_n * CTA_K
-    total = _align_up(total, 128) + kt_max * 512
+    # The activation ring also stages the BF16 output tile.
+    total = _align_up(total, 1024) + max(b_st * tactic.mma_n * CTA_K, tactic.mma_n * MMA_M * 2)
+    total = _align_up(total, 128) + (512 if fold_weight_scale else kt_max * 512)
     total = _align_up(total, 128) + b_st * _sf_blocks(tactic.mma_n) * 512
     return total + 1024  # allocator slack
 
 
-def validate_mid_tactic(n: int, k: int, tactic: MidMTactic) -> None:
-    if tactic.mma_n not in SUPPORTED_MID_MMA_N:
-        raise ValueError(f"mma_n must be one of {SUPPORTED_MID_MMA_N}, got {tactic.mma_n}")
+def validate_mid_tactic(
+    n: int, k: int, tactic: MidMTactic, fold_weight_scale: bool = False
+) -> None:
+    supported = SUPPORTED_MMA_N if fold_weight_scale else SUPPORTED_MID_MMA_N
+    if tactic.mma_n not in supported:
+        raise ValueError(f"mma_n must be one of {supported}, got {tactic.mma_n}")
     if n % N_ALIGN or k % CTA_K:
         raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     if not 1 <= tactic.split_k <= min(16, k // CTA_K):
         raise ValueError(f"split_k={tactic.split_k} invalid for K={k}")
     if tactic.a_stages < 1 or tactic.b_stages < 1:
         raise ValueError("a_stages and b_stages must be >= 1")
-    need = mid_smem_bytes(n, k, tactic)
-    if need > _MID_SMEM_CAPACITY:
-        raise ValueError(f"tactic {tactic} needs {need} B of SMEM > {_SMEM_CAPACITY} B")
+    need = mid_smem_bytes(n, k, tactic, fold_weight_scale)
+    capacity = _mid_smem_capacity(fold_weight_scale)
+    if need > capacity:
+        raise ValueError(f"tactic {tactic} needs {need} B of SMEM > {capacity} B")
 
 
-def max_mid_a_stages(n: int, k: int, tactic: MidMTactic) -> int:
+def max_mid_a_stages(n: int, k: int, tactic: MidMTactic, fold_weight_scale: bool = False) -> int:
     kt_max = _ceil_div(k // CTA_K, tactic.split_k)
+    capacity = _mid_smem_capacity(fold_weight_scale)
     best = 1
     for a in range(1, kt_max + 1):
-        if mid_smem_bytes(n, k, dataclasses.replace(tactic, a_stages=a)) <= _MID_SMEM_CAPACITY:
+        if mid_smem_bytes(n, k, dataclasses.replace(tactic, a_stages=a), fold_weight_scale) <= (
+            capacity
+        ):
             best = a
     return best
 
@@ -1322,6 +1893,60 @@ def _min_s32(a, b, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _ldg_b32(addr, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fold_scales_x4(act4, w_exp, *, loc=None, ip=None):
+    """Four bytes ``clamp(e_act_i + w_exp - 127, 0, 254)`` of a packed word of four UE8M0
+    activation exponents (``_sts_scale`` of the low-M kernel, four at a time)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(act4, loc=loc, ip=ip), _iv(w_exp, loc=loc, ip=ip)],
+            "{\n"
+            ".reg .s32 a, v, r;\n"
+            "mov.b32 r, 0;\n"
+            + "".join(
+                f"bfe.u32 a, $1, {8 * i}, 8;\n"
+                "add.s32 v, a, $2;\n"
+                "sub.s32 v, v, 127;\n"
+                "max.s32 v, v, 0;\n"
+                "min.s32 v, v, 254;\n"
+                f"bfi.b32 r, v, r, {8 * i}, 8;\n"
+                for i in range(4)
+            )
+            + "mov.b32 $0, r;\n}",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sts_b32(addr, v, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _iv(v, loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
 class MxFp8QuantKernel:
     """``x`` BF16 ``[M, K]`` -> E4M3 ``[M, K]`` + UE8M0 1x32 scales for the mid-M GEMM.
 
@@ -1399,11 +2024,11 @@ class MxFp8QuantKernel:
                 sf_addr = xs_ptr.toint() + Int64(sf_off)
                 if r < m:
                     ws = [rX[it * 16 + i] for i in range(16)]
-                    e_a = _ue8m0_of_amax(_abs_max_bf16x32(ws))
-                    inv = _bf16x2_inv_scale(e_a)
+                    e_a = ue8m0_of_amax(_abs_max_bf16x32(ws))
+                    inv = bf16x2_inv_scale(e_a)
                     packed = []
                     for v in cutlass.range_constexpr(4):
-                        p0, p1 = _quant_bf16x8_to_e4m3(*ws[4 * v : 4 * v + 4], inv)
+                        p0, p1 = quant_bf16x8_to_e4m3(*ws[4 * v : 4 * v + 4], inv)
                         packed.extend((p0, p1))
                     dst = xq_ptr.toint() + Int64(r * self.k + g * SF_VEC)
                     _stg_v4_b32(dst, *packed[:4])
@@ -1413,25 +2038,52 @@ class MxFp8QuantKernel:
                     _stg_u8(sf_addr, Int32(127))
 
 
-class Fp8BlockScaleMidMGemmKernel:
-    """Swap-AB MXFP8 GEMM fed by pre-quantized FP8 activations (64 < M <= 256).
+class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
+    """Swap-AB MXFP8 GEMM fed by pre-quantized FP8 activations.
 
     Same weight path and split-K cluster as :class:`Fp8BlockScaleLowMGemmKernel`, but the
-    activation operand is the output of :class:`MxFp8QuantKernel`: warp 2 loads the
-    E4M3 tile with TMA (128B swizzle, i.e. directly in the UMMA B layout) and its scale
-    block with a bulk copy. The weight block scale goes into SFA (one UE8M0 per K tile,
-    replicated over the 128 rows), written once to SMEM before the mainloop. Warps 4-7 run
-    the epilogue in 32-column TMEM blocks; with ``split_k > 1`` each rank owns every
-    ``split_k``-th 4-token chunk and peers push partials with ``st.async`` into its
-    weight ring once every CTA of the cluster has finished its mainloop.
+    activation operand is already MXFP8: warp 2 loads the E4M3 tile with TMA (128B swizzle,
+    i.e. directly in the UMMA B layout). Warps 4-7 run the epilogue in TMEM blocks of up to 32
+    columns; with ``split_k > 1`` each rank owns every ``split_k``-th 4-token chunk and peers
+    push partials with ``st.async`` into its weight ring once every CTA of the cluster has
+    finished its mainloop. ``nvfp4_out`` builds the NVFP4-output variant (:meth:`call_nvfp4`):
+    the staged BF16 output tile is stored as its NVFP4 quantization instead.
+
+    The weight block scale is applied in one of two ways:
+
+    * mid-M path (``mma_n`` in :data:`SUPPORTED_MID_MMA_N`, activation from
+      :class:`MxFp8QuantKernel`): it goes into SFA (one UE8M0 per K tile, replicated over the
+      128 rows), written once to SMEM before the mainloop, and warp 2 bulk-copies the
+      activation scale block next to each E4M3 tile.
+    * ``fold_weight_scale`` (prequantized low-M path, ``mma_n`` in :data:`SUPPORTED_MMA_N`,
+      activation scales in the R128c4 layout of an upstream producer): warp 3 folds it into
+      the activation scales (``sfb = clamp(e_act + e_w - 127, 0, 254)``) and SFA is a constant
+      1.0, the low-M kernel's scale arithmetic. With the low-M kernel's ``mma_n``, split-K and
+      K-tile order the output is then bitwise the low-M kernel's on the BF16 activation the
+      operand quantizes.
     """
 
     _THREADS = 256
     _B_WARP = 2
+    _SF_WARP = 3
     _EPI_WARP0 = 4
 
-    def __init__(self, n: int, k: int, tactic: MidMTactic, use_pdl: bool):
-        validate_mid_tactic(n, k, tactic)
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        tactic: MidMTactic,
+        use_pdl: bool,
+        nvfp4_out: bool = False,
+        fold_weight_scale: bool = False,
+    ):
+        validate_mid_tactic(n, k, tactic, fold_weight_scale)
+        if nvfp4_out and n % MMA_M:
+            raise ValueError(f"the NVFP4 output needs N={n} to be a multiple of {MMA_M}")
+        if nvfp4_out and fold_weight_scale:
+            raise ValueError("the NVFP4 output is not combined with fold_weight_scale")
+        self.nvfp4_out = nvfp4_out
+        self.fold_weight_scale = fold_weight_scale
         self.n = n
         self.k = k
         self.mma_n = tactic.mma_n
@@ -1454,6 +2106,9 @@ class Fp8BlockScaleMidMGemmKernel:
         # Accumulator columns plus SFA / SFB columns, rounded to a power of two.
         cols = self.mma_n + 2 * _SF_TMEM_COLS
         self.tmem_cols = 1 << (cols - 1).bit_length()
+        self.blk = min(32, self.mma_n)
+        # SFA stages: one per K tile, or the constant 1.0 when the weight scale is folded.
+        self.sfa_stages = 1 if fold_weight_scale else self.kt_max
 
     @cute.jit
     def __call__(
@@ -1463,6 +2118,39 @@ class Fp8BlockScaleMidMGemmKernel:
         xs_ptr: cute.Pointer,
         ws_ptr: cute.Pointer,
         out_ptr: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
+        self._launch(w_ptr, xq_ptr, xs_ptr, ws_ptr, out_ptr, None, None, m, stream)
+
+    @cute.jit
+    def call_nvfp4(
+        self,
+        w_ptr: cute.Pointer,
+        xq_ptr: cute.Pointer,
+        xs_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        codes_ptr: cute.Pointer,
+        scales_ptr: cute.Pointer,
+        gsf_ptr: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
+        """NVFP4-output launch: E2M1 codes ``uint8 [m, N / 2]`` and linear E4M3 scales ``uint8
+        [m * N / 16]`` of the BF16 output, quantized with the FP32 global scale at
+        ``gsf_ptr``."""
+        self._launch(w_ptr, xq_ptr, xs_ptr, ws_ptr, codes_ptr, scales_ptr, gsf_ptr, m, stream)
+
+    @cute.jit
+    def _launch(
+        self,
+        w_ptr: cute.Pointer,
+        xq_ptr: cute.Pointer,
+        xs_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        scales_ptr,
+        gsf_ptr,
         m: Int32,
         stream: cuda.CUstream,
     ):
@@ -1476,7 +2164,14 @@ class Fp8BlockScaleMidMGemmKernel:
                 stride=(MMA_M * 4, (1, 4 * n)),
             ),
         )
-        mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
+        mSF, mGSF = None, None
+        if cutlass.const_expr(self.nvfp4_out):
+            # E2M1 codes (two per byte), linear E4M3 scales and the FP32 global scale.
+            mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n // 2), stride=(n // 2, 1)))
+            mSF = cute.make_tensor(scales_ptr, cute.make_layout((m, n // 16), stride=(n // 16, 1)))
+            mGSF = cute.make_tensor(gsf_ptr, cute.make_layout(1))
+        else:
+            mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             cutlass.Float8E4M3FN,
@@ -1495,7 +2190,7 @@ class Fp8BlockScaleMidMGemmKernel:
             tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, self.b_stages
         )
         sfa_layout = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma, self.mma_tiler, SF_VEC, self.kt_max
+            tiled_mma, self.mma_tiler, SF_VEC, self.sfa_stages
         )
         sfb_layout = blockscaled_utils.make_smem_layout_sfb(
             tiled_mma, self.mma_tiler, SF_VEC, self.b_stages
@@ -1566,6 +2261,8 @@ class Fp8BlockScaleMidMGemmKernel:
             b_layout,
             sfa_layout,
             sfb_layout,
+            mSF,
+            mGSF,
         ).launch(
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self._THREADS, 1, 1),
@@ -1593,6 +2290,8 @@ class Fp8BlockScaleMidMGemmKernel:
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
         sfb_layout: cute.Layout,
+        mSF: Optional[cute.Tensor],
+        mGSF: Optional[cute.Tensor],
     ):
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1629,7 +2328,8 @@ class Fp8BlockScaleMidMGemmKernel:
                     cute.arch.mbarrier_init(a_full + i, 1)
                     cute.arch.mbarrier_init(a_empty + i, 1)
                 for i in cutlass.range_constexpr(self.b_stages):
-                    cute.arch.mbarrier_init(b_full + i, 1)
+                    # The E4M3 tile (TMA, expect_tx) and, folded, its scales (warp 3).
+                    cute.arch.mbarrier_init(b_full + i, 2 if self.fold_weight_scale else 1)
                     cute.arch.mbarrier_init(b_empty + i, 1)
                 cute.arch.mbarrier_init(storage.acc_full, 1)
                 cute.arch.mbarrier_init(storage.tmem_ready, 1)
@@ -1671,7 +2371,8 @@ class Fp8BlockScaleMidMGemmKernel:
                     cache_policy=Int64(_EVICT_FIRST),
                 )
         elif warp_idx == self._B_WARP:
-            # Activation producer: E4M3 tile by TMA plus its scale block by a bulk copy.
+            # Activation producer: E4M3 tile by TMA plus (not folded) its scale block by a bulk
+            # copy.
             if cutlass.const_expr(self.use_pdl):
                 griddepcontrol_wait()
             sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
@@ -1692,21 +2393,27 @@ class Fp8BlockScaleMidMGemmKernel:
                 if kt >= self.b_stages:
                     cute.arch.mbarrier_wait(b_empty + stage, ((kt // self.b_stages) & 1) ^ 1)
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        b_full + stage, self.b_stage_bytes + self.sfb_stage_bytes
-                    )
-                    _bulk_load_g2s(
-                        sfb_base + stage * self.sfb_stage_bytes,
-                        xs_ptr.toint() + Int64((kt_start + kt) * self.sfb_stage_bytes),
-                        self.sfb_stage_bytes,
-                        (b_full + stage).toint(),
-                    )
+                    if cutlass.const_expr(self.fold_weight_scale):
+                        cute.arch.mbarrier_arrive_and_expect_tx(b_full + stage, self.b_stage_bytes)
+                    else:
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            b_full + stage, self.b_stage_bytes + self.sfb_stage_bytes
+                        )
+                        _bulk_load_g2s(
+                            sfb_base + stage * self.sfb_stage_bytes,
+                            xs_ptr.toint() + Int64((kt_start + kt) * self.sfb_stage_bytes),
+                            self.sfb_stage_bytes,
+                            (b_full + stage).toint(),
+                        )
                 cute.copy(
                     tma_atom_b,
                     tBgB[(None, 0, kt_start + kt, 0)],
                     tBsB[(None, stage)],
                     tma_bar_ptr=b_full + stage,
                 )
+        elif warp_idx == self._SF_WARP:
+            if cutlass.const_expr(self.fold_weight_scale):
+                self.scale_warp(storage, xs_ptr, mWS, m, n_tile, kt_start, kt_count)
         elif warp_idx == _MMA_WARP:
             self.mma_warp(
                 tiled_mma,
@@ -1725,11 +2432,92 @@ class Fp8BlockScaleMidMGemmKernel:
                 tiled_mma,
                 storage,
                 mOut,
+                mSF,
+                mGSF,
                 m,
                 tidx - 32 * self._EPI_WARP0,
                 n_tile,
                 rank,
             )
+
+    @cute.jit
+    def scale_warp(
+        self,
+        storage,
+        xs_ptr: cute.Pointer,
+        mWS: cute.Tensor,
+        m: Int32,
+        n_tile: Int32,
+        kt_start: Int32,
+        kt_count: Int32,
+    ):
+        """Folded SFB of every K tile: lane r (and r + 32) writes token row r's four exponents
+        ``clamp(e_act + e_w - 127, 0, 254)`` at ``(r % 32) * 16 + (r // 32) * 4``; rows past M
+        (zero codes) get ``e_act = 127``. The activation exponents of one row and K tile are one
+        word of the R128c4 scale (rows below 128: atom ``kt``, byte ``(r % 32) * 16 +
+        (r // 32) * 4``)."""
+        lane = cute.arch.lane_idx()
+        b_full = storage.b_full.data_ptr()
+        b_empty = storage.b_empty.data_ptr()
+        sf_base = storage.sSFB.data_ptr().toint()
+        # Weight block exponents of this CTA's K tiles (static: before the wait).
+        w_exps = []
+        for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
+            e = Int32(127)
+            if lane + 32 * j < kt_count:
+                e = Int32(mWS[n_tile, kt_start + lane + 32 * j])
+            w_exps.append(e)
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        rows_per_lane = _ceil_div(self.mma_n, 32)
+        # Issue every activation exponent load first (one word = the 4 groups of a K tile).
+        acts = []
+        for i in cutlass.range_constexpr(rows_per_lane):
+            r = lane + 32 * i
+            row_words = []
+            for kt in cutlass.range_constexpr(self.kt_max):
+                v = Int32(0x7F7F7F7F)
+                if (r < m) & (kt < kt_count) & (r < self.mma_n):
+                    v = _ldg_b32(
+                        xs_ptr.toint() + Int64((kt_start + kt) * 512 + (r & 31) * 16 + (r >> 5) * 4)
+                    )
+                row_words.append(v)
+            acts.append(row_words)
+        if cutlass.const_expr(self.b_stages >= self.kt_max):
+            # Every K tile has its own stage: write all scales, fence once, release all tiles.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + kt * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_warp()
+            for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
+                if lane + 32 * j < kt_count:
+                    cute.arch.mbarrier_arrive(b_full + lane + 32 * j)
+        else:
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    stage = kt % self.b_stages
+                    if cutlass.const_expr(kt >= self.b_stages):
+                        cute.arch.mbarrier_wait(b_empty + stage, ((kt // self.b_stages) & 1) ^ 1)
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + stage * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(b_full + stage)
 
     @cute.jit
     def mma_warp(
@@ -1751,23 +2539,28 @@ class Fp8BlockScaleMidMGemmKernel:
         b_empty = storage.b_empty.data_ptr()
         lane = cute.arch.lane_idx()
 
-        # SFA for every K tile: the weight block exponent replicated over 128 rows x 4
-        # groups. Weights are static, so this needs no wait on the previous grid.
+        # SFA: for every K tile the weight block exponent replicated over 128 rows x 4 groups,
+        # or (folded into SFB) one stage of the constant 1.0. Weights are static, so this needs
+        # no wait on the previous grid.
         sfa_base = storage.sSFA.data_ptr().toint()
-        exps = []
-        for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
-            e = Int32(127)
-            if lane + 32 * j < kt_count:
-                e = Int32(mWS[n_tile, kt_start + lane + 32 * j])
-            exps.append(e)
-        for kt in cutlass.range(kt_count, unroll=1):
-            e = cute.arch.shuffle_sync(exps[0], kt & 31)
-            for j in cutlass.range_constexpr(1, len(exps)):
-                ej = cute.arch.shuffle_sync(exps[j], kt & 31)
-                if (kt >> 5) == j:
-                    e = ej
-            word = e * Int32(0x01010101)
-            _sts_v4_b32(sfa_base + kt * 512 + lane * 16, word, word, word, word)
+        if cutlass.const_expr(self.fold_weight_scale):
+            one4 = Int32(0x7F7F7F7F)
+            _sts_v4_b32(sfa_base + lane * 16, one4, one4, one4, one4)
+        else:
+            exps = []
+            for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
+                e = Int32(127)
+                if lane + 32 * j < kt_count:
+                    e = Int32(mWS[n_tile, kt_start + lane + 32 * j])
+                exps.append(e)
+            for kt in cutlass.range(kt_count, unroll=1):
+                e = cute.arch.shuffle_sync(exps[0], kt & 31)
+                for j in cutlass.range_constexpr(1, len(exps)):
+                    ej = cute.arch.shuffle_sync(exps[j], kt & 31)
+                    if (kt >> 5) == j:
+                        e = ej
+                word = e * Int32(0x01010101)
+                _sts_v4_b32(sfa_base + kt * 512 + lane * 16, word, word, word, word)
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_warp()
 
@@ -1805,27 +2598,59 @@ class Fp8BlockScaleMidMGemmKernel:
         num_kphases = cute.size(tCrA, mode=[2])
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        for kt in cutlass.range(kt_count, unroll=1):
-            a_stage = kt % self.a_stages
-            b_stage = kt % self.b_stages
-            cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
-            cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
-            cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
-            cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
-            for kp in cutlass.range_constexpr(num_kphases):
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc,
-                    tCrA[(None, None, kp, a_stage)],
-                    tCrB[(None, None, kp, b_stage)],
-                    tCtAcc,
-                )
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            with cute.arch.elect_one():
-                tcgen05.commit(a_empty + a_stage)
-                tcgen05.commit(b_empty + b_stage)
+        if cutlass.const_expr(self.fold_weight_scale):
+            cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, 0)], tCtSFA_s2t)
+            # Fully unrolled over the largest K-tile count; the MMA descriptor fields are set
+            # outside the per-tile predicate (a rank with one K tile fewer skips the last tile's
+            # work), and only stages that are refilled are released.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                a_stage = kt % self.a_stages
+                b_stage = kt % self.b_stages
+                live = kt < kt_count
+                if live:
+                    cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                    cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                    cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
+                for kp in cutlass.range_constexpr(num_kphases):
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                    if live:
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[(None, None, kp, a_stage)],
+                            tCrB[(None, None, kp, b_stage)],
+                            tCtAcc,
+                        )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if live:
+                    with cute.arch.elect_one():
+                        if cutlass.const_expr(kt + self.a_stages < self.kt_max):
+                            tcgen05.commit(a_empty + a_stage)
+                        if cutlass.const_expr(kt + self.b_stages < self.kt_max):
+                            tcgen05.commit(b_empty + b_stage)
+        else:
+            for kt in cutlass.range(kt_count, unroll=1):
+                a_stage = kt % self.a_stages
+                b_stage = kt % self.b_stages
+                cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
+                cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
+                for kp in cutlass.range_constexpr(num_kphases):
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, a_stage)],
+                        tCrB[(None, None, kp, b_stage)],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                with cute.arch.elect_one():
+                    tcgen05.commit(a_empty + a_stage)
+                    tcgen05.commit(b_empty + b_stage)
         with cute.arch.elect_one():
             tcgen05.commit(storage.acc_full)
 
@@ -1838,12 +2663,15 @@ class Fp8BlockScaleMidMGemmKernel:
         tiled_mma: cute.TiledMma,
         storage,
         mOut: cute.Tensor,
+        mSF: Optional[cute.Tensor],
+        mGSF: Optional[cute.Tensor],
         m: Int32,
         q: Int32,
         n_tile: Int32,
         rank: Int32,
     ):
-        """TMEM -> registers (32-column blocks) -> token-major SMEM tile -> 16-byte stores.
+        """TMEM -> registers (``blk``-column blocks) -> token-major SMEM tile -> 16-byte stores
+        (BF16) or :meth:`_store_nvfp4`.
 
         With ``split_k > 1`` rank ``r`` reduces every chunk ``c`` (4 tokens) with
         ``c % split_k == r``; peers push their FP32 partials with ``st.async`` into its
@@ -1860,7 +2688,7 @@ class Fp8BlockScaleMidMGemmKernel:
         tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
         tAcc = tCtAcc[((None, None), 0, 0)]
         cAcc = cute.make_identity_tensor((MMA_M, self.mma_n))
-        blk = 32
+        blk = self.blk
         tiled_t2r = tcgen05.make_tmem_copy(
             cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(blk)), cutlass.Float32),
             cute.local_tile(tAcc, (MMA_M, blk), (0, 0)),
@@ -1942,11 +2770,14 @@ class Fp8BlockScaleMidMGemmKernel:
         # cover one row, so every store is a full line.
         if cutlass.const_expr(S == 1):
             cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
-            for p in cutlass.range(q, m * store_cols, MMA_M, unroll=1):
-                t = p >> 4
-                col = (p & 15) * 16
-                w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
-                _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
+            if cutlass.const_expr(self.nvfp4_out):
+                self._store_nvfp4(out_base, m, rank, m, n_tile, q, mOut, mSF, mGSF)
+            else:
+                for p in cutlass.range(q, m * store_cols, MMA_M, unroll=1):
+                    t = p >> 4
+                    col = (p & 15) * 16
+                    w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
+                    _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
         else:
             # Owned chunks c = rank + i * S; the column of element v of chunk c is 4c + v.
             active = (m + 3) >> 2
@@ -1976,14 +2807,17 @@ class Fp8BlockScaleMidMGemmKernel:
                                 _f32_to_bf16_bits(acc[v]),
                             )
                 cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
-                # The r-th owned row is token 4 * (rank + (r // 4) * S) + r % 4.
-                for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
-                    r = p >> 4
-                    t = 4 * (rank + (r >> 2) * S) + (r & 3)
-                    if t < m:
-                        col = (p & 15) * 16
-                        w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
-                        _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
+                if cutlass.const_expr(self.nvfp4_out):
+                    self._store_nvfp4(out_base, my_chunks * 4, rank, m, n_tile, q, mOut, mSF, mGSF)
+                else:
+                    # The r-th owned row is token 4 * (rank + (r // 4) * S) + r % 4.
+                    for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
+                        r = p >> 4
+                        t = 4 * (rank + (r >> 2) * S) + (r & 3)
+                        if t < m:
+                            col = (p & 15) * 16
+                            w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
+                            _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
 
 
 # ---------------------------------------------------------------------------
@@ -2028,7 +2862,9 @@ def _tile_n(n: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class _ShapeTables:
-    """Per-architecture tactics and selection limits, keyed by ``(N in whole tiles, K)``."""
+    """Measured per-architecture overrides of the natural-dimension rule below (tactics:
+    :func:`_rule_split`, :func:`default_tactic`, :func:`default_mid_tactic`; limits:
+    :func:`max_m_for`, :func:`low_m_max_for`), keyed by ``(N in whole tiles, K)``."""
 
     #: (N, K, mma_n) -> (split_k, x_stages, b_stages, quant_warps, quant_groups) of the
     #: low-M kernel; the weight ring takes the remaining shared memory.
@@ -2041,8 +2877,14 @@ class _ShapeTables:
     #: other shapes.
     max_m: dict
     default_max_m: int
-    #: (N, K) -> largest M of the low-M kernel (mid-M kernel above); ``LOW_M_MAX`` otherwise.
+    #: (N, K) -> largest M of the low-M kernel (mid-M kernel above); the rule otherwise.
     low_m_cutover: dict
+    #: (N, K) -> ``((min_m, max_m, kernel, split_k), ...)``: the M ranges for which callers
+    #: producing an NVFP4 activation select the NVFP4-output variant over this GEMM followed by
+    #: ``fp4_quantize``, with the kernel (``"low"`` / ``"mid"``) and cluster split-K it runs
+    #: (``None``: that kernel's default tactic; see :func:`nvfp4_out_tactic`). None for other
+    #: shapes. Independent of ``max_m``, which limits the BF16 GEMM.
+    nvfp4_out_route: dict = dataclasses.field(default_factory=dict)
 
 
 # SM100 / SM103, tuned on GB300 for the Kimi-K3 decode projections (CUDA graph, weights not
@@ -2309,11 +3151,22 @@ _SM107_TABLES = _ShapeTables(
         (7168, 3584): 32,
         (3072, 7168): 32,
         (2176, 7168): 32,
+        (768, 7168): LOW_M_MAX,
+        (7168, 768): LOW_M_MAX,
         (6144, 7168): 32,
+        (7168, 1536): LOW_M_MAX,
+        (1536, 7168): LOW_M_MAX,
+    },
+    # MoE latent down feeding the NVFP4 routed experts, which runs on a side stream next to the
+    # router GEMM and the routing kernels: measured on Rubin with the routing beside it (CUDA
+    # graph, cold weights), narrower grids than the standalone optimum (84-112 CTAs up to 96
+    # tokens) and the NVFP4 output beat the GEMM + ``fp4_quantize`` at every M up to 256.
+    nvfp4_out_route={
+        (3584, 7168): ((1, 16, "low", 3), (17, 96, "mid", 4), (97, 256, "mid", None)),
     },
 )
 
-#: Minimum weight-ring depth the heuristic keeps when growing the activation ring.
+#: Minimum weight-ring depth the rule keeps when growing the activation ring.
 _MIN_A_STAGES = 6
 #: Rule for the cluster split-K of shapes without measured tactics: the largest split whose
 #: grid stays within this fraction of the SMs, with at least this many K tiles per CTA (low-M
@@ -2390,6 +3243,30 @@ def kernel_max_m_for(n: int, k: int) -> int:
     return min(max_m_for(n, k), low_m_max_for(n, k))
 
 
+def _nvfp4_out_route(n: int, k: int) -> tuple:
+    if not _is_supported_device(torch.cuda.current_device()) or n % MMA_M or k % CTA_K:
+        return ()
+    return _tables().nvfp4_out_route.get((n, k), ())
+
+
+def nvfp4_out_max_m_for(n: int, k: int) -> int:
+    """Largest M for which a caller that needs the NVFP4 quantization of this GEMM's output
+    selects :func:`run_low_m_gemm_nvfp4` on the current device (0: never; the GEMM followed by
+    ``fp4_quantize`` then serves it)."""
+    return max((hi for _, hi, _, _ in _nvfp4_out_route(n, k)), default=0)
+
+
+def nvfp4_out_tactic(m: int, n: int, k: int) -> "LowMTactic | MidMTactic | None":
+    """Tactic of the NVFP4-output variant for M tokens from the current device's route
+    (``None`` where the route does not select it)."""
+    for lo, hi, kernel, split_k in _nvfp4_out_route(n, k):
+        if lo <= m <= hi:
+            if split_k is None:
+                return default_tactic(m, n, k) if kernel == "low" else default_mid_tactic(m, n, k)
+            return split_tactic(m, n, k, split_k, mid=kernel == "mid")
+    return None
+
+
 @functools.cache
 def _rule_split(n: int, k: int, mid: bool) -> int:
     """Cluster split-K of the low-M (``mid``: mid-M) kernel for an ``[N, K]`` weight without
@@ -2460,8 +3337,44 @@ def default_tactic(m: int, n: int, k: int) -> LowMTactic:
 
 
 @functools.cache
+def gated_tactic(m: int, n: int, k: int) -> LowMTactic:
+    """:func:`default_tactic` with room for the gate ring: the activation ring (and with it the
+    gate ring) shortened to whole quantization groups until the weight ring keeps the rule's
+    minimum depth, and the weight ring shortened if it still does not fit.
+
+    Split-K and the quantization layout are unchanged (ring depths only change the schedule), so
+    the gated GEMM rounds exactly like the plain GEMM on ``bf16(x * gate)``.
+    """
+    base = default_tactic(m, n, k)
+    kt_max = _ceil_div(k // CTA_K, base.split_k)
+    groups = base.quant_groups
+    best = None
+    for x_stages in (base.x_stages, 8, 4):
+        if x_stages > base.x_stages or (x_stages < kt_max and x_stages % groups):
+            continue
+        tactic = dataclasses.replace(base, x_stages=x_stages)
+        a_stages = min(base.a_stages, max_a_stages(n, k, tactic, gated=True))
+        tactic = dataclasses.replace(tactic, a_stages=a_stages)
+        if best is None or tactic.a_stages > best.a_stages:
+            best = tactic
+        if tactic.a_stages >= min(_MIN_A_STAGES, kt_max):
+            break
+    validate_tactic(n, k, best, gated=True)
+    return best
+
+
+@functools.cache
+def _gated_tactic_fits(m: int, n: int, k: int) -> bool:
+    try:
+        gated_tactic(m, n, k)
+    except ValueError:
+        return False
+    return True
+
+
+@functools.cache
 def default_mid_tactic(m: int, n: int, k: int) -> MidMTactic:
-    """Deterministic mid-M tactic: tuned table first, heuristic otherwise."""
+    """Deterministic mid-M tactic: measured table first, the rule otherwise."""
     mma_n = mid_mma_n_for(m)
     tables = _tables()
     tuned = tables.mid_m_tuned.get((_tile_n(n), k, mma_n)) or tables.mid_m_default.get(
@@ -2483,6 +3396,41 @@ def default_mid_tactic(m: int, n: int, k: int) -> MidMTactic:
     return tactic
 
 
+def split_tactic(m: int, n: int, k: int, split_k: int, mid: bool) -> "LowMTactic | MidMTactic":
+    """The default tactic for M tokens with ``split_k`` cluster ranks instead of the tuned count:
+    the low-M kernel's (its ring depths rounded down to whole quantization groups) or, with
+    ``mid``, the mid-M kernel's (4 activation stages, fewer if they do not fit)."""
+    if mid:
+        for b_stages in (4, 3, 2):
+            base = MidMTactic(
+                mma_n=mid_mma_n_for(m), split_k=split_k, a_stages=1, b_stages=b_stages
+            )
+            tactic = dataclasses.replace(base, a_stages=max_mid_a_stages(n, k, base))
+            try:
+                validate_mid_tactic(n, k, tactic)
+            except ValueError:
+                continue
+            return tactic
+        raise ValueError(f"no mid-M tactic with split_k={split_k} for M={m}, N={n}, K={k}")
+    base = default_tactic(m, n, k)
+    kt_max = _ceil_div(k // CTA_K, split_k)
+    groups = base.quant_groups
+
+    def whole_groups(stages: int) -> int:
+        return max(groups, min(stages, kt_max) // groups * groups)
+
+    tactic = dataclasses.replace(
+        base,
+        split_k=split_k,
+        a_stages=1,
+        x_stages=whole_groups(base.x_stages),
+        b_stages=max(2, whole_groups(base.b_stages)),
+    )
+    tactic = dataclasses.replace(tactic, a_stages=max_a_stages(n, k, tactic))
+    validate_tactic(n, k, tactic)
+    return tactic
+
+
 def _dummy_ptr(dtype):
     return make_ptr(dtype, 1 << 20, cute.AddressSpace.gmem, assumed_align=16)
 
@@ -2491,19 +3439,47 @@ def _gmem_ptr(dtype, tensor: torch.Tensor):
     return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
 
 
+def _dummy_f32_ptr():
+    return make_ptr(cutlass.Float32, 1 << 20, cute.AddressSpace.gmem, assumed_align=4)
+
+
+def _f32_ptr(tensor: torch.Tensor):
+    return make_ptr(cutlass.Float32, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+
+
 def _current_stream(device: torch.device) -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
 @functools.cache
-def _compiled_kernel(n: int, k: int, tactic: LowMTactic, use_pdl: bool):
-    kernel = Fp8BlockScaleLowMGemmKernel(n, k, tactic, use_pdl)
+def _compiled_kernel(n: int, k: int, tactic: LowMTactic, use_pdl: bool, gated: bool, sigmoid: bool):
+    kernel = Fp8BlockScaleLowMGemmKernel(n, k, tactic, use_pdl, gated=gated, sigmoid=sigmoid)
+    w_ptr = _dummy_ptr(cutlass.Float8E4M3FN)
+    x_ptr = _dummy_ptr(cutlass.BFloat16)
+    tail = (
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.BFloat16),
+        Int32(1),
+        _current_stream(torch.device("cuda")),
+    )
+    if gated:
+        return cute.compile(
+            kernel.call_gated, w_ptr, x_ptr, _dummy_ptr(cutlass.BFloat16), Int32(k), *tail
+        )
+    return cute.compile(kernel, w_ptr, x_ptr, *tail)
+
+
+@functools.cache
+def _compiled_nvfp4_kernel(n: int, k: int, tactic: LowMTactic, use_pdl: bool):
+    kernel = Fp8BlockScaleLowMGemmKernel(n, k, tactic, use_pdl, nvfp4_out=True)
     return cute.compile(
-        kernel,
+        kernel.call_nvfp4,
         _dummy_ptr(cutlass.Float8E4M3FN),
         _dummy_ptr(cutlass.BFloat16),
         _dummy_ptr(cutlass.Uint8),
-        _dummy_ptr(cutlass.BFloat16),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_f32_ptr(),
         Int32(1),
         _current_stream(torch.device("cuda")),
     )
@@ -2523,21 +3499,39 @@ def _compiled_quant(k: int, sf_blocks: int, use_pdl: bool):
 
 
 @functools.cache
-def _compiled_mid_kernel(n: int, k: int, tactic: MidMTactic, use_pdl: bool):
-    kernel = Fp8BlockScaleMidMGemmKernel(n, k, tactic, use_pdl)
-    return cute.compile(
-        kernel,
-        _dummy_ptr(cutlass.Float8E4M3FN),
-        _dummy_ptr(cutlass.Float8E4M3FN),
-        _dummy_ptr(cutlass.Uint8),
-        _dummy_ptr(cutlass.Uint8),
-        _dummy_ptr(cutlass.BFloat16),
-        Int32(1),
-        _current_stream(torch.device("cuda")),
+def _compiled_mid_kernel(
+    n: int,
+    k: int,
+    tactic: MidMTactic,
+    use_pdl: bool,
+    nvfp4_out: bool,
+    fold_weight_scale: bool = False,
+):
+    kernel = Fp8BlockScaleMidMGemmKernel(
+        n, k, tactic, use_pdl, nvfp4_out=nvfp4_out, fold_weight_scale=fold_weight_scale
     )
+    head = (
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.Uint8),
+    )
+    tail = (Int32(1), _current_stream(torch.device("cuda")))
+    if nvfp4_out:
+        return cute.compile(
+            kernel.call_nvfp4,
+            *head,
+            _dummy_ptr(cutlass.Uint8),
+            _dummy_ptr(cutlass.Uint8),
+            _dummy_f32_ptr(),
+            *tail,
+        )
+    return cute.compile(kernel, *head, _dummy_ptr(cutlass.BFloat16), *tail)
 
 
-def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool) -> None:
+def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) -> None:
+    """The mid-M path into ``out`` (BF16), or with ``nvfp4 = (scales, global_sf)`` its NVFP4
+    output (``out`` the codes)."""
     m, k = x.shape
     n = w.shape[0]
     sf_blocks = _sf_blocks(tactic.mma_n)
@@ -2551,15 +3545,104 @@ def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool) -> None:
         Int32(m),
         stream,
     )
-    _compiled_mid_kernel(n, k, tactic, use_pdl)(
+    gemm = _compiled_mid_kernel(n, k, tactic, use_pdl, nvfp4 is not None)
+    operands = (
+        _gmem_ptr(cutlass.Float8E4M3FN, w),
+        _gmem_ptr(cutlass.Float8E4M3FN, xq),
+        _gmem_ptr(cutlass.Uint8, xs),
+        _gmem_ptr(cutlass.Uint8, w_scale),
+    )
+    if nvfp4 is None:
+        gemm(*operands, _gmem_ptr(cutlass.BFloat16, out), Int32(m), stream)
+    else:
+        scales, global_sf = nvfp4
+        gemm(
+            *operands,
+            _gmem_ptr(cutlass.Uint8, out),
+            _gmem_ptr(cutlass.Uint8, scales),
+            _f32_ptr(global_sf),
+            Int32(m),
+            stream,
+        )
+
+
+#: Weight-ring depth :func:`default_prequantized_tactic` keeps before it shortens the activation
+#: ring.
+_PQ_MIN_A_STAGES = 6
+
+
+@functools.cache
+def default_prequantized_tactic(m: int, n: int, k: int) -> MidMTactic:
+    """The low-M kernel's ``mma_n`` and split-K for ``(M, N, K)`` (same bits) and the deepest
+    weight ring that fits next to the activation ring of the prequantized kernel. The activation
+    ring holds every K tile of the CTA unless that leaves fewer than ``_PQ_MIN_A_STAGES`` weight
+    stages; then it is the deepest ring that does."""
+    base = default_tactic(m, n, k)
+    kt_max = _ceil_div(k // CTA_K, base.split_k)
+    best = None
+    for b_stages in range(kt_max, 0, -1):
+        t = MidMTactic(mma_n=base.mma_n, split_k=base.split_k, a_stages=1, b_stages=b_stages)
+        t = dataclasses.replace(t, a_stages=max_mid_a_stages(n, k, t, fold_weight_scale=True))
+        if mid_smem_bytes(n, k, t, fold_weight_scale=True) > _SMEM_CAPACITY:
+            continue
+        best = best or t
+        if t.a_stages >= min(_PQ_MIN_A_STAGES, kt_max):
+            return t
+    if best is None:
+        raise ValueError(f"no prequantized tactic fits for M={m}, N={n}, K={k}")
+    return best
+
+
+def precompile_prequantized(n: int, k: int, max_m: int) -> int:
+    """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
+    an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
+    tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
+    for tactic in tactics:
+        _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False, fold_weight_scale=True)
+    return len(tactics)
+
+
+def run_low_m_gemm_prequantized(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tactic: MidMTactic | None = None,
+    use_pdl: bool = True,
+) -> torch.Tensor:
+    """Launch ``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` on the current stream: bitwise
+    :func:`run_low_m_gemm` on the BF16 activation that ``(xq, xs)`` quantizes (the TMA-fed
+    kernel with ``fold_weight_scale``).
+
+    Args:
+        xq: ``[M, K]`` contiguous E4M3 activation, ``1 <= M <= low_m_max_for(N, K)``.
+        xs: its UE8M0 1x32 scales in the R128c4 layout (uint8, at least ``128 * K / 32``
+            bytes).
+        w, w_scale, out: as for :func:`run_low_m_gemm`.
+        tactic: kernel specialization (``mma_n`` in :data:`SUPPORTED_MMA_N`);
+            :func:`default_prequantized_tactic` if None.
+        use_pdl: launch with programmatic dependent launch.
+    """
+    m, k = xq.shape
+    n = w.shape[0]
+    if not 1 <= m <= low_m_max_for(n, k):
+        raise ValueError(f"the prequantized GEMM serves M <= {low_m_max_for(n, k)}, got {m}")
+    if tactic is None:
+        tactic = default_prequantized_tactic(m, n, k)
+    if m > tactic.mma_n:
+        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
+    _compiled_mid_kernel(n, k, tactic, use_pdl, False, fold_weight_scale=True)(
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
         _gmem_ptr(cutlass.Uint8, xs),
         _gmem_ptr(cutlass.Uint8, w_scale),
         _gmem_ptr(cutlass.BFloat16, out),
         Int32(m),
-        stream,
+        _current_stream(xq.device),
     )
+    return out
 
 
 def run_low_m_gemm(
@@ -2568,6 +3651,8 @@ def run_low_m_gemm(
     w_scale: torch.Tensor,
     out: torch.Tensor,
     *,
+    gate: torch.Tensor | None = None,
+    sigmoid: bool = False,
     tactic: LowMTactic | MidMTactic | None = None,
     use_pdl: bool = True,
 ) -> torch.Tensor:
@@ -2575,7 +3660,9 @@ def run_low_m_gemm(
 
     ``M <= low_m_max_for(N, K)`` runs the low-M kernel (activation quantized inside the
     GEMM); larger M runs a small MXFP8 quantization kernel followed by the mid-M GEMM, chained
-    with PDL so the GEMM's weight stream overlaps the quantization.
+    with PDL so the GEMM's weight stream overlaps the quantization. ``gate`` and ``sigmoid``
+    select the low-M kernel's variants (low-M range only), bitwise equal to the plain GEMM on
+    ``x * gate`` and to ``torch.sigmoid`` of the plain GEMM's output.
 
     Args:
         x: ``[M, K]`` contiguous BF16 activation, ``1 <= M <= MAX_M``.
@@ -2583,6 +3670,8 @@ def run_low_m_gemm(
         w_scale: DeepGEMM-packed UE8M0 scale, int32 ``[N, ceil(K / 512)]`` with strides
             ``(1, N)``.
         out: ``[M, N]`` contiguous BF16 output.
+        gate: optional BF16 ``[M, K]`` multiplier of ``x`` (see :func:`check_gate`).
+        sigmoid: store ``torch.sigmoid`` of the BF16 output.
         tactic: kernel specialization; the per-architecture default if None.
         use_pdl: launch with programmatic dependent launch.
     """
@@ -2590,25 +3679,126 @@ def run_low_m_gemm(
     n = w.shape[0]
     if not 1 <= m <= MAX_M:
         raise ValueError(f"M={m} must be in [1, {MAX_M}]")
+    variant = gate is not None or sigmoid
+    if variant and m > low_m_max_for(n, k):
+        raise ValueError(f"the gated / sigmoid GEMM serves M <= {low_m_max_for(n, k)}, got {m}")
     if tactic is None:
-        if m <= low_m_max_for(n, k):
+        if gate is not None:
+            tactic = gated_tactic(m, n, k)
+        elif m <= low_m_max_for(n, k):
             tactic = default_tactic(m, n, k)
         else:
             tactic = default_mid_tactic(m, n, k)
     if m > tactic.mma_n:
         raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
     if isinstance(tactic, MidMTactic):
+        if variant:
+            raise ValueError("the gated / sigmoid GEMM needs a low-M tactic")
         _run_mid(x, w, w_scale, out, tactic, use_pdl)
         return out
-    _compiled_kernel(n, k, tactic, use_pdl)(
+    compiled = _compiled_kernel(n, k, tactic, use_pdl, gate is not None, sigmoid)
+    gate_args = ()
+    if gate is not None:
+        gate_args = (_gmem_ptr(cutlass.BFloat16, gate), Int32(gate.stride(0)))
+    compiled(
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.BFloat16, x),
+        *gate_args,
         _gmem_ptr(cutlass.Uint8, w_scale),
         _gmem_ptr(cutlass.BFloat16, out),
         Int32(m),
         _current_stream(x.device),
     )
     return out
+
+
+def _nvfp4_default_tactic(m: int, n: int, k: int) -> "LowMTactic | MidMTactic":
+    """The route's tactic where it selects the NVFP4 output, else the BF16 GEMM's default."""
+    tactic = nvfp4_out_tactic(m, n, k)
+    if tactic is not None:
+        return tactic
+    if m <= low_m_max_for(n, k):
+        return default_tactic(m, n, k)
+    return default_mid_tactic(m, n, k)
+
+
+def run_low_m_gemm_nvfp4(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    global_sf: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    tactic: LowMTactic | MidMTactic | None = None,
+    use_pdl: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Launch this GEMM with the NVFP4 output on the current stream.
+
+    Writes ``fp4_quantize(y, global_sf, 16, False, False)`` of the BF16 GEMM output ``y`` that
+    :func:`run_low_m_gemm` produces at the same tactic, byte for byte. A low-M tactic runs the
+    low-M kernel, a mid-M tactic the MXFP8 quantization kernel + mid-M kernel.
+
+    Args:
+        x, w, w_scale: as for :func:`run_low_m_gemm`, ``N`` a multiple of 128.
+        global_sf: FP32 one-element NVFP4 global scale, read on the device.
+        codes: ``uint8 [M, N / 2]`` E2M1 output, two values per byte, low nibble first.
+        scales: ``uint8 [M * N / 16]`` E4M3 scale factors in the linear layout.
+        tactic: kernel specialization; :func:`nvfp4_out_tactic` where the current device's
+            route selects the NVFP4 output, the BF16 GEMM's default tactic otherwise.
+        use_pdl: launch with programmatic dependent launch.
+    """
+    m, k = x.shape
+    n = w.shape[0]
+    if not 1 <= m <= MAX_M:
+        raise ValueError(f"M={m} must be in [1, {MAX_M}]")
+    if tactic is None:
+        tactic = _nvfp4_default_tactic(m, n, k)
+    if m > tactic.mma_n:
+        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
+    validate_nvfp4_out_tactic(n, k, tactic)
+    if isinstance(tactic, MidMTactic):
+        _run_mid(x, w, w_scale, codes, tactic, use_pdl, nvfp4=(scales, global_sf))
+        return codes, scales
+    _compiled_nvfp4_kernel(n, k, tactic, use_pdl)(
+        _gmem_ptr(cutlass.Float8E4M3FN, w),
+        _gmem_ptr(cutlass.BFloat16, x),
+        _gmem_ptr(cutlass.Uint8, w_scale),
+        _gmem_ptr(cutlass.Uint8, codes),
+        _gmem_ptr(cutlass.Uint8, scales),
+        _f32_ptr(global_sf),
+        Int32(m),
+        _current_stream(x.device),
+    )
+    return codes, scales
+
+
+def can_run_nvfp4(
+    x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor, global_sf: torch.Tensor
+) -> bool:
+    """Whether :func:`run_low_m_gemm_nvfp4` accepts these operands at its default tactic
+    (non-raising): a supported device, valid GEMM operands, ``1 <= M <= MAX_M``, whole 128-row
+    weight tiles and a one-element FP32 ``global_sf`` on the same device. Where callers select
+    the NVFP4 output is :func:`nvfp4_out_max_m_for`."""
+    if not x.is_cuda or not _is_supported_device(x.device.index):
+        return False
+    try:
+        check_inputs(x, w, w_scale)
+    except ValueError:
+        return False
+    m, k = x.shape
+    n = w.shape[0]
+    if not 1 <= m <= MAX_M:
+        return False
+    if not (
+        global_sf.dtype == torch.float32 and global_sf.numel() == 1 and global_sf.device == x.device
+    ):
+        return False
+    try:
+        validate_nvfp4_out_tactic(n, k, _nvfp4_default_tactic(m, n, k))
+    except ValueError:
+        return False
+    return True
 
 
 def pack_block_scale_from_mxfp8_layout(sf: torch.Tensor, n: int, k: int) -> torch.Tensor:
@@ -2637,15 +3827,12 @@ def pack_block_scale_from_mxfp8_layout(sf: torch.Tensor, n: int, k: int) -> torc
     return packed
 
 
-def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
-    """Raise ``ValueError`` unless :func:`run_low_m_gemm` accepts these operands."""
-    if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
-        raise ValueError("x must be a contiguous 2D bfloat16 tensor")
+def _check_weight(w: torch.Tensor, w_scale: torch.Tensor, k: int) -> None:
     if w.dtype != torch.float8_e4m3fn or w.dim() != 2 or not w.is_contiguous():
         raise ValueError("w must be a contiguous 2D float8_e4m3fn tensor")
-    n, k = w.shape
-    if x.shape[1] != k:
-        raise ValueError(f"x has K={x.shape[1]}, weight has K={k}")
+    n = w.shape[0]
+    if w.shape[1] != k:
+        raise ValueError(f"the activation has K={k}, the weight K={w.shape[1]}")
     if n % N_ALIGN or k % CTA_K:
         raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     words = _ceil_div(k // CTA_K, 4)
@@ -2658,8 +3845,61 @@ def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> Non
         raise ValueError(
             f"w_scale must be DeepGEMM-packed UE8M0 int32 [{n}, {words}] with strides (1, {n})"
         )
-    if x.data_ptr() % 16 or w.data_ptr() % 16:
-        raise ValueError("x and w must be 16-byte aligned")
+    if w.data_ptr() % 16:
+        raise ValueError("w must be 16-byte aligned")
+
+
+def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
+    """Raise ``ValueError`` unless :func:`run_low_m_gemm` accepts these operands."""
+    if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
+        raise ValueError("x must be a contiguous 2D bfloat16 tensor")
+    if x.data_ptr() % 16:
+        raise ValueError("x must be 16-byte aligned")
+    _check_weight(w, w_scale, x.shape[1])
+
+
+def check_prequantized_inputs(
+    xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor
+) -> None:
+    """Raise ``ValueError`` unless :func:`run_low_m_gemm_prequantized` accepts these operands."""
+    if xq.dtype != torch.float8_e4m3fn or xq.dim() != 2 or not xq.is_contiguous():
+        raise ValueError("xq must be a contiguous 2D float8_e4m3fn tensor")
+    m, k = xq.shape
+    if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < MMA_M * (k // SF_VEC):
+        raise ValueError(f"xs must be the contiguous uint8 R128c4 scale of {m} rows")
+    if xs.device != xq.device:
+        raise ValueError(f"xs must live on xq's device, got {xs.device} vs {xq.device}")
+    if xq.data_ptr() % 16 or xs.data_ptr() % 4:
+        raise ValueError("xq must be 16-byte and xs 4-byte aligned")
+    _check_weight(w, w_scale, k)
+
+
+def check_gate(x: torch.Tensor, gate: torch.Tensor) -> None:
+    """Raise ``ValueError`` unless ``gate`` is a valid multiplier of ``x`` for the gated GEMM:
+    BF16 shaped like ``x``, on ``x``'s device, unit column stride, a row stride that is a
+    multiple of 8 elements, 16-byte aligned."""
+    if gate.dtype != torch.bfloat16 or gate.dim() != 2 or tuple(gate.shape) != tuple(x.shape):
+        raise ValueError("gate must be a 2D bfloat16 tensor shaped like x")
+    if gate.device != x.device:
+        raise ValueError(f"gate must live on x's device, got {gate.device} vs {x.device}")
+    if gate.stride(1) != 1 or gate.stride(0) % 8 or gate.stride(0) < gate.shape[1]:
+        raise ValueError("gate needs unit column stride and a row stride that is a multiple of 8")
+    if gate.data_ptr() % 16:
+        raise ValueError("gate must be 16-byte aligned")
+
+
+def gate_fits(x: torch.Tensor, gate: torch.Tensor, n: int) -> bool:
+    """Whether the gated low-M kernel takes ``x`` and ``gate`` for an ``[N, K]`` weight, given
+    that the low-M kernel serves ``x``'s rows (:func:`kernel_max_m_for`): the gate ring of its
+    tactic fits in shared memory and ``gate`` passes :func:`check_gate`."""
+    m, k = x.shape
+    if not _gated_tactic_fits(m, n, k):
+        return False
+    try:
+        check_gate(x, gate)
+    except ValueError:
+        return False
+    return True
 
 
 __all__ = [
@@ -2668,12 +3908,32 @@ __all__ = [
     "N_ALIGN",
     "LowMTactic",
     "MidMTactic",
+    "amax_bf16x8",
+    "amax_pair",
+    "bf16x2_inv_scale",
+    "can_run_nvfp4",
+    "check_gate",
     "check_inputs",
+    "check_prequantized_inputs",
     "default_mid_tactic",
+    "default_prequantized_tactic",
     "default_tactic",
+    "gate_fits",
+    "gated_tactic",
     "kernel_max_m_for",
     "low_m_max_for",
     "max_m_for",
+    "mxfp8_quantize_reference",
+    "nvfp4_out_max_m_for",
+    "nvfp4_out_tactic",
     "pack_block_scale_from_mxfp8_layout",
+    "quant_bf16x8_to_e4m3",
+    "sigmoid_bf16",
     "run_low_m_gemm",
+    "run_low_m_gemm_nvfp4",
+    "run_low_m_gemm_prequantized",
+    "precompile_prequantized",
+    "split_tactic",
+    "ue8m0_of_amax",
+    "validate_nvfp4_out_tactic",
 ]

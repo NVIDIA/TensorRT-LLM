@@ -25,6 +25,9 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+    fp8_e4m3_saturate,
+)
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
@@ -218,12 +221,21 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
         return 0
     is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
     is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
+    # Draft layers declared through layer specs have a lifecycle of their own and
+    # read their own block offsets.
+    spec_draft_layers = (
+        set(kv_cache_manager.draft_layer_ids)
+        if getattr(kv_cache_manager, "layer_specs", None) is not None
+        else set()
+    )
     # NVFP4 sparse layers and the hybrid draft layer (read through its own view)
     # never read the staged table and may sit in pools with another factor.
     factors = {
         int(get_pool(layer_idx, "HND")[1])
         for layer_idx in layer_offsets
-        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
+        if not is_nvfp4(layer_idx)
+        and not is_hybrid_draft(layer_idx)
+        and layer_idx not in spec_draft_layers
     }
     return factors.pop() if len(factors) == 1 else 0
 
@@ -276,7 +288,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
     # plain cast and a no-op when the fused producer already emitted FP8.
     if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = q.to(torch.float8_e4m3fn)
+        q = fp8_e4m3_saturate(q)
 
     reserve = torch.cuda.is_current_stream_capturing()
     workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))

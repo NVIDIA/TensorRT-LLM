@@ -388,6 +388,154 @@ class TestKimiExtensionMapping:
             self.apply(response_format={"type": "json_schema", "json_schema": wrapper})
 
 
+def k3_thinking_kwargs(req: ChatCompletionRequest) -> dict:
+    """The K3 template's own thinking controls in the request's merged kwargs."""
+    kwargs = req.chat_template_kwargs or {}
+    return {key: kwargs[key] for key in ("thinking", "thinking_effort") if key in kwargs}
+
+
+class TestKimiGenericThinkingKwargs:
+    """``enable_thinking`` / ``reasoning_effort``: the kwargs other chat templates read."""
+
+    def apply(self, **kwargs) -> ChatCompletionRequest:
+        req = make_request(**kwargs)
+        apply_model_chat_extensions(req, "kimi_k3")
+        return req
+
+    @pytest.mark.parametrize(
+        "generic, expected",
+        [
+            ({"enable_thinking": False}, {"thinking": False}),
+            ({"enable_thinking": True}, {"thinking": True}),
+            ({"reasoning_effort": "low"}, {"thinking_effort": "low"}),
+            ({"reasoning_effort": "high"}, {"thinking_effort": "high"}),
+            ({"reasoning_effort": "max"}, {"thinking_effort": "max"}),
+            ({"reasoning_effort": "High"}, {"thinking_effort": "high"}),
+            ({"reasoning_effort": "none"}, {"thinking": False}),
+            # No K3 equivalent: the template default applies.
+            ({"reasoning_effort": "medium"}, {}),
+            # No effort for a request whose thinking is off ...
+            ({"enable_thinking": False, "reasoning_effort": "high"}, {"thinking": False}),
+            # ... and "none" does not override an explicit thinking setting.
+            ({"enable_thinking": True, "reasoning_effort": "none"}, {"thinking": True}),
+            # Only a bool is a thinking setting.
+            ({"enable_thinking": "false"}, {}),
+            # "none" turns thinking off even beside a native effort, which is kept; the template
+            # ignores it while thinking is off.
+            (
+                {"thinking_effort": "high", "reasoning_effort": "none"},
+                {"thinking": False, "thinking_effort": "high"},
+            ),
+            # A native effort wins over the generic one.
+            ({"thinking_effort": "low", "reasoning_effort": "max"}, {"thinking_effort": "low"}),
+        ],
+        ids=[
+            "thinking_off",
+            "thinking_on",
+            "effort_low",
+            "effort_high",
+            "effort_max",
+            "effort_any_case",
+            "effort_none",
+            "effort_medium",
+            "no_effort_when_off",
+            "none_keeps_thinking_on",
+            "non_bool_thinking",
+            "none_beside_native_effort",
+            "native_effort_wins",
+        ],
+    )
+    def test_generic_kwargs_map_to_the_k3_kwargs(self, generic: dict, expected: dict) -> None:
+        req = self.apply(chat_template_kwargs=generic)
+        assert k3_thinking_kwargs(req) == expected
+
+    def test_k3_kwargs_win_over_the_generic_ones(self) -> None:
+        req = self.apply(
+            chat_template_kwargs={
+                "thinking": True,
+                "thinking_effort": "high",
+                "enable_thinking": False,
+                "reasoning_effort": "low",
+            }
+        )
+        assert k3_thinking_kwargs(req) == {"thinking": True, "thinking_effort": "high"}
+        assert req.injected_chat_template_kwargs == ["reasoning_effort"]
+
+    @pytest.mark.parametrize(
+        "fields, expected",
+        [
+            (
+                {"thinking": {"type": "enabled", "effort": "high"}},
+                {"thinking": True, "thinking_effort": "high"},
+            ),
+            ({"thinking": {"type": "disabled"}}, {"thinking": False}),
+            ({"reasoning_effort": "none"}, {"thinking": False}),
+            ({"reasoning_effort": "high"}, {"thinking": True, "thinking_effort": "high"}),
+        ],
+        ids=["thinking_effort", "thinking_disabled", "reasoning_effort_none", "reasoning_effort"],
+    )
+    def test_request_fields_win_over_the_generic_kwargs(self, fields: dict, expected: dict) -> None:
+        req = self.apply(
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"}, **fields
+        )
+        assert k3_thinking_kwargs(req) == expected
+
+    def test_translated_kwargs_are_marked_as_server_injected(self) -> None:
+        # The unused-kwargs guard exempts injected keys when a Jinja template renders.
+        req = self.apply(
+            chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "low"},
+            injected_chat_template_kwargs=["enable_thinking"],
+        )
+        assert req.injected_chat_template_kwargs == [
+            "enable_thinking",
+            "reasoning_effort",
+            "thinking",
+            "thinking_effort",
+        ]
+
+    def test_thinking_off_is_parsed_as_an_answer_from_the_start(self) -> None:
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        req = self.apply(chat_template_kwargs={"enable_thinking": False})
+        parser = ReasoningParserFactory.create_reasoning_parser("kimi_k3", req.chat_template_kwargs)
+        result = parser.parse("plain answer<|close|>response<|sep|><|end_of_msg|>")
+        assert (result.content, result.reasoning_content) == ("plain answer", "")
+
+
+class TestKimiAnthropicThinkingControls:
+    """Anthropic ``thinking`` / ``output_config.effort`` reach the K3 template kwargs."""
+
+    def convert(self, **fields) -> ChatCompletionRequest:
+        from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
+        from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+        req = convert_anthropic_request(
+            AnthropicMessagesRequest(model="m", max_tokens=4096, messages=[USER_MSG], **fields)
+        )
+        apply_model_chat_extensions(req, "kimi_k3")
+        return req
+
+    def test_thinking_disabled_turns_k3_thinking_off(self) -> None:
+        req = self.convert(thinking={"type": "disabled"}, output_config={"effort": "high"})
+        assert k3_thinking_kwargs(req) == {"thinking": False}
+        assert "thinking" in req.injected_chat_template_kwargs
+
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
+    def test_effort_sets_the_k3_effort(self, effort: str) -> None:
+        req = self.convert(
+            thinking={"type": "enabled", "budget_tokens": 1024}, output_config={"effort": effort}
+        )
+        assert k3_thinking_kwargs(req) == {"thinking": True, "thinking_effort": effort}
+        assert "thinking_effort" in req.injected_chat_template_kwargs
+
+    def test_applying_the_extension_again_changes_nothing(self) -> None:
+        # A router renders a request and forwards it; the worker applies the extension again.
+        req = self.convert(output_config={"effort": "low"})
+        kwargs, injected = dict(req.chat_template_kwargs), list(req.injected_chat_template_kwargs)
+        apply_model_chat_extensions(req, "kimi_k3")
+        assert (req.chat_template_kwargs, req.injected_chat_template_kwargs) == (kwargs, injected)
+
+
 class TestKimiParamPolicy:
     @pytest.fixture(autouse=True)
     def _enable_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:

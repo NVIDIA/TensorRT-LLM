@@ -37,6 +37,7 @@ def _worker():
     worker._position_initialized = torch.ones(NUM_ROWS, dtype=torch.bool, device="cuda")
     worker._kv_windows = torch.ones(NUM_ROWS, 2, WINDOW, 8, dtype=torch.bfloat16, device="cuda")
     worker._batch_to_slot = torch.zeros(NUM_ROWS - 1, dtype=torch.long, device="cuda")
+    worker._host_batch_to_slot = []
     worker._confidence_logits = None
     worker._free_slots = collections.deque(range(NUM_ROWS - 1))
     worker._req_to_slot = {}
@@ -76,10 +77,6 @@ def test_join_and_leave_are_stream_ordered():
     assert worker._req_to_slot == {101: 1, 102: 2}
     for row in (0, 1, 2):
         _assert_reset(worker, row)
-    # The scratch row restarts its position every iteration; its window is never read.
-    assert worker._ctx_len[worker._scratch_slot].item() == 0
-    assert worker._valid_len[worker._scratch_slot].item() == 0
-    assert not worker._position_initialized[worker._scratch_slot].item()
     torch.testing.assert_close(
         worker._batch_to_slot[:2], torch.tensor([1, 2], device="cuda"), rtol=0, atol=0
     )

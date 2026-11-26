@@ -49,6 +49,24 @@ def _assert_close(y, ref, tol=1.6e-2):
     assert err <= tol * ref.float().abs().max().item(), err
 
 
+def _cublas_fp8(x8, w, s_in, s_w):
+    """The stock FP8 projection (FP8QDQLinearMethod.apply's cuBLAS call), BF16 out."""
+    return torch.ops.trtllm.cublas_scaled_mm(
+        x8,
+        w.t(),
+        scale_a=s_in.reshape(1),
+        scale_b=s_w.reshape(1),
+        bias=None,
+        out_dtype=torch.bfloat16,
+    )
+
+
+def _assert_e4m3_near(h8, ref_h8, tag=None):
+    """E4M3 codes at most one apart (the FP32 sums' order differs from cuBLAS's), almost all equal."""
+    codes = (h8.view(torch.uint8).int() - ref_h8.view(torch.uint8).int()).abs()
+    assert (codes == 0).float().mean().item() > 0.97 and codes.max().item() <= 1, tag
+
+
 @pytest.mark.parametrize("m", [1, 9, 28])
 @pytest.mark.parametrize(
     "n,k,tactic",
@@ -114,7 +132,7 @@ def test_bf16_segments_and_mixed_launch(m):
     assert torch.equal(b, L.low_m_mma_gemm(x16=x, w_bf16=wba, tactic_bf16=(16, 1)))
 
 
-@pytest.mark.parametrize("m", [1, 7, 28])
+@pytest.mark.parametrize("m", [1, 7, 28, 33, 64, 128])
 def test_shared_expert_launch(m):
     """Shared expert as two launches (gate_up + SwiGLU -> E4M3 with the BF16 gate as an n_valid segment, then
     down) against the stock quantize / cuBLAS FP8 / silu_and_mul / F.linear kernels."""
@@ -127,14 +145,7 @@ def test_shared_expert_launch(m):
     s_in = _scale(x)
     gate_w = torch.zeros(8, k, dtype=torch.bfloat16, device="cuda")
     gate_w[:1] = _bf16_weight(1, k, 12)
-    gu = torch.ops.trtllm.cublas_scaled_mm(
-        _squant(x, s_in),
-        w_gu.t(),
-        scale_a=s_in.reshape(1),
-        scale_b=s_gu.reshape(1),
-        bias=None,
-        out_dtype=torch.bfloat16,
-    )
+    gu = _cublas_fp8(_squant(x, s_in), w_gu, s_in, s_gu)
     ref_h8 = torch.ops.trtllm.silu_and_mul(gu, scale=s_dn_in.reshape(1), dtype=torch.float8_e4m3fn)
     h8, gate = L.low_m_mma_gemm(
         x16=x,
@@ -148,13 +159,12 @@ def test_shared_expert_launch(m):
         out_scale=s_dn_in,
     )
     assert h8.dtype == torch.float8_e4m3fn and gate.shape == (m, 1) and gate.is_contiguous()
-    codes = (h8.view(torch.uint8).int() - ref_h8.view(torch.uint8).int()).abs()
-    assert (codes == 0).float().mean().item() > 0.97 and codes.max().item() <= 1
-    _assert_close(gate, x.float() @ gate_w[:1].float().t())
+    _assert_e4m3_near(h8, ref_h8)
+    _assert_close(gate, F.linear(x, gate_w[:1]))
     out = L.low_m_mma_gemm(
         x8=h8, w_fp8=w_dn, weight_scale=s_dn_w, input_scale=s_dn_in, fp8_act="fp8"
     )
-    _assert_close(out, (h8.float() @ w_dn.float().t()) * (s_dn_in * s_dn_w))
+    _assert_close(out, _cublas_fp8(h8, w_dn, s_dn_in, s_dn_w))
 
 
 @pytest.mark.parametrize("m", [1, 28])
@@ -254,6 +264,45 @@ def test_shared_expert_module_path(inter, monkeypatch, m=7):
     _assert_close(out, ref_out)
     _assert_close(logits, ref_gate)
     assert looked_up == plain_fp8_input
+    # 0 rows (the warp-MMA GEMM refuses M = 0) stay on the stock shared expert, raced rows or not.
+    for raced_rows in (0, 8):
+        blk._shared_expert_raced_rows = raced_rows
+        assert blk._shared_expert_low_m_forward(x[:0]) is None
+
+
+@pytest.mark.parametrize("inter", [512, 64])  # TP2 / TP16 shards of a 1024-wide shared expert
+def test_shared_expert_race_candidates_launch(inter, m=128):
+    """Every tactic the shared expert's two races offer at the row ceiling fits the shard and the kernel's shared
+    memory, and launches with the stock kernels' outputs (quantize + cuBLAS FP8 + silu_and_mul, F.linear for the
+    gate, cuBLAS FP8 down) as the heuristic tactic does."""
+    k = 4096
+    w_gu, s_gu = _fp8_weight(2 * inter, k, 50)
+    w_dn, s_dn = _fp8_weight(k, inter, 51)
+    gate_w = torch.zeros(8, k, dtype=torch.bfloat16, device="cuda")
+    gate_w[:1] = _bf16_weight(1, k, 52)
+    x = _act(m, k, 53)
+    s_in = _scale(x)
+    s_dn_in = torch.tensor(0.05, device="cuda")
+    gu = _cublas_fp8(_squant(x, s_in), w_gu, s_in, s_gu)
+    stock_h8 = torch.ops.trtllm.silu_and_mul(
+        gu, scale=s_dn_in.reshape(1), dtype=torch.float8_e4m3fn
+    )
+    stock_gate = F.linear(x, gate_w[:1])
+    up_inputs = [x, L.swiglu_pairs(w_gu), gate_w, s_gu, s_in, s_dn_in]
+    up = L._SharedExpertLaunchRunner(swiglu=True)
+    tactics = up.get_valid_tactics(up_inputs, None)
+    assert tactics
+    for tactic in (-1, *tactics):
+        h8, gate = up(up_inputs, tactic=tactic)
+        _assert_e4m3_near(h8, stock_h8, tactic)
+        _assert_close(gate, stock_gate)
+    down_inputs = [stock_h8, w_dn, s_dn, s_dn_in]
+    stock_out = _cublas_fp8(stock_h8, w_dn, s_dn_in, s_dn)
+    down = L._SharedExpertLaunchRunner(swiglu=False)
+    tactics = down.get_valid_tactics(down_inputs, None)
+    assert tactics
+    for tactic in (-1, *tactics):
+        _assert_close(down(down_inputs, tactic=tactic), stock_out)
 
 
 @pytest.mark.parametrize("tp16,n,pad", [(False, 1, False), (True, 4, False), (False, 2, True)])
