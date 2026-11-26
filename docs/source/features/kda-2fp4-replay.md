@@ -43,10 +43,14 @@ quantizes the decayed K/Q checkpoint operands to NVFP4 and uses native
 block-scaled MMA. Only the primary checkpoint participates in replay.
 Accepted K/U are cached in BF16 and cumulative per-key G in FP32. The
 history window is 16; rollover reconstructs both checkpoint terms and
-commits the cached updates. Each request keeps its histories in its own slot
-of the KV cache's replay region, which stays with the request while it is
-suspended. A finished request's partial history is discarded: V2 makes only
-prefill-phase recurrent state reusable. Below 1,536 (row, head) items per
+commits the cached updates. The histories live in a table beside the KV cache
+pools, one row per request that holds a recurrent state; the table and the
+per-batch buffers are reserved from the device KV budget before the pools are
+sized. Suspending a request commits its pending entries into the checkpoint, as
+a window that ends at the last pending entry, and frees its row, so the request
+resumes with an empty history. Its later outputs therefore depend on when the
+scheduler suspended it. A finished request's partial history is discarded: V2
+makes only prefill-phase recurrent state reusable. Below 1,536 (row, head) items per
 layer, one CuTe DSL launch per layer fuses Conv4, Q/K normalization, replay,
 and output RMSNorm/gating without changing their calculations. The same
 launch commits a full window: the CTA that appends the sixteenth entry of a
@@ -103,9 +107,9 @@ packed checkpoint format, and they may use different head-sharded TP sizes as
 supported by V2 transfer. A context worker (`TRTLLM_DISAGG_ROLE=context`)
 allocates no K/U/G history and skips generation warmup and capture. It
 rejects real generation requests; attention-DP padding rows are still
-allowed. On a generation worker, the replay region holds one history slot per
-living request, independently of the number of V2 prefix-cache snapshot slots.
-New and transferred requests begin with empty histories.
+allowed. On a generation worker, the history table holds one row per resident
+request, independently of the number of V2 prefix-cache snapshot slots. New and
+transferred requests begin with empty histories.
 
 Speculative backends other than DSpark, beam search, non-BF16 activations, non-128 head
 dimensions, legacy cache managers, and KV-pool rebalancing are not supported

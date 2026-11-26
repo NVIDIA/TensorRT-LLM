@@ -535,7 +535,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             kv_cache_config=kv_cache_config,
             **kwargs,
         )
-        return slope, intercept + attention_intercept + fixed_region_bytes
+        reserved_bytes = cls._estimate_reserved_device_bytes(
+            model_config,
+            mapping,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            **kwargs,
+        )
+        return slope, intercept + attention_intercept + fixed_region_bytes + reserved_bytes
 
     @classmethod
     def _estimate_attention_cache_cost(
@@ -594,6 +601,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         bytes those regions will take; the cost estimate adds them to its fixed
         cost as they are, like the quota does.
         """
+        return 0
+
+    @classmethod
+    def _estimate_reserved_device_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        """Estimated ``_get_reserved_device_bytes()`` of a manager not yet built."""
         return 0
 
     @override

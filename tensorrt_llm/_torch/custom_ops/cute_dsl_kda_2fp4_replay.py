@@ -4631,12 +4631,32 @@ def _persistent_replay(
     )
     if not separate_commit:
         return
+    pool, slots, replay_indices, hk, hu, hg = (tensors[i] for i in (7, 8, 10, 11, 12, 13))
+    items = batch * heads
     many = items >= _COMMIT_MANY_ITEMS
-    commit_ctas_per_sm, commit_stages, early_refill, halves = (
-        (3, 1, True, True) if many else (_COMMIT_CTAS_PER_SM, 2, False, False)
+    _compiled_commit(heads, pdl, history_strides, many, stream)(
+        pool,
+        slots,
+        replay_indices,
+        hk,
+        hu,
+        hg,
+        flags,
+        batch,
+        min(items, _commit_variant(many)[0] * sms),
+        stream,
     )
+
+
+def _commit_variant(many: bool) -> tuple[int, int, bool, bool]:
+    """CTAs per SM, stages, early refill and halves of the separate commit kernel."""
+    return (3, 1, True, True) if many else (_COMMIT_CTAS_PER_SM, 2, False, False)
+
+
+def _compiled_commit(heads, pdl, history_strides, many, stream):
     key = ("commit", heads, pdl, history_strides, many)
     if key not in _compiled:
+        commit_ctas_per_sm, commit_stages, early_refill, halves = _commit_variant(many)
         fake = _fake_tensor_args(heads, history_strides)
         _compiled[key] = cute.compile(
             _launch_commit,
@@ -4658,19 +4678,73 @@ def _persistent_replay(
             stream,
             options=_compile_options(""),
         )
-    pool, slots, replay_indices, hk, hu, hg = (tensors[i] for i in (7, 8, 10, 11, 12, 13))
-    _compiled[key](
-        pool,
-        slots,
-        replay_indices,
-        hk,
-        hu,
-        hg,
-        flags,
-        batch,
-        min(items, commit_ctas_per_sm * sms),
-        stream,
-    )
+    return _compiled[key]
+
+
+def _window_strides(heads: int) -> tuple[int, int, int, int]:
+    """Strides of the dense [rows, H, 16, 128] windows ``commit_windows`` takes."""
+    return (heads * N * K,) * 3 + (1,)
+
+
+def commit_windows_max_rows(heads: int) -> int:
+    """Most rows one ``commit_windows`` call takes (one compiled commit variant)."""
+    return min(CK_MAX_ROWS, (_COMMIT_MANY_ITEMS - 1) // heads)
+
+
+@torch.no_grad()
+def commit_windows(
+    pools: "list[torch.Tensor]",
+    slots: torch.Tensor,
+    replay_indices: torch.Tensor,
+    hk: torch.Tensor,
+    hu: torch.Tensor,
+    hg: torch.Tensor,
+    flags: torch.Tensor,
+) -> None:
+    """Commit the full 16-entry history window of every flagged row into its checkpoint.
+
+    Runs the decode's separate commit kernel on its own, once per layer ``l``:
+    row ``b`` folds ``hk/hu/hg[l, replay_indices[b]]`` into
+    ``pools[l][slots[b]]`` when ``flags[l, b]`` is non-zero, taking entry 15 as
+    the end of the window. ``pools`` are [S,H,STATE_BYTES]; the histories are
+    dense [L, rows, H, 16, 128]; ``slots`` and ``replay_indices`` are int32 with
+    one entry per row, at most ``commit_windows_max_rows(H)``; ``flags`` is
+    int32 [L, CK_MAX_ROWS]. History lengths are left unchanged.
+    """
+    batch = slots.numel()
+    if batch == 0 or not pools:
+        return
+    heads = pools[0].shape[1]
+    layers = len(pools)
+    window = (layers, hk.shape[1], heads, N, K)
+    if (
+        batch > commit_windows_max_rows(heads)
+        or replay_indices.shape != (batch,)
+        or flags.shape != (layers, CK_MAX_ROWS)
+        or any(t.dtype != torch.int32 for t in (slots, replay_indices, flags))
+        or any(t.shape != window or not t.is_contiguous() for t in (hk, hu, hg))
+    ):
+        raise ValueError(
+            f"2FP4 commit needs int32 slots and replay indices of up to "
+            f"{commit_windows_max_rows(heads)} rows, int32 flags [L, {CK_MAX_ROWS}] and "
+            "dense [L, rows, H, 16, 128] histories"
+        )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    launch = _compiled_commit(heads, get_env_enable_pdl(), _window_strides(heads), False, stream)
+    ctas = min(batch * heads, _commit_variant(False)[0] * _sm_count(hk.device))
+    for layer, pool in enumerate(pools):
+        launch(
+            pool,
+            slots,
+            replay_indices,
+            hk[layer],
+            hu[layer],
+            hg[layer],
+            flags[layer],
+            batch,
+            ctas,
+            stream,
+        )
 
 
 def _fake_tp_args(heads: int, history_strides: tuple[int, int, int, int]) -> tuple:

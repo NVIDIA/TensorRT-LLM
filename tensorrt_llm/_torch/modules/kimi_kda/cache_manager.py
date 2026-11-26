@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaLayerCache,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _get_num_cuda_graph_padding_dummy_slots,
     _host_slots_to_device,
     _is_disagg_context_server,
     _mamba_effective_tp_size,
@@ -52,7 +53,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SsmLayerConfig,
 )
 
-from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
+from .replay_region import REPLAY_STATE_REGION, KDA2Fp4LiveHistory, KDAReplayRegion, ReplayLayout
 
 if TYPE_CHECKING:
     from .kda_2fp4 import ReplayHistory
@@ -611,8 +612,6 @@ class KDAReplayState:
         if _is_disagg_context_server(kwargs.get("is_disagg", False)):
             return None
         spec_config = kwargs.get("spec_config")
-        if kwargs.get("kda_2fp4_replay", False):
-            return cls._estimate_selected_2fp4_replay(model_config, mapping, **kwargs)
         num_spec = kwargs.get("kda_replay_num_spec")
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(spec_config, manager_supports_replay=True)
@@ -662,28 +661,6 @@ class KDAReplayState:
             draft_records=state.draft_records,
         )
         return layout, local_layers, stochastic_rounding
-
-    @staticmethod
-    def _estimate_selected_2fp4_replay(
-        model_config, mapping: Mapping, **kwargs
-    ) -> tuple[dict[str, tuple[torch.dtype, list[int]]], int, bool] | None:
-        """The 2FP4 replay layout and local layer count (``KDA2Fp4ReplayState``)."""
-        spec_config = kwargs.get("spec_config")
-        params, local_layers, _ = _get_local_mamba_cache_layout(
-            model_config,
-            mapping,
-            spec_config=spec_config,
-            is_draft=kwargs.get("is_draft", False),
-            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
-        )
-        if not local_layers:
-            return None
-        layout = _kda_2fp4_replay_layout(
-            None if spec_config is None else spec_config.tokens_per_gen_step,
-            params.num_heads // _mamba_effective_tp_size(mapping),
-            params.head_dim,
-        )
-        return layout, local_layers, False
 
     def bind(
         self,
@@ -1391,17 +1368,22 @@ class Kda2Fp4LayerCache(MambaLayerCache):
 class KDA2Fp4ReplayState(KDAReplayState):
     """Replay of packed 2FP4 KDA checkpoints for ordinary decode and DSpark verification.
 
-    Each request owns one replay slot of the KDA replay region, holding every
-    layer's K/U/G history and its length (see ``_kda_2fp4_replay_layout``);
-    the region keeps it across suspension. Ordinary decode replays and, when
-    the window fills, commits inside each layer's launch. DSpark verification
-    leaves the checkpoints untouched; after sampling one ``commit_verified``
-    launch commits every layer's accepted prefix.
+    Each resident request owns one row of a history table beside the KV cache
+    pools (``KDA2Fp4LiveHistory``), holding every layer's K/U/G history and its
+    length (see ``_kda_2fp4_replay_layout``). Suspension commits the pending
+    entries into the checkpoint (``flush``) and frees the row. Ordinary decode
+    replays and, when the window fills, commits inside each layer's launch.
+    DSpark verification leaves the checkpoints untouched; after sampling one
+    ``commit_verified`` launch commits every layer's accepted prefix.
     """
 
     def __init__(self, tokens_per_gen_step: int | None) -> None:
         super().__init__(0 if tokens_per_gen_step is None else tokens_per_gen_step - 1)
         self.tokens_per_gen_step = tokens_per_gen_step
+        # Rows of the live history table; None addresses the histories by state slot.
+        self.live_capacity: int | None = None
+        self._stacked_history: dict[str, torch.Tensor] | None = None
+        self._flush_flags: torch.Tensor | None = None
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._num_heads = 0
         self._owns_history = False
@@ -1457,25 +1439,93 @@ class KDA2Fp4ReplayState(KDAReplayState):
             context.conv_state_shape[0],
         ]
 
-    @override
-    def external_gpu_bytes(self, context: MambaStateLayout) -> int:
+    @staticmethod
+    def _batch_buffer_bytes(
+        layers: int, max_batch_size: int, tokens_per_gen_step: int | None, conv_dim: int
+    ) -> int:
         """DSpark's candidate rows, saved lengths and commit descriptors, or the
-        decode arrival counters and scratch, live outside the pools."""
-        if not context.mamba_pp_layers:
-            return 0
-        if not self.verifies_drafts:
+        decode arrival counters and scratch."""
+        if tokens_per_gen_step is None:
             from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_replay import (
                 REPLAY_WORKSPACE_INT32,
             )
 
-            return (context.max_batch_size + REPLAY_WORKSPACE_INT32) * torch.int32.itemsize
+            return (max_batch_size + REPLAY_WORKSPACE_INT32) * torch.int32.itemsize
         from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_mtp_commit import DESC_FIELDS
 
-        layers = len(context.mamba_pp_layers)
         return (
-            math.prod(self._candidate_shape(context)) * torch.bfloat16.itemsize
-            + layers * context.max_batch_size * torch.int32.itemsize
+            layers * max_batch_size * tokens_per_gen_step * conv_dim * torch.bfloat16.itemsize
+            + layers * max_batch_size * torch.int32.itemsize
             + layers * DESC_FIELDS * torch.int64.itemsize
+        )
+
+    def reserved_gpu_bytes(self, context: MambaStateLayout) -> int:
+        """The live history table and the per-batch buffers ``bind`` allocates beside the pools."""
+        if not context.mamba_pp_layers:
+            return 0
+        layers = len(context.mamba_pp_layers)
+        table = (self.live_capacity or 0) * layers * self.bytes_per_slot(context, 0)
+        return table + self._batch_buffer_bytes(
+            layers, context.max_batch_size, self.tokens_per_gen_step, context.conv_state_shape[0]
+        )
+
+    @staticmethod
+    def estimate_reserved_bytes(
+        model_config, mapping: Mapping, max_batch_size: int, **kwargs
+    ) -> int:
+        """Estimated ``reserved_gpu_bytes`` of a 2FP4 manager not yet built.
+
+        The table holds a row for every resident request and reserved dummy slot.
+        A disaggregated context worker keeps no history.
+        """
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
+        spec_config = kwargs.get("spec_config")
+        params, local_layers, _ = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec_config,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        if not local_layers:
+            return 0
+        heads = params.num_heads // _mamba_effective_tp_size(mapping)
+        tokens_per_gen_step = None if spec_config is None else spec_config.tokens_per_gen_step
+        row_bytes = sum(
+            dtype.itemsize * math.prod(shape)
+            for dtype, shape in _kda_2fp4_replay_layout(
+                tokens_per_gen_step, heads, params.head_dim
+            ).values()
+        )
+        rows = (
+            max_batch_size * mapping.pp_size
+            + int(kwargs.get("gen_preemption_headroom", 0))
+            + _get_num_cuda_graph_padding_dummy_slots(spec_config, max_batch_size)
+            + int(mapping.enable_attention_dp)
+        )
+        return rows * local_layers * row_bytes + KDA2Fp4ReplayState._batch_buffer_bytes(
+            local_layers, max_batch_size, tokens_per_gen_step, 3 * heads * params.head_dim
+        )
+
+    def flush(self, slots: list[int], rows: list[int]) -> None:
+        """Commit the pending history of ``rows`` into the checkpoints at ``slots`` and empty it."""
+        from .kda_2fp4 import flush_histories
+
+        if not self.histories or not rows:
+            return
+        if self._stacked_history is None:
+            raise RuntimeError("KDA 2FP4 flush requires the histories this state allocates")
+        device = self._ssm_states[0].device
+        flush_histories(
+            list(self._ssm_states),
+            self._stacked_history["kda_2fp4_k"],
+            self._stacked_history["kda_2fp4_u"],
+            self._stacked_history["kda_2fp4_g"],
+            self._stacked_history[_KDA_2FP4_LENGTH_ROLE][..., 0],
+            _host_slots_to_device(slots, device).to(torch.int32),
+            _host_slots_to_device(rows, device).to(torch.int32),
+            self._flush_flags,
         )
 
     def bind(
@@ -1541,25 +1591,38 @@ class KDA2Fp4ReplayState(KDAReplayState):
         self.intermediate_indices = torch.arange(
             context.max_batch_size, dtype=torch.int32, device=device
         )
+        if self.live_capacity is not None:
+            # Compile and load the flush now rather than at the first suspension: every
+            # length is still zero, so nothing is committed.
+            self.flush([0], [0])
         logger.info(
             "Configured KDA 2FP4 replay: "
             + ("DSpark verification" if self.verifies_drafts else "ordinary decode")
         )
 
     def _allocate_history(self, context: MambaStateLayout, device: torch.device) -> None:
-        """Allocate standalone histories with one replay slot per recurrent-state slot."""
-        cache_size = context.slot_capacity
+        """Allocate the live history table, or standalone one row per recurrent-state slot."""
+        cache_size = self.live_capacity
+        if cache_size is None:
+            cache_size = context.slot_capacity
         if cache_size is None:
             raise RuntimeError("KDA 2FP4 replay requires the allocated V2 slot capacity")
         layout = self.pool_layout(context)
+        layers = len(context.mamba_pp_layers)
+        # One tensor per plane over all layers: a flush gathers every layer at once.
+        self._stacked_history = {
+            role: torch.zeros([layers, cache_size, *shape], dtype=dtype, device=device)
+            for role, (dtype, shape) in layout.items()
+        }
         self.pool_layers = [
-            {
-                role: torch.zeros([cache_size, *shape], dtype=dtype, device=device)
-                for role, (dtype, shape) in layout.items()
-            }
-            for _ in context.mamba_pp_layers
+            {role: plane[layer] for role, plane in self._stacked_history.items()}
+            for layer in range(layers)
         ]
         self._owns_history = True
+        if self.live_capacity is not None:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_replay import CK_MAX_ROWS
+
+            self._flush_flags = torch.zeros((layers, CK_MAX_ROWS), dtype=torch.int32, device=device)
 
     @override
     def make_layer_cache(
@@ -1603,9 +1666,9 @@ class KDA2Fp4ReplayState(KDAReplayState):
     def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
         """Move standalone histories after the requests' state slots changed.
 
-        Views of the manager's replay pool follow their requests on their own.
+        Live history rows belong to their requests, not to state slots.
         """
-        if not self._owns_history:
+        if not self._owns_history or self.live_capacity is not None:
             return
         moves = [(old, new) for old, new in zip(old_slots, new_slots) if old >= 0 and old != new]
         if not moves:
@@ -1661,6 +1724,8 @@ class KDA2Fp4ReplayState(KDAReplayState):
         super().shutdown()
         self._ssm_states = ()
         self._owns_history = False
+        self._stacked_history = None
+        self._flush_flags = None
         self.histories = []
         self.candidate_x = None
         self.old_lengths = None
@@ -1894,7 +1959,7 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
     """
 
     kda_context_only = False
-    _kda_replay_region: KDAReplayRegion | None = None
+    _kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
     # Draft-owned attention layers kept after the target layers (layer_specs).
     _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
     _kda_mtp_replay = False
@@ -1945,7 +2010,7 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         self._kda_mtp_replay = kda_mtp_replay
         self._kda_2fp4 = kda_2fp4_replay
         self._kda_replay: KDAReplayState | None = None
-        self._kda_replay_region: KDAReplayRegion | None = None
+        self._kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -2239,6 +2304,13 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         providers = super()._region_providers()
         if self._kda_replay is None or not self.mamba_pp_layers:
             return providers
+        if isinstance(self._kda_replay, KDA2Fp4ReplayState):
+            self._kda_replay_region = KDA2Fp4LiveHistory(
+                self._kda_replay,
+                self._state_layout,
+                self._max_resident_sequences() + self._num_reserved_dummy_slots,
+            )
+            return providers
         self._kda_replay_region = KDAReplayRegion(
             self._kda_replay,
             self._state_layout,
@@ -2292,6 +2364,12 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         return region.group_id if region is not None else None
 
     @property
+    def uses_replay_slots(self) -> bool:
+        """Whether the replay buffers have slots of their own instead of the recurrent ones."""
+        region = self._kda_replay_region
+        return region is not None and region.has_own_slots
+
+    @property
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -2306,7 +2384,7 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         if request_ids is None:
             return self.cuda_replay_state_indices
         region = self._kda_replay_region
-        if region is None or region.group_id is None:
+        if region is None or not region.has_own_slots:
             # The replay buffers share the recurrent-state slots.
             return [self._request_id_to_state_index[rid] for rid in request_ids]
         return region.request_indices(request_ids)
@@ -2416,6 +2494,10 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
                 raise RuntimeError(
                     f"Request {request_id} is being suspended before update_resources "
                     "recorded the acceptance of its last verify in its KDA replay state"
+                )
+            if self._kda_replay_region is not None:
+                self._kda_replay_region.suspend(
+                    request_id, self._request_id_to_state_index[request_id], self._stream
                 )
             if request_id in replay.unseeded_requests:
                 # Its replay caches have not been seeded from the transferred
@@ -2531,6 +2613,13 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
             external += self._kda_replay.external_gpu_bytes(self._state_layout)
         return external
 
+    @override
+    def _get_reserved_device_bytes(self) -> int:
+        reserved = super()._get_reserved_device_bytes()
+        if isinstance(self._kda_replay_region, KDA2Fp4LiveHistory):
+            reserved += self._kda_replay_region.reserved_gpu_bytes()
+        return reserved
+
     @classmethod
     @override
     def _estimate_fixed_region_bytes(
@@ -2542,13 +2631,28 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         kv_cache_config: KvCacheConfig,
         **kwargs,
     ) -> int:
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            # The 2FP4 histories live beside the pools (_estimate_reserved_device_bytes).
+            return 0
         return KDAReplayRegion.estimate_fixed_bytes(
-            model_config,
-            mapping,
-            max_batch_size,
-            kv_cache_config.max_util_for_resume,
-            kda_2fp4_replay=kv_cache_config.mamba_state_config.kda_2fp4_replay,
-            **kwargs,
+            model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+        )
+
+    @classmethod
+    @override
+    def _estimate_reserved_device_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        if not kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            return 0
+        return KDA2Fp4ReplayState.estimate_reserved_bytes(
+            model_config, mapping, max_batch_size, **kwargs
         )
 
     @classmethod
@@ -2583,7 +2687,7 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
     ) -> None:
         if self.kda_context_only:
             return
-        if state_indices is not None and self.replay_layer_group_id is not None:
+        if state_indices is not None and self.uses_replay_slots:
             metadata = getattr(attn_metadata, "mamba_metadata", None)
             if getattr(metadata, "replay_state_indices", None) is None:
                 raise RuntimeError("PRIVATE replay state needs mamba_metadata.replay_state_indices")

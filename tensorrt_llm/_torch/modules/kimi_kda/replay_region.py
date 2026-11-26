@@ -35,7 +35,7 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, _KVCache
 
 if TYPE_CHECKING:
-    from .cache_manager import KDAReplayState
+    from .cache_manager import KDA2Fp4ReplayState, KDAReplayState
 
 ReplayLayout = dict[DataRole, tuple[torch.dtype, list[int]]]
 REPLAY_STATE_REGION = "replay_state"
@@ -97,8 +97,16 @@ class KDAReplayRegion:
     def bytes_per_slot(self) -> int:
         return self.region.bytes_per_slot() if self.region is not None else 0
 
+    @property
+    def has_own_slots(self) -> bool:
+        """Whether the replay buffers have slots of their own instead of the recurrent ones."""
+        return self.group_id is not None
+
     def declare_regions(self) -> Sequence[Region]:
         return (self.region,) if self.region is not None else ()
+
+    def suspend(self, request_id: int, state_slot: int, stream: torch.cuda.Stream) -> None:
+        """Nothing to do: the region keeps a suspended request's replay slot."""
 
     def shared_buffers(self, global_layer: int) -> list[BufferConfig]:
         """Buffers addressed by the recurrent slot in draft-records mode."""
@@ -259,4 +267,149 @@ class KDAReplayRegion:
         return KDAReplayState.replay_slot_count(capacity, max_util_for_resume) * bytes_per_slot
 
 
-__all__ = ["KDAReplayRegion", "REPLAY_STATE_REGION", "ReplayLayout"]
+class KDA2Fp4LiveHistory:
+    """The 2FP4 histories of the resident requests, beside the KV cache pools.
+
+    A request gets a history row when it is first prepared and returns it when
+    it is suspended or released. Suspension first commits the row's pending
+    entries into the request's checkpoint (``KDA2Fp4ReplayState.flush``), so a
+    suspended request needs no history and the table holds one row per resident
+    request, however many requests are suspended. It declares no region: the
+    table and the per-batch buffers are reserved from the device budget before
+    the pools are sized.
+
+    Args:
+        state: The selected 2FP4 replay state.
+        context: Rank-local recurrent geometry, before pool allocation.
+        capacity: Rows for every resident request and reserved dummy slot.
+    """
+
+    group_id: int | None = None
+    has_own_slots = True
+    roles: frozenset[DataRole] = frozenset()
+
+    def __init__(self, state: KDA2Fp4ReplayState, context: MambaStateLayout, capacity: int) -> None:
+        self.state = state
+        self.context = context
+        self.capacity = capacity
+        state.live_capacity = capacity
+        self._indices: DeviceCopyBuffer | None = None
+        self._host_indices: torch.Tensor | None = None
+        self._rows: dict[int, int] = {}
+        self._free_rows = list(range(capacity - 1, -1, -1))
+        self._last_index_key: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    def reserved_gpu_bytes(self) -> int:
+        return self.state.reserved_gpu_bytes(self.context)
+
+    def declare_regions(self) -> Sequence[Region]:
+        return ()
+
+    def shared_buffers(self, global_layer: int) -> list[BufferConfig]:
+        return []
+
+    def bind(
+        self,
+        get_buffer: Callable[[int, DataRole, torch.dtype, list[int]], torch.Tensor],
+        layer_offsets: Mapping[int, int],
+        group_ids: Sequence[int],
+        batch_capacity: int,
+        device: torch.device,
+    ) -> None:
+        """Allocate the stable int32 batch indices; the state allocates the table when bound."""
+        if group_ids:
+            raise RuntimeError("KDA 2FP4 live histories declare no region")
+        self._indices = DeviceCopyBuffer(
+            torch.zeros(batch_capacity, dtype=torch.int32, device=device),
+            pin_memory=prefer_pinned(),
+        )
+        self._host_indices = torch.zeros(
+            batch_capacity, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+
+    def cuda_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+        return self._indices.tensor
+
+    def request_indices(self, request_ids: Sequence[int]) -> list[int]:
+        return [self._rows[rid] for rid in request_ids]
+
+    def prepare(
+        self,
+        requests: Sequence[LlmRequest],
+        caches: Mapping[int, _KVCache],
+        state_indices: torch.Tensor,
+        host_state_indices: torch.Tensor,
+        num_contexts: int,
+        skip_unchanged: bool,
+    ) -> None:
+        """Hand rows to newly prepared requests and upload the batch's rows."""
+        rows = []
+        fresh = []
+        for position, request in enumerate(requests):
+            row = self._rows.get(request.py_request_id)
+            if row is None:
+                if not self._free_rows:
+                    raise RuntimeError(
+                        f"KDA 2FP4 history rows exhausted: all {self.capacity} are held by "
+                        "resident requests"
+                    )
+                row = self._free_rows.pop()
+                self._rows[request.py_request_id] = row
+                if position >= num_contexts:
+                    fresh.append(row)
+            rows.append(row)
+        key = (tuple(req.py_request_id for req in requests), tuple(rows))
+        if not (skip_unchanged and key == self._last_index_key):
+            self._last_index_key = key
+            self._host_indices.zero_()
+            self._host_indices[: len(rows)] = torch.tensor(rows, dtype=torch.int32, device="cpu")
+            self._indices.update(self._host_indices)
+        # Context rows are reset separately, after both index vectors are ready.
+        if fresh:
+            self.state.reset_replay_slots(_host_slots_to_device(fresh, state_indices.device))
+
+    def reset_context(
+        self, num_contexts: int, state_indices: torch.Tensor, host_state_indices: torch.Tensor
+    ) -> None:
+        if num_contexts:
+            self.state.reset_slots(
+                state_indices[:num_contexts].long(),
+                host_state_indices[:num_contexts].tolist(),
+                replay_slots=self._indices.tensor[:num_contexts].long(),
+            )
+
+    def update(self, batch: MambaAcceptanceBatch, state_indices: torch.Tensor) -> None:
+        """Record acceptance using graph metadata's history rows when supplied."""
+        indices = getattr(
+            getattr(batch.attention_metadata, "mamba_metadata", None), "replay_state_indices", None
+        )
+        if indices is None:
+            indices = self._indices.tensor
+        start = batch.num_contexts
+        self.state.update(batch, indices[start : start + batch.num_generations].to(torch.int32))
+
+    def suspend(self, request_id: int, state_slot: int, stream: torch.cuda.Stream) -> None:
+        """Commit the request's pending history into its checkpoint and free its row."""
+        row = self._rows.get(request_id)
+        if row is None:
+            return
+        if state_slot >= 0:
+            with self.state.on_cache_stream(stream):
+                self.state.flush([state_slot], [row])
+        self.release(request_id)
+
+    def release(self, request_id: int) -> None:
+        row = self._rows.pop(request_id, None)
+        if row is not None:
+            self._free_rows.append(row)
+        self._last_index_key = None
+
+    def shutdown(self) -> None:
+        self._indices = None
+        self._host_indices = None
+        self._rows.clear()
+        self._free_rows = list(range(self.capacity - 1, -1, -1))
+        self._last_index_key = None
+
+
+__all__ = ["KDA2Fp4LiveHistory", "KDAReplayRegion", "REPLAY_STATE_REGION", "ReplayLayout"]

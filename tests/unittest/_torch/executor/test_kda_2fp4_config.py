@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
-    KDAReplayState,
     KimiK3HybridCacheManager,
     kda_2fp4_states_bytes_per_layer,
 )
@@ -58,16 +57,13 @@ def _model_config() -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("state_config", [{}, {"kda_2fp4_replay": False}])
-def test_2fp4_defaults_to_disabled(state_config: dict) -> None:
-    config = KvCacheConfig(
-        mamba_state_config=state_config,
-        use_kv_cache_manager_v2=False,
-    )
+def test_2fp4_defaults_to_disabled() -> None:
+    # Off by default, so the V2-only check does not reject the V1 manager.
+    config = KvCacheConfig(mamba_state_config={}, use_kv_cache_manager_v2=False)
     assert config.mamba_state_config.kda_2fp4_replay is False
 
 
-@pytest.mark.parametrize("value", [None, {}, {"decode": True}])
+@pytest.mark.parametrize("value", [None, {"decode": True}])
 def test_2fp4_rejects_non_boolean_enablement(value: object) -> None:
     with pytest.raises(ValueError, match="kda_2fp4_replay"):
         KvCacheConfig(mamba_state_config={"kda_2fp4_replay": value})
@@ -111,35 +107,46 @@ def test_2fp4_selects_the_glm5_next_manager() -> None:
 
 
 @pytest.mark.parametrize("dspark", [False, True])
-def test_2fp4_replay_region_budget(monkeypatch: pytest.MonkeyPatch, dspark: bool) -> None:
-    """The replay region reserves every local layer's K/U/G history and length per slot.
+def test_2fp4_live_history_budget(monkeypatch: pytest.MonkeyPatch, dspark: bool) -> None:
+    """The live history table and the per-batch buffers are reserved beside the pools.
 
-    The history lives in region pages, so snapshot slots never scale it and
-    nothing is subtracted from the KV budget separately.
+    The table holds one row per resident request and reserved dummy slot, each
+    with every local layer's K/U/G history and length; no replay region is
+    budgeted. A disaggregated context worker keeps no history.
     """
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextCacheManager
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_mtp_commit import DESC_FIELDS
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_replay import REPLAY_WORKSPACE_INT32
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+        _get_num_cuda_graph_padding_dummy_slots,
+    )
+
     model = _model_config()
     params = extract_mamba_kv_cache_params(model.pretrained_config)
     monkeypatch.setattr(
         "tensorrt_llm._torch.modules.kimi_kda.cache_manager._get_local_mamba_cache_layout",
         lambda *args, **kwargs: (params, 2, 2),
     )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.kda_mtp_replay_num_spec",
-        lambda *_: pytest.fail("2FP4 must not budget the fused-verify replay caches"),
-    )
     spec_config = DSparkDecodingConfig(max_draft_len=3) if dspark else None
-    per_slot = KDAReplayState.estimate_bytes_per_slot(
-        model, Mapping(), spec_config=spec_config, kda_2fp4_replay=True
-    )
     capacity = HISTORY_SIZE + (4 if dspark else 0)
-    layer_bytes = 4 * capacity * 128 * (2 + 2 + 4) + 16
-    # Two local layers plus the shared replay-count row the region estimate keeps.
-    assert per_slot == 2 * layer_bytes + 16
-    # A disaggregated context worker keeps no replay history.
+    # Two local layers of four heads, plus each layer's length row.
+    row_bytes = 2 * (4 * capacity * 128 * (2 + 2 + 4) + 16)
+    rows = 4 + _get_num_cuda_graph_padding_dummy_slots(spec_config, 4)
+    if dspark:
+        batch_bytes = 2 * 4 * 4 * (3 * 4 * 128) * 2 + 2 * 4 * 4 + 2 * DESC_FIELDS * 8
+    else:
+        batch_bytes = (4 + REPLAY_WORKSPACE_INT32) * 4
+    kwargs = dict(max_batch_size=4, kv_cache_config=_cache_config(), spec_config=spec_config)
+    for manager_cls in (KimiK3HybridCacheManager, Glm5NextCacheManager):
+        assert manager_cls._estimate_fixed_region_bytes(model, Mapping(), **kwargs) == 0
+        assert (
+            manager_cls._estimate_reserved_device_bytes(model, Mapping(), **kwargs)
+            == rows * row_bytes + batch_bytes
+        )
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     assert (
-        KDAReplayState.estimate_bytes_per_slot(
-            model, Mapping(), spec_config=spec_config, kda_2fp4_replay=True, is_disagg=True
+        KimiK3HybridCacheManager._estimate_reserved_device_bytes(
+            model, Mapping(), is_disagg=True, **kwargs
         )
         == 0
     )

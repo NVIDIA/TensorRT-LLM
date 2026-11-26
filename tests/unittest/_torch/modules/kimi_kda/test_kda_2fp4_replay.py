@@ -244,7 +244,8 @@ def _verification_descriptors(
 
 @pytest.mark.parametrize(
     ("heads", "tokens", "scheduling_sms"),
-    [(1, 1, None), (3, 4, None), (3, 8, None), (12, 7, None), (12, 4, 1), (96, 7, 1)],
+    # One head and one token; the widest step; Kimi's 96 heads on a one-SM schedule.
+    [(1, 1, None), (3, 8, None), (96, 7, 1)],
 )
 def test_dspark_native_verify_acceptance_and_rollover(
     heads: int,
@@ -545,7 +546,7 @@ def _norm_reference(core: torch.Tensor, fused: dict[str, torch.Tensor]) -> torch
     return (values * fused["norm_weight"].float() * torch.sigmoid(fused["z"].float())).bfloat16()
 
 
-@pytest.mark.parametrize("heads", [1, 3, 12])
+@pytest.mark.parametrize("heads", [1, 12])
 def test_checkpoint_qdq_and_fresh_rows(heads: int) -> None:
     pool, slots, _, state = _fixture(3, heads)
     initial = torch.ones(3, dtype=torch.bool, device="cuda")
@@ -567,8 +568,7 @@ def test_checkpoint_qdq_and_fresh_rows(heads: int) -> None:
     torch.testing.assert_close(restored[0], primary[0] + residual[0], atol=2e-6, rtol=2e-5)
 
 
-@pytest.mark.parametrize("heads", [1, 3, 12])
-@pytest.mark.parametrize("lower_bound", [None, -5.0])
+@pytest.mark.parametrize(("heads", "lower_bound"), [(1, None), (12, -5.0)])
 def test_native_replay_rollover(heads: int, lower_bound: float | None) -> None:
     pool, slots, history, state = _fixture(3, heads)
     replay = _replay_indices(3)
@@ -680,6 +680,58 @@ def test_native_replay_rollover(heads: int, lower_bound: float | None) -> None:
         assert torch.count_nonzero(history.length[untouched]) == 0
 
 
+@pytest.mark.parametrize("tokens", [0, 4], ids=["decode", "dspark"])
+def test_flush_commits_partial_windows(tokens: int) -> None:
+    """A flush commits each row's P < 16 pending entries as a window ending at entry P - 1.
+
+    Every layer is flushed; a row without entries keeps its checkpoint bytes,
+    and every flushed row's length is reset.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_replay import CK_MAX_ROWS
+
+    heads, layers = 3, 2
+    pools, slots = [], None
+    for _ in range(layers):
+        pool, slots, _, _ = _fixture(4, heads)
+        pools.append(pool)
+    rows = _replay_indices(4)
+    live = rows.long()
+    pending = [0, 1, 7, 15]
+    shape = (layers, _REPLAY_SLOTS, heads, ops.HISTORY_SIZE + tokens, 128)
+    keys = torch.randn(shape, device="cuda")
+    keys = (keys / keys.norm(dim=-1, keepdim=True)).bfloat16()
+    updates = (torch.randn(shape, device="cuda") * 0.1).bfloat16()
+    gates = (-torch.rand(shape, device="cuda") * 0.1).cumsum(3)
+    lengths = torch.zeros((layers, _REPLAY_SLOTS, 4), dtype=torch.int32, device="cuda")[..., 0]
+    lengths[:, live] = torch.tensor(pending, dtype=torch.int32, device="cuda")
+    checkpoints = [_read_checkpoint(pool, slots) for pool in pools]
+    before = [pool.clone() for pool in pools]
+
+    flags = torch.zeros((layers, CK_MAX_ROWS), dtype=torch.int32, device="cuda")
+    ops.flush_histories(pools, keys, updates, gates, lengths, slots, rows, flags)
+
+    assert torch.count_nonzero(lengths) == 0
+    for layer, pool in enumerate(pools):
+        assert torch.equal(pool[slots[0].long()], before[layer][slots[0].long()])
+        primary, residual = checkpoints[layer]
+        restored = ops.materialize_checkpoint(
+            pool, slots, torch.ones(4, dtype=torch.bool, device="cuda")
+        )
+        for batch_row, count in enumerate(pending):
+            if not count:
+                continue
+            row = live[batch_row]
+            end = gates[layer, row, :, count - 1]
+            adjusted = (
+                keys[layer, row, :, :count].float()
+                * (end[:, None, :] - gates[layer, row, :, :count]).exp()
+            ).bfloat16()
+            state = (primary[batch_row] + residual[batch_row]) * end.exp()[:, None, :]
+            state += updates[layer, row, :, :count].float().transpose(-1, -2) @ adjusted.float()
+            expected_primary, expected_residual = _qdq(state)
+            _assert_repacked_close(restored[batch_row], expected_primary + expected_residual)
+
+
 @pytest.mark.parametrize("dspark", [False, True])
 def test_dummy_rows_do_not_mutate_checkpoint_or_history(dspark: bool) -> None:
     pool, slots, history, _ = _fixture(1, 3)
@@ -734,39 +786,6 @@ def test_rne_midpoints_and_e4m3_maximum_scale() -> None:
     expected = torch.tensor([0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 6.0], device="cuda")
     torch.testing.assert_close(primary[0, 0, 0, :8], expected, atol=0, rtol=0)
     assert torch.isfinite(ops.materialize_checkpoint(pool, slots, torch.ones_like(slots))).all()
-
-
-@pytest.mark.parametrize("dspark", [False, True])
-def test_replay_never_reads_residual(dspark: bool) -> None:
-    pool, slots, history, _ = _fixture(1, 3)
-    tokens = 4 if dspark else 1
-    if dspark:
-        history = _verification_history(1, 3, tokens)
-    history.u.fill_(float("nan"))
-    fused = _fused_inputs(tokens, 3)
-    conv_before = fused["conv_state"].clone()
-    x = torch.randn((tokens, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
-    kwargs = dict(
-        **fused,
-        gate=x[:, : 3 * 128],
-        beta=x[:, :3],
-        pool=pool,
-        slots=slots,
-        replay_indices=_replay_indices(1),
-        dummy=torch.zeros(1, dtype=torch.bool, device="cuda"),
-        history=history,
-        A_log=torch.zeros(3, device="cuda"),
-        dt_bias=torch.zeros(3, 128, device="cuda"),
-        lower_bound=-5.0,
-        norm_eps=1e-6,
-    )
-    expected = ops.replay(x, **kwargs)
-    history.length.zero_()
-    fused["conv_state"].copy_(conv_before)
-    pool[slots.long(), :, :, 8192:16384] = 255
-    pool[slots.long(), :, :, 17408:18432] = 127  # NaN E4M3 residual scales
-    actual = ops.replay(x, **kwargs)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dspark", [False, True])

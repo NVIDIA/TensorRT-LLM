@@ -14,6 +14,10 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KimiK3HybridCacheManager,
 )
 from tensorrt_llm._torch.modules.kimi_kda.kda_2fp4 import HISTORY_SIZE, STATE_BYTES_PER_HEAD
+from tensorrt_llm._torch.modules.kimi_kda.replay_region import (
+    REPLAY_STATE_REGION,
+    KDA2Fp4LiveHistory,
+)
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -75,14 +79,20 @@ def _manager(
 
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 @pytest.mark.parametrize("dspark", [False, True], ids=["decode", "dspark"])
-def test_2fp4_manager_keeps_packed_checkpoints_and_region_histories(manager_cls, dspark):
+def test_2fp4_manager_keeps_packed_checkpoints_and_live_histories(manager_cls, dspark):
     _requires_2fp4_kernels()
     mgr = _manager(manager_cls, dspark)
     try:
         assert mgr.use_kda_2fp4_replay
         assert isinstance(mgr._kda_replay, KDA2Fp4ReplayState)
         assert mgr.commits_every_generation_step is dspark
-        assert mgr.replay_layer_group_id is not None
+        # One history row per resident request and reserved dummy, beside the pools.
+        live = mgr._kda_replay_region
+        assert isinstance(live, KDA2Fp4LiveHistory)
+        assert live.capacity == mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+        assert mgr.uses_replay_slots
+        assert mgr.get_region_group_ids(REPLAY_STATE_REGION) == ()
+        assert mgr._get_reserved_device_bytes() == live.reserved_gpu_bytes() > 0
         ssm = mgr.all_ssm_states[0]
         assert ssm.dtype == torch.uint8
         assert tuple(ssm.shape[1:]) == (HEADS, 1, STATE_BYTES_PER_HEAD)
@@ -92,6 +102,7 @@ def test_2fp4_manager_keeps_packed_checkpoints_and_region_histories(manager_cls,
             assert isinstance(cache, Kda2Fp4LayerCache)
             history = cache.history
             replay_slots = history.k.shape[0]
+            assert replay_slots == live.capacity
             for plane, dtype in ((history.k, torch.bfloat16), (history.u, torch.bfloat16)):
                 assert plane.shape == (replay_slots, HEADS, capacity, 128)
                 assert plane.dtype == dtype
@@ -101,8 +112,6 @@ def test_2fp4_manager_keeps_packed_checkpoints_and_region_histories(manager_cls,
             assert (history.candidate_x is not None) is dspark
             assert (history.old_lengths is not None) is dspark
             assert (history.arrivals is not None) is not dspark
-        roles = {str(role) for role in mgr.get_disagg_ignored_roles()}
-        assert {"kda_2fp4_k", "kda_2fp4_u", "kda_2fp4_g", "kda_2fp4_len"} <= roles
     finally:
         mgr.shutdown()
 
@@ -213,7 +222,9 @@ def _decode_step(mgr, weights, step):
     return torch.stack(outputs)
 
 
-def _run_decode(steps, suspend_after=None, slot_taken=False):
+def _run_decode(steps, suspend_after=None, slot_taken=False, flush_only=False):
+    """Decode request 1 for ``steps`` steps; at ``suspend_after`` suspend and resume it, or
+    with ``flush_only`` commit its pending history the way suspension does, without suspending."""
     mgr = _manager(heads=SUSPEND_HEADS, layers=SUSPEND_LAYERS)
     others = []
     request = None
@@ -243,18 +254,26 @@ def _run_decode(steps, suspend_after=None, slot_taken=False):
             outputs.append(_decode_step(mgr, weights, step))
             if step == suspend_after:
                 slot = mgr._request_id_to_state_index[1]
-                lengths = [
-                    h.length[mgr.get_replay_state_indices([1])].item()
-                    for h in (mgr.mamba_layer_cache(layer).history for layer in mgr.mamba_pp_layers)
-                ]
-                assert all(0 < length < HISTORY_SIZE for length in lengths)
-                mgr.suspend_request(request)
-                if slot_taken:
-                    _take_ssm_slot(mgr, slot, others)
-                    for ssm, conv in zip(mgr.all_ssm_states, mgr.all_conv_states):
-                        ssm[slot].random_(0, 256)
-                        conv[slot].normal_()
-                assert mgr.resume_request(request)
+                (row,) = mgr.get_replay_state_indices([1])
+                histories = [mgr.mamba_layer_cache(layer).history for layer in mgr.mamba_pp_layers]
+                assert all(0 < history.length[row].item() < HISTORY_SIZE for history in histories)
+                live = mgr._kda_replay_region
+                if flush_only:
+                    live.suspend(1, slot, mgr._stream)
+                else:
+                    mgr.suspend_request(request)
+                    if slot_taken:
+                        _take_ssm_slot(mgr, slot, others)
+                        for ssm, conv in zip(mgr.all_ssm_states, mgr.all_conv_states):
+                            ssm[slot].random_(0, 256)
+                            conv[slot].normal_()
+                    assert mgr.resume_request(request)
+                assert 1 not in live._rows
+                # The freed row's stale entries must not reach its next owner.
+                for history in histories:
+                    for plane in (history.k, history.u, history.g):
+                        plane[row].normal_()
+                    history.length[row] = 5
                 mgr._setup_state_indices([request], num_contexts=0)
                 if slot_taken:
                     assert mgr._request_id_to_state_index[1] != slot
@@ -268,15 +287,18 @@ def _run_decode(steps, suspend_after=None, slot_taken=False):
         mgr.shutdown()
 
 
-@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
-def test_2fp4_history_follows_a_suspended_request(slot_taken):
-    """Suspended with a partial history and resumed, possibly in another SSM slot, a
-    request decodes bit for bit like one never suspended, through the next window
-    commits. No flush is needed: the history pages stay with the request."""
+def test_2fp4_suspension_flushes_the_pending_history():
+    """Suspension commits a request's partial history into its checkpoint and frees its row.
+
+    Resumed in another SSM slot, the request decodes bit for bit like one whose
+    history was committed at the same step without suspension, through the next
+    window commits.
+    """
     _requires_2fp4_kernels()
     steps = 2 * HISTORY_SIZE + 5
-    expected = _run_decode(steps)
-    actual = _run_decode(steps, suspend_after=HISTORY_SIZE + 6, slot_taken=slot_taken)
+    suspend_after = HISTORY_SIZE + 6
+    expected = _run_decode(steps, suspend_after=suspend_after, flush_only=True)
+    actual = _run_decode(steps, suspend_after=suspend_after, slot_taken=True)
     for step, (got, want) in enumerate(zip(actual, expected, strict=True)):
         assert torch.equal(got, want), f"decode step {step}"
 

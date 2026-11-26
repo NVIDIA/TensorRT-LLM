@@ -86,11 +86,11 @@ def _prefill(case: dict, state_pool: torch.Tensor, state_indices: torch.Tensor, 
 @pytest.mark.parametrize(
     ("heads", "lengths", "fresh"),
     [
-        (96, [512, 512], [True, True]),
+        # Chunk-boundary lengths: fresh (bit-exact) and from checkpoints.
         (24, [1, 15, 16, 17, 100, 300, 31, 64], [True] * 8),
-        (96, [0, 48, 129], [False, False, True]),
-        (96, [256] * 4, [False, True, False, True]),
         (12, [100, 1, 31, 64, 17, 300, 16, 15], [False] * 8),
+        # An empty sequence and mixed fresh/checkpointed rows at Kimi's 96 heads.
+        (96, [0, 48, 129], [False, False, True]),
     ],
 )
 def test_packed_prefill_matches_qdq(

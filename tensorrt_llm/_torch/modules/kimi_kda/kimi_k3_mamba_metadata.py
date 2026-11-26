@@ -144,7 +144,10 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         """Fill the static replay-slot buffer, or alias the state slots."""
         kv_cache_manager = attn_metadata.kv_cache_manager
         request_ids = attn_metadata.request_ids
-        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None or request_ids is None:
+        uses_replay_slots = getattr(kv_cache_manager, "uses_replay_slots", None)
+        if uses_replay_slots is None:
+            uses_replay_slots = getattr(kv_cache_manager, "replay_layer_group_id", None) is not None
+        if not uses_replay_slots or request_ids is None:
             self.replay_state_indices = self.state_indices
             return
         batch_size = attn_metadata.seq_lens.shape[0]

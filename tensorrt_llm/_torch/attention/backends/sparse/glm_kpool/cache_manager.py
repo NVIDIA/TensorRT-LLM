@@ -40,7 +40,11 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     get_kda_replay_num_spec,
     kda_2fp4_states_bytes_per_layer,
 )
-from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
+from tensorrt_llm._torch.modules.kimi_kda.replay_region import (
+    REPLAY_STATE_REGION,
+    KDA2Fp4LiveHistory,
+    KDAReplayRegion,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     unwrap_glm5_next_text_config,
@@ -87,7 +91,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """
 
     kda_context_only = False
-    _kda_replay_region: KDAReplayRegion | None = None
+    _kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
     _kda_mtp_replay = False
     _kda_2fp4 = False
     # Its sparse MLA backend does not write or read mixed-precision high layers.
@@ -151,7 +155,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._kda_mtp_replay = kda_mtp_replay
         self._kda_2fp4 = kda_2fp4_replay
         self._kda_replay: KDAReplayState | None = None
-        self._kda_replay_region: KDAReplayRegion | None = None
+        self._kda_replay_region: KDAReplayRegion | KDA2Fp4LiveHistory | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -240,6 +244,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         providers = super()._region_providers()
         if self._kda_replay is None or not self.mamba_pp_layers:
             return providers
+        if isinstance(self._kda_replay, KDA2Fp4ReplayState):
+            self._kda_replay_region = KDA2Fp4LiveHistory(
+                self._kda_replay,
+                self._state_layout,
+                self._max_resident_sequences() + self._num_reserved_dummy_slots,
+            )
+            return providers
         self._kda_replay_region = KDAReplayRegion(
             self._kda_replay,
             self._state_layout,
@@ -293,6 +304,12 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return region.group_id if region is not None else None
 
     @property
+    def uses_replay_slots(self) -> bool:
+        """Whether the replay buffers have slots of their own instead of the recurrent ones."""
+        region = self._kda_replay_region
+        return region is not None and region.has_own_slots
+
+    @property
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -307,7 +324,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if request_ids is None:
             return self.cuda_replay_state_indices
         region = self._kda_replay_region
-        if region is None or region.group_id is None:
+        if region is None or not region.has_own_slots:
             # The replay buffers share the recurrent-state slots.
             return [self._request_id_to_state_index[rid] for rid in request_ids]
         return region.request_indices(request_ids)
@@ -363,6 +380,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 raise RuntimeError(
                     f"Request {request_id} is being suspended before update_resources "
                     "recorded the acceptance of its last verify in its KDA replay state"
+                )
+            if self._kda_replay_region is not None:
+                self._kda_replay_region.suspend(
+                    request_id, self._request_id_to_state_index[request_id], self._stream
                 )
             if request_id in replay.unseeded_requests:
                 # Its replay caches have not been seeded from the transferred
@@ -478,6 +499,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             external += self._kda_replay.external_gpu_bytes(self._state_layout)
         return external
 
+    @override
+    def _get_reserved_device_bytes(self) -> int:
+        reserved = super()._get_reserved_device_bytes()
+        if isinstance(self._kda_replay_region, KDA2Fp4LiveHistory):
+            reserved += self._kda_replay_region.reserved_gpu_bytes()
+        return reserved
+
     @classmethod
     @override
     def _states_bytes_per_layer(cls, params, mapping: Mapping, *, kv_cache_config) -> int:
@@ -510,7 +538,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     ) -> None:
         if self.kda_context_only:
             return
-        if state_indices is not None and self.replay_layer_group_id is not None:
+        if state_indices is not None and self.uses_replay_slots:
             metadata = getattr(attn_metadata, "mamba_metadata", None)
             if getattr(metadata, "replay_state_indices", None) is None:
                 raise RuntimeError("PRIVATE replay state needs mamba_metadata.replay_state_indices")
@@ -698,13 +726,28 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         kv_cache_config: KvCacheConfig,
         **kwargs,
     ) -> int:
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            # The 2FP4 histories live beside the pools (_estimate_reserved_device_bytes).
+            return 0
         return KDAReplayRegion.estimate_fixed_bytes(
-            model_config,
-            mapping,
-            max_batch_size,
-            kv_cache_config.max_util_for_resume,
-            kda_2fp4_replay=kv_cache_config.mamba_state_config.kda_2fp4_replay,
-            **kwargs,
+            model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+        )
+
+    @classmethod
+    @override
+    def _estimate_reserved_device_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        if not kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            return 0
+        return KDA2Fp4ReplayState.estimate_reserved_bytes(
+            model_config, mapping, max_batch_size, **kwargs
         )
 
     def get_index_state_buffer(self, layer_idx: int) -> torch.Tensor | None:

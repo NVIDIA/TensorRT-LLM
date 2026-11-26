@@ -15,7 +15,7 @@ Checkpoint
     projections read only P; materialization and commits read both terms.
 
 History
-    Each request owns a replay slot holding, per head, up to the history
+    Each running request owns a history row holding, per head, up to the history
     window of rows of normalized K and delta-rule update U (BF16) and the
     cumulative per-key log decay G (FP32). G_i is the sum of the per-token
     log decays g_1..g_i since the checkpoint, so the state after i tokens is
@@ -28,6 +28,8 @@ Commit
     prefix), the checkpoint advances to
     S_new = S * exp(G_last) + sum_i u_i (x) (k_i * exp(G_last - G_i))
     over the committed rows, and P/R are requantized with a new outer scale.
+    A suspended request's shorter history is committed the same way
+    (``flush_histories``), so only running requests keep a history.
 
 Batch and pool sizes are runtime parameters; no kernel specializes on batch
 size. Decode replay, DSpark verification and the all-layer post-sampling
@@ -509,6 +511,72 @@ def commit_verified(
             capacity,
             max_tokens,
         )
+
+
+# Bound on the temporary windows one flush chunk gathers (K, U and G of every layer).
+_FLUSH_CHUNK_BYTES = 256 << 20
+
+
+@torch.no_grad()
+def flush_histories(
+    pools: "list[torch.Tensor]",
+    k: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    lengths: torch.Tensor,
+    slots: torch.Tensor,
+    rows: torch.Tensor,
+    flags: torch.Tensor,
+) -> None:
+    """Commit the pending history entries of ``rows`` into the checkpoints at ``slots``.
+
+    Every local layer's history of ``rows`` is committed and emptied: a history
+    of P < 16 entries is handed to the decode commit kernel as a full window
+    whose entries P..15 have K = U = 0 and the cumulative decay of entry P - 1,
+    so the commit ends at entry P - 1 and the padding adds nothing. Rows
+    without entries keep their checkpoints unchanged.
+
+    Args:
+        pools: Per local layer, the packed checkpoints ``[S, H, 1, STATE_BYTES]``.
+        k: The layers' histories ``[L, R, H, capacity, 128]`` (BF16); ``u`` and
+            ``g`` (FP32) alike.
+        lengths: ``[L, R]`` int32 history lengths.
+        slots: ``[n]`` int32 checkpoint slots.
+        rows: ``[n]`` int32 history rows.
+        flags: int32 scratch ``[L, CK_MAX_ROWS]``.
+    """
+    from ...custom_ops.cute_dsl_kda_2fp4_replay import commit_windows, commit_windows_max_rows
+
+    count = rows.numel()
+    if count == 0:
+        return
+    layers, _, heads = k.shape[:3]
+    row_bytes = layers * heads * HISTORY_SIZE * HEAD_DIM * (2 + 2 + 4)
+    chunk = max(1, min(commit_windows_max_rows(heads), _FLUSH_CHUNK_BYTES // row_bytes))
+    window = torch.arange(HISTORY_SIZE, device=rows.device)
+    for start in range(0, count, chunk):
+        chunk_rows = rows[start : start + chunk].long()
+        chunk_slots = slots[start : start + chunk]
+        n = chunk_rows.numel()
+        pending = lengths[:, chunk_rows]
+        padding = (window >= pending[..., None])[:, :, None, :, None]
+        k_window = k[:, chunk_rows, :, :HISTORY_SIZE].masked_fill(padding, 0)
+        u_window = u[:, chunk_rows, :, :HISTORY_SIZE].masked_fill(padding, 0)
+        g_window = g[:, chunk_rows, :, :HISTORY_SIZE]
+        last = (pending.long() - 1).clamp(min=0)[:, :, None, None, None]
+        g_last = g_window.gather(3, last.expand(layers, n, heads, 1, HEAD_DIM))
+        g_window = torch.where(padding, g_last, g_window)
+        flags[:, :n].copy_(pending > 0)
+        commit_windows(
+            [pool.view(pool.shape[0], pool.shape[1], STATE_BYTES_PER_HEAD) for pool in pools],
+            chunk_slots,
+            torch.arange(n, dtype=torch.int32, device=rows.device),
+            k_window,
+            u_window,
+            g_window,
+            flags,
+        )
+        lengths[:, chunk_rows] = 0
 
 
 def _validate_checkpoint(pool: torch.Tensor) -> None:
