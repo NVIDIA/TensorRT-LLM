@@ -21,16 +21,18 @@ for the overall CBTS architecture.
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `import_sanity.py` | `ImportSanityRule` | `importsanityonly` | Python import/definition edits; fixed sanity inventory with runtime coverage retained for mixed files |
+| `import_sanity.py` | `ImportSanityRule` | `importsanityonly` | Python import/definition edits; existing package sanity with runtime coverage retained for mixed files |
 | `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template, developer-assistant, and agent-skill (`skills/`) folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## ImportSanityRule
 
-Uses old/new AST scopes to identify import/definition edits and retain the fixed
-`tests/integration/test_lists/import_sanity.yml` inventory. Pure import files are claimed with
-`importsanityonly`; mixed files stay in the coverage residual and carry a mandatory sanity
-obligation. Other rules still contribute their tests. Missing inventory targets or runnable
-pre-merge registrations force fallback. This rule does not infer runtime readers of constants,
+Uses old/new AST scopes to identify import/definition edits and set `sanity_required=True`.
+The existing PackageSanityCheck stages run the shared
+`tests/integration/test_lists/test-db/l0_sanity_check.yml` suite without per-test narrowing.
+Pure import files are claimed with `importsanityonly`; no named stage is needed because
+Groovy retains package sanity through its existing gate. Mixed files stay in the coverage
+residual. Other rules still contribute their tests. There is no independent import test list
+or selector-registration matching. This rule does not infer runtime readers of constants,
 imports, or decorators, and does not change runtime no-data or shared-state policy.
 
 ## PythonFormattingRule

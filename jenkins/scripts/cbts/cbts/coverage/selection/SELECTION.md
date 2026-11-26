@@ -84,28 +84,27 @@ changed-scope checks below.
 ## 4. Import and definition-time sanity policy
 
 `ImportSanityRule` classifies both source images with the AST scope map. Module statements,
-class-body edits, decorators, defaults, and signature edits require the registered inventory in
-`tests/integration/test_lists/import_sanity.yml`. Classification includes removed code and
+class-body edits, decorators, defaults, and signature edits retain PackageSanityCheck, which
+runs the existing `tests/integration/test_lists/test-db/l0_sanity_check.yml` suite. Classification includes removed code and
 one-line function signatures; it does not follow binding consumers, factories, or decorators.
 Comments and AST-identical edits add no import obligation.
 
 A pure import/definition edit is claimed by the rule and can select sanity without coverage rows.
-A mixed file remains in the Tier-2 residual: the inventory is retained and ordinary runtime
+A mixed file remains in the Tier-2 residual: package sanity is retained and ordinary runtime
 qualnames are resolved with the existing coverage policy. Ordinary function bodies keep direct
 symbol lookup, the default whole-file fallback for absent function rows, and the existing
 shared-pytest-state checks. A runtime residual file without test-attributed coverage still
 forces fallback. Explicit Tier-1 contributions and PR-added/modified tests remain additive.
 
-Every inventory selector must exist in source and have an available, covering pre-merge test-db
-entry. Missing inventory, source selectors, registrations, or stages force fallback. Inventory
-entries are kept independently of coverage and capture quality. CPU checks use their existing
-parent registrations; cold imports and related import checks are also registered in package
-sanity. Package sanity stays enabled; import sanity alone does not require performance sanity.
+The rule sets `sanity_required=True` without adding named stages or per-test filters.
+Groovy retains the baseline-eligible PackageSanityCheck stages through the existing gate;
+they consume the shared sanity suite in full. No separate import inventory or registration
+matching is maintained. Import sanity alone does not require performance sanity.
 
 This is a deliberate sanity policy, not a proof that import-time changes have no runtime effect.
-For example, a changed module constant can alter inference behavior while all cold imports pass.
-The inventory checks loading and selected behavior; it is not exhaustive functional coverage.
-Standalone coverage callers without a validated inventory retain the conservative import bounds.
+For example, a changed module constant can alter inference behavior while sanity tests pass.
+The shared suite checks basic functionality; it is not exhaustive functional coverage.
+Standalone coverage callers without the import-sanity rule retain conservative import bounds.
 
 ## 5. Full impact resolution
 

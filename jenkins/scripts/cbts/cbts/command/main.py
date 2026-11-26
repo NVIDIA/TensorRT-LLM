@@ -101,7 +101,7 @@ def build_rules(
 ) -> list[Rule]:
     return [
         PythonFormattingRule(),
-        ImportSanityRule(yaml_index, stages, repo_root),
+        ImportSanityRule(repo_root),
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
@@ -338,8 +338,10 @@ class Selector:
         # rule explicitly claimed files that need no test stages (e.g. QA
         # test-list edits the pre-merge pipeline doesn't consume), so the
         # empty stage set is intentional and gets preserved through to
-        # Groovy Layer 2.
-        if not affected_stages and scope != "noop":
+        # Groovy Layer 2. Import sanity also needs no named stages: the
+        # sanity_required gate retains PackageSanityCheck there.
+        package_sanity = any(r.import_sanity_files and r.sanity_relevant for _, r in pairs)
+        if not affected_stages and scope != "noop" and not package_sanity:
             return SelectionResult(
                 scope=None,
                 reasons=rule_reasons + [{"source": "fallback", "reason": "no_stages_resolved"}],
@@ -349,6 +351,10 @@ class Selector:
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for _, r in pairs:
             for key, prefix_to_waives in r.block_filters.items():
+                # Import changes require the full shared sanity suite even
+                # when another rule selects individual entries from it.
+                if package_sanity and key[0] == "l0_sanity_check":
+                    continue
                 dst = block_filters.setdefault(key, {})
                 for prefix, waives in prefix_to_waives.items():
                     dst.setdefault(prefix, set()).update(waives)
