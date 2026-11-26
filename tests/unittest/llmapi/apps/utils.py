@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ import pytest
 import requests
 import yaml
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 
@@ -94,32 +94,47 @@ async def logit_bias_effect_helper(client: Any,
 
     assert 'Paris' in output, f"Expected 'Paris' in output with positive logit bias, got: {output}"
 
-    # Test with strong negative bias for 'Paris'
-    logit_bias = {str(token_id): -80 for token_id in paris_token_ids}
+    for include_colliding_keys in [False, True]:
+        # Test with strong negative bias for 'Paris'
+        if include_colliding_keys:
+            logit_bias = {
+                # NB: Space-padded token id precedes actual token id in sort-order, but should
+                #     win here, because it is last in dictionary order.
+                **{
+                    str(token_id): 80
+                    for token_id in paris_token_ids
+                },
+                **{
+                    " " + str(token_id): -80
+                    for token_id in paris_token_ids
+                },
+            }
+        else:
+            logit_bias = {str(token_id): -80 for token_id in paris_token_ids}
 
-    if api_type == 'completions':
-        response = await client.completions.create(
-            model=model_name,
-            prompt='The capital of France is',
-            max_tokens=5,
-            logit_bias=logit_bias,
-            temperature=0.0,
-        )
-        output = response.choices[0].text
-    elif api_type == 'chat':
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=[{
-                "role": "user",
-                "content": "The capital of France is"
-            }],
-            max_tokens=5,
-            logit_bias=logit_bias,
-            temperature=0.0,
-        )
-        output = response.choices[0].message.content
+        if api_type == 'completions':
+            response = await client.completions.create(
+                model=model_name,
+                prompt='The capital of France is',
+                max_tokens=5,
+                logit_bias=logit_bias,
+                temperature=0.0,
+            )
+            output = response.choices[0].text
+        elif api_type == 'chat':
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": "The capital of France is"
+                }],
+                max_tokens=5,
+                logit_bias=logit_bias,
+                temperature=0.0,
+            )
+            output = response.choices[0].message.content
 
-    assert 'Paris' not in output, f"Did not expect 'Paris' in output with negative logit bias, got: {output}"
+        assert 'Paris' not in output, f"Did not expect 'Paris' in output with negative logit bias, got: {output}"
 
 
 async def invalid_logit_bias_helper(client: Any,
@@ -178,6 +193,9 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
         args.extend(['--extra_llm_api_options', str(temp_file_path)])
         args.extend(['--num_postprocess_workers',
                      str(0)])  # disable postprocess workers to avoid OOM
+        # Smaller batch size reduces chance of OOM
+        args.extend(["--max_batch_size", "128"])
+        args.extend(["--max_num_tokens", "1024"])
 
         with RemoteOpenAIServer(model_path, args) as remote_server:
             yield remote_server

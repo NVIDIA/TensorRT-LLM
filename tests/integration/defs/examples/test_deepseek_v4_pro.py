@@ -42,7 +42,7 @@ def _deepseekv4_pro_agg_llm_kwargs(**overrides):
     kwargs = dict(
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=MoeConfig(tactic="trtllm_gen"),
         enable_attention_dp=True,
         max_seq_len=4096,
         max_batch_size=16,

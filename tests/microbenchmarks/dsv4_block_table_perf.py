@@ -74,7 +74,8 @@ def _torch_sliding_block_tables_with_scratch(
     )
     scratch_capacity = scratch_begs.shape[1]
     scratch_rows = scaled_base[:, :, :scratch_capacity, :]
-    mask = mask[pool_ids] & valid_pool[:, :, None, None]
+    # A block in the scratch range that already has a regular page keeps it.
+    mask = mask[pool_ids] & valid_pool[:, :, None, None] & (scratch_rows == BAD_PAGE_INDEX)
     output[:, :, :scratch_capacity, :].copy_(torch.where(mask, scratch_index, scratch_rows))
 
 

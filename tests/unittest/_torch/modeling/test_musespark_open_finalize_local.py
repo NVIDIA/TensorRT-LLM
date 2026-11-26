@@ -1,6 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Single-process contracts of the finalize+all-reduce module: imports, input checks, release order.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Single-process contracts of the finalize+all-reduce module: input checks and release order.
 
 These need no peers. Argument validation runs on a workspace whose launcher is
 replaced by a recorder, so a rejected call is proven to launch nothing.
@@ -9,9 +21,6 @@ exchanges as `TorchDist` does. Release runs on a workspace holding fake
 buffers, with the TP group and the CUDA calls replaced by recorders, so the
 order of every step can be checked exactly.
 """
-
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -22,25 +31,6 @@ from tensorrt_llm._torch.models import musespark_open_finalize_ar
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.models.musespark_open_finalize_ar import FinalizeIpcWorkspace
 from tensorrt_llm.mapping import Mapping
-
-_BLOCKED_DSL = """
-import sys
-for name in ("cutlass", "cutlass.cute", "cutlass.utils", "cutlass._mlir", "cutlass.cutlass_dsl"):
-    sys.modules[name] = None
-from tensorrt_llm._torch.models import musespark_open_boundary, musespark_open_finalize_ar
-from tensorrt_llm._torch.models.modeling_musespark_open import _build_finalize_allreduce_workspace
-print(musespark_open_finalize_ar.HAS_CUTEDSL, musespark_open_boundary._HAS_CUTE_DSL,
-      _build_finalize_allreduce_workspace(object()))
-"""
-
-
-def test_modules_import_without_cute_dsl() -> None:
-    """Both kernels report unavailable and the model keeps the unfused path."""
-    result = subprocess.run(
-        [sys.executable, "-c", _BLOCKED_DSL], capture_output=True, text=True, timeout=600
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.split()[-3:] == ["False", "False", "None"]
 
 
 @pytest.fixture

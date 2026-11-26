@@ -17,6 +17,8 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
 
+pytestmark = pytest.mark.cpu_only
+
 _TOKEN_IDS = [151644, 872, 198, 9707, 151645]
 
 

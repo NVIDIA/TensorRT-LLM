@@ -56,6 +56,14 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_deepseek-v4-pro-fp4_8k1k_con
 # VR200 Kimi-K3
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_kimi-k3-fp4_8k1k_con512_ctx1_dep16_gen1_dep16_eplb0_mtp0_ccb-NIXL]
 
+# VR200 Kimi-K3 NVFP4 ModelingV2 targets: full GSM8K through the disaggregated harness. A case is one
+# deployment of one-GPU DWDP context servers (the tp1 target) and one generation target; tp1's file
+# runs the same deployments, so it lists one case.
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Dep16::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_dep16_bs16_dspark5]
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Helix8Moeep8::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_helix8_bs8_dspark7]
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Helix8Moetp2ep4::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_helix8_bs20_dspark5]
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1/test_accuracy.py::TestModelingV2KimiK3Nvfp4Sm107Tp1::test_gsm8k[disagg-e2e-vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx16_dwdp16_gen1_dep16_bs16_dspark5]
+
 # VR200 MiniMax-M3
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep16_eplb0_eagle3_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-e2e-vr200_minimax-m3-fp4_8k1k_con256_ctx4_tp4_gen1_dep8_eplb0_eagle3_ccb-NIXL]

@@ -349,6 +349,8 @@ srun --mpi=pmix \
         # actually re-running the same configuration twice.
         export KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\"${KIMI_K3_FP8_WEIGHT_READ_MOE_MLP:-0}\"
         echo \"[k3] KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=\$KIMI_K3_FP8_WEIGHT_READ_MOE_MLP\"
+        export KIMI_K3_MXFP8_SHARED_EXPERT=\"${KIMI_K3_MXFP8_SHARED_EXPERT:-0}\"
+        echo \"[k3] KIMI_K3_MXFP8_SHARED_EXPERT=\$KIMI_K3_MXFP8_SHARED_EXPERT\"
 
         # Import tensorrt_llm from $REPO, not from wherever the venv's
         # in-place install points (for git-worktree submits those differ;

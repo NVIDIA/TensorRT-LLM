@@ -107,8 +107,8 @@ def add_multimodal_args(parser):
     parser.add_argument("--image_format",
                         type=str,
                         choices=["pt", "pil"],
-                        default="pt",
-                        help="The format of the image.")
+                        default=None,
+                        help="Defaults to PIL for images and NumPy for videos.")
     parser.add_argument("--device",
                         type=str,
                         default="cpu",
@@ -242,7 +242,7 @@ def main():
                     modality=args.modality,
                     prompts=[cur_prompt],
                     media=args.media,
-                    image_data_format="pt",
+                    image_data_format=image_format,
                     num_frames=8,
                     device="cpu")
 

@@ -16,7 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/common/ncclTorchUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 #include <ATen/cuda/EmptyTensor.h>
