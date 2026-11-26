@@ -3289,6 +3289,217 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                 assert not all(tid == 0 for tid in token_ids)
 
 
+class TestQwen3_8B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "attention_backend",
+        ["VANILLA", pytest.param("TRTLLM", marks=skip_pre_blackwell)])
+    def test_dspark(self, attention_backend):
+        """Standalone DSpark drafter on Qwen3-8B, 0-shot chat.
+
+        Acceptance length is the gate here. DSpark drafters are distilled on
+        the target's own chat-mode generations, so the harness default (5-shot
+        completion) is out of distribution for the drafter and understates
+        acceptance: 4.42 there against 6.26 here, on the same checkpoints.
+        GSM8K accuracy is not meaningful in this regime and is not gated --
+        see the extra_acc_spec entry in references/gsm8k.yaml.
+
+        Both block-decode backends run: TRTLLM is what deployments use, and
+        it is the one the acceptance number above was measured on, but it
+        needs SM100/SM103 so H100 only covers VANILLA. The two differ
+        numerically (GSM8K 28.9 vs 28.1) while landing the same acceptance
+        length, so they share one reference.
+        """
+        pytorch_config = dict(
+            max_batch_size=8,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+
+        # DeepSeek's official DSpark head for this target (block_size 7,
+        # markov_rank 256, confidence head). Head tensors are named after the
+        # submodules that own them (markov_head.*, confidence_head.proj.*),
+        # which is the spelling the drafter loader has to resolve.
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+
+        spec_config = DSparkDecodingConfig(max_draft_len=7,
+                                           speculative_model=dspark_model_dir,
+                                           attention_backend=attention_backend)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            # 0-shot chat, not the harness default 5-shot completion: a DSpark
+            # drafter is distilled on the target's chat-mode output, so the
+            # default prompt is out of distribution for it and understates
+            # acceptance (4.42 vs 6.26 on these same checkpoints). Only the AL
+            # is gated -- extra_acc_spec selects a gsm8k.yaml entry whose
+            # reference accuracy is 0, i.e. run the task, do not gate on it.
+            task.evaluate(llm,
+                          extra_acc_spec="zero_shot_al_only",
+                          extra_evaluator_kwargs=dict(
+                              num_fewshot=0,
+                              apply_chat_template=True,
+                              chat_template_kwargs={"enable_thinking": False},
+                          ))
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
+                  f"= {acceptance_length:.3f}")
+            assert_acceptance_length("TestQwen3_8B::test_dspark",
+                                     acceptance_length)
+
+    _DSPARK_SAMPLED_SYSTEM_PROMPT = (
+        "You are a careful math tutor. Read the problem, identify the "
+        "quantities it gives and the quantity it asks for, and solve it step "
+        "by step. Show each intermediate calculation on its own line, check "
+        "the arithmetic once more before answering, and keep the explanation "
+        "short and concrete. Do not restate the problem, do not introduce "
+        "variables you do not use, and do not round intermediate results. "
+        "When a problem involves money, keep two decimal places; when it "
+        "involves time, convert everything to the same unit before adding. "
+        "End your response with a final line exactly in the form "
+        "#### <answer>, using the simplest numeric form without units.")
+    _DSPARK_SAMPLED_QUESTIONS = (
+        "Natalia sold clips to 48 of her friends in April, and then she sold "
+        "half as many clips in May. How many clips did Natalia sell "
+        "altogether in April and May?",
+        "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 "
+        "minutes of babysitting. How much did she earn?",
+        "Betty is saving money for a new wallet which costs $100. Betty has "
+        "only half of the money she needs. Her parents decided to give her "
+        "$15 for that purpose, and her grandparents twice as much as her "
+        "parents. How much more money does Betty need to buy the wallet?",
+        "James writes a 3-page letter to 2 different friends twice a week. "
+        "How many pages does he write a year?",
+        "Mark has a garden with flowers. He planted plants of three different "
+        "colors in it. Ten of them are yellow, and there are 80% more of "
+        "those in purple. There are only 25% as many green flowers as there "
+        "are yellow and purple flowers. How many flowers does Mark have in "
+        "his garden?",
+        "Albert buys 2 large pizzas and 2 small pizzas. A large pizza has 16 "
+        "slices and a small pizza has 8 slices. If he eats it all, how many "
+        "pieces does he eat that day?",
+        "Ken created a care package to send to his brother. He placed a box "
+        "on a scale and poured in enough jelly beans to bring the weight to "
+        "2 pounds. Then he added enough brownies to cause the weight to "
+        "triple. Next, he added another 2 pounds of jelly beans. Finally, he "
+        "added enough gummy worms to double the weight once again. What was "
+        "the final weight of the box of goodies, in pounds?",
+        "Alexis is applying for a new job and bought a new set of business "
+        "clothes to wear to the interview. She went to a department store "
+        "with a budget of $200 and spent $30 on a button-up shirt, $46 on "
+        "suit pants, $38 on a suit coat, $11 on socks, and $18 on a belt. "
+        "She also purchased a pair of shoes, but lost the receipt for them. "
+        "She has $16 left from her budget. How much did Alexis pay for the "
+        "shoes?",
+    )
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize(
+        "rejection_sample_method,fused_chain,context_recompute_tail",
+        [("standard", True, None), ("block", False, 64)],
+        ids=["standard-fused_chain", "block-per_position"])
+    def test_dspark_rejection_sampling(self, rejection_sample_method,
+                                       fused_chain, context_recompute_tail):
+        """Sampled DSpark drafts under rejection sampling, with prefix reuse.
+
+        The two ancestral draft paths run end to end: a no_topk_no_topp
+        deployment takes the fused Markov chain, and filtered drafts with
+        use_ancestral_draft_sampling take the per-position sampler. They pair
+        with token-level and block verification. Every prompt runs twice, so
+        the repeat takes a prefix-cache hit and the target recomputes the
+        drafter's context tail: None resolves from this drafter's unwindowed
+        layer to -1, a full re-prefill, and 64 reuses all but the last 64
+        prompt tokens. Both passes must finish every request with an
+        acceptance length a broken draft distribution would not reach.
+        """
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=dspark_model_dir,
+            attention_backend="VANILLA",
+            use_rejection_sampling=True,
+            rejection_sample_method=rejection_sample_method,
+            advanced_sampling_mode=("no_topk_no_topp"
+                                    if fused_chain else "full"),
+            use_ancestral_draft_sampling=not fused_chain,
+            context_recompute_tail=context_recompute_tail)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                        free_gpu_memory_fraction=0.6)
+        # Qwen3's recommended non-thinking sampling; the no_topk_no_topp
+        # deployment samples by temperature alone.
+        filters = {} if fused_chain else dict(top_k=20, top_p=0.8)
+        sampling_params = SamplingParams(max_tokens=256,
+                                         temperature=0.7,
+                                         seed=0,
+                                         **filters)
+
+        with LLM(model=target_model_dir,
+                 max_batch_size=8,
+                 disable_overlap_scheduler=True,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                   enable_padding=True),
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            resolved_tail = llm.args.speculative_config.context_recompute_tail
+            assert resolved_tail == (context_recompute_tail or -1)
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "system",
+                        "content": self._DSPARK_SAMPLED_SYSTEM_PROMPT
+                    }, {
+                        "role": "user",
+                        "content": question
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False)
+                for question in self._DSPARK_SAMPLED_QUESTIONS
+            ]
+            for repeat in (False, True):
+                outputs = llm.generate(prompts, sampling_params)
+                for output in outputs:
+                    assert output.outputs[0].finish_reason in ("stop", "length")
+                    assert output.outputs[0].text.strip()
+                    assert output.decoding_iter > 0
+                if repeat:
+                    # A full re-prefill claims no cached tokens; a positive
+                    # tail reuses the prompt up to the tail.
+                    assert all((output.cached_tokens > 0) == (resolved_tail > 0)
+                               for output in outputs)
+                    # The claim stops at least the tail short of the prompt end
+                    # (lower for block alignment).
+                    assert all(
+                        output.cached_tokens <= len(output.prompt_token_ids) -
+                        resolved_tail for output in outputs
+                        if resolved_tail > 0)
+                acceptance_length = sum(
+                    output.avg_decoded_tokens_per_iter * output.decoding_iter
+                    for output in outputs) / sum(output.decoding_iter
+                                                 for output in outputs)
+                print(f"[AL] test_dspark_rejection_sampling"
+                      f"[{rejection_sample_method}] repeat={repeat}: "
+                      f"{acceptance_length:.3f}")
+                # 4.94-5.09 on RTX PRO 6000 (VANILLA), both passes.
+                assert acceptance_length >= 4.0, (
+                    f"acceptance length {acceptance_length:.3f} < 4.0 "
+                    f"(repeat={repeat})")
+
+
 class TestLagunaXS(LlmapiAccuracyTestHarness):
     MODEL_NAME = "poolside/laguna-XS.2"
     MODEL_PATH = f"{llm_models_root()}/Laguna-XS.2"
@@ -3933,16 +4144,17 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         enable_attention_dp=True,
                         enable_block_reuse=True)
 
-    @skip_pre_blackwell
+    @pytest.mark.skipif(get_sm_version() not in (100, 103, 107),
+                        reason="GVR Top-K runs only on SM100, SM103 and SM107")
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(70000)
     def test_nvfp4_adp4_mtp3_trtllm(self, monkeypatch: pytest.MonkeyPatch,
                                     mocker) -> None:
         """NVFP4 on four GPUs with attention DP, MTP3 and the PLE table on GPU.
 
-        Blackwell-only, so the GVR Top-K prerequisites hold. This is the case
-        that keeps both indexer options under accuracy guard: the heuristic
-        Top-K, and the draft loop reusing one selection.
+        Runs on SM100, SM103 and SM107, where GVR Top-K is available. This
+        is the case that keeps both indexer options under accuracy guard:
+        the heuristic Top-K, and the draft loop reusing one selection.
 
         The checkpoint stores the PLE n-gram table as scaled FP8. Under
         attention DP each rank owns a row slice of it and masks the rows it

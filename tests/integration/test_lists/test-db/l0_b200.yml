@@ -96,6 +96,9 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_breakable_prefill_cuda_graph
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[standard-fused_chain]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[block-per_position]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[VANILLA]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4_dflash[TRTLLM]
