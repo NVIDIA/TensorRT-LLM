@@ -51,8 +51,29 @@ For token-aware placement, add
 `kv_cache_routing_new_conv_placement: least_tokens` under `attention_dp_config`.
 This chooses an eligible ADP rank with the lowest active prompt-token load,
 including input tokens of requests assigned in the current batch. The default
-is `round_robin`; `least_queued` uses active-request counts. Existing
-conversation affinity still applies.
+is `round_robin`; `least_queued` uses active-request counts. `least_prefill`
+balances the prefill still to compute instead of prompt length: a later turn
+of a conversation counts only the tokens appended since its previous prompt,
+which the pinned rank already caches, so multi-turn traffic with long cached
+histories does not make a rank look busy. Existing conversation affinity still
+applies.
+
+By default a later turn whose rank is at its active-request limit overflows to
+another rank, where its prefix is not cached. Under saturation that turns cached
+turns into full prefills. `kv_cache_routing_strict_conversation_affinity: true`
+keeps such a turn queued, in arrival order, until its rank has a slot; requests
+behind it are still admitted. `kv_cache_routing_strict_affinity_max_wait_iters`
+bounds that wait in scheduler iterations (0, the default, waits without limit).
+
+With KV cache manager V2 and chunked prefill, the router can also keep long
+uncached prefills from holding the token budget while short turns wait. It
+estimates each turn's uncached prefill: the tokens added since the
+conversation's previous prompt, or the whole prompt for a first turn. The
+environment variable `TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS` schedules a request
+estimated above that many tokens after the other context requests of each
+iteration, and `TLLM_V2_CTX_DEMOTE_MAX_ITERS` bounds how many consecutive
+iterations a request is demoted before it keeps its arrival order (0, the
+default, means no limit). Both default to off.
 
 Use `/v1/chat/completions` for both instance and ADP-rank affinity. The
 `/v1/completions` endpoint supports instance affinity only.
@@ -91,8 +112,23 @@ workers as well. Use `context` scope with conditional disaggregation, which requ
 a KV-cache-aware generation router.
 
 Placement follows the existing conversation routers' behavior. Affinity is best
-effort: a saturated ADP rank can overflow to another rank, and affinity bindings can
-be evicted. Cache reuse depends on matching prompt prefixes and cache availability.
+effort: affinity bindings can be evicted, and by default a request whose home ADP
+rank has no free request slot overflows at once to another rank chosen by
+`kv_cache_routing_new_conv_placement`. Cache reuse depends on matching prompt
+prefixes and cache availability.
+
+To trade queueing delay for reuse on the home rank, set
+`attention_dp_config.kv_cache_routing_home_wait_rounds` (prototype; requires
+`kv_cache_routing_conversation_affinity: true`). A returning conversation (or a
+sub-agent routed by its parent's key) whose home rank is full then stays in the
+waiting queue until a slot frees there, for up to that many scheduling rounds in
+which another rank had room. After that it overflows as above; its conversation
+stays bound to the home rank. While it waits, later requests can be admitted
+ahead of it. With `scheduler_config.waiting_queue_policy: priority`, later
+requests of the same priority can take any rank, and lower-priority requests
+can take other ranks but not the held request's home rank, so each rank still
+admits in priority order. It cannot be combined with
+`kv_cache_routing_strict_conversation_affinity`.
 
 ## Gateway trust boundary
 

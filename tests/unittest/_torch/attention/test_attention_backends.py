@@ -165,7 +165,7 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     and the feature slice (non-default dims on representative configs); callers
     dedup by id. Dimensions that don't apply to a case type are filtered:
     no-cache encoders take only the compute-dtype precisions; MLA uses bf16
-    latent cache; cross skips fp8. Single-KV-head configs use only HND because
+    latent cache. Single-KV-head configs use only HND because
     NHD is physically equivalent and would skip TRTLLM coverage.
     """
     common = _common(cfg)
@@ -215,8 +215,6 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     # Filter dims to those meaningful for this case type.
     if cfg.is_mla:
         precisions = [(d, k) for d, k in precisions if k is None]  # bf16 latent
-    elif cfg.is_cross:
-        precisions = [(d, k) for d, k in precisions if k is None]  # no fp8 cross
     if cfg.num_kv_heads == 1:
         kv_layouts = ["HND"]
 

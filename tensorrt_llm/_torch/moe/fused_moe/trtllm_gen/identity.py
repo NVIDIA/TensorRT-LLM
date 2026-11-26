@@ -24,9 +24,8 @@ from ..impl_contract import MoEInputRequirement, MoEStaticCapability
 from ..impl_identity import MoEImplDescriptor, MoEImplId
 from ..interface import MoESchedulerKind
 
-# Also the op backend registry keys (``moe_op_backend.get_op_backend``).
+# Also the op backend registry key (``moe_op_backend.get_op_backend``).
 PROVIDER_TRTLLM = "trtllm"
-PROVIDER_FLASHINFER = "flashinfer"
 
 TECHNIQUE_TRTLLM_GEN = "trtllm_gen"
 KERNEL_FUSED_MOE = "fused_moe"

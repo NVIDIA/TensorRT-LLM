@@ -56,6 +56,42 @@ if __name__ == "__main__":
 
 from ..blackwell.dense_blockscaled_gemm_persistent import Sm100BlockScaledPersistentDenseGemmKernel
 
+
+@cute.jit
+def _retire_tmem_loads(value: cute.TensorSSA) -> cute.TensorSSA:
+    """Complete TMEM reads before the epilogue's barriers publish their data."""
+    cute.arch.fence_view_async_tmem_load()
+    return value
+
+
+@cute.kernel
+def _reduce_split_k_fp32_kernel(
+    partials: cute.Tensor, output: cute.Tensor, split_k: cutlass.Constexpr
+) -> None:
+    idx = cute.arch.block_idx()[0] * 256 + cute.arch.thread_idx()[0]
+    numel = cute.size(output)
+    if idx < numel:
+        value = cutlass.Float32(0)
+        for split in cutlass.range_constexpr(split_k):
+            value = value + partials[idx + split * numel]
+        output[idx] = value.to(cutlass.BFloat16)
+
+
+@cute.jit
+def reduce_split_k_fp32(
+    partials: cute.Tensor,
+    output: cute.Tensor,
+    split_k: cutlass.Constexpr,
+    stream: cuda.CUstream,
+) -> None:
+    """Reduce contiguous FP32 split planes in order, then round once to BF16."""
+    _reduce_split_k_fp32_kernel(partials, output, split_k).launch(
+        grid=(cute.ceil_div(cute.size(output), 256), 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
+
+
 """
 This example provides an implementation of the SM107 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
 
@@ -150,6 +186,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
     :type raster_order: Literal["m", "n"]
     :param split_k: Number of CTAs that partition K per output tile, defaults to 1
     :type split_k: int
+    :param split_k_partials: Write separate FP32 planes to C with batch extent
+        L * split_k. The caller reduces these planes into its final output.
+    :type split_k_partials: bool
 
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
@@ -197,6 +236,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         raster_order: Literal["m", "n"] = "m",
         scheduler_type: Type = None,
         split_k: int = 1,
+        split_k_partials: bool = False,
     ):
         super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
 
@@ -232,11 +272,26 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         if self.use_clc_dynamic_scheduler:
             self.threads_per_cta = self.threads_per_warp * (len(self.epilog_warp_id) + 3)
 
-        # Each split computes a disjoint K range and atomically reduces its
-        # partial output through TMA. Callers must zero C before every launch.
+        # Each split computes a disjoint K range. The partials mode writes
+        # separate FP32 output planes; atomic mode requires a zeroed C.
         if split_k < 1:
             raise ValueError(f"split_k must be >= 1, got {split_k}")
         self.split_k = split_k
+        self.split_k_partials = split_k_partials
+
+    def _split_k_range(self, k_tile_cnt, l_coord):
+        """Return ``(k_tile_begin, k_tiles)`` of the split-K slice at scheduler L ``l_coord``.
+
+        Slices take balanced ranges, ``[floor(k_tile_cnt * s / split_k),
+        floor(k_tile_cnt * (s + 1) / split_k))`` for slice ``s = l_coord % split_k``,
+        so any ``split_k <= k_tile_cnt`` gives every slice at least one K tile.
+        """
+        if cutlass.const_expr(self.split_k == 1):
+            return 0, k_tile_cnt
+        split_idx = l_coord % self.split_k
+        k_tile_begin = (k_tile_cnt * split_idx) // self.split_k
+        k_tile_end = (k_tile_cnt * (split_idx + 1)) // self.split_k
+        return k_tile_begin, k_tile_end - k_tile_begin
 
     def _compute_grid(
         self,
@@ -251,7 +306,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
-        if self.split_k > 1:
+        if self.split_k > 1 and not self.split_k_partials:
             num_ctas_mnl = (
                 num_ctas_mnl[0],
                 num_ctas_mnl[1],
@@ -859,8 +914,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.b_dtype: Type[cutlass.Numeric] = b_ptr.value_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_ptr.value_type
         self.c_dtype: Type[cutlass.Numeric] = c_ptr.value_type
+        if cutlass.const_expr(self.split_k_partials and self.c_dtype != cutlass.Float32):
+            raise ValueError("Split-K partials require FP32 output storage")
 
         m, n, k, l = problem_mnkl
+        c_l = l
+        if cutlass.const_expr(self.split_k_partials):
+            c_l = l * self.split_k
         self.a_major_mode, self.b_major_mode, self.c_layout = layouts
 
         # Setup attributes that dependent on gemm inputs
@@ -877,12 +937,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
             actual_c_ld = c_ld + (n - c_ld) * (c_ld == 0)
             c_out_layout = cute.make_layout(
-                (m, cute.assume(n, 32), l), stride=(actual_c_ld, 1, m * actual_c_ld)
+                (m, cute.assume(n, 32), c_l), stride=(actual_c_ld, 1, m * actual_c_ld)
             )
         else:
             actual_c_ld = c_ld + (m - c_ld) * (c_ld == 0)
             c_out_layout = cute.make_layout(
-                (cute.assume(m, 32), n, l), stride=(1, actual_c_ld, n * actual_c_ld)
+                (cute.assume(m, 32), n, c_l), stride=(1, actual_c_ld, n * actual_c_ld)
             )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
         b_tensor = cute.make_tensor(b_ptr, b_layout)
@@ -1060,7 +1120,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Setup TMA store for C
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         c_store_op = cpasync.CopyBulkTensorTileS2GOp()
-        if cutlass.const_expr(self.split_k > 1):
+        if cutlass.const_expr(self.split_k > 1 and not self.split_k_partials):
             c_store_op = cpasync.CopyReduceBulkTensorTileS2GOp()
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             c_store_op,
@@ -1381,9 +1441,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
+        # Total K tiles; each split-K slice takes a balanced range of them.
         k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
-        if cutlass.const_expr(self.split_k > 1):
-            k_tile_cnt = k_tile_cnt // self.split_k
 
         #
         # Partition global tensor for TiledMMA_A/B/C
@@ -1473,6 +1532,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
+        # The allocator issues tcgen05.alloc only from its designated warp.
+        # Initialize its bookkeeping before the warp roles diverge.
+        tmem.allocate(self.num_tmem_alloc_cols)
 
         #
         # Construct the scheduler
@@ -1510,11 +1572,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[2],
                 )
 
-                k_tile_start = 0
+                k_tile_start, tile_k_cnt = self._split_k_range(k_tile_cnt, mma_tile_coord_mnl[2])
                 if cutlass.const_expr(self.split_k > 1):
-                    k_tile_start = cutlass.Int32(
-                        (mma_tile_coord_mnl[2] % self.split_k) * k_tile_cnt
-                    )
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
                         mma_tile_coord_mnl[1],
@@ -1545,7 +1604,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 if self.prefetch_enabled:
                     for pf_k_tile in cutlass.range(
-                        0, min(self.prefetch_dist, k_tile_cnt), unroll=1
+                        0, min(self.prefetch_dist, tile_k_cnt), unroll=1
                     ):
                         prefetch_k = k_tile_start + pf_k_tile
                         cute.prefetch(tma_atom_a, tAgA_slice[(None, prefetch_k)])
@@ -1556,12 +1615,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_tile_cnt:
+                if ab_producer_state.count < tile_k_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, tile_k_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
@@ -1598,7 +1657,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                     # Prefetch: Rolling prefetch for next tiles
                     if self.prefetch_enabled:
-                        if k_tile < k_tile_cnt - self.prefetch_dist:
+                        if k_tile < tile_k_cnt - self.prefetch_dist:
                             future_k_tile = load_k + self.prefetch_dist
                             cute.prefetch(
                                 tma_atom_a,
@@ -1620,7 +1679,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_tile_cnt:
+                    if ab_producer_state.count < tile_k_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                 #
@@ -1706,6 +1765,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
+                _, tile_k_cnt = self._split_k_range(k_tile_cnt, cur_tile_coord[2])
                 if cutlass.const_expr(self.split_k > 1):
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
@@ -1723,7 +1783,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
+                if ab_consumer_state.count < tile_k_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 #
@@ -1750,7 +1810,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 #
                 # Mma mainloop
                 #
-                for k_tile in range(k_tile_cnt):
+                for k_tile in range(tile_k_cnt):
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
@@ -1853,7 +1913,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
+                    if ab_consumer_state.count < tile_k_cnt:
                         if is_leader_cta:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
@@ -1884,11 +1944,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
-            #
-            # Alloc tensor memory buffer
-            #
-            tmem.allocate(self.num_tmem_alloc_cols)
-
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
@@ -1925,7 +1980,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
-                if cutlass.const_expr(self.split_k > 1):
+                if cutlass.const_expr(self.split_k > 1 and not self.split_k_partials):
                     mma_tile_coord_mnl = (
                         mma_tile_coord_mnl[0],
                         mma_tile_coord_mnl[1],
@@ -1952,7 +2007,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     tCgC,
                     epi_tile,
                     epi_tiles_executed,
-                    lambda x: epilogue_op(alpha_value * x),
+                    lambda x: epilogue_op(alpha_value * _retire_tmem_loads(x)),
                     mma_tile_coord_mnl,
                     acc_consumer_state,
                     acc_pipeline,
@@ -1960,12 +2015,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 )
 
             c_pipeline.producer_tail()
-
-            #
-            # Dealloc the tensor memory buffer
-            #
-            tmem.relinquish_alloc_permit()
-            tmem.free(acc_tmem_ptr)
 
         #
         # Specialized scheduler warp (CLC dynamic only)
@@ -1987,6 +2036,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     clc_pipeline.consumer_release(clc_consumer_state)
                     clc_consumer_state.advance()
                 clc_pipeline.producer_tail(clc_producer_state)
+
+        # Join every warp role after its pipeline drains before the allocator
+        # warp frees storage that the epilogue warps read asynchronously.
+        cute.arch.sync_threads()
+        if warp_idx < self.mma_warp_id:
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem.retrieve_ptr(self.acc_dtype))
 
     # GPU device kernel
     @cute.kernel
@@ -2376,10 +2432,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 raise testing.CantImplementError(f"split_k must be >= 1, got {split_k}")
             if split_k > 1:
                 num_k_tiles = k // mma_tiler[2]
-                if l != 1 or k % mma_tiler[2] != 0 or num_k_tiles % split_k != 0:
+                if l != 1 or k % mma_tiler[2] != 0 or split_k > num_k_tiles:
                     raise testing.CantImplementError(
-                        f"split_k={split_k} requires L==1 and K tiles "
-                        f"({num_k_tiles}) divisible by split_k"
+                        f"split_k={split_k} requires L==1 and at least split_k "
+                        f"full K tiles (got {num_k_tiles})"
                     )
             # The grid uses a half-sized per-CTA M tile for 2-CTA MMA.
             # Requiring enough real M tiles avoids phantom cluster peers, which
@@ -3816,6 +3872,11 @@ def run_scaled_mm_with_emulated_dtype(
     :return: Execution time of the GEMM kernel
     :rtype: float
     """
+    if gemm_obj.split_k_partials and gemm_obj.split_k > 1:
+        raise ValueError(
+            "The benchmark requires a final output tensor and cannot store split-K partials"
+        )
+
     print(f"Running {gemm_obj.__class__.__name__} test (Emulated) with:")
     print(f"mnkl: {mnkl}")
     print(

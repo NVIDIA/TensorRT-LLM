@@ -15,6 +15,7 @@
 
 from typing import Any, Mapping
 
+from tensorrt_llm._errors import ConfigInputError
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -49,7 +50,7 @@ def update_quant_config_from_compressed_tensors(
             if quant_config.kv_cache_quant_algo in (None, QuantAlgo.FP8):
                 quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             else:
-                raise ValueError(
+                raise ConfigInputError(
                     f"Specified kv_cache_quant_algo={quant_config.kv_cache_quant_algo}, "
                     "conflicting with FP8 KV cache from HF quant config."
                 )

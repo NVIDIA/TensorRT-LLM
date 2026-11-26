@@ -233,8 +233,18 @@ def test_rejects_unsupported_inputs():
         torch.ops.trtllm.fp8_block_scale_low_m_gemm(
             torch.zeros((4, k), device="cuda", dtype=torch.bfloat16), w_fp8, packed.contiguous()
         )
+
+
+def test_max_m_for_measured_shape_and_alignment(monkeypatch):
+    """A shape measured on every architecture is in range, and misaligned N or K gives 0 even
+    where the table has a limit for it (SM107 selects only measured shapes)."""
+    mod = _kernel_module()
+    n, k = 7168, 768
     assert 1 <= mod.max_m_for(n, k) <= mod.MAX_M
-    assert mod.max_m_for(n + 8, k) == 0
+    # N - 8 rounds up to the measured 7168-row tile.
+    assert mod.max_m_for(n - 8, k) == 0
+    # No table key has a misaligned K: give one a limit.
+    monkeypatch.setitem(mod._tables().max_m, (n, k + 64), mod.MAX_M)
     assert mod.max_m_for(n, k + 64) == 0
 
 
@@ -335,11 +345,7 @@ def test_wide_split_k_tactics(m, split_k):
     n, k = 768, 7168
     w_fp8, scale = _make_weight(n, k, seed=19)
     x = _make_activation(m, k, seed=3)
-    if m > mod.LOW_M_MAX:
-        base = mod.MidMTactic(mma_n=mod.mid_mma_n_for(m), split_k=split_k, a_stages=1, b_stages=2)
-        tactic = dataclasses.replace(base, a_stages=mod.max_mid_a_stages(n, k, base))
-    else:
-        tactic = mod.LowMTactic(mma_n=mod.mma_n_for(m), split_k=split_k, a_stages=2, x_stages=4)
+    tactic = mod.split_tactic(m, n, k, split_k, mid=m > mod.LOW_M_MAX)
     out = _run(x, w_fp8, _pack(scale, n, k), tactic)
     torch.cuda.synchronize()
     assert _rel_err(out, _mxfp8_emulated_reference(x, w_fp8, scale)) < 5e-3
@@ -908,13 +914,13 @@ def test_prequantized_tactic_follows_selected_low_m_tactic(n, k):
 @pytest.mark.parametrize("m", [5, 16, 40])
 def test_prequantized_split_k_tactics(m, split_k):
     mod = _kernel_module()
-    n, k = 336, 1280
+    n, k = 336, 768
     w_pad, scale = _make_weight(n, k, seed=11)
     w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
     x = _make_activation(m, k, seed=5)
     xq, xs = _mxfp8_operand(x)
     mma_n = mod.mma_n_for(m)
-    tactic = mod.PrequantizedLowMTactic(mma_n=mma_n, split_k=split_k, a_stages=2, b_stages=2)
+    tactic = mod.MidMTactic(mma_n=mma_n, split_k=split_k, a_stages=2, b_stages=2)
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out, tactic=tactic)
     torch.cuda.synchronize()
@@ -959,3 +965,251 @@ def test_weight_read_linear_forward_prequantized(m, n, k):
     out = linear.forward_prequantized(*_mxfp8_operand(x))
     torch.cuda.synchronize()
     assert torch.equal(out, linear(x))
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 output: fp4_quantize(y, global_sf, 16) of the BF16 output y of the low-M / mid-M kernel
+# at the same tactic, bitwise (the routed experts' NVFP4 input straight from the MoE latent down
+# projection).
+# ---------------------------------------------------------------------------
+
+#: (N, K): MoE latent down, a split-K helix shape and a small shape (all whole 128-row tiles).
+NVFP4_SHAPES = [(3584, 7168), (7168, 768), (384, 1280)]
+NVFP4_MS = [1, 7, 8, 14, 28, 32, 56, 64, 65, 96, 128, 160, 200, 256]
+
+
+def _global_sf(y):
+    """The usual NVFP4 global scale ``448 * 6 / amax`` of a BF16 tensor, as an FP32 [1]."""
+    return (448.0 * 6.0 / y.float().abs().amax().clamp(min=1e-6)).reshape(1)
+
+
+def _bf16_default_tactic(m, n, k):
+    mod = _kernel_module()
+    if m <= mod.low_m_max_for(n, k):
+        return mod.default_tactic(m, n, k)
+    return mod.default_mid_tactic(m, n, k)
+
+
+def _nvfp4_run(x, w, packed, global_sf, tactic=None):
+    m, n = x.shape[0], w.shape[0]
+    codes = torch.empty((m, n // 2), device="cuda", dtype=torch.uint8)
+    scales = torch.empty((m * n // 16,), device="cuda", dtype=torch.uint8)
+    _kernel_module().run_low_m_gemm_nvfp4(x, w, packed, global_sf, codes, scales, tactic=tactic)
+    return codes, scales
+
+
+def _gemm_then_fp4_quantize(x, w, packed, global_sf, tactic):
+    y = _run(x, w, packed, tactic)
+    codes, scales = torch.ops.trtllm.fp4_quantize(y, global_sf, 16, False, False)
+    return codes.view(torch.uint8), scales.view(torch.uint8)
+
+
+def _assert_nvfp4_matches(x, w, packed, tactic, global_sf=None):
+    """NVFP4 output at ``tactic`` equals the BF16 GEMM at ``tactic`` + ``fp4_quantize``."""
+    if global_sf is None:
+        global_sf = _global_sf(_run(x, w, packed, tactic))
+    ref_codes, ref_scales = _gemm_then_fp4_quantize(x, w, packed, global_sf, tactic)
+    codes, scales = _nvfp4_run(x, w, packed, global_sf, tactic)
+    torch.cuda.synchronize()
+    assert codes.shape == ref_codes.shape and scales.shape == ref_scales.shape
+    assert torch.equal(codes, ref_codes)
+    assert torch.equal(scales, ref_scales)
+
+
+@pytest.mark.parametrize("n, k", NVFP4_SHAPES)
+@pytest.mark.parametrize("m", NVFP4_MS)
+def test_nvfp4_out_matches_gemm_then_fp4_quantize(m, n, k):
+    """Low-M kernel up to the shape's cut-over, quantization + mid-M kernel above."""
+    mod = _kernel_module()
+    w_fp8, scale = _make_weight(n, k, seed=n + k)
+    packed = _pack(scale, n, k)
+    x = _make_activation(m, k, seed=m)
+    assert mod.can_run_nvfp4(x, w_fp8, packed, torch.ones(1, device="cuda"))
+    _assert_nvfp4_matches(x, w_fp8, packed, _bf16_default_tactic(m, n, k))
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", [5, 16, 40, 64])
+def test_nvfp4_out_low_m_split_k_tactics(m, split_k):
+    """Every split-K reduce-scatter owner of the low-M kernel quantizes the rows it owns."""
+    mod = _kernel_module()
+    n, k = 384, 1280
+    w_fp8, scale = _make_weight(n, k, seed=11)
+    x = _make_activation(m, k, seed=5)
+    tactic = mod.LowMTactic(mma_n=mod.mma_n_for(m), split_k=split_k, a_stages=2, x_stages=4)
+    _assert_nvfp4_matches(x, w_fp8, _pack(scale, n, k), tactic)
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize(
+    "m, mma_n", [(17, 64), (40, 64), (65, 96), (128, 128), (150, 160), (200, 224), (250, 256)]
+)
+def test_nvfp4_out_mid_m_split_k_tactics(m, mma_n, split_k):
+    """Same for the mid-M kernel's split-K reduction."""
+    mod = _kernel_module()
+    n, k = 384, 1280
+    w_fp8, scale = _make_weight(n, k, seed=13)
+    x = _make_activation(m, k, seed=9)
+    base = mod.MidMTactic(mma_n=mma_n, split_k=split_k, a_stages=1, b_stages=2)
+    tactic = dataclasses.replace(base, a_stages=mod.max_mid_a_stages(n, k, base))
+    _assert_nvfp4_matches(x, w_fp8, _pack(scale, n, k), tactic)
+
+
+@pytest.mark.parametrize(
+    "m, split_k, mid",
+    [(1, 3, False), (8, 3, False), (16, 3, False), (17, 4, True), (64, 4, True), (96, 4, True)],
+)
+def test_nvfp4_out_split_tactic(m, split_k, mid):
+    """The SM107 latent-down route's tactics (``split_tactic``), run on any architecture."""
+    mod = _kernel_module()
+    n, k = 3584, 7168
+    tactic = mod.split_tactic(m, n, k, split_k, mid=mid)
+    assert isinstance(tactic, mod.MidMTactic if mid else mod.LowMTactic)
+    assert tactic.split_k == split_k
+    if not mid:
+        assert tactic.b_stages >= 2
+        assert tactic.x_stages % tactic.quant_groups == 0
+    w_fp8, scale = _make_weight(n, k, seed=n + k)
+    x = _make_activation(m, k, seed=m)
+    _assert_nvfp4_matches(x, w_fp8, _pack(scale, n, k), tactic)
+
+
+def test_nvfp4_out_zero_rows_and_fixed_global_scale():
+    """All-zero token rows (zero scales and codes) and a global scale unrelated to the data."""
+    n, k = 3584, 7168
+    w_fp8, scale = _make_weight(n, k, seed=3)
+    packed = _pack(scale, n, k)
+    gsf = torch.tensor([37.5], device="cuda", dtype=torch.float32)
+    for m in (16, 100):
+        x = _make_activation(m, k, seed=4)
+        x[3] = 0
+        x[11] = 0
+        _assert_nvfp4_matches(x, w_fp8, packed, _bf16_default_tactic(m, n, k), gsf)
+
+
+@pytest.mark.parametrize("m", [8, 64, 128])
+def test_nvfp4_out_cuda_graph(m):
+    mod = _kernel_module()
+    n, k = 3584, 7168
+    w_fp8, scale = _make_weight(n, k, seed=7)
+    packed = _pack(scale, n, k)
+    x = _make_activation(m, k, seed=1)
+    gsf = _global_sf(_run(x, w_fp8, packed))
+    eager = _nvfp4_run(x, w_fp8, packed, gsf)
+    codes, scales = torch.empty_like(eager[0]), torch.empty_like(eager[1])
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mod.run_low_m_gemm_nvfp4(x, w_fp8, packed, gsf, codes, scales)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mod.run_low_m_gemm_nvfp4(x, w_fp8, packed, gsf, codes, scales)
+    codes.zero_()
+    scales.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(codes, eager[0])
+    assert torch.equal(scales, eager[1])
+
+
+def test_nvfp4_out_declines_unsupported_inputs():
+    mod = _kernel_module()
+    gsf = torch.ones(1, device="cuda", dtype=torch.float32)
+    # Partial last weight tile.
+    n, k = 2112, 7168
+    w_pad, scale = _make_weight(n, k, seed=2)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    x = torch.zeros((8, k), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run_nvfp4(x, w, packed, gsf)
+    assert mod.nvfp4_out_max_m_for(n, k) == 0
+    # M above MAX_M, a global scale of the wrong dtype / size.
+    n = 3584
+    w, scale = _make_weight(n, k, seed=2)
+    packed = _pack(scale, n, k)
+    assert mod.can_run_nvfp4(x, w, packed, gsf)
+    big = torch.zeros((mod.MAX_M + 1, k), device="cuda", dtype=torch.bfloat16)
+    assert not mod.can_run_nvfp4(big, w, packed, gsf)
+    assert not mod.can_run_nvfp4(x, w, packed, gsf.double())
+    assert not mod.can_run_nvfp4(x, w, packed, torch.ones(2, device="cuda"))
+    with pytest.raises(ValueError):
+        _nvfp4_run(big, w, packed, gsf)
+    # The low-M kernel stages its BF16 output tile in two quantized-activation stages.
+    # The tactic is valid for the BF16 kernel (quant_groups=1 keeps b_stages=1 legal
+    # there) and violates only the NVFP4 staging rule, so the test fails if that check
+    # is removed or weakened.
+    tactic = mod.LowMTactic(
+        mma_n=32, split_k=1, a_stages=2, x_stages=4, b_stages=1, quant_warps=4, quant_groups=1
+    )
+    mod.validate_tactic(n, k, tactic)
+    with pytest.raises(ValueError, match="b_stages"):
+        mod.validate_nvfp4_out_tactic(n, k, tactic)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops.trtllm, "fp8_block_scale_low_m_gemm_nvfp4"),
+    reason="trtllm::fp8_block_scale_low_m_gemm_nvfp4 is not registered",
+)
+@pytest.mark.parametrize("m", [1, 32, 64, 96, 200])
+def test_nvfp4_out_op(m):
+    """The op runs the default tactic of :func:`run_low_m_gemm_nvfp4` (the route's on SM107)."""
+    mod = _kernel_module()
+    n, k = 3584, 7168
+    w_fp8, scale = _make_weight(n, k, seed=n)
+    packed = _pack(scale, n, k)
+    x = _make_activation(m, k, seed=m)
+    tactic = mod.nvfp4_out_tactic(m, n, k) or _bf16_default_tactic(m, n, k)
+    gsf = _global_sf(_run(x, w_fp8, packed, tactic))
+    codes, scales = torch.ops.trtllm.fp8_block_scale_low_m_gemm_nvfp4(x, w_fp8, packed, gsf)
+    ref_codes, ref_scales = _gemm_then_fp4_quantize(x, w_fp8, packed, gsf, tactic)
+    torch.cuda.synchronize()
+    assert torch.equal(codes, ref_codes)
+    assert torch.equal(scales, ref_scales)
+
+
+@sm107_only
+def test_sm107_nvfp4_out_route_for_latent_down():
+    """SM107 selects the NVFP4 output for the MoE latent down projection up to 256 tokens: the
+    low-M kernel at split-K 3 up to 16 tokens, the mid-M kernel at split-K 4 up to 96 and at its
+    default tactic above; no other shape."""
+    mod = _kernel_module()
+    n, k = 3584, 7168
+    assert mod.nvfp4_out_max_m_for(n, k) == 256
+    for m in (1, 8, 16):
+        assert mod.nvfp4_out_tactic(m, n, k) == mod.split_tactic(m, n, k, 3, mid=False)
+    for m in (17, 64, 96):
+        assert mod.nvfp4_out_tactic(m, n, k) == mod.split_tactic(m, n, k, 4, mid=True)
+    for m in (97, 160, 256):
+        assert mod.nvfp4_out_tactic(m, n, k) == mod.default_mid_tactic(m, n, k)
+    for nk in K3_SHAPES:
+        if nk != (n, k):
+            assert mod.nvfp4_out_max_m_for(*nk) == 0
+            assert mod.nvfp4_out_tactic(8, *nk) is None
+
+
+@sm107_only
+@pytest.mark.parametrize("m", [1, 8, 16, 17, 64, 96, 97, 160, 224, 256])
+def test_sm107_nvfp4_out_route_matches_gemm_then_fp4_quantize(m):
+    """The routed default of ``run_low_m_gemm_nvfp4`` is bitwise the BF16 GEMM at the route's
+    tactic + ``fp4_quantize`` over the whole route (beyond the BF16 GEMM's own ``max_m``)."""
+    mod = _kernel_module()
+    n, k = 3584, 7168
+    w_fp8, scale = _make_weight(n, k, seed=n + k)
+    packed = _pack(scale, n, k)
+    x = _make_activation(m, k, seed=m)
+    tactic = mod.nvfp4_out_tactic(m, n, k)
+    gsf = _global_sf(_run(x, w_fp8, packed, tactic))
+    ref_codes, ref_scales = _gemm_then_fp4_quantize(x, w_fp8, packed, gsf, tactic)
+    codes, scales = _nvfp4_run(x, w_fp8, packed, gsf)
+    torch.cuda.synchronize()
+    assert torch.equal(codes, ref_codes)
+    assert torch.equal(scales, ref_scales)
+
+
+@sm100_only
+def test_sm100_nvfp4_out_not_selected():
+    """SM100 / SM103 keep the GEMM followed by ``fp4_quantize`` for every shape."""
+    mod = _kernel_module()
+    for n, k in K3_SHAPES:
+        assert mod.nvfp4_out_max_m_for(n, k) == 0
+        assert mod.nvfp4_out_tactic(8, n, k) is None

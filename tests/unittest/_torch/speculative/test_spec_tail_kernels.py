@@ -20,12 +20,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import triton_num_compiled
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+    _paged_latent_prepare_kernel,
     decode_draft_block_table,
+    dflash_paged_latent_prepare,
     strict_accept,
 )
 from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
@@ -349,3 +352,42 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+
+
+def test_paged_latent_prepare_reuses_the_compiled_kernel_across_batches():
+    page_size, max_blocks, max_batch, width = 16, 4, 32, 4
+    slot_of_row = torch.arange(max_batch, device="cuda")
+    ctx_len = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    base_pages = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    block_counts = torch.full((max_batch,), max_blocks, dtype=torch.int64, device="cuda")
+    block_tables = torch.arange(max_batch * max_blocks, dtype=torch.int32, device="cuda")
+    num_accepted = torch.ones(max_batch, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros((max_batch, width), dtype=torch.int32, device="cuda")
+    seq_lens = torch.zeros(max_batch, dtype=torch.int32, device="cuda")
+
+    def prepare(first_row, num_gens):
+        dflash_paged_latent_prepare(
+            num_accepted,
+            accepted,
+            slot_of_row[first_row : first_row + num_gens],
+            ctx_len,
+            base_pages,
+            block_counts,
+            block_tables.view(max_batch, max_blocks),
+            seq_lens,
+            first_row,
+            dummy_slot=max_batch,
+            max_ctx=page_size * max_blocks,
+            page_size=page_size,
+            block_size=width,
+            width=width,
+        )
+
+    # One BLOCK_G (16); the first rows are 0, 1, multiples of 16 and neither,
+    # and an odd first row misaligns the int64 slot view.
+    batches = [(0, 9), (1, 16), (3, 12), (16, 16), (2, 9)]
+    prepare(*batches[0])
+    compiled = triton_num_compiled(_paged_latent_prepare_kernel)
+    for batch in batches[1:]:
+        prepare(*batch)
+    assert triton_num_compiled(_paged_latent_prepare_kernel) == compiled

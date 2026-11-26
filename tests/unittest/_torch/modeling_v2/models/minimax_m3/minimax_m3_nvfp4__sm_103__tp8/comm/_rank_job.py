@@ -3,7 +3,7 @@
 """Run this target's collective rank job from pytest, and report what it did.
 
 The same contract as ``tests/unittest/_torch/modeling_v2/comm/_rank_job.py``: the
-launcher beside this file owns the per-device rank processes and the deadline
+launcher selected below owns the per-device rank processes and the deadline
 that kills a wedged collective; this only selects the devices, starts it in a
 fresh interpreter (by file path: this tree is not a package) and turns its exit
 code into an assertion.
@@ -72,21 +72,30 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str, world_size: int) -> str:
+def run(entry: str, world_size: int, directory: Path | None = None) -> str:
     """Run ``_<entry>_op_matrix``'s launcher over ``world_size`` devices (skipped when the node has fewer); returns
     its stdout."""
     assert world_size in WORLD_SIZES, world_size
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=require_world(world_size))
 
-    # The ranks import tensorrt_llm absolutely, and a source checkout is not necessarily installed.
-    # tests/unittest/_torch/modeling_v2/models/minimax_m3/<target>/comm -> repo root.
+    # Match the package resolved by pytest: an unbuilt checkout must not
+    # shadow an installed wheel in rank subprocesses.
     repo_root = Path(__file__).resolve().parents[8]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
-        f"this file moved without its parents[] index following"
-    )
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
+    installed = importlib.util.find_spec("tensorrt_llm")
+    if installed is None or Path(installed.origin).resolve().parents[1] == repo_root:
+        assert (repo_root / "tensorrt_llm").is_dir(), (
+            f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
+            f"this file moved without its parents[] index following"
+        )
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p
+        )
+    elif "PYTHONPATH" in env:
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in env["PYTHONPATH"].split(os.pathsep) if Path(p or ".").resolve() != repo_root
+        )
 
     constants = _load_launcher_constants(launcher)
     timeout = constants.DEADLINE_S + _LAUNCHER_GRACE_S

@@ -8,10 +8,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_gemm import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_gemm import (
     CELLS_BY_TP as M3_MXFP8_GEMM_CELLS_BY_TP,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_gemm import (  # noqa: E501
     m3_mxfp8_gemm as op,
 )
 

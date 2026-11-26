@@ -37,7 +37,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
-    DFLASH_CONTEXT_LOWERING,
+    DFLASH_FOLDED_DECODE_LOWERING,
     get_dflash_paged_append,
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
@@ -92,12 +92,13 @@ def compute_dflash_ctx_buffer_bytes(
     page_size: int = 32,
     kv_factor: int = 2,
     paged: Optional[bool] = None,
+    extra_request_slots: int = 0,
 ) -> int:
     """Per-GPU bytes ``_lazy_init_ctx_buffers`` will allocate for the DFlash
     pooled-context K/V buffers.
 
-    Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
-    slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
+    Mirrors the allocation exactly: ``max_batch_size + extra_request_slots + 1``
+    slots (one scratch slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
     per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
     so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
     holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
@@ -110,7 +111,7 @@ def compute_dflash_ctx_buffer_bytes(
     no drafter to ask -- it falls back to whether ``attention_backend`` is a
     paged backend.
     """
-    num_slots = max_batch_size + 1
+    num_slots = max_batch_size + extra_request_slots + 1
     capacity = max_ctx_len + block_size
     if paged is None:
         paged = attention_backend in _PAGED_ATTENTION_BACKENDS
@@ -246,6 +247,8 @@ def validate_dflash_ctx_buffer_budget(
     tp_size: int = 1,
     memory_budget_bytes: Optional[int] = None,
     arena_before_pool: bool = True,
+    gen_preemption_enabled: bool = False,
+    seq_slot_micro_batches: int = 1,
 ) -> None:
     """Config-time checks for failure modes DFlash otherwise hits late.
 
@@ -285,6 +288,13 @@ def validate_dflash_ctx_buffer_budget(
         arena_before_pool: Which headroom ``memory_budget_bytes`` describes
             (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
             the wording and remedy of the refusal.
+        gen_preemption_enabled: Reserve private-arena rows for paused requests.
+        seq_slot_micro_batches: Micro-batches of ``max_batch_size`` the
+            executor's seq-slot pool holds, which the arena spans
+            (``pp_size`` under pipeline parallelism). The overlap headroom's
+            second micro-batch depends on the target model and the resolved
+            KV cache manager, which are unknown here; the arena check in
+            ``_lazy_init_ctx_buffers`` sees the resolved pool.
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
@@ -368,8 +378,17 @@ def validate_dflash_ctx_buffer_budget(
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
     block_size = K + 1
 
+    from ..pyexecutor.scheduler.gen_preemption import paused_cap
+
+    def _headroom(batch: int) -> int:
+        return paused_cap(batch) if gen_preemption_enabled else 0
+
+    # The arena spans the executor's seq-slot pool (compute_max_num_sequences).
+    extra_slots = _headroom(max_batch_size)
+    pool_batch_slots = max_batch_size * seq_slot_micro_batches
+    num_slots = pool_batch_slots + extra_slots + 1
     required = compute_dflash_ctx_buffer_bytes(
-        max_batch_size,
+        pool_batch_slots,
         max_ctx,
         block_size,
         num_layers,
@@ -377,11 +396,20 @@ def validate_dflash_ctx_buffer_budget(
         head_dim,
         dtype_bytes=dtype_bytes,
         attention_backend=attention_backend,
+        extra_request_slots=extra_slots,
     )
     if required <= memory_budget_bytes:
         return
-    per_slot = required // (max_batch_size + 1)
-    fitting = int(memory_budget_bytes // per_slot) - 1  # one slot is scratch
+    per_slot = required // num_slots
+    fitting_slots = memory_budget_bytes // per_slot
+    lo, hi = 0, max(0, int(fitting_slots) - 1)  # one scratch slot
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if mid * seq_slot_micro_batches + _headroom(mid) + 1 <= fitting_slots:
+            lo = mid
+        else:
+            hi = mid - 1
+    fitting = lo
     gib = 1024**3
     if arena_before_pool:
         budget_desc = (
@@ -412,13 +440,23 @@ def validate_dflash_ctx_buffer_budget(
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
+    batch_term = (
+        f"{seq_slot_micro_batches} x max_batch_size"
+        if seq_slot_micro_batches > 1
+        else "max_batch_size"
+    )
+    slot_formula = (
+        f"{batch_term} + resident_headroom + 1 slots"
+        if gen_preemption_enabled
+        else f"{batch_term} + 1 slots"
+    )
     message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
         f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
         f"{budget_desc} Size formula: "
-        "2 (K and V) x (max_batch_size + 1 slots) x num_layers x "
+        f"2 (K and V) x ({slot_formula}) x num_layers x "
         "(max_ctx + block_size) x kv_heads_per_rank x head_dim x dtype_bytes "
-        f"= 2 x {max_batch_size + 1} x {num_layers} x ({max_ctx} + "
+        f"= 2 x {num_slots} x {num_layers} x ({max_ctx} + "
         f"{block_size}) x {num_kv_heads_per_rank} x {head_dim} x "
         f"{dtype_bytes}. With the current settings, {remedy}."
     )
@@ -601,6 +639,9 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
         self._batch_indices_buffer = DeviceCopyBuffer(
             torch.empty([self.max_num_requests], dtype=torch.int, device="cuda"),
             pin_memory=prefer_pinned(),
@@ -651,7 +692,8 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            current = set(self.request_ids)
+            # Requests paused in place (GEN slot preemption) keep their slot.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
             updates, bases = {}, {}
@@ -1254,7 +1296,8 @@ class DFlashWorker(SpecWorkerBase):
         ``kv_cache_block_offsets`` entries are ``pool_block_index *
         num_pool_layers * kv_factor`` plus the K/V field index. What that has to
         be divided by to index a ``get_buffers`` view depends on the manager --
-        see the stride check below; attention_backend/utils.py hardcodes the V1
+        see the stride check below;
+        ``append_mla_latent_cache_generation_cuda_graph_safe`` hardcodes the V1
         divisor and is not a general contract.
         """
         mgr = draft_kv_cache_manager
@@ -1455,7 +1498,6 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         self._paged_latent_prepare = False
-        max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
@@ -1495,11 +1537,17 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
 
-        # Reserve slot index max_batch as a scratch slot for padding/unknown
-        # dummies; real requests only draw slots 0..max_batch-1, so dummy
-        # writes land here and can't corrupt a real request's context.
-        self._dummy_slot = max_batch
-        num_slots = max_batch + 1
+        # Real requests draw slots 0..num_req_slots-1; the next slot is a
+        # scratch slot for padding/unknown dummies, so dummy writes can't
+        # corrupt a real request's context. The slots are allocated once and
+        # reused for every later batch shape, so they span the executor's whole
+        # seq-slot pool, which already counts requests paused in place by GEN
+        # slot preemption and, under pipeline parallelism or overlap headroom,
+        # more than one micro-batch. max_num_requests is no bound: it is the
+        # captured bucket on CUDA graph metadata.
+        num_req_slots = spec_metadata.num_seq_slots
+        self._dummy_slot = num_req_slots
+        num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
         # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates them
         # from real ids. Imported lazily to avoid an import cycle.
@@ -1512,11 +1560,11 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_base_host = [0] * num_slots
         self._batch_to_slot_buffer = DeviceCopyBuffer(
-            torch.zeros(max_batch, dtype=torch.long, device="cuda"),
+            torch.zeros(num_req_slots, dtype=torch.long, device="cuda"),
             pin_memory=prefer_pinned(),
         )
 
-        self._free_slots = deque(range(max_batch))
+        self._free_slots = deque(range(num_req_slots))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
 
@@ -1562,20 +1610,20 @@ class DFlashWorker(SpecWorkerBase):
             if self._dflash_attention_backend == "TRTLLM" and getattr(
                 draft_model, "_uses_worker_attention_backend", True
             ):
-                # Gated on the drafter that actually runs the trtllm-gen ops:
-                # one paging its own block decode the same way is not shaped
-                # like them. The context kernel's head-size limits apply only
-                # to layers lowered to it; a non-causal windowed layer runs
-                # the block decode plus the future-block merge.
+                # All supported masks lower to decode, including full non-causal
+                # attention with block queries folded into the query heads.
                 lowerings = draft_model.validate_block_attention_windows()
-                has_context_attention = DFLASH_CONTEXT_LOWERING in lowerings
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
                     num_kv_heads=nkv,
                     head_dim=hd,
                     tokens_per_block=page_size,
-                    has_context_attention=has_context_attention,
+                    folded_block_size=(
+                        self._compute_block_size
+                        if DFLASH_FOLDED_DECODE_LOWERING in lowerings
+                        else None
+                    ),
                 )
             elif self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
@@ -1670,9 +1718,10 @@ class DFlashWorker(SpecWorkerBase):
             )
         self._ctx_buf_inited = True
 
-        if not self._ctx_reuse_addressable and getattr(
+        joint_fallback = not self._ctx_reuse_addressable and getattr(
             draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
-        ):
+        )
+        if joint_fallback:
             # Every fallback above (shape mismatch, stride mismatch, pool layer
             # count) logs its own reason and then costs only memory -- except
             # this one, where the scheduler goes on matching prefixes the
@@ -1683,12 +1732,70 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        self._report_prefix_reuse(cache_manager, joint_fallback)
 
         logger.info(
-            f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
+            f"DFlash: allocated ctx buffers: request_slots={num_req_slots}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
+        )
+
+    def _report_prefix_reuse(
+        self, target_cache_manager: Optional[BaseResourceManager], joint_fallback: bool
+    ) -> None:
+        """Report, once, how this drafter's context is served on KV-cache prefix hits.
+
+        Without a recomputed prompt tail (``context_recompute_tail``), a cache
+        hit drafts from only the uncached tail of the prompt on an unpaired
+        pool; a pool paired with the target's block reuse hands the reused
+        prefix's drafter K/V back, but acceptance can still drop on hits, so
+        both warn. ``joint_fallback``: the caller already warned that a paired
+        pool fell back to a private arena.
+        """
+        if not getattr(target_cache_manager, "enable_block_reuse", False):
+            return
+        name = type(self).__name__
+        tail = getattr(target_cache_manager, "spec_recompute_tail", 0)
+        if tail:
+            span = "the whole prompt" if tail < 0 else f"a {tail}-token prompt tail"
+            logger.info_once(
+                f"{name}: prefix-cache hits recompute {span} for the drafter "
+                "(context_recompute_tail), unless the KV cache manager disables it "
+                "with a warning on its first context batch.",
+                key="dflash_prefix_reuse_report",
+            )
+            return
+        if joint_fallback:
+            return
+        # The target skips the reused prefix, so _store_prefill_context only
+        # ever sees the uncached tail; nothing else reports the loss.
+        requested = getattr(self.spec_config, "context_recompute_tail", 0)
+        if requested:
+            why = (
+                f"the KV cache manager disabled context_recompute_tail={requested} "
+                "(see its warning for why)"
+            )
+        else:
+            why = (
+                "context_recompute_tail is 0 (set it to the drafter's attention "
+                "window -- null resolves it -- or -1 to recompute on hits)"
+            )
+        if self._ctx_reuse_addressable:
+            loss = (
+                "the paired draft pool hands the reused prefix's drafter K/V back, "
+                "but acceptance can still drop on prefix-cache hits; a recomputed "
+                "tail trades TTFT for acceptance."
+            )
+        else:
+            loss = (
+                "the drafter's context K/V are not kept where a prefix-cache hit can "
+                "hand them back, so a cache-hit request drafts from only the uncached "
+                "tail of its prompt and acceptance drops on every hit."
+            )
+        logger.warning_once(
+            f"{name}: KV-cache block reuse is on and {why}: {loss}",
+            key="dflash_prefix_reuse_report",
         )
 
     def _ctx_paged_index_args(self):
@@ -1945,6 +2052,25 @@ class DFlashWorker(SpecWorkerBase):
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
+
+    def _reseed_warmup_generation_slots(self, spec_metadata: "DFlashSpecMetadata") -> None:
+        """Seed every generation row's slot from this batch's positions; warmup only.
+
+        Only CUDA-graph warmup runs a graph batch eagerly. Its dummy requests reuse
+        ids across batches, so a slot keeps the previous batch's length -- which the
+        replay after each capture advances for good -- while this batch may give the
+        same id far fewer pages. A unified cache's allocation check then traps.
+        """
+        request_ids = spec_metadata.request_ids or []
+        num_contexts = max(0, len(request_ids) - spec_metadata.num_generations)
+        updates = {}
+        for request_idx, rid in enumerate(request_ids[num_contexts:], num_contexts):
+            slot = self._req_to_slot.get(rid)
+            if slot is None or rid == ATTENTION_DP_DUMMY_REQUEST_ID:
+                continue
+            token_offset = sum(spec_metadata.seq_lens[:request_idx])
+            updates[slot] = min(int(spec_metadata.host_position_ids[token_offset]), self._max_ctx)
+        self._write_ctx_len(updates)
 
     def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
         """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
@@ -2248,6 +2374,12 @@ class DFlashWorker(SpecWorkerBase):
         ):
             # New buffers clear request slots; seed them before generation.
             spec_metadata.prepare()
+        if (
+            self._ctx_unified_cache
+            and spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._reseed_warmup_generation_slots(spec_metadata)
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case
         # raises inside, with the metadata type in the message.
@@ -2389,37 +2521,14 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
-                    )
-
-                    # DFlash 2: replace the independent per-position picks with
-                    # one coherent path through the block (absent for plain
-                    # DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["first_prev_tokens"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-
-                    gen_draft_tokens = self.sample_draft_tokens(
+                    gen_draft_tokens, vocab_size = self._sample_block_draft_tokens(
+                        draft_model,
                         gen_logits,
+                        gen_hidden_states,
+                        inputs,
                         spec_metadata,
+                        num_contexts,
                         batch_size,
-                        num_contexts=num_contexts,
                     )
 
                 # Opt-in confidence-calibration recording (env-gated). The
@@ -2533,6 +2642,51 @@ class DFlashWorker(SpecWorkerBase):
         """
         return gen_logits
 
+    def _sample_block_draft_tokens(
+        self,
+        draft_model: nn.Module,
+        gen_logits: torch.Tensor,
+        gen_hidden_states: torch.Tensor,
+        inputs: dict,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Turn the raw ``[num_gens, K, vocab]`` block logits into ``[num_gens, K]`` int32 drafts.
+
+        Also returns the vocab width of the logits the stored proposals use.
+        Plain DFlash refines the logits (:meth:`_refine_block_logits`, the
+        DFlash 2 candidate scorers) and draws every position with the shared
+        block sampler; a family whose positions condition on the previous
+        draft overrides this (``DSparkWorker``).
+        """
+        num_gens, K = gen_logits.shape[:2]
+        gen_logits = self._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
+
+        # DFlash 2: replace the independent per-position picks with one
+        # coherent path through the block (absent for plain DFlash).
+        if getattr(draft_model, "lilicorr", None) is not None:
+            gen_logits = self._apply_lilicorr(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["lilicorr_anchor"],
+                spec_metadata,
+            )
+        elif getattr(draft_model, "has_candidate_selector", False):
+            gen_logits = self._apply_dflash2_selector(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["first_prev_tokens"],
+                spec_metadata,
+            )
+
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]
+
     def _apply_dflash2_selector(
         self,
         draft_model,
@@ -2551,8 +2705,7 @@ class DFlashWorker(SpecWorkerBase):
 
         The walk always chains through the greedy successor, so under sampling
         a draft token can differ from the predecessor the next position was
-        scored under. That costs acceptance rate, not correctness — same
-        trade-off as ``_apply_dspark_markov_bias``.
+        scored under. That costs acceptance rate, not correctness.
         """
         selector = draft_model.candidate_selector
         candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
