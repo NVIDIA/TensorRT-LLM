@@ -2335,6 +2335,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
             "trust_remote_code": True,
+            "autotuner_nvmmh_config": {},
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.6,
             },
@@ -2351,6 +2352,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
             "trust_remote_code": True,
+            "autotuner_nvmmh_config": {},
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.6,
             },
@@ -2727,6 +2729,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
             "speculative_config": speculative_config,
+            "autotuner_nvmmh_config": {},
             "cache_transceiver_config": cache_transceiver_config,
         }
         gen_server_config = {
@@ -2741,6 +2744,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
             "speculative_config": speculative_config,
+            "autotuner_nvmmh_config": {},
             "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
