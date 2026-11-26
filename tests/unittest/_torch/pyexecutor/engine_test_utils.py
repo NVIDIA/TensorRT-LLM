@@ -133,6 +133,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         context_remaining_length=1,
         context_current_position=prompt_len - 1,
         py_prompt_len=prompt_len,
+        orig_prompt_len=prompt_len,
         py_beam_width=1,
         py_draft_tokens=[],
         is_context_only_request=False,
