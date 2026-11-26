@@ -4,7 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 # Disaggregated Serving with Ray orchestrator
-TensorRT-LLM supports a prototype [Ray orchestrator](../README.md) as an alternative to MPI.
+TensorRT-LLM supports the [Ray orchestrator](../README.md) as an alternative to MPI.
 
 Running disaggregated serving with Ray follows [the same workflow as in MPI](/examples/disaggregated/README.md), except that `orchestrator_type="ray"` must be set on the `LLM` class, and `CUDA_VISIBLE_DEVICES` can be omitted since Ray handles GPU placement.
 
@@ -34,6 +34,3 @@ curl http://localhost:8000/v1/completions \
         "temperature": 0
     }' -w "\n"
 ```
-
-## Disclaimer
-The code is a prototype and subject to change. Currently, there are no guarantees regarding functionality, performance, or stability.

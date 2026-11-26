@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashAttention-4 shared-prefix attention for generation (SM90).
+"""FlashAttention-4 shared-prefix attention for generation (SM90, SM100).
 
 Rows of a generation step that attend the same leading KV pages form a group. One layer of a step
 runs four launches:
@@ -41,10 +41,10 @@ import triton.language as tl
 
 from . import flash_attn4_kernels
 from .flash_attn4_kernels import (
-    FA4_NUM_THREADS,
-    FA4_TILE_MN,
     allocate_split_workspace,
+    fa4_arch_supported,
     fa4_forward,
+    fa4_generation_options,
     fa4_paged_generation_split,
     split_tables,
     write_kv_paged,
@@ -456,13 +456,12 @@ class Fa4Tail:
             page_table=self.table,
             softmax_scale=sm_scale,
             causal=True,
-            tile_mn=FA4_TILE_MN,
-            num_threads=FA4_NUM_THREADS,
             num_splits=1,
             pack_gqa=None,
             out=self.out.view(self.rows, self.q_len, num_heads, head_dim),
             return_lse=True,
             lse=self.lse,
+            **fa4_generation_options(q.device),
         )
 
 
@@ -476,9 +475,8 @@ def fa4_prefix_splits(
 
     The prefix call launches about one CTA per (request, KV head, 128-row tile of the
     request's packed GQA queries) and walks the group's whole prompt in it; a batch of a few
-    rows (a single group) then runs a handful of CTAs: on H100 (Qwen2.5-7B, K=8, 4 rows,
-    4k-token prompt) 8 CTAs. When the rows' query tiles fill less than half the SMs, the
-    group's pages are cut into up to one wave's worth of runs (at most
+    rows (a single group) then runs a handful of CTAs. When the rows' query tiles fill less
+    than half the SMs, the group's pages are cut into up to one wave's worth of runs (at most
     ``FA4_PREFIX_MAX_SPLITS``), each attended by a copy of the queries.
     """
     gqa = max(num_heads // max(num_kv_heads, 1), 1)
@@ -490,10 +488,10 @@ def fa4_prefix_splits(
 
 
 def fa4_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
-    """Whether FlashAttention-4 can serve shared-prefix attention (SM90, bf16, d64/d128)."""
+    """Whether FlashAttention-4 can serve shared-prefix attention (SM90 or SM100, bf16, d64/d128)."""
     if dtype != torch.bfloat16 or head_dim not in (64, 128):
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (9, 0):
+    if not fa4_arch_supported(device):
         return False
     return fa4_forward() is not None
 

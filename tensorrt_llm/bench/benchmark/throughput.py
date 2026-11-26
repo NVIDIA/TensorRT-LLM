@@ -163,8 +163,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 @optgroup.option(
     "--image_data_format",
     type=click.Choice(["pt", "pil"]),
-    default="pt",
-    help="Format of the image data for multimodal models.",
+    default=None,
+    help="Defaults to PIL for images and NumPy for videos.",
 )
 @optgroup.option(
     "--data_device",
@@ -324,7 +324,7 @@ def throughput_command(
     logger.info("Preparing to run throughput benchmark...")
 
     # Parameters from CLI
-    image_data_format: str = params.get("image_data_format", "pt")
+    image_data_format: str | None = params.get("image_data_format")
     data_device: str = params.get("data_device", "cpu")
     no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
     custom_tokenizer: str = params.get("custom_tokenizer", None)

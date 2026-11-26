@@ -38,6 +38,7 @@ def _load_test_case(class_name: str, namespace: dict[str, object]) -> type:
         pytest=pytest,
         LlmapiAccuracyTestHarness=object,
         llm_models_root=lambda: "/unused-models",
+        AutoTunerNvMMHConfig=SimpleNamespace,
         KvCacheConfig=SimpleNamespace,
         DSparkDecodingConfig=SimpleNamespace,
         CudaGraphConfig=SimpleNamespace,
