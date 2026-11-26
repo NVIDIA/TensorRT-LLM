@@ -574,3 +574,8 @@ class FlashInferAttention(AttentionBackend):
     @classmethod
     def support_lse(cls) -> bool:
         return True
+
+    @classmethod
+    def support_key_padding_mask(cls) -> bool:
+        """Unquantized attention takes the mask; a quantized recipe rejects it."""
+        return True

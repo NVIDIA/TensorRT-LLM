@@ -69,6 +69,7 @@ def _manager() -> Mock:
     manager.enable_block_reuse = False
     manager._has_cp_helix = False
     manager.num_locality_domains = 1
+    manager._keep_growth_block = False
     manager.num_extra_kv_tokens = 0
     manager._kv_alloc_extra_tokens = 0
     manager.kv_cache_map = {}

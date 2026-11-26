@@ -256,6 +256,8 @@ class RuntimeHooks:
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
+    # Opt into one-model MTP staging with graph padding and admissions.
+    steady_decode_prepare: bool = False
     # Streaming: also emit a response on decoding iterations 2..N, so the first
     # counted text reaches the client one step after the first token instead of
     # one stream interval later (a reasoning parser holds a leading reasoning
