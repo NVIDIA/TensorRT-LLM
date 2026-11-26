@@ -34,9 +34,13 @@ The MXFP4 checkpoint runs on sm_100 on two targets, TP16 with the experts split 
 
 The NVFP4 checkpoint runs on sm_107 only, on five specialized targets, each one layout of the
 recipe below. Routing admits exactly these layouts; anything else raises `NoTarget` with the facts
-it saw (`modeling_v2="require"` turns that into an error). The Helix16 ULL layout requires a KV cache
-transceiver, MNNVL all-reduce (`AUTO` or `MNNVL`), and a standalone MLA DSpark drafter with Markov
-head weights. It declines an explicit non-generation role, guided decoding, or GEN slot preemption.
+it saw (`modeling_v2="require"` turns that into an error).
+
+Set `modeling_v2: require` explicitly on the Helix16 ULL generation worker. This layout requires
+a KV cache transceiver, MNNVL all-reduce (`AUTO` or `MNNVL`), and a standalone MLA DSpark drafter
+with Markov head weights and a fixed draft length of seven tokens. Set
+`kv_cache_config.enable_kv_pool_rebalance` to `false` so KDA checkpoint slot bindings stay fixed.
+The target declines an explicit non-generation role, guided decoding, or GEN slot preemption.
 
 The recipe:
 
@@ -81,7 +85,9 @@ Constants determine what the SM107 targets run. Engine-wide decisions the target
 (`use_mnnvl_fabric_handle`, `MNNVLAllReduce.is_mnnvl`).
 Of the code the SM107 targets use, `routing.py` reads the deployment's environment to decline
 unsupported deployments. The ultra-low-latency target's step shell reads `CUDA_VISIBLE_DEVICES`
-to map its CUDA device to the physical GPU and pin its executor thread near it.
+to map its CUDA device to a physical GPU index and choose a core from the worker's CPU affinity
+mask. Set `TLLM_NUMA_AWARE_WORKER_AFFINITY=1` for the launcher to bind the worker to the GPU's
+NUMA node. Set it to `0` to disable the ULL executor pin.
 `test_kimi_k3_no_env_switches.py` checks these exceptions.
 
 ### Log lines
