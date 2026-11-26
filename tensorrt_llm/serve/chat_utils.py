@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import os
 import uuid
 from functools import lru_cache, partial
 from pathlib import Path
@@ -20,14 +21,15 @@ from typing_extensions import Required
 
 from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
-                                 load_base64_image_embeds)
+                                 async_load_base64_tensor)
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
                                           is_local_media_url)
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import (NATIVE_MISTRAL_MODEL_TYPES,
-                                       apply_mm_placeholders)
+                                       apply_mm_placeholders,
+                                       close_pending_loads)
 from tensorrt_llm.logger import logger
 
 
@@ -49,6 +51,16 @@ class ImageEmbedsData(TypedDict, total=False):
     image_grid_thw: List[int]
 
 
+class VideoEmbedsData(TypedDict, total=False):
+    """Serialized video embeddings with the grid and timing they were encoded with."""
+    data: Required[str]
+    video_grid_thw: Required[List[int]]
+    timestamps: List[float]
+    fps: float
+    frames_indices: List[int]
+    second_per_grid_ts: float
+
+
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     """Type definition for image embeddings passed in base64-encoded PyTorch tensor format."""
     image_embeds: Required[
@@ -57,11 +69,18 @@ class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     type: Required[Literal["image_embeds"]]
 
 
+class ChatCompletionContentPartVideoEmbedsParam(TypedDict, total=False):
+    """Video embeddings passed as a base64-encoded PyTorch tensor plus metadata."""
+    video_embeds: Required[VideoEmbedsData]
+    type: Required[Literal["video_embeds"]]
+
+
 # Type Aliases and Constants
 ChatCompletionContentPartParam: TypeAlias = Union[
     OpenAIChatCompletionContentPartParam,
     ChatCompletionContentPartVideoParam,
     ChatCompletionContentPartImageEmbedsParam,
+    ChatCompletionContentPartVideoEmbedsParam,
     str,
 ]
 
@@ -72,7 +91,22 @@ VALID_MESSAGE_CONTENT_MM_PART_TYPES = frozenset([
     "audio_url",
     "input_audio",
     "image_embeds",
+    "video_embeds",
 ])
+
+MM_EMBEDS_MAX_BYTES_ENV = "TRTLLM_MM_EMBEDS_MAX_BYTES"
+DEFAULT_MM_EMBEDS_MAX_BYTES = 256 * 1024 * 1024
+
+# Metadata a client may send next to "data", per embeddings part type.
+_EMBEDS_METADATA_KEYS = {
+    "image_embeds":
+    frozenset({"image_grid_thw"}),
+    "video_embeds":
+    frozenset({
+        "video_grid_thw", "timestamps", "fps", "frames_indices",
+        "second_per_grid_ts"
+    }),
+}
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
@@ -94,9 +128,63 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         "input_audio":
         lambda part: cast(dict, part).get("input_audio", None),
         "image_embeds":
-        lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
-            "data", None),
+        lambda part: cast(dict, part).get("image_embeds", None),
+        "video_embeds":
+        lambda part: cast(dict, part).get("video_embeds", None),
     }
+
+
+def mm_embeds_max_bytes() -> int:
+    """Return the per-request limit on decoded image/video embedding bytes."""
+    value = os.environ.get(MM_EMBEDS_MAX_BYTES_ENV)
+    if value is None:
+        return DEFAULT_MM_EMBEDS_MAX_BYTES
+    limit = int(value)
+    if limit <= 0:
+        raise ValueError(
+            f"{MM_EMBEDS_MAX_BYTES_ENV} must be positive, got {value!r}")
+    return limit
+
+
+def _parse_embeds_part(
+        part_type: str, content: Any,
+        mm_data_tracker: MultimodalDataTracker) -> Coroutine[Any, Any, Any]:
+    """Validate an embeddings part and return the coroutine that decodes it.
+
+    The base64 length of every embeddings part in the request is charged
+    against `mm_embeds_max_bytes()` before anything is decoded, and decoding
+    runs off the event loop; the decoder returns no tensor larger than its
+    archive, so this bounds the decoded tensors too. A part with metadata
+    yields the item dict that
+    `parse_external_embeddings` takes, a bare image part yields the tensor.
+    """
+    if not isinstance(content, dict):
+        raise ValueError(
+            f"'{part_type}' must be an object with a 'data' field.")
+    data = content.get("data")
+    if not isinstance(data, str) or not data:
+        raise ValueError(
+            f"'{part_type}' requires a non-empty base64 'data' string.")
+    unknown = set(content) - {"data"} - _EMBEDS_METADATA_KEYS[part_type]
+    if unknown:
+        raise ValueError(
+            f"Unsupported '{part_type}' fields: {sorted(unknown)}; "
+            f"allowed: {sorted(_EMBEDS_METADATA_KEYS[part_type])}.")
+    # A JSON null means the key is absent.
+    metadata = {
+        key: value
+        for key, value in content.items() if key != "data" and value is not None
+    }
+    max_bytes = mm_embeds_max_bytes()
+    mm_data_tracker.charge_embedding_payload(len(data), max_bytes)
+
+    async def decode() -> Any:
+        tensor = await async_load_base64_tensor(data, max_bytes=max_bytes)
+        if not metadata:
+            return tensor
+        return {"mm_embeddings": tensor, **metadata}
+
+    return decode()
 
 
 def _make_media_io(
@@ -177,18 +265,10 @@ def parse_chat_message_content_part(
                               data=_load_request_media(image_io, str_content),
                               is_embedding=False)
 
-    if part_type == "image_embeds":
-        str_content = cast(str, content)
-        image_grid_thw = cast(dict, part)["image_embeds"].get("image_grid_thw")
-
-        async def decode_image_embeds():
-            embeds = load_base64_image_embeds(str_content)
-            if image_grid_thw is None:
-                return embeds
-            return {"mm_embeddings": embeds, "image_grid_thw": image_grid_thw}
-
-        return MultimodalData(modality="image",
-                              data=decode_image_embeds(),
+    if part_type in ("image_embeds", "video_embeds"):
+        return MultimodalData(modality=part_type.removesuffix("_embeds"),
+                              data=_parse_embeds_part(part_type, content,
+                                                      mm_data_tracker),
                               is_embedding=True)
 
     if part_type == "video_url":
@@ -247,19 +327,23 @@ def parse_chat_message_content_parts(
     content_parts: list[Union[str, dict]] = []
 
     media_index = 0
-    for part in parts:
-        parse_res = parse_chat_message_content_part(part, mm_data_tracker)
-        if parse_res:
-            if isinstance(parse_res, str):
-                text_parts.append(parse_res)
-                content_parts.append(parse_res)
-            else:
-                media_parts.append(parse_res)
-                content_parts.append({
-                    "type": parse_res["modality"],
-                    "media_index": media_index,
-                })
-                media_index += 1
+    try:
+        for part in parts:
+            parse_res = parse_chat_message_content_part(part, mm_data_tracker)
+            if parse_res:
+                if isinstance(parse_res, str):
+                    text_parts.append(parse_res)
+                    content_parts.append(parse_res)
+                else:
+                    media_parts.append(parse_res)
+                    content_parts.append({
+                        "type": parse_res["modality"],
+                        "media_index": media_index,
+                    })
+                    media_index += 1
+    except BaseException:
+        close_pending_loads(media["data"] for media in media_parts)
+        raise
 
     text_prompt = "\n".join(text_parts)
 
@@ -307,19 +391,23 @@ def parse_chat_message_content(
         mm_data_tracker,
         keep_content_parts=keep_text_parts and is_part_list,
     )
-    if role == "assistant":
-        result.update(
-            _parse_assistant_message_content(message,
-                                             lenient_tool_call_arguments,
-                                             raw_tool_call_arguments))
-    elif role == "tool":
-        result.update(_parse_tool_message_content(message))
-    elif keep_message_tools and role == "system" and message.get("tools"):
-        # Message-level (dynamic) tool declarations: python-renderer chat
-        # templates (kimi_k3) render these as an in-conversation tool
-        # declare block at this message's position. Other models keep the
-        # pre-existing behavior of silently ignoring the key.
-        result["tools"] = message["tools"]
+    try:
+        if role == "assistant":
+            result.update(
+                _parse_assistant_message_content(message,
+                                                 lenient_tool_call_arguments,
+                                                 raw_tool_call_arguments))
+        elif role == "tool":
+            result.update(_parse_tool_message_content(message))
+        elif keep_message_tools and role == "system" and message.get("tools"):
+            # Message-level (dynamic) tool declarations: python-renderer chat
+            # templates (kimi_k3) render these as an in-conversation tool
+            # declare block at this message's position. Other models keep the
+            # pre-existing behavior of silently ignoring the key.
+            result["tools"] = message["tools"]
+    except BaseException:
+        close_pending_loads(media["data"] for media in result["media"])
+        raise
     return result
 
 
@@ -526,7 +614,8 @@ def parse_chat_messages_coroutines(
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,
-        request_media_io_kwargs=request_media_io_kwargs)
+        request_media_io_kwargs=request_media_io_kwargs,
+        charge_embeddings=resolve_media)
 
     # Determine content format to decide placeholder strategy.
     #
@@ -548,45 +637,54 @@ def parse_chat_messages_coroutines(
     else:
         content_format = ContentFormat.STRING
 
-    for msg in messages:
-        # kimi_k3's reference renderer keeps unparsable tool-call argument
-        # strings verbatim; other templates expect the strict dict contract.
-        # mistral-common (the Mistral-native renderer) encodes each text part
-        # of a content list on its own, and parses a history tool call's
-        # arguments itself.
-        native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
-        parsed_msg = parse_chat_message_content(
-            msg,
-            mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"),
-            keep_text_parts=native_mistral,
-            raw_tool_call_arguments=native_mistral)
-        conversation.append(parsed_msg)
+    current_media = []
+    try:
+        for msg in messages:
+            # kimi_k3's reference renderer keeps unparsable tool-call argument
+            # strings verbatim; other templates expect the strict dict contract.
+            # mistral-common (the Mistral-native renderer) encodes each text part
+            # of a content list on its own, and parses a history tool call's
+            # arguments itself.
+            native_mistral = model_type in NATIVE_MISTRAL_MODEL_TYPES
+            parsed_msg = parse_chat_message_content(
+                msg,
+                mm_data_tracker,
+                lenient_tool_call_arguments=(model_type == "kimi_k3"),
+                keep_message_tools=(model_type == "kimi_k3"),
+                keep_text_parts=native_mistral,
+                raw_tool_call_arguments=native_mistral)
+            conversation.append(parsed_msg)
+            current_media = parsed_msg["media"]
 
-        # Track placeholders added for this message only.
-        msg_placeholder_counts = {}
-        # Snapshot the tracker's item_order length so we can slice off just
-        # the entries this message contributed.
-        item_order_start = len(mm_data_tracker.item_order())
-        if parsed_msg["media"]:
-            for mdata in parsed_msg["media"]:
-                placeholder = mm_data_tracker.add_data(
-                    mdata["modality"],
-                    mdata["data"],
-                    is_embedding=mdata["is_embedding"])
-                if placeholder:
-                    msg_placeholder_counts[
-                        placeholder] = msg_placeholder_counts.get(
-                            placeholder, 0) + 1
+            # Track placeholders added for this message only.
+            msg_placeholder_counts = {}
+            # Snapshot the tracker's item_order length so we can slice off just
+            # the entries this message contributed.
+            item_order_start = len(mm_data_tracker.item_order())
+            if parsed_msg["media"]:
+                for mdata in parsed_msg["media"]:
+                    placeholder = mm_data_tracker.add_data(
+                        mdata["modality"],
+                        mdata["data"],
+                        is_embedding=mdata["is_embedding"])
+                    if placeholder:
+                        msg_placeholder_counts[
+                            placeholder] = msg_placeholder_counts.get(
+                                placeholder, 0) + 1
 
-        apply_mm_placeholders(model_type,
-                              parsed_msg,
-                              msg_placeholder_counts,
-                              mm_data_tracker,
-                              item_order_start=item_order_start,
-                              content_format=content_format)
-        mm_placeholder_counts.append(msg_placeholder_counts)
+            apply_mm_placeholders(model_type,
+                                  parsed_msg,
+                                  msg_placeholder_counts,
+                                  mm_data_tracker,
+                                  item_order_start=item_order_start,
+                                  content_format=content_format)
+            mm_placeholder_counts.append(msg_placeholder_counts)
+    except BaseException:
+        # Nothing will await the loads parked so far, nor this message's loads
+        # that failed to register.
+        close_pending_loads(media["data"] for media in current_media)
+        mm_data_tracker.close_pending()
+        raise
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can
     # be returned directly (not through the coroutine).

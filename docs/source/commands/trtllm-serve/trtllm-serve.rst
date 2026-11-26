@@ -305,6 +305,33 @@ model.
          {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
      ]}
 
+**Video embeddings**
+
+Qwen2.5-VL and Qwen3-VL also take precomputed video embeddings, with the video's
+grid and timing.
+
+* Using "video_embeds" with base64-encoded data:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What happens in this video?"},
+         {"type": "video_embeds", "video_embeds": {"data": "{video_embeddings_base64}", "video_grid_thw": [4, 34, 60], "fps": 2.0, "frames_indices": [0, 1, 2, 3, 4, 5, 6, 7]}}
+     ]}
+
+.. note::
+   `data` is a base64 `torch.save` float tensor of shape `[rows, hidden]`, and
+   `video_grid_thw` is the video's grid `[t, h, w]` from the model's video
+   processor. Qwen3-VL takes either `timestamps` (one per temporal patch) or
+   `fps` with `frames_indices`; Qwen2.5-VL takes either `second_per_grid_ts` or
+   `fps`. Other keys are rejected, and a key sent as `null` counts as absent.
+
+.. note::
+   The embedding parts of one request share a byte limit,
+   ``TRTLLM_MM_EMBEDS_MAX_BYTES`` (default 256 MiB), checked against their
+   base64 length before anything is decoded. It applies to ``image_embeds``
+   and ``video_embeds`` alike.
+
 **Audio**
 
 * Using "audio_url":

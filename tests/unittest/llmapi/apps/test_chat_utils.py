@@ -1208,3 +1208,269 @@ class TestRequestLocalMediaPaths:
         with pytest.raises(ValueError, match="Local media paths are not accepted") as excinfo:
             await self._load(str(media_dirs[0] / "img.png"))
         assert str(missing) not in str(excinfo.value)
+
+
+def _b64_tensor(tensor) -> str:
+    import base64
+    import io
+
+    import torch
+
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+class TestEmbedsParts:
+    """image_embeds / video_embeds parts: metadata, validation and byte limits."""
+
+    @pytest.fixture
+    def mm_tracker(self):
+        return MultimodalDataTracker(model_type="dummy")
+
+    @pytest.mark.asyncio
+    async def test_video_embeds_carry_grid_and_timing(self, mm_tracker):
+        import torch
+
+        embedding = torch.randn(8, 4, dtype=torch.bfloat16)
+        part = {
+            "type": "video_embeds",
+            "video_embeds": {
+                "data": _b64_tensor(embedding),
+                "video_grid_thw": [2, 4, 4],
+                "fps": 2.0,
+                "frames_indices": [0, 1, 2, 3],
+            },
+        }
+        result = parse_chat_message_content_part(part, mm_tracker)
+        assert result["modality"] == "video" and result["is_embedding"]
+        item = await result["data"]
+        assert torch.equal(item.pop("mm_embeddings"), embedding)
+        assert item == {"video_grid_thw": [2, 4, 4], "fps": 2.0, "frames_indices": [0, 1, 2, 3]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("part_type", "metadata", "key"),
+        [
+            ("image_embeds", {}, "image_grid_thw"),
+            ("video_embeds", {"video_grid_thw": [2, 4, 4]}, "fps"),
+        ],
+    )
+    async def test_null_metadata_is_absent(self, mm_tracker, part_type, metadata, key):
+        import torch
+
+        from tensorrt_llm.inputs.external_embeddings import parse_external_embeddings
+
+        data = _b64_tensor(torch.randn(8, 4))
+        modality = part_type.split("_")[0]
+        parsed = []
+        for content in ({**metadata}, {**metadata, key: None}):
+            part = {"type": part_type, part_type: {"data": data, **content}}
+            item = await parse_chat_message_content_part(part, mm_tracker)["data"]
+            (parsed_item,) = parse_external_embeddings({modality: [item]})[modality]
+            parsed.append(parsed_item)
+        missing, null = parsed
+        # The model sees the same item, so a required key fails the same way.
+        assert null.grid_thw == missing.grid_thw and null.fps == missing.fps
+        assert torch.equal(null.embedding, missing.embedding)
+
+    @pytest.mark.parametrize(
+        ("part", "match"),
+        [
+            (
+                {"type": "video_embeds", "video_embeds": {"data": "AA==", "pixel_values": 1}},
+                "Unsupported",
+            ),
+            ({"type": "image_embeds", "image_embeds": {"data": "AA==", "fps": 1.0}}, "Unsupported"),
+            ({"type": "video_embeds", "video_embeds": {"data": 3}}, "base64 'data'"),
+            ({"type": "video_embeds", "video_embeds": "AA=="}, "must be an object"),
+        ],
+    )
+    def test_malformed_parts_are_rejected_before_decode(self, mm_tracker, part, match):
+        with pytest.raises(ValueError, match=match):
+            parse_chat_message_content_part(part, mm_tracker)
+
+    @pytest.mark.asyncio
+    async def test_integer_embeddings_are_rejected(self, mm_tracker):
+        import torch
+
+        result = parse_chat_message_content_part(
+            {
+                "type": "image_embeds",
+                "image_embeds": {"data": _b64_tensor(torch.ones(2, 2, dtype=torch.int32))},
+            },
+            mm_tracker,
+        )
+        with pytest.raises(ValueError, match="unsupported dtype"):
+            await result["data"]
+
+    @pytest.mark.asyncio
+    async def test_payload_that_is_not_a_tensor_is_rejected(self, mm_tracker):
+        import torch
+
+        result = parse_chat_message_content_part(
+            {"type": "image_embeds", "image_embeds": {"data": _b64_tensor({"x": torch.ones(1)})}},
+            mm_tracker,
+        )
+        with pytest.raises(ValueError, match="unsupported pickle opcode"):
+            await result["data"]
+
+    def test_request_byte_limit_spans_parts(self, mm_tracker, monkeypatch):
+        import torch
+
+        data = _b64_tensor(torch.zeros(16, 16))
+        decoded_bytes = len(data) * 3 // 4
+        monkeypatch.setenv(
+            _chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(decoded_bytes + decoded_bytes // 2)
+        )
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        first = parse_chat_message_content_part(part, mm_tracker)
+        first["data"].close()
+        with pytest.raises(ValueError, match="exceed the"):
+            parse_chat_message_content_part(part, mm_tracker)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resolve_media", [True, False])
+    async def test_byte_limit_applies_only_to_decoded_media(self, monkeypatch, resolve_media):
+        import gc
+        import warnings
+
+        import torch
+
+        data = _b64_tensor(torch.zeros(16, 16))
+        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(len(data)))
+        decoder = AsyncMock()
+        monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        messages = [{"role": "user", "content": [part, part]}]
+
+        def parse():
+            return parse_chat_messages_coroutines(
+                messages,
+                MagicMock(),
+                None,
+                model_type_override="qwen2_vl",
+                resolve_media=resolve_media,
+            )
+
+        if resolve_media:
+            with pytest.raises(ValueError, match="exceed the"):
+                parse()
+            return
+        # A generation-only worker discards the parts without decoding them.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert await parse()[1] == (None, None)
+            gc.collect()
+        decoder.assert_not_called()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+    @pytest.mark.parametrize(
+        ("failure", "match"),
+        [
+            ("limit_same_message", "exceed the"),
+            ("limit_next_message", "exceed the"),
+            ("tool_call", "must be valid JSON"),
+            ("registration", "Unknown modality"),
+        ],
+    )
+    def test_failed_parse_closes_parked_decoders(self, monkeypatch, failure, match):
+        import gc
+        import inspect
+        import warnings
+
+        import torch
+
+        data = _b64_tensor(torch.zeros(16, 16))
+        parts = 3 if failure == "registration" else 1
+        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(parts * len(data)))
+        decoder = AsyncMock()
+        monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
+        loads = []
+        parse_embeds_part = _chat_utils._parse_embeds_part
+
+        def recording_parse(*args, **kwargs):
+            loads.append(parse_embeds_part(*args, **kwargs))
+            return loads[-1]
+
+        monkeypatch.setattr(_chat_utils, "_parse_embeds_part", recording_parse)
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        model_type = "qwen2_vl"
+        if failure == "limit_same_message":
+            messages = [{"role": "user", "content": [part, part]}]
+        elif failure == "limit_next_message":
+            messages = [{"role": "user", "content": [part]}] * 2
+        elif failure == "tool_call":
+            tool_call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{"}}
+            messages = [{"role": "assistant", "content": [part], "tool_calls": [tool_call]}]
+        else:
+            # The image registers; the image-only model then rejects the video.
+            video = {"type": "video_embeds", "video_embeds": {"data": data}}
+            messages = [{"role": "user", "content": [part, video, part]}]
+            model_type = "llava_next"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises((ValueError, TypeError), match=match):
+                parse_chat_messages_coroutines(
+                    messages, MagicMock(), None, model_type_override=model_type
+                )
+            gc.collect()
+        assert loads
+        assert all(inspect.getcoroutinestate(load) == inspect.CORO_CLOSED for load in loads)
+        decoder.assert_not_called()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+    @pytest.mark.asyncio
+    async def test_failed_load_cancels_loads_still_running(self):
+        import asyncio
+
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def slow_load():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def failing_load():
+            await started.wait()
+            raise ValueError("bad payload")
+
+        tracker = MultimodalDataTracker(model_type="qwen2_vl")
+        tracker.add_data("image", slow_load())
+        tracker.add_data("image", failing_load(), is_embedding=True)
+        with pytest.raises(ValueError, match="bad payload"):
+            await asyncio.wait_for(tracker.retrieve_all_async(), timeout=30)
+        assert cancelled.is_set()
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+
+    @pytest.mark.asyncio
+    async def test_failed_render_cancels_loads_still_running(self, monkeypatch):
+        import asyncio
+
+        from tensorrt_llm.serve.render import chat as render_chat
+
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def slow_load():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def failing_render(*args, **kwargs):
+            await started.wait()
+            raise ValueError("bad template")
+
+        monkeypatch.setattr(render_chat, "render_conversation", failing_render)
+        monkeypatch.setattr(render_chat, "renders_from_loaded_media", lambda model_type: False)
+        with pytest.raises(ValueError, match="bad template"):
+            await asyncio.wait_for(
+                render_chat.render_conversation_with_media(MagicMock(), slow_load()), timeout=30
+            )
+        assert cancelled.is_set()
+        assert asyncio.all_tasks() == {asyncio.current_task()}

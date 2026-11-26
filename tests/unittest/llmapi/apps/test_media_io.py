@@ -146,7 +146,7 @@ class TestMultimodalLoadErrorPropagation:
         """Exceptions from image embed decoding must propagate."""
         part = {"type": "image_embeds", "image_embeds": {"data": "notbase64"}}
         with patch(
-            "tensorrt_llm.serve.chat_utils.load_base64_image_embeds",
+            "tensorrt_llm.serve.chat_utils.async_load_base64_tensor",
             side_effect=CustomError,
         ):
             result = parse_chat_message_content_part(part, mm_tracker)

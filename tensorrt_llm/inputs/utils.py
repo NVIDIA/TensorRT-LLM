@@ -6,8 +6,8 @@ import base64
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
-                    Optional, Tuple, TypedDict, Union)
+from typing import (Any, Collection, Coroutine, Dict, Iterable, List,
+                    NamedTuple, Optional, Tuple, TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -353,6 +353,25 @@ class ConversationMessage(TypedDict, total=False):
     tools: List[Dict[str, Any]]
 
 
+async def _gather_or_cancel(*aws: Any) -> List[Any]:
+    """`asyncio.gather` that cancels the others when one fails, then raises."""
+    tasks = [asyncio.ensure_future(aw) for aw in aws]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def close_pending_loads(items: Iterable[Any]) -> None:
+    """Close the never-started load coroutines among `items`."""
+    for item in items:
+        if asyncio.iscoroutine(item):
+            item.close()
+
+
 class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
@@ -361,6 +380,7 @@ class MultimodalDataTracker:
         model_type: str,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        charge_embeddings: bool = True,
     ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
@@ -375,6 +395,10 @@ class MultimodalDataTracker:
         # `add_data` (skipping `is_embedding=True` items — the interleave
         # manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
+        # Base64 characters of the request's embeddings parts so far.
+        self._embedding_payload_chars = 0
+        # Off when the request's media is discarded, not decoded.
+        self._charge_embeddings = charge_embeddings
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
@@ -392,8 +416,9 @@ class MultimodalDataTracker:
         """Retrieve all collected multimodal data and embeddings.
 
         All coroutines across all modalities (and across _data/_embeddings) are
-        gathered concurrently in a single asyncio.gather call, so e.g. image
-        downloads and video downloads overlap instead of running sequentially.
+        gathered concurrently, so e.g. image downloads and video downloads
+        overlap instead of running sequentially. The first failure cancels the
+        loads still running and is raised once they have stopped.
         """
 
         async def _retrieve(
@@ -406,7 +431,7 @@ class MultimodalDataTracker:
             if not pairs:
                 return None
             modality_keys, coroutines = zip(*pairs)
-            results = await asyncio.gather(*coroutines)
+            results = await _gather_or_cancel(*coroutines)
             out: dict[str, list] = defaultdict(list)
             for modality, result in zip(modality_keys, results):
                 out[modality].append(result)
@@ -416,7 +441,7 @@ class MultimodalDataTracker:
             return None, None
         # _data and _embeddings also gathered concurrently
         with _time_input_processing("media_load"):
-            data_result, embed_result = await asyncio.gather(
+            data_result, embed_result = await _gather_or_cancel(
                 _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
@@ -433,13 +458,15 @@ class MultimodalDataTracker:
         Placeholder counts and `item_order` are unaffected; `add_data` builds
         both synchronously.
         """
+        self.close_pending()
+        return None, None
+
+    def close_pending(self) -> None:
+        """Close the parked loads without running them; see `discard_all_async`."""
         for pending in (self._data, self._embeddings):
             for items in pending.values():
-                for item in items:
-                    if asyncio.iscoroutine(item):
-                        item.close()
+                close_pending_loads(items)
             pending.clear()
-        return None, None
 
     def retrieve_all_sync(
         self
@@ -457,6 +484,21 @@ class MultimodalDataTracker:
             }
 
         return _retrieve(self._data), _retrieve(self._embeddings)
+
+    def charge_embedding_payload(self, num_chars: int, max_bytes: int) -> None:
+        """Charge a base64 embeddings payload against the request's byte limit.
+
+        Raises `ValueError` once the request's payloads together could decode
+        to more than `max_bytes`, before any of them is decoded.
+        """
+        if not self._charge_embeddings:
+            return
+        self._embedding_payload_chars += num_chars
+        max_chars = 4 * ((max_bytes + 2) // 3)
+        if self._embedding_payload_chars > max_chars:
+            raise ValueError(
+                f"Embedding payloads in this request exceed the {max_bytes}-"
+                "byte limit.")
 
     def add_data(self,
                  media_type: str,
