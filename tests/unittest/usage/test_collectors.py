@@ -165,6 +165,7 @@ class TestModelInfo:
         [
             "LlamaForCausalLM",
             "Cosmos3EdgeForConditionalGeneration",
+            "MuseSparkForConditionalGeneration",
         ],
     )
     def test_public_architecture_is_reported_by_name(self, architecture: str) -> None:

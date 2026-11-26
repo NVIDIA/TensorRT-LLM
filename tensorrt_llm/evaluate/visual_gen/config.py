@@ -30,6 +30,24 @@ def load_yaml_mapping(path: str | None, *, param_hint: str) -> dict[str, Any]:
     return dict(config)
 
 
+def load_generator_config(
+    path: str | None, *, explicit_cli_telemetry: bool = False
+) -> dict[str, Any]:
+    """Read generator YAML once and consume its CLI telemetry opt-out."""
+    from tensorrt_llm.commands._telemetry import apply_raw_config_telemetry_opt_out
+    from tensorrt_llm.usage.config import UsageContext
+
+    config = load_yaml_mapping(path, param_hint="--visual_gen_args")
+    apply_raw_config_telemetry_opt_out(
+        config,
+        usage_context=UsageContext.CLI_EVAL,
+        component="llm",
+        explicit_cli_telemetry=explicit_cli_telemetry,
+    )
+    config.pop("telemetry_config", None)
+    return config
+
+
 def load_prompt_records(
     prompts_path: str,
     num_samples: int | None = None,

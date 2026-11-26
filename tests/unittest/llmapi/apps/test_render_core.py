@@ -223,12 +223,12 @@ class TestRenderChat:
         assert not [w for w in caught if "never awaited" in str(w.message)]
 
         # A model with its own input processor is refused; its length uses the text tokenizer.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         class OwnProcessor:
             tokenizer = None
 
-        own = resources(tokenizer, model_type="mistral_common", input_processor=OwnProcessor())
+        own = resources(tokenizer, model_type="llava_llama", input_processor=OwnProcessor())
         with pytest.raises(UnsupportedRenderError):
             render_chat(chat_request(), own)
         assert (
@@ -482,10 +482,10 @@ class TestExtensions:
         self, tokenizer
     ) -> None:
         # Registers the passthrough content format for this model type.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         with pytest.raises(UnsupportedRenderError, match="own input processor"):
-            render_chat(chat_request(), resources(tokenizer, model_type="mistral_common"))
+            render_chat(chat_request(), resources(tokenizer, model_type="llava_llama"))
 
     def test_a_named_tool_choice_is_refused_for_harmony_like_the_chat_route(
         self, harmony_vocab
@@ -1160,6 +1160,7 @@ class TestRenderedRequest:
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(token_ids=[1], surprise=True)
 
     def test_an_unset_request_id_is_generated(self) -> None:
@@ -1169,4 +1170,5 @@ class TestRenderedRequest:
 
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])

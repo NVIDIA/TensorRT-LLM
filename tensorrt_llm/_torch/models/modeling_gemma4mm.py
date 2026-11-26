@@ -985,6 +985,11 @@ def _normalize_vision_patches(
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
+        "audio": frozenset(),  # Chunked local attention with relative-position bias.
+    }
+
     supports_encoder_cache = True
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
@@ -992,7 +997,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return Gemma4ForCausalLM.get_model_defaults(llm_args)
+        defaults = Gemma4ForCausalLM.get_model_defaults(llm_args)
+        defaults.setdefault("kv_cache_config", {})["enable_swa_scratch_reuse"] = False
+        return defaults
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
@@ -1246,7 +1253,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        attn_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
+        attn_backend = (
+            model_config.attn_backend
+            if name == "text_config"
+            else model_config.get_encoder_attention_backend(name.removesuffix("_config"), "TRTLLM")
+        )
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
@@ -1388,6 +1399,10 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - Support for image_position_ids (2D patch coordinates)
     - mm_token_type_ids-based bidirectional masking
     """
+
+    # fmt: off
+    supported_encoder_attention_backends = Gemma4MultimodalModelBase.supported_encoder_attention_backends
+    # fmt: on
 
     build_mtp_draft_model_from_config = True
     supports_mm_encoder_item_scheduling = True

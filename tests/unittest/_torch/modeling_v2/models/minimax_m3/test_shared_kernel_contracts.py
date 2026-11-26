@@ -88,12 +88,12 @@ def test_full_context_plan_runs_primts_runtime_contract_on_cpu(
     own_reducer: bool,
 ) -> None:
     """Exercise plan construction and runtime operands without CUDA kernels."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
-        m3_fullctx_decode,
-    )
     from tensorrt_llm._torch.attention.backends.prims_ts import decode as tsdec
     from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode import (
         fmha_decode_config,
+    )
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
+        m3_fullctx_decode,
     )
 
     def compiled_main(

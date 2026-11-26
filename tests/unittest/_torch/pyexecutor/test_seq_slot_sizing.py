@@ -80,7 +80,12 @@ from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_d
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig, SleepConfig
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    SchedulerConfig,
+    SkipSoftmaxAttentionConfig,
+    SleepConfig,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -358,6 +363,63 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
 
 
+@pytest.mark.parametrize("use_v2", [True, False])
+@pytest.mark.parametrize(
+    "max_beam_width,enable_sleep",
+    [(1, False), (4, False), (1, True)],
+)
+def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
+    use_v2, max_beam_width, enable_sleep
+):
+    """Skip Softmax keeps the dense KV cache, so it follows the dense V2 rules.
+
+    ``resolved_kv_cache_manager_is_v2`` sizes the seat pool from the dense
+    rules alone, so the manager the creator selects for a Skip Softmax model
+    must be the one those rules predict: V2 when requested, including beam
+    search, and the plain V1 fallback only for a V2-incompatible feature.
+    """
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            architectures=["Qwen3MoeForCausalLM"], num_hidden_layers=2
+        ),
+        sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+    creator._kv_cache_config = kv_cache_config
+    creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
+    creator._cache_transceiver_config = None
+    creator._speculative_config = None
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    selected = creator._get_model_kv_cache_manager_cls()
+    resolved = resolved_kv_cache_manager_is_v2(
+        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
+    )
+
+    assert selected is (KVCacheManagerV2 if use_v2 and not enable_sleep else KVCacheManager)
+    assert resolved is issubclass(selected, KVCacheManagerV2)
+
+
+@pytest.mark.parametrize("max_beam_width,enable_sleep", [(4, False), (1, True)])
+def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sleep):
+    """A sparse algorithm with its own cache manager still refuses the V1 fallback."""
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = max_beam_width
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    with pytest.raises(NotImplementedError, match="sparse-attention models.*'dsa'"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+
+
 @pytest.mark.parametrize("max_beam_width", [1, 2, 4])
 @pytest.mark.parametrize("mla", [False, True])
 @pytest.mark.parametrize("fp4_kv_cache", [False, True])
@@ -420,6 +482,31 @@ def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
         creator._validate_or_fallback_kv_cache_manager_v2(
             KVCacheManagerV2, model_config, kv_cache_config
         )
+
+
+@pytest.mark.parametrize(
+    "algorithm,has_v1_manager",
+    [
+        ("rocket", True),
+        # MiniMax-M3 only has a V2 manager.
+        ("minimax_m3", False),
+    ],
+)
+def test_sparse_sleep_error_names_the_v1_manager(algorithm: str, has_v1_manager: bool) -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = 1
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm=algorithm),
+    )
+
+    with pytest.raises(NotImplementedError, match="SleepConfig") as exc_info:
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+
+    assert ("use_kv_cache_manager_v2=False" in str(exc_info.value)) is has_v1_manager
 
 
 @pytest.mark.parametrize("max_beam_width", [None, 1, 2, 4])
@@ -773,6 +860,7 @@ def _make_kv_cache_creator(disable_overlap_scheduler: bool, is_v2: bool = True) 
     c._disable_overlap_scheduler = disable_overlap_scheduler
     c._llm_args = SimpleNamespace(
         kv_cache_config=SimpleNamespace(kv_events_config=None),
+        enable_locality_domains=False,
     )
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
@@ -989,7 +1077,7 @@ def _sampler_with(store):
 def test_penalty_store_is_read_from_the_torch_sampler_only():
     store = _penalty_store(16)
     assert get_penalty_store(_sampler_with(store)) is store
-    # EarlyStopSampler and friends own no penalty handler, and estimation may have no sampler.
+    # Early-stop samplers own no penalty handler, and estimation may have no sampler.
     assert get_penalty_store(SimpleNamespace()) is None
     assert get_penalty_store(None) is None
     # A mocked sampler auto-creates the attributes; that is not a store to size from.

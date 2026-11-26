@@ -1,0 +1,930 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import datetime
+import os
+import queue
+import threading
+import time
+import traceback
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
+
+from tensorrt_llm._utils import CUASSERT, customized_gc_thresholds, nvtx_range, release_gc
+from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.executor.utils import check_prompt_capacity
+from tensorrt_llm.llmapi.utils import _reapply_current_thread_affinity_to_all_threads
+from tensorrt_llm.logger import logger
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
+
+from ..memory.monitor import providers as monitor_providers
+from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
+from .engine.model_setup import build_encoder_runner, build_mm_encoder_runner
+from .engine.runners.encoder import resolve_scheduled_encoder_args
+from .engine.runners.interface import ScheduledInputs, ScheduledModelRunner
+from .error_classification import ErrorBudget
+from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .hang_detector import (
+    HangDetector,
+    distributed_warmup_guard,
+    hard_kill_on_rank_crash,
+    propagate_hard_kill,
+    start_rank_crash_kill_watchdog,
+)
+from .llm_request import LlmRequest, LlmRequestState, LlmResponse
+from .perf_metrics_manager import PerfMetricsManager
+from .profiling import ProfileController
+from .request_delivery import ResponseChannel
+from .request_utils import RequestBroadcaster, drain_queued_items, merge_requests_to_llm_requests
+from .scheduler import ScheduledRequests
+from .scheduler.waiting_queue import create_waiting_queue
+
+if TYPE_CHECKING:
+    from ray.actor import ActorHandle
+
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.mapping import Mapping
+
+    from ..distributed import Distributed
+    from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+    from .llm_request import ExecutorRequest
+    from .model_loader import ModelLoader
+
+__all__ = [
+    "MultimodalEmbeddingCompletion",
+    "PoolingCompletion",
+    "ScheduledEncoderExecutor",
+    "fit_batch",
+    "prompt_cost",
+]
+
+_MULTIMODAL_INPUT_ERROR = "Requests to a pooling model cannot carry multimodal inputs."
+
+# One forward runs while the next is launched; a third waits for the first to be published.
+_MAX_IN_FLIGHT = 2
+
+
+@dataclass(frozen=True)
+class _InFlight:
+    """A launched batch whose forward the completion thread still has to wait for and publish."""
+
+    requests: list[LlmRequest]
+    done: torch.cuda.Event
+    iteration: int
+    host_start: float
+    forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None
+    num_tokens: int
+    num_waiting: int
+
+
+def prompt_cost(item: RequestQueueItem) -> tuple[int, int]:
+    """Rows and tokens of one queued request; each child request is another full row."""
+    rows = 1 + len(item.child_req_ids or ())
+    return rows, rows * item.request.num_input_tokens
+
+
+def fit_batch(
+    items: Sequence[RequestQueueItem],
+    *,
+    max_batch_size: int,
+    max_num_tokens: int,
+    cost: Callable[[RequestQueueItem], tuple[int, int]] = prompt_cost,
+) -> int:
+    """Count the leading items one forward can take; the first that does not fit starts the next batch."""
+    rows = tokens = 0
+    for count, item in enumerate(items):
+        item_rows, item_tokens = cost(item)
+        rows += item_rows
+        tokens += item_tokens
+        if rows > max_batch_size or tokens > max_num_tokens:
+            return count
+    return len(items)
+
+
+class PoolingCompletion:
+    """Store each request's pooled row as its context logits, when the request asked for them."""
+
+    accepts_multimodal_inputs = False
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        for request, row in zip(requests, outputs["logits"]):
+            if request.py_return_context_logits:
+                request.py_result.append_context_logits(row.unsqueeze(0) if row.ndim == 1 else row)
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.drop_context_logits()
+
+
+class MultimodalEmbeddingCompletion:
+    """Export each request's multimodal embeddings, and its MRoPE positions, as CUDA IPC handles.
+
+    A request without multimodal items in the batch completes without a result. Only the rank
+    whose responses reach the frontend exports: an exported allocation stays alive until a
+    consumer opens and releases its handle, or ``retire`` consumes it.
+    """
+
+    accepts_multimodal_inputs = True
+
+    def __init__(self, *, exports: bool) -> None:
+        self._exports = exports
+
+    def store(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        if not self._exports:
+            return
+        metadata = outputs.get("mm_embedding_metadata")
+        mrope_position_ids = outputs.get("mrope_position_ids")
+        mrope_position_deltas = outputs.get("mrope_position_deltas")
+        for result, (request_index, embeddings, lengths) in enumerate(
+            zip(
+                outputs["mm_embedding_request_indices"],
+                outputs["mm_embeddings"],
+                outputs["mm_embedding_lengths"],
+                strict=True,
+            )
+        ):
+            py_result = requests[request_index].py_result
+            py_result.append_mm_embeddings(
+                embeddings, lengths, None if metadata is None else metadata[result]
+            )
+            if mrope_position_ids is not None and mrope_position_deltas is not None:
+                py_result.set_mrope_position(
+                    mrope_position_ids[result], mrope_position_deltas[result]
+                )
+
+    def retire(self, requests: list[LlmRequest]) -> None:
+        for request in requests:
+            request.py_result.release_exports()
+
+
+class ScheduledEncoderExecutor:
+    """Serve scheduled requests to a non-generation model: queue, admission, batching, one forward.
+
+    Each request runs whole in one forward and completes with it, so there is no
+    sampler, KV cache or generation scheduler. Rank 0 receives requests and publishes
+    responses; every rank runs the same batches. The loop only launches: up to two
+    forwards are in flight, so the next batch is prepared and launched while the previous
+    one runs, and a completion thread publishes each batch as soon as its forward finishes.
+    A forward that fails on the device after its launch is not recoverable and ends the
+    loop like any other crash. Requests wait in the queue that ``scheduler_config``'s
+    waiting-queue policy selects. Settings that only tune generation are ignored: the overlap
+    scheduler, chunked prefill, guided decoding, the rest of ``scheduler_config`` and the
+    iteration-based batch waits. Iteration statistics and KV cache events
+    are always empty. With ``print_iter_log`` rank 0 logs one line per batch: its requests
+    and prompt tokens, the requests still waiting when it launched, the host time from
+    taking the batch to publishing it, and the GPU time of the forward.
+
+    A pooling model's runner pairs with ``PoolingCompletion``, a multimodal encoder's
+    with ``MultimodalEmbeddingCompletion``.
+    """
+
+    is_generation_model = False
+    kv_cache_transceiver = None
+
+    def __init__(
+        self,
+        runner: ScheduledModelRunner,
+        *,
+        completion: PoolingCompletion | MultimodalEmbeddingCompletion,
+        model_loader: ModelLoader,
+        llm_args: TorchLlmArgs,
+        mapping: Mapping,
+        dist: Distributed,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+    ) -> None:
+        """Assemble the executor around a built runner and warm the runner up on every rank.
+
+        Args:
+            runner: The model's runner; every forward goes through its scheduled entry point.
+            completion: How a forward's outputs complete its requests; it fits the runner.
+                ``store`` attaches a forward's results before their responses are created;
+                ``retire`` withdraws them from requests that finish without their result.
+            model_loader: The loader that loaded the model, cleaned up at shutdown.
+            llm_args: The resolved arguments; the executor reads its timeouts, garbage
+                collection threshold and metrics switches.
+            mapping: The parallel mapping, for the warmup's rank-crash handling.
+            dist: The communicator that broadcasts requests from rank 0.
+            max_batch_size: The most sequences one forward takes.
+            max_num_tokens: The most prompt tokens one forward takes.
+            max_seq_len: The longest prompt a request may have.
+        """
+        self._runner = runner
+        self._completion = completion
+        self._model_loader = model_loader
+        self.dist = dist
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        self.max_seq_len = max_seq_len
+        self.metrics: dict[str, float | dict[str, float]] = {}
+
+        self.is_shutdown = False
+        self.shutdown_event = threading.Event()
+        self._event_loop_error: BaseException | None = None
+        self._event_loop_error_delivered = threading.Event()
+        self._loop_completed = False
+        self._worker_thread: threading.Thread | None = None
+        self._gc_gen0_threshold = llm_args.garbage_collection_gen0_threshold
+
+        self._hang_detector = HangDetector(on_detected=self._on_hang_detected)
+        scheduler_config = llm_args.scheduler_config
+        # The wait cap ages requests by rank 0's arrival stamps on rank 0's clock, so that
+        # every rank pops the same order.
+        aging = scheduler_config.waiting_queue_max_wait_s is not None
+        self._request_queue = ExecutorRequestQueue(
+            dist,
+            max_batch_size,
+            enable_iter_perf_stats=False,
+            batch_wait_timeout_ms=llm_args.batch_wait_timeout_ms,
+            stamp_admission_times=aging,
+        )
+        self._broadcaster = RequestBroadcaster(dist, self._hang_detector, sync_clock=aging)
+        self._waiting_queue = create_waiting_queue(
+            scheduler_config.waiting_queue_policy,
+            max_wait_s=scheduler_config.waiting_queue_max_wait_s,
+        )
+        self._error_budget = ErrorBudget()
+        self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
+        self._iter_log = llm_args.print_iter_log and dist.rank == 0
+        self._slots = threading.BoundedSemaphore(_MAX_IN_FLIGHT)
+        self._in_flight: queue.SimpleQueue[_InFlight | None] = queue.SimpleQueue()
+        self._last_staged: torch.cuda.Event | None = None
+        self._completion_thread: threading.Thread | None = None
+        self._completion_error: BaseException | None = None
+        # Ids of the launched, unpublished requests, and of those among them cancelled since;
+        # and ids whose cancellation was sent but not yet taken by the loop.
+        self._cancel_lock = threading.Lock()
+        self._launched_ids: set[int] = set()
+        self._cancelled_after_launch: set[int] = set()
+        self._cancel_sent: set[int] = set()
+        self._response_channel = ResponseChannel()
+        self._iter_counter = 0
+        self._profiler = ProfileController(
+            rank=dist.rank,
+            current_iteration=lambda: self._iter_counter,
+            is_warmup=lambda: False,
+            broadcast_start=self._request_queue.enqueue_profile_start_request,
+            broadcast_stop=self._request_queue.enqueue_profile_stop_request,
+            pause_hang_detector=self._hang_detector.pause,
+        )
+
+        if llm_args.enable_iter_perf_stats:
+            logger.warning(
+                "enable_iter_perf_stats is ignored for non-generation models: they report "
+                "no iteration statistics."
+            )
+
+        self._device_id = torch.cuda.current_device()
+        self._execution_stream = torch.cuda.Stream()
+        self._warmup(mapping)
+
+    @classmethod
+    def create(
+        cls,
+        llm_args: TorchLlmArgs,
+        *,
+        model_path: str,
+        checkpoint_loader: BaseCheckpointLoader,
+        mapping: Mapping,
+        dist: Distributed,
+    ) -> ScheduledEncoderExecutor:
+        """Load and compile the model, build its runner, and warm it up on every rank.
+
+        With ``mm_encoder_only`` the checkpoint's vision encoder is built and rank 0 exports
+        its embeddings; otherwise the checkpoint's pooling model is built.
+
+        Args:
+            llm_args: The arguments; scheduled-encoder constraints are applied to them first.
+            model_path: The checkpoint directory.
+            checkpoint_loader: The loader for the checkpoint's format.
+            mapping: The parallel mapping of this rank.
+            dist: The communicator across the model's ranks.
+
+        Returns:
+            The executor, warmed up; its loop starts with ``start_worker``.
+        """
+        llm_args = resolve_scheduled_encoder_args(llm_args)
+        if llm_args.mm_encoder_only:
+            build = build_mm_encoder_runner
+            # Attention DP is rejected, so rank 0 alone answers the frontend.
+            completion = MultimodalEmbeddingCompletion(exports=dist.rank == 0)
+        else:
+            build = build_encoder_runner
+            completion = PoolingCompletion()
+        with build(
+            llm_args,
+            model_path=model_path,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        ) as built:
+            if built.model_config.is_generation:
+                raise RuntimeError(
+                    "The checkpoint holds a generation model; it runs on PyExecutor."
+                )
+            return cls(
+                built.runner,
+                completion=completion,
+                model_loader=built.model_loader,
+                llm_args=llm_args,
+                mapping=mapping,
+                dist=dist,
+                max_batch_size=built.max_batch_size,
+                max_num_tokens=built.max_num_tokens,
+                max_seq_len=built.max_seq_len,
+            )
+
+    @property
+    def model_loader(self) -> ModelLoader:
+        """The loader that loaded the model; the worker reports its load metrics at startup."""
+        return self._model_loader
+
+    def _warmup(self, mapping: Mapping) -> None:
+        self.dist.barrier()
+        set_moe_comm_warmup(True)
+        try:
+            self._execution_stream.wait_stream(torch.cuda.current_stream())
+            with (
+                torch.cuda.stream(self._execution_stream),
+                distributed_warmup_guard(self.dist, mapping),
+            ):
+                self._runner.warmup()
+            torch.cuda.current_stream().wait_stream(self._execution_stream)
+        finally:
+            set_moe_comm_warmup(False)
+
+    def _on_hang_detected(self) -> None:
+        try:
+            logger.error(
+                f"Hang detected on rank {self.dist.rank} in ScheduledEncoderExecutor; "
+                "hard-killing and propagating to peer ranks."
+            )
+        finally:
+            propagate_hard_kill()
+
+    # The members the worker drives.
+
+    def enqueue_request(
+        self, request: ExecutorRequest, result_wait_queue: ActorHandle | None = None
+    ) -> int:
+        """Queue a request for admission and batching.
+
+        Args:
+            request: The request.
+            result_wait_queue: A Ray result queue that receives the request's responses.
+
+        Returns:
+            The request id the executor answers under.
+        """
+        request_id = self._request_queue.enqueue_request(request)
+        if result_wait_queue is not None:
+            self._response_channel.register([request_id], result_wait_queue)
+        return request_id
+
+    def await_responses(
+        self,
+        id: list[int] | int | None = None,
+        timeout: datetime.timedelta | None = None,
+    ) -> list[list[LlmResponse]] | list[LlmResponse]:
+        """Wait for responses, as ``PyExecutor.await_responses`` does.
+
+        Args:
+            id: None for any request's responses, one request id, or a list of ids.
+            timeout: How long to wait; None waits until a response arrives or shutdown.
+
+        Returns:
+            Every ready response for None; that request's responses for an id;
+            one list per id for a list. Empty on timeout.
+
+        Raises:
+            RuntimeError: The loop ended before a requested id had a response.
+        """
+        timeout = timeout.total_seconds() if timeout is not None else None
+        if id is None:
+            return self._response_channel.await_any(timeout, is_shutdown=lambda: self.is_shutdown)
+        if isinstance(id, int):
+            return self._await_single(id, timeout)
+        return [self._await_single(request_id, timeout) for request_id in id]
+
+    def _await_single(self, request_id: int, timeout: float | None) -> list[LlmResponse]:
+        return self._response_channel.await_single(
+            request_id,
+            timeout,
+            is_shutdown=lambda: self.is_shutdown,
+            read_error=lambda: self._event_loop_error,
+            mark_error_delivered=self._event_loop_error_delivered.set,
+        )
+
+    def cancel_request(self, id: int) -> None:
+        """Cancel a request; it finishes as cancelled unless its batch's completion was settled.
+
+        The completion thread settles a batch in ``_cancel_launched``, just before publishing it.
+
+        Args:
+            id: The request id.
+        """
+        # A launched batch may complete before the loop takes the queued cancellation;
+        # rank 0, which publishes, checks this record then.
+        with self._cancel_lock:
+            self._cancel_sent.add(id)
+        self._request_queue.enqueue_cancel_request(id)
+
+    def start_profile(
+        self,
+        output_dir: str | None = None,
+        num_steps: int | None = None,
+        start_step: int = 0,
+        activities: list[str] | None = None,
+    ) -> None:
+        """Profile a window of loop iterations on every rank; see ``ProfileController.start_profile``."""
+        self._profiler.start_profile(
+            output_dir=output_dir,
+            num_steps=num_steps,
+            start_step=start_step,
+            activities=activities,
+        )
+
+    def stop_profile(self) -> None:
+        """Stop the profile window at the next loop iteration and wait for its trace."""
+        self._profiler.stop_profile()
+
+    def can_enqueue_requests(self) -> bool:
+        """Whether the request queue still accepts requests."""
+        return self._request_queue.can_enqueue_request()
+
+    def get_latest_iteration_stats(self) -> list:
+        """Iteration statistics, which this executor does not report."""
+        return []
+
+    def get_latest_kv_cache_events(self) -> list:
+        """KV cache events; there is no KV cache."""
+        return []
+
+    def start_worker(self) -> None:
+        """Start the loop thread; later calls do nothing."""
+        if self._worker_thread is None:
+            # Loading the model can start threads after the worker set its affinity;
+            # an explicit opt-out stays one.
+            if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None, "1"):
+                _reapply_current_thread_affinity_to_all_threads()
+            self._worker_thread = threading.Thread(
+                target=self._loop_wrapper, daemon=True, name="scheduled_encoder_executor"
+            )
+            self._worker_thread.start()
+
+    def wait_shutdown(self) -> None:
+        """Block until the loop has stopped; non-root ranks wait here."""
+        self.shutdown_event.wait()
+
+    def shutdown(self) -> None:
+        """Let queued requests finish, stop the loop, then release the loader, the graphs and the model."""
+        try:
+            if self._worker_thread is not None:
+                self._request_queue.enqueue_shutdown_request()
+                self.shutdown_event.wait()
+                if self._hang_detector.detected():
+                    logger.error("Hang detected, shutting down immediately.")
+                    return
+                self._worker_thread.join()
+            self._profiler.cleanup()
+            self._model_loader.cleanup()
+            self._runner.release_graphs()
+            del self._runner, self._model_loader
+            release_gc()
+        finally:
+            self._release_memory_monitor()
+
+    def _release_memory_monitor(self) -> None:
+        """Hand the memory monitor back, so the next executor in this process can be monitored.
+
+        ``create_py_executor`` sets the token after construction; releasing
+        it twice is harmless.
+        """
+        token = getattr(self, "_memory_monitor_token", None)
+        if token is not None:
+            monitor_providers.end_executor(token)
+
+    # The loop.
+
+    def _loop_wrapper(self) -> None:
+        crashed = False
+        try:
+            with (
+                host_profiler_context(enable=bool(os.environ.get("TLLM_LINE_PROFILER_PATH"))),
+                customized_gc_thresholds(self._gc_gen0_threshold),
+            ):
+                self._loop()
+        except Exception as error:
+            # A raise after the loop's own exit is teardown; peers are only
+            # stranded by one before it.
+            crashed = not self._loop_completed
+            logger.error(f"Error in event loop: {error}")
+            logger.error(traceback.format_exc())
+            self._event_loop_error = error
+            raise
+        finally:
+            # Armed before cleanup, which can block on a wedged device.
+            watchdog = (
+                start_rank_crash_kill_watchdog(
+                    self.dist.world_size, error_delivered=self._event_loop_error_delivered
+                )
+                if crashed
+                else None
+            )
+            try:
+                with self._response_channel.response_cv:
+                    self.is_shutdown = True
+                    self._response_channel.response_cv.notify_all()
+                self.shutdown_event.set()
+            finally:
+                if crashed:
+                    deadline = None
+                    if watchdog is not None:
+                        watchdog.cancel()
+                        deadline = watchdog.deadline
+                    hard_kill_on_rank_crash(
+                        self.dist.world_size,
+                        deadline=deadline,
+                        error_delivered=self._event_loop_error_delivered,
+                    )
+
+    def _loop(self) -> None:
+        torch.cuda.set_device(self._device_id)
+        # Create the context before any MPI call.
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
+        self._completion_thread = threading.Thread(
+            target=self._completion_loop, daemon=True, name="scheduled_encoder_completion"
+        )
+        self._completion_thread.start()
+        try:
+            with self._profiler.iterations(), self._hang_detector:
+                while True:
+                    self._hang_detector.checkpoint()
+                    self._profiler.end_iteration()
+                    self._profiler.begin_iteration()
+                    with nvtx_range("iteration"):
+                        self._receive()
+                        self._raise_completion_error()
+                        if self.is_shutdown and not self._waiting_queue:
+                            self._wait_in_flight()
+                            self._raise_completion_error()
+                            self._loop_completed = True
+                            break
+                        count = fit_batch(
+                            self._waiting_queue.peek_requests(self.max_batch_size),
+                            max_batch_size=self.max_batch_size,
+                            max_num_tokens=self.max_num_tokens,
+                        )
+                        if count:
+                            items = [self._waiting_queue.pop_request() for _ in range(count)]
+                            self._waiting_queue.mark_admitted(items)
+                            self._run(items)
+                        # Every pass counts, idle ones too, so a stop requested while idle fires.
+                        self._iter_counter += 1
+        finally:
+            self._in_flight.put(None)
+            # After a crash the thread may sit in a wedged device's wait, so it is not joined.
+            if self._loop_completed:
+                self._completion_thread.join()
+
+    def _wait_in_flight(self) -> None:
+        """Block until every launched batch has been published."""
+        for _ in range(_MAX_IN_FLIGHT):
+            self._slots.acquire()
+
+    def _raise_completion_error(self) -> None:
+        if self._completion_error is not None:
+            raise RuntimeError(
+                f"A forward failed on the device: {self._completion_error}"
+            ) from self._completion_error
+
+    @nvtx_range("_receive")
+    def _receive(self) -> None:
+        """Fetch on rank 0, broadcast, then apply shutdown, cancellations and admission."""
+        # Every rank computes the same value: it picks the broadcast transport.
+        idle = not self._waiting_queue and not self.is_shutdown
+        items = []
+        if self.dist.rank == 0:
+            # Once the shutdown signal is consumed nothing would wake a blocking fetch.
+            timeout = None if idle else datetime.timedelta(0)
+            with self._hang_detector.pause():
+                items = self._request_queue.get_from_request_queue(timeout)
+        items = self._broadcaster.broadcast(items, prefer_cpu=idle)
+        if self._broadcaster.sync_clock:
+            self._waiting_queue.set_now(self._broadcaster.rank0_now)
+
+        canceled_ids = set()
+        rejected = []
+        for item in items:
+            if item.is_shutdown_request:
+                self.is_shutdown = True
+                break
+            if item.is_canceled_request:
+                canceled_ids.add(item.id)
+            elif item.is_profile_start_request:
+                self._profiler.apply_start_config(item.profile_config or {})
+            elif item.is_profile_stop_request:
+                self._profiler.apply_stop_config()
+            elif not item.is_normal_request:
+                raise RuntimeError(f"Unsupported request queue item with id {item.id}.")
+            else:
+                try:
+                    self._check_admissible(item)
+                except ValueError as error:
+                    rejected.append((item, str(error)))
+                else:
+                    self._waiting_queue.add_request(item)
+
+        if self.dist.rank == 0:
+            self._respond_with_errors(rejected)
+        if canceled_ids:
+            with self._cancel_lock:
+                self._cancelled_after_launch.update(canceled_ids & self._launched_ids)
+                self._cancel_sent -= canceled_ids
+            self._cancel_waiting(canceled_ids)
+
+    @nvtx_range("_check_admissible")
+    def _check_admissible(self, item: RequestQueueItem) -> None:
+        """Raise ValueError if one forward cannot run this request."""
+        request = item.request
+        if not self._completion.accepts_multimodal_inputs and (
+            getattr(request, "py_multimodal_data", None) is not None
+            or request.mrope_config is not None
+        ):
+            raise ValueError(_MULTIMODAL_INPUT_ERROR)
+        check_prompt_capacity(request.num_input_tokens, min(self.max_seq_len, self.max_num_tokens))
+        rows, tokens = prompt_cost(item)
+        if rows > self.max_batch_size or tokens > self.max_num_tokens:
+            raise ValueError(
+                f"The request runs {rows} sequences of {request.num_input_tokens} tokens in "
+                f"one forward, which exceeds max_batch_size ({self.max_batch_size}) or "
+                f"max_num_tokens ({self.max_num_tokens})."
+            )
+
+    def _cancel_waiting(self, request_ids: set[int]) -> None:
+        """Finish queued requests as cancelled; ids no longer queued are launched or completed."""
+        items = [item for item in self._waiting_queue if item.id in request_ids]
+        if not items:
+            return
+        self._waiting_queue.remove_by_ids({item.id for item in items})
+        if self.dist.rank != 0:
+            return
+        responses = []
+        for item in items:
+            for request in merge_requests_to_llm_requests(
+                [item], exclude_last_generation_logits=False
+            ):
+                request.finish_by_reason(FinishReason.CANCELLED)
+                response = request.create_response()
+                if response is not None:
+                    responses.append((item.id, response))
+        self._publish(responses, (item.id for item in items))
+
+    @nvtx_range("_run")
+    def _run(self, items: list[RequestQueueItem]) -> None:
+        """Launch one forward over ``items``; the completion thread publishes its responses."""
+        host_start = time.monotonic()
+        requests = merge_requests_to_llm_requests(items, exclude_last_generation_logits=False)
+        for request in requests:
+            if request.return_perf_metrics:
+                request.set_first_scheduled_time()
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = requests
+        staged = torch.cuda.Event()
+        inputs = ScheduledInputs(
+            batch=batch,
+            gather_context_logits=any(request.py_return_context_logits for request in requests),
+            inputs_staged=staged,
+        )
+        gpu_forward_start, gpu_forward_end, _ = self._perf_manager.create_timing_events()
+        forward_events = (
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            if self._iter_log
+            else None
+        )
+        with nvtx_range("wait_in_flight"):
+            # The runner reuses its host staging memory, and only two forwards may be in flight.
+            if self._last_staged is not None:
+                self._last_staged.synchronize()
+            self._slots.acquire()
+        self._last_staged = staged
+        try:
+            with torch.cuda.stream(self._execution_stream):
+                with self._perf_manager.record_perf_events(
+                    gpu_forward_start, gpu_forward_end
+                ) as timing:
+                    if forward_events is not None:
+                        forward_events[0].record()
+                    outputs = self._runner.forward(inputs, resource_manager=None)
+                    if forward_events is not None:
+                        forward_events[1].record()
+                if self._perf_manager.enabled:
+                    # There is no sampling: report a zero-length sample phase.
+                    self._perf_manager.save_timing_to_requests(
+                        requests,
+                        gpu_forward_start,
+                        gpu_forward_end,
+                        None,
+                        timing.start_time,
+                        timing.end_time,
+                        timing.end_time,
+                        timing.end_time,
+                    )
+                self._complete(requests, outputs)
+                done = torch.cuda.Event()
+                done.record()
+        except Exception as error:
+            self._slots.release()
+            self._completion.retire(requests)
+            self._fail(requests, error)
+            return
+        with self._cancel_lock:
+            self._launched_ids.update(item.id for item in items)
+        self._in_flight.put(
+            _InFlight(
+                requests=requests,
+                done=done,
+                iteration=self._iter_counter,
+                host_start=host_start,
+                forward_events=forward_events,
+                num_tokens=sum(prompt_cost(item)[1] for item in items) if self._iter_log else 0,
+                num_waiting=len(self._waiting_queue),
+            )
+        )
+
+    def _completion_loop(self) -> None:
+        """Publish each launched batch once its forward has finished, in launch order."""
+        torch.cuda.set_device(self._device_id)
+        while (flight := self._in_flight.get()) is not None:
+            try:
+                with nvtx_range("synchronize"):
+                    # Responses carry device tensors that other threads and processes read.
+                    flight.done.synchronize()
+                self._cancel_launched(flight)
+                if self.dist.rank == 0:
+                    self._publish(
+                        self._create_responses(flight.requests),
+                        (request.py_request_id for request in flight.requests),
+                    )
+                if self._iter_log:
+                    self._log_iteration(flight)
+            except Exception as error:
+                traceback.print_exc()
+                logger.error(f"A forward failed on the device: {error}")
+                if self._completion_error is None:
+                    self._completion_error = error
+                    # Wakes a loop that is waiting for requests so that it raises.
+                    self._request_queue.enqueue_shutdown_request()
+            finally:
+                self._slots.release()
+
+    def _cancel_launched(self, flight: _InFlight) -> None:
+        """Finish the batch's requests cancelled since its launch as cancelled, without results.
+
+        A cancelled request's exports are retired; a cancellation that arrives after this
+        point finds the request completed.
+        """
+        request_ids = {request.py_request_id for request in flight.requests if not request.is_child}
+        with self._cancel_lock:
+            self._launched_ids -= request_ids
+            cancelled_ids = (self._cancelled_after_launch | self._cancel_sent) & request_ids
+            self._cancelled_after_launch -= cancelled_ids
+        if not cancelled_ids:
+            return
+        cancelled = [
+            request
+            for request in flight.requests
+            if (request.parent_request_id if request.is_child else request.py_request_id)
+            in cancelled_ids
+        ]
+        self._completion.retire(cancelled)
+        for request in cancelled:
+            # Replaces the reason LENGTH set by _complete.
+            request.set_finished_reason(FinishReason.CANCELLED, 0)
+
+    def _log_iteration(self, flight: _InFlight) -> None:
+        """Log one batch: its size, the host time until it was published and the GPU time of its forward."""
+        host_ms = (time.monotonic() - flight.host_start) * 1000
+        device_ms = flight.forward_events[0].elapsed_time(flight.forward_events[1])
+        logger.info(
+            f"iter = {flight.iteration}, "
+            f"num_scheduled_requests = {len(flight.requests)}, "
+            f"num_tokens = {flight.num_tokens}, "
+            f"num_waiting = {flight.num_waiting}, "
+            f"host_step_time = {host_ms}ms, "
+            f"device_step_time = {device_ms}ms"
+        )
+
+    @nvtx_range("_complete")
+    def _complete(self, requests: list[LlmRequest], outputs: dict[str, Any]) -> None:
+        """Store the forward's results on its requests and finish each with reason LENGTH."""
+        self._completion.store(requests, outputs)
+        batch_token_time = self._perf_manager.get_timestamp()
+        gpu_times_cache = {}
+        for request in requests:
+            # The public result reports a finished request with no tokens and reason LENGTH.
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.set_finished_reason(FinishReason.LENGTH, 0)
+            self._perf_manager.append_step_metrics(
+                request, self._iter_counter, batch_token_time=batch_token_time
+            )
+            if request.return_perf_metrics:
+                self._perf_manager.compute_batch_gpu_times(
+                    [request], gpu_times_cache=gpu_times_cache
+                )
+
+    @staticmethod
+    def _create_responses(requests: list[LlmRequest]) -> list[tuple[int, LlmResponse]]:
+        """The batch's responses, created once each request's finish reason is settled.
+
+        Creating a response marks its sequence final, so a second one for a sequence could
+        end the request before its other sequences arrive.
+        """
+        responses = []
+        for request in requests:
+            response = request.create_response()
+            if response is not None:
+                responses.append((request.py_request_id, response))
+        return responses
+
+    @nvtx_range("_fail")
+    def _fail(self, requests: list[LlmRequest], error: Exception) -> None:
+        """Fail the batch; a fatal error also fails everything queued and shuts the loop down.
+
+        With several ranks, a fatal error then raises out of the loop: the loop's crash path
+        kills every rank, because the peers' queues still hold work for a forward this rank
+        will never join.
+        """
+        traceback.print_exc()
+        error_msg = str(error) or "error"
+        logger.error(f"Encountered an error in forward function: {error_msg}")
+        # Child requests share their parent's client, which takes one error.
+        responses = [
+            (
+                request.py_request_id,
+                LlmResponse(
+                    request_id=request.py_request_id,
+                    error_msg=error_msg,
+                    client_id=request.py_client_id,
+                ),
+            )
+            for request in requests
+            if not request.is_child
+        ]
+        released = [request.py_request_id for request in requests]
+        fatal = self._error_budget.consume(error_msg)
+        if fatal:
+            logger.error(f"Fatal error detected, initiating shutdown: {error_msg}")
+            self.is_shutdown = True
+            drained = [
+                item
+                for item in drain_queued_items(self._waiting_queue, self._request_queue)
+                if item.request is not None
+            ]
+            responses.extend(
+                (
+                    item.id,
+                    LlmResponse(
+                        request_id=item.id,
+                        error_msg=error_msg,
+                        client_id=item.request.client_id,
+                    ),
+                )
+                for item in drained
+            )
+            released.extend(item.id for item in drained)
+            self._request_queue.enqueue_shutdown_request()
+        if self.dist.rank == 0:
+            self._publish(responses, released)
+        if fatal and self.dist.world_size > 1:
+            raise RuntimeError(f"Fatal error: {error_msg}") from error
+
+    def _respond_with_errors(self, rejected: list[tuple[RequestQueueItem, str]]) -> None:
+        responses = [
+            (
+                item.id,
+                LlmResponse(request_id=item.id, error_msg=error, client_id=item.request.client_id),
+            )
+            for item, error in rejected
+        ]
+        self._publish(responses, (item.id for item, _ in rejected))
+
+    @nvtx_range("_publish")
+    def _publish(
+        self, responses: list[tuple[int, LlmResponse]], finished_ids: Iterable[int]
+    ) -> None:
+        if responses:
+            self._response_channel.publish(responses)
+        for request_id in finished_ids:
+            self._response_channel.release(request_id)

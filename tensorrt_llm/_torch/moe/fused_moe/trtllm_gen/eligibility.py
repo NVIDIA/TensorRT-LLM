@@ -96,14 +96,14 @@ def check_trtllm_gen_capabilities(
     return None
 
 
-def check_flashinfer_shard_alignment(
+def check_intermediate_shard_alignment(
     cls: type,
     p: MoEProblem,
     d: MoEDeployment,
     *,
     weight_alignment: int,
 ) -> MoEEligibility | None:
-    """Per-rank intermediate-shard alignment the FlashInfer bf16 kernels need.
+    """Per-rank intermediate-shard alignment, for the leaves whose weights need it.
 
     ``None`` admits. An absent ``intermediate_size`` on ``p`` means the caller
     did not say, so the gate abstains rather than rejects.

@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -49,7 +50,6 @@ _INDEXER_LOGITS_DTYPE = torch.float32
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
@@ -100,9 +100,8 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
-    # Mixed-precision high page tables; -1 = not in the high pool.
-    mixed_precision_high_block_table = None
-    draft_mixed_precision_high_block_table = None
+    # Sparse attention redirects the selected rows of the mixed-precision high pool itself.
+    mixed_precision_block_offsets_redirect: ClassVar[bool] = False
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -194,6 +193,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Query tokens per generation request for a uniform runtime tier. Zero
     # falls back to the static draft-token ceiling.
     runtime_tokens_per_gen_step: int = 0
+
+    @property
+    def has_mixed_precision_high_rows(self) -> bool:
+        """Whether this batch reads and writes the selected rows of a mixed-precision high layer
+        through the high page table (the sparse backends' way; dense attention redirects block
+        offsets instead)."""
+        return self.mixed_precision_high_block_table is not None
 
     @property
     def is_ragged_verify(self) -> bool:
@@ -305,6 +311,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_struct = None
         self._group_remap_struct_kv_id = 0
         self._group_remap_batched = {}
+        self._skipped_topk_groups: dict[int, int] = {}  # leader -> exclusive end layer
         self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
         self._radix_rows_per_sequence = 1
@@ -483,35 +490,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # No staging: attention reads the gather's FP8 scratch.
         return False
 
-    @property
-    def has_mixed_precision_high_rows(self) -> bool:
-        """Whether this backend writes and reads a mixed-precision high pool."""
-        return self.mixed_precision_high_block_table is not None
-
-    def _fill_mixed_precision_high_block_table(
-        self, manager: "KVCacheManagerV2", high_layer: int, high_table: torch.Tensor
-    ) -> None:
-        """Refresh a mixed-precision high page table over its full width; the rest stay -1.
-
-        The MTP draft loop writes past this step's kv lengths, so every column a request
-        has allocated must be current.
-        """
-        table = torch.full(
-            (self.num_seqs, high_table.shape[1]), -1, dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        manager._fill_page_table(high_layer, self.request_ids, table.numpy())
-        high_table[: self.num_seqs].copy_(table, non_blocking=True)
-
-    def _fill_mixed_precision_high_block_tables(self) -> None:
-        for manager, high_table in (
-            (self.kv_cache_manager, self.mixed_precision_high_block_table),
-            (self.draft_kv_cache_manager, self.draft_mixed_precision_high_block_table),
-        ):
-            if high_table is not None:
-                # All layers share one mixed-precision high pool, so one table serves them all.
-                high_layer = next(iter(manager.mixed_precision_high_layers.values()))
-                self._fill_mixed_precision_high_block_table(manager, high_layer, high_table)
-
     def prepare(self):
         self._validate_ragged_verification()
         if self.sparse_offload_state is not None:
@@ -550,7 +528,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
-        self._fill_mixed_precision_high_block_tables()
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
@@ -574,10 +551,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # MTP layers on the draft manager use its mixed-precision high page table.
-        self.swap_for_draft(
-            "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
-        )
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.
@@ -920,7 +893,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
         )
         self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-        if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+        if (
+            self.max_draft_tokens > 0
+            and not self.use_expanded_buffers_for_mtp
+            and not self.use_cute_dsl_paged_mqa_logits
+        ):
             scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                 scheduler_context_lens.contiguous(),
                 _DG_SCHEDULE_BLOCK_KV,
@@ -1092,7 +1069,32 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self._offloads_dsa_latent():
             # Offloaded rows are dequantized into the offload state's scratch instead.
             return
+        from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 
+        if prims_ts_reads_nvfp4_mla_records(self):
+            # PrimTS reads the records in place, so generation gathers no FP8 rows. A layer
+            # that gathers nevertheless calls ensure_nvfp4_mla_generation_buffers().
+            return
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+
+    def ensure_nvfp4_mla_generation_buffers(self) -> None:
+        """Allocate the gather outputs for a layer that gathers after creation left them out.
+
+        Creation decides without the attention layers. A layer whose FMHA list lacks the PrimTS
+        record reader (skip-correction, an unsupported head count) gathers although the metadata
+        expected the records to be read in place. The first such step allocates the rows, in
+        eager execution: CUDA graph capture needs their addresses fixed beforehand.
+        """
+        if self.nvfp4_mla_fp8_scratch is not None and self.nvfp4_mla_compact_indices is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NVFP4 MLA gather buffers must be allocated during eager warmup, not under "
+                "CUDA graph capture"
+            )
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=self.is_cuda_graph)
+
+    def _allocate_nvfp4_mla_generation_buffers(self, capture_graph=False):
         # MTP verifies the current token and max_draft_tokens draft tokens for
         # every generation request. Each query row has its own TopK selection,
         # so the dequantized FP8 rows and compact offsets must cover the full
@@ -1274,23 +1276,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Mixed-precision high page table; -1 = not in the high pool.
-        if getattr(self.kv_cache_manager, "mixed_precision_high_layers", None):
-            self.mixed_precision_high_block_table = self.get_empty(
-                self.cuda_graph_buffers,
-                [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
-                cache_name="mixed_precision_high_block_table",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
-        if getattr(self.draft_kv_cache_manager, "mixed_precision_high_layers", None):
-            self.draft_mixed_precision_high_block_table = self.get_empty(
-                self.cuda_graph_buffers,
-                [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
-                cache_name="draft_mixed_precision_high_block_table",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
         if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table = self.get_empty(
                 self.cuda_graph_buffers,
@@ -1647,7 +1632,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.nvfp4_mla_fp8_scratch is not None
             and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
         ):
-            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+            # Resize what exists, whether creation or a gathering layer allocated it.
+            self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         previous_cap = int(getattr(self, "_expanded_alloc_draft_cap", -1))
         allocation_cap = max(self._draft_sizing_cap, previous_cap)
         if allocation_cap > previous_cap:
@@ -1701,6 +1687,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # retained across idle steps. Python-only -> safe under graph replay
         # (replay does not re-run this).
         self._group_remap_batched.clear()
+        self._skipped_topk_groups = {}
         self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self):
@@ -1740,6 +1727,52 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self._cached_kv_mgr_id = id(kv_cache_manager)
         self._pool_cache_valid = True
+
+    def skip_shared_topk_copy(
+        self, local_layer_idx: int, topk_shape: tuple[int, ...], *, group_remap: bool
+    ) -> bool:
+        """Record whether this leader skips publishing generation TopK for its followers.
+
+        Offload and mixed-precision readers still need the local TopK values.
+        Keep the copy until the current cache manager's group layout is built.
+        """
+        self._skipped_topk_groups.pop(local_layer_idx, None)
+        if not group_remap:
+            return False
+        struct = self._group_remap_struct
+        shared_topk_indices = self.shared_topk_indices
+        if (
+            self.in_mtp_draft_loop
+            or self.sparse_metadata_params.enable_kv_cache_offload
+            or self.has_mixed_precision_high_rows
+            or struct is None
+            or self._group_remap_struct_kv_id != id(self.kv_cache_manager)
+            or shared_topk_indices is None
+        ):
+            return False
+        leader_of = struct.get("leader_of")
+        if (
+            leader_of is None
+            or not 0 <= local_layer_idx < len(leader_of)
+            or leader_of[local_layer_idx] != local_layer_idx
+        ):
+            return False
+        if struct["group_active"].get(local_layer_idx, False) and topk_shape == (
+            self.num_tokens - self.num_ctx_tokens,
+            shared_topk_indices.shape[1],
+        ):
+            self._skipped_topk_groups[local_layer_idx] = (
+                local_layer_idx + struct["group_size"][local_layer_idx]
+            )
+            return True
+        return False
+
+    def check_shared_topk_fallback(self, local_layer_idx: int) -> None:
+        for leader, end in self._skipped_topk_groups.items():
+            if leader < local_layer_idx < end:
+                raise RuntimeError(
+                    f"DSA layer {local_layer_idx} needs local TopK, but leader {leader} skipped the copy"
+                )
 
     def _ensure_group_remap_struct(self):
         """Build (once) the static full+shared indexer group layout used by the
@@ -2353,10 +2386,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_indices_conversion(self):
         # Build req_idx_per_token for topk_indices conversion
         # Use pinned staging buffer to avoid pageable H2D memcpy
-        self.host_req_idx_per_token[: self.num_tokens] = torch.repeat_interleave(
-            torch.arange(self.num_seqs, dtype=torch.int32),
-            self.seq_lens,
-            dim=0,
+        self.host_req_idx_per_token.numpy()[: self.num_tokens] = np.repeat(
+            np.arange(self.num_seqs, dtype=np.int32), self.seq_lens.numpy()
         )
         self.req_idx_per_token[: self.num_tokens].copy_(
             self.host_req_idx_per_token[: self.num_tokens],

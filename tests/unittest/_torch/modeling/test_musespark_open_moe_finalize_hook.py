@@ -6,7 +6,8 @@
 `unfinalized_combine_fn`, so the scheduler applies the weight-first
 post-expert norm to each expert output before the top-k sum. These run on CPU
 with stub modules: the contract is the registration, the keyword signature the
-scheduler calls, and the output shape, none of which needs a device.
+scheduler calls, and the output shape, none of which needs a device. So is
+the model config the MoE creates the experts of a quant-excluded layer with.
 """
 
 from contextlib import nullcontext
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_musespark_open
 from tensorrt_llm._torch.models.modeling_musespark_open import (
     MuseSparkOpenMoE,
@@ -23,6 +25,8 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,7 +55,8 @@ def _scheduler(moe: MuseSparkOpenMoE) -> ExternalCommMoEScheduler:
     return scheduler
 
 
-def test_the_moe_registers_its_finalize_when_it_creates_the_experts(monkeypatch):
+def _capture_create_moe(monkeypatch) -> dict:
+    """The keyword arguments `MuseSparkOpenMoE` creates its experts with."""
     captured = {}
 
     def create_moe(**kwargs):
@@ -61,7 +66,12 @@ def test_the_moe_registers_its_finalize_when_it_creates_the_experts(monkeypatch)
     monkeypatch.setattr(modeling_musespark_open, "create_moe", create_moe)
     monkeypatch.setattr(modeling_musespark_open, "Linear", lambda *a, **k: torch.nn.Identity())
     monkeypatch.setattr(modeling_musespark_open, "AllReduce", lambda *a, **k: torch.nn.Identity())
-    config = SimpleNamespace(
+    return captured
+
+
+def _moe_model_config(**fields) -> ModelConfig:
+    """A ModelConfig that sets what `MuseSparkOpenMoE.__init__` reads, plus `fields`."""
+    config = dict(
         pretrained_config=SimpleNamespace(
             hidden_size=16,
             expert_hidden_size=8,
@@ -78,11 +88,92 @@ def test_the_moe_registers_its_finalize_when_it_creates_the_experts(monkeypatch)
         quant_config=None,
         allreduce_strategy=AllReduceStrategy.AUTO,
     )
-    moe = MuseSparkOpenMoE(config, layer_idx=0)
+    config.update(fields)
+    return ModelConfig(**config)
+
+
+def test_the_moe_registers_its_finalize_when_it_creates_the_experts(monkeypatch):
+    captured = _capture_create_moe(monkeypatch)
+    moe = MuseSparkOpenMoE(_moe_model_config(), layer_idx=0)
     assert captured["unfinalized_combine_fn"] == moe.finalize
     # The per-expert norm runs before the combine, so this module, not the
     # backend, reduces the partial sums.
     assert captured["reduce_results"] is False
+
+
+# The checkpoint keeps layer 0 unquantized and quantizes the others.
+_LAYER_0_EXCLUDED = QuantConfig(quant_algo=QuantAlgo.NVFP4, exclude_modules=["model.layers.0.*"])
+
+
+@pytest.mark.parametrize(
+    "moe_backend, moe_tactic",
+    [
+        pytest.param("TRTLLM", "trtllm.trtllm_gen.fused_moe.nvfp4", id="trtllm_tactic"),
+        pytest.param("MEGAMOE_CUTEDSL", "mega_moe", id="mega_moe_tactic"),
+        pytest.param("MEGAMOE_DEEPGEMM", None, id="mega_moe_literal"),
+    ],
+)
+def test_a_quant_excluded_layer_runs_bf16_without_the_tactic(monkeypatch, moe_backend, moe_tactic):
+    """A tactic pins implementations of the checkpoint's format, which the layer is not in."""
+    captured = _capture_create_moe(monkeypatch)
+    config = _moe_model_config(
+        quant_config=_LAYER_0_EXCLUDED, moe_backend=moe_backend, moe_tactic=moe_tactic
+    )
+
+    MuseSparkOpenMoE(config, layer_idx=0)
+
+    layer_config = captured["model_config"]
+    # The MegaMoE families have no BF16 implementation.
+    assert layer_config.moe_backend == "TRTLLM"
+    assert layer_config.moe_tactic is None
+    assert captured["override_quant_config"].quant_algo is None
+    assert (config.moe_backend, config.moe_tactic) == (moe_backend, moe_tactic)
+
+
+@pytest.mark.parametrize(
+    "moe_tactic, expected",
+    [
+        pytest.param("mega_moe", ["[0, 2]", "'mega_moe'", "moe_backend=TRTLLM"], id="tactic"),
+        pytest.param(None, None, id="no_tactic"),
+    ],
+)
+def test_one_warning_lists_the_quant_excluded_layers_a_tactic_skips(
+    monkeypatch, moe_tactic, expected
+):
+    warnings = []
+    monkeypatch.setattr(
+        modeling_musespark_open.logger,
+        "warning_once",
+        lambda message, key: warnings.append(message),
+    )
+    config = _moe_model_config(
+        pretrained_config=SimpleNamespace(num_hidden_layers=4),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, exclude_modules=["model.layers.0.*", "model.layers.2.*"]
+        ),
+        moe_backend="MEGAMOE_CUTEDSL",
+        moe_tactic=moe_tactic,
+    )
+
+    modeling_musespark_open._warn_tactic_skips_quant_excluded_layers(config)
+
+    if expected is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert all(part in warnings[0] for part in expected), warnings[0]
+
+
+def test_a_quantized_layer_keeps_the_tactic(monkeypatch):
+    captured = _capture_create_moe(monkeypatch)
+    config = _moe_model_config(
+        quant_config=_LAYER_0_EXCLUDED, moe_backend="MEGAMOE_CUTEDSL", moe_tactic="mega_moe"
+    )
+
+    MuseSparkOpenMoE(config, layer_idx=1)
+
+    assert captured["model_config"] is config
+    assert captured["override_quant_config"] is None
 
 
 def test_the_scheduler_call_site_reaches_the_finalize():

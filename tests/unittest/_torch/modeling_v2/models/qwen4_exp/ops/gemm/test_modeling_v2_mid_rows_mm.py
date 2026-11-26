@@ -7,8 +7,8 @@ torch's e4m3 cast; strided activation rows; CUDA-graph replay with new activatio
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.mid_rows_mm import (  # noqa: E501
     AMAX_FLOOR,
     E4M3_MAX,
     MidWeight,

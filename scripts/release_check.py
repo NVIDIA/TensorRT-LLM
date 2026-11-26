@@ -16,6 +16,7 @@
 
 import argparse
 import re
+import shlex
 import subprocess as sp
 import sys
 import time
@@ -205,14 +206,16 @@ def main():
         print("=== No arguments specified, running pre-commit on ALL files ===")
 
     # Install relevant packages from requirements-dev.txt
-    deps = ["pre-commit", "bandit", "pyrefly"]
+    deps = ["pre-commit", "bandit", "pyrefly", "pytest", "tomli"]
     with open("requirements-dev.txt") as f:
         reqs = f.readlines()
     reqs_to_install = [
-        selected_line for dep in deps
-        for selected_line in [line.strip() for line in reqs if dep in line]
+        selected_line for dep in deps for selected_line in [
+            line.strip() for line in reqs
+            if re.match(rf"^{re.escape(dep)}(?:\[|[<>=!~;\s]|$)", line)
+        ]
     ]
-    run_cmd(f"pip3 install {' '.join(reqs_to_install)}")
+    run_cmd(shlex.join(["python3", "-m", "pip", "install", *reqs_to_install]))
 
     # Install pre-commit hooks
     run_cmd("pre-commit install")

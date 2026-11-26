@@ -26,7 +26,7 @@ from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_single
 from .....quant_def import QuantKind
 from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase
-from ...custom_mix_cga_helpers import (
+from ....blackwell.custom_mix_cga_helpers import (
     PipelineTmaUmmaMixedCga,
     TmaAtomOrPair,
     bind_executable_tma_load_fields,
@@ -725,7 +725,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
                 partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
-                mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
+                mma_tile_m = kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 
@@ -783,7 +783,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 partitioned_smem_sfa = cute.filter_zeros(partitioned_smem_sfa)
                 partitioned_global_sfa = cute.filter_zeros(partitioned_global_sfa)
 
-                mma_tile_m = work_tile.tile_m_idx // self.mma_cta_count
+                mma_tile_m = kernel_extension.local_tile_m(work_tile) // self.mma_cta_count
                 global_a_slice = partitioned_global_a[(None, mma_tile_m, None, 0)]
                 global_sfa_slice = partitioned_global_sfa[(None, mma_tile_m, None, 0)]
 

@@ -11,6 +11,8 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import _fused_q_rope_specs
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Mqa:
     def __init__(self):

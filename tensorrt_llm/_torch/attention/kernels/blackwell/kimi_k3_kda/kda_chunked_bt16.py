@@ -8713,8 +8713,10 @@ def kernel_chain_dv2(
     u_input_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
+    # Two slots: warp 12 commits stateq_done before its wait, so one slot can
+    # complete twice before warp 12 polls it.
     update_ready_mbar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
+        cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
     shared_acc_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
@@ -8823,7 +8825,8 @@ def kernel_chain_dv2(
                 prims.mbarrier_init(stateq_done_mbar.subview(stage), 1)
             # CG1 fuses the right-half pack/scale while idle CG0 warps 4-7
             # fuse the left half. Both groups must finish before delta.
-            prims.mbarrier_init(update_ready_mbar, 8)
+            for stage in cutlass.range_constexpr(2):
+                prims.mbarrier_init(update_ready_mbar.subview(stage), 8)
             for stage in cutlass.range_constexpr(K2_QSTATE_STAGE_COUNT):
                 prims.mbarrier_init(qstate_acc_ready_mbar.subview(stage), 1)
             prims.mbarrier_init(final_state_stored_mbar, 8)
@@ -8921,7 +8924,6 @@ def kernel_chain_dv2(
     elif warp_idx == ROLES.super_mma:
         tmem_raw_addr = tmem_ptr_i32.load()
         si_phase12 = cutlass.Int32(0)
-        upd_phase12 = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             qstate_stage = chunk % K2_QSTATE_STAGE_COUNT
@@ -8958,7 +8960,7 @@ def kernel_chain_dv2(
                 True,
                 DV_HALF,
             )
-            upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
             tcgen05_chain_issue_qkv_mma(
@@ -8976,7 +8978,6 @@ def kernel_chain_dv2(
         tmem_raw_addr = tmem_ptr_i32.load()
         si_l_phase = cutlass.Int32(0)
         si_phase = cutlass.Int32(0)
-        upd_phase = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             raw_phase = (chunk // K2_RAW_STAGE_COUNT) % 2
@@ -9018,7 +9019,7 @@ def kernel_chain_dv2(
             )
 
             xpack_col = tcgen05_shared_input_tmem_col_offset(acc_stage)
-            upd_phase = update_ready_wait(update_ready_mbar, upd_phase)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_chain_issue_delta_half_mma(
                 w_stage_smem, tmem_raw_addr, xpack_col, input_dtype, 0
@@ -9153,7 +9154,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(0))
             if cutlass.const_expr(state_ckpt is not None):
                 # Peeled chunk 0's checkpoint (stride 1 only).
                 checkpoint_due = ckpt_next == cutlass.Int32(1)
@@ -9233,7 +9234,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(chunk % 2))
             if cutlass.const_expr(state_ckpt is not None):
                 # Same contract as the engine-side checkpoint; both M=64 TMEM
                 # halves wait their own k_restore parity slot (the same wait
@@ -9340,7 +9341,7 @@ def kernel_chain_dv2(
                     cutlass.Int32(0),
                 )
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(0))
             for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
                 prev = chunk - cutlass.Int32(1)
                 raw_stage = chunk % K2_RAW_STAGE_COUNT
@@ -9379,7 +9380,7 @@ def kernel_chain_dv2(
                     state_input_ready_l_mbar,
                     0,
                 )
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(chunk % 2))
 
 
 @cute.jit

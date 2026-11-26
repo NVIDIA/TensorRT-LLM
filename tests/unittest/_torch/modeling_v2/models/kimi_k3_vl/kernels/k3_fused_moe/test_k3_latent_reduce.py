@@ -14,7 +14,7 @@
 # limitations under the License.
 """trtllm::k3_latent_reduce (the Kimi K3 latent all-reduce as the consumer of the push-only k3_moe), one process per
 GPU over the TP group of this run (4 on one GB200 tray, 16 on four), on an exchange shared by fabric handle, at every
-M in 1..8 and the explicit CTA splits 14 and 28 (the catalog entry's matrix runs the default split of 4 at W=4):
+M in 1..8 and the explicit CTA splits 14 and 28 (the op's matrix runs the default split of 4 at W=4):
   each rank's partial is pushed as the push-only k3_moe stores it (bf16 pairs through the multicast mapping into slot
   [rank] of the call's half, -0.0 as +0.0); the reduce must equal MNNVLAllReduce's one-shot of the partials bit for
   bit, on every rank, run to run, with one rank's perturbed partial changing the result; after every call the whole
@@ -92,10 +92,8 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        latent_op,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import latent_op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
     from tensorrt_llm.mapping import Mapping
@@ -211,9 +209,7 @@ def test_latent_exchange_refuses_unsupported_tp_size():
     of one. Its refusal of capture at a supported size is a collective agreement: the 4-rank matrix
     (tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/_k3_latent_reduce_op_matrix.py) checks it."""
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        latent_op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import latent_op
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
