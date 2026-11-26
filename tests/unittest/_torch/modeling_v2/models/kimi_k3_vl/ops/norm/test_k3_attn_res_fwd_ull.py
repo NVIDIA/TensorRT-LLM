@@ -24,8 +24,9 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="attn_res_fwd_ull.ARCHS: certified on sm_100 and sm_103",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="attn_res_fwd_ull.ARCHS: certified on sm_100, sm_103 and sm_107",
 )
 
 HIDDEN_SIZE = 7168

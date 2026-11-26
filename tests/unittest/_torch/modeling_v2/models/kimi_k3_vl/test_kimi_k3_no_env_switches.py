@@ -41,7 +41,9 @@ DEVICE_TOPOLOGY = {(Path("ops/common/k3_ull_runtime.py"), "CUDA_VISIBLE_DEVICES"
 _ROUTING = Path("routing.py")
 _SM100_ONLY = {Path("environment.py"), Path("ops/attention/flashinfer_mla_decode.py")}
 
-_READ = re.compile(r"\b(?:os\.environ|os\.getenv|getenv)\b|\.environ\b|__import__\(\s*[\"']os[\"']")
+_READ = re.compile(
+    r"\b(?:os\.environ|os\.getenv|getenv)\b|\.environ\b|__import__\(\s*[\"']os[\"']|\bfrom\s+os\s+import\b.*\benviron\b"
+)
 _LITERAL = re.compile(
     r"""(?:os\.environ\.get|os\.environ\[|os\.getenv)\(?\s*["']([A-Z0-9_]+)["']"""
 )
