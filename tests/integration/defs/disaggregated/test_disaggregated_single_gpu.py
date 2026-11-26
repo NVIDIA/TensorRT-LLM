@@ -474,8 +474,7 @@ def verify_disaggregated(model: str,
 
     with mpi_worker_pool(
             env={
-                **single_host_ucx_env(),
-                "UCX_MM_ERROR_HANDLING":
+                **single_host_ucx_env(), "UCX_MM_ERROR_HANDLING":
                 "y",
                 **({
                     "TLLM_GEN_ADMISSION_TTFT_PERCENTILE": "90"
