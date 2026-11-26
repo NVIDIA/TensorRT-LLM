@@ -6665,6 +6665,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "such as a disk write waiting for the disk I/O pool. Skipped streams go back to the pool, which grows "
         "until enough streams are idle. Process-wide: the first KV cache manager that sets a nonzero value sets "
         "it for the life of the process. Only used by KV cache manager v2.")
+    page_staging_mib: PositiveInt = Field(
+        default=64,
+        le=65536,
+        status="prototype",
+        description=
+        "Size in MiB of the pinned host buffer that KV cache blocks moving between GPU and the disk cache (or a "
+        "remote cache level) pass through. A move takes one stretch of the buffer at a time and waits for the "
+        "earlier move that used the same stretch, so a burst of restores from disk larger than the buffer runs "
+        "one buffer-full at a time. The buffer is never smaller than three of the largest cold blocks. Per KV "
+        "cache manager. Only used by KV cache manager v2.")
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -7272,6 +7282,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.copy_stream_busy_skip > 0 and self.use_kv_cache_manager_v2 is False:
             raise ValueError(
                 "kv_cache_config.copy_stream_busy_skip requires use_kv_cache_manager_v2"
+            )
+        if self.page_staging_mib != 64 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.page_staging_mib requires use_kv_cache_manager_v2"
             )
         disk_options = [
             name for name, value in (

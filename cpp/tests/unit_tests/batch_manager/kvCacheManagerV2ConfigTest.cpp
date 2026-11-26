@@ -57,6 +57,29 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
     EXPECT_NO_THROW(makeConfig().validate());
 }
 
+TEST(KvCacheManagerV2ConfigTest, PageStagingSizeReachesTheStorageConfig)
+{
+    auto config = makeTieredConfig();
+    ASSERT_NO_THROW(config.validate());
+    // The default is the ring the storage manager always built: 64 MiB.
+    EXPECT_EQ(config.pageStagingMiB, 64);
+    auto storage = createStorageConfig(config);
+    EXPECT_EQ(storage.pageStagingBytes, StorageConfig::kDefaultPageStagingBytes);
+    EXPECT_EQ(storage.pageStagingBytes, size_t{64} << 20u);
+
+    config.pageStagingMiB = 1024;
+    ASSERT_NO_THROW(config.validate());
+    storage = createStorageConfig(config);
+    EXPECT_EQ(storage.pageStagingBytes, size_t{1024} << 20u);
+
+    for (int const mib : {0, -1, KVCacheManagerConfig::kMaxPageStagingMiB + 1})
+    {
+        auto bad = makeTieredConfig();
+        bad.pageStagingMiB = mib;
+        EXPECT_THROW(bad.validate(), std::invalid_argument) << mib;
+    }
+}
+
 TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityRespectsProbeLimitAfterPageRounding)
 {
     constexpr int kTokensPerBlock = 128;

@@ -441,6 +441,14 @@ public:
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
 
+    //! The page staging ring as built (KVCacheManagerConfig::pageStagingMiB).
+    struct PageStagingInfo
+    {
+        size_t bytes{0}; //!< Ring size; 0 when no level needs one.
+    };
+
+    [[nodiscard]] PageStagingInfo pageStagingInfo() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -705,7 +713,7 @@ private:
     int mNumLocalityDomains{1};
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
-    static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
+    // The page staging ring holds at least this many of the largest cold pages, whatever its configured size.
     static constexpr size_t kPageStagingDepth = 3;
     static constexpr size_t kMaxIndexBatchBytes = 64u << 10u;
     static constexpr size_t kIndexStagingBytes = 256u << 10u;

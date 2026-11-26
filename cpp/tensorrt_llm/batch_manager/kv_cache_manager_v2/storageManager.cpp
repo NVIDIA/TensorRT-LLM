@@ -546,7 +546,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         TLLM_CHECK_WITH_INFO(maxColdPageBytes <= std::numeric_limits<size_t>::max() / kPageStagingDepth,
             "Cold-page staging size overflow");
-        pageStagingBytes = std::max(kDefaultPageStagingBytes, kPageStagingDepth * maxColdPageBytes);
+        pageStagingBytes = std::max(config.pageStagingBytes, kPageStagingDepth * maxColdPageBytes);
+        if (config.pageStagingBytes != StorageConfig::kDefaultPageStagingBytes)
+        {
+            TLLM_LOG_INFO("[kvCacheManagerV2] page staging ring %zu MiB", pageStagingBytes >> 20u);
+        }
     }
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
@@ -1513,6 +1517,11 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
     mLevels.at(level).storage->release(pg, std::move(slot));
+}
+
+StorageManager::PageStagingInfo StorageManager::pageStagingInfo() const noexcept
+{
+    return {mPageStagingManager ? mPageStagingManager->totalSize() : 0};
 }
 
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept

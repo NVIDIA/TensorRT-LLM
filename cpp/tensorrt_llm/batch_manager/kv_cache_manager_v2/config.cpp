@@ -348,6 +348,11 @@ void KVCacheManagerConfig::validate() const
         throw std::invalid_argument(
             "KVCacheManagerConfig: copyStreamBusySkip must be between 0 and " + std::to_string(kMaxCopyStreamBusySkip));
     }
+    if (pageStagingMiB < 1 || pageStagingMiB > kMaxPageStagingMiB)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: pageStagingMiB must be between 1 and " + std::to_string(kMaxPageStagingMiB));
+    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

@@ -614,6 +614,9 @@ class KVCacheManagerConfig:
     # Pooled CUDA streams, 0 to 4096, a page copy skips while they still have work pending (0: off).
     # Process-wide: the first manager that sets a nonzero value sets it.
     copy_stream_busy_skip: int = 0
+    # Size in MiB, 1 to 65536, of the pinned ring page moves between GPU and disk (or a remote level) pass
+    # through; at least three of the largest cold pages. Per manager.
+    page_staging_mib: int = 64
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

@@ -797,6 +797,16 @@ struct KVCacheManagerConfig
     //! sets a nonzero value sets it for the life of the process.
     int copyStreamBusySkip = 0;
 
+    //! Default and upper bound of pageStagingMiB, matching KvCacheConfig.page_staging_mib.
+    static constexpr int kDefaultPageStagingMiB = 64;
+    static constexpr int kMaxPageStagingMiB = 65536;
+
+    //! Size in MiB, 1 to kMaxPageStagingMiB, of the pinned host ring that page moves between GPU and a cache level
+    //! the GPU cannot address (the disk tier, a remote level) pass through. A move takes one stretch of the ring at a
+    //! time, and waits for the earlier move that used the same stretch, so a burst of moves larger than the ring runs
+    //! one ring-full at a time. The ring is never smaller than three of the largest cold pages. Per manager.
+    int pageStagingMiB = kDefaultPageStagingMiB;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

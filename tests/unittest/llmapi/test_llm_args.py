@@ -3102,6 +3102,29 @@ def test_KvCacheConfig_host_cache_free_reserve(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_page_staging_mib():
+    # The default is the ring KV cache manager v2 always had: 64 MiB.
+    assert KvCacheConfig().page_staging_mib == 64
+    # The ring also serves remote cache levels, so its size needs no disk cache.
+    assert KvCacheConfig(page_staging_mib=1024).page_staging_mib == 1024
+    KvCacheConfig(page_staging_mib=65536)
+    for mib in (0, 65537):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(page_staging_mib=mib)
+    with pytest.raises(
+            ValidationError,
+            match="page_staging_mib requires use_kv_cache_manager_v2"):
+        KvCacheConfig(page_staging_mib=1024, use_kv_cache_manager_v2=False)
+
+    assert _kvcm2_manager_config().page_staging_mib == 64
+    assert _kvcm2_manager_config(page_staging_mib=1024).page_staging_mib == 1024
+    for value in (0, 65537):
+        with pytest.raises(ValueError,
+                           match="pageStagingMiB must be between 1 and 65536"):
+            _kvcm2_manager_config(page_staging_mib=value)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

@@ -12445,6 +12445,65 @@ class TestKVCacheManagerConfigReplace(unittest.TestCase):
         self.assertEqual(missing, [], "constructor fields that dataclasses.replace() would reset")
 
 
+class TestNoBatchingDiskPageStaging(TestNoBatchingDiskOptions):
+    """The disk-option tests again through a 1 MiB page staging ring.
+
+    The ring is never smaller than three of the largest cold pages, so at 1 MiB it holds only a few, and every move
+    between GPU and disk takes ring-full after ring-full on its stream. The option is per manager. The restores still
+    pass refcheck.
+    """
+
+    manager_options = {"page_staging_mib": 1}
+
+    def setUp(self) -> None:
+        # TestNoBatchingDiskOptions' own tests run here too, not only the ones defined in this class.
+        name = self._testMethodName
+        if (
+            name not in type(self).__dict__
+            and name not in TestNoBatchingDiskOptions.__dict__
+            and not name.startswith(self._INHERITED_DISK_TESTS)
+        ):
+            self.skipTest("inherited test does not reach the disk tier")
+        TestNoBatching.setUp(self)
+
+    def _restore_prefix_from_disk(self) -> None:
+        # Push the first request's prefix down to disk, then restore it; refcheck verifies the restored KV. Only a
+        # restore from disk keeps a copy (keep_copy_after_restore), so copies created by the restore show it read
+        # disk.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        filled = _introspection.disk_copy_counters(self.manager)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["created"], filled["created"])
+        self._assert_copies_balance(restored)
+        self.manager.clear_reusable_blocks()
+
+    def test_default_options_build_the_64_mib_ring(self) -> None:
+        # Without the option a manager builds the ring KV cache manager v2 always had.
+        self.manager_options = {}
+        self.disk_tier_options = {"num_io_threads": 4}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertEqual(self.cfg.page_staging_mib, 64)
+        self.assertEqual(_introspection.page_staging(self.manager)["bytes"], 64 << 20)
+
+    def test_disk_moves_run_through_a_small_ring(self) -> None:
+        self._restore_prefix_from_disk()
+        self.assertEqual(self.cfg.page_staging_mib, 1)
+        staging = _introspection.page_staging(self.manager)
+        self.assertGreaterEqual(staging["bytes"], 1 << 20)
+        self.assertLess(staging["bytes"], 64 << 20)  # not the default ring
+
+
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
 

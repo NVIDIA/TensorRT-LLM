@@ -497,6 +497,12 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   `_prepareFreeSlots` evicts until that share of each pool group is free again,
   one reserve ahead of need, so pages falling into the tier take slots whose
   write-out to the tier below has finished.
+- Page staging ring (`page_staging_mib` -> `KVCacheManagerConfig::pageStagingMiB`
+  -> `StorageConfig::pageStagingBytes`, per manager; at least three of the largest
+  cold pages): every GPU <-> disk move (and every remote move) passes through it.
+  `acquire` hands a move as much of the ring as it asks for, and a later move
+  waits for the earlier move that used the same stretch, so a burst of disk
+  restores larger than the ring runs one ring-full at a time.
 
 ### Remote cache levels
 

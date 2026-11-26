@@ -322,6 +322,11 @@ def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, li
     ]
 
 
+def page_staging(manager: Any) -> dict[str, int]:
+    """The page staging ring of the storage manager: ``bytes`` (0 without one)."""
+    return dict(_cpp().page_staging(manager))
+
+
 def disk_copy_counters(manager: Any) -> dict[str, int]:
     """Return the retained disk copy and write-through counters of the storage manager."""
     return dict(_cpp().disk_copy_counters(manager))

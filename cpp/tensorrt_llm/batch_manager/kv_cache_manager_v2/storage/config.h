@@ -249,6 +249,11 @@ struct StorageConfig
 
     HostMemBackingConfig hostMemBacking;
 
+    //! Bytes of the pinned page staging ring (KVCacheManagerConfig::pageStagingMiB), before the floor of three of the
+    //! largest cold pages.
+    static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
+    size_t pageStagingBytes = kDefaultPageStagingBytes;
+
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
 

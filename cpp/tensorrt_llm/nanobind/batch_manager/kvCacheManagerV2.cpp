@@ -2029,7 +2029,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads, int copyStreamBusySkip)
+                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads, int copyStreamBusySkip,
+                int pageStagingMiB)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2061,6 +2062,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
                 cfg->hostCopyThreads = hostCopyThreads;
                 cfg->copyStreamBusySkip = copyStreamBusySkip;
+                cfg->pageStagingMiB = pageStagingMiB;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2077,7 +2079,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
             nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_copy_threads") = 1,
-            nb::arg("copy_stream_busy_skip") = 0)
+            nb::arg("copy_stream_busy_skip") = 0,
+            nb::arg("page_staging_mib") = kv::KVCacheManagerConfig::kDefaultPageStagingMiB)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2122,6 +2125,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Pooled CUDA streams, 0 to 4096, that a page copy skips while they still have work pending (0: it takes "
             "the next pooled stream, busy or not). Process-wide: the first manager that sets a nonzero value sets it "
             "for the life of the process.")
+        .def_rw("page_staging_mib", &kv::KVCacheManagerConfig::pageStagingMiB,
+            "Size in MiB, 1 to 65536, of the pinned host ring that page moves between GPU and the disk tier (or a "
+            "remote level) pass through; at least three of the largest cold pages. Per manager.")
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2974,6 +2980,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return groups;
         },
         nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "page_staging",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const info = manager.storage().pageStagingInfo();
+            nb::dict result;
+            result["bytes"] = info.bytes;
+            return result;
+        },
+        nb::arg("manager"));
     mIntrospection.def(
         "disk_copy_counters",
         [](kv::KvCacheManager& manager)
