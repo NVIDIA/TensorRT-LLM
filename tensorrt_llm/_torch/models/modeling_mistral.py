@@ -434,12 +434,6 @@ _MISTRAL_IMAGE_PARTITIONS = {
 }
 
 
-def _mistral_image_output_lengths(image_sizes, tile: int) -> list[int]:
-    """The patch merger's unfold emits one row for each complete spatial tile."""
-    return [(int(height) // tile) * (int(width) // tile)
-            for height, width in image_sizes]
-
-
 class MistralPixtralEncoderContract:
     """MM encoder item-scheduling contract for Pixtral-based Mistral VLMs.
 
@@ -568,11 +562,14 @@ class MistralPixtralEncoderContract:
                 f"multiple of {min_tokens_per_image} encoder tokens")
         item_refs = [("image", item_idx)
                      for item_idx in range(len(encoder_token_lengths))]
+        tile = patch * merge
         return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
-            output_embedding_lengths=_mistral_image_output_lengths(
-                image_sizes, patch * merge),
+            output_embedding_lengths=[
+                (int(height) // tile) * (int(width) // tile)
+                for height, width in image_sizes
+            ],
             input_partitions={"image": _MISTRAL_IMAGE_PARTITIONS.copy()})
 
     def get_mm_item_metadata(
@@ -1232,34 +1229,14 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         views = []
         for param in multimodal_params:
             image = param.multimodal_data["image"]
-            metadata = param.item_metadata
-            if metadata is None or metadata.output_embedding_lengths is None:
-                merger = self._multi_modal_projector.patch_merger
-                tile = merger._patch_size * merger._spatial_merge_size
-                output_lengths = _mistral_image_output_lengths(
-                    image["image_sizes"], tile)
-                if metadata is None:
-                    metadata = MultimodalItemMetadata([
-                        ("image", index) for index in range(len(output_lengths))
-                    ])
-                metadata = dataclasses.replace(
-                    metadata,
-                    output_embedding_lengths=[
-                        output_lengths[index] for _, index in metadata.item_refs
-                    ])
-                param = MultimodalParams(
-                    multimodal_data={
-                        **param.multimodal_data,
-                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
-                        metadata,
-                    })
+            refs, _ = param.get_item_layout()
             shape = image["pixel_values"].shape[-2:]
             # The processor can place several sizes in one request-wide tensor.
             # Expose their cropped views before batching by shape across requests.
-            if all(tuple(size) == shape for size in image["image_sizes"]):
+            if not refs or all(
+                    tuple(size) == shape for size in image["image_sizes"]):
                 views.append(param)
                 continue
-            refs, _ = param.get_item_layout()
             for index, (modality, local_index) in enumerate(refs):
                 selected = self.build_multimodal_encoder_input(
                     param, [local_index], modality)

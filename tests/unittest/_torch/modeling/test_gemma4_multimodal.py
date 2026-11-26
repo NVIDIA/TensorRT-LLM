@@ -333,6 +333,15 @@ def _make_normalization_processor(image_processor, dtype=torch.bfloat16, *, manu
     return processor
 
 
+def _single_item_data(modality, bucket, output_length):
+    return {
+        modality: bucket,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [(modality, 0)], output_embedding_lengths=[output_length]
+        ),
+    }
+
+
 def _encode_normalization_buckets(buckets, modality="image"):
     model = SimpleNamespace(
         _get_image_features=lambda **kwargs: kwargs["pixel_values"].flatten(0, 1),
@@ -340,13 +349,9 @@ def _encode_normalization_buckets(buckets, modality="image"):
     )
     params = [
         MultimodalParams(
-            multimodal_data={
-                modality: bucket,
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                    [(modality, 0)],
-                    output_embedding_lengths=[bucket["pixel_values"].flatten(0, 1).shape[0]],
-                ),
-            }
+            multimodal_data=_single_item_data(
+                modality, bucket, bucket["pixel_values"].flatten(0, 1).shape[0]
+            )
         )
         for bucket in buckets
     ]
@@ -354,7 +359,7 @@ def _encode_normalization_buckets(buckets, modality="image"):
 
 
 @pytest.mark.cpu_only
-def test_prepared_gemma4_shape_groups_preserve_rows_and_dtype():
+def test_prepared_gemma4_shape_groups_preserve_order_and_dtype():
     tower = mock.Mock(side_effect=lambda pixel_values, **_: pixel_values.flatten(0, 1))
     model = SimpleNamespace(_get_image_features=tower, vision_tower=None)
     params = []
@@ -371,7 +376,9 @@ def test_prepared_gemma4_shape_groups_preserve_rows_and_dtype():
         if modality == "video":
             data["pixel_values"] = data["pixel_values"].reshape(2, 1, 1)
             data["num_frames"] = [2]
-        params.append(MultimodalParams(multimodal_data={modality: data}))
+        params.append(
+            MultimodalParams(multimodal_data=_single_item_data(modality, data, len(values)))
+        )
 
     result = Gemma4MultimodalModelBase.encode_multimodal_inputs(model, params)
 
@@ -393,7 +400,11 @@ def test_prepared_gemma4_audio_groups_preserve_width_and_mask():
     mask = torch.tensor([True, False, True])
     params = [
         MultimodalParams(
-            multimodal_data={"audio": {"audio_features": clip, "audio_features_mask": clip_mask}}
+            multimodal_data=_single_item_data(
+                "audio",
+                {"audio_features": clip, "audio_features_mask": clip_mask},
+                int(clip_mask.sum()),
+            )
         )
         for clip, clip_mask in (
             (features, mask),
@@ -405,7 +416,10 @@ def test_prepared_gemma4_audio_groups_preserve_width_and_mask():
     embeddings = Gemma4MultimodalModelBase.encode_multimodal_inputs(model, params)
 
     torch.testing.assert_close(embeddings[:, 0], torch.tensor([0.0, 2.0, 3.0, 4.0, 6.0]))
-    assert [call.args[0].shape[:2] for call in tower.call_args_list] == [(2, 3), (1, 1)]
+    assert [call.kwargs["audio_features"].shape[:2] for call in tower.call_args_list] == [
+        (2, 3),
+        (1, 1),
+    ]
 
 
 def test_unified_audio_projects_compatible_clips_once():
@@ -416,9 +430,10 @@ def test_unified_audio_projects_compatible_clips_once():
     model.embed_audio.load_weights({"embedding_projection.weight": torch.eye(32)})
     frames = torch.arange(6 * 32, device="cuda", dtype=model.model_dtype).reshape(2, 3, 32)
     masks = torch.tensor([[True, False, True], [False, True, True]])
+    processor = Gemma4UnifiedInputProcessor.__new__(Gemma4UnifiedInputProcessor)
     params = [
-        MultimodalParams(
-            multimodal_data={"audio": {"audio_features": clip, "audio_features_mask": mask}}
+        _with_item_metadata(
+            {"audio": {"audio_features": clip, "audio_features_mask": mask}}, processor
         )
         for clip, mask in zip(frames.split(1), masks.split(1), strict=True)
     ]
@@ -1648,11 +1663,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         model = self._make_model()
         embed_mask_cumsum = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
         multimodal_param = MultimodalParams(
-            multimodal_data={
-                "image": {
-                    "pixel_values": torch.zeros(1, 1, 1, device="cuda"),
-                }
-            },
+            multimodal_data=_single_item_data(
+                "image", {"pixel_values": torch.zeros(1, 1, 1, device="cuda")}, 4
+            ),
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
                 chunk_end_pos=2,
@@ -1703,29 +1716,16 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         model = self._make_model()
         params = [
             MultimodalParams(
-                multimodal_data={"video": {"pixel_values": torch.tensor([[[2.0]]])}},
+                multimodal_data=_single_item_data(
+                    modality, {"pixel_values": torch.tensor([[[value]]])}, 1
+                ),
                 multimodal_runtime=MultimodalRuntimeData(
                     past_seen_token_num=0,
                     chunk_end_pos=1,
                     embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
                 ),
-            ),
-            MultimodalParams(
-                multimodal_data={"image": {"pixel_values": torch.tensor([[[1.0]]])}},
-                multimodal_runtime=MultimodalRuntimeData(
-                    past_seen_token_num=0,
-                    chunk_end_pos=1,
-                    embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
-                ),
-            ),
-            MultimodalParams(
-                multimodal_data={"video": {"pixel_values": torch.tensor([[[3.0]]])}},
-                multimodal_runtime=MultimodalRuntimeData(
-                    past_seen_token_num=0,
-                    chunk_end_pos=1,
-                    embed_mask_cumsum=torch.tensor([1], dtype=torch.int64),
-                ),
-            ),
+            )
+            for modality, value in (("video", 2.0), ("image", 1.0), ("video", 3.0))
         ]
 
         with unittest.mock.patch.object(
@@ -1916,7 +1916,7 @@ class TestGemma4EncoderItems(unittest.TestCase):
                     max_num_encoder_tokens=budget, mm_counts={modality: num_items}
                 )
 
-                metadata = processor.get_mm_item_metadata([], dummy)
+                metadata = dummy[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
 
                 self.assertEqual(list(metadata.encoder_token_lengths), [item_tokens] * num_items)
                 # Every patch slot or mel frame holds valid input.
@@ -1970,6 +1970,10 @@ class TestGemma4EncoderItems(unittest.TestCase):
         self.assertIsNone(
             unified.get_mm_item_metadata([], {"image": {"pixel_values": torch.zeros(1)}})
         )
+        image = {"pixel_values": torch.zeros(2, 4, 6), "image_seq_lens": [2, 4]}
+        metadata = unified.get_mm_item_metadata([], {"image": image})
+        self.assertEqual(metadata.output_embedding_lengths, (2, 4))
+        self.assertIsNone(metadata.encoder_token_lengths)
 
 
 # ---------------------------------------------------------------------------

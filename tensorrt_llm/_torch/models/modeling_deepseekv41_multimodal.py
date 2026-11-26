@@ -205,24 +205,18 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
 
     def _encode_images(self, pixel_values, image_grid_hw, llm_grid_hw):
         height, width = image_grid_hw
-        rows, columns = llm_grid_hw
+        grid_height, grid_width = llm_grid_hw
         features = self.vision(pixel_values, height, width)
-        features = self.aligner(
-            features.reshape(len(pixel_values), height * width, -1), height, width
-        )
+        features = self.aligner(features, height, width)
         batch, count, hidden = features.shape
-        if count != rows * columns:
+        if count != grid_height * grid_width:
             raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
-        grid = features.reshape(batch, rows, columns, hidden)
-        newline = self.image_newline.to(features.dtype).expand(batch, rows, 1, hidden)
-        return torch.cat(
-            (
-                self.image_start.to(features.dtype).expand(batch, 1, hidden),
-                torch.cat((grid, newline), dim=2).flatten(1, 2),
-                self.image_end.to(features.dtype).expand(batch, 1, hidden),
-            ),
-            dim=1,
-        ).flatten(0, 1)
+        newline = self.image_newline.to(features.dtype).expand(batch, 1, hidden)
+        pieces = [self.image_start.to(features.dtype).expand(batch, 1, hidden)]
+        for scanline in features.reshape(batch, grid_height, grid_width, hidden).unbind(1):
+            pieces.extend((scanline, newline))
+        pieces.append(self.image_end.to(features.dtype).expand(batch, 1, hidden))
+        return torch.cat(pieces, dim=1).flatten(0, 1)
 
     def encode_multimodal_inputs(
         self, multimodal_params: Sequence[MultimodalParams]

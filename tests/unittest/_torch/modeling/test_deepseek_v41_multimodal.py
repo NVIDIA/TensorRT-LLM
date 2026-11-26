@@ -199,6 +199,8 @@ def test_complete_vision_and_aligner_match_reference(
         expected = _reference_encoder(model, aligner, vision_config, patches, 4, 5)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(model(patches.flatten(2), 4, 5), model(patches, 4, 5))
+    patch = patches[:1].flatten(1)
+    torch.testing.assert_close(model(patch.unsqueeze(0), 1, 1), model(patch, 1, 1).unsqueeze(0))
     model.bfloat16()
     assert model.patch_embed.proj.weight.dtype == torch.bfloat16
     for name, parameter in model.named_parameters():

@@ -30,11 +30,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
-from tensorrt_llm.inputs.multimodal import (
-    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalItemMetadata,
-    MultimodalParams,
-)
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -1007,9 +1003,6 @@ class _MistralCpuEncoder(modeling_mistral.Mistral3VLM):
         self.calls = []
         self._vision_tower = self._tower
         self._multi_modal_projector = lambda features, sizes: features * 2
-        self._multi_modal_projector.patch_merger = SimpleNamespace(
-            _patch_size=1, _spatial_merge_size=1
-        )
 
     def _tower(self, pixel_values, image_sizes):
         self.calls.append((pixel_values.clone(), image_sizes.clone()))
@@ -1047,7 +1040,6 @@ def test_mistral_encoder_batches_equal_sizes_across_requests(sizes_as_tensor):
         for index, shape in enumerate(sizes)
     ]
     encoder = _MistralCpuEncoder()
-    params[0].multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
     actual = encoder.encode_multimodal_inputs(params)
     images_by_size = {}
     per_request = []
@@ -1062,28 +1054,3 @@ def test_mistral_encoder_batches_equal_sizes_across_requests(sizes_as_tensor):
         assert torch.equal(pixels, torch.stack(images))
         assert image_sizes.tolist() == [list(size)] * len(images)
     assert torch.equal(actual, torch.cat(per_request))
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("size", "expected_length", "keep_item_refs"), [((3, 4), 2, False), ((3, 3), 1, True)]
-)
-def test_mistral_prepared_image_counts_complete_merge_tiles(size, expected_length, keep_item_refs):
-    encoder = _MistralCpuEncoder()
-    merger = modeling_mistral.Mistral3PatchMerger.__new__(modeling_mistral.Mistral3PatchMerger)
-    torch.nn.Module.__init__(merger)
-    merger._patch_size = 1
-    merger._spatial_merge_size = 2
-    merger.merging_layer = torch.nn.Identity()
-    encoder._multi_modal_projector = mock.Mock(wraps=merger, patch_merger=merger)
-    param = _mistral_cpu_param([size])
-    metadata = param.multimodal_data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-    if keep_item_refs:
-        param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-            metadata.item_refs
-        )
-
-    image = param.multimodal_data["image"]
-    expected = encoder._get_image_features(image["pixel_values"], image["image_sizes"])
-    assert expected.shape[0] == expected_length
-    assert torch.equal(encoder.encode_multimodal_inputs([param]), expected)

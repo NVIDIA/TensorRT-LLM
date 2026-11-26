@@ -24,7 +24,6 @@ import copy
 import dataclasses
 import math
 from collections.abc import Mapping
-from functools import partial
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -492,7 +491,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             )
         else:
             encoder_token_lengths, output_embedding_lengths = self._vision_item_lengths(
-                multimodal_data[modality], int(self.config.vision_config.pooling_kernel_size) ** 2
+                multimodal_data[modality]
             )
         if mm_item_order:
             item_refs = [(entry["modality"], entry["index"]) for entry in mm_item_order]
@@ -509,9 +508,8 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
 
-    @staticmethod
     def _vision_item_lengths(
-        modality_data: Dict[str, Any], pooling_area: int
+        self, modality_data: Dict[str, Any], *, pooling_area: int | None = None
     ) -> Tuple[List[int], List[int]]:
         """Return the patch cost and soft-token count of every image or video.
 
@@ -534,6 +532,8 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                 f"Gemma4 vision input has {total_frames} frames, but declares "
                 f"{len(seq_lens)} frame lengths and {sum(frames_per_item)} frames across its items"
             )
+        if pooling_area is None:
+            pooling_area = int(self.config.vision_config.pooling_kernel_size) ** 2
         if any(int(seq_len) % pooling_area for seq_len in seq_lens):
             raise ValueError(
                 f"Processed Gemma4 frames must hold a multiple of {pooling_area} valid patches"
@@ -547,19 +547,17 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         return encoder_token_lengths, output_embedding_lengths
 
     @staticmethod
-    def _audio_item_lengths(
-        modality_data: Dict[str, Any], stride: int = _AUDIO_SUBSAMPLING_FACTOR
-    ) -> Tuple[List[int], List[int]]:
+    def _audio_item_lengths(modality_data: Dict[str, Any]) -> Tuple[List[int], List[int]]:
         """Return the subsampled frame cost and valid output frame count of every audio clip."""
         audio_features = modality_data["audio_features"]
         num_clips, num_mel_frames = (int(size) for size in audio_features.shape[:2])
         # Every clip is padded to the longest clip in the request.
-        encoder_tokens = len(range(0, num_mel_frames, stride))
+        encoder_tokens = len(range(0, num_mel_frames, _AUDIO_SUBSAMPLING_FACTOR))
         mask = modality_data.get("audio_features_mask")
         output_embedding_lengths = (
             [encoder_tokens] * num_clips
             if mask is None
-            else mask[:, ::stride].bool().sum(dim=-1).tolist()
+            else mask[:, ::_AUDIO_SUBSAMPLING_FACTOR].bool().sum(dim=-1).tolist()
         )
         return [encoder_tokens] * num_clips, output_embedding_lengths
 
@@ -679,6 +677,9 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                     ),
                     "audio_features_mask": torch.ones(num_items, num_mel_frames, dtype=torch.bool),
                 }
+        # The startup profiler selects one modality per encoder call.
+        if len(mm_data) == 1:
+            mm_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = self.get_mm_item_metadata([], mm_data)
         return mm_data
 
     @staticmethod
@@ -1001,10 +1002,9 @@ def _gemma4_square_grid(pixels: torch.Tensor) -> torch.Tensor:
     return grid.reshape(1, -1, 2).expand(len(pixels), -1, -1)
 
 
-def _gemma4_encode_view(
-    model, param: MultimodalParams, modality: str, data: Dict[str, Any]
-) -> MultimodalParams:
-    """Prepare tower kwargs and read or derive the layout of a full or selected request."""
+def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalParams:
+    """Prepare the tower inputs for a full or selected request."""
+    data = param.multimodal_data[modality]
     if modality == "audio":
         features = data["audio_features"]
         mask = data.get("audio_features_mask")
@@ -1033,46 +1033,7 @@ def _gemma4_encode_view(
         if positions is not None:
             payload["image_position_ids"] = positions
 
-    metadata = param.item_metadata
-    audio_mask = payload.get("audio_features_mask")
-    untrimmed_audio = (
-        audio_mask is not None
-        and audio_mask.dtype != torch.bool
-        and getattr(model, "audio_tower", None) is not None
-    )
-    if (
-        metadata is not None
-        and metadata.output_embedding_lengths is not None
-        and not untrimmed_audio
-    ):
-        refs, lengths = param.get_item_layout()
-    elif metadata is None and param.multimodal_runtime is not None and not untrimmed_audio:
-        refs, lengths = [(modality, 0)], [param.multimodal_runtime.total_embeds_in_request]
-    else:
-        if modality == "audio":
-            stride = (
-                _AUDIO_SUBSAMPLING_FACTOR if getattr(model, "audio_tower", None) is not None else 1
-            )
-            costs, output_lengths = Gemma4InputProcessor._audio_item_lengths(payload, stride)
-            if untrimmed_audio:
-                # The audio tower strips padded frames only for Boolean masks.
-                output_lengths = costs
-        else:
-            area = (
-                model._top_config.vision_config.pooling_kernel_size**2
-                if getattr(model, "vision_tower", None) is not None
-                else 1
-            )
-            _, output_lengths = Gemma4InputProcessor._vision_item_lengths(data, area)
-        refs = (
-            metadata.item_refs if metadata else [(modality, i) for i in range(len(output_lengths))]
-        )
-        lengths = [output_lengths[i] for _, i in refs]
-    if audio_mask is not None and audio_mask.device != payload["audio_features"].device:
-        # Projection-only models also accept a flat clip and its one-dimensional mask.
-        if data["audio_features"].ndim == 2 and getattr(model, "audio_tower", None) is None:
-            audio_mask = data["audio_features_mask"]
-        payload["audio_features_mask"] = [audio_mask]
+    refs, lengths = param.get_item_layout()
     layout = MultimodalItemMetadata(
         refs,
         output_embedding_lengths=lengths,
@@ -1081,21 +1042,6 @@ def _gemma4_encode_view(
     return MultimodalParams(
         multimodal_data={modality: payload, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: layout}
     )
-
-
-def _gemma4_encode_audio(encoder, audio_features, audio_features_mask=None):
-    if isinstance(audio_features_mask, list) and (
-        getattr(encoder, "__func__", None) is not Gemma4ForConditionalGeneration._get_audio_features
-    ):
-        # Project all frames together, then index each request with its original host mask.
-        projected = encoder(audio_features, None)
-        clips = projected.split([mask.numel() for mask in audio_features_mask])
-        embeddings = [
-            clip.reshape(*mask.shape, projected.shape[-1])[mask.bool()]
-            for clip, mask in zip(clips, audio_features_mask, strict=True)
-        ]
-        return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings)
-    return encoder(audio_features, audio_features_mask)
 
 
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
@@ -1250,12 +1196,10 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 continue
             if modality not in groups:
                 encoder = (
-                    partial(_gemma4_encode_audio, self._get_audio_features)
-                    if modality == "audio"
-                    else self._get_image_features
+                    self._get_audio_features if modality == "audio" else self._get_image_features
                 )
                 groups[modality] = EncoderGroup((modality,), encoder)
-            view = _gemma4_encode_view(self, param, modality, param.multimodal_data[modality])
+            view = _gemma4_encode_view(param, modality)
             views.append(view)
             if modality == "audio":
                 continue
@@ -1627,7 +1571,7 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     def _get_audio_features(
         self,
         audio_features: torch.Tensor,
-        audio_features_mask: torch.Tensor | list[torch.Tensor] | None = None,
+        audio_features_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Process audio features through audio tower and embedder.
 
@@ -1636,20 +1580,21 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         into the LLM input embeddings.
         """
         num_audio_tokens = None
+        if (
+            audio_features_mask is not None
+            and audio_features_mask.device.type == "cpu"
+            and audio_features_mask.dtype == torch.bool
+        ):
+            # The audio tower samples the mask through two stride-2 stages.
+            # Read its output size before H2D, avoiding CUDA nonzero's host sync.
+            num_audio_tokens = int(audio_features_mask[:, ::4].sum().item())
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
             if audio_features_mask is not None:
-                masks = (
-                    audio_features_mask
-                    if isinstance(audio_features_mask, list)
-                    else [audio_features_mask]
+                output = self.audio_tower(
+                    audio_features,
+                    attention_mask=audio_features_mask.to(audio_features.device, non_blocking=True),
                 )
-                if masks[0].device.type == "cpu" and masks[0].dtype == torch.bool:
-                    # Read output sizes before the request masks move to CUDA.
-                    num_audio_tokens = sum(int(mask[:, ::4].sum().item()) for mask in masks)
-                masks = [mask.to(audio_features.device, non_blocking=True) for mask in masks]
-                mask = masks[0] if len(masks) == 1 else torch.cat(masks)
-                output = self.audio_tower(audio_features, attention_mask=mask)
             else:
                 output = self.audio_tower(audio_features)
             hidden = output.last_hidden_state  # (B, T, H_audio)

@@ -5,7 +5,7 @@ import base64
 import copy
 import math
 import re
-from functools import lru_cache, partial
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -1497,13 +1497,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
 def _qwen_vision_batch(
     multimodal_params: List[MultimodalParams],
-    modalities: Tuple[str, ...],
     prepare_pixels: Optional[Callable] = None,
 ) -> Dict[str, torch.Tensor]:
     pixels = []
     grids = []
-    for modality in modalities:
-        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+    for modality, pixel_key in (("image", "pixel_values"),
+                                ("video", "pixel_values_videos")):
         for param in multimodal_params:
             bucket = param.multimodal_data.get(modality)
             if bucket is None:
@@ -1520,14 +1519,10 @@ def _qwen_vision_batch(
 
 
 def _qwen_vision_groups(
-        encode: Callable,
-        prepare_pixels: Optional[Callable] = None) -> Tuple[EncoderGroup, ...]:
-    return tuple(
-        EncoderGroup((modality, ), encode,
-                     partial(_qwen_vision_batch,
-                             modalities=(modality, ),
-                             prepare_pixels=prepare_pixels))
-        for modality in ("image", "video"))
+    encode: Callable,
+    build_batched_input: Callable = _qwen_vision_batch,
+) -> Tuple[EncoderGroup, ...]:
+    return (EncoderGroup(("image", "video"), encode, build_batched_input), )
 
 
 class Qwen2VisionModelBase(nn.Module):
@@ -1657,62 +1652,9 @@ class Qwen2VisionModelBase(nn.Module):
     def forward(
             self,
             multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        params = []
-        for param in multimodal_params:
-            record = param.item_metadata
-            if record is None or record.output_embedding_lengths is None:
-                # Prepared inputs may omit scheduling metadata. With one modality
-                # and no item reorder, the packed output is already in prompt order.
-                grids = {
-                    m: param.multimodal_data[m][f"{m}_grid_thw"]
-                    for m in ("image", "video")
-                    if param.multimodal_data.get(m) is not None
-                }
-                if not grids:
-                    continue
-                if len(multimodal_params) == 1 and len(grids) == 1 and (
-                        record is None or len(record.item_refs) == 1):
-                    return [
-                        self._encode_batched(
-                            **_qwen_vision_batch([param], tuple(grids)))
-                    ]
-                merge = self.config.spatial_merge_size**2
-                if ordered_grids := param.multimodal_data.get(
-                        "multimodal_embedding_metadata"):
-                    # The processor saves these grids in prompt order on the host.
-                    next_index = {"image": 0, "video": 0}
-                    refs = []
-                    lengths = []
-                    for item in ordered_grids:
-                        modality = "image" if "image_grid_thw" in item else "video"
-                        refs.append((modality, next_index[modality]))
-                        next_index[modality] += 1
-                        lengths.append(
-                            math.prod(item[f"{modality}_grid_thw"]) // merge)
-                    if record is not None:
-                        refs = record.item_refs
-                else:
-                    lengths_by_ref = {
-                        (m, i): math.prod(row) // merge
-                        for m, grid in grids.items()
-                        for i, row in enumerate(grid.tolist())
-                    }
-                    refs = record.item_refs if record is not None else list(
-                        lengths_by_ref)
-                    lengths = [lengths_by_ref[ref] for ref in refs]
-                param = MultimodalParams(
-                    multimodal_data={
-                        **param.multimodal_data,
-                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
-                        MultimodalItemMetadata(
-                            refs, output_embedding_lengths=lengths),
-                    })
-            params.append(param)
-        if not params:
-            return []
         return [
             encode_multimodal_by_groups(
-                _qwen_vision_groups(self._encode_batched), params)
+                _qwen_vision_groups(self._encode_batched), multimodal_params)
         ]
 
 

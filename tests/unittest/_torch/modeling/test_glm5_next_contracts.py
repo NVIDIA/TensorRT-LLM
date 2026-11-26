@@ -482,6 +482,45 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
     assert metadata.output_embedding_lengths == (4,) * num_images
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_mixed_vision_batch_matches_single_items():
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
+
+    model = Glm5NextVisionModelBase(ModelConfig(pretrained_config=_config())).cuda().eval()
+    model.visual.setup_attn_metadata(max_num_tokens=128)
+    torch.manual_seed(17)
+    for weight in model.parameters():
+        weight.normal_(0, 0.01)
+    params = []
+    for modality, grid, key in (
+        ("video", [2, 4, 6], "pixel_values_videos"),
+        ("image", [1, 4, 4], "pixel_values"),
+    ):
+        patches = grid[0] * grid[1] * grid[2]
+        params.append(
+            MultimodalParams(
+                multimodal_data={
+                    modality: {
+                        key: torch.randn(patches, 24, dtype=torch.bfloat16),
+                        f"{modality}_grid_thw": torch.tensor([grid]),
+                    },
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)], output_embedding_lengths=[patches // 4]
+                    ),
+                }
+            )
+        )
+
+    expected = torch.cat([model([item])[0] for item in params])
+    (actual,) = model(params)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.01)
+
+
 def _materialize_meta(module: torch.nn.Module) -> None:
     """Allocate meta tensors on CUDA as ModelLoader does after MetaInitMode construction."""
     module._apply(lambda t: torch.empty_like(t, device="cuda") if t.is_meta else t)

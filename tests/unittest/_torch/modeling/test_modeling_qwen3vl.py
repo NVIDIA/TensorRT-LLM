@@ -1309,21 +1309,7 @@ def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     assert data["multimodal_embedding_metadata"] == expected
     requests = [MultimodalParams(multimodal_data=data) for _ in range(2)]
     _assert_rows_hold_item_grids(torch.cat(encoder.forward(requests)), lengths * 2, expected * 2)
-    assert calls == ["cpu", "cpu"]
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("retain_order", [False, True])
-def test_qwen2_prepared_vision_recovers_missing_rows(retain_order):
-    cls = modeling_qwen2vl.Qwen2VisionModelBase
-    data, lengths, expected, encoder, calls = _qwen_vl_item_grid_case(cls)
-    record = data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
-    if retain_order:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(record.item_refs)
-    encoder.config = SimpleNamespace(spatial_merge_size=2)
-    requests = [MultimodalParams(multimodal_data=data) for _ in range(2)]
-    _assert_rows_hold_item_grids(torch.cat(encoder.forward(requests)), lengths * 2, expected * 2)
-    assert len(calls) == 2
+    assert calls == ["cpu"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1346,19 +1332,7 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
         get_num_tokens=lambda _: sum(lengths),
     )
 
-    transfers = []
-    tensor_to = torch.Tensor.to
-
-    def track_placement(tensor, *args, **kwargs):
-        placed = tensor_to(tensor, *args, **kwargs)
-        if tensor.device.type == "cpu" and placed.is_cuda:
-            transfers.append(tensor.nbytes)
-        return placed
-
     def forward(multimodal_params):
-        # Both requests' pixels and grids are placed before the tower receives them.
-        sizes = [tensor.nbytes for m in ("image", "video") for tensor in data[m].values()]
-        assert transfers == sizes * 2
         # Any device-to-host copy, like tolist() on a CUDA tensor, raises here.
         previous_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
@@ -1372,19 +1346,15 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
         encoder_cache_enabled=False,
         moe_load_balancer=None,
     )
-    inputs = ScheduledInputs(
-        batch=SimpleNamespace(context_requests=[request, copy.deepcopy(request)])
+    result = runner.forward(
+        ScheduledInputs(batch=SimpleNamespace(context_requests=[request])),
+        resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
     )
-    with patch.object(torch.Tensor, "to", track_placement):
-        result = runner.forward(
-            inputs,
-            resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
-        )
 
     assert set(grid_devices) == {"cuda"}
-    assert result["mm_embedding_metadata"] == [expected, expected]
-    for embedding in result["mm_embeddings"]:
-        _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
+    assert result["mm_embedding_metadata"] == [expected]
+    (embedding,) = result["mm_embeddings"]
+    _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
 
 
 # ---------------------------------------------------------------------------

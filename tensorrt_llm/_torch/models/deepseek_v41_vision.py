@@ -148,22 +148,18 @@ class DeepseekV41VisionModel(nn.Module):
             n_h: Number of patch rows.
             n_w: Number of patch columns.
         """
-        count = n_h * n_w
-        single = (
-            patches.ndim >= 2
-            and patches.shape[0] == count
-            and patches.numel() == count * self.patch_embed.proj.in_features
-        )
-        if single:
+        grid_shape = (n_h * n_w, self.patch_embed.proj.in_features)
+        batched = patches.ndim == 3 and patches.shape[1:] == grid_shape
+        if not batched and patches.ndim >= 2:
             patches = patches.flatten(1).unsqueeze(0)
-        if n_h <= 0 or n_w <= 0 or patches.ndim != 3 or patches.shape[1] != count:
+        if n_h <= 0 or n_w <= 0 or patches.shape[1:] != grid_shape:
             raise ValueError("Vision patches must match a positive n_h by n_w grid")
         hidden_states = self.patch_embed(patches)
         cos, sin = _get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta, patches.device)
         for block in self.blocks:
             hidden_states = block(hidden_states, cos, sin)
         features = self.norm(hidden_states)
-        return features.squeeze(0) if single else features
+        return features if batched else features.squeeze(0)
 
 
 class DeepseekV41Aligner(nn.Module):

@@ -1461,8 +1461,8 @@ def _qwen3vl_prepare_pixels(value: torch.Tensor, bucket: dict[str, Any]) -> torc
 def _qwen3vl_build_batched_input(
     multimodal_params: list[MultimodalParams],
 ) -> dict[str, Any]:
-    """Pack patch rows and grids in image-then-video order."""
-    return _qwen_vision_batch(multimodal_params, ("image", "video"), _qwen3vl_prepare_pixels)
+    """Pack image patches and grids first, followed by video."""
+    return _qwen_vision_batch(multimodal_params, _qwen3vl_prepare_pixels)
 
 
 class Qwen3VisionModelBase(nn.Module):
@@ -1541,7 +1541,7 @@ class Qwen3VisionModelBase(nn.Module):
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        return _qwen_vision_groups(self.encode_batched, _qwen3vl_prepare_pixels)
+        return _qwen_vision_groups(self.encode_batched, _qwen3vl_build_batched_input)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
