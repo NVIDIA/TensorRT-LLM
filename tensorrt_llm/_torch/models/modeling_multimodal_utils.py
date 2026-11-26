@@ -407,11 +407,8 @@ def _join_embeddings(embeddings: List[torch.Tensor],
             return embeddings[0][:0]
         embeddings = slices
 
-    if len(embeddings) == 1:
-        return embeddings[0]
-    # Attached items may sit on different devices; slices move, not items.
-    device = embeddings[0].device
-    return torch.cat([embedding.to(device) for embedding in embeddings], dim=0)
+    return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
+                                                                dim=0)
 
 
 def get_multimodal_embeddings(

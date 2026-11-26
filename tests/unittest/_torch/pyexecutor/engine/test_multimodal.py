@@ -997,12 +997,11 @@ def test_attached_embedding_is_sliced_to_the_forward_rows(
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_attached_items_on_different_devices_are_joined() -> None:
+def test_attached_items_on_different_devices_are_attached_whole() -> None:
     mm_item_scheduler = bare_mm_item_scheduler(_FloatModel())
     mm_item_scheduler.bytes_per_embedding = 8
-    attachment = torch.arange(10, dtype=torch.float16).reshape(5, 2)
-    request = _attached_request([attachment[:2], attachment[2:].cuda()], [0, 1, 2, 2, 2, 3, 4, 5])
+    embedding = [torch.ones(2, 2), torch.ones(3, 2, device="meta")]
+    request = _attached_request(embedding, [0, 1, 2, 2, 2, 3, 4, 5])
     initialize_multimodal_encoder_request(request, max_num_tokens=8)
     runtime = MultimodalRuntimeData(
         embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
@@ -1012,9 +1011,8 @@ def test_attached_items_on_different_devices_are_joined() -> None:
 
     multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
-    torch.testing.assert_close(
-        multimodal_data["multimodal_embedding"].cpu(), attachment[1:4].float()
-    )
+    assert multimodal_data is request.py_multimodal_data
+    assert "multimodal_embedding_is_chunk" not in multimodal_data
 
 
 def test_attached_embedding_without_row_placement_is_attached_whole() -> None:

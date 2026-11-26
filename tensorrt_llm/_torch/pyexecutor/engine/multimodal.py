@@ -667,7 +667,8 @@ class MultimodalItemScheduler:
         The request keeps the full attachment, so a host attachment puts at
         most one forward's rows on the device, as with encoder outputs; a
         device attachment stays resident with its producer until prefill ends.
-        Without runtime row placement, prefill is one-shot and uses every row.
+        Without runtime row placement, prefill is one-shot and uses every row;
+        items on different devices also attach whole, staged by input prep.
         """
         multimodal_data = request.py_multimodal_data
         embedding = (
@@ -677,8 +678,10 @@ class MultimodalItemScheduler:
         )
         if embedding is None or runtime is None:
             return multimodal_data
-        start = runtime.num_cached_mm_tokens
         pieces = list(embedding) if isinstance(embedding, (list, tuple)) else [embedding]
+        if len({piece.device for piece in pieces}) > 1:
+            return multimodal_data
+        start = runtime.num_cached_mm_tokens
         rows = _join_embeddings(pieces, start=start, end=start + runtime.num_mm_tokens_in_chunk)
         dtype, _ = self._embedding_dtype_and_width()
         multimodal_data = dict(multimodal_data)
