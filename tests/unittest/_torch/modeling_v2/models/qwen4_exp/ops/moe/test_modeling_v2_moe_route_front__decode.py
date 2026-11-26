@@ -154,8 +154,8 @@ def test_preload_and_early_are_bitwise_the_plain_launch(rows, local, tile, ties)
 _COMPILE_EARLY = """
 import sys
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import moe_route_front__decode as op
-rows, local, tile, fast2 = (int(v) for v in sys.argv[1:5])
-assert op.compile_front(rows, 2560, 2560, local, tile, fast2, early=True)
+rows, local, tile, fast2, route_only, ids_in = (int(v) for v in sys.argv[1:7])
+assert op.compile_front(rows, 2560, 2560, local, tile, fast2, bool(route_only), bool(ids_in), True)
 """
 
 
@@ -164,10 +164,20 @@ assert op.compile_front(rows, 2560, 2560, local, tile, fast2, early=True)
     reason="compiles for the running SM103 GPU",
 )
 @pytest.mark.parametrize(
-    "rows, local, tile, fast2",
-    [(288, 128, 32, 0), (448, 64, 32, 0), (640, 128, 32, 2), (832, 128, 64, 2), (768, 64, 32, 1)],
+    "rows, local, tile, fast2, route_only, ids_in",
+    [
+        (288, 128, 32, 0, 0, 0),
+        (448, 64, 32, 0, 0, 0),
+        (640, 128, 32, 2, 0, 0),
+        (832, 128, 64, 2, 0, 0),
+        (768, 64, 32, 1, 0, 0),
+        (576, 64, 32, 1, 1, 0),  # the packed gather's routing-only front
+        (896, 64, 64, 1, 1, 1),  # over owner-routed rows
+    ],
 )
-def test_early_reads_nothing_before_its_wait(tmp_path, rows, local, tile, fast2):
+def test_early_reads_nothing_before_its_wait(
+    tmp_path, rows, local, tile, fast2, route_only, ids_in
+):
     """`early` releases FC1 right after the wait, so the wait must come before every global access:
     in the SASS exactly one `ACQBULK` (`griddepcontrol.wait`) with no global access, branch or label
     before it, in the PTX no global load above it, and no `ld.global.nc` anywhere (ptxas may move one
@@ -182,7 +192,7 @@ def test_early_reads_nothing_before_its_wait(tmp_path, rows, local, tile, fast2)
         CUTE_DSL_DISABLE_FILE_CACHING="1",
         TRTLLM_ENABLE_PDL="1",
     )
-    args = [str(rows), str(local), str(tile), str(fast2)]
+    args = [str(v) for v in (rows, local, tile, fast2, route_only, ids_in)]
     subprocess.run([sys.executable, "-c", _COMPILE_EARLY, *args], env=env, check=True, timeout=1800)
     sass = glob.glob(str(tmp_path / "*.sass"))
     ptx = glob.glob(str(tmp_path / "*.ptx"))
@@ -201,14 +211,16 @@ def test_route_only_is_the_full_launchs_routing(cell):
     spec, device = cell.spec, torch.device("cuda")
     seed = zlib.crc32(cell.why.encode()) % 2**31 + 17
     logits, x, global_scale, tables = _operands(spec, seed, device)
-    fast2 = spec.get("fast2", False)
+    fast2, early = spec.get("fast2", False), spec.get("early", False)
     rows, hidden = spec["rows"], spec["hidden"]
     assert op.compile_front(rows, hidden, x.stride(0), spec["num_local"], spec["tile"], fast2)
-    assert op.compile_front(rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True)
+    assert op.compile_front(
+        rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True, early=early
+    )
     args = (spec["tile"], spec["local_offset"], spec["num_local"])
     full_tables = tables.clone()
     _, _, ids, wts = op.moe_route_front(logits, x, global_scale, full_tables, *args, fast2)
-    ids2, wts2 = op.route_front_only(logits, tables, *args, hidden, fast2)
+    ids2, wts2 = op.route_front_only(logits, tables, *args, hidden, fast2, early=early)
     torch.cuda.synchronize()
     assert torch.equal(ids2, ids) and torch.equal(wts2.view(torch.int16), wts.view(torch.int16))
     assert torch.equal(tables, full_tables)
@@ -227,17 +239,17 @@ def test_ids_in_is_the_routing_fronts_routing(cell):
     spec, device = cell.spec, torch.device("cuda")
     seed = zlib.crc32(cell.why.encode()) % 2**31 + 29
     logits, _, _, tables = _operands(spec, seed, device)
-    fast2 = spec.get("fast2", False)
+    fast2, early = spec.get("fast2", False), spec.get("early", False)
     rows, hidden = spec["rows"], spec["hidden"]
     args = (spec["tile"], spec["local_offset"], spec["num_local"])
     assert op.compile_front(rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True)
     assert op.compile_front(
-        rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True, ids_in=True
+        rows, hidden, hidden, spec["num_local"], spec["tile"], fast2, True, True, early
     )
     ref_tables = tables.clone()
     ids, wts = op.route_front_only(logits, ref_tables, *args, hidden, fast2)
     routed = op.routed_rows(ids, wts)
-    ids2, wts2 = op.route_front_only(routed, tables, *args, hidden, fast2, ids_in=True)
+    ids2, wts2 = op.route_front_only(routed, tables, *args, hidden, fast2, ids_in=True, early=early)
     torch.cuda.synchronize()
     assert torch.equal(ids2, ids) and torch.equal(wts2.view(torch.int16), wts.view(torch.int16))
     assert torch.equal(tables, ref_tables)

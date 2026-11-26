@@ -341,14 +341,16 @@ def route_front_only(
     hidden: int,
     fast2: bool | int = False,
     ids_in: bool = False,
+    early: bool = False,
 ):
     """`moe_route_front`'s routing alone, for rows whose NVFP4 form the caller has already (the
     attention-DP packed gather): `ids, wts` and the tables written into `tables`, bitwise the full
     launch's over the same logits (the same routing cluster; its quantization clusters are not
     launched). With `ids_in`, `logits` is the rows' routing instead, `[rows, IDS_ROW_SLOTS]` int16
     (contiguous) formed from their logits by the kernel's `route_one_token`: the same `ids, wts`
-    and tables. `compile_front(rows, hidden, hidden, num_local, tile, fast2, True, ids_in)`
-    first. Not an entry of its own: `moe_route_front`'s test holds it to that launch."""
+    and tables. `early`: the launch compiled with the release right after its wait.
+    `compile_front(rows, hidden, hidden, num_local, tile, fast2, True, ids_in, early)` first.
+    Not an entry of its own: `moe_route_front`'s test holds it to that launch."""
     import cuda.bindings.driver as cuda
     import cutlass
 
@@ -357,7 +359,7 @@ def route_front_only(
         # the kernel reads 16-bit slots at a fixed row pitch: a logits tensor here reads garbage
         assert logits.dtype is torch.int16 and logits.is_contiguous(), logits.dtype
         assert tuple(logits.shape) == (rows, IDS_ROW_SLOTS), tuple(logits.shape)
-    fn = _COMPILED.get(_key(rows, hidden, hidden, num_local, tile, fast2, True, ids_in))
+    fn = _COMPILED.get(_key(rows, hidden, hidden, num_local, tile, fast2, True, ids_in, early))
     assert fn is not None, f"no routing-only front compiled for {rows} rows: `compile_front`"
     dev = logits.device
     ids = torch.empty([rows, TOP_K], dtype=torch.int32, device=dev)

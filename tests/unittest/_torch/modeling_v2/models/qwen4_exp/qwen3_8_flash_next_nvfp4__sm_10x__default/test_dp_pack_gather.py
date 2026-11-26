@@ -48,8 +48,10 @@ def _setup(monkeypatch, log, mid_rows=(), fin_rows=()):
     monkeypatch.setattr(
         M,
         "_route_front_only",
-        lambda lg, tab, tile, off, local, hidden, fast2, ids_in=False: log.append(
-            ("route only", lg, tab, tile) + (("ids_in",) if ids_in else ())
+        lambda lg, tab, tile, off, local, hidden, fast2, ids_in=False, early=False: log.append(
+            ("route only", lg, tab, tile)
+            + (("ids_in",) if ids_in else ())
+            + (("early",) if early else ())
         )
         or ("ids", "wts"),
     )
@@ -66,7 +68,7 @@ def _setup(monkeypatch, log, mid_rows=(), fin_rows=()):
         layers={7: 3},
         tactics={32: (16, 0)},
         flats={32: {3: "flat3"}},
-        fast2=set(),
+        fast2={},
         views={32: {3: [torch.zeros(320, dtype=torch.int32)]}},
     )
     pk = M._DpPack(_Pack(log), frozenset({32}), {9: "mw9"}, frozenset(mid_rows))
@@ -109,6 +111,24 @@ def test_block_launch_order(monkeypatch, mid):
         ("route only", "lg", "flat3", 16),
         ("runner", True, ("xq", "xsf", "ids", "wts")),
         ("reduce", "out"),
+    ]
+
+
+@pytest.mark.parametrize("ownk", [False, True])
+def test_block_releases_the_runner_early_at_the_fronts_early_rows(monkeypatch, ownk):
+    """`DP_ROUTE_FRONT_EARLY_ENV`: at a gathered row count the route front releases early, the
+    routing-only front (packed or owner-routed rows) takes its early launch too."""
+    log = []
+    core, pk, L = _setup(monkeypatch, log)
+    core._route_front.early = {32}
+    if ownk:
+        pk.ownk, pk.ownk_rows = _Pack(log, "ownk", "idw"), frozenset({32})
+    M._dp_pack_block(core, pk, torch.zeros(4, 8), L, None, lambda: None, [], None, None)
+    routed = [e for e in log if e[0] == "route only"]
+    assert routed == [
+        ("route only", "idw" if ownk else "lg", "flat3", 16)
+        + (("ids_in",) if ownk else ())
+        + ("early",)
     ]
 
 
@@ -270,7 +290,7 @@ def test_build_off_ignored_and_agreed(monkeypatch):
     monkeypatch.setenv(M.DP_MOE_OWNK_ENV, "0")
     monkeypatch.setattr(M, "_dp_decode_rank", lambda core, device: True)
     monkeypatch.setattr(M.torch.cuda, "device", lambda d: contextlib.nullcontext())
-    st = SimpleNamespace(tactics={24: (8, 0), 32: (16, 0), 96: (16, 0)}, fast2=set())
+    st = SimpleNamespace(tactics={24: (8, 0), 32: (16, 0), 96: (16, 0)}, fast2={})
     core = SimpleNamespace(
         dp_size=4, _lamport_trip=SimpleNamespace(steps=object(), world=8), _route_front=st
     )
@@ -304,7 +324,7 @@ def test_build_off_ignored_and_agreed(monkeypatch):
 
 
 def _ownk_core(rows):
-    st = SimpleNamespace(tactics={g: (16, 0) for g in rows}, fast2=set())
+    st = SimpleNamespace(tactics={g: (16, 0) for g in rows}, fast2={})
     core = SimpleNamespace(
         dp_rank=0,
         _lamport_trip=SimpleNamespace(world=8),
@@ -329,7 +349,7 @@ def test_ownk_build_agreed_and_checked(monkeypatch, value):
     )
     compiled = []
 
-    def compile_front(g, hidden, stride, local, tile, fast2, route_only, ids_in):
+    def compile_front(g, hidden, stride, local, tile, fast2, route_only, ids_in, early=False):
         compiled.append((g, route_only, ids_in))
         return g > 256
 
@@ -483,7 +503,7 @@ def test_check_holds_the_codes_to_what_the_transport_delivers(monkeypatch, ownk)
         local_experts=64,
         expert_offset=0,
     )
-    st = SimpleNamespace(tactics={1: [0]}, flats={1: [torch.zeros(4)]}, fast2=frozenset())
+    st = SimpleNamespace(tactics={1: [0]}, flats={1: [torch.zeros(4)]}, fast2={})
     pk = M._DpPack(gather, frozenset({1}), {}, frozenset())
     what = M._dp_pack_check(core, pk, st, 1, "cpu", ownk=gather if ownk else None)
     assert what == ""

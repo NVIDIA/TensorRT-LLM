@@ -530,6 +530,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate
     fused_sigmoid_gate_mul_add,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
+    LEAN_MAX_ROWS as _ROUTE_FRONT_LEAN_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
     MAX_ROWS as _ROUTE_FRONT_MAX_ROWS,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.moe_route_front__decode import (
@@ -1455,17 +1458,35 @@ _ROUTE_FRONT_TACTICS_BASE = ((256, (8, 53)), (512, (16, 32)), (1025, (32, 20)))
 #: listed tactic's (`_route_front_check` against `_route_front_w64_tactic`'s listed reference);
 #: a row count whose check fails keeps the runner's routing.
 _ROUTE_FRONT_TACTICS_W64 = ((96, (8, 53)), (192, (16, 32)), (896, (32, 32)), (1025, (64, 5)))
-#: Switch, on by default: where a route front was built over dep8's 64-expert window, its launches
-#: of `_ROUTE_FRONT_FAST2_ROWS` gathered rows (two tokens a warp) route each token on the kernel's
-#: one-token fast path (`moe_route_front(..., fast2=True)`) instead of both on the full per-lane
-#: sort. The same experts, weights, codes and tables, bit for bit (the build's check against the
-#: runner's own routing still gates every row count; a row count that fails it keeps the two-token
-#: sort). GB300 micro, us a launch: 8.72 -> 5.41 at 544 rows, 8.71 -> 6.27 at 768, 8.93 -> 7.41 at
-#: 1024; dep8 server step at 17 / 18 / 20 / 24 requests a rank: -0.15..-0.23 / -0.166 / -0.145 /
-#: -0.134 ms. `0` keeps the two-token sort. Read once, when the target is built.
+#: Switch, on by default: where a route front was built over dep4's 128-expert or dep8's 64-expert
+#: window, its launches of `_ROUTE_FRONT_FAST2_ROWS` gathered rows (two tokens a warp) route each
+#: token on the kernel's one-token fast path (`moe_route_front(..., fast2=)`) instead of both on
+#: the full per-lane sort, in the form `_ROUTE_FRONT_FAST2_FORMS` lists for the window. The same
+#: experts, weights, codes and tables, bit for bit (the build's check against the runner's own
+#: routing still gates every row count; a row count that fails it keeps the two-token sort).
+#: GB300, dep8 (form 1), us a launch: 8.72 -> 5.41 at 544 rows, 8.71 -> 6.27 at 768, 8.93 -> 7.41 at
+#: 1024; server step at 17 / 18 / 20 / 24 requests a rank: -0.15..-0.23 / -0.166 / -0.145 / -0.134
+#: ms. dep4 (form 2, the second token's logits loaded first): 9.34 -> 5.94 / 9.42 -> 5.92 / 9.39 ->
+#: 6.37 / 9.38 -> 6.65 at 528 / 640 / 768 / 832 rows (form 1: 6.41 at 528); server step at 33 / 40 /
+#: 48 requests a rank -0.15 / -0.12 / -0.09..-0.12 ms. `0` keeps the two-token sort; `2` takes
+#: form 2 at both windows (an A/B value). Read once, when the target is built.
 DP_ROUTE_FAST2_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FAST2"
 #: Gathered rows a launch takes the fast path at: two tokens a warp, up to the launch's last.
 _ROUTE_FRONT_FAST2_ROWS = (513, 1024)  # capacity: fixed: dispatch thresholds
+#: The fast path's form per expert window, as measured: dep4's 128 experts with the second token's
+#: logits loaded first (2), dep8's 64 one token after the other (1).
+_ROUTE_FRONT_FAST2_FORMS = {128: 2, 64: 1}  # capacity: fixed: a dispatch table
+#: Switch, on by default: an attention-DP route front past the lean form's rows
+#: (`_ROUTE_FRONT_LEAN_MAX_ROWS`, which releases at its start already) releases its dependent, the
+#: runner's FC1, right after its own `griddepcontrol.wait`, which is then the launch's first
+#: statement, instead of after its last global access (`moe_route_front(..., early=True)`). FC1's
+#: own wait still holds its reads until the front has completed, so the bits are the same; FC1's
+#: launch and prologue overlap the routing. Measured as `DP_MOE_ROUTE_FRONT_EARLY` on every dep4 /
+#: dep8 front point; d6a micro inside the dep4 round trip at 24 / 32 requests a rank (384 / 512
+#: gathered rows): -0.385..-0.395 / -0.406..-0.411 ms a step with the release against -0.349..-0.358
+#: / -0.370..-0.379 without, about 0.035 ms for the release. Engages only with PDL. `0` keeps the
+#: end release. Read once, when the target is built.
+DP_ROUTE_FRONT_EARLY_ENV = "TRTLLM_QWEN4_EXP_DP_ROUTE_FRONT_EARLY"
 #: Switch, on by default: a tep4 rank (attention TP over four ranks without attention DP, the
 #: routed experts as 128-expert windows) runs a captured generation-only step on the forms the
 #: one-rank target runs, at its shard:
@@ -4097,17 +4118,18 @@ def _dp_pack_check(core, pk: _DpPack, st, rows: int, device, ownk=None) -> str:
     ]
     tile = int(st.tactics[g][0])
     flat = st.flats[g][0].clone()
-    window = (tile, core.expert_offset, core.local_experts, core.hidden, g in st.fast2)
+    window = (tile, core.expert_offset, core.local_experts, core.hidden, st.fast2.get(g, 0))
+    early = _route_front_early_kw(st, g)
     if ownk is None:
-        ids, wts = _route_front_only(lg, flat, *window)
+        ids, wts = _route_front_only(lg, flat, *window, **early)
         _, rxq2, _, rids, rwts = _route_front_run(core, st, gathered, L, 0, lg)
         want = st.flats[g][0]
     else:
         want = st.flats[g][0].clone()
-        rids, rwts = _route_front_only(logits, want, *window)
+        rids, rwts = _route_front_only(logits, want, *window, **early)
         if not torch.equal(lg.view(torch.int16), _routed_rows(rids, rwts)):
             bad.append("owner routing")
-        ids, wts = _route_front_only(lg, flat, *window, True)
+        ids, wts = _route_front_only(lg, flat, *window, True, **early)
     if not torch.equal(ids, rids) or not torch.equal(wts.view(torch.int16), rwts.view(torch.int16)):
         bad.append("routing")
     if not torch.equal(flat, want):
@@ -4151,7 +4173,14 @@ def _dp_pack_build(core, device) -> "_DpPack | None":
             for g in sorted(st.tactics):
                 tile = int(st.tactics[g][0])
                 if _route_front_compile(
-                    g, core.hidden, core.hidden, core.local_experts, tile, g in st.fast2, True
+                    g,
+                    core.hidden,
+                    core.hidden,
+                    core.local_experts,
+                    tile,
+                    st.fast2.get(g, 0),
+                    True,
+                    **_route_front_early_kw(st, g),
                 ):
                     rows.add(g)
             mids, mid_rows = {}, set()
@@ -4226,7 +4255,15 @@ def _dp_ownk_build(core, pk: _DpPack, st, device, dist) -> None:
             for g in wanted:
                 tile = int(st.tactics[g][0])
                 if _route_front_compile(
-                    g, core.hidden, core.hidden, core.local_experts, tile, g in st.fast2, True, True
+                    g,
+                    core.hidden,
+                    core.hidden,
+                    core.local_experts,
+                    tile,
+                    st.fast2.get(g, 0),
+                    True,
+                    True,
+                    **_route_front_early_kw(st, g),
                 ):
                     built.add(g)
     except Exception as e:  # noqa: BLE001 -- every rank decides together below
@@ -4288,8 +4325,9 @@ def _dp_pack_block(core, pk: _DpPack, x, L, rs_next, shared_expert, forked, main
         core.expert_offset,
         core.local_experts,
         core.hidden,
-        g in st.fast2,
+        st.fast2.get(g, 0),
         ownk,
+        **_route_front_early_kw(st, g),
     )
     rsi = getattr(core, "_rs_inject", None) if rs_next is not None else None
     fin = (
@@ -4566,6 +4604,12 @@ def _decode_forms(core) -> str:
             "mtp attn pack": getattr(core, "dp_mtp_attn_pack", False),
             "hc first x2": getattr(core, "hc_first_x2", False),
             "route fast2 rows": rows(getattr(route, "fast2", None) if route else None),
+            "route fast2 preload rows": [
+                r for r, f in sorted(getattr(route, "fast2", {}).items()) if f == 2
+            ]
+            if route
+            else [],
+            "route front early rows": rows(getattr(route, "early", None) if route else None),
             "draft moe tile": getattr(core, "_draft_moe_tactics", None) is not None,
             "launch order": getattr(core, "dp_launch_order", False),
             "index key fp8": getattr(core, "index_key_fp8", False),
@@ -7283,8 +7327,11 @@ class _RouteFront:
         # the front's launch, and each layer's staging buffer.
         self.decode: frozenset = frozenset()
         self.stages: list = []
-        # `DP_ROUTE_FAST2_ENV`: the row counts compiled with two tokens a warp on the fast path.
-        self.fast2: set = set()
+        # `DP_ROUTE_FAST2_ENV`: the row counts compiled with two tokens a warp on the fast path,
+        # and the form each takes (`_ROUTE_FRONT_FAST2_FORMS`).
+        self.fast2: dict = {}
+        # `DP_ROUTE_FRONT_EARLY_ENV`: the row counts compiled with the release after the wait.
+        self.early: set = set()
 
 
 def _route_front_tactic(runner, core, rows: int) -> tuple | None:
@@ -7381,7 +7428,8 @@ def _route_front_run(
             tile,
             core.expert_offset,
             core.local_experts,
-            rows in st.fast2,
+            st.fast2.get(rows, 0),
+            rows in st.early,
         )
     xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
     out = st.runner.run_moe_prerouted(
@@ -7485,15 +7533,35 @@ def _route_front_check(core, st: _RouteFront, L: _LayerWeights, layer: int, rows
     return ", ".join(bad)
 
 
-def _route_front_fast2(core, rows: int) -> bool:
-    """`DP_ROUTE_FAST2_ENV` for a route front of `rows` gathered rows: dep8's 64-expert window at
-    `_ROUTE_FRONT_FAST2_ROWS` with the switch on (the default)."""
+def _route_front_fast2(core, rows: int) -> int:
+    """`DP_ROUTE_FAST2_ENV` for a route front of `rows` gathered rows: the fast path's form
+    (`_ROUTE_FRONT_FAST2_FORMS`: 2 at dep4's 128-expert window, 1 at dep8's 64) at
+    `_ROUTE_FRONT_FAST2_ROWS` under attention DP with the switch on (the default), 2 at both with
+    the switch at `2`, else 0. Another value raises."""
+    raw = os.environ.get(DP_ROUTE_FAST2_ENV, "").strip()
+    forced = raw == "2"
+    on = forced or _switch(DP_ROUTE_FAST2_ENV, default=True)
     lo, hi = _ROUTE_FRONT_FAST2_ROWS
+    form = _ROUTE_FRONT_FAST2_FORMS.get(core.local_experts, 0)
+    if not (on and core.dp_size > 1 and form and lo <= rows <= hi):
+        return 0
+    return 2 if forced else form
+
+
+def _route_front_early_kw(st, rows: int) -> dict:
+    """`early=True` for a row count the route front releases early (`_RouteFront.early`), for the
+    routing-only fronts of the packed gather, else nothing."""
+    return {"early": True} if rows in getattr(st, "early", ()) else {}
+
+
+def _route_front_early(core, rows: int) -> bool:
+    """`DP_ROUTE_FRONT_EARLY_ENV` for a route front of `rows` gathered rows: under attention DP past
+    the lean form's rows, with PDL and the switch on (the default)."""
     return (
         core.dp_size > 1
-        and core.local_experts == _ROUTE_FRONT_WINDOWS[8]
-        and lo <= rows <= hi
-        and _switch(DP_ROUTE_FAST2_ENV, default=True)
+        and rows > _ROUTE_FRONT_LEAN_MAX_ROWS
+        and bool(get_env_enable_pdl())
+        and _switch(DP_ROUTE_FRONT_EARLY_ENV, default=True)
     )
 
 
@@ -7549,10 +7617,21 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
                 rows, core.hidden, core.hidden, core.local_experts, int(tactic[0])
             ):
                 continue
-            if _route_front_fast2(core, rows) and _route_front_compile(
-                rows, core.hidden, core.hidden, core.local_experts, int(tactic[0]), True
+            form = _route_front_fast2(core, rows)
+            if form and _route_front_compile(
+                rows, core.hidden, core.hidden, core.local_experts, int(tactic[0]), form
             ):
-                st.fast2.add(rows)
+                st.fast2[rows] = form
+            if _route_front_early(core, rows) and _route_front_compile(
+                rows,
+                core.hidden,
+                core.hidden,
+                core.local_experts,
+                int(tactic[0]),
+                st.fast2.get(rows, 0),
+                early=True,
+            ):
+                st.early.add(rows)
             n = sum(table_sizes(rows, core.topk, core.local_experts, int(tactic[0])))
             fill = (torch.arange(n, device=device) % rows).to(torch.int32)
             st.tactics[rows] = tactic
@@ -7572,13 +7651,15 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
             if rows not in st.tactics:
                 continue
             bad = _route_front_check(core, st, layers[i], i, rows, gen)
-            if bad and rows in st.fast2:
+            if bad and (rows in st.fast2 or rows in st.early):
                 logger.warning(
-                    f"{DP_ROUTE_FAST2_ENV}: layer {i} at {rows} gathered rows on the fast path "
-                    f"differs from the runner's own routing ({bad}); that row count keeps the "
-                    "two-token sort"
+                    f"{DP_ROUTE_FAST2_ENV} / {DP_ROUTE_FRONT_EARLY_ENV}: layer {i} at {rows} "
+                    f"gathered rows (fast path form {st.fast2.get(rows, 0)}, early release "
+                    f"{rows in st.early}) differs from the runner's own routing ({bad}); that row "
+                    "count keeps the two-token sort and the end release"
                 )
-                st.fast2.discard(rows)
+                st.fast2.pop(rows, None)
+                st.early.discard(rows)
                 bad = _route_front_check(core, st, layers[i], i, rows, gen)
             if bad and rows in st.refs:
                 logger.warning(
@@ -7602,7 +7683,13 @@ def _route_front_build(core, layers, device) -> _RouteFront | None:
     logger.info(
         f"MoE route front: rank {core.mapping.tp_rank} of {core.mapping.tp_size}, "
         f"{'gathered ' if dp else ''}rows {built}, tactics {[st.tactics[r] for r in built]}"
-        + (f", two tokens a warp on the fast path at {sorted(st.fast2)}" if st.fast2 else "")
+        + (
+            f", two tokens a warp on the fast path at {sorted(st.fast2)} (forms "
+            f"{[st.fast2[r] for r in sorted(st.fast2)]})"
+            if st.fast2
+            else ""
+        )
+        + (f", FC1 released after the wait at {sorted(st.early)}" if st.early else "")
     )
     return st
 

@@ -13,6 +13,10 @@
   activation, at a tep4 rank on its own rows with the site's activation, which the runner reads.
 * The build is off with the switch at 0, away from attention DP and tep4, on host weights, and
   away from the certified windows (128 experts at dep4 / tep4, 64 at dep8) and GPU (SM103).
+* Past 512 gathered rows the fast path's form follows the window (`_ROUTE_FRONT_FAST2_FORMS`:
+  dep4 2, dep8 1); past the lean rows an attention-DP front releases FC1 after its wait
+  (`DP_ROUTE_FRONT_EARLY_ENV`), with PDL; the run passes both to the launch, and a row count
+  whose check fails on them drops both and is checked again.
 
 The ops are recorders; no kernel runs.
 """
@@ -295,12 +299,17 @@ def test_build_takes_the_certified_windows(monkeypatch, dp_size, local_experts):
 @pytest.mark.parametrize(
     "dp_size, local, rows, value, expected",
     [
-        (8, 64, 544, None, True),
-        (8, 64, 1024, "1", True),
-        (8, 64, 512, None, False),  # one token a warp: nothing to change
-        (8, 64, 544, "0", False),
-        (4, 128, 640, None, False),  # dep4's window: not measured
-        (1, 128, 16, None, False),
+        (8, 64, 544, None, 1),
+        (8, 64, 1024, "1", 1),
+        (8, 64, 512, None, 0),  # one token a warp: nothing to change
+        (8, 64, 544, "0", 0),
+        (4, 128, 528, None, 2),  # dep4's window: the second token's logits first (front512)
+        (4, 128, 832, "1", 2),
+        (4, 128, 1024, "0", 0),
+        (8, 64, 768, "2", 2),  # the A/B value: form 2 at dep8 too
+        (4, 128, 512, "2", 0),
+        (2, 256, 640, None, 0),  # dep2's window: no route front
+        (1, 128, 16, None, 0),
     ],
 )
 def test_fast2_rows(monkeypatch, dp_size, local, rows, value, expected):
@@ -309,16 +318,43 @@ def test_fast2_rows(monkeypatch, dp_size, local, rows, value, expected):
     else:
         monkeypatch.setenv(M.DP_ROUTE_FAST2_ENV, value)
     core = SimpleNamespace(dp_size=dp_size, local_experts=local)
-    assert M._route_front_fast2(core, rows) is expected
+    assert M._route_front_fast2(core, rows) == expected
 
 
-@pytest.mark.parametrize("fast2", [False, True])
-def test_run_passes_the_fast_path(monkeypatch, fast2):
-    """`_route_front_run` launches the row count's compiled form."""
+def test_fast2_rejects_another_value(monkeypatch):
+    monkeypatch.setenv(M.DP_ROUTE_FAST2_ENV, "3")
+    with pytest.raises(ValueError):
+        M._route_front_fast2(SimpleNamespace(dp_size=4, local_experts=128), 640)
+
+
+@pytest.mark.parametrize(
+    "dp_size, rows, value, pdl, expected",
+    [
+        (4, 272, None, True, True),  # past the lean form's 256 rows
+        (8, 448, None, True, True),
+        (4, 832, "1", True, True),
+        (4, 256, None, True, False),  # the lean form releases at its start already
+        (4, 640, "0", True, False),
+        (4, 640, None, False, False),  # no PDL: nothing to release
+        (1, 16, None, True, False),  # tep4
+    ],
+)
+def test_early_rows(monkeypatch, dp_size, rows, value, pdl, expected):
+    if value is None:
+        monkeypatch.delenv(M.DP_ROUTE_FRONT_EARLY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_ROUTE_FRONT_EARLY_ENV, value)
+    monkeypatch.setattr(M, "get_env_enable_pdl", lambda: pdl)
+    assert M._route_front_early(SimpleNamespace(dp_size=dp_size), rows) is expected
+
+
+@pytest.mark.parametrize("fast2, early", [(0, False), (1, False), (2, False), (2, True)])
+def test_run_passes_the_fast_path(monkeypatch, fast2, early):
+    """`_route_front_run` launches the row count's compiled form and release."""
     seen = []
 
-    def front(logits, x, gscale, flat, tile, offset, local, f2):
-        seen.append(f2)
+    def front(logits, x, gscale, flat, tile, offset, local, f2, early=False):
+        seen.append((f2, early))
         return None, None, torch.zeros(2, 10), torch.zeros(2, 10)
 
     class Runner:
@@ -331,7 +367,9 @@ def test_run_passes_the_fast_path(monkeypatch, fast2):
     st.flats = {544: [torch.zeros(4, dtype=torch.int32)]}
     st.views = {544: [[torch.zeros(1)] * 6]}
     if fast2:
-        st.fast2.add(544)
+        st.fast2[544] = fast2
+    if early:
+        st.early.add(544)
     L = SimpleNamespace(moe_gscale=None)
     for name in ("fc1_w", "fc1_s", "fc2_w", "fc2_s", "out1_scale", "out1_gate_scale", "out2_scale"):
         setattr(L, name, None)
@@ -342,4 +380,85 @@ def test_run_passes_the_fast_path(monkeypatch, fast2):
         M._route_front_run(core, st, torch.zeros(544, 8), L, 0, torch.zeros(544, 512))
     except Exception:  # noqa: BLE001 -- the runner stand-in stops short; the front ran first
         pass
-    assert seen == [fast2]
+    assert seen == [(fast2, early)]
+
+
+class _Gen:
+    def __init__(self, device=None):
+        pass
+
+    def manual_seed(self, seed):
+        return self
+
+
+@pytest.mark.parametrize("fails_on_forms", [False, True])
+def test_build_compiles_the_forms_and_drops_them_on_a_failed_check(monkeypatch, fails_on_forms):
+    """dep4 at 33 and 52 requests a rank (528 / 832 gathered rows): the build compiles the plain
+    front, the fast path in form 2 and the early release; a check that fails on them drops both
+    for that row count and checks it again on the plain form, which keeps the route front."""
+    for env in (M.DP_ROUTE_FRONT_ENV, M.DP_ROUTE_FAST2_ENV, M.DP_ROUTE_FRONT_EARLY_ENV):
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: _NullCtx())
+    monkeypatch.setattr(torch, "Generator", _Gen)
+    arange = torch.arange
+    monkeypatch.setattr(torch, "arange", lambda n, device=None: arange(n))
+    monkeypatch.setattr(M, "get_env_enable_pdl", lambda: True)
+    monkeypatch.setattr(M, "_moe_runner", lambda: None)
+    monkeypatch.setattr(M, "_route_front_tactic", lambda runner, core, rows: (32, 32))
+    compiled = []
+
+    def compile_front(rows, hidden, stride, local, tile, fast2=False, early=False):
+        compiled.append((rows, int(fast2), early))
+        return True
+
+    monkeypatch.setattr(M, "_route_front_compile", compile_front)
+    checked = []
+
+    def check(core, st, L, i, rows, gen):
+        checked.append((rows, st.fast2.get(rows, 0), rows in st.early))
+        return "selected experts" if fails_on_forms and rows in st.early else ""
+
+    monkeypatch.setattr(M, "_route_front_check", check)
+    monkeypatch.setattr(M, "table_sizes", lambda *a: [4])
+    monkeypatch.setattr(M, "table_views", lambda flat, *a: [flat])
+    core = SimpleNamespace(
+        dp_size=4,
+        tep_fast=False,
+        one_rank=False,
+        trunk_moe_backend="TRTLLM",
+        num_experts=512,
+        topk=10,
+        local_experts=128,
+        hidden=2560,
+        num_layers=2,
+        max_verify_rows=4,
+        model_config=SimpleNamespace(cuda_graph_batch_sizes=[33, 52]),
+        mapping=SimpleNamespace(tp_rank=0, tp_size=4),
+    )
+    layers = [SimpleNamespace(fc1_w=torch.zeros(1)), SimpleNamespace(fc1_w=torch.zeros(1))]
+    st = M._route_front_build(core, layers, torch.device("cuda"))
+    assert compiled == [
+        (528, 0, False),
+        (528, 2, False),
+        (528, 2, True),
+        (832, 0, False),
+        (832, 2, False),
+        (832, 2, True),
+    ]
+    assert sorted(st.tactics) == [528, 832]
+    if fails_on_forms:
+        assert st.fast2 == {} and st.early == set()
+        assert checked == [(528, 2, True), (528, 0, False), (832, 2, True), (832, 0, False)]
+    else:
+        assert st.fast2 == {528: 2, 832: 2} and st.early == {528, 832}
+        assert checked == [(528, 2, True), (832, 2, True)]
+
+
+class _NullCtx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
