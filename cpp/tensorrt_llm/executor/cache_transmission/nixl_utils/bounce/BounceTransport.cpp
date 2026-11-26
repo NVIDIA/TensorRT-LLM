@@ -227,7 +227,7 @@ void BounceContext::sendGrants(std::vector<Grant> const& grants)
         auto [peer, id, rid] = splitKey(flow);
         if (auto window = windows.find(id, peer))
         {
-            channel->sendTo(peer, signBounceFrame(encodeGrant(rid, creds), window->key()));
+            channel->sendTo(peer, signBounceFrame(encodeGrant(rid, creds), window->key(), window->id()));
         }
     }
 }
@@ -306,7 +306,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         TLLM_LOG_WARNING(
             "BounceTransport(%s): rejected WANT from peer %s: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
     }
-    auto const key = makeKey(peer, bounceWindowId(window->key()), h.requestId);
+    auto const key = makeKey(peer, window->id(), h.requestId);
     if (isCancelWant(chunkBytes))
     {
         // Explicit cancel/abort (the sender failed or retracted): precisely free this flow's
@@ -355,7 +355,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
                 mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), bytes,
                 static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
             // Request-level NACK: the sender fails now instead of waiting out requestTimeoutMs.
-            mCtx.channel->sendTo(peer, signBounceFrame(encodeNack(h.requestId, 0, 0), window->key()));
+            mCtx.channel->sendTo(peer, signBounceFrame(encodeNack(h.requestId, 0, 0), window->key(), window->id()));
             return;
         }
     }
@@ -374,7 +374,7 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     {
         return;
     }
-    auto const key = makeKey(peer, bounceWindowId(window->key()), h.requestId);
+    auto const key = makeKey(peer, window->id(), h.requestId);
     // Drop a DATA whose region this flow no longer holds — it was cancelled/reclaimed (e.g. an empty
     // WANT raced ahead of this DATA), and the region may have been re-granted to another flow.
     // Scattering it would read a freed/re-owned region and corrupt that other flow's data.
@@ -613,7 +613,7 @@ void BounceReceiver::recoverScatterJob(
         try
         {
             mCtx.channel->sendTo(
-                job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key()));
+                job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
         }
         catch (std::exception const& sendErr)
         {
@@ -737,31 +737,42 @@ void BounceReceiver::scatterWorkerLoop()
                         static_cast<unsigned long long>(job.rid), job.chunkIdx);
                     inBounds = false;
                 }
+                auto const destinationAllowed = [&](std::uint64_t address, std::uint64_t length) {
+                    auto const it = regions.upper_bound(address);
+                    if (it == regions.begin())
+                    {
+                        return false;
+                    }
+                    auto const& [base, registration] = *std::prev(it);
+                    auto const [bytes, device] = registration;
+                    auto const offset = address - base;
+                    return device == static_cast<std::uint32_t>(mCtx.deviceId) && offset < bytes
+                        && length <= bytes - offset && job.window->contains(address, length);
+                };
+
                 std::size_t nTotal = 0;
                 std::uint64_t seen = 0;
                 for (std::uint32_t i = 0; i < n && inBounds; ++i)
                 {
                     auto const& e = job.entries[i];
+                    auto const steps = static_cast<std::uint64_t>(e.count - 1);
+                    if (steps && e.dstStride > (UINT64_MAX - e.dstAddr) / steps)
+                    {
+                        inBounds = false;
+                        break;
+                    }
+                    auto const span = steps * e.dstStride;
+                    if (e.pieceSize > UINT64_MAX - (e.dstAddr + span))
+                    {
+                        inBounds = false;
+                        break;
+                    }
+                    // Contiguous runs need one lookup. A strided run spanning multiple
+                    // intervals must still establish ownership of every piece.
+                    bool const covered = destinationAllowed(e.dstAddr, span + e.pieceSize);
                     for (std::uint32_t p = 0; p < e.count; ++p)
                     {
-                        if (p != 0 && e.dstStride > (UINT64_MAX - e.dstAddr) / p)
-                        {
-                            inBounds = false;
-                            break;
-                        }
-                        auto const address = e.dstAddr + p * e.dstStride;
-                        auto it = regions.upper_bound(address);
-                        if (it == regions.begin())
-                        {
-                            inBounds = false;
-                            break;
-                        }
-                        auto const& [base, registration] = *std::prev(it);
-                        auto const [bytes, device] = registration;
-                        auto const offset = address - base;
-                        if (device != static_cast<std::uint32_t>(mCtx.deviceId)
-                            || !job.window->contains(address, e.pieceSize) || offset >= bytes
-                            || e.pieceSize > bytes - offset)
+                        if (!covered && !destinationAllowed(e.dstAddr + p * e.dstStride, e.pieceSize))
                         {
                             inBounds = false;
                             break;
@@ -832,13 +843,13 @@ void BounceReceiver::scatterWorkerLoop()
                     kNvtxAckSend, "ackSend rid=%llu chunk=%u", static_cast<unsigned long long>(job.rid), job.chunkIdx);
                 acked = true;
                 mCtx.channel->sendTo(
-                    job.peer, signBounceFrame(encodeAck(job.rid, job.chunkIdx, job.offset), job.window->key()));
+                    job.peer, signBounceFrame(encodeAck(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
             }
             else
             {
                 nackSent = true;
                 mCtx.channel->sendTo(
-                    job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key()));
+                    job.peer, signBounceFrame(encodeNack(job.rid, job.chunkIdx, job.offset), job.window->key(), job.window->id()));
             }
             {
                 std::lock_guard<std::mutex> lk(mDoneMu);
@@ -911,6 +922,7 @@ std::shared_future<BounceResult> BounceSender::submit(
         chunkBytes[i] = static_cast<std::uint32_t>(plan.chunks()[i].packedBytes);
     }
 
+    auto const windowId = bounceWindowId(windowKey);
     std::uint64_t const rid = mNextRid.fetch_add(1, std::memory_order_relaxed);
     std::uint64_t const planBytes = plan.totalBytes();
     {
@@ -918,6 +930,7 @@ std::shared_future<BounceResult> BounceSender::submit(
         Request req;
         req.peer = peer;
         req.windowKey = windowKey;
+        req.windowId = windowId;
         req.numChunks = numChunks;
         req.plan = std::move(plan);
         req.promise = promise;
@@ -931,7 +944,7 @@ std::shared_future<BounceResult> BounceSender::submit(
     }
     // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
     // own control endpoint so the receiver can addPeer us and send GRANT/ACK back (self-bootstrap).
-    mCtx.channel->sendTo(peer, signBounceFrame(encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()), windowKey));
+    mCtx.channel->sendTo(peer, signBounceFrame(encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()), windowKey, windowId));
     if (mCtx.cfg.enableEagerGather)
     {
         // Overlap the WANT->GRANT control round-trip with the gather: launch this request's first
@@ -1365,7 +1378,7 @@ bool BounceSender::pollSenderHandles()
                         static_cast<std::size_t>(nRuns) * sizeof(BounceScatterRun));
                     mCtx.channel->sendTo(req.peer,
                         signBounceFrame(encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns),
-                            req.windowKey));
+                            req.windowKey, req.windowId));
                 }
                 if (!p.xfer->release())
                 {
@@ -1702,7 +1715,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     else
     {
         mCtx.channel->sendTo(
-            req.peer, signBounceFrame(encodeCancel(rid, mCtx.channel->localEndpoint()), req.windowKey));
+            req.peer, signBounceFrame(encodeCancel(rid, mCtx.channel->localEndpoint()), req.windowKey, req.windowId));
     }
     bounceRangeEnd(req.nvtxGrantWait);
     bounceRangeEnd(req.nvtxCreditStarved);

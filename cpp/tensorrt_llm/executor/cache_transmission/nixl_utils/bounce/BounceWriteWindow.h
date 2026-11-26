@@ -50,6 +50,11 @@ public:
         return mEndpoint;
     }
 
+    [[nodiscard]] std::string const& id() const noexcept
+    {
+        return mId;
+    }
+
     [[nodiscard]] std::string const& key() const noexcept
     {
         return mKey;
@@ -62,6 +67,7 @@ private:
     std::string mPeer;
     std::string mEndpoint;
     std::string mKey;
+    std::string mId;
     std::vector<Range> mRanges;
     mutable std::shared_mutex mMutex;
     bool mOpen{true};
@@ -84,7 +90,8 @@ private:
 // Domain-separated from KV result reporting. The key is never transmitted in
 // the bounce channel. Both the operation and its complete payload are signed.
 std::string bounceWindowId(std::string const& key);
-std::string signBounceFrame(std::string const& frame, std::string const& key);
+std::string signBounceFrame(std::string frame, std::string const& key);
+std::string signBounceFrame(std::string frame, std::string const& key, std::string const& id);
 bool readBounceWindowId(std::string const& envelope, std::size_t payloadEnd, std::string& id);
 bool verifyBounceFrame(std::string const& envelope, std::string const& key);
 

@@ -56,10 +56,17 @@ std::string bounceWindowId(std::string const& key)
     return signature(key, "TRTLLM bounce window id v1");
 }
 
-std::string signBounceFrame(std::string const& frame, std::string const& key)
+std::string signBounceFrame(std::string frame, std::string const& key)
 {
-    auto envelope = frame + bounceWindowId(key);
-    return envelope + signature(key, envelope);
+    return signBounceFrame(std::move(frame), key, bounceWindowId(key));
+}
+
+std::string signBounceFrame(std::string frame, std::string const& key, std::string const& id)
+{
+    frame.reserve(frame.size() + 2 * kTagBytes);
+    frame.append(id);
+    frame.append(signature(key, frame));
+    return frame;
 }
 
 bool readBounceWindowId(std::string const& envelope, std::size_t payloadEnd, std::string& id)
@@ -87,8 +94,12 @@ BounceWriteWindow::BounceWriteWindow(std::string peer, std::string endpoint, std
     : mPeer(std::move(peer))
     , mEndpoint(std::move(endpoint))
     , mKey(std::move(key))
+    , mId(bounceWindowId(mKey))
 {
-    std::sort(ranges.begin(), ranges.end());
+    if (!std::is_sorted(ranges.begin(), ranges.end()))
+    {
+        std::sort(ranges.begin(), ranges.end());
+    }
     for (auto const& [base, len] : ranges)
     {
         if (!len || base > std::numeric_limits<std::uint64_t>::max() - len)
@@ -145,11 +156,10 @@ void BounceWriteWindow::close()
 std::shared_ptr<BounceWriteWindow> BounceWriteWindows::add(
     std::string peer, std::string endpoint, std::string key, std::vector<BounceWriteWindow::Range> ranges)
 {
-    auto id = bounceWindowId(key);
     auto window
         = std::make_shared<BounceWriteWindow>(std::move(peer), std::move(endpoint), std::move(key), std::move(ranges));
     std::lock_guard lock(mMutex);
-    if (!mWindows.emplace(std::move(id), window).second)
+    if (!mWindows.emplace(window->id(), window).second)
     {
         throw std::invalid_argument("Bounce receive window already registered");
     }

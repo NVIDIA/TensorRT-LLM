@@ -369,6 +369,7 @@ private:
     struct Request
     {
         std::string windowKey;
+        std::string windowId;
         std::string peer;
         std::uint32_t numChunks{};
         BounceTransferPlan plan;
