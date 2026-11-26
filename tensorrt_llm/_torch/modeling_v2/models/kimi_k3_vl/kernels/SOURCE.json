@@ -852,10 +852,12 @@
    "source": "tensorrt_llm/_torch/attention/backends/fp4_mla/cute_dsl_utils.py",
    "source_sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
    "import_edits": [],
-   "local_edits": [],
-   "sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
+   "local_edits": [
+    "Serialize FP4 MLA compilation with the shared lock and filter PyIR status messages."
+   ],
+   "sha256": "54589e24ccf94d04b68e68f9b6cc70df30be72c394004628be7096122adc39a8",
    "target_path": "kernels/fp4_mla_cute_dsl_utils.py",
-   "reused": "byte-identical to the family's file, which the target now imports"
+   "reused": "The ULL target imports the Kimi K3 family implementation directly."
   },
   "ops/chain/k3_ull_prefetch.py": {
    "source": "NVIDIA implementation developed for the vLLM Kimi K3 Rubin decode backend",
