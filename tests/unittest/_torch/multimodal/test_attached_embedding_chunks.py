@@ -115,10 +115,11 @@ def test_chunked_long_attachment_matches_unchunked(
     llm, chunked_llm, encoder = engines
     params = SamplingParams(max_tokens=32)
     media = [images["large"]]
-    # The second prompt shares the image with the first but not the text after
-    # it, so it reuses the KV cache the first one's sliced chunks wrote. Reuse
-    # perturbs the numerics, so after it the reference is the raw image on the
-    # same chunked engine rather than the unchunked engine.
+    # The first attached request prefills cold, consuming every sliced row.
+    # The second prompt shares the image but not the text after it, so it
+    # reuses the KV cache the first one's chunks wrote. Reuse perturbs the
+    # numerics, so the chunked reference is the raw image on the same engine,
+    # run after the attached request so its blocks cannot warm it.
     for index, prompt in enumerate(
         ("Describe the image in detail.", "What colors are in this picture?")
     ):
@@ -129,19 +130,20 @@ def test_chunked_long_attachment_matches_unchunked(
         assert rows > 3 * _CHUNK_TOKENS
         expected = llm.generate(raw_inputs, params)
         assert llm.generate(inputs, params).outputs[0].token_ids == expected.outputs[0].token_ids
-        chunked_expected = chunked_llm.generate(raw_inputs, params)
         output = chunked_llm.generate(inputs, params)
+        chunked_expected = chunked_llm.generate(raw_inputs, params)
         assert output.outputs[0].token_ids == chunked_expected.outputs[0].token_ids
+        image_positions = [
+            position
+            for position, token in enumerate(expected.prompt_token_ids)
+            if token == _IMAGE_TOKEN_ID
+        ]
+        assert len(image_positions) == rows
         if index == 0:
+            assert output.cached_tokens < image_positions[0]
             assert output.outputs[0].token_ids == expected.outputs[0].token_ids
-
-    image_positions = [
-        position
-        for position, token in enumerate(expected.prompt_token_ids)
-        if token == _IMAGE_TOKEN_ID
-    ]
-    assert len(image_positions) == rows
-    assert output.cached_tokens > image_positions[-1]
+        else:
+            assert output.cached_tokens > image_positions[-1]
 
 
 @pytest.mark.threadleak(enabled=False)

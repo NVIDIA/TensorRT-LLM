@@ -12817,7 +12817,6 @@ class PyExecutor:
                     "whose KV blocks a transfer still owns")
         # The sequences of an n>1 request share one client result, which the
         # first error response ends; a second one crashes the response path.
-        responded_groups = set()
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -12831,11 +12830,13 @@ class PyExecutor:
             if (getattr(request, "context_remaining_length", 0) > 0 and getattr(
                     request, "context_current_position", None) == 0):
                 request.py_kv_reuse_poisoned = True
+            group = getattr(request, "py_sequence_group", None)
+            if group is not None:
+                if group.error_sent:
+                    continue
+                group.error_sent = True
             group_id = (request.parent_request_id if getattr(
                 request, "is_child", False) else req_id)
-            if group_id in responded_groups:
-                continue
-            responded_groups.add(group_id)
             # The group answers under its parent's id, which callers await.
             error_responses[group_id] = LlmResponse(
                 request_id=group_id,

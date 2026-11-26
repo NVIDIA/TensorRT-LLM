@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmResult,
     PyResult,
     SamplingConfig,
+    SequenceGroupState,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
@@ -811,7 +812,12 @@ def test_failed_parent_fails_its_child_sequences() -> None:
 
 
 @pytest.mark.parametrize("child_first", [False, True])
-def test_failed_sequence_group_gets_one_error_response(child_first: bool) -> None:
+@pytest.mark.parametrize("separate_calls", [False, True])
+def test_failed_sequence_group_gets_one_error_response(
+    child_first: bool, separate_calls: bool
+) -> None:
+    group = SequenceGroupState()
+
     def sequence(request_id: int, parent_id: int | None) -> types.SimpleNamespace:
         return types.SimpleNamespace(
             py_request_id=request_id,
@@ -819,6 +825,7 @@ def test_failed_sequence_group_gets_one_error_response(child_first: bool) -> Non
             parent_request_id=parent_id,
             py_client_id=7,
             context_remaining_length=0,
+            py_sequence_group=group,
         )
 
     parent, child = sequence(1, None), sequence(10, 1)
@@ -833,11 +840,15 @@ def test_failed_sequence_group_gets_one_error_response(child_first: bool) -> Non
     executor._transfer_owns_request_blocks.return_value = False
 
     failed = [child, parent] if child_first else [parent, child]
+    for requests in [failed[:1], failed[1:]] if separate_calls else [failed]:
+        PyExecutor._handle_errors(executor, "over budget", requests=requests, charge_budget=False)
 
-    PyExecutor._handle_errors(executor, "over budget", requests=failed, charge_budget=False)
-
-    ((responses,), _) = executor._enqueue_responses.call_args
-    assert [(req_id, response.request_id) for req_id, response in responses] == [(1, 1)]
+    responses = [
+        (req_id, response.request_id)
+        for call in executor._enqueue_responses.call_args_list
+        for req_id, response in call.args[0]
+    ]
+    assert responses == [(1, 1)]
     assert executor.active_requests == []
     assert [call.args[0] for call in executor._terminate_request.call_args_list] == failed
 

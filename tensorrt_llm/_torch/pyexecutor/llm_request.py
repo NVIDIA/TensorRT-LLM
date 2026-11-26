@@ -879,6 +879,14 @@ class LlmResult:
 
 
 @dataclass
+class SequenceGroupState:
+    """State shared by the sequences of one request, parent and children."""
+
+    # The group's client result ends with its first error response.
+    error_sent: bool = False
+
+
+@dataclass
 class LlmResponse:
     request_id: int
     error_msg: Optional[str] = None
@@ -1140,6 +1148,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
+        self.py_sequence_group = SequenceGroupState()
 
         self._validation_error = _validation_error
 
@@ -1500,6 +1509,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
         child.is_cuda_graph_dummy = self.is_cuda_graph_dummy
+        child.py_sequence_group = self.py_sequence_group
 
         # Register only after all input copies and Python initialization succeed.
         self._register_child_request(child)
