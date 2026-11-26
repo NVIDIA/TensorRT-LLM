@@ -24,11 +24,15 @@ with warnings.catch_warnings():
         message=(
             rf"^Protobuf gencode version {re.escape(_PROTOBUF_GENCODE)} is exactly one major "
             rf"version older than the runtime version {_PROTOBUF_RUNTIME_MAJOR}\.[0-9.]+ at "
-            r"openengine/v1/[A-Za-z0-9_]+\.proto\."
+            r"(?:openengine/v1|trtllm/openengine/v1)/[A-Za-z0-9_]+\.proto\."
         ),
         category=UserWarning,
     )
     from ._generated import (
+        encoded_media_pb2,
+        encoder_transfer_pb2,
+        encoder_transfer_pb2_grpc,
+        encoding_pb2,
         error_pb2,
         generation_pb2,
         kv_pb2,
@@ -45,6 +49,10 @@ __all__ = [
     "MINIMUM_CLIENT_REVISION",
     "SCHEMA_RELEASE",
     "SCHEMA_REVISION",
+    "encoded_media_pb2",
+    "encoding_pb2",
+    "encoder_transfer_pb2",
+    "encoder_transfer_pb2_grpc",
     "error_pb2",
     "generation_pb2",
     "kv_pb2",

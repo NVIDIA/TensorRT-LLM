@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
+import grpc
 import pytest
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
@@ -681,3 +682,23 @@ def test_collect_once_exposes_iteration_and_rank():
     assert record.per_iter["iter"] == 7
     assert record.per_iter["attentionDpRank"] == 2
     owner._record_error.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status, expected",
+    [
+        (grpc.StatusCode.OK, "engine_error"),
+        (grpc.StatusCode.CANCELLED, "cancelled"),
+        (grpc.StatusCode.DEADLINE_EXCEEDED, "timeout"),
+    ],
+)
+def test_rpc_status_preserves_engine_error_or_overrides_with_cancellation_once(status, expected):
+    from tensorrt_llm.grpc.openengine.metrics import RequestMetrics
+
+    outcomes = []
+    metrics = RequestMetrics(SimpleNamespace(record_outcome=lambda *value: outcomes.append(value)))
+    metrics.accepted()
+    metrics.engine_failed()
+    metrics.finish(status)
+    metrics.finish(status)
+    assert outcomes == [("aggregated", expected)]

@@ -211,6 +211,7 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    'grpc/openengine/proto/trtllm/openengine/v1/*.proto',
 ]
 
 # MSA packages staged under 3rdparty/ by scripts/build_wheel.py from the msa_vllm

@@ -130,6 +130,25 @@ def _handoff(request, payload):
     request.kv.session.CopyFrom(session)
 
 
+@pytest.mark.parametrize(
+    "kind,expected_digest",
+    [
+        ("prompt", "3edfbe3bcb8cb71664d6318a01dea1dc1197ce7485e9b26b2ffb7321e770013b"),
+        ("token_ids", "a1c2bb24c97e2044995a0764718462ffcde11f2ae583bcf7716f2544931caae8"),
+    ],
+)
+def test_prepared_decode_preserves_version_one_digest(kind, expected_digest):
+    llm, request, capture, _ = _fixture()
+    if kind == "token_ids":
+        request.token_ids.ids.extend([1, 2, 3])
+    payload = json.loads(_decode_preparation(request, llm, capture))
+    assert payload["version"] == 1
+    assert payload["input_digest"] == expected_digest
+    assert payload["config_digest"] == (
+        "16bc205841cb67c7cf250e7b84d5c96234d98146a6c303d8eb161b0b226e06fe"
+    )
+
+
 def test_qwen_prepared_decode_roundtrip_preserves_tokens_and_positions():
     llm, request, capture, positions = _fixture()
     payload = _decode_preparation(request, llm, capture)

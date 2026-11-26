@@ -6,6 +6,7 @@
 import grpc
 import warnings
 
+from . import encoding_pb2 as openengine_dot_v1_dot_encoding__pb2
 from . import generation_pb2 as openengine_dot_v1_dot_generation__pb2
 from . import kv_pb2 as openengine_dot_v1_dot_kv__pb2
 from . import lifecycle_pb2 as openengine_dot_v1_dot_lifecycle__pb2
@@ -43,8 +44,8 @@ class InferenceStub(object):
     - traceparent and tracestate: W3C Trace Context.
 
     The openengine- prefix is reserved for metadata defined by this protocol.
-    Routing and admission keys apply to Inference RPCs. Trace Context applies to
-    every RPC and should be propagated across downstream calls.
+    Routing and admission keys apply to Generate and Encode. Trace Context applies
+    to every RPC and should be propagated across downstream calls.
 
     """
 
@@ -71,8 +72,8 @@ class InferenceServicer(object):
     - traceparent and tracestate: W3C Trace Context.
 
     The openengine- prefix is reserved for metadata defined by this protocol.
-    Routing and admission keys apply to Inference RPCs. Trace Context applies to
-    every RPC and should be propagated across downstream calls.
+    Routing and admission keys apply to Generate and Encode. Trace Context applies
+    to every RPC and should be propagated across downstream calls.
 
     """
 
@@ -109,8 +110,8 @@ class Inference(object):
     - traceparent and tracestate: W3C Trace Context.
 
     The openengine- prefix is reserved for metadata defined by this protocol.
-    Routing and admission keys apply to Inference RPCs. Trace Context applies to
-    every RPC and should be propagated across downstream calls.
+    Routing and admission keys apply to Generate and Encode. Trace Context applies
+    to every RPC and should be propagated across downstream calls.
 
     """
 
@@ -131,6 +132,126 @@ class Inference(object):
             '/openengine.v1.Inference/Generate',
             openengine_dot_v1_dot_generation__pb2.GenerateRequest.SerializeToString,
             openengine_dot_v1_dot_generation__pb2.GenerateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class EncoderStub(object):
+    """Optional service for engines that produce transferable encoded media.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Encode = channel.unary_unary(
+                '/openengine.v1.Encoder/Encode',
+                request_serializer=openengine_dot_v1_dot_encoding__pb2.EncodeRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_encoding__pb2.EncodeResponse.FromString,
+                _registered_method=True)
+        self.ReleaseEncodedMedia = channel.unary_unary(
+                '/openengine.v1.Encoder/ReleaseEncodedMedia',
+                request_serializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.FromString,
+                _registered_method=True)
+
+
+class EncoderServicer(object):
+    """Optional service for engines that produce transferable encoded media.
+    """
+
+    def Encode(self, request, context):
+        """Produce engine-owned media outputs; the endpoint's role is set at startup.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseEncodedMedia(self, request, context):
+        """Release a completed output at its producer; never cancels an active transfer.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_EncoderServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Encode': grpc.unary_unary_rpc_method_handler(
+                    servicer.Encode,
+                    request_deserializer=openengine_dot_v1_dot_encoding__pb2.EncodeRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_encoding__pb2.EncodeResponse.SerializeToString,
+            ),
+            'ReleaseEncodedMedia': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseEncodedMedia,
+                    request_deserializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'openengine.v1.Encoder', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('openengine.v1.Encoder', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class Encoder(object):
+    """Optional service for engines that produce transferable encoded media.
+    """
+
+    @staticmethod
+    def Encode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Encoder/Encode',
+            openengine_dot_v1_dot_encoding__pb2.EncodeRequest.SerializeToString,
+            openengine_dot_v1_dot_encoding__pb2.EncodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseEncodedMedia(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Encoder/ReleaseEncodedMedia',
+            openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaRequest.SerializeToString,
+            openengine_dot_v1_dot_encoding__pb2.ReleaseEncodedMediaResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -175,6 +296,11 @@ class ControlStub(object):
                 '/openengine.v1.Control/Abort',
                 request_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.FromString,
+                _registered_method=True)
+        self.Shutdown = channel.unary_unary(
+                '/openengine.v1.Control/Shutdown',
+                request_serializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.FromString,
                 _registered_method=True)
         self.LoadLora = channel.unary_unary(
                 '/openengine.v1.Control/LoadLora',
@@ -238,6 +364,13 @@ class ControlServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Shutdown(self, request, context):
+        """Identity-fenced, idempotent shutdown of the entire engine serving group.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def LoadLora(self, request, context):
         """LoRA lifecycle.
         """
@@ -297,6 +430,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.Abort,
                     request_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.SerializeToString,
+            ),
+            'Shutdown': grpc.unary_unary_rpc_method_handler(
+                    servicer.Shutdown,
+                    request_deserializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.SerializeToString,
             ),
             'LoadLora': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadLora,
@@ -459,6 +597,33 @@ class Control(object):
             '/openengine.v1.Control/Abort',
             openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.SerializeToString,
             openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Shutdown(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Control/Shutdown',
+            openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.SerializeToString,
+            openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -299,6 +299,7 @@ def _assert_transfer_only_progress(
 ) -> PyExecutor:
     """Exercise real idle and shutdown predicates against each rank's lifecycle state."""
     executor = object.__new__(PyExecutor)
+    executor.dist = dist
     executor._disagg_coordinator = harness.coordinator
     executor.kv_cache_transceiver = harness.transceiver
     executor.async_transfer_manager = harness.transfers
@@ -311,7 +312,6 @@ def _assert_transfer_only_progress(
     assert not executor.should_stop_processing
 
     executor.is_shutdown = False
-    executor.dist = dist
     executor.enable_attention_dp = False
     executor.control_requests = []
     executor.request_accumulated = []
