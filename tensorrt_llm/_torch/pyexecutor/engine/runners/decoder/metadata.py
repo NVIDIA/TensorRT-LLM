@@ -356,43 +356,27 @@ def captures_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mappi
     )
 
 
-def merged_sampling_graphs_blocker(
-    metadata: SpecMetadata, config: DecoderRunnerConfig, mapping: Mapping | None
-) -> str | None:
+def merged_sampling_graphs_blocker(metadata: SpecMetadata, config: DecoderRunnerConfig) -> str | None:
     """Why this engine cannot merge its greedy and sampling graphs, or None when it can.
 
-    Merged graphs record the greedy and the sampling variant of every sampling site under
-    conditional nodes (``graph_conditional``). Only the sites of the plain one-engine EAGLE3
-    worker are conditional so far; any engine with a divergence elsewhere keeps two graphs.
+    Merged graphs record the greedy and the sampling variant of DSpark's fused acceptance
+    under conditional nodes (``graph_conditional``); any other engine keeps two graphs.
     """
     from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
 
     if not graph_conditional.conditional_nodes_available():
         return "this torch cannot capture CUDA graph conditional nodes"
-    is_dspark = type(metadata) is DSparkSpecMetadata
-    if type(metadata) is not Eagle3OneModelSpecMetadata and not is_dspark:
+    if type(metadata) is not DSparkSpecMetadata:
         return f"{type(metadata).__name__} has no conditional sampling sites"
-    if is_dspark:
-        # DSpark's branches (the fused strict accept and the sampler) are rank-local launches
-        # with no collective, so ranks may take different branches. Anything that adds a
-        # per-variant divergence or a collective elsewhere keeps two graphs.
-        if os.environ.get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS", "0") not in ("", "0", "0.0"):
-            return "forced acceptance mutates host RNG state per traced branch"
-        if getattr(config.spec_config, "enable_penalty", False):
-            return "occurrence penalties are applied per variant outside the conditional sites"
-    if metadata.is_spec_dec_tree:
-        return "dynamic-tree drafting has its own sampling sites"
+    # The branches are rank-local launches with no collective, so ranks may take different ones.
+    if os.environ.get("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS", "0") not in ("", "0", "0.0"):
+        return "forced acceptance mutates host RNG state per traced branch"
+    if getattr(config.spec_config, "enable_penalty", False):
+        return "occurrence penalties are applied per variant outside the conditional sites"
     if metadata.use_rejection_sampling:
-        return "rejection sampling splits the draft sampling sites too"
-    if config.watermark_config is not None:
-        return "text watermarking is not supported by the merged sampling sites"
-    if getattr(config.spec_config, "use_relaxed_acceptance_for_thinking", False):
-        return "relaxed acceptance bypasses the conditional sampling site"
+        return "rejection sampling takes the unmerged acceptance path"
     if config.samples_from_vocab_shards:
-        return "vocabulary-sharded sampling changes the logits layout per variant"
-    if not is_dspark and mapping is not None and mapping.world_size != 1:
-        return "only single-GPU engines are supported"
+        return "vocabulary-sharded sampling takes the unmerged acceptance path"
     return None
 
 
@@ -421,7 +405,7 @@ def create_spec_metadata(
         metadata.greedy_graphs = listed is None or "greedy" in listed
         metadata.shard_temperature_only_graphs = listed is None or "temperature_only" in listed
         if graph_conditional.merge_sampling_graphs_requested():
-            blocker = merged_sampling_graphs_blocker(metadata, config, mapping)
+            blocker = merged_sampling_graphs_blocker(metadata, config)
             if blocker is None:
                 metadata.merged_sampling_graph = True
                 logger.info(

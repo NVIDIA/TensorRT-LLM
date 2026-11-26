@@ -2235,13 +2235,6 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()
-        if (os.environ.get("TRTLLM_REUSE_GRAPH_POOL_ON_CLEAR", "0") == "1"
-                and graph_pool is not None):
-            # EXPERIMENT (merged greedy/sampling graphs): torch never frees a graph pool that
-            # captured a conditional node, so dropping the handle strands the pool. Keep it; the
-            # next capture round reuses its free blocks.
-            torch.cuda.empty_cache()
-            return
         del self.memory_pool
         self.memory_pool = None
         if release_nccl_window_owners and graph_pool is not None:

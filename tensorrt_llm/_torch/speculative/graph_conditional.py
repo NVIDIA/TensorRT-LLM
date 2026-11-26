@@ -128,12 +128,6 @@ def graph_if_else(
             return if_result if host_pred else else_result
         return if_fn() if host_pred else else_fn()
 
-    if os.environ.get("TRTLLM_COND_IMPL") == "torch_cond":  # EXPERIMENT, not for commit
-        from torch._higher_order_ops.cudagraph_conditional_nodes import (
-            CUDAGraphCaptureControlFlowOpDispatchMode)
-        with CUDAGraphCaptureControlFlowOpDispatchMode():
-            return torch.cond(pred, if_fn, else_fn, ())
-
     graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
 
     # A body is always closed, so a failing branch surfaces its own error rather than torch's

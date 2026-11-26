@@ -2965,42 +2965,6 @@ class SpecWorkerBase(nn.Module, ABC):
         return penalized
 
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
-                             batch_size, spec_metadata):
-        """Accept draft tokens; in a merged greedy/sampling graph, under conditional nodes.
-
-        With ``spec_metadata.merged_sampling_graph`` the all-greedy and the sampling
-        variants are both recorded, and ``greedy_pred_dev`` selects one at replay.
-        Otherwise this is ``_accept_draft_tokens_impl``.
-        """
-        if not graph_conditional.merged_sampling_active(spec_metadata):
-            return self._accept_draft_tokens_impl(logits, draft_tokens,
-                                                  num_contexts, batch_size,
-                                                  spec_metadata)
-        if (isinstance(logits, VocabShardedLogits)
-                or spec_metadata.sharded_target_logits):
-            raise NotImplementedError(
-                "merged greedy/sampling CUDA graphs do not support vocabulary-"
-                "sharded target logits: unset "
-                f"{graph_conditional.MERGE_SAMPLING_GRAPHS_ENV}")
-
-        def variant(all_greedy: bool):
-
-            def run():
-                with graph_conditional.sampling_variant_override(
-                        spec_metadata, all_greedy):
-                    return self._accept_draft_tokens_impl(
-                        logits, draft_tokens, num_contexts, batch_size,
-                        spec_metadata)
-
-            return run
-
-        return graph_conditional.graph_if_else(
-            spec_metadata.greedy_pred_dev,
-            variant(True),
-            variant(False),
-            host_pred=bool(spec_metadata.is_all_greedy_sample))
-
-    def _accept_draft_tokens_impl(self, logits, draft_tokens, num_contexts,
                                   batch_size, spec_metadata):
         """
         Accept draft tokens with optional rejection sampling support.

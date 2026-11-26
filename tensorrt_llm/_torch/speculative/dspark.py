@@ -1822,6 +1822,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if accepted is None:
             if vocab_sharded_logits:
                 raise RuntimeError("Vocabulary-sharded target logits need the fused acceptance")
+            if graph_conditional.merged_sampling_active(
+                spec_metadata
+            ) and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "merged greedy/sampling CUDA graphs need DSpark's fused acceptance "
+                    f"(e.g. no guided decoding): unset {graph_conditional.MERGE_SAMPLING_GRAPHS_ENV}"
+                )
             accepted = self.sample_and_accept_draft_tokens(logits, attn_metadata, spec_metadata)
         accepted_tokens, num_accepted_tokens = accepted[:2]
         prepared = accepted[2:] or None
