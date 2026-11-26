@@ -61,8 +61,12 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 from tensorrt_llm.serve.perf_metrics import (
     _PERF_METRICS_HEADER_BUDGET_BYTES,
+    CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
+    SERVER_TIMING_HEADER,
     SSE_METRICS_EVENT,
+    START_END_TIME_HEADER,
+    STEP_METRICS_HEADER,
     ClientMetricsCollector,
     adjusted_clock_from_headers,
     build_metrics_record_from_headers,
@@ -480,6 +484,8 @@ class OpenAIHttpClient(OpenAIClient):
                 self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for chunk in response_generator:
+                    if chunk == _SSE_DONE_EVENT:
+                        success = True
                     yield chunk
             success = True
         finally:
@@ -825,6 +831,14 @@ class OpenAIHttpClient(OpenAIClient):
                     headers = json.loads(data)
                     if not isinstance(headers, dict):
                         raise TypeError("perf metrics payload must be a JSON object")
+                    for header in (
+                        SERVER_TIMING_HEADER,
+                        START_END_TIME_HEADER,
+                        STEP_METRICS_HEADER,
+                        CTX_CHUNK_METRICS_HEADER,
+                    ):
+                        if header in headers and not isinstance(headers[header], str):
+                            raise TypeError(f"perf metrics header {header} must be a string")
                     metrics = build_metrics_record_from_headers(
                         headers,
                         _metrics_phase(self._role),
@@ -843,11 +857,11 @@ class OpenAIHttpClient(OpenAIClient):
         # the request. Drop any partial metrics trailer left by an upstream error.
         if recovered_after_done:
             pending = _SSE_DONE_EVENT
-        if pending:
-            yield pending
         self._metrics_collector.complete_latency_seconds.observe(
             get_steady_clock_now_in_seconds() - start_time
         )
+        if pending:
+            yield pending
 
     async def _finish_request(
         self,
