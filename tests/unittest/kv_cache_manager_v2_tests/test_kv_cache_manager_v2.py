@@ -12223,6 +12223,32 @@ class TestNoBatchingDiskWriteBehind(TestNoBatchingDiskOptions):
             "write-behind keeps a failed flush's page readable instead of discarding the copy"
         )
 
+    def test_eviction_takes_back_copy_whose_write_is_still_running(self) -> None:
+        # A staged write-through copy completes at memory speed, so no copy is still in flight when its page falls to
+        # disk (the base test's reused_pending). The staged counterpart: copies whose flush has not run yet are taken
+        # back by the host -> disk evictions, and restoring the prefix reads them from staging.
+        self.disk_tier_options = {"num_io_threads": 4, "write_through": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        _introspection.delay_disk_write_behind_flushes_for_testing(3600)
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        counters = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(counters["write_through_pages"], 0)
+        self.assertGreater(counters["reused"], 0)
+        self.assertGreater(_introspection.disk_write_behind_pages_for_testing(), 0)
+        self._assert_copies_balance(counters)
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        _introspection.delay_disk_write_behind_flushes_for_testing(0)
+        self._wait_for_flushes()
+        self.manager.clear_reusable_blocks()
+
     def _push_first_request_to_disk(self) -> tuple["TestNoBatching.Request", itertools.count]:
         self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
         self.assertTrue(_introspection.async_disk_io_enabled())
