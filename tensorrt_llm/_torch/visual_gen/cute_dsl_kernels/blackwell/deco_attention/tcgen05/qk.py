@@ -15,17 +15,18 @@
 """The QK of the attention kernel: S = Q' K'^T over the QK channels of NVFP4, both operands staged in shared memory.
 
 Operands:
-    * Q' and K': rows of 256 E2M1 codes (128 bytes), the 128 rotated head channels and then the 2 x rank compensation
-      channels; 192 codes are used at rank 32 and all 256 at rank 64. One UE4M3 scale factor per 16 channels.
+    * Q' and K': rows of 256 E2M1 codes (128 bytes), the 128 rotated head channels and then the compensation
+      channels; a QK build uses the first 192 codes or all 256 (constants.qk_channels). One UE4M3 scale factor per
+      16 channels.
     * The scale factors are read as the preparation wrote them: its power-of-two score scale in log2 units is the
       softmax multiplier itself, so no per-call pass touches them.
 Classes, one per MMA width of the compile target (the operand layouts, the TMA atoms of Q', K' and their scale
 factors, the load warp's copies and the MMA warp's scale-factor staging SMEM -> TMEM and QK issue):
     sm_103a  QkK96    two K = 96 MMAs
     sm_100a  QkK64    three K = 64 MMAs
-    sm_107a  QkK128   one K = 128 MMA (head channels) and one K = 64 MMA (compensation channels), Q' in TMEM; at rank
-                      64 two K = 128 MMAs (head channels, compensation channels)
-Rank 64 is offered where the target has the K = 128 instruction and the TMEM columns for the wider Q' (ranks).
+    sm_107a  QkK128   one K = 128 MMA (head channels) and one K = 64 MMA (compensation channels), Q' in TMEM; with
+                      256 channels two K = 128 MMAs (head channels, compensation channels)
+The 256-channel build is offered where the target has the K = 128 instruction and the TMEM columns for the wider Q'.
 """
 
 import cutlass
@@ -38,17 +39,12 @@ from cutlass.cute.nvgpu.common import OperandMajorMode
 
 from .. import target
 from ..common.dsl import CTAGroup, Tcgen05CpShape, make_tmem_ptr, tcgen05_cp
-from ..constants import DEFAULT_RANK, QK_ROW_BYTES, RANKS, qk_channels, qk_scale_atoms
+from ..constants import QK_ROW_BYTES, qk_scale_atoms
 from .ptx import smem_desc_sw128
 
 ROW_ELEMS = (
     2 * QK_ROW_BYTES
-)  # E2M1 codes of a Q' / K' row, the first qk_channels(rank) of them used
-
-
-def ranks():
-    """Return the ranks of the compile target's QK: all with the K = 128 instruction, else the default rank alone."""
-    return RANKS if target.has_k128_fp4_mma() else (DEFAULT_RANK,)
+)  # E2M1 codes of a Q' / K' row, the first channels of the QK build of them used
 
 
 # ------------------------------------------- Layouts of the block-scaled operands and their scale factors
@@ -106,7 +102,7 @@ class QkK96:
     """The QK of sm_103a: two K = 96 MMAs.
 
     * Q' and K': byte rows in 128B-swizzled SMEM, one K = 96 instruction start every three 16-byte blocks.
-    * Scale factors: UE4M3 tiles staged into TMEM per QK, four columns per 64 channels each (12 at rank 32): one Q
+    * Scale factors: UE4M3 tiles staged into TMEM per QK, four columns per 64 channels each (12 for 192): one Q
       tile (Q0's or Q1's, re-copied before each QK) and one K tile shared by both QKs of a KV step.
     """
 
@@ -116,12 +112,12 @@ class QkK96:
     sf_vec_size = 16
     tmem_qsf_offset = 192
 
-    def __init__(self, mma_tiler, rank):
-        # the channels of Q' and K' at this compensation rank
-        self.channels = qk_channels(rank)
+    def __init__(self, mma_tiler, channels):
+        # the channels of Q' and K' of the QK build
+        self.channels = channels
         self.mma_tiler_mnk = (*mma_tiler, self.channels)
         # the K' scale-factor slot follows the Q' one
-        self.tmem_ksf_offset = self.tmem_qsf_offset + 4 * qk_scale_atoms(rank)
+        self.tmem_ksf_offset = self.tmem_qsf_offset + 4 * qk_scale_atoms(channels)
         # the scale-factor helpers describe the K = 96 instruction of sm_103a by its canonical K = 768 tile (eight
         # instructions), one stage of which covers the 192 channels
         self.layout_tiler = (*mma_tiler, 768)
@@ -551,7 +547,7 @@ class QkK96:
 
 
 class QkK64(QkK96):
-    """The QK of sm_100a: the same operands, one K = 64 block-scaled MMA per 64 channels of the QK (three at rank 32).
+    """The QK of sm_100a: the same operands, one K = 64 block-scaled MMA per 64 channels of the QK (three for 192).
 
     * Q' and K': E2M1 tiles in the standard 128B-swizzled K-major layout over the padded 256-channel rows (the
       channels past the QK's are not written and not read).
@@ -560,8 +556,8 @@ class QkK64(QkK96):
 
     k_smem_dtype = cutlass.Float4E2M1FN
 
-    def __init__(self, mma_tiler, rank):
-        super().__init__(mma_tiler, rank)
+    def __init__(self, mma_tiler, channels):
+        super().__init__(mma_tiler, channels)
         self.pad_tiler = (*mma_tiler, ROW_ELEMS)
         self.k_blocks = self.channels // 64
 
@@ -836,19 +832,19 @@ class QkK128(QkK64):
     """The QK of targets with the K = 128 instruction (sm_107a): the K = 64 operands, Q' read from TMEM.
 
     * Head channels (128): one K = 128 block-scaled MMA (SM107MmaMXF4NVF4Op). Compensation channels: one K = 64 MMA
-      at rank 32 (64 channels), a second K = 128 MMA at rank 64 (128 channels).
+      for 64 of them, a second K = 128 MMA for 128.
     * All read the same K' stages and scale-factor slots: a pair of K blocks of the K = 64 layouts lies as a K = 128
       operand does.
     * Q' in TMEM: the MMA warp copies each Q stage into its slot once per work tile. A slot has eight channels per
-      column (two slots of 24 columns at rank 32, of 32 at rank 64) and lies past the kernel's 512 columns.
+      column (two slots of 24 columns for 192 channels, of 32 for 256) and lies past the kernel's 512 columns.
     """
 
     q_tmem = True
     tmem_q_offset = 512  # Q' slots 0 and 1 (eight E2M1 codes per column)
     q_stage_bytes = 128 * ROW_ELEMS // 2
 
-    def __init__(self, mma_tiler, rank):
-        super().__init__(mma_tiler, rank)
+    def __init__(self, mma_tiler, channels):
+        super().__init__(mma_tiler, channels)
         # K = 128 MMAs of a QK: over every whole pair of K blocks (the K = 64 MMA takes a last single block)
         self.k128_mmas = self.k_blocks // 2
         if self.q_slot(2) > cute.arch.get_max_tmem_alloc_cols(target.arch_name()):
@@ -918,8 +914,8 @@ class QkK128(QkK64):
     def issue_qk(self, qk_mma, j, d, descs, si_handle):
         """Issue QK_j from Q' slot j and commit its S credit.
 
-        K = 128 MMAs over the K-block pairs (0, 1) and, at rank 64, (2, 3); then the K = 64 issue from the block
-        after them, block 2 at rank 32 and none at rank 64.
+        K = 128 MMAs over the K-block pairs (0, 1) and, with 256 channels, (2, 3); then the K = 64 issue from the
+        block after them, block 2 with 192 channels and none with 256.
         """
         mma128 = qk_mma[5][0]
         sfA, sfB = qk_mma[3][3], qk_mma[4][3]
@@ -933,10 +929,11 @@ class QkK128(QkK64):
         super().issue_qk(qk_mma, j, d, (sA, sB), si_handle, k0=2 * self.k128_mmas)
 
 
-def for_target(mma_tiler, rank):
-    """Return the QK of the compile target at a compensation rank it takes (one of ranks()): QkK96, QkK128 or QkK64."""
+def for_target(mma_tiler, channels):
+    """Return the QK of the compile target for a QK build of `channels` channels (constants.qk_channels): QkK96,
+    QkK128 or QkK64."""
     if target.has_k96_fp4_mma():
-        return QkK96(mma_tiler, rank)
+        return QkK96(mma_tiler, channels)
     if target.has_k128_fp4_mma():
-        return QkK128(mma_tiler, rank)
-    return QkK64(mma_tiler, rank)
+        return QkK128(mma_tiler, channels)
+    return QkK64(mma_tiler, channels)

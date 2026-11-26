@@ -9,7 +9,7 @@ import pytest
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+    from tensorrt_llm.visual_gen.args import DeCoAttentionConfig
 
 
 @pytest.fixture(scope="module")
@@ -48,13 +48,14 @@ def isolated_cudnn_plans(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[
 
 
 @pytest.fixture
-def deco_recipe() -> Callable[..., "QuantAttentionConfig"]:
+def deco_recipe() -> Callable[..., "DeCoAttentionConfig"]:
     """Return a function that builds the DeCo-Attention recipe: compensated NVFP4 Q/K with V
-    in ``v_dtype`` (``fp8`` by default)."""
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+    in ``v_dtype`` (``fp8`` by default) and the other fields of ``DeCoAttentionConfig`` as
+    keywords."""
+    from tensorrt_llm.visual_gen.args import DeCoAttentionConfig
 
-    def recipe(v_dtype: str = "fp8") -> QuantAttentionConfig:
-        return QuantAttentionConfig(qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True)
+    def recipe(v_dtype: str = "fp8", **fields) -> DeCoAttentionConfig:
+        return DeCoAttentionConfig(v_dtype=v_dtype, **fields)
 
     return recipe
 

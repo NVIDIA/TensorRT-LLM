@@ -20,7 +20,8 @@ o = (P V + S M) * v8_scale / l. A CTA takes 128 query rows of one (batch, head) 
 keys; per key tile:
     * QK: S = Q' K'^T over the 192 channels of Q' and K' on the block-scaled NVFP4 MMA (kind::mxf4nvf4, m16n8k64,
       UE4M3 scales).
-    * Softmax (softmax.py): online, log2 units, lazy rescale at T = 4, I-ExpCast into E4M3 P, row sum of quantized P.
+    * Softmax (softmax.py): online, log2 units, lazy rescale at the threshold T of the build, I-ExpCast into E4M3
+      P, row sum of quantized P.
     * PV: O += P V on the FP8 MMA (m16n8k32), V being the E4M3 V minus its means of every 128 keys.
     * Means term: the block sums of P times v_mean on BF16 MMAs. v_mean holds one row per 16 keys, a tile's mean in
       all 8 of its rows; the means MMA weights the rows by the 16-key block sums of P, which add up to the tile's.
@@ -112,13 +113,15 @@ def take_turn(st, sw):
     barrier_cta_sync(st.bid_wait, thread_count=64)
 
 
-def cta_state(tidx, qt, hh, bb, dist):
-    """Return the state st of thread tidx of the CTA of unit (query tile qt, head hh, batch bb); dist: its lookahead.
+def cta_state(tidx, qt, hh, bb, dist, rescale_threshold):
+    """Return the state st of thread tidx of the CTA of unit (query tile qt, head hh, batch bb); dist: its lookahead;
+    rescale_threshold: the rescale threshold of its softmax.
 
     The steps of a CTA body share st; start_ring and load_operands complete it, then no step assigns a field. Fields:
         tidx, warp, lane, g, q, grp   the thread: its rows are g = lane / 4 and g + 8 of the warp, q = lane % 4 its
                                       place in the quad; grp 0: warps 0-3 (rows 0-63), 1: warps 4-7 (rows 64-127)
-        qt, hh, bb, dist              the unit (query tile, head, batch) and the ldmatrix lookahead of the MMA phases
+        qt, hh, bb, dist              the unit (query tile, head, batch), the ldmatrix lookahead of the MMA phases
+        rescale_threshold             the rescale threshold of the softmax (trace time)
         bid_wait, bid_pass            the turn barriers of the warp pair (w, w + 4): this warp's and its partner's
         turn, turn_held               the turn of an MMA phase as mma_phase takes it: (take, pass, EARLY)
         sp, smem, fbar                shared memory: its pointer, its address, the address of the stages' full barriers
@@ -137,6 +140,7 @@ def cta_state(tidx, qt, hh, bb, dist):
     grp = warp >> 2  # 0: warps 0-3 (rows 0-63), 1: warps 4-7 (rows 64-127)
     pair = warp & 3  # warps w and w + 4 form a pair and alternate in issuing MMAs
     st = State(tidx=tidx, qt=qt, hh=hh, bb=bb, warp=warp, lane=lane, g=g, q=q, grp=grp, dist=dist)
+    st.rescale_threshold = rescale_threshold
     st.bid_wait = 1 + pair + 4 * grp  # this warp's turn barrier (64 threads: the pair)
     st.bid_pass = 5 + pair - 4 * grp  # its partner's
     # the turn of an MMA phase (mma_phase): take it, pass it EARLY steps before the end; turn_held: already taken
@@ -404,7 +408,9 @@ def softmax_step(st, acc, sm, lim, stage=None, refill=None):
     * stage: the softmax counts its release by this warp (release_count), the count going to refill; None: no release.
     """
     release = (lambda: release_count(st, stage)) if stage is not None else None
-    return softmax_tile(acc, st.O, st.P, *sm, st.sc, st.q, lim, release, refill)
+    return softmax_tile(
+        acc, st.O, st.P, *sm, st.sc, st.q, lim, release, refill, st.rescale_threshold
+    )
 
 
 @cute.jit
@@ -580,7 +586,7 @@ def run_unit(
 
 
 @cute.jit
-def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid):
+def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid, rescale_threshold):
     """Run the CTA body: a whole unit (bid < n_full) or a key-range piece of a unit of the split tail.
 
     * A whole unit runs all key tiles in its order (diagonal first) and stores its rows; piece p of `split` runs the
@@ -594,7 +600,7 @@ def unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, bid):
     tidx = Int32(cute.arch.thread_idx()[0])
     whole = bid < n_full
     unit = Int32(cutlass.select_(whole, bid, n_full + (bid - n_full) // split))
-    st = cta_state(tidx, unit % nT, (unit // nT) % H, unit // (nT * H), DIST)
+    st = cta_state(tidx, unit % nT, (unit // nT) % H, unit // (nT * H), DIST, rescale_threshold)
     # a whole unit counts as the only piece of one
     piece = Int32(cutlass.select_(whole, Int32(0), (bid - n_full) % split))
     parts = Int32(cutlass.select_(whole, Int32(1), split))
@@ -651,6 +657,8 @@ def attn_kernel(
     n_full: Int32,
     split: Int32,
     lens_ptr,
+    *,
+    rescale_threshold: cutlass.Constexpr,
 ):
     """Run the attention: CTAs 0 .. n_full - 1 take whole query tiles, the others key-range pieces of the split tail.
 
@@ -658,10 +666,14 @@ def attn_kernel(
       (launch.split_plan); part_ptr: their partials.
     * ss_ptr, vs_ptr: the score scale and v8_scale; flags_ptr: the per-tile flags of the V pass.
     * lens_ptr: None, or the valid prefix lengths, which the body then reads.
+    * rescale_threshold: the rescale threshold of the softmax, from 0 to log2(448) (ValueError while the kernel
+      is traced otherwise).
     """
     bid_, _, _ = cute.arch.block_idx()
     # what the body reads: Q', its scales, the score scale, the V flags, and the TMA atoms and tensors of K', V,
     # the K' scales and v_mean
     tiles = (tma_atom_k, tma_k, tma_atom_v, tma_v, tma_atom_s, tma_s, tma_atom_m, tma_m)
     ops = (q_ptr, qsf_ptr, ss_ptr, flags_ptr, tiles)
-    unit_body(ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, Int32(bid_))
+    unit_body(
+        ops, lens_ptr, vs_ptr, o_ptr, part_ptr, S, H, split, n_full, Int32(bid_), rescale_threshold
+    )

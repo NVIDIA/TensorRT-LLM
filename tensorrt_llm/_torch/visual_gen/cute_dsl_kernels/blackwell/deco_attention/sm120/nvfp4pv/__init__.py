@@ -26,12 +26,15 @@ Files:
 import torch
 
 from ...constants import QK_ROW_BYTES, QK_SCALE_ATOMS
+from ...inputs import Compensation
+from ...runtime import Layout
 from . import launch, prep
 from .layout import STAGE, key_tiles
 
 
-def layout(b: int, s: int, h: int, nsm: int) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
-    """Return the buffers of one call in workspace order, name -> (dtype, shape): the operands, then the scratch.
+def layout(b: int, s: int, h: int, nsm: int, rank: tuple[int, int], bases: str) -> Layout:
+    """Return the buffers of one call in workspace order, name -> (dtype, shape): the operands, then the scratch
+    (that of the preparation follows the rank (r_q, r_k) of the compensation terms and the bases kind).
 
     q4          the QK channels of Q' as E2M1 in the first bytes of a token row
     q_sf        UE4M3 per token and 16 channels, in the scale atoms of the QK MMA
@@ -45,7 +48,7 @@ def layout(b: int, s: int, h: int, nsm: int) -> dict[str, tuple[torch.dtype, tup
         "img": (torch.uint8, (b * h * tiles * STAGE,)),
         "score_scale": (torch.float32, (1,)),
         "v4_scale": (torch.float32, (1,)),
-        **prep.scratch(b, s, h, nsm),
+        **prep.scratch(b, s, h, nsm, rank, bases),
         **launch.scratch(b, s, h, nsm),
     }
 
@@ -54,21 +57,24 @@ def prepare(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rows: torch.Tensor,
     buffers: dict[str, torch.Tensor],
-    lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    lens: torch.Tensor | None,
+    comp: Compensation,
 ) -> None:
-    """Run the preparation on the buffers of a call (layout): the operands from BF16 q, k, v and the sampled rows.
-    Every buffer may hold anything on entry; the counters of the basis launch and of the attention's split units, which
-    must be zero when their launches start, are zeroed here. lens, map_rows: as in prep.run."""
+    """Run the preparation on the buffers of a call (layout): the operands from BF16 q, k, v. Every buffer may hold
+    anything on entry; the counters of the basis launch and of the attention's split units, which must be zero when
+    their launches start, are zeroed here. lens, comp: as in prep.run."""
     buffers["done"].zero_()
     launch.split_counters(buffers["split"]).zero_()
-    prep.run(q, k, v, rows, buffers, lens, map_rows)
+    prep.run(q, k, v, buffers, lens, comp)
 
 
 def attention(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
-    """Run the attention: BF16 o from the buffers of a call that prepare has filled; lens: those of prepare, or None."""
-    launch.run(buffers, o, lens)
+    """Run the attention: BF16 o from the buffers of a call that prepare has filled; lens: those of prepare, or None;
+    rescale_threshold: the rescale threshold of the softmax, one of constants.RESCALE_THRESHOLDS["nvfp4"]."""
+    launch.run(buffers, o, lens, rescale_threshold)

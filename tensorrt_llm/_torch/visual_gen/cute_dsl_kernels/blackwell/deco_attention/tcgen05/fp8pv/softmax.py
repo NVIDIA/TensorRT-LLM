@@ -16,10 +16,10 @@
 
 One 128-row Q tile per warpgroup, a thread per row.
 Skip correction:
-    * A row keeps its anchor m (the running row maximum) unless the tile maximum exceeds it by more than
-      T = RESCALE_THRESHOLD binades; only then is O_j rescaled.
-    * P is pre-scaled by s_P = 2^P_PRESCALE_LOG2 = 2^floor(log2 448 - T) = 16, so P = s_P 2^(c (s - m)) stays below
-      the largest E4M3 value while the anchor lags by up to T binades.
+    * A row keeps its anchor m (the running row maximum) unless the tile maximum exceeds it by more than T binades,
+      the kernel's rescale threshold (one of constants.RESCALE_THRESHOLDS["fp8"]); only then is O_j rescaled.
+    * P is pre-scaled by s_P = 2^floor(log2 448 - T) (constants.p_prescale_log2; 16 at T = 4), so
+      P = s_P 2^(c (s - m)) stays below the largest E4M3 value while the anchor lags by up to T binades.
 I-ExpCast:
     * c, the multiplier of the raw scores in log2 units, is a power of two of at least 2^MIN_SCORE_LOG2 (the
       preparation's score scale); c SUBNORMAL_ULPS 2^-149 is then an f32 subnormal.
@@ -52,11 +52,9 @@ from ...common.expmath import (
     tree_sum,
 )
 from ...common.mem import sptr, store_vector
-from ...constants import E4M3_MAX, RESCALE_THRESHOLD, SUBNORMAL_ULPS
+from ...constants import SUBNORMAL_ULPS
 from ..tmem import ld_tmem_f32, st_tmem_f32
 
-# P pre-scale: s_P = 2^floor(log2(largest finite E4M3) - T)
-P_PRESCALE_LOG2 = int(math.log2(E4M3_MAX) - RESCALE_THRESHOLD)
 # The score-scale floor of this family: log2 of the smallest multiplier of the raw scores the landing takes exactly,
 # a power of two from 1 / SUBNORMAL_ULPS up (I-ExpCast above); the preparation raises the score scale to at least it.
 MIN_SCORE_LOG2 = -(SUBNORMAL_ULPS.bit_length() - 1)
@@ -157,11 +155,11 @@ class SoftmaxRole:
         moved = tile_row_max > old_row_max + thr_inc
         row_max_safe = cutlass.select_(moved, tile_row_max, old_row_max)
         # the addend takes the subnormal multiplier of the exp, and 15 is the exponent bias of the f16 pattern: the
-        # anchor score maps exactly onto s_P = 2^P_PRESCALE_LOG2 (exact in the P format)
+        # anchor score maps exactly onto s_P = 2^p_prescale_log2 (exact in the P format)
         self.exp_cast(
             tTMEM_LOADrS,
             tTMEM_STORErS_x4,
-            (scale_sub, subnormal_anchor_bias(row_max_safe, scale_sub, P_PRESCALE_LOG2)),
+            (scale_sub, subnormal_anchor_bias(row_max_safe, scale_sub, self.p_prescale_log2)),
         )
         # Rare: the anchor moved for a row of this warp -> rescale O_j once PV_j(i-1) has landed, before P_j(i) is
         # published (PV_j(i) accumulates on top of it). Rows that kept their anchor, or start a work tile, use 1.
@@ -395,7 +393,7 @@ class SoftmaxRole:
         tTMEM_STOREtS_x4 = tiled_tmem_store.get_slice(copy_thread_idx).partition_D(tStS_P)
         o_phase = Int32(0)
         # skip-correction threshold in raw score units (T binades)
-        thr_inc = Float32(RESCALE_THRESHOLD) / score_scale
+        thr_inc = Float32(self.rescale_threshold) / score_scale
         scale_sub = subnormal_scale(score_scale)
         # K slots 8..15 of the means A operand, which no batch writes, stay zero
         z = Int32(0)

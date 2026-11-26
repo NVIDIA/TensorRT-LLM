@@ -23,6 +23,8 @@
 """
 
 import functools
+import importlib
+from types import ModuleType
 
 from cutlass import Arch
 from cutlass.cutlass_dsl import BaseDSL
@@ -65,6 +67,13 @@ def kernel_family() -> str:
     """Return the kernel family of the current target, deco_attention/<family>: "tcgen05" (B200, GB300, Rubin) or
     "sm120" (warp-level MMAs: RTX PRO 6000); cached, as the target is fixed per process."""
     return _FAMILY[arch()]
+
+
+@functools.cache
+def family() -> ModuleType:
+    """Return the package of the kernel family of the current target, deco_attention/<family>, imported on first
+    use."""
+    return importlib.import_module(f".{kernel_family()}", __package__)
 
 
 def arch_name() -> str:

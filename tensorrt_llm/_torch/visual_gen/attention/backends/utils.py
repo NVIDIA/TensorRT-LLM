@@ -25,7 +25,7 @@ from typing import NamedTuple, Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, DeCoAttentionConfig, QuantAttentionConfig
 
 from .interface import AttentionBackend
 
@@ -40,14 +40,14 @@ def get_quant_algorithm(
         quant_attention_config: The quantized attention config, if any.
 
     Returns:
-        "deco_attention" or "vc_attention" for a recipe that sets that field; None without
-        a config and for the other recipes, which the config gives by their dtypes and
-        block sizes alone
+        "deco_attention" for a DeCoAttentionConfig, "vc_attention" for a recipe that sets
+        that field; None without a config and for the other recipes, which the config gives
+        by their dtypes and block sizes alone
     """
     if quant_attention_config is None:
         return None
-    if quant_attention_config.deco_attention:
-        return "deco_attention"
+    if isinstance(quant_attention_config, DeCoAttentionConfig):
+        return quant_attention_config.algorithm
     if quant_attention_config.vc_attention:
         return "vc_attention"
     return None
@@ -83,7 +83,7 @@ def get_visual_gen_attention_backend(
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                  Requires flash-attn package with cute interface
         - "CUTEDSL": CuTe DSL kernels: dense/SkipSoftmax FMHA, VSA or SOL depending on
-                     ``sparse_algorithm``. quant_attention_config with ``deco_attention``
+                     ``sparse_algorithm``. A DeCoAttentionConfig as quant_attention_config
                      selects DeCo-Attention (NVFP4 Q/K, FP8 or NVFP4 PV).
         - "CUDNN": cuDNN fused SDPA. Unquantized by default; quant_attention_config
                    selects per-tensor FP8 or block-scaled MXFP8 (Blackwell).

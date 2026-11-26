@@ -16,7 +16,8 @@
 
 Launches of a call, on the current stream; each compiles once per process, device and presence of valid lengths:
     * The attention kernel (kernel.py) over the whole units (query tile, head, batch), then the key-range pieces of
-      the split tail; its host function builds the TMA atoms of K', V, the K' scales and v_mean.
+      the split tail; its host function builds the TMA atoms of K', V, the K' scales and v_mean. It also compiles
+      once per rescale threshold.
     * The merge of the pieces (epilogue.py).
 A call holds at least one key tile: deco_attention.api rejects a shorter sequence.
 """
@@ -30,7 +31,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.typing import Int32, Int64
 
-from ...runtime import compiled, current_stream, gmem_ptr, num_sms
+from ...runtime import Layout, compiled, current_stream, gmem_ptr, num_sms
 from .epilogue import PART_N, merge_partial_kernel
 from .kernel import attn_kernel
 from .layout import EP, K_STEPS, KA_BYTES, KT, LEN_BYTES, NTHR, QT, SF_BYTES, SMEM_BYTES
@@ -68,6 +69,7 @@ def attn_launch(
     n_tail: Int32,
     parts: Int32,
     stream: cuda.CUstream,
+    rescale_threshold: cutlass.Constexpr,
 ):
     nT = (S + KT - 1) // KT
     batch = Int64(S) * H * 128
@@ -117,7 +119,8 @@ def attn_launch(
         ),
         (128, 8, 2),
     )
-    # lens_ptr: None, or the valid prefix lengths, which the kernels read in place
+    # lens_ptr: None, or the valid prefix lengths, which the kernels read in place; rescale_threshold: that of the
+    # softmax
     attn_kernel(
         q_ptr,
         qsf_ptr,
@@ -139,6 +142,7 @@ def attn_launch(
         n_full,
         parts,
         lens_ptr,
+        rescale_threshold=rescale_threshold,
     ).launch(
         grid=[n_full + n_tail * parts, 1, 1],
         block=[NTHR, 1, 1],
@@ -165,7 +169,7 @@ def merge_launch(
     )
 
 
-def scratch(B: int, S: int, H: int, nsm: int) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
+def scratch(B: int, S: int, H: int, nsm: int) -> Layout:
     """Return the scratch of the attention, name -> (dtype, shape), which every call writes before it reads it."""
     nT = (S + KT - 1) // KT
     _, n_tail, parts = split_plan(nT * H * B, nT, nsm)
@@ -176,11 +180,15 @@ _compiled = {}
 
 
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
     """Write BF16 o [B, S, H, 128] = (P V' + S M) * v8_scale / l from the buffers of the call, on the current stream.
     Nothing here reads a device value or allocates. lens: None, or the int32 valid prefix lengths [B] of the
-    preparation, read in place by the kernel variants with lengths; the launch plan follows the padded sequence."""
+    preparation, read in place by the kernel variants with lengths; the launch plan follows the padded sequence.
+    rescale_threshold: one of constants.RESCALE_THRESHOLDS["fp8"]."""
     q4 = buffers["q4"]
     B, S, H, _ = q4.shape
     dev = q4.device
@@ -199,15 +207,18 @@ def run(
     lens_ptr = gmem_ptr(cutlass.Int32, lens, 4) if lens is not None else None
     ptrs = [gmem_ptr(dt, x, 16) for dt, x in ops]
 
-    def launch(fn: Callable, ptrs: list, sizes: tuple[int, ...]) -> None:
-        key = (dev.index, fn, lens is not None)
-        args = (*ptrs, lens_ptr, *(Int32(n) for n in sizes), stream)
-        compiled(_compiled, key, lambda: fn, *args)(*ptrs, lens_ptr, *sizes, stream)
+    def launch(fn: Callable, ptrs: list, sizes: tuple[int, ...], *consts: float) -> None:
+        key = (dev.index, fn, lens is not None, *consts)
+
+        def make() -> tuple:
+            return fn, *ptrs, lens_ptr, *(Int32(n) for n in sizes), stream, *consts
+
+        compiled(_compiled, key, make)(*ptrs, lens_ptr, *sizes, stream)
 
     nT = (S + KT - 1) // KT
     plan = split_plan(nT * H * B, nT, num_sms(dev))
     partial = gmem_ptr(cutlass.Float32, buffers["partial"], 16)
     flags = gmem_ptr(cutlass.Int32, buffers["v_flags"], 16)
-    launch(attn_launch, [*ptrs, partial, flags], (S, H, B, *plan))
+    launch(attn_launch, [*ptrs, partial, flags], (S, H, B, *plan), rescale_threshold)
     if plan[1]:
         launch(merge_launch, [partial, ptrs[8], ptrs[6]], (S, H, *plan))

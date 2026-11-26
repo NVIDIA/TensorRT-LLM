@@ -15,13 +15,20 @@
 """Q'/K' pass of the sm_120 preparation: rotation, NVFP4 body and compensation channels, per 16-token warp tile.
 
 * Per tile: the Hadamard rotation, NVFP4 of the 8 body blocks, the projections of q1 (the dequantized body) and dq
-  (its quantization residual) on the basis U (their A fragments come from the accumulators of the rotation), NVFP4
-  of the 4 compensation blocks.
+  (its quantization residual) on the compensation basis (their A fragments come from the accumulators of the
+  rotation), NVFP4 of the compensation blocks.
+* Compensation channels, rank = (r_q, r_k) directions: the blocks of the Q-residual term (Q: dq B_q, K: k1 B_q),
+  the blocks of the K-residual term (Q: q1 B_k, K: dk B_k), then zero blocks up to COMP_CHANNELS. B_q and B_k
+  are the leading r_q and r_k directions of the basis of each term (chain.basis_rows): of the one basis
+  with bases "shared", of a basis of its own with "separate".
+* Projections: on the min(r_q, r_k) leading directions of both terms the body and the residual are each projected,
+  and the two results change places with the side; the further directions of the wider term take one projection, of
+  the operand that the term has on the side of the tile. One MMA per 8 directions of a term and body block.
 * Outputs: codes through a per-warp smem stage, provisional (unencoded) block scales as BF16 in the final atom
   layout, per-CTA group maxima (the encode launch turns them into the group scales and the UE4M3 bytes).
 * A fragments come straight from 8-byte global loads: k-step a (16 channels 16a..16a+15) maps logical k = 2t + e to
   channel 16a + 4t + e and k = 2t + 8 + e to channel 16a + 4t + 2 + e, for both the general rotation (B fragments of
-  Hd from smem) and the fast path.
+  Hd: _hd_fragment) and the fast path.
 * Fast path (Hd verified on device to be diag(s) x Sylvester H128 = H8 (x) H16): one MMA per 16-channel block against
   diag(s_a) H16 (= Hd[16a.., 0..15]), then an 8-point FWHT across the blocks in registers (every thread holds the
   same in-block positions of all eight blocks).
@@ -34,7 +41,7 @@ from cutlass.utils import SmemAllocator
 
 from ...common.expmath import bf16x2, f2u, round_m3, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ...constants import E2M1_MAX, QK_CHANNELS, QK_SCALE_ATOMS, QPRE
+from ...constants import COMP_CHANNELS, E2M1_MAX, QK_CHANNELS, QK_SCALE_ATOMS, QPRE
 from ..ptx.shared import (
     e2m1x2_to_f32x2,
     f32x4_to_e2m1x4,
@@ -51,13 +58,33 @@ TILE_SCALES = QK_SCALE_ATOMS * 512
 K_CHUNKS = QK_CHANNELS // 32
 K_ARRAY = 128 * 16
 
-# shared memory map (bytes): Hd^T, U^T, the per-warp code and scale stages, the reduction area
-SQ_HDT = 0  # 128 rows x 256 B, 8-byte slots, slot ^ 4 (row & 3)
-SQ_UTS = 32768  # 32 rows x 272 B
-SQ_STG = SQ_UTS + 8704  # per warp: codes 16 x 144 B, scales 16 x 24 B
-STG_W = 16 * 144 + 16 * 24  # 2688
-SQ_RED = SQ_STG + 8 * STG_W  # 64 floats + flag
-SQ_TOTAL = SQ_RED + 512
+# shared memory map (bytes): Hd^T from 0 in rows of 256 B (8-byte slots, slot ^ 4 (row & 3)), the U stage (the
+# directions of the two terms in BF16, rows of 272 B), the per-warp code and scale stages, the reduction area
+STG_W = 16 * 144 + 16 * 24  # per warp: codes 16 x 144 B, scales 16 x 24 B
+
+
+def _smem_map(stage_rows):
+    """Return (rows of Hd^T, offset of the U stage, of the per-warp stages, of the reduction area, bytes) for a U
+    stage of stage_rows rows: all of Hd^T beside up to 32 rows of directions; beside more, 64 rows of directions and
+    16 rows of Hd^T: those that the fast path reads, or in the general rotation those of the block in work."""
+    hd_rows, u_rows = (128, 32) if stage_rows <= 32 else (16, 64)
+    uts = hd_rows * 256
+    stg = uts + u_rows * 272
+    red = stg + 8 * STG_W  # 64 floats + flag
+    return hd_rows, uts, stg, red, red + 512
+
+
+def _hd_slot(hdt, stage_row, c, j):
+    """The shared address of Hd[c][j] in the Hd^T stage, whose row stage_row holds output channel j."""
+    return sptr(Uint16, hdt + stage_row * 256 + ((c >> 2) ^ ((j & 3) << 2)) * 8 + (c & 3) * 2)
+
+
+def _hd_fragment(hdt, stage_row, j, s, t):
+    """The B fragment of a rotation MMA, Hd[16 s + 4 t .. + 3][j], from its slot of the Hd^T stage, whose row
+    stage_row holds output channel j."""
+    return load_vector(
+        sptr(Uint32, hdt + stage_row * 256 + ((4 * s + t) ^ ((j & 3) << 2)) * 8, 8), 2
+    )
 
 
 @cute.jit
@@ -103,9 +130,28 @@ def _emit(
         )
 
 
-def _body_block(bo, x, pq, pd, uts, stg, sst, g, t):
-    """Trace-time helper: quantize body block bo (x[0..7]: n-tile 0 c0..c3, n-tile 1 c0..c3), emit it, and
-    accumulate its projections q1 U -> pq, dq U -> pd. Returns the larger of its two block scales."""
+def _stage_rows(rank, separate):
+    """Return the first rows in the U stage of the directions that the residual and the wider term's further
+    projection take, and the rows of the stage; the directions of the body start at row 0.
+
+    * Bases "shared": the one basis is staged once, the leading direction first, and all three read it from their
+      first direction.
+    * Bases "separate": staged by use: the min(r_q, r_k) leading directions of the basis that the body takes on
+      the side of the tile, those of the basis of the residual, then the further directions of the wider term.
+    """
+    both, top = min(rank), max(rank)
+    return (both, 2 * both, both + top) if separate else (0, both, top)
+
+
+def _body_block(bo, x, side, proj, uts, stg, sst, g, t):
+    """Quantize and emit body block bo and accumulate its projections; return the larger of its two block scales.
+
+    * A trace-time helper. x[0..7]: n-tile 0 c0..c3, n-tile 1 c0..c3.
+    * proj = (body, residual, further), each (accumulators, directions, first row in the U stage).
+    * Body and residual: the dequantized body and the residual, on the leading directions that both terms have.
+    * Further (its fourth entry: the index of the wider term): the operand that the wider term has on this side,
+      on that term's further directions.
+    """
     cw0, sc0, d00, d01, d02, d03 = _quant_block(x[0], x[1], x[4], x[5])
     cw1, sc1, d10, d11, d12, d13 = _quant_block(x[2], x[3], x[6], x[7])
     _emit(stg, sst, g, t, Int32(bo), cw0, cw1, sc0, sc1)
@@ -116,17 +162,31 @@ def _body_block(bo, x, pq, pd, uts, stg, sst, g, t):
         bf16x2(x[4] - d02, x[5] - d03),
         bf16x2(x[6] - d12, x[7] - d13),
     ]
-    for n in range(4):
-        ub = uts + (8 * n + g) * 272 + (16 * bo + 2 * t) * 2
-        bv = [
+    (pb, both, rb), (pr, _, rr), (pw, further, rw, wide) = proj
+
+    def fragment(row):
+        ub = uts + (row + g) * 272 + (16 * bo + 2 * t) * 2
+        return [
             cute.arch.load(sptr(Uint32, ub), Uint32),
             cute.arch.load(sptr(Uint32, ub + 16), Uint32),
         ]
-        r1 = mma_bf16([pq[4 * n], pq[4 * n + 1], pq[4 * n + 2], pq[4 * n + 3]], aq, bv)
-        r2 = mma_bf16([pd[4 * n], pd[4 * n + 1], pd[4 * n + 2], pd[4 * n + 3]], ad, bv)
+
+    def project(acc, n, a, bv):
+        r = mma_bf16([acc[4 * n + e] for e in range(4)], a, bv)
         for e in range(4):
-            pq[4 * n + e] = r1[e]
-            pd[4 * n + e] = r2[e]
+            acc[4 * n + e] = r[e]
+
+    for n in range(both // 8):
+        bv = fragment(rb + 8 * n)
+        project(pb, n, aq, bv)
+        project(pr, n, ad, bv if rr == rb else fragment(rr + 8 * n))
+    if further:
+        # the Q-residual term has the residual of a Q tile and the body of a K tile, the K-residual term the
+        # other one
+        of_q, of_k = (aq, ad) if wide else (ad, aq)
+        aw = [Uint32(cutlass.select_(side != 0, of_k[i], of_q[i])) for i in range(4)]
+        for n in range(further // 8):
+            project(pw, n, aw, fragment(rw + 8 * n))
     return cute.arch.fmax(sc0, sc1)
 
 
@@ -199,7 +259,8 @@ def qk_kernel(
     q_p: Int64,
     k_p: Int64,
     had_p: Int64,
-    ut_p: Int64,
+    ut_q_p: Int64,
+    ut_k_p: Int64,
     q4_p: Int64,
     k4_p: Int64,
     prov_p: Int64,
@@ -215,30 +276,42 @@ def qk_kernel(
     lens_p,
     *,
     tile_pitch: cutlass.Constexpr = None,
+    rank: cutlass.Constexpr,
+    separate: cutlass.Constexpr,
 ):
-    """The Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile). QP, KP: the bytes between
-    consecutive tokens of q and of k. lens_p: None, or the global address of the valid prefix lengths: the tokens from
-    the length of their batch element on are then read as zeros (zero codes and block scales, outside the group
-    maxima), and a tile without a valid token is left as it is. tile_pitch: None, or K' goes to tile images."""
+    """Run the Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile).
+
+    * QP, KP: the bytes between consecutive tokens of q and of k.
+    * lens_p: None, or the global address of the valid prefix lengths: the tokens from the length of their batch
+      element on are then read as zeros (zero codes and block scales, outside the group maxima), and a tile
+      without a valid token is left as it is.
+    * tile_pitch: None, or K' goes to tile images.
+    * rank, separate: the channels of the two compensation terms and whether each has a basis of its own.
+    * ut_q_p, ut_k_p: the basis of the Q-residual term and that of the K-residual term, FP32
+      [B H][directions][128] with the leading direction last; with bases "shared" the one address, twice.
+    """
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     lane = tid & 31
     warp = tid >> 5
     g = lane >> 2
     t = lane & 3
+    res_row, fur_row, stage_rows = _stage_rows(rank, separate)
+    both, wide = min(rank), int(rank[1] > rank[0])
+    hd_rows, sq_uts, sq_stg, sq_red, sq_bytes = _smem_map(stage_rows)
     smem = SmemAllocator()
-    buf = smem.allocate_array(Uint32, SQ_TOTAL // 4, byte_alignment=128)
+    buf = smem.allocate_array(Uint32, sq_bytes // 4, byte_alignment=128)
     sb = Int32(buf.toint())
-    hdt = sb + SQ_HDT
-    uts = sb + SQ_UTS
-    stg = sb + SQ_STG + warp * STG_W
+    hdt = sb
+    uts = sb + sq_uts
+    stg = sb + sq_stg + warp * STG_W
     sst = stg + 16 * 144
-    red = sb + SQ_RED
+    red = sb + sq_red
     flag = red + 256
 
     if tid == 0:
         cute.arch.store(sptr(Uint32, flag), Uint32(1))
-    # Hd^T into smem (row j = output channel, slot (c / 4) ^ 4 (j & 3) for input channel c); check Hd == diag(s) x H128
+    # Hd^T into smem (row j < hd_rows = output channel, _hd_slot); check Hd == diag(s) x H128
     ok = Uint32(1)
     for it in cutlass.range_constexpr(8):
         idx = it * QK_THREADS + tid  # 2048 chunks of 8 output channels
@@ -249,33 +322,24 @@ def qk_kernel(
         ok = ok & Uint32((s0 == Uint32(0x3F80)) | (s0 == Uint32(0xBF80)))
         for e in cutlass.range_constexpr(8):
             j = j0 + e
-            slot = (c >> 2) ^ ((j & 3) << 2)
             hv = (w[e // 2] if e % 2 == 0 else w[e // 2] >> Uint32(16)) & Uint32(0xFFFF)
-            cute.arch.store(sptr(Uint16, hdt + j * 256 + slot * 8 + (c & 3) * 2), hv.to(Uint16))
+            staged = cutlass.const_expr(hd_rows == 128) or j < hd_rows
+            if staged:
+                cute.arch.store(_hd_slot(hdt, j, c, j), hv.to(Uint16))
             par = Uint32(cute.arch.popc(Uint32(c & j)) & 1)
             ok = ok & Uint32(hv == (s0 ^ (par << Uint32(15))))
-    # zero the code stage (bytes 96..127 of every row stay zero)
+    # zero the code stage (bytes 96..127 of every row stay zero), and with zero blocks the scale stage behind it
+    stage_bytes = 16 * 144 if sum(rank) == COMP_CHANNELS else STG_W
     zz = Uint32(0)
-    for it in cutlass.range_constexpr(5):
+    for it in cutlass.range_constexpr((stage_bytes + 511) // 512):
         off = it * 512 + lane * 16
-        if off < 16 * 144:
+        if off < stage_bytes:
             store_vector(sptr(Uint32, stg + off, 16), (zz, zz, zz, zz))
     cute.arch.sync_threads()
     if ok == Uint32(0):
         cute.arch.store(sptr(Uint32, flag), Uint32(0))
     cute.arch.sync_threads()
     fast = Int32(cute.arch.load(sptr(Uint32, flag), Uint32))
-    # fast-path B fragments: block a, n-tile n -> Hd[16a + 4t .. +3][8n + g]
-    hb = cute.make_rmem_tensor((32,), Uint32)
-    for a in cutlass.range_constexpr(8):
-        for n in cutlass.range_constexpr(2):
-            row = 8 * n + g
-            bv = load_vector(
-                sptr(Uint32, hdt + row * 256 + ((4 * a + t) ^ ((row & 3) << 2)) * 8, 8), 2
-            )
-            hb[a * 4 + n * 2] = bv[0]
-            hb[a * 4 + n * 2 + 1] = bv[1]
-
     gm = cute.make_rmem_tensor((6,), Float32)
     gm.fill(0.0)
     item_lo = (cta * nitems) // ncta
@@ -319,15 +383,28 @@ def qk_kernel(
         if live:
             if bhs != cur:
                 cute.arch.sync_threads()
-                for it in cutlass.range_constexpr(2):
-                    idx = it * QK_THREADS + tid  # 512 chunks of 16 B
-                    r = idx >> 4
-                    cc = idx & 15
-                    w = load_invariant(
-                        Uint32, ut_p + (Int64(bh) * 4096 + Int64(r * 128 + cc * 8)) * 2, 4
-                    )
+                for it in cutlass.range_constexpr(stage_rows // 8):
+                    idx = it * QK_THREADS + tid  # 8 rows of 32 chunks of four directions' channels
+                    r = idx >> 5
+                    cc = idx & 31
+                    # stage row r holds direction r - first of a basis that has `directions` of them (_stage_rows):
+                    #   * bases "shared": the one basis
+                    #   * rows of the body: the basis of the K-residual term on a Q tile, of the Q-residual term
+                    #     on a K tile; rows of the residual: that of the other term
+                    #   * further rows: the basis of the wider term, from its direction `both` on
+                    first, directions, basis_p = 0, stage_rows, ut_q_p
+                    if cutlass.const_expr(separate and 8 * it >= fur_row):
+                        first, directions, basis_p = both, rank[wide], (ut_q_p, ut_k_p)[wide]
+                    elif cutlass.const_expr(separate):
+                        first = res_row if 8 * it >= res_row else 0
+                        q_term = (side != 0) if first == 0 else (side == 0)
+                        directions = Int64(cutlass.select_(q_term, Int64(rank[0]), Int64(rank[1])))
+                        basis_p = Int64(cutlass.select_(q_term, ut_q_p, ut_k_p))
+                    src = Int64(bh) * directions + Int64(directions - 1 - (r - first))
+                    u4 = load_invariant(Float32, basis_p + (src * 128 + Int64(cc * 4)) * 4, 4)
                     store_vector(
-                        sptr(Uint32, uts + r * 272 + cc * 16, 16), (w[0], w[1], w[2], w[3])
+                        sptr(Uint32, uts + r * 272 + cc * 8, 8),
+                        (bf16x2(u4[0], u4[1]), bf16x2(u4[2], u4[3])),
                     )
                 cute.arch.sync_threads()
                 cur = bhs
@@ -335,10 +412,19 @@ def qk_kernel(
                 dst = Int64(cutlass.select_(side != 0, k4_p, q4_p))
             pre = Float32(cutlass.select_(side != 0, Float32(1.0), Float32(QPRE)))
             tok0 = tile * 128 + warp * 16
-            pq = cute.make_rmem_tensor((16,), Float32)
-            pd = cute.make_rmem_tensor((16,), Float32)
-            pq.fill(0.0)
-            pd.fill(0.0)
+            # the projections (module docstring), 4 accumulators per 8 directions: the body and the residual on the
+            # directions both terms have, and the wider term's further directions, from their rows of the stage
+            pb = cute.make_rmem_tensor((COMP_CHANNELS // 2,), Float32)
+            pr = cute.make_rmem_tensor((COMP_CHANNELS // 2,), Float32)
+            pw = cute.make_rmem_tensor((COMP_CHANNELS // 2,), Float32)
+            pb.fill(0.0)
+            pr.fill(0.0)
+            pw.fill(0.0)
+            proj = (
+                (pb, both, 0),
+                (pr, both, res_row),
+                (pw, max(rank) - both, fur_row, wide),
+            )
             gb = Float32(0.0)
             if fast != 0:
                 # stage 1: z_a = x_a (diag(s_a) H16), 16-channel blocks
@@ -346,9 +432,9 @@ def qk_kernel(
                 for a in cutlass.range_constexpr(8):
                     aa = [af[4 * a], af[4 * a + 2], af[4 * a + 1], af[4 * a + 3]]
                     for n in cutlass.range_constexpr(2):
-                        r = mma_bf16(
-                            [Float32(0.0)] * 4, aa, [hb[a * 4 + n * 2], hb[a * 4 + n * 2 + 1]]
-                        )
+                        # B fragment of block a, n-tile n: Hd[16a + 4t .. +3][8n + g]
+                        hb = _hd_fragment(hdt, 8 * n + g, 8 * n + g, a, t)
+                        r = mma_bf16([Float32(0.0)] * 4, aa, hb)
                         for e in cutlass.range_constexpr(4):
                             yv[a * 8 + n * 4 + e] = r[e]
                 # stage 2: 8-point FWHT across the blocks, per in-block position
@@ -362,21 +448,31 @@ def qk_kernel(
                                 yv[(a + hstep) * 8 + pos] = u0 - u1
                 for bo in cutlass.range_constexpr(8):
                     x = [yv[bo * 8 + i] * pre for i in range(8)]
-                    gb = cute.arch.fmax(gb, _body_block(bo, x, pq, pd, uts, stg, sst, g, t))
+                    gb = cute.arch.fmax(gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t))
             else:
                 for bo in cutlass.range_constexpr(8):
+                    if cutlass.const_expr(hd_rows < 128):
+                        # the stage holds the 16 rows of Hd^T of one block at a time: thread = (input channel,
+                        # 8 output channels of the block)
+                        cute.arch.sync_threads()
+                        hc = tid >> 1
+                        hj = 16 * bo + (tid & 1) * 8
+                        hw = load_invariant(Uint32, had_p + Int64(hc * 128 + hj) * 2, 4)
+                        for e in cutlass.range_constexpr(8):
+                            hv = (hw[e // 2] if e % 2 == 0 else hw[e // 2] >> Uint32(16)) & Uint32(
+                                0xFFFF
+                            )
+                            cute.arch.store(
+                                _hd_slot(hdt, hj + e - 16 * bo, hc, hj + e), hv.to(Uint16)
+                            )
+                        cute.arch.sync_threads()
                     acc = [Float32(0.0)] * 8
                     for s in cutlass.range_constexpr(8):
                         aa = [af[4 * s], af[4 * s + 2], af[4 * s + 1], af[4 * s + 3]]
                         for n in cutlass.range_constexpr(2):
                             row = 8 * (2 * bo + n) + g
-                            bv = load_vector(
-                                sptr(
-                                    Uint32,
-                                    hdt + row * 256 + ((4 * s + t) ^ ((row & 3) << 2)) * 8,
-                                    8,
-                                ),
-                                2,
+                            bv = _hd_fragment(
+                                hdt, row - (16 * bo if hd_rows < 128 else 0), row, s, t
                             )
                             r = mma_bf16(
                                 [acc[4 * n], acc[4 * n + 1], acc[4 * n + 2], acc[4 * n + 3]], aa, bv
@@ -384,28 +480,25 @@ def qk_kernel(
                             for e in cutlass.range_constexpr(4):
                                 acc[4 * n + e] = r[e]
                     x = [acc[i] * pre for i in range(8)]
-                    gb = cute.arch.fmax(gb, _body_block(bo, x, pq, pd, uts, stg, sst, g, t))
-            # compensation channels: Q [dq U | q1 U], K [k1 U | dk U]; gc: the larger block scale of either half
+                    gb = cute.arch.fmax(gb, _body_block(bo, x, side, proj, uts, stg, sst, g, t))
+            # the projections of the two terms: the Q-residual term has the residual of a Q tile and the body of a K
+            # tile, the K-residual term the other one; then the further directions of the wider term
+            term = [
+                [Float32(cutlass.select_(side != 0, pb[i], pr[i])) for i in range(both // 2)],
+                [Float32(cutlass.select_(side != 0, pr[i], pb[i])) for i in range(both // 2)],
+            ]
+            term[wide] = term[wide] + [pw[i] for i in range((max(rank) - both) // 2)]
+            # compensation channels: the 16-channel blocks of the Q-residual term, then of the K-residual term (the
+            # stage holds zeros behind them); gc: the larger block scale of each term
             gc = [Float32(0.0)] * 2
-            for ci in cutlass.range_constexpr(2):
-                for bp in cutlass.range_constexpr(2):
-                    nb = 2 * bp
-                    v = [Float32(0.0)] * 8
-                    for e in cutlass.range_constexpr(4):
-                        pqa = pq[4 * nb + e]
-                        pqb = pq[4 * (nb + 1) + e]
-                        pda = pd[4 * nb + e]
-                        pdb = pd[4 * (nb + 1) + e]
-                        if ci == 0:
-                            v[e] = Float32(cutlass.select_(side != 0, pqa, pda))
-                            v[4 + e] = Float32(cutlass.select_(side != 0, pqb, pdb))
-                        else:
-                            v[e] = Float32(cutlass.select_(side != 0, pda, pqa))
-                            v[4 + e] = Float32(cutlass.select_(side != 0, pdb, pqb))
-                    cw0, sc0, *_ = _quant_block(v[0], v[1], v[4], v[5])
-                    cw1, sc1, *_ = _quant_block(v[2], v[3], v[6], v[7])
-                    gc[ci] = cute.arch.fmax(gc[ci], cute.arch.fmax(sc0, sc1))
-                    _emit(stg, sst, g, t, Int32(8 + 2 * ci + bp), cw0, cw1, sc0, sc1)
+            for cb in cutlass.range_constexpr(sum(rank) // 16):
+                ti = int(cb >= rank[0] // 16)
+                nb = 2 * cb - ti * rank[0] // 8
+                v = term[ti][4 * nb : 4 * nb + 8]
+                cw0, sc0, *_ = _quant_block(v[0], v[1], v[4], v[5])
+                cw1, sc1, *_ = _quant_block(v[2], v[3], v[6], v[7])
+                gc[ti] = cute.arch.fmax(gc[ti], cute.arch.fmax(sc0, sc1))
+                _emit(stg, sst, g, t, Int32(8 + cb), cw0, cw1, sc0, sc1)
             isk = Int32(side == 1)
             groups = (gb, gc[0], gc[1])
             for j in cutlass.range_constexpr(3):

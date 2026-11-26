@@ -17,10 +17,11 @@
 """Online softmax of the sm_120 FP8-PV attention kernel, in log2 units, one 128-key tile at a time.
 
 From the raw scores of the tile of a warp to the E4M3 P of the PV MMA, its row sums and its 16-key block sums:
-P = E4M3(2^(c s - a + T)), with c the score scale (the multiplier of the raw scores in log2 units), a the anchor of a
-row (the running maximum of c s) and T = RESCALE_THRESHOLD.
-    * Landing (I-ExpCast, land_pack): one FMA per score pair puts t = c s - a + T on the f32 subnormal grid as
-      K0 + (c s - a) 2^10 ulps, K0 the f16 bit pattern of 2^T, so the low 16 bits are the f16 pattern of a
+P = E4M3(2^(c s - a + pre)), with c the score scale (the multiplier of the raw scores in log2 units), a the anchor of
+a row (the running maximum of c s), T the rescale threshold of the kernel build and pre = int(log2(448) - T), which
+keeps the T binades above the anchor inside the E4M3 range.
+    * Landing (I-ExpCast, land_pack): one FMA per score pair puts t = c s - a + pre on the f32 subnormal grid as
+      K0 + (c s - a) 2^10 ulps, K0 the f16 bit pattern of 2^pre, so the low 16 bits are the f16 pattern of a
       piecewise-linear 2^t; a saturating pack flushes everything below the grid (and -inf) to +0.
     * Landing paths, behind a warp-uniform index (expcast_guard): one FMA per pair with the subnormal multiplier
       c 2^-139, which needs it exact on the grid (c a multiple of 2^-10: the power-of-two scales of the preparation
@@ -50,7 +51,6 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 
 from ...common.expmath import RN, scale_bf16x2
-from ...constants import RESCALE_THRESHOLD
 from ..ptx.fp8pv import compare, expcast_guard, land_finish, land_pack, landed_flags
 from .layout import KT, key_grp, key_rot
 
@@ -121,11 +121,13 @@ def softmax_tile(
     lim,
     release,
     refill,
+    rescale_threshold: cutlass.Constexpr,
 ):
     """Run the online softmax of one S tile (rows g and g + 8 of the warp); return the anchors, row sums and path.
 
-    * P[4 i + e]: the PV fragments, P = E4M3(2^(s - anchor + T)); P[16], P[17]: the 16-key block sums of the quantized
-      P, the means-MMA B fragments. The lazy rescale is that of the module docstring.
+    * P[4 i + e]: the PV fragments, P = E4M3(2^(s - anchor + pre)); P[16], P[17]: the 16-key block sums of the
+      quantized P, the means-MMA B fragments. The lazy rescale is that of the module docstring, at T =
+      rescale_threshold.
     * Keys at or past lim (the valid keys of the tile, a run-time count, or KT at trace time) are masked.
     * release() counts the release of its stage by the warp and refill(count) refills the stage when the count says
       so (the stage ring of kernel.py); None: the phase releases nothing.
@@ -140,15 +142,15 @@ def softmax_tile(
     old = Int32(0)
     if cutlass.const_expr(release is not None):
         old = release()
-    xs = land_pack(acc, sc, anc0, anc1, exp_path)
+    xs = land_pack(acc, sc, anc0, anc1, exp_path, rescale_threshold)
     if cutlass.const_expr(refill is not None):
         refill(old)
-    fl = landed_flags(xs)
+    fl = landed_flags(xs, rescale_threshold)
     if (fl & 1) != 0:
         m0, m1 = tile_max(acc, sc)
         # skip correction: the anchor moves only when the tile max exceeds it by more than T
-        mv0 = compare(m0, anc0 + RESCALE_THRESHOLD, "gt", Float32)
-        mv1 = compare(m1, anc1 + RESCALE_THRESHOLD, "gt", Float32)
+        mv0 = compare(m0, anc0 + rescale_threshold, "gt", Float32)
+        mv1 = compare(m1, anc1 + rescale_threshold, "gt", Float32)
         na0 = Float32(cutlass.select_(mv0 != 0, m0, anc0))
         na1 = Float32(cutlass.select_(mv1 != 0, m1, anc1))
         exp_path = expcast_guard(sc, na0, na1)
@@ -160,7 +162,7 @@ def softmax_tile(
         # block sums still waiting for their means MMA (the first step of a pair) are not in O yet: same rescale
         P[16] = scale_bf16x2(P[16], al0)
         P[17] = scale_bf16x2(P[17], al1)
-        xs = land_pack(acc, sc, na0, na1, exp_path)
+        xs = land_pack(acc, sc, na0, na1, exp_path, rescale_threshold)
     # the block sums of the last two steps: P[18..19] (k - 1, the first of a pair), P[16..17] (this step)
     P[18] = P[16]
     P[19] = P[17]

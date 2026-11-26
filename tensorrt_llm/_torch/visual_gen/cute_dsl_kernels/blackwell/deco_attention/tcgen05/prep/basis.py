@@ -15,26 +15,35 @@
 """Compensation basis of the DeCo preparation: the clear launch and the eigensolver launch.
 
 * The clear launch (one CTA) zeroes the per-call words of gmax, in which the later launches accumulate their maxima.
-* The eigensolver launch (one 288-thread CTA per (batch, head)) accumulates the Gram matrices of the sampled q and k
-  rows (the tokens of the argument rows, in 256-row chunks) with tcgen05 MMAs and normalizes each by its trace.
-* It writes the eigenvectors V of the `rank` largest eigenvalues (32 or 64) of Gq0 / tr + Gk0 / tr of the unrotated
-  tokens as U^T: the shared basis of the 2 x rank compensation channels of Q' and K'.
+* The eigensolver launch (288-thread CTAs) accumulates the Gram matrices Gq0 and Gk0 of the sampled q rows and of the
+  sampled k rows (the tokens of the two row arguments, in 256-row chunks, summed in parts of GRAM_PART_ROWS rows) with
+  tcgen05 MMAs and normalizes each by its trace.
+* A CTA writes the eigenvectors V of the DIRECTIONS largest eigenvalues (32, 64 or 128: eig_directions) of
+  2 w Gq0 / tr(Gq0) + 2 (1 - w) Gk0 / tr(Gk0) of the unrotated tokens as U^T, the leading direction last.
+    - Shared basis: one CTA per (batch, head), w the Gram weight; the compensation terms take its leading directions.
+    - Separate bases: two CTAs per (batch, head): w = 0 (Gk alone) for the Q-residual term, then w = 1 (Gq alone) for
+      the K-residual term, U^T [2, B, H, DIRECTIONS, 128].
 * U = Hd^T V / sqrt(128): G = Hd^T G0 Hd / 128 has the eigenvectors Hd^T V / sqrt(128) when G0 has V (Hd Hd^T = 128 I).
 * The eigensolver CTA (_eig_body) has eight row warps and a pivot warp: the Householder tridiagonalization of the whole
-  matrix, then, for the RANK largest eigenvalues with 256 / RANK threads each, the Sturm multisection, the eigenvectors
-  by twisted factorization, the cluster repair of nearly repeated eigenvalues and the back-transform.
+  matrix, then, for the DIRECTIONS largest eigenvalues with 256 / DIRECTIONS threads each, the Sturm multisection,
+  the eigenvectors by twisted factorization, the cluster repair of nearly repeated eigenvalues, the
+  orthonormalization of the vectors in eigenvalue order and the back-transform.
+* The rows of U^T are orthonormal, and the last r of them span the space of the r largest eigenvalues for every r;
+  inside a run of repeated eigenvalues they are some orthonormal basis of its space.
 
 Per-call words of gmax (float32, cleared by the clear launch):
-    0..2, 3..5  maxima of the three scale groups of Q' and of K' (head channels, first and second compensation half)
+    0..2, 3..5  maxima of the three scale groups of Q' and of K' (head channels, Q-residual term, K-residual term)
     6           maximum of |V - mean| of the V scan (7 is not used)
 """
+
+import functools
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Float32, Int32, Int64, Uint32
 
-from ...common.dsl import Tcgen05Fence, tcgen05_fence
+from ...common.dsl import Tcgen05Fence, Tcgen05Wait, tcgen05_fence, tcgen05_wait
 from ...common.expmath import RN, f2u, hash01, rcp_or_zero, u2f, warp_sum
 from ...common.mem import (
     cp_async16,
@@ -46,15 +55,24 @@ from ...common.mem import (
     store_vector,
 )
 from ...common.state import State
-from ...constants import INV_SQRT_HEAD_DIM
+from ...constants import INV_SQRT_HEAD_DIM, MIN_GRAM_TRACE
 from ..ptx import idesc_bf16, smem_desc_mn_sw128
-from ..tmem import ld_tmem_f32_x32_wait, tc_commit, tc_mma
+from ..tmem import ld_tmem_f32_x32_wait, st_tmem_f32, tc_commit, tc_mma
 from ..valid_len import valid_len
 
 EIG_THREADS = 288  # eigensolver CTA: eight row warps and the pivot warp
+# the directions an eigensolver CTA is built for: 256 / DIRECTIONS threads per eigenvalue
+EIG_DIRECTIONS = (32, 64, 128)
 # Per-call words of gmax (module docstring): count; first Q' and K' maximum, V maximum
 GMAX_WORDS = 8
 GMAX_Q, GMAX_K, GMAX_V = 0, 3, 6
+
+
+@functools.cache
+def eig_directions(rank):
+    """Return the directions of the eigensolver build of a rank (r_q, r_k): the smallest of EIG_DIRECTIONS that holds
+    the larger compensation term; 0 without compensation channels."""
+    return next((d for d in EIG_DIRECTIONS if d >= max(rank)), 0) if any(rank) else 0
 
 
 # ---------------------------------------------------------------- clear launch
@@ -72,37 +90,85 @@ def clear_kernel(gmax: cute.Tensor):
 
 # ---------------------------------------------------------------- Gram matrices
 
+# Gram: the rows of a part; the MMAs sum the chunks of a part, and a part joins the sum of the parts when it ends
+GRAM_PART_ROWS = 1536
+
+
+@cute.jit
+def _sampled_token(rowsb, n_rows, sample, batch, S, lens):
+    """Return the token that sample `sample` of a row argument (n_rows rows at the global address rowsb) stands for
+    in batch element `batch`; lens: as in _gram."""
+    sample = cutlass.min(sample, n_rows - 1)
+    if cutlass.const_expr(lens is None):
+        r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
+        tok = cutlass.max(cutlass.min(r, S - 1), Int32(0))
+    else:
+        # with lengths: the row of the batch element, mapped into its valid prefix or kept below its end
+        if cutlass.const_expr(lens[1]):
+            sample = batch * n_rows + sample
+        r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
+        n = valid_len(lens[0], batch, S)
+        if cutlass.const_expr(lens[2]):
+            tok = Int32((Int64(r) * Int64(n)) // Int64(S))
+        else:
+            tok = cutlass.max(cutlass.min(r, n - 1), Int32(0))
+    return Uint32(tok)
+
+
+@cute.jit
+def _close_part(st, tm: Int32, first: Int32):
+    """Add the part of the two Gram matrices that the MMAs summed (TMEM columns 0 .. 255 at tm) to the sum of the
+    parts (columns 256 .. 511), which the first part starts (first != 0); by the four warps that read TMEM rows."""
+    if st.tidx < 128:
+        tl = (st.warp * 32) << 16
+        for c32 in cutlass.range_constexpr(8):
+            part = ld_tmem_f32_x32_wait(tm + tl + 32 * c32)
+            total = ld_tmem_f32_x32_wait(tm + tl + 256 + 32 * c32)
+            total = [
+                Float32(cutlass.select_(first != 0, part[e], total[e] + part[e])) for e in range(32)
+            ]
+            st_tmem_f32(tm + tl + 256 + 32 * c32, total)
+        tcgen05_wait(Tcgen05Wait.STORE)
+
 
 @cute.jit
 def _gram(
     st,
     qtens: cute.Tensor,
     ktens: cute.Tensor,
-    rows: cute.Tensor,
+    rows_q: cute.Tensor,
+    rows_k,
     bh: Int32,
     S: Int32,
     H: Int32,
     QP: Int32,
     KP: Int32,
-    NQK: Int32,
-    NCQ: Int32,
+    NQ: Int32,
+    NK: Int32,
+    gram_weight: Float32,
     lens,
 ):
-    """Stage in VH the sum of the trace-normalized Gram matrices of the sampled q and k rows of bh, 256 rows per chunk.
+    """Stage in VH the weighted sum 2 w Gq / tr(Gq) + 2 (1 - w) Gk / tr(Gk) (w = gram_weight) of the
+    trace-normalized Gram matrices of the sampled q rows and of the sampled k rows of bh, 256 rows per chunk.
+
+    * The MMAs sum parts of GRAM_PART_ROWS rows; with more rows than one part, a second pair of TMEM matrices takes
+      the sum of the parts (_close_part).
 
     * QP, KP: the bytes between consecutive tokens of q and of k (256 H for a contiguous tensor).
-
+    * rows_q (NQ rows) gives the tokens of Gq; rows_k (the global address of NK rows) those of Gk, or None: the
+      tokens of rows_q.
     * All 288 threads participate (eight warps stage, four read TMEM rows); the step's last barrier publishes VH.
     * lens: None, or (the global address of the valid prefix lengths, rows per sample, mapped rows). With rows per
-      sample rows is [B, NQK] and the batch element uses its own row; a row r of a batch element of n valid tokens
-      stands for token floor(r n / S) with mapped rows and for token min(r, n - 1) otherwise (token 0 when n is 0).
+      sample a row argument is [B, rows] and the batch element uses its own row; a row r of a batch element of n valid
+      tokens stands for token floor(r n / S) with mapped rows and for token min(r, n - 1) otherwise (token 0 when n
+      is 0).
     """
     sRed = st.sRed
     if st.tidx == 0:
         cute.arch.mbarrier_init(sptr(Int64, st.mbar), 1)
         cute.arch.mbarrier_init_fence()
     if st.warp == 0:
-        cute.arch.alloc_tmem(256, sptr(Uint32, st.hold))
+        cute.arch.alloc_tmem(512, sptr(Uint32, st.hold))
         cute.arch.relinquish_tmem_alloc_permit()
     tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
     cute.arch.sync_threads()
@@ -113,76 +179,90 @@ def _gram(
     head = bh - batch * H
     qb = Int64(qtens.iterator.toint())
     kb = Int64(ktens.iterator.toint())
-    rowsb = Int64(rows.iterator.toint())
-    for ch in cutlass.range(NCQ, unroll=1):
-        if ch > 0:
-            mbar_wait(st.mbar, (ch - 1) & 1)
-        if st.tidx < 256:
-            sample = cutlass.min(ch * 256 + st.tidx, NQK - 1)
-            if cutlass.const_expr(lens is None):
-                r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
-                tok_bits = Uint32(cutlass.max(cutlass.min(r, S - 1), Int32(0)))
-            else:
-                # with lengths: the row of the batch element, mapped into its valid prefix or kept below its end
-                if cutlass.const_expr(lens[1]):
-                    sample = batch * NQK + sample
-                r = Int32(load_invariant(Uint32, rowsb + Int64(sample) * Int64(4)))
-                n = valid_len(lens[0], batch, S)
-                if cutlass.const_expr(lens[2]):
-                    tok = Int32((Int64(r) * Int64(n)) // Int64(S))
-                else:
-                    tok = cutlass.max(cutlass.min(r, n - 1), Int32(0))
-                tok_bits = Uint32(tok)
-            cute.arch.store(sptr(Uint32, st.rbb + st.tidx * 4), tok_bits)
-        cute.arch.sync_threads()
-        if st.tidx < 256:
-            # a batch element without valid tokens copies zeros: its rows stand for no token
-            alive = Int32(1)
-            if cutlass.const_expr(lens is not None):
-                alive = Int32(valid_len(lens[0], batch, S) > 0)
-            for j in cutlass.range_constexpr(16):
-                it = st.tidx + 256 * j
-                tt = it >> 4
-                cc = it & 15
-                tok = Int32(cute.arch.load(sptr(Uint32, st.rbb + tt * 4), Uint32))
-                nb = Int32(16) * Int32((ch * 256 + tt) < NQK) * alive
-                row = Int64(batch) * Int64(S) + Int64(tok)
-                off = Int64(head * 256 + cc * 16)
-                dst = (
-                    (tt >> 3) * 2048
-                    + (cc >> 3) * 1024
-                    + (tt & 7) * 128
-                    + (((cc & 7) ^ (tt & 7)) << 4)
+    # the token indices of a chunk: those of q in rb, those of k (with rows of its own) in tw
+    tok_k = st.rbb
+    if cutlass.const_expr(rows_k is not None):
+        tok_k = st.twb
+    NCQ = (cutlass.max(NQ, NK) + 255) >> 8
+    part_chunks = GRAM_PART_ROWS // 256
+    for part in cutlass.range((NCQ + part_chunks - 1) // part_chunks, unroll=1):
+        ch0 = part * part_chunks
+        # a part ends: its sum joins the sum of the parts before the MMAs start the next one
+        if part > 0:
+            mbar_wait(st.mbar, (ch0 - 1) & 1)
+            tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+            _close_part(st, tm, Int32(part == 1))
+        for ch in cutlass.range(ch0, cutlass.min(ch0 + part_chunks, NCQ), unroll=1):
+            if ch > ch0:
+                mbar_wait(st.mbar, (ch - 1) & 1)
+            if st.tidx < 256:
+                sample = ch * 256 + st.tidx
+                cute.arch.store(
+                    sptr(Uint32, st.rbb + st.tidx * 4),
+                    _sampled_token(Int64(rows_q.iterator.toint()), NQ, sample, batch, S, lens),
                 )
-                cp_async16(st.dmb + dst, qb + row * Int64(QP) + off, nb)
-                cp_async16(st.zbb + dst, kb + row * Int64(KP) + off, nb)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.fence_proxy("async.shared", space="cta")
-        tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
-        cute.arch.sync_threads()
-        tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
-        if st.warp == 0:
-            acc0 = Int32(ch > 0)
-            for j in cutlass.range_constexpr(16):
-                da = smem_desc_mn_sw128(st.dmb + j * 4096)
-                dl = smem_desc_mn_sw128(st.zbb + j * 4096)
-                tc_mma(tm, da, da, idesc, acc0 if j == 0 else Int32(1), kind="f16", a_tmem=False)
-                tc_mma(
-                    tm + 128, dl, dl, idesc, acc0 if j == 0 else Int32(1), kind="f16", a_tmem=False
-                )
-            tc_commit(st.mbar)
+                if cutlass.const_expr(rows_k is not None):
+                    cute.arch.store(
+                        sptr(Uint32, tok_k + st.tidx * 4),
+                        _sampled_token(rows_k, NK, sample, batch, S, lens),
+                    )
+            cute.arch.sync_threads()
+            if st.tidx < 256:
+                # a batch element without valid tokens copies zeros: its rows stand for no token
+                alive = Int32(1)
+                if cutlass.const_expr(lens is not None):
+                    alive = Int32(valid_len(lens[0], batch, S) > 0)
+                for j in cutlass.range_constexpr(16):
+                    it = st.tidx + 256 * j
+                    tt = it >> 4
+                    cc = it & 15
+                    tok = Int32(cute.arch.load(sptr(Uint32, st.rbb + tt * 4), Uint32))
+                    nb = Int32(16) * Int32((ch * 256 + tt) < NQ) * alive
+                    row = Int64(batch) * Int64(S) + Int64(tok)
+                    off = Int64(head * 256 + cc * 16)
+                    dst = (
+                        (tt >> 3) * 2048
+                        + (cc >> 3) * 1024
+                        + (tt & 7) * 128
+                        + (((cc & 7) ^ (tt & 7)) << 4)
+                    )
+                    cp_async16(st.dmb + dst, qb + row * Int64(QP) + off, nb)
+                    if cutlass.const_expr(rows_k is not None):
+                        tok = Int32(cute.arch.load(sptr(Uint32, tok_k + tt * 4), Uint32))
+                        nb = Int32(16) * Int32((ch * 256 + tt) < NK) * alive
+                        row = Int64(batch) * Int64(S) + Int64(tok)
+                    cp_async16(st.zbb + dst, kb + row * Int64(KP) + off, nb)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.fence_proxy("async.shared", space="cta")
+            tcgen05_fence(Tcgen05Fence.BEFORE_THREAD_SYNC)
+            cute.arch.sync_threads()
+            tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+            if st.warp == 0:
+                acc0 = Int32(ch > ch0)
+                for j in cutlass.range_constexpr(16):
+                    da = smem_desc_mn_sw128(st.dmb + j * 4096)
+                    dl = smem_desc_mn_sw128(st.zbb + j * 4096)
+                    acc = acc0 if j == 0 else Int32(1)
+                    tc_mma(tm, da, da, idesc, acc, kind="f16", a_tmem=False)
+                    tc_mma(tm + 128, dl, dl, idesc, acc, kind="f16", a_tmem=False)
+                tc_commit(st.mbar)
     mbar_wait(st.mbar, (NCQ - 1) & 1)
     tcgen05_fence(Tcgen05Fence.AFTER_THREAD_SYNC)
+    # the matrices: the only part, or the sum of the parts once the last part has joined it
+    gm = tm
+    if NCQ > part_chunks:
+        _close_part(st, tm, Int32(0))
+        gm = tm + 256
     # Only the first four warps use trace scratch.
     tl = (st.warp * 32) << 16
     if st.tidx < 128:
         dga = Float32(0.0)
         dgb = Float32(0.0)
-        ga_diag = ld_tmem_f32_x32_wait(tm + tl + 32 * st.warp)
+        ga_diag = ld_tmem_f32_x32_wait(gm + tl + 32 * st.warp)
         for e in cutlass.range_constexpr(32):
             dga = Float32(cutlass.select_(st.lane == e, ga_diag[e], dga))
-        gk_diag = ld_tmem_f32_x32_wait(tm + tl + 128 + 32 * st.warp)
+        gk_diag = ld_tmem_f32_x32_wait(gm + tl + 128 + 32 * st.warp)
         for e in cutlass.range_constexpr(32):
             dgb = Float32(cutlass.select_(st.lane == e, gk_diag[e], dgb))
         sa = warp_sum(dga)
@@ -193,14 +273,17 @@ def _gram(
     cute.arch.sync_threads()
     tra = (sRed[0] + sRed[1]) + (sRed[2] + sRed[3])
     trb = (sRed[8] + sRed[9]) + (sRed[10] + sRed[11])
-    ia = rcp_or_zero(tra)
-    ib = rcp_or_zero(trb)
+    # a trace below MIN_GRAM_TRACE: its operand counts as zero, like zero rows
+    tra = Float32(cutlass.select_(tra < Float32(MIN_GRAM_TRACE), Float32(0.0), tra))
+    trb = Float32(cutlass.select_(trb < Float32(MIN_GRAM_TRACE), Float32(0.0), trb))
+    ia = rcp_or_zero(tra) * (Float32(2.0) * gram_weight)
+    ib = rcp_or_zero(trb) * (Float32(2.0) - Float32(2.0) * gram_weight)
     # VH is unused until the first Householder pivot. The normalized matrix is staged there with a 16-byte column XOR
     # swizzle, which the paired-row loads undo before VH takes its reflector layout.
     if st.tidx < 128:
         for c32 in cutlass.range_constexpr(4):
-            ga = ld_tmem_f32_x32_wait(tm + tl + 32 * c32)
-            gk = ld_tmem_f32_x32_wait(tm + tl + 128 + 32 * c32)
+            ga = ld_tmem_f32_x32_wait(gm + tl + 32 * c32)
+            gk = ld_tmem_f32_x32_wait(gm + tl + 128 + 32 * c32)
             for c4 in cutlass.range_constexpr(8):
                 dst = st.vhb + (st.tidx * 32 + ((c32 * 8 + c4) ^ (st.tidx & 7))) * 16
                 words = tuple(f2u(ga[c4 * 4 + e] * ia + gk[c4 * 4 + e] * ib) for e in range(4))
@@ -209,7 +292,7 @@ def _gram(
     cute.arch.sync_threads()
     if st.warp == 0:
         cute.arch.dealloc_tmem(
-            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16), 256
+            cute.make_ptr(Float32, tm, cute.AddressSpace.tmem, assumed_align=16), 512
         )
 
 
@@ -218,12 +301,12 @@ def _gram(
 _ZS = 130  # row stride (floats) of the padded L / z buffer (zbb); the D- buffer has rows of 128
 
 
-def _eig_state(tidx, RANK):
+def _eig_state(tidx, DIRECTIONS):
     """Return the state that the steps of the eigensolver CTA share: the coordinates of the thread, the trace-time
-    constants of the rank and the addresses of the shared-memory arrays."""
+    constants of the build and the addresses of the shared-memory arrays."""
     # threads per eigenvalue and per eigenvector of the 256 that search and back-transform them, and the row groups
     # of an eigenvector in the back-transform
-    tpe = 256 // RANK
+    tpe = 256 // DIRECTIONS
     lane = tidx % 32
     warp = tidx // 32
 
@@ -253,8 +336,8 @@ def _eig_state(tidx, RANK):
     # red: warp reductions: the trace partials of Gq (0..3) and Gk (8..11); in the cluster repair, per warp the last
     # chain with a replaced member (48..)
     red_p = smem.allocate_array(Float32, 64, byte_alignment=16)
-    # tw: the norm partials of a reflector [lane]; in the twisted factorization, [side][slot] each, the smallest
-    # gamma (0..), its row as Uint32 (256..) and the norm half (512..)
+    # tw: in _gram, the token indices of a chunk of k rows; the norm partials of a reflector [lane]; in the twisted
+    # factorization, [side][slot] each, the smallest gamma (0..), its row as Uint32 (256..) and the norm half (512..)
     tw_p = smem.allocate_array(Float32, 768, byte_alignment=16)
     # the mbarrier of the Gram MMAs and the word that receives their TMEM address
     gram_mb_p = smem.allocate_array(Int64, 2, byte_alignment=8)
@@ -263,7 +346,7 @@ def _eig_state(tidx, RANK):
         tidx=tidx,
         lane=lane,
         warp=warp,
-        RANK=RANK,
+        DIRECTIONS=DIRECTIONS,
         tpe=tpe,
         tpe_log2=tpe.bit_length() - 1,
         ng=32 // tpe,
@@ -556,7 +639,9 @@ def _next_reflector(st, ksum, k):
         rest = sigma - x0p * x0p
         nrm = cute.math.sqrt(sigma, approx=True)
         alpha = Float32(cutlass.select_(x0p >= Float32(0.0), -nrm, nrm))
-        do_it = Int32(rest > sigma * Float32(1e-30))
+        # row 126 has one element after the diagonal: no reflector (the back-transform applies H_0 .. H_125), also
+        # when the rounding of the two squares leaves a positive rest
+        do_it = Int32((rest > sigma * Float32(1e-30)) & (kr < 126))
         tau1 = Float32(
             cutlass.select_(do_it != 0, cute.arch.rcp_approx(sigma - x0p * alpha), Float32(0.0))
         )
@@ -591,9 +676,10 @@ def _square_offdiagonal(st):
 
 
 def _sturm_rounds(tpe):
-    """Return the rounds of multisection (2 tpe + 1 sections each) that refine an interval 17^3 times or more."""
+    """Return the rounds of multisection (2 tpe + 1 sections each) that refine an interval 17^4 times or more: an
+    eigenvalue is then known to about an ulp of the Gershgorin span."""
     rounds = 1
-    while (2 * tpe + 1) ** rounds < 17**3:
+    while (2 * tpe + 1) ** rounds < 17**4:
         rounds += 1
     return rounds
 
@@ -674,11 +760,12 @@ def _gershgorin(st):
 
 @cute.jit
 def _search_threads(st, glo, ghi):
-    """The search of a thread: tpe threads per eigenvalue (slot t / tpe, eigenvalue index m_idx = 128 - RANK + slot,
-    sub the thread within the slot) and the 513-point grid glo + stp0 i over the Gershgorin interval. Each round cuts
-    an interval into 2 tpe + 1 sections, and the rounds together refine an interval of the grid 17^3 times or more."""
+    """The search of a thread: tpe threads per eigenvalue (slot t / tpe, eigenvalue index m_idx = 128 - DIRECTIONS +
+    slot, sub the thread within the slot) and the 513-point grid glo + stp0 i over the Gershgorin interval. Each round
+    cuts an interval into 2 tpe + 1 sections, and the rounds together refine an interval of the grid 17^4 times or
+    more."""
     slot = st.tidx // st.tpe
-    m_idx = (128 - st.RANK) + slot
+    m_idx = (128 - st.DIRECTIONS) + slot
     sub = st.tidx % Int32(st.tpe)
     stp0 = (ghi - glo) / Float32(513)
     return State(glo=glo, stp0=stp0, slot=slot, m_idx=m_idx, sub=sub)
@@ -749,9 +836,9 @@ def _refine_eigenvalues(st, search):
 @cute.jit
 def _twist_sides(st):
     """The twisted factorization of a thread: the two sides of an eigenvalue sit in different warps (side =
-    tidx / RANK, slot tslot, active below 2 RANK): side 0 runs the backward (D-) sweep, side 1 the forward (L) sweep;
-    the twist index and the norm are combined through shared memory."""
-    nslot = Int32(st.RANK)
+    tidx / DIRECTIONS, slot tslot, active below 2 DIRECTIONS): side 0 runs the backward (D-) sweep, side 1 the forward
+    (L) sweep; the twist index and the norm are combined through shared memory."""
+    nslot = Int32(st.DIRECTIONS)
     side = st.tidx // nslot
     tslot = st.tidx - side * nslot
     act = st.tidx < 2 * nslot
@@ -951,7 +1038,7 @@ def _orthogonalize_replaced(st, REPS: cutlass.Constexpr = 2, KEPT: cutlass.Const
       buffer holds the coefficients and the norm partials. The step has barriers of its own: one follows each phase.
     """
     sZ, sCoef = st.sZ, st.sCoef
-    nslot = Int32(st.RANK)
+    nslot = Int32(st.DIRECTIONS)
     mine = Int32(0)
     pos = Int32(0)
     if st.tidx < nslot:
@@ -1022,7 +1109,7 @@ def _cluster_repair(st, span: Float32):
       orthogonalization against the kept vectors. The step has barriers of its own; its last one publishes z.
     """
     sE2, sRed, sZ = st.sE2, st.sRed, st.sZ
-    nslot = Int32(st.RANK)
+    nslot = Int32(st.DIRECTIONS)
     tolc = span * Float32(2e-5)
     if st.tidx < 128:
         sE2[st.tidx] = Float32(0.0)
@@ -1131,6 +1218,75 @@ def _cluster_repair(st, span: Float32):
             # the filter is column-parallel; the orthogonalization reads whole columns
             cute.arch.sync_threads()
             _orthogonalize_replaced(st)
+
+
+@cute.jit
+def _orthonormalize(st, PASSES: cutlass.Constexpr = 1):
+    """Orthonormalize the vectors in eigenvalue order, all slots at once, after the barrier that publishes z:
+    z_j <- z_j - sum over the slots i above j of (z_i . z_j) z_i, then unit norm; PASSES times.
+
+    * The twisted vectors of close eigenvalues are not orthogonal to each other. A slot and the slots above it
+      span what they spanned before, so the space of every leading run of directions is kept.
+    * Products: slot a forms those with the DIRECTIONS / 2 slots that follow it cyclically, shared by its
+      256 / DIRECTIONS threads -> the D- buffer [lower slot][higher slot]; the slot's own product and the three
+      before it are stored as zero.
+    * Rows: thread i < 128 updates row i of z in ascending slot order, four slots per step from the group of
+      slot j + 1 on, so a slot reads the slots above it before they change. Norms: one thread per slot (-> the
+      norm halves of the twist), then one thread per row.
+    * The step has barriers of its own; the last one publishes z.
+    """
+    sZ, sNorm2 = st.sZ, st.sNorm2
+    nslot = st.DIRECTIONS
+    slot = st.tidx >> st.tpe_log2
+    sub = st.tidx & (st.tpe - 1)
+    for _ in cutlass.range_constexpr(PASSES):
+        if st.tidx < 256:
+            for o in cutlass.range(1 + sub, nslot // 2 + 1, st.tpe):
+                other = (slot + o) & (nslot - 1)
+                d0 = Float32(0.0)
+                d1 = Float32(0.0)
+                for ii in cutlass.range(0, 128, 2, unroll=4):
+                    d0 = cute.fma(sZ[ii, slot], sZ[ii, other], d0)
+                    d1 = cute.fma(sZ[ii + 1, slot], sZ[ii + 1, other], d1)
+                at = cutlass.min(slot, other) * 128 + cutlass.max(slot, other)
+                cute.arch.store(sptr(Float32, st.dmb + at * 4), d0 + d1)
+            if sub == 0:
+                for back in cutlass.range_constexpr(4):
+                    own = slot * 128 + cutlass.max(slot - back, Int32(0))
+                    cute.arch.store(sptr(Float32, st.dmb + own * 4), Float32(0.0))
+        cute.arch.sync_threads()
+        if st.tidx < 128:
+            zrow = st.zbb + st.tidx * (_ZS * 4)
+            for j in cutlass.range(0, nslot - 1):
+                crow = st.dmb + j * 512
+                z0 = Float32(sZ[st.tidx, j])
+                z1 = Float32(0.0)
+                z2 = Float32(0.0)
+                z3 = Float32(0.0)
+                for g in cutlass.range((j + 1) >> 2, nslot >> 2):
+                    c4 = load_vector(sptr(Uint32, crow + g * 16, 16), 4)
+                    ya = load_vector(sptr(Uint32, zrow + g * 16, 8), 2)
+                    yb = load_vector(sptr(Uint32, zrow + g * 16 + 8, 8), 2)
+                    z0 = cute.fma(-u2f(c4[0]), u2f(ya[0]), z0)
+                    z1 = cute.fma(-u2f(c4[1]), u2f(ya[1]), z1)
+                    z2 = cute.fma(-u2f(c4[2]), u2f(yb[0]), z2)
+                    z3 = cute.fma(-u2f(c4[3]), u2f(yb[1]), z3)
+                sZ[st.tidx, j] = (z0 + z1) + (z2 + z3)
+        cute.arch.sync_threads()
+        if st.tidx < nslot:
+            n0 = Float32(0.0)
+            n1 = Float32(0.0)
+            for ii in cutlass.range(0, 128, 2, unroll=4):
+                n0 = cute.fma(sZ[ii, st.tidx], sZ[ii, st.tidx], n0)
+                n1 = cute.fma(sZ[ii + 1, st.tidx], sZ[ii + 1, st.tidx], n1)
+            sNorm2[0, st.tidx] = Float32(1.0) / cute.math.sqrt(
+                cute.arch.fmax(n0 + n1, Float32(1e-30)), rounding=RN
+            )
+        cute.arch.sync_threads()
+        if st.tidx < 128:
+            for j in cutlass.range(0, nslot, unroll=4):
+                sZ[st.tidx, j] = sZ[st.tidx, j] * sNorm2[0, j]
+        cute.arch.sync_threads()
 
 
 # ---------------------------------------------------------------- eigensolver: back-transform and U
@@ -1268,10 +1424,10 @@ def _back_transform(st):
 
 @cute.jit
 def _write_basis(st, uT: cute.Tensor, bh: Int32):
-    """Threads < 256, after the barrier that publishes the back-transformed z: write U = Hd^T Z / sqrt(128) to uT of bh
-    (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32."""
+    """Threads < 256, after the barrier that publishes the back-transformed z: write U = Hd^T Z / sqrt(128) to basis bh
+    of uT (Hd is in the D- buffer); a thread takes 16 rotated channels of one basis vector out of every 32."""
     if st.tidx < 256:
-        for part in cutlass.range_constexpr(st.RANK // 32):
+        for part in cutlass.range_constexpr(st.DIRECTIONS // 32):
             urow = st.lane  # basis vector (U^T row)
             if cutlass.const_expr(part > 0):
                 urow = urow + 32 * part
@@ -1287,7 +1443,7 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
             s128 = Float32(INV_SQRT_HEAD_DIM)
             ub = (
                 Int64(uT.iterator.toint())
-                + Int64(bh) * Int64(st.RANK * 512)
+                + Int64(bh) * Int64(st.DIRECTIONS * 512)
                 + Int64((urow * 128 + k0) * 4)
             )
             for c4 in cutlass.range_constexpr(4):
@@ -1300,8 +1456,27 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
 
 
 @cute.jit
-def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, lens):
-    """Solve one eigenproblem per CTA: CTA bh writes the Q/K basis U of (batch, head) bh, U^T [B, H, RANK, 128].
+def _eig_body(
+    qtens,
+    ktens,
+    rows_q,
+    rows_k,
+    hadamard,
+    uT,
+    S,
+    H,
+    QP,
+    KP,
+    NQ,
+    NK,
+    gram_weight,
+    DIRECTIONS,
+    lens,
+    SEPARATE,
+):
+    """Solve one eigenproblem per CTA: CTA c writes basis c of uT, U^T [B, H, DIRECTIONS, 128] of the weighted Gram
+    sum of (batch, head) c, or with SEPARATE U^T [2, B, H, DIRECTIONS, 128]: the basis of Gk, then that of Gq (module
+    docstring).
 
     * The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V pass
       launched beside it touches only the original V, its own outputs and its words of gmax.
@@ -1314,12 +1489,18 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, le
     # the preceding launch on this stream clears the per-call words that the launches after this one read
     cute.arch.griddepcontrol_wait()
     tidx, _, _ = cute.arch.thread_idx()
-    bh, _, _ = cute.arch.block_idx()
+    cta, _, _ = cute.arch.block_idx()
     cute.arch.griddepcontrol_launch_dependents()
-    st = _eig_state(tidx, RANK)
+    st = _eig_state(tidx, DIRECTIONS)
+    bh = cta
+    if cutlass.const_expr(SEPARATE):
+        gdim, _, _ = cute.arch.grid_dim()
+        second = Int32(cta >= (gdim >> 1))
+        bh = cta - second * (gdim >> 1)
+        gram_weight = Float32(second)
     # dm and zb hold the aligned Gram operand images until the MMAs complete. The normalized matrix is then staged in
     # VH, whose first reflector is written only after all paired-row math threads have loaded their register tiles.
-    _gram(st, qtens, ktens, rows, bh, S, H, QP, KP, NQK, NCQ, lens)
+    _gram(st, qtens, ktens, rows_q, rows_k, bh, S, H, QP, KP, NQ, NK, gram_weight, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
     pair = _load_row_pairs(st)
@@ -1361,6 +1542,7 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, le
     _normalize_halves(st, twist)
     cute.arch.sync_threads()
     _cluster_repair(st, span)
+    _orthonormalize(st)
 
     # back-transform: z <- H_0 ... H_125 z, then U = Hd^T Z / sqrt(128)
     _stage_hadamard_f32(st, hadamard)
@@ -1368,28 +1550,55 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, le
     cute.arch.sync_threads()
     _back_transform(st)
     cute.arch.sync_threads()
-    _write_basis(st, uT, bh)
+    _write_basis(st, uT, cta)
 
 
 @cute.kernel
 def eig_kernel(
     qtens: cute.Tensor,
     ktens: cute.Tensor,
-    rows: cute.Tensor,
+    rows_q: cute.Tensor,
+    rows_k: Int64,
     hadamard: cute.Tensor,
     uT: cute.Tensor,
     S: Int32,
     H: Int32,
     QP: Int32,
     KP: Int32,
-    NQK: Int32,
-    NCQ: Int32,
+    NQ: Int32,
+    NK: Int32,
+    gram_weight: Float32,
     lens: Int64,
-    RANK: cutlass.Constexpr,
-    LENS: cutlass.Constexpr,
+    DIRECTIONS: cutlass.Constexpr,
+    ROWS_MODE: cutlass.Constexpr,
+    TWO_ROW_SETS: cutlass.Constexpr,
+    SEPARATE: cutlass.Constexpr,
 ):
-    """Run the eigensolver CTA (_eig_body). LENS: None for a call whose batch elements are all full (lens is not read);
-    else (rows per sample, mapped rows) for valid prefix lengths, int32 [B] at the address lens: rows is [B, NQK] or
-    [NQK], and with mapped rows _gram maps them from the padded sequence into each valid prefix."""
-    lens_arg = (lens, LENS[0], LENS[1]) if LENS else None
-    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, lens_arg)
+    """Run the eigensolver CTA (_eig_body) of DIRECTIONS directions.
+
+    * ROWS_MODE: None for a call whose batch elements are all full (lens is not read); else (rows per sample, mapped
+      rows) for valid prefix lengths, int32 [B] at the address lens: a row argument is [B, rows] or [rows], and
+      with mapped rows _gram maps them from the padded sequence into each valid prefix.
+    * TWO_ROW_SETS: Gk takes the NK rows at the address rows_k; without it the rows of rows_q (rows_k and NK are
+      not read).
+    * SEPARATE: the grid holds two CTAs per (batch, head) and gram_weight is not read.
+    """
+    lens_arg = (lens, ROWS_MODE[0], ROWS_MODE[1]) if ROWS_MODE else None
+    _eig_body(
+        qtens,
+        ktens,
+        rows_q,
+        rows_k if TWO_ROW_SETS else None,
+        hadamard,
+        uT,
+        S,
+        H,
+        QP,
+        KP,
+        NQ,
+        NQ if not TWO_ROW_SETS else NK,
+        gram_weight,
+        DIRECTIONS,
+        lens_arg,
+        SEPARATE,
+    )

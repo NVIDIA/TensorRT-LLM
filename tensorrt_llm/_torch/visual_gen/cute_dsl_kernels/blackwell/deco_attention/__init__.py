@@ -18,10 +18,11 @@ PV on RTX PRO 6000 (README.md)."""
 from .api import (
     TENSOR_ALIGNMENT,
     attention,
+    max_comp_channels,
     min_seq_len,
     prepare,
     pv_formats,
-    ranks,
+    rescale_thresholds,
     token_rows,
     workspace_size,
 )
@@ -30,10 +31,11 @@ from .inputs import sample_rows
 __all__ = [
     "TENSOR_ALIGNMENT",
     "attention",
+    "max_comp_channels",
     "min_seq_len",
     "prepare",
     "pv_formats",
-    "ranks",
+    "rescale_thresholds",
     "sample_rows",
     "token_rows",
     "workspace_size",

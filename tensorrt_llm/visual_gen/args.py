@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
-from pydantic import field_validator, model_validator
+from pydantic import (
+    Discriminator,
+    SerializerFunctionWrapHandler,
+    Tag,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
@@ -55,9 +62,9 @@ class QuantAttentionConfig(StrictBaseModel):
 
     Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
     backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
-    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. CUTEDSL runs NVFP4 Q/K with FP8 V,
-    or with NVFP4 V on SM120, as DeCo-Attention when deco_attention is set. Unsupported
-    recipes are rejected by AttentionConfig's validator with a ValueError.
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. DeCo-Attention has its own config,
+    DeCoAttentionConfig. Unsupported recipes are rejected by AttentionConfig's validator
+    with a ValueError.
     """
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
@@ -133,17 +140,209 @@ class QuantAttentionConfig(StrictBaseModel):
             "fastest setting measured at unchanged quality. vc_attention only."
         ),
     )
-    deco_attention: bool = Field(
-        False,
+
+
+class DeCoAttentionConfig(QuantAttentionConfig):
+    """DeCo-Attention recipe of the CUTEDSL backend, selected by ``algorithm: deco_attention``.
+
+    Q/K are Hadamard-rotated, quantized to NVFP4 and carry compensation channels for the
+    first-order quantization error of the scores; V is smoothed over blocks of keys and
+    quantized to FP8 or NVFP4. Self-attention with head dimension 128.
+
+    * Compensation channels: ``q_channels`` of the Q-residual term, which compensates the
+      rounding residual of Q, and ``k_channels`` of the K-residual term, which compensates
+      that of K.
+    * Bases: the directions the two terms project on (``basis``, ``gram_weight``), estimated
+      on sampled tokens of the sequence (``q_sample_rate``, ``k_sample_rate``,
+      ``min_sample_rows``).
+    * The recipe sets every scaling granularity and smooths V itself: the block sizes and the
+      smoothing and VC-Attention options of QuantAttentionConfig are not options of it and
+      take their defaults only.
+    """
+
+    algorithm: Literal["deco_attention"] = Field(
+        "deco_attention",
         status="prototype",
         description=(
-            "Run the recipe as DeCo-Attention on the CUTEDSL backend. nvfp4 Q/K are "
-            "Hadamard-rotated and carry compensation channels for the first-order "
-            "quantization error of the scores; V is smoothed over blocks of keys and quantized "
-            "to fp8, or to nvfp4 on SM120. Self-attention with head dimension 128."
+            "Selects DeCo-Attention. A mapping must set it: a quant_attention_config without "
+            "an algorithm is a QuantAttentionConfig."
+        ),
+    )
+    qk_dtype: Literal["nvfp4"] = Field(
+        "nvfp4",
+        status="prototype",
+        description="Q/K quantization format: block-scaled nvfp4.",
+    )
+    v_dtype: Literal["fp8", "nvfp4"] = Field(
+        "fp8",
+        status="prototype",
+        description=(
+            "V quantization format, which is also the format of BMM2: fp8, or nvfp4 on a GPU "
+            "whose kernels offer it."
+        ),
+    )
+    q_block_size: Literal[0] = Field(
+        0,
+        status="prototype",
+        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
+    )
+    k_block_size: Literal[0] = Field(
+        0,
+        status="prototype",
+        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
+    )
+    v_block_size: Literal[0] = Field(
+        0,
+        status="prototype",
+        description="Not an option of DeCo-Attention, which sets its scaling granularity itself.",
+    )
+    smooth_k: Literal[False] = Field(
+        False,
+        status="prototype",
+        description="Not an option of DeCo-Attention.",
+    )
+    smooth_v: Literal[False] = Field(
+        False,
+        status="prototype",
+        description="Not an option of DeCo-Attention, which smooths V itself.",
+    )
+    vc_attention: Literal[False] = Field(
+        False,
+        status="prototype",
+        description="Not an option of DeCo-Attention.",
+    )
+    vc_repair_budget: float = Field(
+        0.0,
+        ge=0.0,
+        le=0.0,
+        status="prototype",
+        description="Not an option of DeCo-Attention.",
+    )
+    q_channels: Optional[int] = Field(
+        None,
+        ge=0,
+        multiple_of=16,
+        status="prototype",
+        description=(
+            "Compensation channels of the Q-residual term, a multiple of 16; 0 drops the "
+            "term. None is half of the compensation channels the kernels of the GPU offer: "
+            "32 of 64, or 64 of 128."
+        ),
+    )
+    k_channels: Optional[int] = Field(
+        None,
+        ge=0,
+        multiple_of=16,
+        status="prototype",
+        description=(
+            "Compensation channels of the K-residual term, a multiple of 16; 0 drops the "
+            "term. None is half of the compensation channels the kernels of the GPU offer: "
+            "32 of 64, or 64 of 128."
+        ),
+    )
+    basis: Literal["shared", "separate"] = Field(
+        "shared",
+        status="prototype",
+        description=(
+            "Bases of the two compensation terms. shared takes both from the leading "
+            "eigenvectors of one weighted sum of the Gram matrices of Q and K; separate takes "
+            "the basis of the Q-residual term from the leading eigenvectors of the Gram matrix "
+            "of K and that of the K-residual term from those of Q."
+        ),
+    )
+    gram_weight: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        status="prototype",
+        description=(
+            "Weight of the Gram matrix of Q against that of K in the shared basis: 0.5 weighs "
+            "them equally, 1 takes Q alone and 0 takes K alone. basis: shared only."
+        ),
+    )
+    q_sample_rate: float = Field(
+        1 / 256,
+        gt=0.0,
+        le=1.0,
+        status="prototype",
+        description=(
+            "Fraction of the tokens of the sequence, padding included, whose Q rows estimate "
+            "the Gram matrix of Q."
+        ),
+    )
+    k_sample_rate: float = Field(
+        1 / 256,
+        gt=0.0,
+        le=1.0,
+        status="prototype",
+        description=(
+            "Fraction of the tokens of the sequence, padding included, whose K rows estimate "
+            "the Gram matrix of K."
+        ),
+    )
+    min_sample_rows: Optional[int] = Field(
+        None,
+        ge=1,
+        status="prototype",
+        description=(
+            "Fewest sampled tokens per Gram matrix, whatever the sample rate gives. None is "
+            "twice the channels of the larger compensation term, at least 64."
         ),
     )
 
+    @model_serializer(mode="wrap")
+    def _serialize_with_algorithm(self, handler: SerializerFunctionWrapHandler) -> Dict[str, Any]:
+        # A dump that leaves out defaults or unset fields still names the algorithm: a mapping
+        # without it is a QuantAttentionConfig.
+        return {"algorithm": self.algorithm, **handler(self)}
+
+    @model_validator(mode="after")
+    def _validate_deco_attention(self) -> "DeCoAttentionConfig":
+        if (self.q_channels or 0) + (self.k_channels or 0) > 128:
+            raise ValueError(
+                "DeCo-Attention takes at most 128 compensation channels, got "
+                f"q_channels={self.q_channels} and k_channels={self.k_channels}."
+            )
+        if self.basis == "separate" and self.gram_weight != 0.5:
+            raise ValueError(
+                "gram_weight weighs the Gram matrices of basis='shared' and does not apply to "
+                f"basis='separate', got gram_weight={self.gram_weight}."
+            )
+        return self
+
+
+def _quant_attention_tag(value: Any) -> Optional[str]:
+    """Return the tag of the quantized attention config that a value selects.
+
+    Its ``algorithm``; "QuantAttentionConfig" for a value without one; None for an
+    ``algorithm`` that is not a string.
+    """
+    if isinstance(value, dict):
+        algorithm = value.get("algorithm")
+    else:
+        algorithm = getattr(value, "algorithm", None)
+    if algorithm is None:
+        return "QuantAttentionConfig"
+    return algorithm if isinstance(algorithm, str) else None
+
+
+# Union of quantized attention configs. A config that names an algorithm is the config class of
+# that algorithm; a config without one is a QuantAttentionConfig, a recipe given by its dtypes
+# and block sizes.
+_QuantAttentionConfigUnion = Annotated[
+    Union[
+        Annotated[QuantAttentionConfig, Tag("QuantAttentionConfig")],
+        Annotated[DeCoAttentionConfig, Tag("deco_attention")],
+    ],
+    Discriminator(
+        _quant_attention_tag,
+        custom_error_type="quant_attention_algorithm",
+        custom_error_message=(
+            "Unknown quant_attention_config algorithm. Set algorithm to 'deco_attention', or "
+            "omit it for a recipe given by its dtypes and block sizes."
+        ),
+    ),
+]
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
@@ -160,13 +359,14 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, CUDNN, FLASHINFER, CUTEDSL, FA4",
     )
-    quant_attention_config: Optional[QuantAttentionConfig] = Field(
+    quant_attention_config: Optional[_QuantAttentionConfigUnion] = Field(
         None,
         status="prototype",
         description=(
             "Quantized-attention recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends). "
-            "Set to a QuantAttentionConfig instance to enable quantized "
-            "attention; leave as None to disable."
+            "Set to a QuantAttentionConfig instance, or to a DeCoAttentionConfig instance "
+            "(algorithm: deco_attention, CUTEDSL backend), to enable quantized attention; "
+            "leave as None to disable."
         ),
     )
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
@@ -243,24 +443,21 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "nvfp4", (0, 0, 0)),
         }
-        # DeCo-Attention quantizes Q/K to NVFP4 with compensation channels and runs the PV in
-        # FP8, or in NVFP4 on SM120 (the backend checks the hardware). Its preparation sets
-        # every scaling granularity, so the block sizes stay 0.
-        DECO_ATTENTION_RECIPES = {
-            ("nvfp4", "fp8", (0, 0, 0)),
-            ("nvfp4", "nvfp4", (0, 0, 0)),
-        }
 
         if self.quant_attention_config is None:
             return self
 
         q_config = self.quant_attention_config
+        # DeCoAttentionConfig validates its own fields; the backend checks them against the GPU.
+        if isinstance(q_config, DeCoAttentionConfig):
+            if self.backend != "CUTEDSL":
+                raise ValueError(
+                    "DeCo-Attention (algorithm='deco_attention') is a CUTEDSL backend option, "
+                    f"got backend='{self.backend}'."
+                )
+            return self
         block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
         recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
-        if q_config.deco_attention and self.backend != "CUTEDSL":
-            raise ValueError(
-                f"deco_attention is a CUTEDSL backend option, got backend='{self.backend}'."
-            )
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
             if q_config.vc_attention:
@@ -314,16 +511,12 @@ class AttentionConfig(StrictBaseModel):
                 f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
-            if q_config.deco_attention:
-                recipes, family = DECO_ATTENTION_RECIPES, "DeCo-Attention recipes"
-            else:
-                recipes, family = CUTEDSL_RECIPES, "recipes"
-            if recipe not in recipes:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported {family} "
+                    f"for backend='CUTEDSL'. Supported recipes "
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(recipes)}."
+                    f"{sorted(CUTEDSL_RECIPES)}."
                 )
         elif self.backend == "CUDNN":
             if recipe not in CUDNN_RECIPES:
@@ -389,8 +582,8 @@ class AttentionConfig(StrictBaseModel):
         # kernels, which take no sparse configuration either.
         if self.quant_attention_config.vc_attention:
             raise ValueError("vc_attention does not compose with sparse_attention_config.")
-        if self.quant_attention_config.deco_attention:
-            raise ValueError("deco_attention does not compose with sparse_attention_config.")
+        if isinstance(self.quant_attention_config, DeCoAttentionConfig):
+            raise ValueError("DeCo-Attention does not compose with sparse_attention_config.")
         if self.backend == "TRTLLM":
             return self
         algorithm = self.sparse_attention_config.algorithm
@@ -1124,6 +1317,7 @@ class VisualGenArgs(StrictBaseModel):
 
 __all__ = [
     "QuantAttentionConfig",
+    "DeCoAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "SolAttentionConfig",

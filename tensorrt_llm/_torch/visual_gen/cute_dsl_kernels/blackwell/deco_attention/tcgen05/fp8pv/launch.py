@@ -19,7 +19,7 @@
 * Split launch: the units of a last partial wave, each split along KV into pieces so that every SM stays busy; the
   pieces are merged in the epilogue through scratch in global memory (epilogue.py). It is a programmatic dependent
   of the main launch: it reads only the inputs and writes other rows of O.
-* Each (device, compensation rank, cluster shape, launch kind) compiles once per process.
+* A kernel compiles once per process and key (_get_compiled).
 """
 
 from collections.abc import Callable
@@ -75,20 +75,32 @@ def _get_compiled(
     args: tuple,
     device: torch.device,
     sm_count: int,
-    rank: int,
+    qk_channels: int,
     cluster_m: int,
     *,
     split: bool,
     pdl: bool,
     lens: bool,
+    rescale_threshold: float,
 ) -> Callable:
+    """Return the kernel compiled for args, kept per key: the device and its SM count, the channels of the QK build,
+    the cluster shape (CTA pairs or single CTAs), the launch kind (main or split launch, as a programmatic dependent
+    or not), with or without lengths, and the rescale threshold."""
     return compiled(
         _compiled,
-        (device.index, sm_count, rank, cluster_m, split, pdl, lens),
-        lambda: PingPongAttention(
-            sm_count, rank, cluster_m=cluster_m, split=split, pdl=pdl, lens=lens
+        (device.index, sm_count, qk_channels, cluster_m, split, pdl, lens, rescale_threshold),
+        lambda: (
+            PingPongAttention(
+                sm_count,
+                qk_channels,
+                cluster_m=cluster_m,
+                split=split,
+                pdl=pdl,
+                lens=lens,
+                rescale_threshold=rescale_threshold,
+            ),
+            *args,
         ),
-        *args,
     )
 
 
@@ -130,10 +142,16 @@ def _make_args(
 
 @torch.no_grad()
 def run(
-    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    qk_channels: int,
+    lens: torch.Tensor | None,
+    rescale_threshold: float,
 ) -> None:
     """Run the NVFP4 Q'K' + FP8 PV attention on the operands of the preparation into BF16 o [B, S, H, 128].
 
+    * qk_channels: the channels of the QK build of the operands (constants.qk_channels). rescale_threshold: one of
+      constants.RESCALE_THRESHOLDS["fp8"].
     * buffers: the buffers of the call, the layout of this package. score_scale is the multiplier of the raw scores
       in log2 units, a power of two of at least 2^softmax.MIN_SCORE_LOG2, and stays on the device like v8_scale.
     * Every launch goes to the current stream; nothing here reads a device value or allocates (graph-capturable).
@@ -184,12 +202,28 @@ def run(
             else 1
         )
         _get_compiled(
-            args, dev, sm_count, rank, cluster_m, split=False, pdl=pdl, lens=lens is not None
+            args,
+            dev,
+            sm_count,
+            qk_channels,
+            cluster_m,
+            split=False,
+            pdl=pdl,
+            lens=lens is not None,
+            rescale_threshold=rescale_threshold,
         )(*args)
     if "split_flags" in buffers:
         # last partial wave: every remaining unit split into n_parts KV pieces (at most one piece per SM)
         ws = (buffers["split_o"], buffers["split_ml"], buffers["split_flags"])
         args = make_args(n_parts, ws)
         _get_compiled(
-            args, dev, sm_count, rank, 1, split=True, pdl=pdl and n_full > 0, lens=lens is not None
+            args,
+            dev,
+            sm_count,
+            qk_channels,
+            1,
+            split=True,
+            pdl=pdl and n_full > 0,
+            lens=lens is not None,
+            rescale_threshold=rescale_threshold,
         )(*args)

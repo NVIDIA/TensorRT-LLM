@@ -20,6 +20,7 @@ their scales and the means go to the tile images of the attention (layout.py).
 
 import torch
 
+from ...inputs import Compensation
 from ..prep import chain
 from .layout import SK_OFF, SKSF_OFF, STAGE
 from .softmax import MIN_SCORE_LOG2
@@ -28,7 +29,8 @@ from .v_pass import V_THREADS, basis_kernel, v_kernel
 _host = chain.make_host(basis_kernel, v_kernel, V_THREADS, 2, k_image=(SK_OFF, SKSF_OFF, STAGE))
 _compiled = {}
 
-# the buffers of a call whose addresses the host function takes after q, k, v, the rows and the rotation, in its order
+# the buffers of a call whose addresses the host function takes after q, k, v, the rows, the basis addresses and
+# the rotation, in its order
 _HOST_BUFFERS = (
     "q4",
     "img",
@@ -39,7 +41,6 @@ _HOST_BUFFERS = (
     "v4_scale",
     None,
     None,
-    "ut",
     "vmax",
     "gmax",
     "prov",
@@ -47,7 +48,8 @@ _HOST_BUFFERS = (
 )
 
 
-# the scratch of the chain at a shape on a device of nsm SMs, name -> (dtype, shape): that of both chains
+# the scratch of the chain at a shape on a device of nsm SMs for a rank and a bases kind, name -> (dtype, shape):
+# that of both chains
 scratch = chain.scratch
 
 
@@ -55,16 +57,13 @@ def run(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rows: torch.Tensor,
     buffers: dict[str, torch.Tensor],
-    lens: torch.Tensor | None = None,
-    map_rows: bool = False,
+    lens: torch.Tensor | None,
+    comp: Compensation,
 ) -> None:
     """Fill the operands of the attention kernel from raw BF16 q, k, v [B, S, H, 128], in the buffers of the call.
 
     * Q' (q4, q_sf), score_scale (floored at 2^MIN_SCORE_LOG2), K', V' and the means (img, v4_scale).
-    * rows: the sampled tokens of the Q/K basis (inputs.sample_rows); lens, map_rows: as in chain.run.
+    * lens, comp: as in chain.run.
     """
-    chain.run(
-        _host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, rows, buffers, lens, map_rows
-    )
+    chain.run(_host, _compiled, _HOST_BUFFERS, MIN_SCORE_LOG2, q, k, v, buffers, lens, comp)

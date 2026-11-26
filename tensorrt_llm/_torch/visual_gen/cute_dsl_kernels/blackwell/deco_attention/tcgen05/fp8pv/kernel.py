@@ -57,7 +57,7 @@ from ... import target
 from ...common.dsl import Tcgen05Fence, tcgen05_fence
 from ...common.mem import load_invariant
 from ...common.state import State
-from ...constants import HEAD_DIM
+from ...constants import HEAD_DIM, p_prescale_log2
 from .. import qk
 from ..ptx import ld_global_nc_f32
 from . import tuning
@@ -100,13 +100,18 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
     def __init__(
         self,
         sm_count: int,
-        rank: int,
+        qk_channels: int,
         cluster_m: int = 1,
         split: bool = False,
         pdl: bool = True,
         lens: bool = False,
+        *,
+        rescale_threshold: float,
     ):
         self.sm_count = sm_count
+        # T of the skip correction and the P pre-scale that goes with it (softmax.py)
+        self.rescale_threshold = rescale_threshold
+        self.p_prescale_log2 = p_prescale_log2(rescale_threshold)
         # lens: the launch takes per-sample valid prefix lengths: a batch element of n valid tokens attends its first
         # n keys, and its query rows from n on are zero in O. The roles run the live units (sched.py) over the KV
         # tiles that hold a valid key; the idle warp stores the rows of the other units
@@ -125,7 +130,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         tune = tuning.tuning()
         # the roles of a main launch with lengths that read the lengths with loads of their own (_role_work)
         self.own_loads = tune.lens_own_loads
-        self.qk = qk.for_target(mma_tiler, rank)
+        self.qk = qk.for_target(mma_tiler, qk_channels)
         self.load_sleep_ns = tune.load_sleep_ns
         self.s_probe = tune.s_probe
         self.rescale_loop = tune.rescale_loop

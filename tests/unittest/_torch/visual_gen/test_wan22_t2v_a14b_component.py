@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.offloading import ModuleOffloadManager
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
+    DeCoAttentionConfig,
     ParallelConfig,
     QuantAttentionConfig,
     TorchCompileConfig,
@@ -330,7 +331,7 @@ def _assert_attention_backend(model, backend_name: str, quant_attention_config=N
         "CUTEDSL": "CuTeDSLAttention",
         "FA4": "FlashAttn4Attention",
     }[backend_name]
-    if getattr(quant_attention_config, "deco_attention", False):
+    if isinstance(quant_attention_config, DeCoAttentionConfig):
         expected = "DeCoAttention"
     assert model.blocks, "No transformer blocks were built"
     for block in model.blocks:

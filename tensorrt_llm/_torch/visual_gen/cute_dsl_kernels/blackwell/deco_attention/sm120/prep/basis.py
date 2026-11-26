@@ -16,8 +16,13 @@
 # ruff: noqa: E741
 """Basis launch of the sm_120 preparation: the compensation basis of Q' and K', and the scan of V.
 
-* One CTA per (batch, head) eigenproblem: Gram of the sampled q, k tokens, Householder tridiagonalization, multisection
-  bisection of the top 32 eigenvalues, inverse iteration, MGS, back transform, U^T = (Hd^T V / sqrt(128))^T in BF16.
+* One CTA per eigenproblem: Gram of the sampled q, k tokens, Householder tridiagonalization, multisection bisection
+  of the top eigenvalues, inverse iteration, modified Gram-Schmidt (MGS), back transform,
+  U^T = (Hd^T V / sqrt(128))^T in FP32.
+* A problem solves for 32 or 64 directions (basis_plan) and stores the leading ones that its basis holds, the
+  leading direction last. One problem per (batch, head) weighs the two Gram matrices; of the two problems of
+  bases "separate" the first takes the Gram of k alone, for the basis of the Q-residual term, and the second
+  that of q, for the basis of the K-residual term.
 * The other CTAs scan V for the range of what the kernel's PV format casts (the maxima that set its tensor scale).
   When the launch has room for it (FUSED), they scan the tiles a counter hands out and then run the kernel's V pass
   on the tiles another counter hands out, joined by the eigensolver CTAs as basis_cta describes; the V pass is a
@@ -32,33 +37,45 @@ from cutlass import Float32, Int16, Int32, Int64, Uint16, Uint32
 from cutlass.utils import SmemAllocator
 
 from ...common.dsl import MMALayout, ldmatrix, nanosleep
-from ...common.expmath import bf16x2, f2u, hash01, u2f, warp_max, warp_sum
+from ...common.expmath import f2u, hash01, u2f, warp_max, warp_sum
 from ...common.mem import cp_async16, gptr, load_invariant, load_vector, sptr, store_vector
 from ...common.state import State
-from ...constants import INV_SQRT_HEAD_DIM
+from ...constants import INV_SQRT_HEAD_DIM, MIN_GRAM_TRACE
 from ..ptx.shared import ld_global_nc_b32_hint_pred, ld_shared_f32_v4_pred, mma_bf16
 from ..valid_len import valid_len
 
 EIG_THREADS = 512
-NIT_BIS = 6
 NIT_INV = 2
+# Gram: the rows of a part; the sums of a part are added to the accumulators of the two matrices when it ends
+GRAM_PART_ROWS = 6144
+# Householder: a row takes no reflection when the squared sum of its entries behind the first is at most this (the
+# matrix has a trace of at most 2)
+REFLECT_FLOOR = 1e-30
+# MGS: at most this many sweeps; a sweep runs when a column of the sweep before kept less than half of its squared
+# norm
+MGS_SWEEPS = 2
+# directions of a problem -> (threads of an eigenvalue in the multisection, its rounds)
+BISECTION = {32: (16, 6), 64: (8, 8)}
 
 # shared memory map (bytes)
 SM_UHH = 0  # packed Householder vectors (8440 floats)
-SM_WORK = 33792  # 32 KB: Gram staging / G half staging / Z [128][32] + PIV [128][32]
+SM_WORK = 33792  # 32 KB: Gram staging / G half staging / Z [128][directions], PIV [128][32] behind 32 directions
 SM_UBUF = 66560  # u of the Householder step in flight (128 floats)
 SM_PBUF = 67072  # p = A u of that step (128 floats)
 SM_DD = 67584  # diagonal of the tridiagonal matrix (128 floats)
 SM_EE = 68096  # its off-diagonal (127 floats)
 SM_E2 = 68608  # the squares of the off-diagonal, floored (128 floats)
-SM_LAM = 69120  # the 32 eigenvalues
 SM_ZC = 69248  # the MGS column in flight: two buffers of 128 floats, used in turn
-SM_RED = 70272  # per-warp parts of the sums and bounds taken over the CTA
-SM_SCL = 70976  # 32 inverse-iteration scales
-SM_IDX2 = 71168  # up to 512 sampled token indices (Gram)
-# V pass (after the eigensolver / scan): input tiles at 0 (2 x 32 KB), output stages here
+SM_RED = 70272  # per-warp parts of the sums and bounds taken over the CTA; the words of the MGS sweeps at RED_SWEEP
+RED_SWEEP = 160  # one word per MGS sweep but the last: not zero when a column lost half of its squared norm in it
+SM_IDX2 = 71168  # up to 512 sampled token indices of q (Gram); then the eigenvalues and the scales
+SM_LAM = SM_IDX2  # up to 64 eigenvalues
+SM_SCL = SM_IDX2 + 256  # up to 64 inverse-iteration scales
+# V pass (after the eigensolver / scan): input tiles at 0 (2 x 32 KB), output stages here. The eigensolver keeps
+# there up to 512 sampled token indices of k (Gram) and, with 64 directions, PIV [128][32]
 SM_VSTG = 73728
 SM_TOTAL = 92160
+IDX = (SM_IDX2, SM_VSTG)  # the sampled token indices of q and of k
 # The eigensolver also uses the start of the buffer twice: for the two cp.async buffers of the Gram rounds, 26112 B
 # each (2 x 48 rows at a 272-byte stride) at 0 and 26112, and at the end for the Hadamard matrix (32 KB at SM_UHH).
 
@@ -75,6 +92,25 @@ def pow2_inv_of_max(a, b):
     return (Int32(0x7F000000) - (m.bitcast(Int32) & 0x7F800000)).bitcast(Float32)
 
 
+def basis_plan(rank: tuple[int, int], separate: bool) -> tuple[int, int]:
+    """Return (problems per (batch, head), directions a problem solves for) of the terms rank = (r_q, r_k).
+
+    * Problems: none without a term; one with bases "shared"; two with "separate".
+    * Directions: 32 up to max(r_q, r_k) = 32, else 64.
+    """
+    top = max(rank)
+    if top == 0:
+        return 0, 0
+    return 2 if separate else 1, 32 if top <= 32 else 64
+
+
+def of_side(dtype, pair, mat):
+    """pair[mat] as a dtype value, for mat 0 (q) or 1 (k) at trace time or at run time."""
+    if isinstance(mat, int):
+        return dtype(pair[mat])
+    return dtype(cutlass.select_(mat != 0, dtype(pair[1]), dtype(pair[0])))
+
+
 @cute.jit
 def _uhh_off(k: Int32) -> Int32:
     a = k >> 2
@@ -83,21 +119,28 @@ def _uhh_off(k: Int32) -> Int32:
 
 
 # ------------------------------------------------------------------------------------------------ eigensolver steps
-# The steps of _eig, in the order it runs them, on its thread state st and its register tensors acc, A, uu, za, zbv.
-# No step contains a CTA barrier: _eig places them between the steps, and a step reads from shared memory what the
-# steps before the last barrier wrote.
+# The steps of _eig, in the order it runs them, on its thread state st and its register tensors part, acc, A, uu,
+# z, zn. No step contains a CTA barrier: _eig places them between the steps, and a step reads from shared memory
+# what the steps before the last barrier wrote.
 @cute.jit
-def sampled_token(st, sidx):
-    """The token of sample sidx of this batch element, from rows_p. With lengths (st.lens_p is their address) the
-    batch element has st.nv valid tokens: st.rows_mode 0 is the default draw over the padded sequence,
-    whose row r stands for token floor(r nv / S); modes 1 and 2 are the caller's rows, shared by the batch [NQK] or
-    per batch element [B, NQK], taken as given below nv and as the last valid token from nv on."""
+def sampled_token(st, mat, sidx):
+    """Return the token of sample sidx of q (mat 0) or k (mat 1) of this batch element.
+
+    * From the rows of that operand (st.rows_p, st.N of them); without lengths a row is clamped to the sequence.
+    * With lengths (st.lens_p is their address) the batch element has st.nv valid tokens, and the rows mode of
+      the operand decides (st.rows_mode holds it once per operand: that of q in bits 0..1, that of k in bits
+      2..3):
+        - 0, the default draw over the padded sequence: row r stands for token floor(r nv / S).
+        - 1 and 2, the caller's rows, shared by the batch [N] or per batch element [B, N]: taken as given
+          below nv, and as the last valid token from nv on.
+    """
+    rows_p = of_side(Int64, st.rows_p, mat)
     if cutlass.const_expr(st.lens_p is None):
-        r = Int32(load_invariant(Uint32, st.rows_p + Int64(sidx) * 4))
+        r = Int32(load_invariant(Uint32, rows_p + Int64(sidx) * 4))
         return Uint32(cutlass.max(cutlass.min(r, st.S - 1), Int32(0)))
-    mode = st.rows_mode
-    own = Int64(cutlass.select_(mode == 2, st.b * st.NQK, Int32(0)))
-    r = Int32(load_invariant(Uint32, st.rows_p + (own + Int64(sidx)) * 4))
+    mode = of_side(Int32, (st.rows_mode & 3, st.rows_mode >> 2), mat)
+    own = Int64(cutlass.select_(mode == 2, st.b * of_side(Int32, st.N, mat), Int32(0)))
+    r = Int32(load_invariant(Uint32, rows_p + (own + Int64(sidx)) * 4))
     mapped = Int32((Int64(r) * Int64(st.nv)) // Int64(st.S))
     tok = Int32(cutlass.select_(mode == 0, mapped, cutlass.min(r, st.nv - 1)))
     return Uint32(cutlass.max(tok, Int32(0)))
@@ -105,11 +148,12 @@ def sampled_token(st, sidx):
 
 @cute.jit
 def preload_tokens(st):
-    """Thread tid < NQK copies sampled token index tid from rows_p to SM_IDX2: the first 512 indices, which the Gram
-    copies read from there (those beyond are read from rows_p per copy)."""
-    sIdx = st.sIdx
-    if st.tid < st.NQK:
-        sIdx[st.tid] = sampled_token(st, st.tid)
+    """Thread tid < N copies sampled token index tid of q to SM_IDX2 and of k to SM_VSTG: the first 512 indices of each
+    operand, which the Gram copies read from there (those beyond are read from the rows per copy)."""
+    for mat in cutlass.range_constexpr(2):
+        sIdx = cute.make_tensor(sptr(Uint32, st.sb + IDX[mat]), cute.make_layout(512))
+        if st.tid < st.N[mat]:
+            sIdx[st.tid] = sampled_token(st, mat, st.tid)
 
 
 @cute.jit
@@ -123,9 +167,28 @@ def round_chunk(st, it: cutlass.Constexpr):
 
 
 @cute.jit
-def preloaded_token(st, sidx):
-    """The token index of sample sidx from SM_IDX2 (the index clamped to the last sample and to the 512 preloaded)."""
-    return Int32(st.sIdx[cutlass.min(cutlass.min(sidx, st.NQK - 1), 511)])
+def staged_chunk(st, mat, sidx, chk, late: cutlass.Constexpr):
+    """Return (source address, bytes) of the copy of 16-byte chunk chk of sample sidx of q (mat 0) or k (mat 1).
+
+    * Source: the row of the sample's preloaded token, the index clamped to the last sample and to the 512
+      preloaded. late: sidx may be 512 or more, and such a token is read from the rows.
+    * No bytes, so zeros: a sample past the rows of the operand; an operand that has no weight in the Gram of
+      this problem; with lengths, a batch element without a valid token.
+    """
+    n = of_side(Int32, st.N, mat)
+    ok = Int32(sidx < n) & of_side(Int32, st.used, mat)
+    if cutlass.const_expr(st.lens_p is not None):
+        ok = ok & Int32(st.nv > 0)
+    slot = cutlass.max(cutlass.min(cutlass.min(sidx, n - 1), 511), 0)
+    idx = st.sb + of_side(Int32, IDX, mat) + slot * 4
+    tok = Int32(cute.arch.load(sptr(Uint32, idx), Uint32))
+    if cutlass.const_expr(late):
+        if sidx >= 512:
+            if sidx < n:
+                tok = Int32(sampled_token(st, mat, sidx))
+    return chunk_src(st, mat, tok, chk), Int32(
+        Uint32(cutlass.select_(ok != 0, Uint32(16), Uint32(0)))
+    )
 
 
 @cute.jit
@@ -141,31 +204,21 @@ def chunk_src(st, mat, tok, chk):
 @cute.jit
 def stage_first_rounds(st):
     """cp.async of the thread's chunks of rounds 0 and 1 into the buffers at 0 and 26112 (row r of a round at
-    r * 272), one group per round; a sample past NQK copies zeros. Token indices: preload_tokens, barrier."""
+    r * 272), one group per round (staged_chunk). Token indices: preload_tokens, barrier."""
     for pre in cutlass.range_constexpr(2):
         for it in cutlass.range_constexpr(3):
             mat, sm, chk = round_chunk(st, it)
-            sidx = pre * 48 + sm
-            ok = Int32(sidx < st.NQK)
-            if cutlass.const_expr(st.lens_p is not None):
-                # a batch element without a valid token copies zeros
-                ok = ok & Int32(st.nv > 0)
-            tok = preloaded_token(st, sidx)
-            src = chunk_src(st, mat, tok, chk)
-            cp_async16(
-                st.sb + pre * 26112 + (mat * 48 + sm) * 272 + chk * 16,
-                src,
-                Int32(Uint32(cutlass.select_(ok != 0, Uint32(16), Uint32(0)))),
-            )
+            src, nbytes = staged_chunk(st, mat, pre * 48 + sm, chk, False)
+            cp_async16(st.sb + pre * 26112 + (mat * 48 + sm) * 272 + chk * 16, src, nbytes)
         cute.arch.cp_async_commit_group()
 
 
 @cute.jit
-def gram_round(st, acc, buf):
+def gram_round(st, part, buf):
     """Adds the 48 rows of q and of k staged at buf (their cp.async group waited for, barrier) to the warp's blocks
     of Xq^T Xq and Xk^T Xk, rows 16 mi .. 16 mi + 15, columns 8 nb .. 8 nb + 63: per 16 staged rows a 16 x 16 A
     fragment and eight 16 x 8 B fragments by transposed ldmatrix, BF16 mma.sync into f32. The thread's entries:
-    acc[32 side + 4 n + 2 hh + e] = row 16 mi + g + 8 hh, column 8 (nb + n) + 2 t + e (side 0: q, 1: k)."""
+    part[32 side + 4 n + 2 hh + e] = row 16 mi + g + 8 hh, column 8 (nb + n) + 2 t + e (side 0: q, 1: k)."""
     for ks in cutlass.range_constexpr(3):
         for side in cutlass.range_constexpr(2):
             xb = buf + side * 48 * 272
@@ -181,35 +234,31 @@ def gram_round(st, acc, buf):
                 for hn in cutlass.range_constexpr(2):
                     base = side * 32 + (2 * np2 + hn) * 4
                     r = mma_bf16(
-                        [acc[base], acc[base + 1], acc[base + 2], acc[base + 3]],
+                        [part[base], part[base + 1], part[base + 2], part[base + 3]],
                         a,
                         [bq[2 * hn], bq[2 * hn + 1]],
                     )
                     for e in cutlass.range_constexpr(4):
-                        acc[base + e] = r[e]
+                        part[base + e] = r[e]
+
+
+@cute.jit
+def close_part(part, acc):
+    """acc += part, part = 0: the sums of a part of the Gram rounds join the accumulators of Xq^T Xq and Xk^T Xk."""
+    for e in cutlass.range_constexpr(64):
+        acc[e] = acc[e] + part[e]
+        part[e] = Float32(0.0)
 
 
 @cute.jit
 def refill(st, buf, rd):
     """cp.async of the thread's chunks of round rd + 2 into the buffer at buf, which round rd has left (every warp
-    is done with it: barrier), as one group; past the last round the group is empty, which keeps the group
-    accounting of the round loop uniform. A token index beyond the 512 preloaded is read from rows_p."""
+    is done with it: barrier), as one group (staged_chunk); past the last round the group is empty, which keeps the
+    group accounting of the round loop uniform."""
     for it in cutlass.range_constexpr(3):
         mat, sm, chk = round_chunk(st, it)
-        sidx = (rd + 2) * 48 + sm
-        ok = Int32(sidx < st.NQK)
-        if cutlass.const_expr(st.lens_p is not None):
-            ok = ok & Int32(st.nv > 0)
-        tok = preloaded_token(st, sidx)
-        if sidx >= 512:
-            if sidx < st.NQK:
-                tok = Int32(sampled_token(st, sidx))
-        src = chunk_src(st, mat, tok, chk)
-        cp_async16(
-            buf + (mat * 48 + sm) * 272 + chk * 16,
-            src,
-            Int32(Uint32(cutlass.select_(ok != 0, Uint32(16), Uint32(0)))),
-        )
+        src, nbytes = staged_chunk(st, mat, (rd + 2) * 48 + sm, chk, True)
+        cp_async16(buf + (mat * 48 + sm) * 272 + chk * 16, src, nbytes)
     cute.arch.cp_async_commit_group()
 
 
@@ -239,15 +288,21 @@ def publish_traces(st, acc):
 
 @cute.jit
 def normalize_gram(st, acc):
-    """acc[0:32] = the thread's entries of G = Xq^T Xq / tr(Xq^T Xq) + Xk^T Xk / tr(Xk^T Xk) (a matrix of zero trace
-    is left out), with the traces summed from the 16 warp parts (publish_traces, barrier)."""
+    """acc[0:32] = the thread's entries of G = weight_q Xq^T Xq / tr(Xq^T Xq) + weight_k Xk^T Xk / tr(Xk^T Xk),
+    (weight_q, weight_k) = st.weights (a matrix whose trace is below MIN_GRAM_TRACE counts as zero), with the traces
+    summed from the 16 warp parts (publish_traces, barrier)."""
     tq = Float32(0.0)
     tk2 = Float32(0.0)
     for wi in cutlass.range_constexpr(16):
         tq = tq + st.sRed[wi]
         tk2 = tk2 + st.sRed[16 + wi]
-    iq = Float32(cutlass.select_(tq > Float32(0.0), cute.math.rcp(tq), Float32(0.0)))
-    ik = Float32(cutlass.select_(tk2 > Float32(0.0), cute.math.rcp(tk2), Float32(0.0)))
+    weight_q, weight_k = st.weights
+    iq = Float32(
+        cutlass.select_(tq >= Float32(MIN_GRAM_TRACE), cute.math.rcp(tq) * weight_q, Float32(0.0))
+    )
+    ik = Float32(
+        cutlass.select_(tk2 >= Float32(MIN_GRAM_TRACE), cute.math.rcp(tk2) * weight_k, Float32(0.0))
+    )
     for e in cutlass.range_constexpr(32):
         acc[e] = acc[e] * iq + acc[32 + e] * ik
 
@@ -342,15 +397,16 @@ def write_reflector(st, A, k, ko: cutlass.Constexpr, alpha, uscale):
 @cute.jit
 def publish_reflector(st, A, k, ko: cutlass.Constexpr):
     """Step k (segment ko) in the warp of row k: with x the part of row k right of the diagonal, the reflector
-    H = I - u u^T that maps x to alpha e_1, alpha = -sign(x_0) |x|, u = (x - alpha e_1) / sqrt(|x|^2 - alpha x_0)
-    (u = 0 and alpha = x_0 when x has no entry but x_0). The threads of row k write u (write_reflector); its thread
-    qq 0 writes d_k to SM_DD and e_k = alpha to SM_EE."""
+    H = I - u u^T that maps x to alpha e_1, alpha = -sign(x_0) |x|, u = (x - alpha e_1) / sqrt(|x|^2 - alpha x_0).
+    No reflection (u = 0 and alpha = x_0) when the entries of x behind x_0 have a squared sum of at most
+    REFLECT_FLOOR, or of at most 1e-30 of |x|^2. The threads of row k write u (write_reflector); its thread qq 0
+    writes d_k to SM_DD and e_k = alpha to SM_EE."""
     sD, sE = st.sD, st.sE
     if st.warp == (k >> 3):
         sg, x0c, dc = row_sums(st, A, k, ko)
         nrm = cute.math.sqrt(sg, approx=True, ftz=True)
         alpha = Float32(cutlass.select_(x0c >= Float32(0.0), -nrm, nrm))
-        doit = Int32(sg - x0c * x0c > sg * Float32(1e-30))
+        doit = Int32(sg - x0c * x0c > cute.arch.fmax(sg * Float32(1e-30), Float32(REFLECT_FLOOR)))
         uscale = Float32(
             cutlass.select_(
                 doit != 0,
@@ -493,24 +549,25 @@ def sturm_count(st, x):
 
 @cute.jit
 def multisect(st, lo0, hi0, span):
-    """The bracket (lo, hi) of eigenvalue jv (the jv-th largest) after NIT_BIS rounds of multisection by its 16
-    threads (a half warp), from the spectrum bounds widened by span * 1e-6: 16 points cut the bracket into 17
-    sections, thread sv counts the eigenvalues below point sv + 1 (sturm_count), and a ballot of the half warp
-    picks the section that holds the eigenvalue."""
+    """The bracket (lo, hi) of eigenvalue jv (the jv-th largest) after the rounds of multisection by its n threads
+    (BISECTION; consecutive lanes of a warp), from the spectrum bounds widened by span * 1e-6: n points cut the
+    bracket into n + 1 sections, thread sv counts the eigenvalues below point sv + 1 (sturm_count), and a ballot of
+    the n threads picks the section that holds the eigenvalue."""
+    n, rounds = BISECTION[st.directions]
     mtarget = 127 - st.jv
     lo = lo0 - span * Float32(1e-6) - Float32(1e-30)
     hi = hi0 + span * Float32(1e-6) + Float32(1e-30)
-    for _ in cutlass.range_constexpr(NIT_BIS):
-        wdt = (hi - lo) * Float32(1.0 / 17.0)
+    for _ in cutlass.range_constexpr(rounds):
+        wdt = (hi - lo) * Float32(1.0 / (n + 1))
         x = lo + wdt * Float32(st.sv + 1)
         cnt = sturm_count(st, x)
         bal = Uint32(cute.arch.vote_ballot_sync(Int32(cnt) >= mtarget + 1))
-        bits = (bal >> Uint32((st.lane >> 4) * 16)) & Uint32(0xFFFF)
+        bits = (bal >> Uint32((st.lane // n) * n)) & Uint32((1 << n) - 1)
         first = Int32(cute.arch.popc((~bits) & (bits - Uint32(1))))
         nlo = Float32(cutlass.select_(first > 0, lo + wdt * Float32(first), lo))
         nhi = lo + wdt * Float32(first + 1)
         isnone = Int32(bits == Uint32(0))
-        lo = Float32(cutlass.select_(isnone != 0, lo + wdt * Float32(16.0), nlo))
+        lo = Float32(cutlass.select_(isnone != 0, lo + wdt * Float32(n), nlo))
         hi = Float32(cutlass.select_(isnone != 0, hi, nhi))
     return lo, hi
 
@@ -536,15 +593,15 @@ def floored_pivot(piv, pfl):
 
 
 @cute.jit
-def inverse_iteration(st, span):
-    """Warp 0, lane c: the eigenvector of eigenvalue c (SM_LAM: publish_eigenvalue, barrier) by NIT_INV inverse
-    iterations from a hashed start vector, in place in column c of Z (f32 [128][32] at SM_WORK): elimination without
-    pivoting of T - lambda I (SM_DD, SM_EE), its pivots floored in magnitude at span * 1e-9 and kept behind Z, then
-    back substitution. Each iteration starts from the last iterate times 1 / max |x|; the last such scale goes to
-    SM_SCL [c]."""
+def inverse_iteration(st, span, first: cutlass.Constexpr):
+    """Warp 0, lane c - first: the eigenvector of eigenvalue c (SM_LAM: publish_eigenvalue, barrier) by NIT_INV
+    inverse iterations from a hashed start vector, in place in column c of Z (f32 [128][directions] at SM_WORK):
+    elimination without pivoting of T - lambda I (SM_DD, SM_EE), its pivots floored in magnitude at span * 1e-9 and
+    kept in PIV, then back substitution. Each iteration starts from the last iterate times 1 / max |x|; the last
+    such scale goes to SM_SCL [c]."""
     sD, sE, sZ, sPiv, sScl = st.sD, st.sE, st.sZ, st.sPiv, st.sScl
     if st.warp == 0:
-        c = st.lane
+        c = first + st.lane
         lam = st.sLam[c]
         pfl = span * Float32(1e-9) + Float32(1e-30)
         for i in cutlass.range(128, unroll=4):
@@ -553,7 +610,7 @@ def inverse_iteration(st, span):
         for _ in cutlass.range_constexpr(NIT_INV):
             piv = sD[0] - lam
             piv = floored_pivot(piv, pfl)
-            sPiv[0, c] = piv
+            sPiv[0, st.lane] = piv
             y = sZ[0, c] * scale
             sZ[0, c] = y
             for i in cutlass.range(1, 128, unroll=4):
@@ -564,7 +621,7 @@ def inverse_iteration(st, span):
                 piv = (di - lam) - l * em
                 piv = floored_pivot(piv, pfl)
                 y = bi * scale - l * y
-                sPiv[i, c] = piv
+                sPiv[i, st.lane] = piv
                 sZ[i, c] = y
             xx = y * cute.arch.rcp_approx(piv)
             sZ[127, c] = xx
@@ -573,7 +630,7 @@ def inverse_iteration(st, span):
                 i = 126 - i2
                 yi = sZ[i, c]
                 ei = sE[i]
-                ri = cute.arch.rcp_approx(sPiv[i, c])
+                ri = cute.arch.rcp_approx(sPiv[i, st.lane])
                 xx = (yi - ei * xx) * ri
                 sZ[i, c] = xx
                 amax = cute.arch.fmax(amax, cute.math.abs(xx))
@@ -584,71 +641,96 @@ def inverse_iteration(st, span):
 
 
 @cute.jit
-def load_columns(st, za, zbv):
-    """za, zbv = the thread's rows 4 lane .. 4 lane + 3 of columns 2 warp and 2 warp + 1 of Z, times their scales of
-    SM_SCL (inverse_iteration, barrier)."""
-    sca = st.sScl[2 * st.warp]
-    scb = st.sScl[2 * st.warp + 1]
-    for e in cutlass.range_constexpr(4):
-        za[e] = st.sZ[4 * st.lane + e, 2 * st.warp] * sca
-        zbv[e] = st.sZ[4 * st.lane + e, 2 * st.warp + 1] * scb
+def load_columns(st, z, zn):
+    """z[4 j + e] = the thread's rows 4 lane .. 4 lane + 3 of column st.cols warp + j of Z, the warp's column j, times
+    its scale of SM_SCL (inverse_iteration, barrier); zn[j] = the squared norm of that column."""
+    for j in cutlass.range_constexpr(st.cols):
+        col = st.cols * st.warp + j
+        sc = st.sScl[col]
+        for e in cutlass.range_constexpr(4):
+            z[4 * j + e] = st.sZ[4 * st.lane + e, col] * sc
+        zn[j] = warp_sum(
+            z[4 * j] * z[4 * j]
+            + z[4 * j + 1] * z[4 * j + 1]
+            + z[4 * j + 2] * z[4 * j + 2]
+            + z[4 * j + 3] * z[4 * j + 3]
+        )
 
 
 @cute.jit
-def publish_column(st, za, zbv, c, buf):
-    """Column c of the MGS, in the warp that holds it (in za or zbv): normalizes it and writes it to buf, the lane
-    its four rows."""
-    if st.warp == (c >> 1):
-        odd = c & 1
-        cv = [Float32(cutlass.select_(odd != 0, zbv[e], za[e])) for e in range(4)]
+def publish_column(st, z, zn, c, buf, lost_p):
+    """Column c of an MGS sweep, in the warp that holds it: normalizes it and writes it to buf, the lane its four rows.
+
+    * zn: the squared norms that the warp's columns had before the sweep; that of column c becomes 1.
+    * lost_p: None, or the shared-memory word that lane 0 sets when the column kept less than half of that squared
+      norm: the projections of the sweep took the rest.
+    """
+    if st.warp == c // st.cols:
+        own = c % st.cols
+        cv = [z[e] for e in range(4)]
+        before = zn[0]
+        for j in cutlass.range_constexpr(1, st.cols):
+            before = Float32(cutlass.select_(own == j, zn[j], before))
+            for e in cutlass.range_constexpr(4):
+                cv[e] = Float32(cutlass.select_(own == j, z[4 * j + e], cv[e]))
         n2 = warp_sum(cv[0] * cv[0] + cv[1] * cv[1] + cv[2] * cv[2] + cv[3] * cv[3])
+        if cutlass.const_expr(lost_p is not None):
+            if st.lane == 0:
+                if n2 < Float32(0.5) * before:
+                    cute.arch.store(sptr(Uint32, lost_p), Uint32(1))
+        for j in cutlass.range_constexpr(st.cols):
+            zn[j] = Float32(cutlass.select_(own == j, Float32(1.0), zn[j]))
         inv = cute.math.rsqrt(cute.arch.fmax(n2, Float32(1e-30)), approx=True, ftz=True)
         for e in cutlass.range_constexpr(4):
             cv[e] = cv[e] * inv
-            za[e] = Float32(cutlass.select_(odd != 0, za[e], cv[e]))
-            zbv[e] = Float32(cutlass.select_(odd != 0, cv[e], zbv[e]))
+            for j in cutlass.range_constexpr(st.cols):
+                z[4 * j + e] = Float32(cutlass.select_(own == j, cv[e], z[4 * j + e]))
         store_vector(sptr(Float32, buf + st.lane * 16, 16), (cv[0], cv[1], cv[2], cv[3]))
 
 
 @cute.jit
-def project_out(st, za, zbv, c, buf):
+def project_out(st, z, c, buf):
     """Every warp removes from its columns behind c their component along column c, read from buf (publish_column,
     barrier)."""
     z4 = load_vector(sptr(Float32, buf + st.lane * 16, 16), 4)
-    da = warp_sum(z4[0] * za[0] + z4[1] * za[1] + z4[2] * za[2] + z4[3] * za[3])
-    db = warp_sum(z4[0] * zbv[0] + z4[1] * zbv[1] + z4[2] * zbv[2] + z4[3] * zbv[3])
-    fa = Float32(cutlass.select_(2 * st.warp > c, da, Float32(0.0)))
-    fb = Float32(cutlass.select_(2 * st.warp + 1 > c, db, Float32(0.0)))
-    for e in cutlass.range_constexpr(4):
-        za[e] = za[e] - fa * z4[e]
-        zbv[e] = zbv[e] - fb * z4[e]
+    for j in cutlass.range_constexpr(st.cols):
+        d = warp_sum(
+            z4[0] * z[4 * j] + z4[1] * z[4 * j + 1] + z4[2] * z[4 * j + 2] + z4[3] * z[4 * j + 3]
+        )
+        f = Float32(cutlass.select_(st.cols * st.warp + j > c, d, Float32(0.0)))
+        for e in cutlass.range_constexpr(4):
+            z[4 * j + e] = z[4 * j + e] - f * z4[e]
 
 
 @cute.jit
-def back_transform(st, za, zbv):
-    """v = H_0 ... H_125 z on the warp's two columns: for k = 125 .. 0, z <- z - u_k (u_k . z), with u_k from its
-    packed place in SM_UHH (complete since the tridiagonalization) by a predicated load: a lane whose rows lie
-    before the packed part takes zeros."""
+def back_transform(st, z):
+    """v = H_0 ... H_125 z on the warp's columns: for k = 125 .. 0, z <- z - u_k (u_k . z), with u_k from its packed
+    place in SM_UHH (complete since the tridiagonalization) by a predicated load: a lane whose rows lie before the
+    packed part takes zeros."""
     for k2 in cutlass.range(126, unroll=1):
         k = 125 - k2
         start = (k >> 2) << 2
         u4 = ld_shared_f32_v4_pred(
             st.uhh + (_uhh_off(k) + 4 * st.lane - start) * 4, Int32(4 * st.lane >= start)
         )
-        da = warp_sum(u4[0] * za[0] + u4[1] * za[1] + u4[2] * za[2] + u4[3] * za[3])
-        db = warp_sum(u4[0] * zbv[0] + u4[1] * zbv[1] + u4[2] * zbv[2] + u4[3] * zbv[3])
-        for e in cutlass.range_constexpr(4):
-            za[e] = za[e] - da * u4[e]
-            zbv[e] = zbv[e] - db * u4[e]
+        for j in cutlass.range_constexpr(st.cols):
+            d = warp_sum(
+                u4[0] * z[4 * j]
+                + u4[1] * z[4 * j + 1]
+                + u4[2] * z[4 * j + 2]
+                + u4[3] * z[4 * j + 3]
+            )
+            for e in cutlass.range_constexpr(4):
+                z[4 * j + e] = z[4 * j + e] - d * u4[e]
 
 
 @cute.jit
-def store_columns(st, za, zbv):
-    """Writes the thread's rows of its two eigenvectors back to columns 2 warp and 2 warp + 1 of Z (SM_WORK)."""
+def store_columns(st, z):
+    """Writes the thread's rows of the warp's eigenvectors back to their columns of Z (SM_WORK)."""
     sZ = st.sZ
-    for e in cutlass.range_constexpr(4):
-        sZ[4 * st.lane + e, 2 * st.warp] = za[e]
-        sZ[4 * st.lane + e, 2 * st.warp + 1] = zbv[e]
+    for j in cutlass.range_constexpr(st.cols):
+        for e in cutlass.range_constexpr(4):
+            sZ[4 * st.lane + e, st.cols * st.warp + j] = z[4 * j + e]
 
 
 @cute.jit
@@ -662,28 +744,35 @@ def stage_hadamard(st, had_p):
 
 
 @cute.jit
-def project_basis(st, ut_p, bh):
+def project_basis(st, ut_p, bh, keep):
     """U = Hd^T V / sqrt(128) from Hd in SM_UHH and the eigenvectors V in Z (stage_hadamard, store_columns, barrier):
-    thread (d = tid & 127, rg = tid >> 7) sums column d of Hd against the eigenvectors r = 8 rg .. 8 rg + 7 and
-    stores U^T[r][d] in BF16 at ut_p [bh][r][d]."""
+    thread (d = tid & 127, rg = tid >> 7) sums, per 32 directions, column d of Hd against the eigenvectors
+    r = 8 rg .. 8 rg + 7 of them and stores U^T[r][d] for r < keep in FP32 at ut_p [bh][keep - 1 - r][d]: the basis
+    [keep][128] of (batch, head) bh, the leading direction last."""
     dcol = st.tid & 127
     rg = st.tid >> 7
-    uo = cute.make_rmem_tensor((8,), Float32)
-    uo.fill(0.0)
-    for j in cutlass.range(128, unroll=4):
-        hv = u2f(st.sHd[j, dcol].to(Uint32) << Uint32(16))
-        v0 = load_vector(sptr(Float32, st.work + (j * 32 + 8 * rg) * 4, 16), 4)
-        v1 = load_vector(sptr(Float32, st.work + (j * 32 + 8 * rg + 4) * 4, 16), 4)
-        for e in cutlass.range_constexpr(4):
-            uo[e] = uo[e] + hv * v0[e]
-            uo[4 + e] = uo[4 + e] + hv * v1[e]
-    sc = Float32(INV_SQRT_HEAD_DIM)
-    for e in cutlass.range_constexpr(8):
-        r = 8 * rg + e
-        hb = bf16x2(uo[e] * sc, Float32(0.0))
-        cute.arch.store(
-            gptr(Uint16, ut_p + (Int64(bh) * 4096 + Int64(r * 128 + dcol)) * 2), hb.to(Uint16)
-        )
+    whole = isinstance(keep, int) and keep == st.directions
+    for first in cutlass.range_constexpr(0, st.directions, 32):
+        uo = cute.make_rmem_tensor((8,), Float32)
+        uo.fill(0.0)
+        for j in cutlass.range(128, unroll=4):
+            hv = u2f(st.sHd[j, dcol].to(Uint32) << Uint32(16))
+            v0 = load_vector(
+                sptr(Float32, st.work + (j * st.directions + first + 8 * rg) * 4, 16), 4
+            )
+            v1 = load_vector(
+                sptr(Float32, st.work + (j * st.directions + first + 8 * rg + 4) * 4, 16), 4
+            )
+            for e in cutlass.range_constexpr(4):
+                uo[e] = uo[e] + hv * v0[e]
+                uo[4 + e] = uo[4 + e] + hv * v1[e]
+        sc = Float32(INV_SQRT_HEAD_DIM)
+        for e in cutlass.range_constexpr(8):
+            r = first + 8 * rg + e
+            kept = cutlass.const_expr(whole) or r < keep
+            if kept:
+                row = Int64(bh) * Int64(keep) + Int64(keep - 1 - r)
+                cute.arch.store(gptr(Float32, ut_p + (row * 128 + dcol) * 4), uo[e] * sc)
 
 
 # ------------------------------------------------------------------------------------------------ eigensolver
@@ -691,50 +780,77 @@ def project_basis(st, ut_p, bh):
 def _eig(
     q_p: Int64,
     k_p: Int64,
-    rows_p: Int64,
+    rows_p,
     had_p: Int64,
-    ut_p: Int64,
-    bh: Int32,
+    ut_addrs,
+    problem: Int32,
     S: Int32,
     H: Int32,
     QP: Int32,
     KP: Int32,
-    NQK: Int32,
+    N,
+    weights,
     tid: Int32,
     sb: Int32,
     lens_p,
     rows_mode,
+    rank: cutlass.Constexpr,
+    separate: cutlass.Constexpr,
 ):
-    """Run the eigensolver CTA of (batch, head) bh (thread tid of EIG_THREADS, shared memory at sb with the map SM_*).
+    """Run the eigensolver CTA of a problem (thread tid of EIG_THREADS, shared memory at sb with the map SM_*).
 
-    * Result: the compensation basis U^T [32][128] in BF16 at ut_p [bh], from the NQK tokens of q and k that rows_p
-      samples and the Hadamard matrix at had_p.
+    * rank, separate: the channels (r_q, r_k) of the two compensation terms and whether each has its own basis;
+      basis_plan gives the problems per (batch, head) and the directions a problem solves for. Problem `problem` is
+      that of (batch, head) problem // problems.
+    * One problem per (batch, head): the Gram matrices of q and k weighed with `weights`; its max(r_q, r_k) leading
+      directions are the shared basis, at the first address of ut_addrs. Two: the even one takes the Gram of k
+      alone, r_q directions to the basis of the Q-residual term, the odd one that of q alone, r_k to the basis
+      of the K-residual term.
+    * Result: U^T in FP32, [B H][kept directions][128], at ut_addrs = (basis of the Q-residual term, basis of the
+      K-residual term; the shared basis at the first), from the tokens of q and k that rows_p samples (the
+      pairs rows_p, N: the rows of q and of k and their counts) and the Hadamard matrix at had_p.
     * The body is the sequence of the steps above, by phase. Every CTA barrier of the eigensolver is in this body,
-      with what it publishes, and every thread reaches it: none is under a condition, and the loops around them have
-      the same trip count in all threads.
+      with what it publishes, and every thread reaches it: the loops around the barriers have the same trip count
+      in all threads, and the one condition around barriers, that of a further MGS sweep, is a shared-memory word
+      that every thread reads behind a barrier.
     * st gets the coordinates, the region addresses and the typed views of a phase where the phase begins. A view
       (s...) covers a regular array of one scalar type, for the scalar loads and stores that index it; the 16-byte
       vector loads and stores, the asynchronous copies, ldmatrix and the predicated loads take the region addresses.
     * QP, KP: the bytes between consecutive tokens of q and of k.
-    * lens_p, rows_mode: None, or the global address of the valid prefix lengths and the rows mode of sampled_token:
-      the sampled tokens then lie in the valid prefix of the batch element.
+    * lens_p, rows_mode: None, or the global address of the valid prefix lengths and the rows mode of
+      sampled_token: the sampled tokens then lie in the valid prefix of the batch element.
     """
+    problems, directions = basis_plan(rank, separate)
     st = State(
-        tid=tid, sb=sb, NQK=NQK, H=H, QP=QP, KP=KP, q_p=q_p, k_p=k_p, rows_p=rows_p, lens_p=lens_p
+        tid=tid, sb=sb, N=N, H=H, QP=QP, KP=KP, q_p=q_p, k_p=k_p, rows_p=rows_p, lens_p=lens_p
     )
     st.rows_mode = rows_mode
+    st.directions = directions
+    st.cols = directions // 16  # MGS columns of a warp
     st.lane = tid & 31
     st.warp = tid >> 5
     # the lane's entries of an mma.sync accumulator fragment: rows g and g + 8, columns 2 t and 2 t + 1
     st.g = st.lane >> 2
     st.t = st.lane & 3
+    bh = problem // problems
+    basis_p = ut_addrs[0]
+    keep = max(rank)
+    if cutlass.const_expr(problems == 2):
+        second = problem - bh * 2
+        weight_q = Float32(2 * second)
+        weights = (weight_q, Float32(2.0) - weight_q)
+        basis_p = of_side(Int64, ut_addrs, second)
+        keep = of_side(Int32, rank, second)
+    st.weights = weights
+    # the tokens of an operand without weight are not copied (staged_chunk); its rows are still preloaded
+    st.used = (Int32(weights[0] != Float32(0.0)), Int32(weights[1] != Float32(0.0)))
     b = bh // H
     st.h = bh - b * H  # head, of batch b
     st.S = S
     if cutlass.const_expr(lens_p is not None):
         st.b = b
         st.nv = valid_len(lens_p, b, S)  # the valid tokens of the batch element
-    st.work = sb + SM_WORK  # also Z [128][32], once G has left it
+    st.work = sb + SM_WORK  # also Z [128][directions], once G has left it
     # the 16 warp parts of two sums or bounds (the second set at 16; at 4 for the bounds of four warps)
     st.sRed = cute.make_tensor(sptr(Float32, sb + SM_RED), cute.make_layout(32))
 
@@ -743,9 +859,10 @@ def _eig(
     # the warp's blocks of the two matrices: rows 16 mi .. 16 mi + 15, columns 8 nb .. 8 nb + 63
     st.mi = st.warp & 7
     st.nb = (st.warp >> 3) * 8
-    nrounds = (NQK + 47) // 48
+    nrounds = (cutlass.max(N[0] * st.used[0], N[1] * st.used[1]) + 47) // 48
     st.rowoff = Int64(b) * Int64(S)  # the first token row of the batch
-    st.sIdx = cute.make_tensor(sptr(Uint32, sb + SM_IDX2), cute.make_layout(512))
+    part = cute.make_rmem_tensor((64,), Float32)
+    part.fill(0.0)
     acc = cute.make_rmem_tensor((64,), Float32)
     acc.fill(0.0)
     preload_tokens(st)
@@ -754,13 +871,25 @@ def _eig(
     # the row address a lane gives a transposed ldmatrix: row r8 of matrix jm
     st.jm = st.lane >> 3
     st.r8 = st.lane & 7
-    for rd in cutlass.range(nrounds, unroll=1):
+    # the first part, then the further parts (rows beyond GRAM_PART_ROWS)
+    part_rounds = GRAM_PART_ROWS // 48
+    for rd in cutlass.range(cutlass.min(nrounds, part_rounds), unroll=1):
         cute.arch.cp_async_wait_group(1)
         cute.arch.sync_threads()  # publishes round rd: every thread has waited for its copies
         buf = sb + (rd & 1) * 26112
-        gram_round(st, acc, buf)
+        gram_round(st, part, buf)
         cute.arch.sync_threads()  # every warp is done with the buffer
         refill(st, buf, rd)
+    close_part(part, acc)
+    for first in cutlass.range(part_rounds, nrounds, part_rounds, unroll=1):
+        for rd in cutlass.range(first, cutlass.min(first + part_rounds, nrounds), unroll=1):
+            cute.arch.cp_async_wait_group(1)
+            cute.arch.sync_threads()  # publishes round rd
+            buf = sb + (rd & 1) * 26112
+            gram_round(st, part, buf)
+            cute.arch.sync_threads()  # every warp is done with the buffer
+            refill(st, buf, rd)
+        close_part(part, acc)
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
     publish_traces(st, acc)
@@ -813,45 +942,61 @@ def _eig(
 
     # ------------------------------------------------ multisection bisection (division-free Sturm counts):
     # thread = section point sv of eigenvalue jv
-    st.jv = tid >> 4
-    st.sv = tid & 15
+    st.jv = tid // BISECTION[directions][0]
+    st.sv = tid % BISECTION[directions][0]
     lo, hi = multisect(st, lo0, hi0, span)
-    st.sLam = cute.make_tensor(sptr(Float32, sb + SM_LAM), cute.make_layout(32))
+    st.sLam = cute.make_tensor(sptr(Float32, sb + SM_LAM), cute.make_layout(directions))
     publish_eigenvalue(st, lo, hi)
-    cute.arch.sync_threads()  # publishes the 32 eigenvalues
+    cute.arch.sync_threads()  # publishes the eigenvalues
 
-    # ------------------------------------------------ inverse iteration (warp 0, one eigenvector per lane)
-    st.sZ = cute.make_tensor(sptr(Float32, st.work), cute.make_layout((128, 32), stride=(32, 1)))
-    # the pivots [128][32], behind Z
-    st.sPiv = cute.make_tensor(
-        sptr(Float32, st.work + 16384), cute.make_layout((128, 32), stride=(32, 1))
+    # ------------------------------------------------ inverse iteration (warp 0, one eigenvector per lane, 32 at a
+    # time)
+    st.sZ = cute.make_tensor(
+        sptr(Float32, st.work), cute.make_layout((128, directions), stride=(directions, 1))
     )
-    st.sScl = cute.make_tensor(sptr(Float32, sb + SM_SCL), cute.make_layout(32))
-    inverse_iteration(st, span)
-    cute.arch.sync_threads()  # publishes Z and the scales
+    # the pivots [128][32] of the 32 eigenvectors in flight: behind Z, or in the V stage area when Z fills SM_WORK
+    piv = st.work + 16384 if directions == 32 else sb + SM_VSTG
+    st.sPiv = cute.make_tensor(sptr(Float32, piv), cute.make_layout((128, 32), stride=(32, 1)))
+    st.sScl = cute.make_tensor(sptr(Float32, sb + SM_SCL), cute.make_layout(directions))
+    for first in cutlass.range_constexpr(0, directions, 32):
+        inverse_iteration(st, span, first)
+    lost = sb + SM_RED + RED_SWEEP
+    if tid == 0:
+        for sweep in cutlass.range_constexpr(MGS_SWEEPS - 1):
+            cute.arch.store(sptr(Uint32, lost + 4 * sweep), Uint32(0))
+    cute.arch.sync_threads()  # publishes Z, the scales and the cleared words of the MGS sweeps
 
-    # ------------------------------------------------ MGS (one pass, normalizing); warp w holds columns 2w, 2w+1
-    za = cute.make_rmem_tensor((4,), Float32)
-    zbv = cute.make_rmem_tensor((4,), Float32)
-    load_columns(st, za, zbv)
+    # ------------------------------------------------ MGS, normalizing; warp w holds st.cols columns from column
+    # st.cols w
+    # * a further sweep runs while a column kept less than half of its squared norm, MGS_SWEEPS at most
+    # * the word of a sweep is shared, so every thread takes the same branch around the barriers
+    z = cute.make_rmem_tensor((4 * st.cols,), Float32)
+    zn = cute.make_rmem_tensor((st.cols,), Float32)
+    load_columns(st, z, zn)
     zc = sb + SM_ZC
-    for c in cutlass.range(32, unroll=1):
-        # two buffers in turn: column c + 1 is written while a warp may still read column c
-        buf = zc + (c & 1) * 512
-        publish_column(st, za, zbv, c, buf)
-        cute.arch.sync_threads()  # publishes the normalized column c
-        project_out(st, za, zbv, c, buf)
+    for sweep in cutlass.range_constexpr(MGS_SWEEPS):
+        run = Uint32(1)
+        if cutlass.const_expr(sweep > 0):
+            run = cute.arch.load(sptr(Uint32, lost + 4 * (sweep - 1)), Uint32)
+        if run != Uint32(0):
+            for c in cutlass.range(directions, unroll=1):
+                # two buffers in turn: column c + 1 is written while a warp may still read column c
+                buf = zc + (c & 1) * 512
+                lost_p = lost + 4 * sweep if sweep < MGS_SWEEPS - 1 else None
+                publish_column(st, z, zn, c, buf, lost_p)
+                cute.arch.sync_threads()  # publishes the normalized column c and whether it lost half
+                project_out(st, z, c, buf)
 
     # ------------------------------------------------ back transform: v = H_0 ... H_125 z
-    back_transform(st, za, zbv)
+    back_transform(st, z)
     cute.arch.sync_threads()  # every warp has applied the Householder vectors: their area is free
-    store_columns(st, za, zbv)
+    store_columns(st, z)
     stage_hadamard(st, had_p)
     cute.arch.sync_threads()  # publishes the eigenvectors and Hd
 
-    # ------------------------------------------------ U = Hd^T V / sqrt(128), stored as U^T bf16 [32][128]
+    # ------------------------------------------------ U = Hd^T V / sqrt(128), stored as U^T f32 [keep][128]
     st.sHd = cute.make_tensor(sptr(Uint16, st.uhh), cute.make_layout((128, 128), stride=(128, 1)))
-    project_basis(st, ut_p, bh)
+    project_basis(st, basis_p, bh, keep)
 
 
 # ------------------------------------------------------------------------------------------------ V helpers
@@ -1159,30 +1304,37 @@ def vpass_tiles(v_p, done_p, S, H, VP, T, ntiles, tid, sb, lens_p, encode):
 def basis_cta(
     q_p: Int64,
     k_p: Int64,
-    rows_p: Int64,
     had_p: Int64,
-    ut_p: Int64,
     done_p: Int64,
     S: Int32,
     H: Int32,
     QP: Int32,
     KP: Int32,
     T: Int32,
-    NQK: Int32,
     BH: Int32,
     nspare: Int32,
+    eig,
     FUSED: cutlass.Constexpr,
     vscan_gs,
     vscan,
     vpass,
-    lens_p=None,
-    rows_mode=None,
+    lens_p,
+    rank: cutlass.Constexpr,
+    separate: cutlass.Constexpr,
 ):
-    """The CTA of a basis launch (grid BH + nspare, EIG_THREADS threads): the CTAs below BH solve one eigenproblem
-    each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(ntiles, tid, sb) over the
-    tiles a counter hands out, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb),
-    grid-stride over all of V). QP, KP: the token pitches of q and k (_eig). sb: the CTA's shared memory. lens_p,
-    rows_mode: the lengths arguments of _eig."""
+    """Run the CTA of a basis launch (grid neig + nspare, EIG_THREADS threads).
+
+    * The CTAs below neig solve one eigenproblem each; the nspare others scan V with the scan of the kernel's PV
+      format.
+    * FUSED: vscan(ntiles, tid, sb) over the tiles a counter hands out, then the V pass
+      vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb), grid-stride over all of V. sb: the CTA's
+      shared memory.
+    * eig, the run-time arguments of the eigenproblems: (the addresses of the basis of the Q-residual term and
+      of that of the K-residual term, the rows of q and of k, their counts NQ and NK, neig, the weights weight_q and
+      weight_k, the rows mode). neig is 0 when the caller gave the basis.
+    * QP, KP: the token pitches of q and k; lens_p, rank, separate: as in _eig.
+    """
+    ut_q_p, ut_k_p, rows_q_p, rows_k_p, NQ, NK, neig, weight_q, weight_k, rows_mode = eig
     tid, _, _ = cute.arch.thread_idx()
     pid, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
@@ -1190,10 +1342,30 @@ def basis_cta(
     sb = Int32(buf.toint())
     ntiles = BH * T
     # eigenproblems, and the V maxima in the other CTAs
-    if pid < BH:
-        _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, QP, KP, NQK, tid, sb, lens_p, rows_mode)
+    if pid < neig:
+        if cutlass.const_expr(max(rank) > 0):
+            _eig(
+                q_p,
+                k_p,
+                (rows_q_p, rows_k_p),
+                had_p,
+                (ut_q_p, ut_k_p),
+                pid,
+                S,
+                H,
+                QP,
+                KP,
+                (NQ, NK),
+                (weight_q, weight_k),
+                tid,
+                sb,
+                lens_p,
+                rows_mode,
+                rank,
+                separate,
+            )
     elif cutlass.const_expr(not FUSED):
-        vscan_gs(pid - BH, tid, sb)
+        vscan_gs(pid - neig, tid, sb)
     else:
         vscan(ntiles, tid, sb)
     if cutlass.const_expr(FUSED):
