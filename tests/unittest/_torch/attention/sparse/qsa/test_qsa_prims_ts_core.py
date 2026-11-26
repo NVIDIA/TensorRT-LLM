@@ -548,6 +548,7 @@ def test_decode_rows_get_exact_plans(monkeypatch: pytest.MonkeyPatch) -> None:
     q, k_cache, v_cache, block_table, block_ids, request_indices, positions, selected, metadata = (
         _make_case([1] * 5, seed=7)
     )
+    # Run the larger decode first: workspace growth clears the active plan cache.
     out = _sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
