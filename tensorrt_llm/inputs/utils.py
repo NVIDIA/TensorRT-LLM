@@ -4,6 +4,7 @@
 import asyncio
 import base64
 from collections import defaultdict
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
@@ -69,7 +70,7 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
 
 
 def load_image(image: Union[str, Image.Image],
-               format: str = "pt",
+               format: str = "pil",
                device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
@@ -96,7 +97,7 @@ def load_image(image: Union[str, Image.Image],
 
 async def async_load_image(
         image: Union[str, Image.Image],
-        format: str = "pt",
+        format: str = "pil",
         device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
@@ -139,7 +140,7 @@ def load_base64_video(video: str) -> BytesIO:
 def load_video(video: str,
                num_frames: int = 10,
                fps: int = 30,
-               format: str = "pt",
+               format: str = "np",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
     """Load video frames with the shared source-byte cache identity.
@@ -174,7 +175,7 @@ def load_video(video: str,
 async def async_load_video(video: str,
                            num_frames: int = 10,
                            fps: int = 30,
-                           format: str = "pt",
+                           format: str = "np",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
     """Load video frames without blocking the event loop.
@@ -183,7 +184,8 @@ async def async_load_video(video: str,
     are read fully into memory during decoding. Local-file I/O failures raise
     ValueError, with the original OSError as their cause.
     """
-    assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+    assert format in ("pt", "np",
+                      "pil"), "format must be one of 'pt', 'np', 'pil'"
 
     # See `load_video`: share the serving decode path so hashes agree.
     video_io = VideoMediaIO(num_frames=num_frames,
@@ -629,6 +631,24 @@ def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
             is not PreTrainedTokenizerBase.apply_chat_template)
 
 
+def uses_tokenizer_native_renderer(tokenizer: Union[TransformersTokenizer,
+                                                    TokenizerBase],
+                                   processor: ProcessorMixin,
+                                   chat_template: Optional[str]) -> bool:
+    """Whether `apply_chat_template` renders with the tokenizer's own renderer.
+
+    It does when no Jinja template is declared anywhere (the call, the
+    processor or the tokenizer) and the tokenizer overrides
+    `apply_chat_template` in Python, as the kimi_k3 checkpoint tokenizer does.
+    """
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    return (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer))
+
+
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
     processor: ProcessorMixin,
@@ -729,10 +749,7 @@ def _resolve_render_dispatch(
     if isinstance(tokenizer, TransformersTokenizer):
         # The TokenizerBase renders the template.
         tokenizer = tokenizer.tokenizer
-    if (chat_template is None
-            and getattr(processor, "chat_template", None) is None
-            and getattr(tokenizer, "chat_template", None) is None
-            and _has_python_chat_template(tokenizer)):
+    if uses_tokenizer_native_renderer(tokenizer, processor, chat_template):
         return _RenderDispatch("native", tokenizer)
     return _RenderDispatch(
         "jinja", tokenizer,
@@ -964,7 +981,17 @@ def apply_chat_template(
                                                         mm_placeholder_count)
     # STRING path: placeholders already inserted in content by caller
 
-    result = tokenizer.apply_chat_template(
+    template_renderer = tokenizer.apply_chat_template
+    if (model_type in ("kimi_k3", "kimi_linear")
+            and isinstance(tokenizer, PreTrainedTokenizerBase)
+            and callable(getattr(tokenizer, "_encode_chat_segments", None))):
+        # Kimi-K3's segment renderer (also used by its kimi_linear text model)
+        # ignores Jinja templates. Other overrides, e.g. Kimi-K2.5's, delegate
+        # to Jinja after preprocessing tools and must remain in the call path.
+        template_renderer = partial(PreTrainedTokenizerBase.apply_chat_template,
+                                    tokenizer)
+
+    result = template_renderer(
         conversation=conversation,
         tokenize=enable_tokenize,
         return_dict=False,
@@ -1160,7 +1187,7 @@ def default_multimodal_input_loader(
     modality: str,
     prompts: List[str],
     media: Optional[Union[List[str], List[List[str]]]] = None,
-    image_data_format: str = "pt",
+    image_data_format: Optional[str] = None,
     num_frames: int = 8,
     mm_embeddings: Optional[Union[List[torch.Tensor],
                                   List[List[torch.Tensor]]]] = None,
@@ -1168,6 +1195,10 @@ def default_multimodal_input_loader(
     extract_audio: bool = False,
     trust_remote_code: bool = True,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
+
+    format_kwargs = {
+        "format": image_data_format
+    } if image_data_format is not None else {}
 
     def convert_to_conversation_message(
         prompt: str,
@@ -1186,7 +1217,7 @@ def default_multimodal_input_loader(
                     media = [media]
             else:
                 _load = lambda mm: load_image(
-                    mm, format=image_data_format, device=device)
+                    mm, device=device, **format_kwargs)
 
             mm_data = [
                 MultimodalData(modality=modality,
@@ -1203,9 +1234,9 @@ def default_multimodal_input_loader(
                     modality=modality,
                     data=load_video(i,
                                     num_frames,
-                                    format=image_data_format,
                                     device=device,
-                                    extract_audio=extract_audio),
+                                    extract_audio=extract_audio,
+                                    **format_kwargs),
                     is_embedding=False,
                 ) for i in media
             ]
@@ -1233,9 +1264,7 @@ def default_multimodal_input_loader(
                 _modal = None
                 if _modal is None:
                     try:
-                        data = load_image(m,
-                                          format=image_data_format,
-                                          device=device)
+                        data = load_image(m, device=device, **format_kwargs)
                         _modal = "image"
                     except Exception:
                         pass
@@ -1258,9 +1287,7 @@ def default_multimodal_input_loader(
                     mm_data.append(
                         MultimodalData(
                             modality="image",
-                            data=load_image(m,
-                                            format=image_data_format,
-                                            device=device),
+                            data=load_image(m, device=device, **format_kwargs),
                             is_embedding=False,
                         ))
         else:

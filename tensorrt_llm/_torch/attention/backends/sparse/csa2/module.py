@@ -63,6 +63,13 @@ def _lowm_tiles(n: int, rows: int) -> int:
     return 1
 
 
+def _lowm_query_mma_options(weight: torch.Tensor, rows: int) -> tuple[bool, bool] | None:
+    """Use BF16 dequantization for the small SM107 QAKV and Q-B projections."""
+    if get_sm_version() == 107 and 0 < rows <= 8 and weight.shape in ((1792, 5120), (4096, 1280)):
+        return True, False
+    return None
+
+
 # Per (device, stream): the fused context kernel's O-A input buffers, grown to the largest forward.
 # Each layer's attention kernel writes them and its O-A reads them on that stream before the next
 # layer's kernel writes them again.
@@ -542,6 +549,7 @@ class DeepseekV41Attention(nn.Module):
                 split_n=self.wq_a.weight.shape[0],
                 scale_swizzled=True,
                 n_tiles=_lowm_tiles(self._fused_qkv_weight.shape[0], hidden_states.shape[0]),
+                mma_options=_lowm_query_mma_options(self._fused_qkv_weight, hidden_states.shape[0]),
             )
             return self._project_decode_query(
                 latent, swa, query_stream, late_stream=late_stream, fp8_query=fp8_query
@@ -838,6 +846,7 @@ class DeepseekV41Attention(nn.Module):
                         (self.q_norm.weight, self.q_norm.variance_epsilon) if norm_in_q_b else None
                     ),
                     n_tiles=_lowm_tiles(self.wq_b.weight.shape[0], latent.shape[0]),
+                    mma_options=_lowm_query_mma_options(self.wq_b.weight, latent.shape[0]),
                 )
             elif fused:
                 q = mxfp8_query_gemm(

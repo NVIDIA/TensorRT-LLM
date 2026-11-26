@@ -5,6 +5,7 @@
 import contextlib
 import math
 import os
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,7 +18,10 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_TOKENS_PER_BLOCK,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_layout import Fp4MlaCacheLayout
-from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+    Fp4MlaKVCacheManagerV2,
+    Fp4MlaV2CacheLayoutPolicy,
+)
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import has_fp4_mla_cache_layout
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
@@ -89,6 +93,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     MambaKVCacheParams,
     extract_mamba_kv_cache_params,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import has_state_layers
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     PAGE_PRIORITY_DEFAULT,
@@ -3561,6 +3566,82 @@ def test_cpp_hybrid_prepare_expect_snapshot_points():
         [64, 128],
         [],
     ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("manager_cls", "owned_flags"),
+    [
+        (Fp4MlaKVCacheManagerV2, ("fp4_mla_context_only_cache",)),
+        (MambaHybridCacheManagerV2, ()),
+        (KimiK3HybridCacheManager, ("kda_context_only", "fp4_mla_context_only_cache")),
+        (Glm5NextCacheManager, ("kda_context_only",)),
+    ],
+)
+@pytest.mark.parametrize("kda", [False, True])
+@pytest.mark.parametrize("fp4", [False, True])
+def test_context_only_capability_preserves_owner_flags(
+    manager_cls: type[KVCacheManagerV2],
+    owned_flags: tuple[str, ...],
+    kda: bool,
+    fp4: bool,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.resource_manager import is_context_only_kv_cache
+
+    mgr = object.__new__(manager_cls)
+    mgr.kda_context_only = kda
+    # The FP4 MLA flag belongs to the layout; only a manager with the layout hooks reads it.
+    mgr.fp4_mla_layout = Fp4MlaCacheLayout(mgr)
+    mgr.fp4_mla_layout.fp4_mla_context_only_cache = fp4
+    flags = {"kda_context_only": kda, "fp4_mla_context_only_cache": fp4}
+
+    assert is_context_only_kv_cache(mgr) is any(flags[flag] for flag in owned_flags)
+
+
+@pytest.mark.cpu_only
+def test_mixed_hybrid_seeds_kda_replay_caches_after_state_transfer() -> None:
+    """Neither the V1 KV base nor the resource-manager default shadows the recurrent step."""
+    mgr = object.__new__(MixedMambaHybridCacheManager)
+    mgr.seed_kda_replay_caches_for_disagg_gen = MagicMock()
+
+    mgr.on_state_transfer_complete([7])
+
+    mgr.seed_kda_replay_caches_for_disagg_gen.assert_called_once_with([7])
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda monkeypatch: _build_v2_mamba2_replay_manager(), id="mamba2"),
+        pytest.param(lambda monkeypatch: _build_v2_gdn_replay_manager(), id="gdn"),
+        pytest.param(
+            lambda monkeypatch: _build_v2_gdn_replay_manager(Qwen4ExpHybridCacheManager),
+            id="gdn-ple",
+        ),
+        pytest.param(
+            lambda monkeypatch: _build_kda_replay_manager(
+                model_manager_cls=KimiK3HybridCacheManager
+            ),
+            id="kda",
+        ),
+        pytest.param(
+            lambda monkeypatch: _build_kda_replay_manager(model_manager_cls=Glm5NextCacheManager),
+            id="kda-kpool",
+        ),
+        pytest.param(lambda monkeypatch: _build_v2_hybrid_fp4_mla(monkeypatch), id="kda-fp4-mla"),
+    ],
+)
+def test_v2_hybrid_layout_has_state_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    build: Callable[[pytest.MonkeyPatch], KVCacheManagerV2],
+) -> None:
+    """The KV connector is rejected by this layout fact for every recurrent family."""
+    mgr = build(monkeypatch)
+    try:
+        assert has_state_layers(mgr)
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.parametrize(
