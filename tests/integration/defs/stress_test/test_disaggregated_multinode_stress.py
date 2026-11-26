@@ -238,8 +238,6 @@ def test_deepseek_v41_flash_1p1d_tp4(disagg_cluster: _Cluster) -> None:
             "--tokenizer-trust-remote-code",
             "--extra-inputs",
             "ignore_eos:true",
-            "--extra-inputs",
-            "min_tokens:1024",
             "--request-cancellation-rate",
             "10",
             "--request-cancellation-delay",
