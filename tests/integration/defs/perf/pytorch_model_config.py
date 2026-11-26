@@ -106,6 +106,8 @@ _PERF_PRESETS = {
     },
     'gpt_oss_eagle3': {
         'enable_autotuner': False,
+        'enable_chunked_prefill': True,
+        'kv_cache_config.enable_block_reuse': False,
         'speculative_config': {
             'speculative_model_dir':
             '${LLM_MODELS_ROOT}/gpt_oss/gpt-oss-120b-Eagle3',
@@ -155,13 +157,6 @@ _PERF_PRESETS = {
         'kv_cache_config.mamba_state_config.periodic_snapshot_interval': 8192,
         'kv_cache_config.free_gpu_memory_fraction': 0.8,
     },
-    'm31_dspark7': {
-        'speculative_config.decoding_type': 'DSpark',
-        'speculative_config.max_draft_len': 7,
-        'speculative_config': {
-            'speculative_model': '${LLM_MODELS_ROOT}/MiniMax-M3.1-Flash/dspark'
-        },
-    },
     'minimax_m3': {
         'kv_cache_config.enable_block_reuse': False,
         'sparse_attention_config.algorithm': 'minimax_m3',
@@ -176,6 +171,22 @@ _PERF_PRESETS = {
         'kv_cache_config.dtype': 'nvfp4',
         'cuda_graph_config.max_batch_size': 64,
         'max_seq_len': 16384,
+    },
+    'minimax_m31_flash_dspark7': {
+        'kv_cache_config.enable_block_reuse': False,
+        'sparse_attention_config.algorithm': 'minimax_m3',
+        'sparse_attention_config.implementation': 'msa',
+        'sparse_attention_config.indexer_kv_dtype': 'fp8',
+        'sparse_attention_config.fuse_qkv_index_projection': True,
+        'modeling_v2': 'require',
+        'kv_cache_config.dtype': 'nvfp4',
+        'cuda_graph_config.max_batch_size': 64,
+        'max_seq_len': 16384,
+        'speculative_config': {
+            'decoding_type': 'DSpark',
+            'max_draft_len': 7,
+            'speculative_model': '${LLM_MODELS_ROOT}/MiniMax-M3.1-Flash/dspark',
+        },
     },
     'minimax_m3_fp4': {
         'kv_cache_config.enable_block_reuse': False,
@@ -198,10 +209,6 @@ _PERF_PRESETS = {
         'kv_cache_config.dtype': 'fp8',
         'moe_config.backend': 'CUTLASS',
         'sparse_attention_config.implementation': 'msa',
-    },
-    'mtp3': {
-        'speculative_config.decoding_type': 'MTP',
-        'speculative_config.max_draft_len': 3,
     },
     'nano_omni': {
         'cuda_graph_config.max_batch_size': 1,

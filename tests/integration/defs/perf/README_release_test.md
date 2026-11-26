@@ -125,17 +125,15 @@ YAML. Fields omitted from both use the runner and TensorRT-LLM defaults.
   Look up the name in `_PERF_PRESETS` to see all fields for that preset, including
   GPU-specific overrides. See [pytorch_model_config.py](pytorch_model_config.py).
 - Set a case-specific field directly with `-cfg:enable_attention_dp=true`.
-  Append comma-separated overrides to a selection, or combine selections from left
-  to right with `+`, as in `-cfg:glm53_flash_fp8+mtp3`.
+  Append comma-separated overrides to the selected preset or YAML, as in
+  `-cfg:glm53_flash_fp8,decoding_type=MTP,max_draft_len=3`.
   Use YAML scalar values and dotted field names, for example
   `cfg:speculative_config.decoding_type=NGram,max_draft_len=3`. The runner passes these fields to
   the same configuration validation as a YAML file. Put paths and lists in the selected recipe or preset.
-  Later selections override earlier ones and merge nested mappings.
 
-Each Core and Spark case selects at most one model YAML. Complete recipes come from
-`examples/configs/curated/`. Cases using named Python presets get all their shared
-settings from that module. Draft paths prefixed with `${LLM_MODELS_ROOT}/` resolve
-against the test model cache at launch.
+Each Core and Spark case selects at most one named preset or curated YAML file.
+Draft paths prefixed with `${LLM_MODELS_ROOT}/` resolve against the test model
+cache at launch.
 
 The test parameter also names the engine directory. Keep both the full parameter and
 the exported benchmark name within 255 bytes. Reuse a shared profile when inlining
