@@ -47,10 +47,11 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    "role, exact_token_comparison",
+    "role, exact_token_comparison, inherited_deterministic, inherited_multi_block",
     [
-        pytest.param("baseline", True, id="exact-token-comparison"),
-        pytest.param("donor", False, id="accuracy-donor"),
+        pytest.param("baseline", True, None, "ON", id="exact-token-comparison"),
+        pytest.param("donor", False, None, "ON", id="accuracy-donor"),
+        pytest.param("donor", False, "1", "OFF", id="accuracy-donor-inherited-determinism"),
     ],
 )
 def test_worker_attention_settings_follow_comparison_mode(
@@ -58,6 +59,8 @@ def test_worker_attention_settings_follow_comparison_mode(
     tmp_path: Path,
     role: str,
     exact_token_comparison: bool,
+    inherited_deterministic: str | None,
+    inherited_multi_block: str,
 ) -> None:
     construction_kwargs: dict[str, object] = {}
 
@@ -89,8 +92,11 @@ def test_worker_attention_settings_follow_comparison_mode(
                 str(tmp_path / "stop"),
             ]
         )
-    monkeypatch.setenv("FORCE_MULTI_BLOCK_MODE", "ON")
-    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.setenv("FORCE_MULTI_BLOCK_MODE", inherited_multi_block)
+    if inherited_deterministic is None:
+        monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", inherited_deterministic)
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(mx_e2e_worker, "LLM", capture_llm_settings)
 
@@ -104,8 +110,8 @@ def test_worker_attention_settings_follow_comparison_mode(
         os.environ.get("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "0"),
     )
     multi_block = overrides.get("FORCE_MULTI_BLOCK_MODE", os.environ["FORCE_MULTI_BLOCK_MODE"])
-    assert deterministic == ("1" if exact_token_comparison else "0")
-    assert multi_block == ("OFF" if exact_token_comparison else "ON")
+    assert deterministic == ("1" if exact_token_comparison else (inherited_deterministic or "0"))
+    assert multi_block == ("OFF" if exact_token_comparison else inherited_multi_block)
 
 
 @pytest.mark.parametrize(
