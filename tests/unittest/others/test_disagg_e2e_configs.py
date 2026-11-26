@@ -18,6 +18,10 @@ _CONFIG_DIRS = (
     "tests/scripts/perf",
     "tests/scripts/perf-sanity",
 )
+_EXPLICIT_TRANSFER_WINDOW_RECIPES = {
+    Path("examples/configs/curated/qwen3.5-gb300-agentx-tep8-decode.yaml"),
+    Path("examples/configs/curated/qwen3.5-gb300-agentx-tep16-decode.yaml"),
+}
 
 
 def _config_paths() -> list[Path]:
@@ -52,6 +56,7 @@ def test_e2e_recipe_avoids_legacy_transceiver_options(path: Path) -> None:
     """
     configs = list(_transceiver_configs(yaml.safe_load(path.read_text())))
     assert configs, f"No transceiver configuration found in {path}"
+    uses_explicit_window = path.relative_to(_ROOT) in _EXPLICIT_TRANSFER_WINDOW_RECIPES
     for worker, config in configs:
         assert config.get("backend") not in {"UCX", "MPI", "MOONCAKE"}, (path, config)
         assert "agent_bounce_buffer_enable" not in config, (path, config)
@@ -62,7 +67,7 @@ def test_e2e_recipe_avoids_legacy_transceiver_options(path: Path) -> None:
                 path,
                 worker,
             )
-        # The Python transceiver ignores max_tokens_in_buffer, but with PP > 1 the
-        # generation executor still uses it as the KV transfer admission window.
-        if worker.get("pipeline_parallel_size", 1) <= 1:
+        # The AgentX TEP decode recipes explicitly enable the executor's
+        # transfer window at PP=1. Ordinary PP=1 recipes use the default.
+        if worker.get("pipeline_parallel_size", 1) <= 1 and not uses_explicit_window:
             assert "max_tokens_in_buffer" not in config, (path, config)

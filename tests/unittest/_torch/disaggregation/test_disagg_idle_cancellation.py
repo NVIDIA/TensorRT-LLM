@@ -644,7 +644,7 @@ def test_scheduler_excludes_cancelled_model_work_without_releasing_its_roots(
     healthy = _request(2)
     healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request, healthy]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler
@@ -762,7 +762,12 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
     executor.kv_cache_manager = Mock(
-        spec=["update_resources", "is_preemption_pending", "has_pending_preemption"]
+        spec=[
+            "update_resources",
+            "is_preemption_pending",
+            "has_pending_preemption",
+            "prepare_expect_snapshot_points",
+        ]
     )
     executor.kv_cache_manager.is_preemption_pending.return_value = False
     executor.kv_cache_manager.has_pending_preemption.return_value = False
@@ -914,7 +919,7 @@ def test_model_cancellation_keeps_unqualified_scheduler_paths_unchanged(
     request = _request(1)
     request.state = LlmRequestState.GENERATION_IN_PROGRESS
     executor.active_requests = [request]
-    executor.kv_cache_manager = SimpleNamespace()
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
     executor.inflight_req_ids = set()
     executor.scheduler = Mock()
     executor.scheduler.schedule_request.side_effect = _ReachedScheduler
@@ -2536,3 +2541,46 @@ def test_pending_cancel_idle_hold_needs_the_consensus_vote(
     else:
         broadcast.assert_called_once_with([], prefer_cpu=False)
         assert fetch_probe.last_timeout == timedelta(0)
+
+
+def test_scheduler_holds_failed_receive_until_retirement_then_cleans_once(executor):
+    request, healthy = _request(1), _request(2)
+    healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor.active_requests = [request, healthy]
+    executor._fatal_error = None
+    session, aux = _published_receive(executor, request)
+    aux.get_slot_data.return_value = ([42], [], (8, 0))
+    executor.kv_cache_transceiver._kv_cache_manager = SimpleNamespace(
+        get_history_length=lambda req: req.prompt_len
+    )
+    executor._handle_errors("held transfer failed", requests=[request], charge_budget=False)
+    executor.kv_cache_manager = SimpleNamespace(prepare_expect_snapshot_points=Mock())
+    executor.inflight_req_ids = set()
+    executor.enable_batch_waiting = False
+    executor._get_ctx_mla_kv_len_cap = lambda: None
+    executor.scheduler = Mock()
+    executor.scheduler.schedule_request.side_effect = lambda requests, _: SchedulerOutput(
+        [], [], list(requests), [], [], len(requests)
+    )
+    executor.scheduler.take_lost_kv_requests.return_value = []
+
+    batch, _, _ = executor._schedule()
+    assert batch.generation_requests == [healthy]
+    executor.scheduler.schedule_request.assert_called_once_with([healthy], set())
+    executor._sweep_transfer_held_failures()
+    executor.resource_manager.free_resources.assert_not_called()
+    assert executor._response_channel.responses == {}
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    executor.disagg.reap_gen_receives(0)
+    executor._sweep_transfer_held_failures()
+    executor._sweep_transfer_held_failures()
+    executor._flush_pending_transfer_responses()
+    assert executor.active_requests == [healthy]
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
+    assert (
+        executor._response_channel.responses[request.py_request_id][0].error_msg
+        == "held transfer failed"
+    )
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    executor.sampler.release_request.assert_called_once_with(request)

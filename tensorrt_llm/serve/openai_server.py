@@ -54,7 +54,8 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
-from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
+                                            _validate_media_io_kwargs)
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -142,8 +143,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
-                                       prepare_chat_request, render_chat,
-                                       render_chat_for_length,
+                                       prepare_chat_request,
+                                       prompt_tokens_excluded_from_usage,
+                                       render_chat, render_chat_for_length,
                                        render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
@@ -704,6 +706,7 @@ class OpenAIServer(_VideoRoutesMixin):
         ip = getattr(self.generator, "input_processor", None)
         if isinstance(ip, BaseMultimodalInputProcessor):
             model_pref = ip.get_preferred_media_io_kwargs() or {}
+            _validate_media_io_kwargs(model_pref)
             if model_pref:
                 cfg = self.multimodal_server_config or MultimodalServerConfig()
                 merged = {m: dict(kw) for m, kw in model_pref.items()}
@@ -2507,14 +2510,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt.
+            # sees the full prompt. count_tokens leaves out the same tokens.
             postproc_args.num_prompt_tokens_offset = (
-                render_resources.prompt_tokens_excluded_from_usage(
-                    add_generation_prompt=request.add_generation_prompt,
-                    pre_tokenized=request.prompt_token_ids is not None
-                    or request.prompt_token_ids_b64 is not None,
-                    request_chat_template=request.chat_template,
-                ))
+                prompt_tokens_excluded_from_usage(request, render_resources))
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.
@@ -2577,9 +2575,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ``_build_forced_tool_call_decoding``) while the media loads,
                 # or once it has loaded for a renderer that needs it.
                 # Tokenization stays with the engine's input processor, except
-                # for a prompt that comes back as ids (control-token text in the
-                # messages, encoded as text). The engine adds no special tokens
-                # to ids and does not truncate them, so the renderer does.
+                # for a prompt that comes back as ids: a tokenizer-native
+                # renderer's own ids, which keep control-token strings in
+                # message content as text (only for text-only prompts, since
+                # the input processor expands media placeholders in the text),
+                # or a prompt whose control-token text in the messages was
+                # encoded as text. The engine adds no special tokens to ids and
+                # does not truncate them: native ids are taken only when neither
+                # is asked for, and the renderer applies both to the others.
                 rendered, (
                     mm_data,
                     mm_embeddings) = await render_conversation_with_media(
@@ -2595,6 +2598,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         injected_chat_template_kwargs=request.
                         injected_chat_template_kwargs,
                         forced_prefix=forced_tool_begin_prefix,
+                        prefer_native_ids=not any(
+                            message.get("media") for message in conversation),
                         add_special_tokens=request.add_special_tokens,
                         truncate_prompt_tokens=request.truncate_prompt_tokens,
                     )
@@ -2876,7 +2881,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Media, an own-processor model or an unconvertible Harmony
                     # request: count the text, tools and template without the media.
                     rendered = render_chat_for_length(chat_request, resources)
-                return len(rendered.token_ids)
+                # Reported like the chat route's prompt usage, which leaves out
+                # the rendered tokens the model extension excludes from it.
+                excluded = prompt_tokens_excluded_from_usage(
+                    chat_request, resources)
+                return max(0, len(rendered.token_ids) - excluded)
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:

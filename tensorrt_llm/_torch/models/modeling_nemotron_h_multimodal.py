@@ -234,8 +234,10 @@ def video_to_pixel_values(
     return _resize_and_normalize(video_tensor, target_h, target_w, norm_mean, norm_std)
 
 
-def _get_media_dimensions(media: Union[Image.Image, torch.Tensor]) -> Tuple[int, int]:
-    """Return (width, height) for a PIL Image or a CHW tensor."""
+def _get_media_dimensions(media: Image.Image | torch.Tensor | np.ndarray) -> Tuple[int, int]:
+    """Return (width, height) for a PIL image, CHW tensor or decoded HWC frame."""
+    if isinstance(media, np.ndarray):
+        return media.shape[1], media.shape[0]
     if isinstance(media, torch.Tensor):
         return media.shape[2], media.shape[1]
     return media.width, media.height
@@ -1537,7 +1539,7 @@ class NemotronHMultimodalInputProcessor(
     def get_num_tokens_per_video(
         self,
         *,
-        video: List[Union[Image.Image, torch.Tensor]],
+        video: List[Union[Image.Image, torch.Tensor, np.ndarray]],
         video_pruning_rate: Optional[float] = None,
         video_metadata: Optional[dict] = None,
         video_audio: Optional[AudioData] = None,
@@ -1818,7 +1820,7 @@ class NemotronHMultimodalInputProcessor(
 
     def _compute_video_shape_descriptor(
         self,
-        video_frames: List[Image.Image],
+        video_frames: List[Image.Image | torch.Tensor] | np.ndarray,
     ) -> List[int]:
         """Compute the `video_size` descriptor `[num_frames, num_tiles, h, w]`
         from frame dimensions only, without running the pixel-processing
@@ -1844,11 +1846,7 @@ class NemotronHMultimodalInputProcessor(
         """
         num_frames = len(video_frames)
         if self.video_target_num_patches is not None:
-            frame = video_frames[0]
-            if isinstance(frame, Image.Image):
-                orig_w, orig_h = frame.width, frame.height
-            else:
-                orig_h, orig_w = frame.shape[-2], frame.shape[-1]
+            orig_w, orig_h = _get_media_dimensions(video_frames[0])
             target_w, target_h, _ = get_video_target_size_and_feature_size(
                 orig_w=orig_w,
                 orig_h=orig_h,
@@ -2204,7 +2202,7 @@ class NemotronHMultimodalInputProcessor(
         return processed_data, processed_query
 
     def _process_videos_frames(
-        self, videos: List[List[Image.Image | torch.Tensor]]
+        self, videos: List[List[Image.Image | torch.Tensor] | np.ndarray]
     ) -> Dict[str, Any]:
         """Process video frames using custom video preprocessing.
 
@@ -2217,6 +2215,8 @@ class NemotronHMultimodalInputProcessor(
         pixel_values_list = []
         video_size_list = []
         for video in videos:
+            if isinstance(video, np.ndarray):
+                video = [Image.fromarray(frame) for frame in video]
             num_frames = len(video)
 
             if self.video_target_num_patches is not None:

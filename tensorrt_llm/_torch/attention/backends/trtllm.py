@@ -62,7 +62,7 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fmha.registry import is_fmha_lib_enabled
+from .fmha.registry import is_fmha_lib_enabled, step_planning_fmha_lib_classes
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, fp4_mla_cache_layout,
                       has_fp4_mla_cache_layout, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
@@ -257,6 +257,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     beam_shared_prefix_enabled: bool = field(default=False,
                                              init=False,
                                              repr=False)
+    # Per-step device tensors that FMHA libraries derive once and share across
+    # the layers of a forward (e.g. page tables); emptied by every prepare().
+    fmha_step_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -539,6 +544,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         self.beam_shared_prefix_enabled = is_fmha_lib_enabled(
             "beam_shared_prefix")
+        self.fmha_step_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1388,6 +1394,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
+        self.fmha_step_caches = {}
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
@@ -1755,6 +1762,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
 
+        # Per-step host planning of the enabled FMHA libraries that plan steps
+        # (Fmha.plan_step). It must run here, ahead of every forward of the
+        # step, so that under CUDA graphs it precedes both capture and replay.
+        for fmha_cls in step_planning_fmha_lib_classes():
+            fmha_cls.plan_step(self)
+
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1878,17 +1891,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def supports_steady_decode_step(self) -> bool:
-        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
-        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare()."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
-                and self.kv_cache_manager is not None
-                and not self.enable_flash_mla and not self.enable_helix
+                and self._steady_decode_config_supported())
+
+    def _steady_decode_config_supported(self) -> bool:
+        """Whether the common prepare() needs no host state beyond the KV lengths and
+        block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV, full generation page table or FMHA step plan)."""
+        return (self.kv_cache_manager is not None and not self.enable_flash_mla
+                and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
                 and self.mixed_precision_high_block_table is None
-                and not self.kv_cache_params.use_full_generation_page_table)
+                and not self.kv_cache_params.use_full_generation_page_table
+                # No enabled FMHA library plans steps in prepare().
+                and not step_planning_fmha_lib_classes())
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips
@@ -1901,14 +1920,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         batch_block_table_key(self.request_ids))
         self._steady_block_table_keys = tuple(keys)
 
-    def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
+    def prepare_steady_decode_step(
+            self,
+            kv_lens: List[int],
+            prompt_lens: Optional[List[int]] = None) -> None:
         """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.
 
-        Requires supports_steady_decode_step and the same requests, prompt lengths, request types and beam width
-        as that prepare(); kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets the host
-        state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies the
-        block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
-        copies the full table width (max_blocks None), as prepare() does.
+        Requires supports_steady_decode_step, the same request types and beam width as that prepare() and, without
+        ``prompt_lens``, its requests; kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets
+        the host state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies
+        the block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
+        copies the full table width (max_blocks None), as prepare() does. With ``prompt_lens``, other requests
+        took the rows: prompt_lens_cuda[:num_seqs] already holds their prompt lengths too.
         """
         AttentionMetadata.prepare(self)
         self._invalidate_mla_scheduler_buffers()
@@ -1916,6 +1939,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             get_global_attrs().attention_metadata = weakref.ref(self)
         num_seqs = self.num_seqs
         assert len(kv_lens) == num_seqs and self.num_contexts == 0
+        if prompt_lens is not None:
+            self.prompt_lens_cpu[:num_seqs].copy_(
+                torch.as_tensor(prompt_lens, dtype=torch.int, device='cpu'))
+            h2d_cache.forget(self.prompt_lens_cuda)
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
         host_kv_lens = torch.tensor(kv_lens, dtype=torch.int)
         self.kv_lens[:num_seqs].copy_(host_kv_lens + num_extra_kv_tokens)

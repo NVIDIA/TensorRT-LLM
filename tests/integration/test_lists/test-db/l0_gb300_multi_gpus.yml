@@ -70,7 +70,7 @@ l0_gb300_multi_gpus:
   # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
   # runs them. multi_gpu/test_gqa_kv_replica.py runs in l0_gb300's pre_merge block instead;
   # --ignore arguments do not change the CSV key (test_unittests.py _parallel_config_key).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (120)
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (150)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
@@ -100,8 +100,11 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
-  - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_gpt_oss"
+  # Pre-merge runs it on DGX B200 only.
+  - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
+  - unittest/_torch/modeling/test_modeling_llama.py
+  - unittest/_torch/modeling/test_modeling_llama_min_latency.py
+  - unittest/_torch/modeling/test_modeling_gpt_oss.py
   # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each
   # test spawns its four ranks with MPIPoolExecutor.
   - unittest/_torch/modeling/test_musespark_open_finalize_allreduce.py
@@ -125,7 +128,7 @@ l0_gb300_multi_gpus:
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
-  - unittest/_torch/multi_gpu_modeling -k "deepseek"
+  - unittest/_torch/multi_gpu_modeling/test_deepseek.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=2-tp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False]

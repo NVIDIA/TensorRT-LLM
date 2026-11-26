@@ -105,10 +105,7 @@ def test_an_unknown_type_is_refused():
 
 @pytest.mark.parametrize("encoding", ["JPEG", "PNG"])
 def test_the_preferred_loader_keeps_the_pixels_of_a_pil_decode(encoding: str) -> None:
-    """The media loader format the processor asks for yields an array of Pillow's pixels.
-
-    mistral-common decodes an image with Pillow; the loaders decode a JPEG with torchvision.
-    """
+    """The native processor uses the default RGB PIL decode."""
     from tensorrt_llm._torch.models.modeling_mistral import MistralNativeInputProcessor
     from tensorrt_llm.inputs.media_io import ImageMediaIO
 
@@ -118,9 +115,9 @@ def test_the_preferred_loader_keeps_the_pixels_of_a_pil_decode(encoding: str) ->
     buffer = BytesIO()
     _rgb(3, (480, 640)).save(buffer, encoding)
     loaded = ImageMediaIO.create(preferred.get("image"), None).load_bytes(buffer.getvalue())
-    assert isinstance(loaded, np.ndarray) and loaded.dtype == np.uint8
+    assert isinstance(loaded, Image.Image) and loaded.mode == "RGB"
     pillow = np.asarray(Image.open(BytesIO(buffer.getvalue())).convert("RGB"))
-    assert np.array_equal(np.asarray(_to_pil(loaded)), pillow)
+    assert np.array_equal(np.asarray(loaded), pillow)
 
 
 @pytest.fixture(scope="module")
@@ -157,8 +154,7 @@ def test_pixels_are_what_mistral_common_makes_of_the_loaded_image(
 ):
     """Nothing lies between the loaded image and mistral-common's resize and normalize.
 
-    The server loads ``np`` arrays; other callers may pass PIL images or ``pt`` tensors. No
-    image is serialized on the way.
+    The server loads PIL images. Callers can also pass arrays or tensors.
     """
     from mistral_common.protocol.instruct.chunk import ImageChunk
 
@@ -195,8 +191,7 @@ def test_pil_image_size_is_the_size_of_the_pil_image(image, size):
 def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_processor, served):
     """A chat renders and processes to the reference ids and grids.
 
-    The server loads images in the format the processor prefers (``np`` arrays); a caller
-    without that configuration gets the loaders' default (``pt`` tensors).
+    Both loader configurations supply RGB PIL images.
     """
     from tensorrt_llm.inputs.content_format import ContentFormat
     from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -238,8 +233,7 @@ def test_a_served_chat_keeps_roles_image_order_and_control_tokens(native_process
         )
     )
     assert ids == expected
-    loaded_type = np.ndarray if served else torch.Tensor
-    assert all(isinstance(image, loaded_type) for image in mm_data["image"])
+    assert all(isinstance(image, Image.Image) for image in mm_data["image"])
     actual_ids, extra = native_processor(
         {"prompt_token_ids": ids, "multi_modal_data": mm_data}, None
     )

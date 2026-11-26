@@ -17,8 +17,8 @@ kernels at that precision (``M3Eagle3Worker``).
 
 **The core** (``MiniMaxM3Tp2ModelingV2``) holds the weights (``weights.MODEL_WEIGHTS``) and the runtime resources the
 steps use -- one MSA attention backend per layer, the TP all-reduce communicator, the RoPE table, the MXFP8 GEMM
-dispatch state the engine tunes -- and dispatches each step, on the host, from its context count alone
-(``_select_target``):
+dispatch state the engine tunes. The shell passes the step's phase as ``has_context``. Direct core calls
+can derive it from the attention metadata:
 
 * ``DecodeTarget`` takes every pure generation step, of 1..``WIDE_MAX_TOKENS`` rows (up to 48 requests, each one token
   or a draft verify of 1 + 3 rows). Up to ``DECODE_MAX_TOKENS`` tokens with 1-D input ids it runs the decode-step
@@ -56,8 +56,11 @@ steps; a CUDA-graph capture only reads it, so a capture that finds it missing is
 
 **What this target asserts rather than adapts**: SM 10.7, the topology and checkpoint (``routing.py``); the
 MiniMax-M3 MSA sparse attention runtime with the fused five-way QKV/index projection, an FP8 indexer and an FP8 or
-NVFP4 KV cache, no torch.compile and no piecewise prefill graphs (``_validate_runtime``); text-only input (the vision
+NVFP4 KV cache (``_validate_runtime``); text-only input (the vision
 tower is not built and a step carrying image input raises).
+
+With piecewise CUDA graphs, only eligible prefill/mixed batches use torch.compile; decode and above-ceiling
+prefill keep their eager dispatch.
 """
 
 from __future__ import annotations
@@ -198,6 +201,12 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec imp
     m3_force_vec,
     m3_force_vec_req,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.prefill_ops import (
+    prefill_attention,
+    prefill_routed_experts,
+    register_prefill_core,
+    run_prefill_attention,
+)
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs as _draft_loader_moe_kwargs,
 )
@@ -238,7 +247,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.speculative.interface import (
     should_use_separate_draft_kv_cache as should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._torch.utils import ActType_TrtllmGen, get_model_extra_attrs
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, get_model_extra_attrs, is_torch_compiling
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -1362,7 +1371,8 @@ _VALUES: set = set()
 
 
 def _record(*meta: Hashable) -> None:
-    if _VALUE_DUMP:
+    """Collect eager value dumps without specializing symbolic counts during tracing."""
+    if _VALUE_DUMP and not torch.compiler.is_compiling():
         _VALUES.add(meta)
 
 
@@ -1665,9 +1675,12 @@ def _router_tc_fp4(core, i: int, h: torch.Tensor) -> Optional[tuple]:
     context step: the TF32 tensor-core router with the routed experts' NVFP4 activation quantization fused in (the agg
     canon's router on these rows); None elsewhere (the caller routes on its fp32 router)."""
     rows = h.shape[0] if h.dim() == 2 else 0
+    # The floor leaves the MoE engine's rows to it. Compiled prefill skips the engine, so the kernel (certified from
+    # one row) takes those rows too, and the traced rows split only at the ceiling.
+    min_rows = 1 if is_torch_compiling() else ROUTER_TC_GEN_MIN_ROWS
     if not (
-        ROUTER_TC_GEN.covers(rows)
-        and core.router_tc_cluster16
+        core.router_tc_cluster16
+        and min_rows <= rows <= ROUTER_TC_GEN_MAX_ROWS
         and h.dtype == torch.bfloat16
         and h.stride(1) == 1
         and (h.stride(0) * 2) % 16 == 0
@@ -2060,13 +2073,16 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
     release so the down GEMV stages its weights during it) at the rows its cells certify, in any graph or eager step;
     otherwise the Triton kernel (``m3_silu_and_mul``). Indexer kdev17 (TP2 chain): -0.69 us per dense layer vs the
     Triton kernel. Every decline is logged once."""
+    if is_torch_compiling():
+        # Compiled prefill always takes the Triton kernel; comparing its symbolic rows would split the buckets.
+        return m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
     path = DENSE_SWIGLU_CPP_PATH
     rows = gu.shape[0]
     max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS_BY_TP[2])
     params = (core.swiglu_alpha, core.swiglu_limit, core.swiglu_beta)
     act = None
     if rows > max_rows:
-        uncovered(path, f"{rows} rows, past its certified {max_rows}")
+        uncovered(path, f"more than {max_rows} rows")
     elif params != (DENSE_ALPHA, DENSE_LIMIT, DENSE_BETA):
         uncovered(path, f"activation parameters {params}")
     else:
@@ -2800,11 +2816,6 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 
     # --------------------------------------------------------------------------------------------- the dispatch
 
-    def _select_target(self, attn_metadata: AttentionMetadata):
-        """Which target runs this step: one host-side integer, fixed per CUDA-graph capture. A step with context rows
-        (a mixed step included) is prefill's; every pure generation step is decode's, whatever its width."""
-        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
-
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2814,6 +2825,8 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         capture: Callable[..., None] = _plain_capture,
         capture_target: Optional[Callable[..., Optional[tuple]]] = None,
+        *,
+        has_context: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         """``capture``: the Eagle3 hidden-state capture of a layer (the worker's, with its capture norm), and
@@ -2823,7 +2836,10 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if kwargs.get("lora_params") is not None:
             raise ValueError("this MiniMax-M3 target serves no LoRA adapters")
-        return self._select_target(attn_metadata).forward(
+        if has_context is None:
+            has_context = attn_metadata.num_contexts != 0
+        target = self._prefill if has_context else self._decode
+        return target.forward(
             attn_metadata,
             input_ids,
             position_ids,
@@ -2837,11 +2853,6 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 # --------------------------------------------------------------------------------------------------------------------
 # The targets
 # --------------------------------------------------------------------------------------------------------------------
-
-
-#: The cores the breakable prefill graphs' eager attention boundary looks up by key: an ``eager_on_graph`` callable
-#: replays with weak references to its arguments, so they may be tensors or scalars only.
-_BCG_CORES: Dict[str, "MiniMaxM3Tp2ModelingV2"] = {}
 
 
 def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
@@ -2866,39 +2877,10 @@ def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
     )
 
 
-def _prefill_attention_boundary(
-    packed, position_ids, q, k, v, idx_q, output, core_key: str, i: int
-) -> None:
-    """The attention boundary of a prefill layer under a breakable prefill CUDA graph, run eagerly at every replay (as
-    the built-in model's MiniMax-M3 attention boundary is): everything that depends on the step's live row count. A
-    sparse layer passes its ``packed`` five-way projection: the horizontal producer runs here over the live rows
-    (K / V / index-K into the paged caches, Q / index-Q out), then the MSA backend; a dense layer passes q / k / v."""
-    core = _BCG_CORES[core_key]
-    md = get_model_extra_attrs()["attention_metadata"]()
-    live = int(md.num_tokens)
-    if packed is not None:
-        horizontal = _sparse_qkv_producer(
-            core,
-            i,
-            packed[:live],
-            position_ids[..., :live] if position_ids is not None else None,
-            md.kv_cache_manager,
-            md.msa_idx_k_cache,
-            md.msa_out_cache_loc,
-        )
-        if horizontal is None:
-            raise RuntimeError(
-                f"MiniMax-M3 sparse layer {i}: no horizontal producer takes this step's caches (an FP8 or NVFP4 HND "
-                "pool with an FP8 index-K cache)"
-            )
-        q, idx_q = horizontal
-        k = v = None
-    _msa_attention_live(core, i, q, k, v, idx_q, md, output)
+# Breakable replays call the boundary body directly; the custom op is only for compiled graphs.
+_prefill_attention_eager = eager_on_graph(run_prefill_attention)
 
-
-_prefill_attention_eager = eager_on_graph(_prefill_attention_boundary)
-
-#: The drafters the breakable prefill graphs' eager draft attention boundary looks up by key (``_BCG_CORES``'s rule).
+#: Breakable drafter attention passes a key because replay arguments must be tensors or scalars.
 _BCG_DRAFTS: Dict[str, "M3Eagle3Draft"] = {}
 
 
@@ -2915,6 +2897,41 @@ def _draft_attention_boundary(qkv, output, draft_key: str) -> None:
 _draft_attention_eager = eager_on_graph(_draft_attention_boundary)
 
 
+def _run_routed_chunks(
+    core: MiniMaxM3Tp2ModelingV2, i: int, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    """Run finalized routed experts in balanced chunks limited by ``moe_max_num_tokens``.
+
+    Even chunks use the auxiliary MoE chunking stream when available.
+    """
+    rows = x.shape[0]
+    num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
+    if num_chunks <= 1:
+        return _routed_experts(core, i, x, None, router_logits, True)
+    sizes = _split_chunk(rows, num_chunks)
+    xs, logits = x.split(sizes), router_logits.split(sizes)
+    aux = core.aux_stream_moe_chunk
+    if aux is None:
+        return torch.cat(
+            [_routed_experts(core, i, xs[c], None, logits[c], True) for c in range(num_chunks)]
+        )
+    ev_main, ev_overlap = core.moe_chunk_events[i]
+    ev_main.record()
+    with torch.cuda.stream(aux):
+        ev_main.wait()
+    outs: List[torch.Tensor] = []
+    for c in range(num_chunks):
+        if c % 2 == 0:
+            with torch.cuda.stream(aux):
+                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
+        else:
+            outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
+    with torch.cuda.stream(aux):
+        ev_overlap.record()
+    ev_overlap.wait()
+    return torch.cat(outs)
+
+
 class PrefillTarget:
     """A step with context rows: prefill chunks, and the mixed steps that carry generation rows beside them. Every
     layer runs in its generic form; the attention core is the MSA backend's for every row.
@@ -2925,15 +2942,20 @@ class PrefillTarget:
 
     def __init__(self, core: MiniMaxM3Tp2ModelingV2) -> None:
         self.core = core
-        self._bcg_key = f"m3_tp2_core_{id(core)}"
-        _BCG_CORES[self._bcg_key] = core
+        self._core_key = register_prefill_core(
+            core,
+            _sparse_qkv_producer,
+            _msa_attention_live,
+            _fp8_index_qk_norm_rope,
+            _run_routed_chunks,
+        )
         # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per forward.
         self._contract_pending = step_contract_enabled()
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): the metadata fields this target consumes
         must exist (they are private trtllm surface). Calling ``step_args`` is the check; once per target instance."""
-        if not self._contract_pending:
+        if torch.compiler.is_compiling() or not self._contract_pending:
             return
         try:
             self.step_args(md)
@@ -2942,16 +2964,8 @@ class PrefillTarget:
         self._contract_pending = False
 
     def step_args(self, md) -> dict:
-        """The one projection of the MSA metadata this target's forward reads, computed once per step.
-
-        Counts and per-step host scalars are read here; device tensors are the metadata's persistent buffers, held
-        by reference; ``msa_idx_k_cache`` is the metadata's per-layer index-K cache getter. ``metadata`` is the
-        prepared object itself: the MSA backend's step (``m3_msa_attention``) takes it as its argument.
-        """
+        """Borrow the metadata and cache handles used by eager prefill attention."""
         return dict(
-            num_contexts=md.num_contexts,
-            num_ctx_tokens=md.num_ctx_tokens,
-            num_tokens=md.num_tokens,
             kv_cache_manager=md.kv_cache_manager,
             msa_idx_k_cache=md.msa_idx_k_cache,
             msa_out_cache_loc=md.msa_out_cache_loc,
@@ -2972,7 +2986,8 @@ class PrefillTarget:
         core = self.core
         self._check_step_contract(attn_metadata)
         step = self.step_args(attn_metadata)
-        _record("prefill", int(step["num_tokens"]), int(step["num_contexts"]))
+        if _VALUE_DUMP and not torch.compiler.is_compiling():
+            _record("prefill", int(attn_metadata.num_tokens), int(attn_metadata.num_contexts))
         hidden = (
             m3_embedding(input_ids, core.w["embed"]) if inputs_embeds is None else inputs_embeds
         )
@@ -2997,34 +3012,13 @@ class PrefillTarget:
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call:
-        the MoE scheduler's even split, even chunks on the MoE chunking stream."""
+    def _routed_chunks(self, i: int, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """Run routed experts, keeping the chunk loop outside the compiled graph."""
         core = self.core
-        rows = x.shape[0]
-        num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
-        if num_chunks <= 1:
-            return _routed_experts(core, i, x, None, router_logits, True)
-        sizes = _split_chunk(rows, num_chunks)
-        xs, logits = x.split(sizes), router_logits.split(sizes)
-        aux = core.aux_stream_moe_chunk
-        ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
-        outs: List[torch.Tensor] = []
-        for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
-                with torch.cuda.stream(aux):
-                    outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-            else:
-                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
-        return torch.cat(outs)
+        if is_torch_compiling() and core.moe_max_num_tokens < core.max_num_tokens:
+            # One op for any number of chunks: the graph neither unrolls them nor guards on their count.
+            return prefill_routed_experts(x, router_logits, self._core_key, i)
+        return _run_routed_chunks(core, i, x, router_logits)
 
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: on ``ROUTER_TC_GEN``'s rows the TF32 tensor-core router with the
@@ -3044,7 +3038,8 @@ class PrefillTarget:
         core = self.core
         rows = h.shape[0] if h.dim() == 2 else 0
         if (
-            h.dim() == 2
+            not is_torch_compiling()
+            and h.dim() == 2
             and h.dtype == torch.bfloat16
             and 1 <= rows <= MOE_ENGINE_MAX_TOKENS
             and rows >= MOE_FOLD_MIN_TOKENS
@@ -3055,7 +3050,7 @@ class PrefillTarget:
                 taken(MOE_ENGINE.path, rows)
                 folded = m3_moe_engine(h.contiguous(), engine, None, None)
                 return folded, None
-        if not return_parts and _triton_finalize_rows(core, h):
+        if not is_torch_compiling() and not return_parts and _triton_finalize_rows(core, h):
             routed_parts, shared_out = maybe_execute_in_parallel(
                 lambda: _routed_experts(core, i, h, None, _router_logits(core, i, h), False),
                 lambda: self._swiglu_mlp(h, f"l{i}_sh", False),
@@ -3072,7 +3067,9 @@ class PrefillTarget:
             core.moe_events[i][1],
             # The warmup tuning pass profiles the shared expert's GEMMs: keep it on the main stream, between the
             # same collectives on every rank (the capture pass and serving still overlap it on the aux stream).
-            None if flashinfer_mxfp8_autotune_active() else core.aux_stream_moe,
+            None
+            if is_torch_compiling() or flashinfer_mxfp8_autotune_active()
+            else core.aux_stream_moe,
             disable_on_compile=True,
         )
         if return_parts:
@@ -3084,7 +3081,7 @@ class PrefillTarget:
         """A generic layer boundary: the multicast all-reduce + residual + RMSNorm on the rows it takes (with the
         shared + routed add folded in), else the built-in fused all-reduce."""
         core = self.core
-        if _can_mc(x, folded=x2 is not None):
+        if not is_torch_compiling() and _can_mc(x, folded=x2 is not None):
             fused = _mc_allreduce_norm(core, x, x2, residual, norm_w)
             if fused is not None:
                 return fused
@@ -3102,7 +3099,8 @@ class PrefillTarget:
             residual = hidden
             hidden = flashinfer_rmsnorm(hidden, core.w[f"l{i}_in_norm"], core.rms_eps)
         hidden, _ = self._attention(i, position_ids, hidden, step)
-        if _can_mc(hidden):
+        use_mc = not is_torch_compiling()
+        if use_mc and _can_mc(hidden):
             fused = _mc_allreduce_norm(core, hidden, None, residual, core.w[f"l{i}_post_norm"])
             hidden, residual = (
                 fused
@@ -3122,7 +3120,7 @@ class PrefillTarget:
                 if spec_metadata is not None and spec_metadata.is_layer_capture(i):
                     capture(spec_metadata, i, folded[1], None)
                 return folded
-            out, routed = self._moe(i, hidden, return_parts=_can_mc(hidden, folded=True))
+            out, routed = self._moe(i, hidden, return_parts=use_mc and _can_mc(hidden, folded=True))
         else:
             out = self._swiglu_mlp(hidden, f"l{i}_mlp", True, dense=True)
             routed = None
@@ -3148,19 +3146,36 @@ class PrefillTarget:
             o = self._attention_core(i, q, k, v, None, step)
             return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
         if not core.fused_projection:
-            if is_in_breakable_cuda_graph():
+            # Compiled prefill supports unfused projections inside a breakable context.
+            if not is_torch_compiling() and is_in_breakable_cuda_graph():
                 raise RuntimeError(
                     "this MiniMax-M3 target runs a breakable prefill CUDA graph only with the five-way projection "
                     "(fuse_qkv_index_projection)"
                 )
             return self._unfused_sparse_attention(i, position_ids, hidden, step)
         packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
+        if is_torch_compiling():
+            output = packed.new_empty(
+                (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
+            )
+            prefill_attention(
+                packed,
+                position_ids,
+                None,
+                None,
+                None,
+                None,
+                output,
+                self._core_key,
+                i,
+            )
+            return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         if is_in_breakable_cuda_graph():
             output = packed.new_empty(
                 (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
             )
             _prefill_attention_eager(
-                packed, position_ids, None, None, None, None, output, self._bcg_key, i
+                packed, position_ids, None, None, None, None, output, self._core_key, i
             )
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         horizontal = _sparse_qkv_producer(
@@ -3201,26 +3216,38 @@ class PrefillTarget:
                 core, i, idx_qk, position_ids, step["msa_idx_k_cache"], step["msa_out_cache_loc"]
             )
 
-        (q, k, v), idx_q = maybe_execute_in_parallel(
-            _main,
-            _index,
-            core.attn_events[i][0],
-            core.attn_events[i][1],
-            core.aux_stream_attn,
-            disable_on_compile=True,
-        )
-        o = self._attention_core(i, q, k, v, idx_q, step)
+        if is_torch_compiling():
+            q, k, v = _main()
+            idx_qk = m3_bf16_linear(hidden, core.w[f"l{i}_idx_w"])
+            o = self._attention_core(
+                i, q, k, v, None, step, idx_qk=idx_qk, position_ids=position_ids
+            )
+        else:
+            (q, k, v), idx_q = maybe_execute_in_parallel(
+                _main,
+                _index,
+                core.attn_events[i][0],
+                core.attn_events[i][1],
+                core.aux_stream_attn,
+                disable_on_compile=True,
+            )
+            o = self._attention_core(i, q, k, v, idx_q, step)
         return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
 
-    def _attention_core(self, i: int, q, k, v, idx_q, step) -> torch.Tensor:
+    def _attention_core(
+        self, i: int, q, k, v, idx_q, step, *, idx_qk=None, position_ids=None
+    ) -> torch.Tensor:
         """The attention core over the step's live tokens (a padded step's pad rows are left as allocated): the MSA
         backend (``m3_msa_attention``: the KV write unless a producer wrote the caches, the sparse layers' top-k block
         selection, the FMHA over the context rows and any generation rows beside them)."""
         core = self.core
         output = q.new_empty((q.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16)
+        if is_torch_compiling():
+            prefill_attention(None, position_ids, q, k, v, idx_qk, output, self._core_key, i)
+            return output
         if is_in_breakable_cuda_graph():
             # The live row count is a host value of the step: read at every replay inside the eager boundary.
-            _prefill_attention_eager(None, None, q, k, v, idx_q, output, self._bcg_key, i)
+            _prefill_attention_eager(None, None, q, k, v, None, output, self._core_key, i)
         else:
             _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
         return output
@@ -3655,9 +3682,9 @@ class DecodeTarget:
         rows = h.shape[0] if h.dim() == 2 else 0
         cap = min(GENERIC_MC_FINALIZE_MAX_TOKENS, m3_mc_allreduce.FINALIZE_MAX_TOKENS)
         if (
-            not (DECODE_MAX_TOKENS < rows <= cap)
+            torch.compiler.is_compiling()
+            or not (DECODE_MAX_TOKENS < rows <= cap)
             or h.dtype != torch.bfloat16
-            or torch.compiler.is_compiling()
         ):
             return None
         if self._bucket_flags(rows) is None:
@@ -3683,35 +3710,6 @@ class DecodeTarget:
             act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
         return _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm, push)
 
-    def _routed_chunks(self, i: int, x, router_logits):
-        """The routed experts from the bf16 activation over at most ``moe_max_num_tokens`` rows per runner call: the MoE
-        scheduler's even split, even chunks on the MoE chunking stream."""
-        core = self.core
-        rows = x.shape[0]
-        num_chunks = (rows + core.moe_max_num_tokens - 1) // core.moe_max_num_tokens
-        if num_chunks <= 1:
-            return _routed_experts(core, i, x, None, router_logits, True)
-        sizes = _split_chunk(rows, num_chunks)
-        xs, logits = x.split(sizes), router_logits.split(sizes)
-        aux = core.aux_stream_moe_chunk
-        ev_main, ev_overlap = core.moe_chunk_events[i]
-        if aux is not None:
-            ev_main.record()
-            with torch.cuda.stream(aux):
-                ev_main.wait()
-        outs: List[torch.Tensor] = []
-        for c in range(num_chunks):
-            if aux is not None and c % 2 == 0:
-                with torch.cuda.stream(aux):
-                    outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-            else:
-                outs.append(_routed_experts(core, i, xs[c], None, logits[c], True))
-        if aux is not None:
-            with torch.cuda.stream(aux):
-                ev_overlap.record()
-            ev_overlap.wait()
-        return torch.cat(outs)
-
     def _routed(self, i: int, h: torch.Tensor):
         """Router + routed experts, finalized: on ``ROUTER_TC_GEN``'s rows the TF32 tensor-core router with the
         experts' NVFP4 activation fused in (one runner call: the rows are within ``moe_max_num_tokens``), else the
@@ -3721,7 +3719,7 @@ class DecodeTarget:
         if fused is not None:
             logits, x_fp4, x_sf = fused
             return _routed_experts(core, i, x_fp4, x_sf, logits, True)
-        return self._routed_chunks(i, h, _decode_router_logits(core, i, h))
+        return _run_routed_chunks(core, i, h, _decode_router_logits(core, i, h))
 
     def _moe(self, i: int, h: torch.Tensor, *, return_parts: bool, push=None):
         """The MoE block of layer ``i`` without its reduction.
@@ -6093,6 +6091,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
 
+    # Keep decode and above-ceiling prefill on their hand-fused eager paths.
+    use_fx_for_pcg_fallback = False
+
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.
@@ -6205,6 +6206,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )
+        has_context = attn_metadata.num_contexts != 0
         worker = self.spec_worker
         capture = _plain_capture
         capture_target = None
@@ -6215,13 +6217,26 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
                 worker.arm_capture_norm(
                     attn_metadata, spec_metadata, self.lm_head, self.draft_model
                 )
+        capture_for_core = capture
+        if (
+            worker is not None
+            and spec_metadata is not None
+            and has_context
+            and is_torch_compiling()
+        ):
+            assert worker._m3_capture_norm is None and worker._m3_fc_early_drafter is None, (
+                "compiled prefill requires plain Eagle3 capture"
+            )
+            capture_for_core = _modeling_support._prepare_prefill_eagle3_capture(spec_metadata)
         hidden_states = self.model(
             attn_metadata=attn_metadata,
+            # Pass the local phase into the compiled core without tracing request counts.
+            has_context=has_context,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
-            capture=capture,
+            capture=capture_for_core,
             capture_target=capture_target,
             **kwargs,
         )
