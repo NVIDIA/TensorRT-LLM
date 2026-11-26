@@ -10,7 +10,7 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
-from ..test_llm import llama_model_path
+from ..model_paths import llama_model_path
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 

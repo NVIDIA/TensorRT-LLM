@@ -1444,6 +1444,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         )
         logger.info(f"ple n-gram table: {host.describe()}")
 
+    def release_host_resident_weights(self) -> None:
+        """Close the host-resident n-gram table and, in `node`, its broker threads."""
+        _weights._close_ngram_table(self)
+
     # ---------------------------------------------------------------- bind ---
 
     def _bind_cache_manager(self, md, position_ids) -> None:

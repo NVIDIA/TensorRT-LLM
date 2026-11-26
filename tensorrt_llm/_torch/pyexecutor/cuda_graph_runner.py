@@ -5,8 +5,8 @@ import bisect
 import contextlib
 import os
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Sequence, Tuple, TypeAlias)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    NamedTuple, Optional, Sequence, Tuple, TypeAlias)
 
 import torch
 
@@ -41,6 +41,9 @@ from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
 from .sampler import SampleStateTensors
 from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from ..modules.engram import EngramPreReplayHook
 
 
 # Opt-in: catches attn_metadata/spec_metadata tensors rebound between capture
@@ -738,6 +741,25 @@ class CUDAGraphRunner:
         """
         self._pre_replay_hooks.append(hook)
 
+    @property
+    def fusible_engram_hook(self) -> "EngramPreReplayHook | None":
+        """The sole Engram hook, which can run early without reordering another hook."""
+        if len(self._pre_replay_hooks) != 1:
+            return None
+        from ..modules.engram import EngramPreReplayHook
+
+        hook = self._pre_replay_hooks[0]
+        return hook if isinstance(hook, EngramPreReplayHook) else None
+
+    def pre_replay_hook_positions(self, num_tokens: int) -> torch.Tensor:
+        """Flat storage of the hooks' corrected positions for a ``num_tokens``
+        replay, for a preparation that does the hooks' work itself."""
+        assert not self.config.use_mrope
+        if self._pre_replay_position_ids is None:
+            self._pre_replay_position_ids = torch.empty_like(
+                self.shared_static_tensors["position_ids"])
+        return self._pre_replay_position_ids.view(-1)[:num_tokens]
+
     def _resolve_sample_type(
         self,
         batch: ScheduledRequests,
@@ -1365,6 +1387,7 @@ class CUDAGraphRunner:
         *,
         position_id_offsets: Optional[torch.Tensor] = None,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Optional[torch.Tensor]:
         """Replay a graph, applying optional per-generation-token offsets to hooks.
 
@@ -1373,6 +1396,8 @@ class CUDAGraphRunner:
         ``static_inputs_staged``: the number of tokens whose static input ids and
         positions the input preparation already wrote (see PreparedInputs); the
         replay copies them only when it runs another token count.
+        ``pre_replay_staged``: with those staged tokens and the offsets, the
+        preparation also wrote the sole Engram hook's positions and refreshed its hashes.
         """
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -1399,6 +1424,9 @@ class CUDAGraphRunner:
         static_input_ids = static_tensors["input_ids"][:seqlen]
         copy_input_ids = (not prestaged and input_ids.data_ptr()
                           != static_input_ids.data_ptr())
+        hooks_done = (prestaged and pre_replay_staged
+                      and position_id_offsets is not None
+                      and self.fusible_engram_hook is not None)
 
         position_ids = current_inputs["position_ids"]
         # Hooks get their own corrected positions: the captured preprocessing
@@ -1518,7 +1546,7 @@ class CUDAGraphRunner:
         device_copy.flush(in_graph=captured_copier_active)
         if prologue_copier is not None and not captured_copier_active:
             prologue_copier.quiesce_graph_window()
-        if self._pre_replay_hooks:
+        if self._pre_replay_hooks and not hooks_done:
             hook_tensors = static_tensors
             if hook_positions is not None:
                 if not staged:

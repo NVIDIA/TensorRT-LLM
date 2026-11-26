@@ -517,7 +517,9 @@ launch at its first layer. Decoder boundaries raise read-only SWA floors: rows
 below them still write their SWA. Live KV-length updates refresh positions and
 every KV owner's GLOBAL write slots and compressed groups in one CuTe DSL launch; host-resident metadata uses the equivalent PyTorch
 expressions. A steady generation step keeps the previous geometry and re-reads
-the page tables only when a request crosses a page.
+the page tables when a request joins, rows are remapped, or a request's page
+storage may have changed. It validates the write pages for joining and changed
+requests before those tables are used.
 
 `set_source_batch()` permits encoder source lengths to differ from decoder
 query lengths. Compressor output capacity follows source rows; incomplete
