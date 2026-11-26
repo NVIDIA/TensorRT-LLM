@@ -467,6 +467,7 @@ _DP_FRONT_STACK = dict(
     dp_bitmap=True,
     dp_opt_in=True,
     index_key_fp8=True,
+    topk_cowrite=True,
 )
 _DP8_FRONT_STACK = dict(_DP_FRONT_STACK, dp8_domain=True, dp_fuse=True)
 _QUANTIZED_KV = [
@@ -1047,6 +1048,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             env["TRTLLM_QWEN4_EXP_DP_DRAFT_GQA_GROUPED1"] = "1"
         if variant.get("index_key_fp8"):
             env["TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"] = "1"
+        if variant.get("topk_cowrite"):
+            # the generation cluster top-k's coalesced write (opt-in, the same selection)
+            env["TRTLLM_QWEN4_EXP_DP_TOPK_NARROW"] = "1"
         if variant.get("tep_opt_in"):
             for name in (
                 "DRAFT_LAYER",
@@ -1055,6 +1059,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 "FINAR_SHARED",
                 "INDEX_PREFETCH",
                 "GQA_E4M3",
+                "TOPK_NARROW",
             ):
                 env[f"TRTLLM_QWEN4_EXP_TEP_{name}"] = "1"
         key = f"{self.ACCEPTANCE_KEY_MTP3}_{kv_dtype}_kv"

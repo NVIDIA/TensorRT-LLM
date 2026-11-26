@@ -1051,6 +1051,21 @@ INDEX_KEY_FP8_ENV = "TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"
 #: critical path, 2.7-3.3 us a layer at 7..25 requests a rank, -0.021..-0.072 ms a step in the
 #: server A/B. Read once, when the target is built.
 DP_SCORES_EARLY_ENV = "TRTLLM_QWEN4_EXP_DP_SCORES_EARLY"
+#: Off by default (unmeasured on this kernel): at a dep4 / dep8 rank (`DP_TOPK_NARROW_ENV`) or a tep4
+#: rank (`TEP_TOPK_NARROW_ENV`) on SM103, a generation step's cluster top-k
+#: (`qsa_topk_expand_cluster`) stores its selection coalesced (`cowrite=True`): each CTA puts its
+#: selected blocks, which hold consecutive positions of the row's list, into a shared position ->
+#: block map, then writes its stretch of `topk_indices` and of the token selection with all its
+#: threads, instead of each key's thread storing its block and four tokens at scattered columns.
+#: The same values at the same columns. The measured `TOPK_NARROW=16w` was a 16-warp leader
+#: selection plus this writer in our own leader-CTA cluster kernel (-1.05 us a launch, dep8 g12
+#: -0.018 ms a step, TEP -0.016 ms); the kernel the stack runs has no leader CTA (every CTA narrows
+#: through DSMEM histograms), so only the writer half has a counterpart, and its gain here is
+#: unmeasured. `1` (or the measured `16w` / `w`) turns it on. Read once, when the target is built.
+DP_TOPK_NARROW_ENV = "TRTLLM_QWEN4_EXP_DP_TOPK_NARROW"
+TEP_TOPK_NARROW_ENV = "TRTLLM_QWEN4_EXP_TEP_TOPK_NARROW"
+#: Spellings of the coalesced top-k write's switches that turn it on.
+_TOPK_NARROW_ON = ("1", "w", "16w", "true", "on", "yes")
 #: Off by default (opt-in: a cold-page codec over the KV cache manager's migration bridge, whose
 #: callbacks run on the manager's copy thread). Context servers only, with `INDEX_KEY_FP8_ENV`,
 #: block reuse, a host tier, MTP-3 and the `L - 2` in-forward snapshot: every anchor writer also
@@ -1524,6 +1539,117 @@ def _dp_scores_early(core, device) -> bool:
         f"({DP_SCORES_EARLY_ENV}=1): rank {core.dp_rank} of {core.dp_size}"
     )
     return True
+
+
+def _topk_cowrite_build(core, device) -> bool:
+    """`DP_TOPK_NARROW_ENV` at a dep4 / dep8 rank, `TEP_TOPK_NARROW_ENV` at a tep4 rank, read once
+    at build: True on SM103 with the layout's switch on; set where it cannot apply: one warning,
+    False. A value outside `_TOPK_NARROW_ON` and `0` raises."""
+    dp = core.dp_size > 1
+    env = DP_TOPK_NARROW_ENV if dp else TEP_TOPK_NARROW_ENV
+    on = False
+    for name in (DP_TOPK_NARROW_ENV, TEP_TOPK_NARROW_ENV):
+        raw = os.environ.get(name, "").strip()
+        value = raw.lower()
+        if value and value not in _TOPK_NARROW_ON and value not in ("0", "false", "off", "no"):
+            raise ValueError(f"{name}={raw!r}: expected 1 (or 16w / w) or 0")
+        if value in _TOPK_NARROW_ON:
+            if name == env:
+                on = True
+            else:
+                logger.warning(
+                    f"{name} is set but ignored: it serves "
+                    + ("a tep4 rank" if dp else "a dep4 / dep8 rank")
+                    + f"; this rank has attention DP {core.dp_size}"
+                )
+    if not on:
+        return False
+    serves = (
+        _dp_decode_rank(core, device)
+        if dp
+        else (
+            _tep4_layout(core)
+            and device.type == "cuda"
+            and torch.cuda.get_device_capability(device) == archs.SM_103
+        )
+    )
+    if not serves:
+        logger.warning(
+            f"{env} is set but ignored: it serves a dep4 / dep8 or a tep4 rank on SM103; this rank "
+            f"has attention DP {core.dp_size}, attention TP {core.attn_tp_size}"
+        )
+        return False
+    try:
+        bad = _topk_cowrite_check(core, device)
+    except Exception as e:  # noqa: BLE001 -- this rank alone declines; no collective follows
+        bad = f"the check raised {type(e).__name__}: {e}"
+    if bad:
+        # Rank-local: the selection is the same bits either way, so ranks may differ here.
+        logger.warning(f"{env} is set but ignored at rank {core.mapping.tp_rank}: {bad}")
+        return False
+    raw = os.environ.get(env, "").strip()
+    logger.info(
+        f"cluster top-k stores its selection coalesced ({env}={raw}): rank {core.mapping.tp_rank} "
+        f"of {core.mapping.tp_size}"
+        + (
+            "; the measured 16-warp leader selection has no counterpart in this kernel, only "
+            "the writer half"
+            if raw.lower() == "16w"
+            else ""
+        )
+    )
+    return True
+
+
+#: Score-table width of the coalesced top-k write's build check (262144 tokens with MTP's pages).
+_TOPK_COWRITE_CHECK_WIDTH = 65568  # capacity: fixed: a check shape
+
+
+def _topk_cowrite_check(core, device) -> str:
+    """The cluster top-k with and without `cowrite` over the same random rows (windows from a few
+    blocks to the whole table, ties at the threshold), at every generation row count of this rank
+    the cluster serves (the trunk's `max_verify_rows` x a graph batch size, a draft step's batch
+    size, and one row) under each placement `_selection` gives it past 37 rows (trunk and draft):
+    every launch plan (cluster size, `solo_blocks`, row map) the rank runs, on the operand dtypes
+    `_selection` passes (int64 positions, int32 sequence lengths); the row count is a runtime
+    argument, so the compiles are one per plan. "" when `topk_indices` and the token selection are
+    bitwise equal, else what differs. Rank-local (no collective)."""
+    limit = getattr(core, "dp_topk_cluster_rows", _TOPK_CLUSTER_MAX_ROWS)
+    sizes = getattr(core.model_config, "cuda_graph_batch_sizes", None) or ()
+    draft = {int(b) for b in sizes if 1 <= int(b) <= limit}
+    rows_list = sorted({1, *_graph_rows(core, 1, limit), *draft})
+    width = _TOPK_COWRITE_CHECK_WIDTH
+    k, cr = core.block_topk, core.compress_ratio
+    gen = torch.Generator(device=device).manual_seed(20261126)
+    for rows in rows_list:
+        scores = torch.randn([rows, width], generator=gen, device=device)
+        # Coarse scores: exact ties inside the top-k and at its threshold.
+        scores = scores.mul(8).round().div(8).float()
+        ends = torch.randint(1, width + 1, [rows], generator=gen, device=device).to(torch.int32)
+        ends[0] = width
+        pos = (ends.to(torch.int64) * cr - 1).clamp(min=0)
+        lens = (pos + 1).to(torch.int32)
+        places = [{}]
+        if limit > _TOPK_CLUSTER_MAX_ROWS:
+            places = [_topk_placement(scores, False)]
+            if rows in draft and _topk_placement(scores, True) != places[0]:
+                places.append(_topk_placement(scores, True))
+        for place in places:
+            outs = []
+            for cowrite in (False, True):
+                topk = torch.full([rows, k], -7, dtype=torch.int32, device=device)
+                sel = qsa_topk_expand_cluster(
+                    scores, ends, pos, lens, topk, cr, core.token_topk, cowrite=cowrite, **place
+                )
+                outs.append((topk, sel))
+            torch.cuda.synchronize(device)
+            (t0, s0), (t1, s1) = outs
+            where = f"{rows} rows" + (f" ({place})" if place else "")
+            if not torch.equal(t0, t1):
+                return f"topk_indices differ at {where}"
+            if not torch.equal(s0, s1):
+                return f"the token selection differs at {where}"
+    return ""
 
 
 def _dp_topk_cluster_rows(core) -> int:
@@ -2928,6 +3054,7 @@ def _decode_forms(core) -> str:
             "steady prepare": getattr(core, "host_step_forms", {}).get("dp_steady", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
             "replay gap": getattr(core, "host_step_forms", {}).get("qsa_replay_gap", False),
+            "topk cowrite": getattr(core, "topk_cowrite", False),
         }
     else:
         forms = {
@@ -2943,6 +3070,7 @@ def _decode_forms(core) -> str:
             "attn inplace": getattr(core, "tep_attn_inplace", False),
             "index key fp8": getattr(core, "index_key_fp8", False),
             "qsa steady": getattr(core, "host_step_forms", {}).get("qsa_steady", False),
+            "topk cowrite": getattr(core, "topk_cowrite", False),
             "tp sum lamport": getattr(core, "_tep_tpsum", None) is not None,
             "index split": getattr(core, "tep_index_split", 0),
         }
@@ -3382,6 +3510,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
         # The trunk verify's early index scores (`DP_SCORES_EARLY_ENV`, opt-in), settled after load.
         self.dp_scores_early = False
+        # The generation cluster top-k's coalesced write (`DP_TOPK_NARROW_ENV` /
+        # `TEP_TOPK_NARROW_ENV`, opt-in), settled after load.
+        self.topk_cowrite = False
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -3601,6 +3732,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._draft_o = _draft_o_build(self, device)
             self._siteb = _siteb_build(self, device)
             self.dp_scores_early = _dp_scores_early(self, device)
+            self.topk_cowrite = _topk_cowrite_build(self, device)
             self._draft_moe_tactics = _draft_moe_tactics_build(self, device)
             self.tep_attn_inplace = _tep_attn_inplace_build(self, device)
             self.dp_launch_order = _switch(DP_LAUNCH_ORDER_ENV, default=True) and (
@@ -6907,6 +7039,8 @@ def _selection(
         cluster_rows = getattr(core, "dp_topk_cluster_rows", _TOPK_CLUSTER_MAX_ROWS)
     if _topk_expand_cluster_supports(scores, max_rows=cluster_rows):
         placement = _topk_placement(scores, draft) if cluster_rows > _TOPK_CLUSTER_MAX_ROWS else {}
+        if not context and getattr(core, "topk_cowrite", False):
+            placement["cowrite"] = True
         qsa_topk_expand_cluster(
             scores,
             visible_blocks,
