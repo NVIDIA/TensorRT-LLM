@@ -62,7 +62,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_comm, mpi_rank
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.llmapi.llm_args import (
     _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS,
     MoePerLayerDynamicLoadBalancerConfig,
@@ -115,37 +115,6 @@ def _init_worker(custom_paths: list[str]) -> None:
     for custom_path in custom_paths:
         if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
             sys.path.append(custom_path)
-
-
-def _init_process_group(rank: int, world_size: int) -> None:
-    """Join the NCCL WORLD group, which MegaMoE resolves as its EP group."""
-    master_addr = "127.0.0.1"
-    store = None
-    if rank == 0:
-        # Bind before publishing the OS-selected port.
-        store = dist.TCPStore(
-            host_name=master_addr,
-            port=0,
-            world_size=world_size,
-            is_master=True,
-            wait_for_workers=False,
-        )
-    master_port = mpi_comm().bcast(store.port if store is not None else None, root=0)
-    if store is None:
-        store = dist.TCPStore(
-            host_name=master_addr,
-            port=master_port,
-            world_size=world_size,
-            is_master=False,
-            wait_for_workers=False,
-        )
-    os.environ["MASTER_ADDR"] = master_addr
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["LOCAL_RANK"] = str(rank)
-    torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", store=store, rank=rank, world_size=world_size)
 
 
 def _record_routes(
@@ -238,7 +207,8 @@ def _run_rank(
 
         geometry.MAX_PAIR_TEAM_EP = 2
     rank = mpi_rank()
-    _init_process_group(rank, world_size)
+    # MegaMoE joins the NCCL WORLD group, which it resolves as its EP group, when it is built.
+    torch.cuda.set_device(rank)
     # The test utilities create weights and scales on the default device.
     with torch.device(f"cuda:{rank}"):
         # The planner, BCG capture, and replay must all bind to the same MAIN.
