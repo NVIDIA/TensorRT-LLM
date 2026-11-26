@@ -19,6 +19,7 @@ different test scripts (perf sanity, module perf, accuracy, etc.).
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -483,11 +484,11 @@ def prepare_regressive_test_cases(
 
                 # Re-evaluate main's own latest value against this same baseline
                 # and this same (pre-merge) threshold. Anything unusable -- field
-                # absent, null, non-numeric, non-positive -- must not exempt, so
-                # a broken post-merge record leaves the gate armed.
+                # absent, null, non-numeric, non-positive, non-finite -- must not
+                # exempt, so a broken post-merge record leaves the gate armed.
                 if latest_post_merge is not None:
                     prior_value = _safe_float(latest_post_merge.get(metric), None)
-                    if prior_value is not None and prior_value > 0:
+                    if prior_value is not None and math.isfinite(prior_value) and prior_value > 0:
                         usable_post_merge_metrics.add(metric)
                         if _is_regressive(prior_value, baseline_value, threshold, maximize):
                             post_merge_regressive_metrics.append(metric)

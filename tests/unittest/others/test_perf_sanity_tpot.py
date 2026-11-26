@@ -542,6 +542,143 @@ def test_ttft_caller_isolates_duplicate_server_names(
 
 
 @pytest.mark.parametrize(
+    ("mode", "collision"),
+    [("aggr_upload", "servers"), ("aggr", "servers"), ("aggr_upload", "clients")],
+)
+def test_ttft_caller_rejects_ambiguous_history_keys(
+    perf_sanity_caller: Callable, tmp_path: Path, mode: str, collision: str
+) -> None:
+    """Configured measurements reject colliding history identities before launch."""
+    worker_path = tmp_path / "speculative.yaml"
+    worker_path.write_text(yaml.safe_dump({"speculative_config": {"decoding_type": "MTP"}}))
+    if collision == "servers":
+        servers = [
+            {
+                "extra_llm_api_config_path": str(worker_path),
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            },
+            {"client_configs": [{"name": "con1", "concurrency": 1}]},
+        ]
+    else:
+        servers = [
+            {
+                "client_configs": [
+                    {"name": "con1", "concurrency": 1},
+                    {"name": "con1", "concurrency": 2},
+                ],
+            }
+        ]
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": servers,
+    }
+    launches = []
+    timeouts = []
+    with pytest.raises(
+        ValueError,
+        match="Duplicate aggregated performance history key.*distinct server or client names",
+    ):
+        perf_sanity_caller(
+            [
+                _ttft_history(
+                    s_test_case_name="latency-control_tp1_ep1_pp1_cp1_bs512_attnTRTLLM_moe-con1"
+                )
+            ],
+            config=config,
+            test_case=f"{mode}-latency_control",
+            launches=launches,
+            probe_timeouts=timeouts,
+            expect_upload=False,
+        )
+    assert not launches and not timeouts
+
+
+def test_ttft_caller_distinguishes_runtime_history_keys(perf_sanity_caller: Callable) -> None:
+    """An equal case name with different reporting runtimes is not a key collision."""
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 4},
+        "server_configs": [
+            {
+                "name": "plain",
+                "speculative_config": {"decoding_type": "MTP"},
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            },
+            {
+                "name": "plain",
+                "tensor_parallel_size": 4,
+                "client_configs": [{"name": "con1", "concurrency": 1}],
+            },
+        ],
+    }
+    uploaded, error = perf_sanity_caller(
+        [
+            _ttft_history(s_runtime="multi_node_aggr_server", d_al=2.0, d_baseline_al=2.0),
+            _ttft_history(),
+        ],
+        config=config,
+    )
+    assert error is not None and len(uploaded) == 2
+    assert [row["s_test_case_name"] for row in uploaded] == ["plain-con1", "plain-con1"]
+    assert [row["s_runtime"] for row in uploaded] == ["multi_node_aggr_server", "aggr_server"]
+    assert [row["b_is_regression"] for row in uploaded] == [False, True]
+    assert all(_metric_comparison(row, "d_mean_ttft") == (125.0, 100.0) for row in uploaded)
+
+
+def test_ttft_caller_allows_offline_duplicate_names(
+    perf_sanity_caller: Callable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline measurements have no history identity to collide with or capacity query."""
+    monkeypatch.delenv("OPEN_SEARCH_DB_BASE_URL", raising=False)
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": [
+            {"name": "plain", "client_configs": [{"name": "con1", "concurrency": 1}]},
+            {"name": "plain", "client_configs": [{"name": "con1", "concurrency": 1}]},
+        ],
+    }
+    launches = []
+    timeouts = []
+    uploaded, error = perf_sanity_caller(
+        None, config=config, launches=launches, probe_timeouts=timeouts, expect_upload=False
+    )
+    assert error is None and not uploaded and not timeouts
+    assert len(launches) == 2 and launches[0][0] != launches[1][0]
+
+
+def test_ttft_caller_ignores_accuracy_only_history_keys(perf_sanity_caller: Callable) -> None:
+    """An accuracy-only client emits no performance row and cannot collide with one."""
+    config = {
+        "metadata": {"model_name": "latency-control"},
+        "hardware": {"gpus_per_node": 1},
+        "server_configs": [
+            {
+                "name": "plain",
+                "client_configs": [
+                    {
+                        "name": "con1",
+                        "concurrency": 1,
+                        "only_run_accuracy": True,
+                        "accuracy_config": {
+                            "enable_accuracy_test": True,
+                            "tasks": {"control-task": {}},
+                        },
+                    },
+                    {"name": "con1", "concurrency": 1},
+                ],
+            }
+        ],
+    }
+    uploaded, error = perf_sanity_caller([_ttft_history()], config=config)
+    assert error is not None and len(uploaded) == 1
+    assert uploaded[0]["s_test_case_name"] == "plain-con1"
+    assert uploaded[0]["b_is_regression"] is True
+    assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
+
+
+@pytest.mark.parametrize(
     "worker,hardware_gpus_per_node,should_gate",
     [
         pytest.param({"tensor_parallel_size": 8}, 4, False, id="tensor-multi-node"),
@@ -589,7 +726,10 @@ def test_ttft_caller_resolves_launch_topology(
         legacy_node_size = hardware_gpus_per_node or legacy_gpus
         runtime = "aggr_server" if legacy_gpus == legacy_node_size else "multi_node_aggr_server"
         uploaded, error = perf_sanity_caller(
-            [_ttft_history(s_runtime=runtime)], config=config, launches=launches
+            [_ttft_history(s_runtime=runtime)],
+            config=config,
+            launches=launches,
+            worker_device_count=lambda environment: 8 if hardware_gpus_per_node == 0 else 4,
         )
         assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
         assert uploaded[0]["b_is_regression"] is should_gate
@@ -619,8 +759,14 @@ def test_ttft_caller_uses_worker_node_size(perf_sanity_caller: Callable, tmp_pat
             }
         ],
     }
+
+    def unexpected_query(environment: dict[str, str]) -> int:
+        raise AssertionError("An explicit worker node size must not probe CUDA capacity")
+
     uploaded, error = perf_sanity_caller(
-        [_ttft_history(s_runtime="multi_node_aggr_server")], config=config
+        [_ttft_history(s_runtime="multi_node_aggr_server")],
+        config=config,
+        worker_device_count=unexpected_query,
     )
     assert _metric_comparison(uploaded[0], "d_mean_ttft") == pytest.approx((125.0, 100.0))
     assert uploaded[0]["l_gpus_per_node"] == 4
@@ -927,7 +1073,9 @@ def test_ttft_caller_respects_ray_node_capacity(
     assert error is None
 
 
-@pytest.mark.parametrize("prior_state", ["missing", "invalid", "nonpositive"])
+@pytest.mark.parametrize(
+    "prior_state", ["missing", "invalid", "nonpositive", "infinite", "negative-infinite", "nan"]
+)
 def test_ttft_caller_distinguishes_unknown_prior_with_complete_baselines(
     perf_sanity_caller: Callable, prior_state: str
 ) -> None:
@@ -942,7 +1090,13 @@ def test_ttft_caller_distinguishes_unknown_prior_with_complete_baselines(
     if prior_state == "missing":
         latest.pop("d_mean_ttft")
     else:
-        latest["d_mean_ttft"] = "not-a-number" if prior_state == "invalid" else 0.0
+        latest["d_mean_ttft"] = {
+            "invalid": "not-a-number",
+            "nonpositive": 0.0,
+            "infinite": "Infinity",
+            "negative-infinite": "-Infinity",
+            "nan": "NaN",
+        }[prior_state]
     older = _ttft_history(
         **{
             "@timestamp": "2026-01-01T00:00:00.000Z",

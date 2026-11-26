@@ -60,11 +60,24 @@ raises with the server's name and the underlying error rather than guessing capa
 Each server command receives a distinct worker file even when server names match;
 existing integer case names and topology fields retain their definitions.
 Changing or removing the source file after measurement does not change the
-verdict. Partially occupied nodes qualify even though their uploaded
-`s_runtime` is `multi_node_aggr_server`.
+verdict. Partially occupied nodes qualify, but their uploaded `s_runtime` depends
+on the reporting hints, not the probed capacity. They can be labeled
+`multi_node_aggr_server` when the reported GPU count and node size differ, or
+`aggr_server` when those hints match. With TP=4 specified inline in the perf YAML
+and no hardware or GPU-count hint, a worker that sees eight devices still reports
+four GPUs and a node size of four, so it uploads as `aggr_server`. Baseline
+matching retains this reporting label.
 Higher-concurrency, speculative and genuinely multi-node clients, disaggregated
 `e2e`/`gen_only`, and aggregated `ctx_only`/`gen_only_no_context` modes do not gain
 this gate. Selection is per client, including in mixed batches.
+
+Measured regular aggregated clients with a configured history endpoint must have
+distinct history identities: `s_test_case_name`, `s_gpu_type`, `s_runtime` and
+`s_branch`. The branch is shared within the batch. Collisions fail before worker
+launch with a request for distinct server or client names, rather than silently
+sharing or discarding a baseline. Unique names and reporting labels are not
+rewritten. Accuracy-only clients emit no performance row and are excluded from
+this check; offline and command-only callers do not require a history identity.
 
 Mean TTFT uses the matched case's baseline and configured pre-merge or post-merge
 tolerance (10% and 5% by default). Without a stored override, matched post-merge

@@ -109,9 +109,9 @@ not an unconditional guarantee about its branch.
   cannot excuse throughput, and throughput alone cannot excuse TTFT.
 - A row is exempt only when both its independent losses and any grouped losses
   qualify. With no independent gates, this is the **whole-case exemption**.
-- Anything unusable in that record — metric absent, null, non-numeric, or
-  non-positive — cannot supply a qualifying miss for that metric. Other usable
-  matched metrics still follow the independent/grouped rule above. Diagnostics
+- Anything unusable in that record — metric absent, null, non-numeric,
+  non-positive or non-finite — cannot supply a qualifying miss for that metric.
+  Other usable matched metrics still follow the independent/grouped rule above. Diagnostics
   distinguish known new misses from misses whose prior value is unknown; an
   unusable prior value is not evidence that a loss is new. The prior-miss list
   covers only metrics compared in the current run, not absent current measurements.

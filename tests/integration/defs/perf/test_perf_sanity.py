@@ -5639,6 +5639,39 @@ class PerfSanityTestConfig:
         else:
             return self._get_disagg_commands(self._output_dir, self.test_output_dir)
 
+    def _aggr_result_identity(
+        self, server_config: ServerConfig, client_config: ClientConfig
+    ) -> dict[str, str]:
+        """Aggregated history fields; the job branch is shared by the batch."""
+        return {
+            "s_gpu_type": self.gpu_type,
+            "s_runtime": "multi_node_aggr_server"
+            if server_config.gpus != server_config.gpus_per_node
+            else "aggr_server",
+            "s_test_case_name": f"{server_config.name}-{client_config.name}",
+        }
+
+    def _validate_aggr_history_identities(self) -> None:
+        """Reject ambiguous measured rows without renaming existing history keys."""
+        identities: dict[tuple[str, ...], tuple[int, int]] = {}
+        match_keys = [key for key in get_test_case_match_keys() if key != "s_branch"]
+        for server_idx, client_configs in self.server_client_configs.items():
+            server_config = self.server_configs[server_idx]
+            for client_idx, client_config in enumerate(client_configs):
+                if client_config.only_run_accuracy:
+                    continue
+                identity = self._aggr_result_identity(server_config, client_config)
+                history_key = tuple(identity[key] for key in match_keys)
+                previous = identities.get(history_key)
+                if previous is not None:
+                    first_server_idx, first_client_idx = previous
+                    raise ValueError(
+                        f"Duplicate aggregated performance history key {identity!r} for "
+                        f"server {first_server_idx}, client {first_client_idx} and "
+                        f"server {server_idx}, client {client_idx}; use distinct server or client names."
+                    )
+                identities[history_key] = (server_idx, client_idx)
+
     def _get_aggr_commands(
         self, output_dir: str, test_output_dir: str, *, collect_ttft_eligibility: bool = False
     ) -> AggrTestCmds:
@@ -5646,6 +5679,13 @@ class PerfSanityTestConfig:
         server_cmds = []
         client_cmds = {}
         self._ttft_eligible_server_idxs = set()
+        collect_ttft_eligibility = (
+            collect_ttft_eligibility
+            and bool(os.environ.get("OPEN_SEARCH_DB_BASE_URL"))
+            and self.benchmark_mode is None
+        )
+        if collect_ttft_eligibility:
+            self._validate_aggr_history_identities()
 
         for server_idx, client_configs in self.server_client_configs.items():
             server_config = self.server_configs[server_idx]
@@ -5660,14 +5700,9 @@ class PerfSanityTestConfig:
                 config_file.write(config_content)
             server_cmd = server_config.to_cmd(test_output_dir, config_path=config_path)
 
-            if (
-                collect_ttft_eligibility
-                and os.environ.get("OPEN_SEARCH_DB_BASE_URL")
-                and self.benchmark_mode is None
-                and any(
-                    client.concurrency == 1 and not client.only_run_accuracy
-                    for client in client_configs
-                )
+            if collect_ttft_eligibility and any(
+                client.concurrency == 1 and not client.only_run_accuracy
+                for client in client_configs
             ):
                 rendered_config = yaml.safe_load(config_content) or {}
                 if not (rendered_config.get("speculative_config") or {}).get(
@@ -6234,18 +6269,10 @@ class PerfSanityTestConfig:
                         cmd_idx += 1
                         continue
 
-                    new_data = {
-                        "s_gpu_type": self.gpu_type,
-                        "s_runtime": "multi_node_aggr_server"
-                        if server_config.gpus != server_config.gpus_per_node
-                        else "aggr_server",
-                    }
+                    new_data = self._aggr_result_identity(server_config, client_config)
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
                     new_data["l_warmup_pass_requests"] = warmup_plan[client_idx]
-                    # Add test_case_name for convenient filtering on OpenSearch
-                    new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
-
                     add_perf_metric_value(
                         new_data,
                         server_perf_results[client_idx],
