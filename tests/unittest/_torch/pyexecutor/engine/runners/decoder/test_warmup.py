@@ -892,7 +892,9 @@ def test_autotuner_warmup_prepares_dynamic_moe_graph_tactic(
         _forward_warmup=forward,
     )
     resources = SimpleNamespace(
-        get_resource_manager=lambda key: SimpleNamespace(get_num_available_tokens=lambda **_: 4096)
+        get_resource_manager=lambda key: SimpleNamespace(
+            is_context_only_cache=False, get_num_available_tokens=lambda **_: 4096
+        )
     )
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
