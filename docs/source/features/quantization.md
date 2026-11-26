@@ -234,10 +234,21 @@ The language component decides which quantization methods are supported by a giv
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
 | Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
 | Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
-| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
+| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   | Y[^rubin-nvfp4-kv] |     Y     |     Y     |     Y      |     Y      |
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |
+
+[^rubin-nvfp4-kv]: On SM107, NVFP4 KV cache is retained for dense FP4 MLA with
+    the TRTLLM attention backend, DSA with a non-mixed KV-cache dtype, MiniMax-M3
+    MSA sparse layers, and modeling-v2 targets that explicitly support NVFP4 KV
+    cache (such as GLM-5.2). MiniMax-M3 MSA dense and draft layers use FP8.
+    Other attention configurations, including standard-attention
+    LLaMA-v2, LLaMA 3 and Qwen-3, fall back to FP8 KV cache with a warning at load.
+    A `mixed_*` dtype is rejected by this SM107 guard only when its effective
+    mapped quantization remains NVFP4 and none of the supported paths applies,
+    as with `mixed_nvfp4_*` on DSA. For ordinary dense models,
+    `mixed_nvfp4_fp8` maps to FP8 for this check and does not trigger that rejection.
 
 ```{note}
 FP8 block wise scaling GEMM kernels for sm100/103/107 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).

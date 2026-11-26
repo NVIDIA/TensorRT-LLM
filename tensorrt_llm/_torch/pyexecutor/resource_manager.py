@@ -20,8 +20,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Optional,
+                    Sequence, Set, Tuple, Union, overload)
 
 import torch
 
@@ -163,17 +163,18 @@ class ResourceManagerType(enum.Enum):
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
-def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
+def is_context_only_kv_cache(
+        kv_cache_manager: "KVCacheManager | KVCacheManagerV2 | None") -> bool:
     """Whether a KV cache manager can serve context requests only.
 
     A disaggregated context worker may omit generation-only cache state: the
     KDA draft-verification buffers (``kda_context_only``) or the FP4 MLA V
     scales and packed V (``fp4_mla_context_only_cache``). Such a worker
-    cannot run a generation row, including a warmup or padding dummy.
+    cannot run a generation row, including a warmup or padding dummy. A CSA2
+    cache pruned for a context worker is not reported here; it carries
+    ``context_swa_layer_limit``.
     """
-    return (getattr(kv_cache_manager, "kda_context_only", False) is True
-            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
-                       False) is True)
+    return kv_cache_manager is not None and kv_cache_manager.is_context_only_cache is True
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -211,6 +212,9 @@ def _merge_kv_cache_pool_pointers(
 
 
 class BaseResourceManager(ABC):
+    # A cache that omits generation-only state overrides this; see
+    # is_context_only_kv_cache.
+    is_context_only_cache: bool = False
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
@@ -246,6 +250,13 @@ class BaseResourceManager(ABC):
 
     def add_dummy_requests(self, request_ids: List[int]):
         pass
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: list[LlmRequest]) -> None:
+        """Prepare optional snapshot boundaries before scheduling."""
+
+    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
+        """Notify optional state owners after a disaggregated transfer."""
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -3205,6 +3216,17 @@ class ResourceManager:
     def register_resource_manager(self, type: ResourceManagerType,
                                   resource_manager: BaseResourceManager):
         self.resource_managers[type] = resource_manager
+
+    @overload
+    def get_resource_manager(
+        self, type: Literal[ResourceManagerType.KV_CACHE_MANAGER]
+    ) -> "KVCacheManager | KVCacheManagerV2 | None":
+        ...
+
+    @overload
+    def get_resource_manager(
+            self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
+        ...
 
     def get_resource_manager(
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
