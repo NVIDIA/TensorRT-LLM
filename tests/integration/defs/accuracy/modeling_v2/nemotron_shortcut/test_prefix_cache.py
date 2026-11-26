@@ -58,3 +58,50 @@ def test_chunked_prefix_resume(model_root, precision, mtp, record_property):
         assert answers[0] != answers[1]
         if mtp:
             assert accepted > 0, "Neither warm request accepted any draft tokens"
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("precision", ["bf16", "nvfp4"])
+def test_host_cache_round_trip(model_root, precision, record_property):
+    with shortcut_text_engine(
+        model_root / precision,
+        max_batch_size=1,
+        max_seq_len=2048,
+        max_num_tokens=256,
+        enable_chunked_prefill=True,
+        enable_iter_perf_stats=True,
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            max_tokens=2048,
+            host_cache_size=4 << 30,
+            cold_tier_offload_min_priority=0,
+            mamba_state_config={"additional_snapshot_offsets_from_end": [1]},
+        ),
+    ) as llm:
+        sampling = SamplingParams(temperature=0, max_tokens=8)
+        prompt = "Paris is the capital in this record." + " An unrelated note." * 160
+        prompt += "\nName the capital in the record:"
+        cold = llm.generate(prompt, sampling)
+        llm.get_stats(timeout=2)
+        offloaded = 0
+        for word in ("blue", "red", "green", "yellow", "white", "orange", "purple", "gold"):
+            llm.generate((word + " ") * 900, sampling)
+            for iteration in llm.get_stats(timeout=2):
+                for pool in iteration.get("kvCacheIterationStatsByPoolGroup", {}).values():
+                    offloaded += pool["iterOffloadBytes"]
+            if offloaded:
+                break
+        assert offloaded > 0, "No cached pages moved to the host under pressure"
+        restored = llm.generate(prompt, sampling)
+        onboarded = sum(
+            pool["iterOnboardBytes"]
+            for iteration in llm.get_stats(timeout=2)
+            for pool in iteration.get("kvCacheIterationStatsByPoolGroup", {}).values()
+        )
+        assert onboarded > 0, "The repeated request did not read any host-resident pages"
+        assert restored.cached_tokens > 0
+        assert list(restored.outputs[0].token_ids) == list(cold.outputs[0].token_ids)
+        record_property("offloaded_bytes", offloaded)
+        record_property("onboarded_bytes", onboarded)
+        record_property("restored_cache_tokens", restored.cached_tokens)
