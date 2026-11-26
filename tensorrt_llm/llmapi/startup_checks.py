@@ -179,6 +179,12 @@ def check_architecture_registered(
 
     if any(is_model_arch_known(arch) for arch in architectures):
         return
+    if llm_args.modeling_v2 != "off":
+        from tensorrt_llm._torch.modeling_v2._router_index import registered_routes
+
+        # Workers resolve the first architecture against their device and configuration.
+        if architectures[0] in registered_routes():
+            return
     raise UnsupportedError(
         f"Unknown model architecture: {architectures[0]}. TensorRT-LLM has no "
         f"implementation registered for the checkpoint's architectures {architectures}.",

@@ -415,6 +415,18 @@ def get_kv_cache_manager_cls(
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
 
+        if config_utils.is_nemotron_shortcut(config):
+            if not use_v2:
+                raise ValueError(
+                    "Nemotron Shortcut GDP and sparse index state require KV cache manager V2."
+                )
+            if is_disagg:
+                raise ValueError("Disaggregated state transfer is unavailable for this decoder.")
+            _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
+            from ..modules.nemotron_shortcut.cache_manager import \
+                NemotronShortcutCacheManager
+            return NemotronShortcutCacheManager
+
         if config_utils.is_glm5_next(config):
             # glm5_next indexer state is a V2 extra buffer: reject any knob
             # that would select a non-V2 manager.
@@ -5076,7 +5088,8 @@ def _create_kv_cache_manager(
             is_disagg=is_disagg,
             **manager_extra_kwargs,
         )
-    elif is_nemotron_hybrid(config):
+    elif is_nemotron_hybrid(config) or config_utils.is_nemotron_shortcut(
+            config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")

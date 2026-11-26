@@ -63,7 +63,7 @@ from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
-                           resolve_auto_ssm_cache_dtype,
+                           is_nemotron_shortcut, resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
 
@@ -1337,6 +1337,10 @@ class ModelLoader:
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        # The V2 target is routed later. Its GDP and index pages already require V2.
+        if original_kv_cache_manager_setting == "auto" and is_nemotron_shortcut(
+                config.pretrained_config):
+            llm_args.kv_cache_config.use_kv_cache_manager_v2 = True
         if (original_kv_cache_manager_setting == "auto" and
             (llm_args.kv_cache_config.dtype == "nvfp4" or
              (llm_args.kv_cache_config.dtype == "auto"

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 import torch
 import transformers
 
+from tensorrt_llm._torch.configs.nemotron_shortcut import (
+    NemotronShortcutConfig, NemotronShortcutTextConfig)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
@@ -181,7 +183,21 @@ def dspark_layer_window_size(use_swa: bool, swa_window: int,
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
+        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config) or \
+        is_nemotron_shortcut(config)
+
+
+def is_nemotron_shortcut(config):
+    model_type = getattr(config, "model_type", None)
+    return model_type in (NemotronShortcutConfig.model_type,
+                          NemotronShortcutTextConfig.model_type)
+
+
+def get_nemotron_shortcut_layer_masks(config):
+    """The two cache masks exclude plain MLP blocks."""
+    text = getattr(config, "text_config", None) or config
+    return ([kind == "full_attention" for kind in text.layer_types],
+            [kind == "linear_attention" for kind in text.layer_types])
 
 
 def is_kimi_linear(config):
@@ -372,6 +388,9 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
         from ..modules.kimi_kda.cache_manager import \
             resolve_kimi_ssm_cache_dtype
         return resolve_kimi_ssm_cache_dtype(config)
+    if is_nemotron_shortcut(config):
+        # GDP accumulates its recurrent state in FP32 even with quantized weights.
+        return resolve_ssm_cache_dtype(config) or torch.float32
     return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
             or fallback)
 
@@ -665,6 +684,9 @@ def extract_mamba_kv_cache_params(config,
             get_nemotron_cache_params as extract
     elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         from ..modules.fla.cache_manager import get_gdn_cache_params as extract
+    elif is_nemotron_shortcut(config):
+        from ..modules.nemotron_shortcut.cache_manager import \
+            get_nemotron_shortcut_cache_params as extract
     elif is_kimi_linear(config):
         from ..modules.kimi_kda.cache_manager import \
             get_kimi_cache_params as extract
@@ -1133,6 +1155,21 @@ def load_pretrained_config(model_name_or_path: str,
             f"qwen3 with target_layer_ids "
             f"{translated['dflash_config']['target_layer_ids']} "
             f"(aux_hidden_state_layer_ids - 1) and no sliding window")
+    elif model_type in (NemotronShortcutConfig.model_type,
+                        NemotronShortcutTextConfig.model_type):
+        # The decoder uses the same config for dense and quantized weights.
+        text_dict = (config_dict["text_config"] if model_type
+                     == NemotronShortcutConfig.model_type else config_dict)
+        model_config = NemotronShortcutTextConfig.from_dict(text_dict, **kwargs)
+        model_config.architectures = [
+            NemotronShortcutTextConfig.causal_lm_architecture
+        ]
+        if model_config.dtype is None:
+            model_config.dtype = _resolve_composite_torch_dtype(config_dict)
+        if (getattr(model_config, "quantization_config", None) is None
+                and "quantization_config" in config_dict):
+            model_config.quantization_config = config_dict[
+                "quantization_config"]
     elif model_type in ("glm5_next", "glm5_next_text"):
         from tensorrt_llm._torch import configs
         config_name = ("Glm5NextConfig"

@@ -34,9 +34,10 @@ from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
-    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
-    is_qwen4_exp, load_pretrained_config)
+    get_kimi_linear_num_attention_layers, get_nemotron_shortcut_layer_masks,
+    get_qwen3_hybrid_num_attention_layers, is_glm5_next, is_kimi_linear,
+    is_nemotron_hybrid, is_nemotron_shortcut, is_qwen3_hybrid, is_qwen4_exp,
+    load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -2423,6 +2424,9 @@ class ModelConfig(Generic[TConfig]):
             return get_kimi_linear_num_attention_layers(cfg)
         if is_glm5_next(cfg):
             return get_glm5_next_num_attention_layers(cfg)
+        if is_nemotron_shortcut(cfg):
+            # Only full-attention blocks allocate attention KV pages.
+            return sum(get_nemotron_shortcut_layer_masks(cfg)[0])
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -2441,6 +2445,8 @@ class ModelConfig(Generic[TConfig]):
             # carry num_hidden_layers at the top level before normalization.
             _, kda_mask = get_glm5_next_layer_masks(cfg)
             return sum(kda_mask)
+        if is_nemotron_shortcut(cfg):
+            return sum(get_nemotron_shortcut_layer_masks(cfg)[1])
         return 0
 
 
