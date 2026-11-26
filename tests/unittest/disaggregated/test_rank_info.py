@@ -77,6 +77,30 @@ def test_rank_info_msgpack_roundtrip(bounded_replay_on_generation: bool) -> None
     assert restored.bounded_replay_on_generation is bounded_replay_on_generation
 
 
+@pytest.mark.parametrize("exponent", [None, 0, -3, 2])
+def test_rank_info_carries_csa2_swa_fp8_scale_exponent(exponent) -> None:
+    """The CSA2 swa_fp8 storage-scale exponent reaches the peer.
+
+    A cache without swa_fp8 rows keeps the wire shape of peers that predate the field.
+    """
+    ri = RankInfo(
+        instance_name="ctx_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[4],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+        swa_fp8_scale_exponent=exponent,
+    )
+    data = ri.to_bytes()
+    assert ("swa_fp8_scale_exponent" in msgpack.unpackb(data)) == (exponent is not None)
+    assert RankInfo.from_bytes(data).swa_fp8_scale_exponent == exponent
+
+
 def test_rank_info_roundtrip_with_aux_meta():
     meta = AuxBufferMeta(
         ptrs=np.array([0x4000, 0x5000], dtype=np.int64),

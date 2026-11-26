@@ -822,6 +822,46 @@ def test_view_validation_allows_nonoverlapping_pp_stage() -> None:
 
 
 @pytest.mark.parametrize(
+    ("local_exponent", "peer_exponent", "error"),
+    [
+        (None, None, None),
+        (0, 0, None),
+        (2, 2, None),
+        (0, 2, "TRTLLM_CSA2_SWA_FP8_AMAX"),
+        (-3, 0, "TRTLLM_CSA2_SWA_FP8_AMAX"),
+        # Scaled records on one side differ in row size instead (test_csa2_kv_transfer.py).
+        (None, 0, None),
+    ],
+)
+def test_peer_registrar_requires_one_csa2_swa_fp8_scale(local_exponent, peer_exponent, error):
+    """A peer storing CSA2 swa_fp8 SWA rows at another storage scale is rejected.
+
+    The rows carry no scale, so both peers must store them at the same power-of-two exponent.
+    """
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.swa_fp8_scale_exponent = local_exponent
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.swa_fp8_scale_exponent = peer_exponent
+    if error is None:
+        reg.validate_swa_scale_compatible(peer_ri)
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        assert reg.get_peer_rank_info("peer", 1) == peer_ri
+        return
+    with pytest.raises(ValueError, match=error):
+        reg.validate_swa_scale_compatible(peer_ri)
+    with pytest.raises(ValueError, match=error):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    with pytest.raises(KeyError):
+        reg.get_peer_rank_info("peer", 1)
+
+
+@pytest.mark.parametrize(
     ("local_replay", "peer_replay"),
     [(False, False), (True, True), (False, True), (True, False)],
 )

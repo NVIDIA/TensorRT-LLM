@@ -88,6 +88,9 @@ class RankInfo:
     # compares global KV heads; their views reshard like the target's at any
     # attention TP.
     draft_layers_reshard_across_tp: bool = False
+    # Storage-scale exponent of a CSA2 cache's swa_fp8 SWA rows (TRTLLM_CSA2_SWA_FP8_AMAX), which
+    # both peers must share; None for caches without them.
+    swa_fp8_scale_exponent: Optional[int] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -106,6 +109,9 @@ class RankInfo:
         if not self.draft_layers_reshard_across_tp:
             # Only a hosting manager's peers need the field.
             data.pop("draft_layers_reshard_across_tp")
+        if self.swa_fp8_scale_exponent is None:
+            # Preserve the wire shape for peers without CSA2 swa_fp8 rows.
+            data.pop("swa_fp8_scale_exponent")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -175,6 +181,7 @@ class RankInfo:
             draft_kv_dtype=draft_kv_dtype,
             draft_layers_reshard_across_tp=shares_draft_layers
             and getattr(kvm, "hosts_unified_draft_layers", False),
+            swa_fp8_scale_exponent=getattr(kvm, "swa_fp8_scale_exponent", None),
         )
 
     @classmethod

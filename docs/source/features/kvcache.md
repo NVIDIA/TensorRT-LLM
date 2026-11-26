@@ -395,7 +395,8 @@ This choice does not change the NVFP4 MAIN cache or INDEX layout. Attention
 compute/staging precision and MXFP8 projection quantization are independent of
 the persistent SWA encoding. Disaggregated context and generation instances must
 use matching SWA layouts; transfers do not convert between them, and a peer whose
-layout differs is rejected when it registers.
+layout differs is rejected when it registers. With `fp8`, they must also share the
+storage scale: a peer with another `TRTLLM_CSA2_SWA_FP8_AMAX` exponent is rejected too.
 
 ### Enable Offloading to Host Memory
 

@@ -59,7 +59,7 @@ from .....configs.deepseek_v41 import (
     encoder_replay_enabled,
 )
 from .page_table_bounds import PageTableBounds
-from .params import CSA2Layout, SwaCacheFormat, resolve_swa_cache_format
+from .params import CSA2Layout, SwaCacheFormat, resolve_swa_cache_format, swa_fp8_scale_exponent
 from .quantization import (
     INDEX_DATA_BYTES,
     INDEX_PAGE_ROWS,
@@ -1706,6 +1706,13 @@ class CSA2CacheManager(KVCacheManagerV2):
                 width,
                 (dst_tensor.data_ptr(), dst_tensor.shape, dst_tensor.stride()),
             )
+
+    @property
+    def swa_fp8_scale_exponent(self) -> int | None:
+        """Storage-scale exponent ``e`` of this cache's swa_fp8 SWA rows, which hold
+        E4M3(x / 2**e) and carry no scale (``TRTLLM_CSA2_SWA_FP8_AMAX``), so every process that
+        reads them, such as a disaggregated peer, needs the same one; None for scaled records."""
+        return swa_fp8_scale_exponent() if self.swa_cache_format == "swa_fp8" else None
 
     @property
     def blocks_in_primary_pool(self):

@@ -390,8 +390,9 @@ SM100/103/107. `fp8` and `fp8_ds_mla` are different formats:
 To serve DeepSeek-V4.1 on the native provider with per-group SWA scales, use
 `dtype: fp8_ds_mla`. `TRTLLM_CSA2_COMPUTE_BACKEND=trtllm` or `prims_ts` overrides
 the default provider for any dtype; PrimTS reads both SWA records. Context and
-generation instances of a disaggregated deployment must use the same dtype: a
-peer whose SWA records differ is rejected when it registers.
+generation instances of a disaggregated deployment must use the same dtype, and with
+`fp8` the same `TRTLLM_CSA2_SWA_FP8_AMAX` storage scale: a peer whose SWA records differ
+is rejected when it registers.
 
 Candidate-consumer layers (index-source layers after the checkpoint's
 `candidate_source_layer_id`; the released checkpoint has them) score their

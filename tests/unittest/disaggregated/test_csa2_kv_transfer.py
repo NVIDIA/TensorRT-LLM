@@ -212,18 +212,11 @@ def test_csa2_transfer_rejects_mismatched_swa_layout(local_dtype, peer_dtype):
         peer = RankInfo.from_bytes(peer.to_bytes())
         assert local.page_table is not None
         registrar = PeerRegistrar(local, KVRegionExtractorV1(local.page_table))
-        registrar.register(peer.instance_name, peer.instance_rank, peer)
-        rejected = 0
-        for local_key, peer_key in registrar.get_pool_mapping(peer).items():
-            group, pool = local_key
-            view = local.page_table.layer_groups[group].pool_views[pool]
-            if str(CSA2CacheRole.SWA.role) in view.pool_role:
-                with pytest.raises(ValueError, match="Replicated cache region size mismatch"):
-                    registrar.get_kv_map(peer, local_key, peer_key)
-                rejected += 1
-            else:
-                registrar.get_kv_map(peer, local_key, peer_key)
-        assert rejected > 0
+        # The SWA records of the two dtypes differ in size, so the peer is rejected when it
+        # registers, before any request is admitted.
+        with pytest.raises(ValueError, match=r"replicated view .* kv_cache_config\.dtype") as error:
+            registrar.register(peer.instance_name, peer.instance_rank, peer)
+        assert str(CSA2CacheRole.SWA.role) in str(error.value)
     finally:
         for manager in managers:
             manager.shutdown()
