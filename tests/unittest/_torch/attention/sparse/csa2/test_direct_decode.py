@@ -6,6 +6,7 @@ backend's choice between it and the staged FP8 path."""
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import direct_decode
 from tensorrt_llm._torch.attention.backends.sparse.csa2.direct_decode import direct_sparse_decode
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows, unpack_rows
 
@@ -24,7 +25,7 @@ def reference_sparse_decode(
     """FP32 dense reference of ``direct_sparse_decode`` (exactly decoded rows, FP32 softmax)."""
     rows = q.shape[0]
     parts, masks = [], []
-    sources = [(swa_pool, swa_indices, "swa")]
+    sources = [(swa_pool, swa_indices, "swa_fp8" if swa_pool.shape[1] == 512 else "swa")]
     if main_indices is not None and main_indices.shape[1] > 0:
         slots = main_indices.long()
         if main_mapping is not None:
@@ -63,9 +64,9 @@ def reference_sparse_decode(
     return torch.einsum("qhk,qkd->qhd", probabilities, kv).bfloat16()
 
 
-def _pools(swa_slots=300, main_slots=2048, seed=0, main_stride=356):
+def _pools(swa_slots=300, main_slots=2048, seed=0, main_stride=356, swa_format="swa"):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    swa = pack_rows(torch.randn(swa_slots, 512, device="cuda", generator=g) * 2, "swa")
+    swa = pack_rows(torch.randn(swa_slots, 512, device="cuda", generator=g) * 2, swa_format)
     # The main cache is a strided view of its page group (main and index records interleaved).
     owner = torch.empty(main_slots, main_stride, device="cuda", dtype=torch.uint8)
     main = owner[:, :288]
@@ -127,9 +128,11 @@ def _assert_close_to_fp32(actual, expected):
 
 # 8 query heads per rank (TP8) run as a zero-padded 16-head MMA tile.
 @pytest.mark.parametrize("main_width,heads,rows", [(512, 8, 16), (512, 64, 6), (0, 64, 2)])
+# Scaled 528-byte SWA records and unit-scale 512-byte E4M3 records (``kv_cache_config.dtype="fp8"``).
+@pytest.mark.parametrize("swa_format", ["swa", "swa_fp8"])
 @torch.inference_mode()
-def test_matches_fp32_reference(rows, heads, main_width):
-    case = _case(rows, heads, 128, main_width, mapped=main_width > 0)
+def test_matches_fp32_reference(rows, heads, main_width, swa_format):
+    case = _case(rows, heads, 128, main_width, mapped=main_width > 0, swa_format=swa_format)
     si, mi = case[2], case[4]
     # A row without valid keys attends only the sink: zeros.
     si[-1] = -1
@@ -150,6 +153,65 @@ def test_matches_fp32_reference(rows, heads, main_width):
     torch.ops.trtllm.mla_rope_inplace(roped, positions, cos_sin, heads, 448, 64, False, False)
     expected = _run((roped, *case[1:]))
     assert torch.equal(_bits(_run(case, query_rope=(positions, cos_sin))), _bits(expected))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100/SM103 small-M O-A",
+)
+@pytest.mark.parametrize("rows,heads", [(6, 8)])
+@torch.inference_mode()
+def test_output_rotated_back_gives_the_o_a_latent_bitwise(rows, heads):
+    """The output rotated back in the launch gives the small-M O-A without inverse RoPE the latent
+    of the O-A that rotates on load, bit for bit, eagerly and in graph replays."""
+    from tensorrt_llm._torch.modules.low_m_gemm import fp8_grouped_lowm, lowm_tiles
+
+    case = _case(rows, heads, 128, 512, mapped=True, seed=rows + heads)
+    q = case[0]
+    g = torch.Generator(device="cuda").manual_seed(rows * heads)
+    positions = torch.randint(0, 4096, (rows,), device="cuda", generator=g, dtype=torch.int32)
+    angle = torch.rand(4096, 32, device="cuda", generator=g) * 6.2831853
+    cos_sin = torch.cat((angle.cos(), angle.sin()), 1).view(4096, 2, 32)
+    groups, rank, depth = heads // 8, 1024, 8 * 512
+    # Latent row r of a group passes one channel of head (r % 512) // 64: RoPE ones below 512.
+    r = torch.arange(rank, device="cuda")
+    head = (r % 512) // 64
+    column = torch.where(r < 512, head * 512 + 448 + r % 64, head * 512 + (r % 64) * 7)
+    weight = torch.zeros(groups * rank, depth, device="cuda")
+    weight[torch.arange(groups * rank, device="cuda"), column.repeat(groups)] = 1.0
+    weight = weight.to(torch.float8_e4m3fn)
+    scale = torch.ones(groups * rank // 128, depth // 128, device="cuda")
+    tiles = lowm_tiles(groups * rank, rows, rank)
+
+    def project(rotated_back):
+        out = _run(case, query_rope=(positions, cos_sin), output_rope=rotated_back)
+        latent = fp8_grouped_lowm(
+            out.view(rows, -1),
+            weight,
+            scale,
+            rank,
+            inverse_rope=None if rotated_back else (positions, cos_sin, 512),
+            n_tiles=tiles,
+        )
+        return out, latent
+
+    def check(rotated, plain):
+        assert torch.equal(_bits(rotated[0][..., :448]), _bits(plain[0][..., :448]))
+        assert torch.equal(_bits(rotated[1]), _bits(plain[1]))
+
+    check(project(True), project(False))
+    graphs, captured = [], []
+    for rotated_back in (True, False):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured.append(project(rotated_back))
+        graphs.append(graph)
+    for trial in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * (trial + 1)).to(torch.bfloat16))
+        positions.random_(0, 4096, generator=g)
+        for graph in graphs:
+            graph.replay()
+        check(*captured)
 
 
 @pytest.mark.parametrize("rows", [12])
@@ -192,8 +254,8 @@ def _backend(heads, layout=None, layer_idx=20):
         qk_rope_head_dim=64,
         v_head_dim=512,
         rope_append=False,
-        sparse_params=CSA2Params(layout=layout),
-        kv_cache_dtype="fp8",
+        sparse_params=CSA2Params(layout=layout, compute_backend="trtllm"),
+        kv_cache_dtype="fp8_ds_mla",
     )
 
 
@@ -305,3 +367,91 @@ def test_exported_slots_replace_the_mapping_bitwise(rows, heads):
     assert torch.equal(_bits(_run(case, slots_out=slots)), out)
     assert torch.equal(slots, _reference_slots(mi, mapping))
     assert torch.equal(_bits(_run((q, swa, si, main, slots, sink, None))), out)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100/SM103 keys-as-M attention",
+)
+@torch.inference_mode()
+def test_exported_main_rows_replace_the_decode_bitwise():
+    """An index source storing its decoded main rows is unchanged, and a Reuse launch loading them
+    equals the one decoding them from the exported slots, eagerly and in graph replays."""
+    rows = 6
+    case = _case(rows, 8, 128, 512, mapped=True, seed=46)
+    q, swa, si, main, mi, sink, mapping = case
+    image = direct_decode.main_rows_bytes(8, 128, 512, q.device)
+    slots = torch.empty(rows, 512, dtype=torch.int64, device="cuda")
+    main_rows = torch.full((rows, image), 0xFF, dtype=torch.uint8, device="cuda")
+    outputs = [torch.empty_like(q) for _ in range(4)]
+    reuse = (q, swa, si, main, slots, sink, None)
+
+    def forward():
+        _run(case, output=outputs[0])
+        _run(case, output=outputs[1], slots_out=slots, rows_out=main_rows)
+        # main_ready: the launch before a Reuse decode starts only once the source completed.
+        slots.add_(0)
+        _run(reuse, output=outputs[2], main_ready=True)
+        _run(reuse, output=outputs[3], main_ready=True, rows_in=main_rows)
+
+    def check():
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(outputs[1]), _bits(outputs[0]))
+        assert torch.equal(_bits(outputs[3]), _bits(outputs[2]))
+        _assert_close_to_fp32(outputs[3], _reference(case))
+
+    forward()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for trial in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * (trial + 1) * 0.5).to(torch.bfloat16))
+        mi.copy_(mi.flip(1))
+        graph.replay()
+        check()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SM100/SM103 keys-as-M attention",
+)
+@pytest.mark.parametrize("selection", ["mapped"])
+@torch.inference_mode()
+def test_keys_as_m_attention_matches_the_two_part_launch(monkeypatch, selection):
+    """At 8 heads per rank the keys-as-M attention matches the FP32 reference as the two-part launch
+    does, eagerly and in graph replays; a row without valid keys outputs zeros."""
+    main_width = 0 if selection == "swa" else 512
+    case = _case(6, 8, 128, main_width, mapped=selection == "mapped", seed=76)
+    q, swa, si, main, mi, sink, mapping = case
+    si[-1] = -1
+    if mi is not None:
+        mi[-1] = -1
+    with monkeypatch.context() as patch:
+        patch.setattr(direct_decode, "_v2_engaged", lambda *args: False)
+        two_part = _run(case).clone()
+    output = torch.empty_like(q)
+    _run(case, output=output)
+    _assert_close_to_fp32(output, _reference(case))
+    _assert_close_to_fp32(output, two_part)
+    assert torch.count_nonzero(output[-1]) == 0
+    # A Reuse layer's launch (main rows promised before the dependent wait) gives the same bits.
+    ready = torch.empty_like(q)
+    if main_width:
+        _run(case, output=ready, main_ready=True)
+        assert torch.equal(_bits(ready), _bits(output))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(case, output=output)
+        if main_width:
+            _run(case, output=ready, main_ready=True)
+    for trial in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * (trial + 1) * 0.5).to(torch.bfloat16))
+        si.copy_(si.roll(1, 0))
+        if mi is not None:
+            mi.copy_(mi.flip(1))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_close_to_fp32(output, _reference(case))
+        if main_width:
+            assert torch.equal(_bits(ready), _bits(output))

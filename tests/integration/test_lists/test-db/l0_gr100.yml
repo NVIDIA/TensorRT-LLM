@@ -117,6 +117,11 @@ l0_gr100:
   - unittest/_torch/attention/sparse/csa2/test_query_projection.py
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_topk_opt_in_native_and_graph
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_packed_prefill_logits_schedule_matches_grid_stride
+  # CSA2 PrimTS, the SM107 default provider: its producer, gather and NVFP4 MAIN kernels,
+  # and the backend and module paths that select it.
+  - unittest/_torch/attention/sparse/csa2/test_prims_ts_fp8_producer.py
+  - unittest/_torch/attention/sparse/csa2/test_backend.py -k "prims_ts"
+  - unittest/_torch/attention/sparse/csa2/test_module.py -k "prims_ts"
   - unittest/_torch/kernels/parallel/test_gvr_selfsampling_topk.py TIMEOUT (90)
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_prefill_linear_matches_reference
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_o_b_loaded_tactic_graph

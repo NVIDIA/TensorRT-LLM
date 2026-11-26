@@ -11,6 +11,8 @@ failures. By default the rank retries missing kernels during local planning.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import math
 import os
@@ -21,7 +23,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 from tensorrt_llm.logger import logger
 
@@ -33,6 +35,26 @@ _MAX_DEFAULT_WORKERS = 4
 _DEFAULT_TIMEOUT = 1800
 _HOST_COMPILE_BUDGET = 16  # default workers of all ranks on one host, together
 _LOCAL_RANK_ENV = ("OMPI_COMM_WORLD_LOCAL_SIZE", "RAY_LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE")
+
+
+_WARMUP_WORKERS = contextvars.ContextVar("prims_ts_warmup_workers", default=False)
+
+
+@contextlib.contextmanager
+def warmup_workers():
+    """Let first plans run within this scope (the executor's warmup) compile the PrimTS kernels
+    they lack in the worker pool (``in_warmup``)."""
+    token = _WARMUP_WORKERS.set(True)
+    try:
+        yield
+    finally:
+        _WARMUP_WORKERS.reset(token)
+
+
+def in_warmup() -> bool:
+    """Whether the executor's warmup runs (``warmup_workers``): only then does a first plan start a
+    worker pool for the kernels it lacks, which later first plans and unit tests compile locally."""
+    return _WARMUP_WORKERS.get()
 
 
 def local_rank_count(mapping: Mapping | None) -> int:
@@ -138,12 +160,28 @@ def _wait_for_pool(proc: subprocess.Popen, timeout: float | None) -> int:
     return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
 
 
-def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) -> dict[str, Any]:
-    """JSON-safe description of one ``BatchSparseMLADecodePagedTSWrapper.plan`` call."""
+def encode_payload(
+    device_index: int,
+    rows: int,
+    heads: int,
+    plan_kwargs: dict,
+    *,
+    kind: Literal["mla_decode", "csa2_packed"] = "mla_decode",
+) -> dict[str, Any]:
+    """JSON-safe description of one kernel a worker compiles: a
+    ``BatchSparseMLADecodePagedTSWrapper.plan`` call (``mla_decode``), or the CSA2 PrimTS kernel
+    of a row count ``packed_sparse_mla_missing_rows`` returned for ``plan_kwargs``
+    (``csa2_packed``, compiled by ``compile_packed_sparse_mla_rows``)."""
     kwargs = dict(plan_kwargs)
-    dtype = kwargs.pop("q_dtype")
-    kwargs["q_dtype"] = str(dtype).removeprefix("torch.")
-    return {"device_index": device_index, "rows": rows, "heads": heads, "plan_kwargs": kwargs}
+    if kind == "mla_decode":
+        kwargs["q_dtype"] = str(kwargs.pop("q_dtype")).removeprefix("torch.")
+    return {
+        "kind": kind,
+        "device_index": device_index,
+        "rows": rows,
+        "heads": heads,
+        "plan_kwargs": kwargs,
+    }
 
 
 def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> None:

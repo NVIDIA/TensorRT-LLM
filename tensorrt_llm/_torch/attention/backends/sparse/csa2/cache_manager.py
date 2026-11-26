@@ -59,11 +59,12 @@ from .....configs.deepseek_v41 import (
     encoder_replay_enabled,
 )
 from .page_table_bounds import PageTableBounds
-from .params import CSA2Layout
+from .params import CSA2Layout, SwaCacheFormat, resolve_swa_cache_format, swa_fp8_scale_exponent
 from .quantization import (
     INDEX_DATA_BYTES,
     INDEX_PAGE_ROWS,
     INDEX_SCALE_BYTES,
+    row_bytes,
     store_index_rows,
     store_layer_rows,
     store_rows,
@@ -217,6 +218,7 @@ def _cache_size_layer_components(
     swa_layer_limit: int | None,
     *,
     remote_tail: bool = False,
+    swa_cache_format: SwaCacheFormat = "swa",
 ) -> tuple[list[int], list[int | None], list[int]]:
     """Match packed layer geometry and reuse-policy scratch groups for sizing."""
     owners = [layer for layer in layout.kv_source_layer_ids if layer in layers]
@@ -227,7 +229,7 @@ def _cache_size_layer_components(
     for layer in layers:
         decoder = bool(owners) and layer >= max(owners)
         if swa_layer_limit is None or layer < swa_layer_limit:
-            sizes.append(528)
+            sizes.append(row_bytes(512, swa_cache_format))
             windows.append(
                 _swa_cache_window(
                     layout.window_size,
@@ -346,6 +348,8 @@ class CSA2CacheManager(KVCacheManagerV2):
                 raise NotImplementedError(
                     "CSA2 virtual draft layers require an explicit model-layer mapping"
                 )
+        self.swa_cache_format = resolve_swa_cache_format(kv_cache_config.dtype)
+        self.swa_row_bytes = row_bytes(head_dim, self.swa_cache_format)
         self._page_index_converters = {}
         self._swa_publication_token = None
         self._swa_publication = None
@@ -768,6 +772,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             self.max_draft_len + self.reuse_match_backoff,
             getattr(self, "context_swa_layer_limit", None),
             remote_tail=getattr(self, "bounded_replay_on_generation", False),
+            swa_cache_format=self.swa_cache_format,
         )
 
     def _get_runtime_cache_size_layer_components(self):
@@ -870,7 +875,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                     layer,
                     1,
                     [CSA2CacheRole.SWA],
-                    [528],
+                    [self.swa_row_bytes],
                     self._swa_retention(layer),
                 )
             if layer in self.layout.kv_source_layer_ids:
@@ -926,7 +931,7 @@ class CSA2CacheManager(KVCacheManagerV2):
                 DataType.UINT8,
             )
         elif role == CSA2CacheRole.SWA:
-            rows, width, dtype = self.tokens_per_block, 528, DataType.UINT8
+            rows, width, dtype = self.tokens_per_block, self.swa_row_bytes, DataType.UINT8
         else:
             rows, width, dtype = self.tokens_per_block, 512, DataType.FLOAT
         # Wrapping a pool costs a tensor construction, so equal views are reused.
@@ -958,7 +963,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         return known[first_layer]
 
     def get_swa_buffer(self, layer_idx: int) -> torch.Tensor:
-        return self.get_buffers(layer_idx, CSA2CacheRole.SWA).view(-1, 528)
+        return self.get_buffers(layer_idx, CSA2CacheRole.SWA).view(-1, self.swa_row_bytes)
 
     def get_main_buffer(self, layer_idx: int) -> torch.Tensor:
         """Contiguous ``[rows, 288]`` main records of the layer's KV source."""
@@ -999,7 +1004,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         return rows // INDEX_PAGE_ROWS
 
     def write_swa(self, layer_idx, slots, values, transform=None) -> None:
-        store_rows(self.get_swa_buffer(layer_idx), slots, values, "swa", transform)
+        store_rows(self.get_swa_buffer(layer_idx), slots, values, self.swa_cache_format, transform)
 
     def write_global(
         self, layer_idx, slots, main, index, main_transform=None, index_transform=None
@@ -1010,7 +1015,15 @@ class CSA2CacheManager(KVCacheManagerV2):
         store_index_rows(self.get_index_pages(layer_idx), slots, index, index_transform)
 
     def write_layer_rows(
-        self, layer_idx, slots, values, transform=None, *, global_rows=None, index_q=None
+        self,
+        layer_idx,
+        slots,
+        values,
+        transform=None,
+        *,
+        global_rows=None,
+        index_q=None,
+        release_after_wait=False,
     ):
         """One launch for a layer's SWA rows, its global rows and its packed index queries.
 
@@ -1031,9 +1044,11 @@ class CSA2CacheManager(KVCacheManagerV2):
             slots,
             values,
             transform,
+            swa_cache_format=self.swa_cache_format,
             main=main,
             index=index,
             index_q=index_q,
+            release_after_wait=release_after_wait,
         )
 
     def _get_page_index_converter(self, layer_id, role):
@@ -1693,6 +1708,13 @@ class CSA2CacheManager(KVCacheManagerV2):
             )
 
     @property
+    def swa_fp8_scale_exponent(self) -> int | None:
+        """Storage-scale exponent ``e`` of this cache's swa_fp8 SWA rows, which hold
+        E4M3(x / 2**e) and carry no scale (``TRTLLM_CSA2_SWA_FP8_AMAX``), so every process that
+        reads them, such as a disaggregated peer, needs the same one; None for scaled records."""
+        return swa_fp8_scale_exponent() if self.swa_cache_format == "swa_fp8" else None
+
+    @property
     def blocks_in_primary_pool(self):
         return self.impl.get_page_index_upper_bound(
             self._cache_layer_id(self.pp_layers[0], CSA2CacheRole.SWA), CSA2CacheRole.SWA.role
@@ -1911,6 +1933,11 @@ class CSA2CacheManager(KVCacheManagerV2):
             replay_window,
             tokens_per_block,
         )
+        raw_dtype = (
+            kv_cache_config.dtype
+            if kv_cache_config is not None
+            else getattr(model_config, "extra_attrs", {}).get("kv_cache_dtype", "auto")
+        )
         sizes, windows, scratch_groups = _cache_size_layer_components(
             layout,
             range(num_layers),
@@ -1921,6 +1948,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             remote_tail=bool(
                 getattr(model_config, "extra_attrs", {}).get("bounded_replay_on_generation", False)
             ),
+            swa_cache_format=resolve_swa_cache_format(raw_dtype),
         )
         _, headroom = _get_generation_kv_capacity(
             spec_config, is_draft=kwargs.get("is_draft", False)

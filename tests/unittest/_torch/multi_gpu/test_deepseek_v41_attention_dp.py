@@ -523,6 +523,8 @@ _REPLAY_WINDOW = 5
 _ENCODER_REPLAY_WINDOW = 128
 # Both ADP ranks can recover a full cache block plus their uncached suffixes.
 _REPLAY_MAX_TOKENS = 512
+# The replay cache managers and attention modules share one KV dtype, so their SWA formats agree.
+_REPLAY_KV_CACHE_DTYPE = "fp8"
 
 
 def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) -> torch.nn.Module:
@@ -549,6 +551,7 @@ def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) 
         index_heads=8,
         mapping=mapping,
         compute_backend="trtllm",
+        kv_cache_dtype=_REPLAY_KV_CACHE_DTYPE,
     )
     for name, parameter in module.named_parameters():
         if name.endswith("norm.weight"):
@@ -574,7 +577,7 @@ def _replay_metadata(
             enable_block_reuse=False,
             max_gpu_total_bytes=128 << 20,
             enable_swa_scratch_reuse=scratch,
-            dtype="fp8",
+            dtype=_REPLAY_KV_CACHE_DTYPE,
         ),
         CacheType.SELFKONLY,
         num_layers=1,
@@ -840,7 +843,7 @@ def _check_dp_encoder_replay_case(
                 enable_block_reuse=True,
                 enable_swa_scratch_reuse=scratch,
                 max_gpu_total_bytes=128 << 20,
-                dtype="fp8",
+                dtype=_REPLAY_KV_CACHE_DTYPE,
             ),
             CacheType.SELFKONLY,
             num_layers=2,
@@ -1251,7 +1254,7 @@ def _decoder_pass_case(
 
 
 @torch.inference_mode()
-def _run_decoder_pass_graph() -> None:
+def _run_decoder_pass_graph(provider: str) -> None:
     import os
     from pathlib import Path
 
@@ -1282,14 +1285,22 @@ def _run_decoder_pass_graph() -> None:
     )
     saved_env = {
         name: os.environ.get(name)
-        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+        for name in (
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY",
+            "TRTLLM_FORCE_COMM_METHOD",
+            "TRTLLM_CSA2_COMPUTE_BACKEND",
+        )
     }
     saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
     os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    os.environ["TRTLLM_CSA2_COMPUTE_BACKEND"] = provider
     # The platform's own MoE communication, as served (EP all-to-all where supported).
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     set_per_request_prefill_cuda_graph_flag(False)
     try:
+        major, minor = torch.cuda.get_device_capability()
+        if provider == "prims_ts" and major * 10 + minor not in (100, 103, 107):
+            pytest.skip("CSA2 PrimTS sparse MLA requires SM100, SM103 or SM107")
         # The CED test model of _deepseek_v41_test_utils.cache_config with FP8 KV.
         config, sparse = _tiny_v41_model_config()
         text = config.pretrained_config.text_config
@@ -1338,7 +1349,8 @@ def _run_decoder_pass_graph() -> None:
             with patch.object(graph, "run", wraps=graph.run) as run:
                 graphed = _decoder_pass_case(model, config, sparse, mapping, case, True, image)
             assert run.call_count == 1
-            # Padding rows change the GEMM tactics serving the live rows: bf16 rounding only.
+            # Padding rows change the GEMM tactics serving the live rows: bf16 rounding only. Both
+            # passes attend the dummy step's row with the same kernel.
             tolerance = 2**-4 if (rank, step) == (1, 2) else 0
             error = None
             try:
@@ -1358,12 +1370,16 @@ def _run_decoder_pass_graph() -> None:
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("parallel_moe_executor", [pytest.param(2, id="world2")], indirect=True)
-def test_attention_dp_decoder_pass_graph(parallel_moe_executor: MPIPoolExecutor | None) -> None:
-    """The decoder-pass CUDA graph reproduces the eager decoder pass on every DEP2 rank."""
+@pytest.mark.parametrize("provider", ["trtllm", "prims_ts"])
+def test_attention_dp_decoder_pass_graph(
+    parallel_moe_executor: MPIPoolExecutor | None, provider: str
+) -> None:
+    """The decoder-pass CUDA graph of each CSA2 attention provider reproduces the eager decoder
+    pass on every DEP2 rank."""
     if parallel_moe_executor is None:
-        _run_decoder_pass_graph()
+        _run_decoder_pass_graph(provider)
         return
-    results = [parallel_moe_executor.submit(_run_decoder_pass_graph) for _ in range(2)]
+    results = [parallel_moe_executor.submit(_run_decoder_pass_graph, provider) for _ in range(2)]
     assert all(result.result() is None for result in results)
 
 
@@ -1438,10 +1454,17 @@ def _run_encoder_pass_graph() -> None:
     )
     saved_env = {
         name: os.environ.get(name)
-        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+        for name in (
+            "TRTLLM_V41_DECODER_BOUNDED_REPLAY",
+            "TRTLLM_FORCE_COMM_METHOD",
+            "TRTLLM_CSA2_COMPUTE_BACKEND",
+        )
     }
     saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
     os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    # These cases check the native trtllm-gen provider's encoder pass graph ("auto" selects
+    # PrimTS on SM100, SM103 and SM107).
+    os.environ["TRTLLM_CSA2_COMPUTE_BACKEND"] = "trtllm"
     # The platform's own MoE communication, as served (EP all-to-all where supported).
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     set_per_request_prefill_cuda_graph_flag(False)

@@ -34,6 +34,7 @@ from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
+    cache_record_size,
     is_sm107_target,
     nvfp4_row_bytes,
 )
@@ -199,11 +200,26 @@ class MlaConfig(Nvfp4KVConfig):
     compact_nv_rope: bool = False
     q_tma_stage: bool = False
     q_nope_tmem: bool = False
+    # Q NoPE stays in a full SMEM stage the loader prefetches; the MMA warp
+    # copies it into TMEM before the tile's first QK and releases the stage.
+    q_tmem_mma_copy: bool = False
     # Softmax/correction already use the native WS Layout-E row ownership.
     ws_native_e: bool = False
     ws_qk: bool = False
     # Use M64 tcgen05.mma.ws for PV; P is staged in SMEM, O follows Layout E.
     ws_pv: bool = False
+    # WS final BF16 output: columns per SMEM-transposed chunk (32 or 64), 0 for
+    # direct per-lane stores.
+    ws_coalesce_cols: int = 0
+    # WS final BF16 output leaves each SW128 SMEM chunk through a TMA tensor
+    # store instead of thread stores (requires ws_coalesce_cols == 64).
+    ws_tma_output: bool = False
+    # WS quantized tail: lane stripes held as BF16 words across the O release
+    # (requires ws_tma_output); 0 quantizes every stripe before the release.
+    ws_tail_staged_stripes: int = 0
+    # Q lands in two K/V ring slices and the MMA warp copies it to TMEM from
+    # there; the Q pipeline only carries a zero-byte tile token (see SparseMlaProfile).
+    q_in_kv: bool = False
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
     sparse_reuse_kv: bool = False
@@ -214,6 +230,27 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
+    # Keep-AB direct BF16 output staged through SMEM for full-line stores.
+    coalesce_keeps_output: bool = False
+    # Programmatic dependent launch for the attention kernel itself: it waits
+    # for the preceding grid before any input read and releases dependents.
+    use_pdl: bool = False
+    # Grids of at most this many CTAs release PDL dependents right after the
+    # entry wait instead of at exit (0: never). Dependents always wait for the
+    # whole grid; an early release only moves their launch and prologue onto
+    # SMs this grid leaves idle, which crowds them once the grid is large.
+    pdl_entry_trigger_max_ctas: int = 0
+    # With use_pdl, a persistent grid whose scales are launch scalars and
+    # whose loaders bind sparse sources without reading them waits after its
+    # prologue (TMA descriptor prefetch, shared-memory carve-out and barrier
+    # initialization, TMEM allocation) instead of at entry, so that prologue
+    # overlaps the preceding grid. Other grids keep the entry wait
+    # (ThroughputLatencyMlaDecodeTs.waits_after_prologue). Like use_pdl, it is
+    # set on the kernel object by callers that launch it directly with PDL,
+    # such as TensorRT-LLM's DeepSeek-V4.1 CSA2 decode. No FlashInfer entry
+    # point enables it: the sparse MLA wrapper launches without PDL, and the
+    # DeepSeek-V4.1 backend binds a KV producer, which keeps the entry wait.
+    pdl_wait_after_prologue: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
@@ -295,13 +332,46 @@ class MlaConfig(Nvfp4KVConfig):
         """Use independent gather/transform warps with two retained tiles."""
         return self.has_nvfp4_kv and self.whole_kv_tile
 
+    @property
+    def tma_fp8_primary_tiles(self) -> bool:
+        """Gather an FP8 primary pool's tiles straight into the retained whole tile.
+
+        A per-tensor FP8 primary row is already the E4M3 operand, so the loader
+        warps TMA-gather its four 128-byte panels into the retained SW128 tile
+        instead of copying a raw 512-byte record. The raw record ring then holds
+        the NVFP4 extra pool's records only, whose 288-byte stride admits two
+        buffers.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.kv_cache_format == "fp8"
+            and self.extra_kv_cache_format == "nvfp4"
+            and not self.rope_dim
+        )
+
+    @property
+    def raw_record_stride(self) -> int:
+        """Return the raw SMEM row pitch in bytes, aligned for four-row TMA gathers.
+
+        FP8 primary tiles bypass the raw ring (tma_fp8_primary_tiles), so the
+        extra pool's NVFP4 records size it.
+        """
+        if self.tma_fp8_primary_tiles:
+            return (
+                (cache_record_size(self.extra_kv_cache_format, self.rope_dim) + 31)
+                // 32
+                * 32
+            )
+        return Nvfp4KVConfig.raw_record_stride.fget(self)
+
     def raw_record_ring_fits(self) -> bool:
         """Return whether a second 128-row raw record buffer fits in SMEM.
 
-        D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room beside
-        the two retained whole tiles. D576 records (352 B, 44 KiB per buffer)
-        take the H64 whole-tile schedule to 264 KB, which fits only SM107's
-        327 KiB. Mixed FP8 sources (512 B records) keep one raw buffer.
+        D512 NVFP4 records (288 B, 36 KiB per buffer) leave room beside the two
+        retained whole tiles, also beside FP8 primary tiles that bypass the raw
+        ring. D576 records (352 B, 44 KiB per buffer) take the H64 whole-tile
+        schedule to 264 KB, which fits only SM107's 327 KiB. Raw 512-byte FP8
+        records keep one raw buffer.
         """
         if self.rope_dim:
             return is_sm107_target() and self.raw_record_stride <= 352
@@ -324,14 +394,15 @@ class MlaConfig(Nvfp4KVConfig):
     def early_raw_snapshot(self) -> bool:
         """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
 
-        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
-        the converter's raw-slot release no longer waits for PV to free a
-        retained whole-tile stage and two gathers stay in flight.
+        Enabled with the two-slot raw ring (D512 NVFP4 records, with FP8 primary
+        tiles gathered straight into the retained tile), so the converter's
+        raw-slot release no longer waits for PV to free a retained whole-tile
+        stage and two gathers stay in flight.
         """
         return (
             self.async_nvfp4_kv_gather
             and self.raw_record_stages == 2
-            and self.kv_cache_format != "fp8"
+            and (self.kv_cache_format != "fp8" or self.tma_fp8_primary_tiles)
         )
 
     @property
@@ -1994,8 +2065,9 @@ def configure_sparse_mla(
         raise ValueError(
             "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
         )
-    if reuse and cfg.num_ctas_per_head_dim != 1:
-        raise ValueError("retained KV requires one V owner")
+    if reuse and cfg.num_ctas_per_head_dim != 1 and not keep:
+        # Keep-AB V owners read their own D128 slices of the retained K tile.
+        raise ValueError("retained KV with a V split requires Keep-AB")
     if profile.kv_tile_size not in (64, 128) or (
         profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
     ):
@@ -2071,6 +2143,45 @@ def configure_sparse_mla(
         cfg.has_nvfp4_kv and keep and issuers == 8 and reuse
     ) or whole_nvfp4_kv
     ws_mma = retained_nvfp4_kv and keep
+    if ws_mma and cfg.num_ctas_per_head_dim != 1:
+        # One WS N256 PV pass reads two adjacent D128 slices and the tail stores
+        # 256 columns, so a V owner would read and write its neighbor's slices.
+        # Only the non-WS Keep-AB PV (one D128 slice per pass) splits V.
+        raise ValueError("retained NVFP4 Keep-AB KV (WS MMA) requires one V owner")
+    # Retained native FP8 K tiles feed the same WS QK/PV, with Q copied to TMEM.
+    ws_fp8 = profile.ws_mma
+    if ws_fp8 and not (
+        keep
+        and reuse
+        and issuers == 8
+        and cfg.is_fp8_qkv()
+        and not cfg.has_nvfp4_kv
+        and cfg.rope_dim == 0
+        and profile.kv_tile_size == 128
+        and cfg.num_ctas_per_head_dim == 1
+    ):
+        raise ValueError(
+            "FP8 WS MMA requires D512 Keep-AB with retained BK128 E4M3 K, eight issuers "
+            "and one V owner"
+        )
+    if (profile.ws_store_cols or profile.ws_tma_store) and not ws_fp8:
+        raise ValueError("coalesced WS output stores require the FP8 WS MMA layout")
+    if profile.ws_store_cols not in (0, 32, 64):
+        raise ValueError("ws_store_cols must be 0, 32 or 64")
+    if profile.ws_tma_store and profile.ws_store_cols != 64:
+        raise ValueError("WS TMA output stores need 64-column (128-byte) chunks")
+    if not 0 <= profile.ws_tail_staged_stripes <= 8:
+        raise ValueError("ws_tail_staged_stripes must be in [0, 8]")
+    if profile.ws_tail_staged_stripes and not profile.ws_tma_store:
+        raise ValueError("a staged WS tail needs WS TMA output stores")
+    if profile.ws_q_in_kv and not (keep and ws_fp8):
+        raise ValueError("Q in the K/V ring needs the keeps-MMA-AB WS FP8 schedule")
+    if profile.ws_tma_store and cfg.logical_num_heads_q % 32:
+        # One box holds a correction warp's 32 consecutive heads of one query.
+        raise ValueError("WS TMA output stores need a multiple of 32 heads")
+    if ws_fp8 and profile.reuse_kv_stages % 2:
+        # One N256 PV pass reads two adjacent D128 stages as one operand.
+        raise ValueError("FP8 WS MMA needs an even number of retained KV stages")
     # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
     # BF16 BK128 retains one, with additional stages used for prefetch.
     kv_stages = (
@@ -2103,12 +2214,22 @@ def configure_sparse_mla(
     # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing. D576 records
     # need SM107's SMEM (raw_record_ring_fits); there the ring makes
     # persistent top-k 2048 decode 5-9% faster (VR200 H12 832 rows: 125.8 ->
-    # 115.6 us; H64: 145.9 -> 132.5 us).
+    # 115.6 us; H64: 145.9 -> 132.5 us). An FP8 primary with an NVFP4 extra
+    # pool gathers its primary tiles straight into the retained tile
+    # (tma_fp8_primary_tiles), so its 288-byte NVFP4 records take the ring too.
+    fp8_primary_tiles = (
+        retained_nvfp4_kv
+        and cfg.kv_cache_format == "fp8"
+        and cfg.extra_kv_cache_format == "nvfp4"
+        and not cfg.rope_dim
+    )
     raw_record_ring = (
         2
         if retained_nvfp4_kv
-        and cfg.raw_record_ring_fits()
-        and cfg.kv_cache_format != "fp8"
+        and (
+            fp8_primary_tiles
+            or (cfg.raw_record_ring_fits() and cfg.kv_cache_format != "fp8")
+        )
         and cfg.use_persistent_scheduler
         else 1
     )
@@ -2154,6 +2275,21 @@ def configure_sparse_mla(
             correction_regs=160 if issuers == 8 else 192,
             mma_load_regs=96 if uniform and issuers == 4 else 64,
         )
+        if ws_fp8:
+            # Q NoPE is read from TMEM; the MMA warp copies each prefetched SMEM
+            # stage into it, in tcgen05 order after the previous tile's QK.
+            roles.update(
+                ws_pv=True,
+                ws_qk=True,
+                ws_native_e=True,
+                q_nope_tmem=True,
+                q_tmem_mma_copy=True,
+                ws_coalesce_cols=profile.ws_store_cols,
+                ws_tma_output=profile.ws_tma_store,
+                ws_tail_staged_stripes=profile.ws_tail_staged_stripes,
+                q_in_kv=profile.ws_q_in_kv,
+                tmem_s_cols=64,
+            )
     else:
         balanced = profile.balanced_registers
         roles = dict(
@@ -2202,6 +2338,6 @@ def configure_sparse_mla(
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
         q_stages=1
-        if retained_nvfp4_kv or single or (reuse and profile.reuse_kv_stages)
+        if retained_nvfp4_kv or ws_fp8 or single or (reuse and profile.reuse_kv_stages)
         else cfg.q_stages,
     )

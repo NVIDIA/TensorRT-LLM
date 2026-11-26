@@ -351,9 +351,12 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile import warmup_workers
+
         try:
-            # Retain a partial summary when a phase raises.
-            with self._warmup_timer:
+            # Retain a partial summary when a phase raises. First plans of PrimTS kernels during
+            # warmup compile the kernels they lack in the shared worker pool.
+            with self._warmup_timer, warmup_workers():
                 return self._warmup_scheduled(resource_manager, kv_cache_manager)
         finally:
             # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage

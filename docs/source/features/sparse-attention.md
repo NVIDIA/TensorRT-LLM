@@ -368,14 +368,31 @@ sparse_attention_config:
 
 | Constraint | CSA2 support |
 |---|---|
-| Hardware | SM100 family: native trtllm-gen. SM90 (FlashMLA BF16) and SM120/121 (FlashInfer BF16 FA2) only for checkpoints without candidate-consumer layers |
+| Hardware | SM100 family: PrimTS on SM100/103/107 with `dtype: fp8`, native trtllm-gen otherwise (see the KV-cache dtypes below). SM90 (FlashMLA BF16) and SM120/121 (FlashInfer BF16 FA2) only for checkpoints without candidate-consumer layers |
 | Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
 | Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
 | KV-cache block size | `128` or `256` tokens |
-| Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
+| Persistent cache | SWA records selected by `dtype` (see the KV-cache dtypes below); NVFP4 main/index records |
 | Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
 | Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
 | Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification and `kv_cache_config.enable_kv_pool_rebalance` unsupported |
+
+`kv_cache_config.dtype` selects the persistent SWA record and, unless
+`TRTLLM_CSA2_COMPUTE_BACKEND` names a provider, the attention provider on
+SM100/103/107. `fp8` and `fp8_ds_mla` are different formats:
+
+| `kv_cache_config.dtype` | Persistent SWA row (512 channels) | Default provider on SM100/103/107 | Native trtllm-gen generation |
+|---|---|---|---|
+| `fp8` | 512 E4M3 bytes at one process-wide power-of-two scale: unit by default, saturating at ±448; `TRTLLM_CSA2_SWA_FP8_AMAX` names the largest magnitude to hold | PrimTS | Stages every generation step |
+| `fp8_ds_mla` | 528 bytes: 512 E4M3 bytes and 16 UE8M0 scales, one per 32 channels | Native trtllm-gen | Fused decode (64 query heads) and direct decode read the packed caches |
+| `auto`, `bfloat16` | 528 bytes, as for `fp8_ds_mla` | Native trtllm-gen | Fused decode (64 query heads); other tiles stage in BF16 |
+
+To serve DeepSeek-V4.1 on the native provider with per-group SWA scales, use
+`dtype: fp8_ds_mla`. `TRTLLM_CSA2_COMPUTE_BACKEND=trtllm` or `prims_ts` overrides
+the default provider for any dtype; PrimTS reads both SWA records. Context and
+generation instances of a disaggregated deployment must use the same dtype, and with
+`fp8` the same `TRTLLM_CSA2_SWA_FP8_AMAX` storage scale: a peer whose SWA records differ
+is rejected when it registers.
 
 Candidate-consumer layers (index-source layers after the checkpoint's
 `candidate_source_layer_id`; the released checkpoint has them) score their

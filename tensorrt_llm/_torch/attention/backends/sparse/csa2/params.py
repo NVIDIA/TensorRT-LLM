@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -13,6 +15,17 @@ import torch
 from tensorrt_llm._utils import is_sm_100f, is_sm_120f
 
 from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
+
+# Re-exported: the formats and scale exponents live in formats.py, which the PrimTS kernels'
+# host code imports without this module.
+from .formats import Q_FP8_AMAX_ENV as Q_FP8_AMAX_ENV
+from .formats import SWA_FP8_AMAX_ENV as SWA_FP8_AMAX_ENV
+from .formats import PrimsTSMainFormat as PrimsTSMainFormat
+from .formats import SwaCacheFormat as SwaCacheFormat
+from .formats import q_fp8_scale_exponent as q_fp8_scale_exponent
+from .formats import resolve_swa_cache_format as resolve_swa_cache_format
+from .formats import swa_fp8_scale_exponent as swa_fp8_scale_exponent
+from .formats import swa_scale_exponent as swa_scale_exponent
 
 if TYPE_CHECKING:
     from .metadata import CSA2TrtllmMetadata
@@ -180,7 +193,8 @@ class CSA2Params(SparseParams):
     # native path supports it: trtllm-gen without packed attention, and only
     # when an FP8 staging dtype is requested. An explicit ``True`` still demands
     # that path and is rejected elsewhere rather than silently downgraded, and
-    # ``False`` pins BF16 staging.
+    # ``False`` pins BF16 staging. Either explicit value selects the native
+    # provider, since PrimTS attends unit-scale E4M3 without staging.
     use_fp8_staging: bool | None = None
 
     def __post_init__(self) -> None:
@@ -194,24 +208,112 @@ class CSA2Params(SparseParams):
             raise ValueError("CSA2 emission requires temporal GVR and CuTe DSL paged MQA")
 
 
-def select_csa2_backend(sm_version: int) -> str:
-    """Match the DSV4 hardware families without confusing SM120 with SM100."""
-    if sm_version == 90:
-        return "flash_mla"
-    if is_sm_100f(sm_version):
-        return "trtllm"
-    if is_sm_120f(sm_version):
-        return "flashinfer"
-    raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
+def csa2_prims_ts_unsupported_reason() -> str | None:
+    """Why this process cannot run the CSA2 PrimTS provider on its current CUDA device, or None.
+
+    Checks, without compiling or allocating, the CuTe DSL toolchain the PrimTS kernels need
+    (``get_prims_ts_toolchain_unsupported_reason``), the import of the vendored PrimTS
+    internals the provider builds on, and a host-side plan of its smallest packed launch. The
+    answer is cached per device, so the workspace reservation and every layer get the same one.
+    """
+    if not torch.cuda.is_available():
+        return "CUDA is unavailable"
+    return _prims_ts_unsupported_reason(torch.cuda.current_device())
+
+
+@functools.cache
+def _prims_ts_unsupported_reason(device: int) -> str | None:
+    from ...fmha.prims_ts_sparse_mla import get_prims_ts_toolchain_unsupported_reason
+
+    reason = get_prims_ts_toolchain_unsupported_reason()
+    if reason is not None:
+        return reason
+    try:
+        from ._prims_ts_packed import get_packed_sparse_mla_workspace_size
+
+        get_packed_sparse_mla_workspace_size(
+            device, 1, 64, max_topk=128, max_extra_topk=512, swa_cache_format="swa_fp8"
+        )
+    except (ImportError, AttributeError, TypeError, ValueError) as error:
+        return f"the vendored PrimTS kernels it builds on are unavailable ({error})"
+    return None
+
+
+def select_csa2_backend(
+    sm_version: int,
+    params: CSA2Params | None = None,
+    swa_cache_format: SwaCacheFormat | None = None,
+) -> str:
+    """Resolve an explicit provider, environment override, or hardware default.
+
+    ``swa_cache_format`` is the persistent SWA encoding (``resolve_swa_cache_format``).
+    The hardware default is PrimTS on SM100/103/107 only for ``swa_fp8``, the encoding of
+    ``kv_cache_config.dtype="fp8"``; with the 528-byte scaled SWA records of the other KV
+    dtypes, or an unknown encoding, it is the native provider, whose fused and direct
+    decode read those records. An explicit provider is not limited by the encoding. Where the
+    default would be PrimTS but this process cannot run it (``csa2_prims_ts_unsupported_reason``:
+    a missing or old CuTe DSL toolchain, or vendored PrimTS internals that no longer import or
+    plan), it raises instead of falling back to a native provider without its fused and
+    direct decodes on these rows.
+    """
+    backend = "auto" if params is None else params.compute_backend
+    if backend == "auto":
+        backend = os.environ.get("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
+    if backend not in ("auto", "trtllm", "prims_ts", "flash_mla", "flashinfer"):
+        raise ValueError(f"Unknown CSA2 attention backend: {backend}")
+    if backend == "auto":
+        native_only = (
+            params is not None
+            and (params.use_packed_sparse_attention or params.use_fp8_staging is not None)
+        ) or swa_cache_format != "swa_fp8"
+        if sm_version in (100, 103, 107) and not native_only:
+            reason = csa2_prims_ts_unsupported_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    f"CSA2 PrimTS, the default provider for kv_cache_config.dtype=fp8 on "
+                    f"SM{sm_version}, cannot run in this process: {reason}. Install the "
+                    "requirements.txt toolchain, use kv_cache_config.dtype=fp8_ds_mla for the "
+                    "native provider with its fused and direct decodes, or set "
+                    "TRTLLM_CSA2_COMPUTE_BACKEND=trtllm to run the native provider on fp8 SWA "
+                    "rows, which stages every generation step"
+                )
+        if sm_version == 90:
+            backend = "flash_mla"
+        elif sm_version in (100, 103, 107) and not native_only:
+            backend = "prims_ts"
+        elif is_sm_100f(sm_version):
+            backend = "trtllm"
+        elif is_sm_120f(sm_version):
+            backend = "flashinfer"
+        else:
+            raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
+    if backend == "prims_ts":
+        if sm_version not in (100, 103, 107):
+            raise ValueError("CSA2 PrimTS sparse MLA requires SM100, SM103 or SM107")
+        if params is not None and params.use_packed_sparse_attention:
+            raise ValueError(
+                "CSA2 PrimTS cannot select the separate custom packed attention kernel"
+            )
+        if params is not None and params.use_fp8_staging is True:
+            raise ValueError("CSA2 FP8 staging requires trtllm-gen without packed attention")
+        if params is not None and params.use_fp8_staging is False:
+            raise ValueError(
+                "CSA2 PrimTS attends unit-scale E4M3; BF16 staging (use_fp8_staging=False) "
+                "requires trtllm-gen"
+            )
+    return backend
 
 
 @dataclass(kw_only=True, slots=True)
 class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     """Selected packed-pool inputs for the standard sparse prediction hook.
 
-    SWA uses CSA2 FP8 rows, main uses CSA2 FP4 rows, both uint8 [pool_rows, bytes].
+    SWA uses the explicit ordinary E4M3 or legacy MXFP8 format; MAIN uses CSA2
+    FP4 rows. Both pools have uint8 [pool_rows, bytes] physical views.
     swa_indices and inherited topk_indices are [queries, selected] pool-relative
-    row indices; -1 denotes padding. topk_indices addresses main_pool.
+    row indices; -1 denotes padding, and physical row zero is valid. With
+    main_mapping, topk_indices instead addresses logical rows in its live
+    owner page table, resolved by the consuming provider's metadata/staging.
     """
 
     # Decode may prepare Q on another stream while this stream publishes KV.
@@ -219,6 +321,10 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     # With a Q amax word, staging may reduce the selected rows before ``query_ready`` and
     # wait only to finalize the scale. Layers that run the indexer meanwhile keep waiting first.
     late_query_ready: bool = False
+    # Recorded on the model stream before this layer's projections, where its selections and
+    # the MAIN rows they address were already complete: a layer that runs no indexer and writes
+    # no MAIN rows. PrimTS may prepare its selection metadata from it on a side stream.
+    selection_ready: torch.cuda.Event | None = None
     # Unit-scale FP8 Q from the projection epilogue; staging resolves its live scale.
     projected_quant_q: torch.Tensor | None = None
     # Context: ``projected_quant_q`` is final at unit scale and no BF16 Q exists. Only the
@@ -228,13 +334,15 @@ class CSA2BackendForwardArgs(SparseBackendForwardArgs):
     # is all of Q staging reads; the scale derivation consumes and clears it.
     projected_q_amax: torch.Tensor | None = None
     swa_pool: torch.Tensor | None = None
+    # None is resolved by the backend; standalone metadata callers retain the legacy encoding.
+    swa_cache_format: SwaCacheFormat | None = None
     swa_indices: torch.Tensor | None = None
     main_pool: torch.Tensor | None = None
     # Logical MAIN group indices for shared-domain staging, before page mapping.
     main_logical_indices: torch.Tensor | None = None
     # (page_table, page_size, max_positions, requests, visible): when present,
-    # ``topk_indices`` hold logical positions that the native staging kernels
-    # map to physical rows themselves.
+    # ``topk_indices`` hold logical positions resolved by native staging or
+    # PrimTS packed metadata, using the owner's live page table.
     main_mapping: tuple | None = None
     # (kv_source, index_source, query_start): layers with equal groups share
     # one staging compaction per forward.
@@ -280,17 +388,25 @@ class CSA2ForwardState:
     output_fp8: tuple[torch.Tensor, ...] | None = None
     output_fp8_written: bool = False
     # (data, scale, positions, cos/sin) of the grouped MXFP8 o_a projection's input: the fused
-    # decode kernel or the ``gen_fmha`` generation core writes data and scale instead of the BF16
-    # output.
+    # decode kernel, the ``gen_fmha`` generation core, or a PrimTS context or generation tile
+    # whose plan can, writes data and scale instead of the BF16 output and sets
+    # output_mxfp8_written; the module projects this input only then.
     output_mxfp8: tuple[torch.Tensor, ...] | None = None
+    output_mxfp8_written: bool = False
     # (positions, cos/sin) when the query still awaits its RoPE, which the direct decode applies.
     query_rope: tuple[torch.Tensor, torch.Tensor] | None = None
+    # With ``query_rope``: the direct decode writes its output rotated back for the O-A.
+    output_rope: bool = False
     swa_transform: RowTransform | None = None
     main_transform: RowTransform | None = None
     index_transform: RowTransform | None = None
     # Recorded on a side stream after the index weights and the paged indexer descriptors;
     # the indexer waits for it before scoring.
     index_ready: torch.cuda.Event | None = None
+    # Recorded on the model stream right before the fused decode kernel launches.
+    decode_start: torch.cuda.Event | None = None
+    # The module entered the layer and published its cache rows (``publish_layer_rows``) itself.
+    rows_published: bool = False
 
 
 @dataclass(frozen=True)

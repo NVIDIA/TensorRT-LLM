@@ -175,6 +175,22 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    def validate_swa_scale_compatible(self, peer_ri: RankInfo) -> None:
+        """Require the same storage scale for CSA2 swa_fp8 SWA rows on both peers.
+
+        Those rows hold E4M3(x / 2**e) at one process-wide exponent (``TRTLLM_CSA2_SWA_FP8_AMAX``)
+        and carry no scale, so rows sent at another exponent have the right size but decode to
+        wrong values. A peer with scaled SWA records instead (another ``kv_cache_config.dtype``)
+        has rows of another size, which ``validate_replicated_region_sizes`` rejects.
+        """
+        local, peer = self._ri.swa_fp8_scale_exponent, peer_ri.swa_fp8_scale_exponent
+        if local is None or peer is None or local == peer:
+            return
+        raise ValueError(
+            "PeerRegistrar: CSA2 swa_fp8 SWA rows use storage-scale exponent "
+            f"local={local}, peer={peer}; set TRTLLM_CSA2_SWA_FP8_AMAX identically on every worker"
+        )
+
     def validate_draft_layers_compatible(self, peer_ri: RankInfo) -> None:
         """Raise ValueError when the peers' shared draft KV layouts disagree.
 
@@ -227,6 +243,7 @@ class PeerRegistrar:
         # trusted on any other field. Raises ValueError naming both versions.
         validate_protocol_version(peer_ri)
         self.validate_bounded_replay_compatible(peer_ri)
+        self.validate_swa_scale_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 
@@ -245,6 +262,7 @@ class PeerRegistrar:
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self.validate_draft_layers_compatible(peer_ri)
         self.validate_view_head_geometry(peer_ri)
+        self.validate_replicated_region_sizes(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -259,6 +277,37 @@ class PeerRegistrar:
             )
 
         return True
+
+    def validate_replicated_region_sizes(self, peer_ri: RankInfo) -> None:
+        """Require each replicated paged view to hold the same layer regions on both sides.
+
+        A ring view may size its ring differently but not its slots; any other replicated
+        view is copied region for region (``ReplicatedMapper``), so a peer whose regions
+        differ, such as one with another KV cache dtype, could never transfer them and is
+        rejected here instead of on its first transfer.
+        """
+        self_page_table = self._self_ext_cache.page_table
+        peer_page_table = peer_ri.page_table
+        for (self_lg, self_pi), (peer_lg, peer_pi) in self.get_pool_mapping(peer_ri).items():
+            layer_group = self_page_table.layer_groups[self_lg]
+            self_pv = layer_group.pool_views[self_pi]
+            if layer_group.kind != CacheKind.PAGED or self_pv.mapper_kind != MapperKind.REPLICATED:
+                continue
+            peer_pv = peer_page_table.layer_groups[peer_lg].pool_views[peer_pi]
+            self_ring = getattr(self_pv, "ring_slot_bytes", None)
+            peer_ring = getattr(peer_pv, "ring_slot_bytes", None)
+            if self_ring or peer_ring:
+                what, local, peer = "ring slot bytes", self_ring, peer_ring
+            else:
+                what = "bytes per layer"
+                local = get_layer_byte_ranges(self_pv)[1]
+                peer = get_layer_byte_ranges(peer_pv)[1]
+            if local != peer:
+                raise ValueError(
+                    f"PeerRegistrar: replicated view {sorted(self_pv.pool_role)} holds {local} "
+                    f"{what} locally and {peer} on the peer; both workers need the same cache "
+                    "layout (for example the same kv_cache_config.dtype)"
+                )
 
     def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
         """Require matching per-view head geometry before registering the peer."""

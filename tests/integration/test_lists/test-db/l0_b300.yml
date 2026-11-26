@@ -55,8 +55,12 @@ l0_b300:
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
-  # CSA2 (DeepSeek-V4.1 sparse attention) keeps the aggregate above inside its 90-minute budget.
-  - unittest/_torch/attention/sparse/csa2
+  # CSA2 (DeepSeek-V4.1 sparse attention) runs apart from the aggregate above, in three entries:
+  # its PrimTS producer and backend files compile many CuTe DSL kernels (about 30 and 20 minutes
+  # cold on B200).
+  - unittest/_torch/attention/sparse/csa2 --ignore=unittest/_torch/attention/sparse/csa2/test_backend.py --ignore=unittest/_torch/attention/sparse/csa2/test_prims_ts_fp8_producer.py
+  - unittest/_torch/attention/sparse/csa2/test_backend.py
+  - unittest/_torch/attention/sparse/csa2/test_prims_ts_fp8_producer.py
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/modeling/test_kimi_k3_mla.py -k "nvfp4 or layerwise"
