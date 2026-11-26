@@ -598,6 +598,7 @@ def test_nonblocking_gen_progress_notifies_unsettled_senders_once(terminal: str)
     else:
         now[0] = 11.0
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver._init_gen_idle_poll(False)

@@ -1385,6 +1385,37 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
+    @pytest.mark.parametrize("held", ["writer", "failed_receive", "vote", "response_flush"])
+    def test_no_fit_waits_for_every_ranks_receive_cleanup(self, monkeypatch, held):
+        """Even a terminal peer must let local receive cleanup return capacity first."""
+        monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+        monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+        ex = self._make_executor(fill_phase_active=True)
+        ex.dist.tp_size = ex.dist.world_size = 2
+        ex.dist.tp_allgather.side_effect = lambda local: [local, (True, True)]
+        owner = _make_active_request(in_transfer=held == "writer")
+        ex.active_requests.append(owner)
+        ex.kv_cache_transceiver.has_cancelling_gen_pages.return_value = held == "failed_receive"
+        ex.kv_cache_transceiver.has_pending_gen_cancellation_vote.return_value = held == "vote"
+        ex._pending_response_terminations = [owner] if held == "response_flush" else []
+        ex.kv_cache_manager.is_request_active.return_value = True
+
+        result, _ = ex._prepare_and_schedule_batch()
+        assert result is not None
+        ex._handle_errors.assert_not_called()
+        ex.dist.tp_allgather.assert_called_once_with((False, True))
+
+        # Once the last vote closes, a queued response without a local
+        # allocation cannot keep a true shortage alive.
+        ex.active_requests.remove(owner)
+        ex.kv_cache_transceiver.has_cancelling_gen_pages.return_value = False
+        ex.kv_cache_transceiver.has_pending_gen_cancellation_vote.return_value = False
+        ex.kv_cache_manager.is_request_active.return_value = False
+        result, _ = ex._prepare_and_schedule_batch()
+        assert result is None
+        ex._handle_errors.assert_called_once()
+        assert ex.dist.tp_allgather.call_count == 2
+
     def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
         """Only the admitted subset is prepared for receive; the idle context
         poll still runs once regardless of the deferred candidates."""

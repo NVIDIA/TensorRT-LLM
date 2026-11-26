@@ -61,11 +61,18 @@ _CASES = (
     "cancel_before_publication",
     "cancel_late_aux",
     "cancel_late_kv",
+    "cancel_peer_first",
     "timeout_late_aux",
     "source_fatal",
     "destination_fatal",
 )
-_CONTEXT_FIRST_CASES = ("baseline", "cancel_late_kv", "source_fatal", "destination_fatal")
+_CONTEXT_FIRST_CASES = (
+    "baseline",
+    "cancel_late_kv",
+    "cancel_peer_first",
+    "source_fatal",
+    "destination_fatal",
+)
 _PHASE_TIMEOUT_S = 30.0
 _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
 _WORKER_TIMEOUT_S = 600.0
@@ -537,9 +544,28 @@ def _worker(args: argparse.Namespace) -> None:
         deadline=args.startup_deadline,
     )
     endpoint = json.loads((directory / "endpoint.json").read_text())["endpoint"]
+    # No model or scheduler loop is initialized. Native sessions own the transfers.
+    executor = object.__new__(PyExecutor)
+    executor.sampler = Mock(spec=["release_request"])
+    executor.model_engine = None
+    executor.draft_model_engine = None
+    executor.kv_cache_transceiver = transceiver
+    executor.kv_cache_manager = manager
+    executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+    executor.async_transfer_manager = AsyncTransferManager(
+        executor.resource_manager, should_store_blocks=False
+    )
+    executor.dist = transceiver._dist
+    executor.enable_attention_dp = not context_first
+    executor._is_kv_manager_v2 = True
+    executor.gather_all_responses = False
+    executor._disagg_pp_termination_handler = None
+    executor._response_channel = ResponseChannel()
     world.Barrier()
     if rank == 1 and not context_first:
         _record(directory, f"{role}.1.blocked", state="MPI_Barrier")
+        if role == "gen" and case == "cancel_peer_first":
+            _publish_peer_cancel_error(executor, None)
         world.Barrier()
         transceiver.shutdown()
         manager.shutdown()
@@ -576,25 +602,7 @@ def _worker(args: argparse.Namespace) -> None:
     full_pool = _pool_state(manager)
     assert full_pool["total"] == initial_pool["total"]
     assert full_pool["free"] == full_pool["available"] == full_pool["evictable"] == 0
-    # No model, scheduler loop, or response transport is initialized. Transfers
-    # are owned by native sessions, not admitted through the executor manager.
-    executor = object.__new__(PyExecutor)
-    executor.sampler = Mock(spec=["release_request"])
-    executor.model_engine = None
-    executor.draft_model_engine = None
-    executor.kv_cache_transceiver = transceiver
-    executor.kv_cache_manager = manager
-    executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-    executor.async_transfer_manager = AsyncTransferManager(
-        executor.resource_manager, should_store_blocks=False
-    )
-    executor.dist = transceiver._dist
-    executor.enable_attention_dp = not context_first
-    executor._is_kv_manager_v2 = True
     executor._prefetched_request_ids = {request.py_request_id}
-    executor.gather_all_responses = False
-    executor._disagg_pp_termination_handler = None
-    executor._response_channel = ResponseChannel()
     if rank == 0:
         executor._response_channel.register([request.py_request_id], None)
     assert executor.disagg is not None
@@ -626,6 +634,8 @@ def _worker(args: argparse.Namespace) -> None:
         """
         status = submit(transfer_request)
         submissions.append(status)
+        # Peer-first FP4 holds AUX after submission: cancelling an unsubmitted AUX
+        # would also send a failure report, obscuring which event GEN observed first.
         if case not in ("baseline", "cancel_before_publication") and len(submissions) == (
             1 if context_first or case == "cancel_late_kv" else 2
         ):
@@ -728,6 +738,36 @@ def _worker(args: argparse.Namespace) -> None:
     _record(root_directory, f"{role}.{rank}.clean")
 
 
+def _publish_peer_cancel_error(executor: PyExecutor, request: LlmRequest | None) -> None:
+    """Run normal GEN error cleanup after retirement, including idle ADP participation."""
+    from mpi4py import MPI
+
+    from tensorrt_llm.bindings import LlmRequestState
+
+    if request is not None:
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not request.is_finished_due_to_cancellation
+    executor.active_requests = [request] if request is not None else []
+    executor.canceled_req_ids = []
+    executor._fatal_error = None
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._merged_transfer_flush = None
+    executor._stage_responses = False
+    executor.model_engine = Mock(spec=["wait_for_input_copy"])
+    if executor.enable_attention_dp:
+        # The other ADP rank has no request, but joins the error vote and response gather.
+        MPI.COMM_WORLD.Barrier()
+        assert executor.disagg.handle_errors_synced()
+        executor._flush_pending_transfer_responses()
+    else:
+        executor.disagg._check_transfer_errors("generation requests")
+    if executor.dist.rank == 0:
+        assert request is not None
+        (response,) = executor._response_channel.responses[request.py_request_id]
+        assert response.request_id == request.py_request_id and response.error_msg
+
+
 def _exercise_live_session(
     args: argparse.Namespace,
     transceiver: KvCacheTransceiverV2,
@@ -757,11 +797,14 @@ def _exercise_live_session(
     import torch
 
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+    from tensorrt_llm._torch.disaggregation.orchestration.cancellation import ReceiveCancellation
+    from tensorrt_llm.bindings import LlmRequestState
 
     role, case = args.role, args.case
     context_first = args.context_first
     peer_rank = transceiver._mapping.rank if context_first else 0
     kv_masked = context_first or case == "cancel_late_kv"
+    peer_first = case == "cancel_peer_first"
     expected_byte = 123 + peer_rank
     worker, manager = transceiver._transfer_worker, transceiver._kv_cache_manager
     rid, slot = args.unique_id, session.aux_slot
@@ -827,7 +870,7 @@ def _exercise_live_session(
 
     fatal_check.append(check_fatal)
     cancel_before_retirement = (role == "ctx" and context_first) or (
-        role == "gen" and not context_first
+        role == "gen" and not context_first and not peer_first
     )
 
     if case != "baseline":
@@ -860,15 +903,27 @@ def _exercise_live_session(
         )
         if case.startswith("cancel_"):
             assert retirement._request_deadline - time.monotonic() > _PHASE_TIMEOUT_S
-            # The other endpoint may already have sent cancellation after the gate.
-            # Local cancellation must preserve that first drain, not restart grace.
+            if role == "gen" and peer_first:
+                _wait(lambda: session.cancelled_by_peer, "GEN received CTX cancellation")
+            elif role == "ctx" and not peer_first:
+                rank_dirs = _evidence_directories(Path(args.directory), context_first)
+                _wait(
+                    lambda: all((path / "gen.cancelled.json").exists() for path in rank_dirs),
+                    "every active GEN rank accepted local cancellation",
+                )
             previous_drain = retirement._drain_started
             assert executor._try_cancel_request(request) is cancel_before_retirement
-            if role == "gen" and not context_first:
-                assert executor.disagg._retiring_gen_receives == {request.py_request_id: request}
-                executor._terminate_request(request)
-                retained()
             assert session.status == SessionStatus.CANCELLED, (session.status, retirement._reason)
+            if role == "gen":
+                assert session.cancelled_by_peer is peer_first
+                if not peer_first:
+                    _record(directory, "gen.cancelled")
+                if cancel_before_retirement:
+                    assert executor.disagg._retiring_gen_receives == {
+                        request.py_request_id: request
+                    }
+                    executor._terminate_request(request)
+                    retained()
             if previous_drain is not None:
                 assert retirement._drain_started == previous_drain
         elif case == "timeout_late_aux":
@@ -891,22 +946,40 @@ def _exercise_live_session(
             )
         retained()
         drain_started = session._retirement._drain_started
-        for _ in range(3):
+        for poll_index in range(3):
             if case.startswith("cancel_"):
-                assert executor._try_cancel_request(request) is cancel_before_retirement
-                if role == "gen" and not context_first:
+                # BF16 GEN commits its logical result at the receive vote,
+                # independently of the still-masked physical completion.
+                logical_cancel_ready = cancel_before_retirement or (
+                    role == "gen" and context_first and not peer_first and poll_index > 0
+                )
+                assert executor._try_cancel_request(request) is logical_cancel_ready
+                if role == "gen" and (not context_first or poll_index > 0):
+                    assert transceiver.cancel_gen_logically(request) is (
+                        ReceiveCancellation.FAILED if peer_first else ReceiveCancellation.CANCELLED
+                    )
+                    if peer_first:
+                        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+                        assert not executor.disagg._retiring_gen_receives
+                        assert not getattr(request, "py_kv_transfer_verified", False)
+                if role == "gen" and logical_cancel_ready:
+                    assert executor.disagg._retiring_gen_receives == {
+                        request.py_request_id: request
+                    }
                     executor._terminate_request(request)
                 assert session._retirement._drain_started == drain_started
             status = poll(0)
             assert not any(status)
             retained()
+        pool = _pool_state(manager)
+        assert pool["available"] == 0, "masked completion must keep the request's last slot pinned"
         _record(
             directory,
             f"{role}.retained",
             logical=session.status.name,
             addresses=addresses,
             native_submissions=len(submissions),
-            pool=_pool_state(manager),
+            pool=pool,
         )
         _wait(
             lambda: (directory / "report_ambiguous.json").exists(),
@@ -1012,8 +1085,21 @@ def _exercise_live_session(
     if context_first or case != "cancel_late_kv":
         assert all(bool(torch.all(region == expected_byte)) for region in regions)
 
-    assert executor._try_cancel_request(request)
-    executor._terminate_request(request)
+    assert not transceiver.has_inflight_transfer(request)
+    if case == "baseline":
+        if role == "gen":
+            assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            assert request.py_kv_receive_cancel_outcome is None
+            assert request.py_kv_receive_cancel_disposition is None
+        executor._terminate_request(request)
+    elif role == "gen" and peer_first:
+        assert executor._try_cancel_request(request)
+        assert transceiver.cancel_gen_logically(request) is ReceiveCancellation.FAILED
+        assert not getattr(request, "py_kv_transfer_verified", False)
+        _publish_peer_cancel_error(executor, request)
+    else:
+        assert executor._try_cancel_request(request)
+        executor._terminate_request(request)
     executor.disagg._retire_cancelled_gen_receives()
     assert request.py_request_id not in executor._prefetched_request_ids
     assert request.py_request_id not in executor._response_channel.result_wait_queues

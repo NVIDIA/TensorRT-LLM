@@ -128,6 +128,7 @@ class _ReceiveCase:
             py_request_id=_OLD_REQUEST,
             is_child=False,
             is_context_only_request=False,
+            is_generation_only_request=True,
             is_disagg_generation_transmission_in_progress=True,
             py_kv_transfer_start_time=self.now,
             py_kv_transfer_timed_out=False,
@@ -167,6 +168,7 @@ class _ReceiveCase:
         self.handle = TaskHandle(self.session, self.session._kv_tasks[0], token_end=1)
         assert self.handle.poll() is None
         self.transceiver = object.__new__(KvCacheTransceiverV2)
+        self.transceiver._init_receive_cancellation_state()
         self.transceiver._fp4_mla_bridge_enabled = ownership
         self.transceiver.kv_transfer_timeout_ms = 1000
         self.transceiver._ever_had_recv_session = True

@@ -1278,6 +1278,7 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
 
     sessions = {rid: session} if session is not None else {}
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._init_receive_cancellation_state()
     transceiver._pending_rank_info_admissions = None
     transceiver._context_first_ownership = False
     transceiver._wait_reqs = {}
