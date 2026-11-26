@@ -16,6 +16,7 @@ l0_cpu:
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_reporting.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_prefill_fullgraph.py
+  - test_unittests.py::test_mpi_profiler
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
@@ -141,6 +142,9 @@ l0_cpu:
   - unittest/_torch/sampler/test_stop_criteria.py
   - unittest/test_startup.py
   - unittest/test_unified_cache.py
+  - unittest/_torch/executor/test_profile_window_filenames.py
+  - unittest/_torch/executor/test_workflow_profiler.py
+  - unittest/test_profiler.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory

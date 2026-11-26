@@ -13,6 +13,19 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+add_tllm_gtest(
+  ncclProfilerUtilsTest
+  SOURCES
+  ncclProfilerUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  CUDA::cudart
+  CUDA::cuda_driver
+  OWNER
+  common
+  LABELS
+  "unit;common;thop;gpu")
+
 if(${BUILD_PYT})
   add_tllm_gtest(
     fmhaParamsTest
