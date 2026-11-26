@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import uuid
 from functools import wraps
 
 import openai
@@ -31,7 +32,6 @@ import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import is_sm_100f
-from test_common.etcd_utils import running_etcd
 
 from tensorrt_llm.logger import logger
 
@@ -522,6 +522,90 @@ def router(request):
     return request.param
 
 
+ETCD_START_ATTEMPTS = 3
+ETCD_READY_TIMEOUT_S = 30
+ETCD_STOP_TIMEOUT_S = 10
+
+
+def _stop_etcd(proc: subprocess.Popen, data_dir: str) -> None:
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=ETCD_STOP_TIMEOUT_S)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> None:
+    deadline = time.monotonic() + ETCD_READY_TIMEOUT_S
+    with requests.Session() as session:
+        session.trust_env = False
+        while True:
+            if proc.poll() is not None:
+                raise RuntimeError(f"etcd exited during startup with code {proc.returncode}")
+            try:
+                response = session.get(
+                    f"{client_url}/health",
+                    timeout=min(1.0, max(0.1, deadline - time.monotonic())),
+                    allow_redirects=False,
+                )
+                if response.status_code == 200:
+                    return
+            except requests.RequestException:
+                pass
+            if time.monotonic() >= deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"etcd exited during startup with code {proc.returncode}")
+                raise TimeoutError(
+                    f"Timed out after {ETCD_READY_TIMEOUT_S}s waiting for etcd to become healthy"
+                )
+            time.sleep(0.1)
+
+
+def _start_etcd(work_dir: str) -> tuple[subprocess.Popen, str, str]:
+    for attempt in range(1, ETCD_START_ATTEMPTS + 1):
+        data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
+        client_port = get_free_port()
+        peer_port = get_free_port()
+        client_url = f"http://127.0.0.1:{client_port}"
+        peer_url = f"http://127.0.0.1:{peer_port}"
+        proc = subprocess.Popen(
+            [
+                "etcd",
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                client_url,
+                "--advertise-client-urls",
+                client_url,
+                "--listen-peer-urls",
+                peer_url,
+                "--initial-advertise-peer-urls",
+                peer_url,
+                "--initial-cluster",
+                f"default={peer_url}",
+            ]
+        )
+        try:
+            _wait_for_etcd_ready(proc, client_url)
+            return proc, f"etcd://127.0.0.1:{client_port}", data_dir
+        except RuntimeError:
+            exited_early = proc.poll() is not None
+            _stop_etcd(proc, data_dir)
+            if exited_early and attempt < ETCD_START_ATTEMPTS:
+                logger.warning(
+                    f"etcd exited before becoming healthy on client={client_port} "
+                    f"peer={peer_port} (attempt {attempt}/{ETCD_START_ATTEMPTS}); "
+                    "retrying with fresh ports."
+                )
+                continue
+            raise
+        except BaseException:
+            _stop_etcd(proc, data_dir)
+            raise
+    raise AssertionError("unreachable")
+
+
 @pytest.fixture
 def service_discovery(request, disagg_port, work_dir):
     """Setup service discovery (etcd or http).
@@ -533,8 +617,11 @@ def service_discovery(request, disagg_port, work_dir):
         tuple: (process or None, uri string)
     """
     if request.param == "etcd":
-        with running_etcd(data_dir_root=work_dir, port_allocator=get_free_port) as etcd:
-            yield etcd.process, etcd.uri
+        etcd, uri, data_dir = _start_etcd(work_dir)
+        try:
+            yield etcd, uri
+        finally:
+            _stop_etcd(etcd, data_dir)
     else:
         yield None, f"http://localhost:{disagg_port}"
 

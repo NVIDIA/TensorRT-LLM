@@ -1,8 +1,7 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 import asyncio
 import contextlib
+import subprocess
+import tempfile
 import threading
 import time
 
@@ -10,7 +9,6 @@ import pytest
 import pytest_asyncio
 import uvicorn
 from fastapi import FastAPI
-from test_common.etcd_utils import running_etcd
 
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, StorageItem, WatchEvent, WatchEventType,
@@ -273,9 +271,13 @@ class TestEtcdClusterStorage(TestClusterStorage):
 
     @pytest.fixture(scope="class")
     def storage_server(self):
-        with running_etcd(extra_args=["--log-level", "debug"]) as etcd:
-            self.etcd = etcd.process
-            yield self.etcd, etcd.uri
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.etcd = subprocess.Popen(
+                ["etcd", "--data-dir", temp_dir, "--log-level", "debug"])
+            time.sleep(2)  # wait for etcd to start
+            yield self.etcd, "etcd://localhost:2379"
+        self.etcd.kill()
+        self.etcd.wait()
 
 
 @pytest.mark.asyncio

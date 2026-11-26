@@ -54,9 +54,6 @@ def wait_for_endpoint_ready(
     server_proc: subprocess.Popen | None = None,
     check_interval: float = 30.0,
     additional_server_procs: list[tuple[subprocess.Popen | None, str]] | None = None,
-    poll_interval: float = 1.0,
-    trust_env: bool = True,
-    allow_redirects: bool = True,
 ):
     """Poll ``url`` until it returns 200, failing fast and loudly otherwise.
 
@@ -67,56 +64,42 @@ def wait_for_endpoint_ready(
       - an error keyword appears in a ``check_files`` log (scanned every
         ``check_interval`` seconds; time-based rather than iteration-based);
       - ``timeout`` elapses without the endpoint becoming ready.
-
-    Set ``trust_env=False`` and ``allow_redirects=False`` for direct loopback
-    probes that must bypass environment HTTP proxies and reject redirects.
     """
     start = time.monotonic()
     next_file_check = start + check_interval
     missing_warned: set[str] = set()
-    with requests.Session() as session:
-        session.trust_env = trust_env
-        while time.monotonic() - start < timeout:
-            fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
-            for additional_proc, what in additional_server_procs or []:
-                fail_if_proc_died(additional_proc, what, check_files)
-
-            if check_files and time.monotonic() >= next_file_check:
-                next_file_check = time.monotonic() + check_interval
-                for check_file in check_files:
-                    if not os.path.exists(check_file):
-                        if check_file not in missing_warned:
-                            missing_warned.add(check_file)
-                            print(
-                                f"[WARNING] server log {check_file} does not exist "
-                                "(yet?); cannot scan it for errors"
-                            )
-                        continue
-                    error_lines = check_error(check_file)
-                    if error_lines:
-                        error_lines_str = ", ".join(
-                            [f"line {line_idx}: {line_str}" for line_idx, line_str in error_lines]
-                        )
-                        _fail_with_server_logs(
-                            f"Found error in server file {check_file}: {error_lines_str}",
-                            check_files,
-                        )
-            try:
-                time.sleep(poll_interval)
-                request_timeout = min(5.0, max(0.5, timeout - (time.monotonic() - start)))
-                if (
-                    session.get(
-                        url, timeout=request_timeout, allow_redirects=allow_redirects
-                    ).status_code
-                    == 200
-                ):
-                    print(f"endpoint {url} is ready")
-                    return
-            except Exception as err:
-                print(f"endpoint {url} is not ready, with exception: {err}")
+    while time.monotonic() - start < timeout:
         fail_if_proc_died(server_proc, "Server process (before becoming ready)", check_files)
         for additional_proc, what in additional_server_procs or []:
             fail_if_proc_died(additional_proc, what, check_files)
+
+        if check_files and time.monotonic() >= next_file_check:
+            next_file_check = time.monotonic() + check_interval
+            for check_file in check_files:
+                if not os.path.exists(check_file):
+                    if check_file not in missing_warned:
+                        missing_warned.add(check_file)
+                        print(
+                            f"[WARNING] server log {check_file} does not exist "
+                            "(yet?); cannot scan it for errors"
+                        )
+                    continue
+                error_lines = check_error(check_file)
+                if error_lines:
+                    error_lines_str = ", ".join(
+                        [f"line {line_idx}: {line_str}" for line_idx, line_str in error_lines]
+                    )
+                    _fail_with_server_logs(
+                        f"Found error in server file {check_file}: {error_lines_str}",
+                        check_files,
+                    )
+        try:
+            time.sleep(1)
+            if requests.get(url, timeout=5).status_code == 200:
+                print(f"endpoint {url} is ready")
+                return
+        except Exception as err:
+            print(f"endpoint {url} is not ready, with exception: {err}")
     _fail_with_server_logs(
         f"Endpoint {url} did not become ready within {timeout} seconds", check_files
     )

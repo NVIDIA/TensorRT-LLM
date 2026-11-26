@@ -20,9 +20,7 @@ import subprocess
 import time
 
 import requests
-from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import get_sm_version, llm_models_root
-from test_common.etcd_utils import running_etcd
 
 from tensorrt_llm.logger import logger
 
@@ -231,12 +229,24 @@ def cleanup_processes(processes):
                     pass
 
 
-def cleanup_etcd_data(endpoints=None, env=None):
+def start_etcd_server(working_dir, env=None) -> subprocess.Popen:
+    """Start etcd server."""
+    cmd = ["etcd"]
+
+    logger.info("Starting etcd server...")
+    process = subprocess.Popen(cmd,
+                               env=env,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               text=True,
+                               bufsize=1,
+                               cwd=working_dir)
+    return process
+
+
+def cleanup_etcd_data(env=None):
     """Clean up etcd data using etcdctl."""
-    cmd = ["etcdctl"]
-    if endpoints:
-        cmd.append(f"--endpoints={endpoints}")
-    cmd.extend(["del", "--prefix", "trtllm/"])
+    cmd = ["etcdctl", "del", "--prefix", "trtllm/"]
 
     logger.info("Cleaning etcd data...")
     result = subprocess.run(cmd,
@@ -252,7 +262,7 @@ def cleanup_etcd_data(endpoints=None, env=None):
         logger.warning(f"Failed to clean etcd data: {result.stderr}")
 
 
-def create_config_files(config, etcd_host="localhost", etcd_port=2379):
+def create_config_files(config):
     """Create necessary configuration files"""
     # Create context config file
     context_config_content = """pytorch_backend_config:
@@ -271,9 +281,9 @@ cache_transceiver_config:
         file.write(generation_config_content)
 
     # Create etcd config file
-    etcd_config_content = f"""server_type: "etcd"
-hostname: "{etcd_host}"
-port: {etcd_port}
+    etcd_config_content = """server_type: "etcd"
+hostname: "localhost"
+port: 2379
 health_check_timeout: 5.0"""
 
     with open(ETCD_CONFIG_FILE, 'w') as file:
@@ -304,120 +314,112 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
     cleanup_automated_output_files()
 
     config = {"model_path": "Qwen3/Qwen3-0.6B"}
+
+    # Create configuration files
+    create_config_files(config)
     processes = {}
 
     try:
         # Step 1: Start etcd server
         logger.info("Step 1: Starting etcd server...")
-        with running_etcd(port_allocator=get_free_port, env=env,
-                          cwd=".") as etcd:
-            # Create configuration files
-            create_config_files(config,
-                                etcd_host=etcd.client_host,
-                                etcd_port=etcd.client_port)
+        processes["etcd"] = start_etcd_server(".", env=env)
+        time.sleep(5)  # Give etcd time to start
 
-            # Step 2: Clean etcd data
-            logger.info("Step 2: Cleaning etcd data...")
-            cleanup_etcd_data(endpoints=etcd.client_url, env=env)
+        # Step 2: Clean etcd data
+        logger.info("Step 2: Cleaning etcd data...")
+        cleanup_etcd_data(env=env)
 
-            # Step 3: Start context server on GPU 0 (port 8001)
-            logger.info(
-                "Step 3: Starting context server on GPU 0 (port 8001)...")
-            processes["context_8001"] = start_context_server(config,
-                                                             gpu_id=0,
-                                                             port=8001,
-                                                             env=env)
+        # Step 3: Start context server on GPU 0 (port 8001)
+        logger.info("Step 3: Starting context server on GPU 0 (port 8001)...")
+        processes["context_8001"] = start_context_server(config,
+                                                         gpu_id=0,
+                                                         port=8001,
+                                                         env=env)
 
-            # Step 4: Start generation server on GPU 1 (port 8002)
-            logger.info(
-                "Step 4: Starting generation server on GPU 1 (port 8002)...")
-            processes["generation_8002"] = start_generation_server(config,
-                                                                   gpu_id=1,
-                                                                   port=8002,
-                                                                   env=env)
+        # Step 4: Start generation server on GPU 1 (port 8002)
+        logger.info(
+            "Step 4: Starting generation server on GPU 1 (port 8002)...")
+        processes["generation_8002"] = start_generation_server(config,
+                                                               gpu_id=1,
+                                                               port=8002,
+                                                               env=env)
 
-            # Step 5: Wait till gen and context ready
-            logger.info(
-                "Step 5: Waiting for context and generation servers to be ready..."
-            )
-            if not wait_for_server_health(port=8001):
-                logger.error("Context server on port 8001 failed to start")
-                return False
-            if not wait_for_server_health(port=8002):
-                logger.error("Generation server on port 8002 failed to start")
-                return False
+        # Step 5: Wait till gen and context ready
+        logger.info(
+            "Step 5: Waiting for context and generation servers to be ready...")
+        if not wait_for_server_health(port=8001):
+            logger.error("Context server on port 8001 failed to start")
+            return False
+        if not wait_for_server_health(port=8002):
+            logger.error("Generation server on port 8002 failed to start")
+            return False
 
-            # Step 6: Start disaggregated service
-            logger.info("Step 6: Starting disaggregated service...")
-            processes["disagg_service"] = start_disaggregated_service(config,
-                                                                      env=env)
+        # Step 6: Start disaggregated service
+        logger.info("Step 6: Starting disaggregated service...")
+        processes["disagg_service"] = start_disaggregated_service(config,
+                                                                  env=env)
 
-            # Step 7: Wait for disaggregated service and run first client test
-            logger.info(
-                "Step 7: Waiting for disaggregated service and running first client test..."
-            )
-            if not wait_for_server_health(port=8000):
-                logger.error("Disaggregated service failed to start")
-                return False
+        # Step 7: Wait for disaggregated service and run first client test
+        logger.info(
+            "Step 7: Waiting for disaggregated service and running first client test..."
+        )
+        if not wait_for_server_health(port=8000):
+            logger.error("Disaggregated service failed to start")
+            return False
 
-            first_test_success = run_client_test(config, env=env)
-            if not first_test_success:
-                logger.error("First client test failed")
-                return False
+        first_test_success = run_client_test(config, env=env)
+        if not first_test_success:
+            logger.error("First client test failed")
+            return False
 
-            # Step 8: Start second context server on GPU 2 (port 8003)
-            logger.info(
-                "Step 8: Starting second context server on GPU 2 (port 8003)..."
-            )
-            processes["context_8003"] = start_context_server(config,
-                                                             gpu_id=2,
-                                                             port=8003,
-                                                             env=env)
+        # Step 8: Start second context server on GPU 2 (port 8003)
+        logger.info(
+            "Step 8: Starting second context server on GPU 2 (port 8003)...")
+        processes["context_8003"] = start_context_server(config,
+                                                         gpu_id=2,
+                                                         port=8003,
+                                                         env=env)
 
-            # Step 9: Wait till ready and then 10 seconds, run second client test
-            logger.info(
-                "Step 9: Waiting for second context server and running second client test..."
-            )
-            if not wait_for_server_health(port=8003):
-                logger.error(
-                    "Second context server on port 8003 failed to start")
-                return False
+        # Step 9: Wait till ready and then 10 seconds, run second client test
+        logger.info(
+            "Step 9: Waiting for second context server and running second client test..."
+        )
+        if not wait_for_server_health(port=8003):
+            logger.error("Second context server on port 8003 failed to start")
+            return False
 
-            logger.info(
-                "Waiting additional 10 seconds for system stabilization...")
-            time.sleep(10)
+        logger.info("Waiting additional 10 seconds for system stabilization...")
+        time.sleep(10)
 
-            second_test_success = run_client_test(config, env=env)
-            if not second_test_success:
-                logger.error("Second client test failed")
-                return False
+        second_test_success = run_client_test(config, env=env)
+        if not second_test_success:
+            logger.error("Second client test failed")
+            return False
 
-            # Step 10: Kill 8001 process (first context server)
-            logger.info("Step 10: Killing first context server (port 8001)...")
-            if "context_8001" in processes:
-                process = processes["context_8001"]
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-            kill_server_by_port(8001)
+        # Step 10: Kill 8001 process (first context server)
+        logger.info("Step 10: Killing first context server (port 8001)...")
+        if "context_8001" in processes:
+            process = processes["context_8001"]
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        kill_server_by_port(8001)
 
-            # Step 11: Wait a few seconds and run final client test
-            logger.info(
-                "Step 11: Waiting a few seconds and running final client test..."
-            )
-            time.sleep(5)
+        # Step 11: Wait a few seconds and run final client test
+        logger.info(
+            "Step 11: Waiting a few seconds and running final client test...")
+        time.sleep(5)
 
-            final_test_success = run_client_test(config, env=env)
-            if not final_test_success:
-                logger.error("Final client test failed")
-                return False
+        final_test_success = run_client_test(config, env=env)
+        if not final_test_success:
+            logger.error("Final client test failed")
+            return False
 
-            logger.info(
-                "✅ All automated disaggregated tests passed successfully!")
-            return True
+        logger.info("✅ All automated disaggregated tests passed successfully!")
+        return True
 
     except Exception as e:
         logger.exception(f"Error during automated test: {e}")

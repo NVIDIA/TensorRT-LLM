@@ -17,8 +17,6 @@
 import ast
 import os
 import subprocess
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -368,80 +366,3 @@ def test_report_error_always_appends_tail_even_on_keyword_hit(tmp_path):
     msg = str(e.value)
     assert "Error line 1" in msg  # keyword context present
     assert "the actual fatal last words" in msg  # AND the tail
-
-
-def test_wait_for_endpoint_ready_ignores_env_proxy_when_trust_env_false(monkeypatch) -> None:
-    """Direct readiness probes must not be satisfied by an HTTP proxy returning 200."""
-
-    class AlwaysOkProxyHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.end_headers()
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), AlwaysOkProxyHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        proxy_url = f"http://127.0.0.1:{server.server_address[1]}"
-        monkeypatch.setenv("HTTP_PROXY", proxy_url)
-        monkeypatch.setenv("http_proxy", proxy_url)
-        monkeypatch.delenv("NO_PROXY", raising=False)
-        monkeypatch.delenv("no_proxy", raising=False)
-
-        with pytest.raises(RuntimeError, match="did not become ready within"):
-            wait_for_endpoint_ready(
-                DEAD_URL,
-                timeout=1,
-                poll_interval=0.1,
-                trust_env=False,
-                allow_redirects=False,
-            )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-def test_wait_for_endpoint_ready_rejects_redirects_when_disallowed() -> None:
-    """Direct readiness probes must not follow redirects to another 200 endpoint."""
-
-    class RedirectingHealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if self.path == "/health":
-                self.send_response(302)
-                self.send_header("Location", "/ok")
-                self.end_headers()
-            else:
-                self.send_response(200)
-                self.end_headers()
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectingHealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        health_url = f"http://127.0.0.1:{server.server_address[1]}/health"
-        with pytest.raises(RuntimeError, match="did not become ready within"):
-            wait_for_endpoint_ready(
-                health_url,
-                timeout=1,
-                poll_interval=0.1,
-                trust_env=False,
-                allow_redirects=False,
-            )
-        wait_for_endpoint_ready(
-            health_url,
-            timeout=2,
-            poll_interval=0.1,
-            trust_env=False,
-            allow_redirects=True,
-        )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)

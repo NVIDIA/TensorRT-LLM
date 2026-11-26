@@ -3,13 +3,14 @@
 
 import asyncio
 import secrets
+import subprocess
+import tempfile
 import time
 from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 from test_cluster_storage import http_server_storage
-from test_common.etcd_utils import running_etcd
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
@@ -168,11 +169,15 @@ def storage_server(config):
         with server.run_in_thread():
             yield cluster_storage, config.cluster_uri
     elif config.cluster_uri.startswith("etcd"):
-        with running_etcd(extra_args=["--log-level", "debug"]) as etcd:
-            config.cluster_uri = etcd.uri
+        with tempfile.TemporaryDirectory() as temp_dir:
+            etcd = subprocess.Popen(
+                ["etcd", "--data-dir", temp_dir, "--log-level", "debug"])
+            time.sleep(2)  # wait for etcd to start
             yield create_cluster_storage(
-                etcd.uri, config.cluster_name,
-                **config.cluster_storage_options()), etcd.uri
+                config.cluster_uri, config.cluster_name,
+                **config.cluster_storage_options()), config.cluster_uri
+        etcd.kill()
+        etcd.wait()
     else:
         raise ValueError(f"Invalid cluster storage URI: {config.cluster_uri}")
 

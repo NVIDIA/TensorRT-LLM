@@ -1,30 +1,64 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import contextlib
+import os
+import signal
+import socket
+import subprocess
+import time
 import unittest
 
 import pytest
-from test_common.etcd_utils import running_etcd
 
 from tensorrt_llm.serve.metadata_server import EtcdDictionary, etcd3
 
 pytestmark = pytest.mark.cpu_only
 
 
+def wait_for_port(host, port, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError(f"Timeout waiting for {host}:{port}")
+
+
+def start_etcd_server():
+    # Command to start etcd
+    etcd_cmd = ["etcd"]
+
+    # Start etcd in background
+    process = subprocess.Popen(
+        etcd_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setsid)  # This makes it run in a new process group
+
+    # Wait a bit for etcd to start
+
+    return process
+
+
+def stop_etcd_server(process):
+    # Kill the process group
+    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    process.wait()
+
+
 class TestEtcdDictionary(unittest.TestCase):
 
     def setUp(self):
-        self._stack = contextlib.ExitStack()
-        self.addCleanup(self._stack.close)
-
         # Start etcd server
-        etcd = self._stack.enter_context(running_etcd())
-        self.etcd_process = etcd.process
+        self.etcd_process = start_etcd_server()
 
         # Setup etcd connection parameters
-        self.host = etcd.client_host
-        self.port = etcd.client_port
+        self.host = "localhost"
+        self.port = 2379
+
+        wait_for_port(self.host, self.port)
 
         # Create a clean etcd client for test setup/teardown
         self.cleanup_client = etcd3.client(host=self.host, port=self.port)
@@ -38,6 +72,9 @@ class TestEtcdDictionary(unittest.TestCase):
     def tearDown(self):
         # Clean up test keys after each test
         self._cleanup_test_keys()
+
+        # Stop etcd server
+        stop_etcd_server(self.etcd_process)
 
     def _cleanup_test_keys(self):
         # Helper method to remove test keys
