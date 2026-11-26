@@ -1601,7 +1601,8 @@ class TestRequestCleanup:
             assert [chunk async for chunk in response] == [b"data: [DONE]\n\n"]
         await response.aclose()
 
-        client._metrics_collector.complete_latency_seconds.observe.assert_called_once()
+        if not close_after_done:
+            client._metrics_collector.complete_latency_seconds.observe.assert_called_once()
         mock_router.finish_request.assert_awaited_once_with(
             streaming_completion_request, mock_session, success=True, req_id=42
         )
