@@ -14,9 +14,11 @@
 # limitations under the License.
 """Unit tests for tool-schema validation on ChatCompletionRequest."""
 
+import msgspec
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm.serve.openai_client import _encode_request_body
 from tensorrt_llm.serve.openai_protocol import (
     TOOL_PARAM_MAX_ENUM_VALUES,
     ChatCompletionRequest,
@@ -24,6 +26,28 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_first_worker_request_preserves_calls_with_both_reasoning_fields():
+    calls = [
+        {
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {"name": "read", "arguments": argument},
+        }
+        for i, argument in enumerate(('{"path":"a.txt"}', '{"path":"b.txt"}'))
+    ]
+    message = {
+        "role": "assistant",
+        "content": "",
+        "reasoning": "Read both files.",
+        "reasoning_content": "Read both files.",
+        "tool_calls": calls,
+    }
+    request = ChatCompletionRequest(model="test-model", messages=[message])
+
+    body = msgspec.msgpack.decode(_encode_request_body(request))
+    assert body["messages"] == [message]
 
 
 def _enum_tool(enum_count: int, name: str = "pick") -> dict:
