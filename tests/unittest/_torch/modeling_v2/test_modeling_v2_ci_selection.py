@@ -12,8 +12,8 @@ class from. The rule maps paths, not names, so it is safe only while:
 * no code reaches into a target except the target itself and the family's
   ``routing.py``;
 * test directories mirror source directories: every target has accuracy tests in
-  ``accuracy/modeling_v2/<family>/<D>/``, and every accuracy directory names a
-  target;
+  ``accuracy/modeling_v2/<family>/<D>/`` (except the targets in
+  ``_WAIVED_ACCURACY_TARGETS``), and every accuracy directory names a target;
 * some test-db entry runs every modeling_v2 unit test, and some test-db or QA list
   entry runs every target's accuracy tests;
 * every dynamic import names a module the rule's import analysis can read.
@@ -244,6 +244,15 @@ def test_accuracy_directories_are_targets(repo: Path = _REPO):
 # An exemption is invalid as soon as routing or registry imports are introduced.
 _COMPONENT_ONLY_FAMILIES: set[str] = {"beam", "inkling2"}
 
+# Routed targets waived from having accuracy tests, as ``<family>/<target>``, with why no accuracy
+# test can run them. An entry is invalid once its target gains accuracy tests or is no longer routed.
+_WAIVED_ACCURACY_TARGETS: dict[str, str] = {
+    "kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8": (
+        "a disaggregated Helix CP8 generation server behind a DEP16 context server (24 Rubin GPUs "
+        "on six trays), which no CI stage or QA launcher can start"
+    ),
+}
+
 
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     """Every class a family's ``route`` returns lives in a target with accuracy tests.
@@ -253,6 +262,7 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     same way, and tests a family whole while one of its returns is unknown.
     """
     problems = []
+    waived = set()
     for family_dir in _families(repo):
         routing = family_dir / "routing.py"
         where = routing.relative_to(repo)
@@ -277,11 +287,23 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
                     f"{where}:{node.lineno}: returns something other than a name bound only by "
                     "`from .<D>.<module> import <Class>`, so its target is unknown"
                 )
+            elif f"{family_dir.name}/{target}" in _WAIVED_ACCURACY_TARGETS:
+                waived.add(f"{family_dir.name}/{target}")
             elif not (repo / _ACC / family_dir.name / target).is_dir():
                 problems.append(
                     f"{where}:{node.lineno}: {node.value.id} from {target}/ has no "
                     f"{_ACC}/{family_dir.name}/{target}/"
                 )
+    for key in sorted(_WAIVED_ACCURACY_TARGETS):
+        family = key.split("/")[0]
+        if not (repo / _PY / "models" / family).is_dir():
+            continue
+        if key not in waived:
+            problems.append(f"_WAIVED_ACCURACY_TARGETS: {key} is not a target its family routes to")
+        elif any((repo / _ACC / key).rglob("test_*.py")):
+            problems.append(
+                f"_WAIVED_ACCURACY_TARGETS: {key} has tests in {_ACC}/{key}/; remove the waiver"
+            )
     assert not problems, "\n".join(problems)
 
 
@@ -367,14 +389,6 @@ _NO_CI_STAGE = {
     ),
 }
 
-# Accuracy targets run on demand with a dedicated launcher outside the CI and QA stage lists.
-_NO_PLATFORM = {
-    "accuracy/modeling_v2/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix8": (
-        "a six-node Rubin disaggregated deployment with a DEP16 context worker "
-        "and a Helix8 generation worker"
-    ),
-}
-
 
 def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     """Every modeling_v2 test is in a list some job runs.
@@ -384,16 +398,12 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     deployments, run from the QA lists. Paths are in test-db form: unit tests relative
     to ``tests/``, accuracy tests relative to ``tests/integration/defs/``. Only paths
     are compared: the ``-m cpu_only`` and ``-m "not cpu_only"`` split between stages is
-    not checked. Unit tests under ``_NO_CI_STAGE`` and accuracy gates under
-    ``_NO_PLATFORM`` are exempt until a matching test list schedules them.
+    not checked. Unit tests under ``_NO_CI_STAGE`` are exempt until a stage can run them.
     """
     unit_root, accuracy_root = repo / "tests", repo / "tests/integration/defs"
     test_db = _test_db_entries(repo)
     any_list = test_db + _qa_entries(repo)
     unit_tests = [str(p.relative_to(unit_root)) for p in sorted((repo / _UNIT).rglob("test_*.py"))]
-    accuracy_tests = [
-        str(p.relative_to(accuracy_root)) for p in sorted((repo / _ACC).rglob("test_*.py"))
-    ]
     # An exemption outlives its reason once its tests move, vanish, or a list starts running them.
     stale = sorted(
         where
@@ -401,13 +411,7 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
         if not any(_at_or_under(t, where) for t in unit_tests)
         or any(_runs(e, t) for e in test_db for t in unit_tests if _at_or_under(t, where))
     )
-    stale += sorted(
-        where
-        for where in _NO_PLATFORM
-        if not any(_at_or_under(t, where) for t in accuracy_tests)
-        or any(_runs(e, t) for e in any_list for t in accuracy_tests if _at_or_under(t, where))
-    )
-    assert not stale, f"_NO_CI_STAGE / _NO_PLATFORM entries with no test or now listed: {stale}"
+    assert not stale, f"_NO_CI_STAGE entries with no test or now listed: {stale}"
     # Test-db path -> the test files that stand for it, and the entries that may run them.
     tests = {
         t: ([t], test_db)
@@ -417,12 +421,11 @@ def test_every_test_is_in_a_test_list(repo: Path = _REPO):
     for family_dir in _families(repo):
         for d in _targets(family_dir):
             accuracy = repo / _ACC / family_dir.name / d.name
-            key = str(accuracy.relative_to(accuracy_root))
-            if accuracy.is_dir() and key not in _NO_PLATFORM:
+            if accuracy.is_dir():
                 files = [
                     str(p.relative_to(accuracy_root)) for p in sorted(accuracy.rglob("test_*.py"))
                 ]
-                tests[key] = (files, any_list)
+                tests[str(accuracy.relative_to(accuracy_root))] = (files, any_list)
     unreached = [
         path
         for path, (files, entries) in tests.items()
