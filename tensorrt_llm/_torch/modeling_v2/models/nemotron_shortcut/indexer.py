@@ -259,6 +259,7 @@ class IndexState:
         self.nvfp4_kv = nvfp4_kv
         self._layout: _Layout | None = None
         self._rows: torch.Tensor | None = None
+        self._width = 0
         self._buffers: _DecodeBuffers | None = None
 
     def bind(self, md, device: torch.device) -> None:
@@ -266,6 +267,7 @@ class IndexState:
         rows = md.max_num_sequences * (1 + (md.max_total_draft_tokens or 0))
         width = md.max_seq_len
         self._rows = torch.arange(rows, dtype=torch.int32, device=device)
+        self._width = width
         if width <= self.topk:
             self._buffers = None
             return
@@ -368,6 +370,12 @@ class IndexState:
             raise RuntimeError("IndexState.bind must run before decoding")
         if n_rows > self._rows.numel():
             raise ValueError(f"{n_rows} generation rows exceed the reserved index buffers")
+        # A cache manager clamps its sequence limit to its pool, so two managers can differ.
+        if md.max_seq_len > self._width:
+            raise ValueError(
+                f"The cache manager admits {md.max_seq_len} tokens per sequence, but the "
+                f"index buffers were bound for {self._width}"
+            )
         width_per_request = generation_width(n_rows, md.num_seqs)
         layout = self._cache_layout(md)
         rows = self._rows[:n_rows]
