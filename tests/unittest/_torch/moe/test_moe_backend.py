@@ -4964,6 +4964,90 @@ def test_sm107_genphase_defaults_are_decode_tactics() -> None:
 
 
 @pytest.mark.cpu_only
+def test_sm107_glm52_genphase_rows_apply_to_their_key_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    def key(world_size: int, experts: int, capacity: int, **fields: Any) -> Tuple:
+        return megamoe_op._megamoe_problem_key(
+            **{
+                **dict(
+                    sm_version=107,
+                    world_size=world_size,
+                    num_topk=8,
+                    num_experts_per_rank=experts,
+                    hidden_size=6144,
+                    intermediate_size_per_partition=2048,
+                    expand_intermediate_size_per_partition=4096,
+                    max_tokens_per_rank=capacity,
+                    output_dtype=torch.bfloat16,
+                    apply_topk_in_fc1=True,
+                    gate_up_clamp=None,
+                    situ_beta=None,
+                    situ_linear_beta=None,
+                    in_kernel_fc2_reduce=False,
+                    combine_format="bf16",
+                ),
+                **fields,
+            }
+        )
+
+    def default(problem_key: Tuple) -> Tuple:
+        return megamoe_op._default_megamoe_tactic_for_key(problem_key, num_tokens=problem_key[7])
+
+    def bucket_entry(capacity: int) -> Tuple:
+        bucket = megamoe_op._sm107_tactic_bucket(capacity)
+        return megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
+
+    row = megamoe_op._unpack_tactic(
+        (
+            [256, 128, 256],
+            [4, 1, 1],
+            None,
+            ("decode", 27),
+            "atomic_counter",
+            "epi_warps",
+            True,
+            1,
+            1,
+            (1, 1),
+        )
+    )
+    # The row keys on the bucket: any capacity that rounds up to 384 or 512 takes it.
+    for capacity in (300, 384, 400, 512):
+        assert default(key(4, 64, capacity)) == row, capacity
+    # Neighbouring buckets keep their bucket entry.
+    for capacity in (128, 256, 1024):
+        assert default(key(4, 64, capacity)) == bucket_entry(capacity), capacity
+    # The rows are measured at EP4 (64 experts per rank) only: EP8 and EP16 (32 and 16 experts per
+    # rank) and other shape fields keep the bucket entry.
+    for capacity in (384, 512):
+        for world_size, experts in ((8, 32), (16, 16)):
+            assert default(key(world_size, experts, capacity)) == bucket_entry(capacity)
+        assert default(key(4, 64, capacity, apply_topk_in_fc1=False)) == bucket_entry(capacity)
+        assert default(key(4, 64, capacity, gate_up_clamp=10.0)) == bucket_entry(capacity)
+        assert default(key(4, 64, capacity, sm_version=103))[3][0] != "decode"
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner(
+        local_rank=0,
+        output_dtype=torch.bfloat16,
+        world_size=4,
+        num_topk=8,
+        num_experts_per_rank=64,
+        hidden_size=6144,
+        intermediate_size_per_partition=2048,
+        expand_intermediate_size_per_partition=4096,
+        max_tokens_per_rank=384,
+        apply_topk_in_fc1=True,
+    )
+    # The default runs the row, and autotuning offers it.
+    assert runner._default_tactic(384) == row
+    assert row in runner.get_valid_tactics([torch.empty(384, 1)], None)
+
+
+@pytest.mark.cpu_only
 def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5046,6 +5130,59 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
     warnings.clear()
     megamoe_op.query_megamoe_kernel_properties(**query, combine_format="16e2m1xbf16")
     assert built == [("generic", tuple(nonbulk[3]))] and not warnings
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("in_kernel_fc2_reduce", [True, False])
+def test_megamoe_blackwell_refuses_the_persistent_reduce_with_the_in_kernel_reduce(
+    monkeypatch: pytest.MonkeyPatch, in_kernel_fc2_reduce: bool
+) -> None:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    import cutlass.utils
+
+    from tensorrt_llm._torch.moe.kernels import megamoe_kernels
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc
+
+    built = []
+
+    class PersistentReduce(megamoe_kernels.BlackwellInferenceMegaMoE):
+        # The op never requests the persistent reduce; ask for it on every build.
+        def __init__(self, problem_desc: Any, impl_desc: Any) -> None:
+            super().__init__(problem_desc, ImplDesc({**impl_desc, "topk_reduce_persistent": True}))
+            built.append(self)
+
+    monkeypatch.setattr(megamoe_kernels, "BlackwellInferenceMegaMoE", PersistentReduce)
+    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 100)
+    # Construction only: the cluster occupancy and the persistent grid's SM count need a device.
+    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 148 // size)
+    monkeypatch.setattr(
+        cutlass.utils,
+        "HardwareInfo",
+        lambda: SimpleNamespace(get_device_multiprocessor_count=lambda: 148),
+    )
+    query = dict(
+        world_size=4,
+        num_topk=6,
+        num_experts_per_rank=96,
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=64,
+        gate_up_clamp=10.0,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+    )
+    if in_kernel_fc2_reduce:
+        # The in-kernel reduce has no separate reduce to schedule, so the pair is refused
+        # rather than built without the persistent reduce.
+        with pytest.raises(ValueError, match="reduce_topk_in_kernel has none"):
+            megamoe_op.query_megamoe_kernel_properties(**query)
+        assert not built
+    else:
+        megamoe_op.query_megamoe_kernel_properties(**query)
+        assert built and all(kernel.topk_reduce_persistent for kernel in built)
 
 
 @pytest.mark.gpu

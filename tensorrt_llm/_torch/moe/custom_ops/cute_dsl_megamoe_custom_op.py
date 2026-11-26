@@ -910,6 +910,58 @@ def _sm107_tactic_bucket(max_tokens_per_rank: int) -> Optional[int]:
     return None
 
 
+# Generation-phase rows of single shapes, keyed by the full runner key with max_tokens_per_rank
+# normalized to its bucket; they replace the bucket entry above for that key only. GLM 5.2 at EP4
+# (64 experts per rank, top-8, hidden 6144, intermediate 2048, top-k weights at FC1): the decode
+# tactic measured fastest at 384 and 512 tokens per rank on VR200.
+def _sm107_glm52_problem_key(world_size: int, num_experts_per_rank: int, bucket: int) -> Tuple:
+    return (
+        107,
+        world_size,
+        8,
+        num_experts_per_rank,
+        6144,
+        2048,
+        4096,
+        bucket,
+        str(torch.bfloat16),
+        True,
+        None,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+
+
+_SM107_GENPHASE_SHAPE_TACTICS: dict[Tuple, Tuple] = {
+    _sm107_glm52_problem_key(4, 64, bucket): (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("decode", 27),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 1),
+    )
+    for bucket in (384, 512)
+}
+
+
+def _sm107_genphase_shape_tactic(problem_key: Tuple) -> Optional[Tuple]:
+    """Generation-phase row of ``problem_key``'s shape at its bucket, or None."""
+    bucket = _sm107_tactic_bucket(problem_key[7]) if problem_key[0] == 107 else None
+    if bucket is None:
+        return None
+    return _SM107_GENPHASE_SHAPE_TACTICS.get(problem_key[:7] + (bucket,) + problem_key[8:])
+
+
 def _sm107_use_in_kernel_fc2_reduce(
     max_tokens_per_rank: int, apply_topk_in_fc1: bool = True
 ) -> bool:
@@ -988,6 +1040,7 @@ def _default_megamoe_tactic_for_problem(
     in_kernel_fc2_reduce: bool,
     combine_format: str,
     shape_tuned_tactic: Optional[Tuple] = None,
+    genphase_shape_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
         if sm_version == 107:
@@ -1005,6 +1058,8 @@ def _default_megamoe_tactic_for_problem(
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
             return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        if genphase_shape_tactic is not None:
+            return _unpack_tactic(genphase_shape_tactic)
         return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
         return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
@@ -1025,6 +1080,7 @@ def _default_megamoe_tactic_for_key(
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
         shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
+        genphase_shape_tactic=_sm107_genphase_shape_tactic(problem_key),
     )
     if combine_dedup and _sm107_default_combine_dedup(problem_key):
         return _with_combine_dedup(tactic)
@@ -2900,11 +2956,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            default_tactic = _shape_tuned_megamoe_tactic(self._tactic_lookup_key())
-            if default_tactic is not None:
-                default_tactic = _unpack_tactic(default_tactic)
-                if default_tactic not in candidates:
-                    candidates.append(default_tactic)
+            for default_tactic in (
+                _shape_tuned_megamoe_tactic(self._tactic_lookup_key()),
+                _sm107_genphase_shape_tactic(self._tactic_lookup_key()),
+            ):
+                if default_tactic is not None:
+                    default_tactic = _unpack_tactic(default_tactic)
+                    if default_tactic not in candidates:
+                        candidates.append(default_tactic)
             # The provider fits a dedup default and its non-dedup base (see
             # query_megamoe_kernel_properties); no other dedup tactic is sized for.
             if _sm107_default_combine_dedup(self.unique_id()):
