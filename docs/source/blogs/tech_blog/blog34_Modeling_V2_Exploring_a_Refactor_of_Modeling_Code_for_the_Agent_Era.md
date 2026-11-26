@@ -251,7 +251,7 @@ Kimi K3 was optimized in Modeling V1 for months. Its Modeling V1 implementation 
 
 Kimi K3.1 has the same backbone as K3. It adds a [DeepSeek sparse-attention](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md) indexer on every MLA layer and ships its own DFlash2 drafter. On day 0, we served K3.1 with the Modeling V1 K3 implementation and the K3 drafter.
 
-**An agent then moved the model to Modeling V2 in three days.** We consider this a short time for a model this heavily optimized, and it matches what we expected from Modeling V2. In Modeling V2, an optimization is code inside a ModelCore directory, not a change spread across shared modules. Moving the model therefore meant carrying those optimizations into the new family, with no review of shared modules and no change to the Modeling V1 code that other models depend on. On top of this, the agent added the DSA indexer and DFlash2.
+An agent then moved the model to Modeling V2 in three days. We consider this a short time for a model this heavily optimized, and it matches what we expected from Modeling V2. In Modeling V2, an optimization is code inside a ModelCore directory, not a change spread across shared modules. Moving the model therefore meant carrying those optimizations into the new family, with no review of shared modules and no change to the Modeling V1 code that other models depend on. On top of this, the agent added the DSA indexer and DFlash2.
 
 Figure 2 shows the result on GB300. At about 185 tok/s/user, throughput per GPU rose from 8.6k to 14.1k tokens/s (+64%). At about 76 tok/s/user, it rose from 18.8k to 28.9k (+54%), with one third fewer GPUs. K3.1 has no Modeling V1 implementation: all of its work lives in Modeling V2.
 
