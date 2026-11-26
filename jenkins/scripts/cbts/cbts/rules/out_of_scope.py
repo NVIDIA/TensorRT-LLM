@@ -51,6 +51,8 @@ OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (
     ".coderabbit.yaml",
     ".nspect-allowlist.toml",
     "scripts/bandit.yaml",
+    # Temporary for PR #22949: let a test change exercise CBTS shard rebalancing.
+    "jenkins/L0_Test.groovy",
     "jenkins/license_cpp.json",
     "legacy-files.txt",
     "ruff-legacy.toml",
