@@ -37,6 +37,7 @@ _WORKER_TIMEOUT = 300
 def _run_worker(
     connection: Connection,
     gpu: str,
+    ucx_env: dict[str, str],
     model: str,
     disaggregated: bool,
     beam_width: int,
@@ -50,7 +51,7 @@ def _run_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
     os.environ["TLLM_KV_CACHE_MANAGER_V2_BACKEND"] = "cpp"
-    os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+    os.environ.update(ucx_env)
 
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
@@ -124,11 +125,24 @@ def _worker(
     *,
     disaggregated: bool,
 ) -> Iterator[tuple[Connection, BaseProcess]]:
+    # Imported here, not at module level: the spawned child re-imports this
+    # module, and defs.common imports tensorrt_llm, which runs MPI_Init before
+    # _run_worker has set up the child's environment.
+    from defs.common import single_host_ucx_env
+
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(
         target=_run_worker,
-        args=(child, gpu, model, disaggregated, beam_width, enable_block_reuse),
+        args=(
+            child,
+            gpu,
+            single_host_ucx_env(),
+            model,
+            disaggregated,
+            beam_width,
+            enable_block_reuse,
+        ),
         name=f"beam-{'disagg' if disaggregated else 'aggregate'}-gpu-{gpu}",
     )
     process.start()
