@@ -24,7 +24,6 @@
 #include "userbuffersTensor.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
-#include <cuda.h>
 #include <torch/extension.h>
 #include <unordered_map>
 
@@ -43,31 +42,14 @@ using tensorrt_llm::common::CublasMMWrapper;
 
 using cublas_lut::AlgoListType;
 
-CUcontext getCurrentCudaContext()
-{
-    CUcontext context{};
-    CUresult result = cuCtxGetCurrent(&context);
-    if (result == CUDA_ERROR_NOT_INITIALIZED || context == nullptr)
-    {
-        TLLM_CUDA_CHECK(cudaFree(nullptr));
-        result = cuCtxGetCurrent(&context);
-    }
-    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "cuCtxGetCurrent failed with error %d", result);
-    TLLM_CHECK_WITH_INFO(context != nullptr, "Current CUDA context is null");
-    return context;
-}
-
-// Each locality domain runs under its own green CUDA context, so the wrapper
-// cannot be a single thread-local instance.
+// PyTorch keeps one cuBLAS handle per thread and device, so a thread needs one wrapper per device.
 std::shared_ptr<CublasMMWrapper> getCublasWrapper()
 {
-    thread_local std::unordered_map<CUcontext, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
-    auto& cublasWrapper = cublasWrappers[getCurrentCudaContext()];
+    thread_local std::unordered_map<c10::DeviceIndex, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
+    auto& cublasWrapper = cublasWrappers[c10::cuda::current_device()];
     if (!cublasWrapper)
     {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+        cublasWrapper = makeCublasWrapperForCurrentThread();
     }
 
     return cublasWrapper;

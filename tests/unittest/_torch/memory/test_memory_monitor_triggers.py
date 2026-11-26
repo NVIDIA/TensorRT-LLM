@@ -375,8 +375,7 @@ _NCCL_CUDA_ERROR = (
         "CUDA driver error: CUDA_ERROR_OUT_OF_MEMORY",
         _TORCH_OOM,
         "[TensorRT-LLM][ERROR] CUBLAS_STATUS_ALLOC_FAILED",
-        "Failed to create cublas handle. Status: 3, Context: 0x5a1, Free Memory: 12 MB "
-        "(0.0%), Total: 81559 MB. Consider reducing kv_cache_config.free_gpu_memory_fraction.",
+        "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
     ],
 )
 def test_device_out_of_memory_messages_are_reported(armed, message):
@@ -393,7 +392,6 @@ def test_device_out_of_memory_messages_are_reported(armed, message):
         "error",
         "",
         None,
-        "Failed to create cublas handle. Status: 1, Context: 0x5a1, Free Memory: 40000 MB",
         # Host memory, not the GPU's.
         "cuMemHostRegister failed: out of memory",
         "HostOOMError: Host out of memory",

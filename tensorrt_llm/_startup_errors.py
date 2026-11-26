@@ -58,7 +58,7 @@ _UNSUPPORTED_RE = re.compile(
 # failed cudaMalloc, the KV cache manager and the C library (ENOMEM).
 _ANY_OOM_RE = re.compile(
     r"out of memory|OUT_OF_MEMORY|cudaErrorMemoryAllocation|OutOfMemoryError|OOMError"
-    r"|Cannot allocate memory|CUBLAS_STATUS_ALLOC_FAILED|Failed to create cublas handle\. Status: 3\b"
+    r"|Cannot allocate memory|CUBLAS_STATUS_ALLOC_FAILED"
     r"|unhandled cuda error",
     re.IGNORECASE,
 )

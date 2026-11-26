@@ -39,7 +39,7 @@ class TrtllmAttention : public AttentionBase, private Features...
 {
 public:
     /// Derives the device constants and the plain layer geometry. Does no CUDA work:
-    /// runners and the cuBLAS handle are created on the first call of each phase, which
+    /// runners and the cuBLAS wrapper are created on the first call of each phase, which
     /// keeps construction legal while a stream is capturing.
     explicit TrtllmAttention(AttentionBase const& key)
         : AttentionBase(key)
@@ -304,7 +304,7 @@ private:
     template <typename T>
     void runGenerationImpl(FmhaParams& p);
 
-    /// CUDA-side state both phases share (cuBLAS handle, env caches); runs once, from
+    /// CUDA-side state both phases share (cuBLAS wrapper, env caches); runs once, from
     /// whichever init hook comes first.
     void initShared();
 

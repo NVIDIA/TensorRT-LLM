@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
@@ -25,6 +24,10 @@
 #include "tensorrt_llm/kernels/lora/loraGroupGEMMParamFillRowReorderFusion.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveScan.h"
 #include "tensorrt_llm/thop/thUtils.h"
+
+#include <c10/cuda/CUDAGuard.h>
+
+#include <unordered_map>
 
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
@@ -68,7 +71,8 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    at::cuda::CUDAGuard deviceGuard(input.device());
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device()).stream();
     auto const numReqs = lora_ranks[0].sizes()[0];
     auto const out_shape = input.sizes();
     int const numLoraModules = lora_ranks.size();
@@ -142,13 +146,13 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         }
     }
 
-    thread_local std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> cublasWrapper;
+    // PyTorch keeps one cuBLAS handle per thread and device, so a thread needs one wrapper per device.
+    thread_local std::unordered_map<c10::DeviceIndex, std::shared_ptr<tensorrt_llm::common::CublasMMWrapper>>
+        cublasWrappers;
+    auto& cublasWrapper = cublasWrappers[c10::cuda::current_device()];
     if (cublasWrapper == nullptr)
     {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper
-            = std::make_shared<tensorrt_llm::common::CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+        cublasWrapper = makeCublasWrapperForCurrentThread();
     }
 
     int const inHiddenSize = input.sizes()[input.sizes().size() - 1];

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -28,6 +29,7 @@
 #include <torch/script.h>
 
 #include <cstdio>
+#include <memory>
 
 #define CHECK_TYPE(x, st)                                                                                              \
     TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
@@ -94,6 +96,15 @@ int nextPowerOfTwo(int v);
 std::optional<float> getFloatEnv(char const* name);
 
 cudaDataType_t convert_torch_dtype(torch::ScalarType dtype);
+
+//! Creates a CublasMMWrapper on the calling thread's PyTorch cuBLAS and cuBLASLt handles for the current device. Use
+//! the wrapper only on this thread and device: PyTorch gives a thread's handles to another thread once it exits.
+inline std::unique_ptr<tensorrt_llm::common::CublasMMWrapper> makeCublasWrapperForCurrentThread()
+{
+    // setup=false: PyTorch need not set its stream, workspace and math mode; the wrapper sets what each call needs.
+    return std::make_unique<tensorrt_llm::common::CublasMMWrapper>(at::cuda::getCurrentCUDABlasHandle(/*setup=*/false),
+        at::cuda::getCurrentCUDABlasLtHandle(), /*stream=*/nullptr, /*workspace=*/nullptr);
+}
 
 } // namespace torch_ext
 

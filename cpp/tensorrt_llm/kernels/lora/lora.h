@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,8 +58,6 @@ private:
     tensorrt_llm::DataType mType;
     int mNumLoraModules;
 
-    // @fixme: seems this is shared across multiple clones.
-    // If we deep copy the wrapper inside clone(), then we may avoid the mutex inside the wrapper?
     CublasGemmWrapperPtr mCublasWrapper;
 
     int mInHiddenSize;

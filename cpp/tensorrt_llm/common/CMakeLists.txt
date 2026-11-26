@@ -139,9 +139,8 @@ target_compile_features(tllm_common_nccl_comm PUBLIC cxx_std_20)
 set_target_properties(tllm_common_nccl_comm PROPERTIES POSITION_INDEPENDENT_CODE
                                                        ON)
 
-add_library(
-  common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu mcastDevMemUtils.cpp
-                    opUtils.cpp safetensors.cpp sageQuant.cu)
+add_library(common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu
+                              mcastDevMemUtils.cpp safetensors.cpp sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","

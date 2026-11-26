@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,23 +30,16 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
-CublasMMWrapper::CublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle,
-    std::shared_ptr<cublasLtHandle_t> cublasltHandle, cudaStream_t stream, void* workspace)
+CublasMMWrapper::CublasMMWrapper(
+    cublasHandle_t cublasHandle, cublasLtHandle_t cublasLtHandle, cudaStream_t stream, void* workspace)
     : mCublasHandle(cublasHandle)
-    , mCublasLtHandle(cublasltHandle)
+    , mCublasLtHandle(cublasLtHandle)
     , mStream(stream)
     , mCublasWorkspace(workspace)
 {
 }
 
 CublasMMWrapper::~CublasMMWrapper() {}
-
-CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
-    : mCublasHandle(wrapper.mCublasHandle)
-    , mCublasLtHandle(wrapper.mCublasLtHandle)
-    , mStream(wrapper.mStream)
-{
-}
 
 void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, int const lda, int const ldb, int const ldc, int8_t fastAcc)
@@ -219,11 +212,11 @@ void CublasMMWrapper::Gemm(cublasOperation_t transa, cublasOperation_t transb, i
     }
     else
     {
-        check_cuda_error(cublasSetStream(getCublasHandle(), mStream));
-        check_cuda_error(cublasSetWorkspace(getCublasHandle(), mCublasWorkspace, workspaceSize));
+        prepareCublasHandle();
+        check_cuda_error(cublasSetWorkspace(mCublasHandle, mCublasWorkspace, workspaceSize));
         // Go with default heuristic to choose tactic as cuBLAS does not allow to choose tactics in Ampere+
         cublasGemmAlgo_t cublasAlgo = CUBLAS_GEMM_DEFAULT;
-        check_cuda_error(cublasGemmEx(getCublasHandle(), transa, transb, m, n, k, alpha, A, mAType, lda, B, mBType, ldb,
+        check_cuda_error(cublasGemmEx(mCublasHandle, transa, transb, m, n, k, alpha, A, mAType, lda, B, mBType, ldb,
             beta, C, mCType, ldc, mComputeType, static_cast<cublasGemmAlgo_t>(cublasAlgo)));
         sync_check_cuda_error(mStream);
     }
@@ -241,8 +234,9 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);
 
-    check_cuda_error(cublasGemmStridedBatchedEx(getCublasHandle(), transa, transb, m, n, k, alpha, A, mAType, lda,
-        strideA, B, mBType, ldb, strideB, beta, C, mCType, ldc, strideC, batchCount, mComputeType,
+    prepareCublasHandle();
+    check_cuda_error(cublasGemmStridedBatchedEx(mCublasHandle, transa, transb, m, n, k, alpha, A, mAType, lda, strideA,
+        B, mBType, ldb, strideB, beta, C, mCType, ldc, strideC, batchCount, mComputeType,
         mAType == CUDA_R_32F ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
@@ -258,9 +252,17 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
     void const* alpha = isFp16ComputeType ? reinterpret_cast<void*>(&h_alpha) : reinterpret_cast<void const*>(&f_alpha);
     void const* beta = isFp16ComputeType ? reinterpret_cast<void*>(&h_beta) : reinterpret_cast<void const*>(&f_beta);
 
-    check_cuda_error(cublasGemmStridedBatchedEx(getCublasHandle(), transa, transb, m, n, k, alpha, A, AType, lda,
-        strideA, B, BType, ldb, strideB, beta, C, CType, ldc, strideC, batchCount, computeType,
+    prepareCublasHandle();
+    check_cuda_error(cublasGemmStridedBatchedEx(mCublasHandle, transa, transb, m, n, k, alpha, A, AType, lda, strideA,
+        B, BType, ldb, strideB, beta, C, CType, ldc, strideC, batchCount, computeType,
         mAType == CUDA_R_32F ? CUBLAS_GEMM_DEFAULT : CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+void CublasMMWrapper::prepareCublasHandle()
+{
+    check_cuda_error(cublasSetStream(mCublasHandle, mStream));
+    check_cuda_error(cublasSetMathMode(mCublasHandle, CUBLAS_DEFAULT_MATH));
+    check_cuda_error(cublasSetPointerMode(mCublasHandle, CUBLAS_POINTER_MODE_HOST));
 }
 
 void CublasMMWrapper::setWorkspace(void* workspace)

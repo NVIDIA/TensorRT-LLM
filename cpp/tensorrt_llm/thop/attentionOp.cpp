@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/attentionVariant.h"
+#include "tensorrt_llm/thop/thUtils.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -1016,8 +1017,6 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         kv_scale_cache_buffer = buffers.kvScaleCacheBuffer;
     }
 
-    auto cublasHandle = mCublasWrapper->getCublasHandle();
-    TLLM_CUDA_CHECK(cublasSetStream(cublasHandle, stream));
     mCublasWrapper->setStream(stream);
     mCublasWrapper->setWorkspace(p.getWorkspace());
     if constexpr (std::is_same_v<T, half>)
@@ -2196,7 +2195,7 @@ void MHA::initShared()
     // Reading these caches the parsed values, keeping getenv() off the per-call path.
     getEnvMmhaMultiblockDebug();
     getEnvMmhaBlocksPerSequence();
-    mCublasWrapper.reset(new tc::CublasMMWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr));
+    mCublasWrapper = makeCublasWrapperForCurrentThread();
 #ifdef SKIP_SOFTMAX_STAT
     mDefaultSkipSoftmaxStat = at::zeros({2}, at::TensorOptions().dtype(at::kUInt32).device(at::kCUDA));
 #endif

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,11 +30,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
+//! Runs cuBLAS / cuBLASLt GEMMs on handles it does not own. The handles belong to one thread and one device, and
+//! whoever owns them may change their state between calls. Use a wrapper only on that thread, with that device current.
 class CublasMMWrapper
 {
 protected:
-    std::shared_ptr<cublasHandle_t> mCublasHandle;
-    std::shared_ptr<cublasLtHandle_t> mCublasLtHandle;
+    cublasHandle_t mCublasHandle;
+    cublasLtHandle_t mCublasLtHandle;
 
     cudaDataType_t mAType{};
     cudaDataType_t mBType{};
@@ -57,13 +59,19 @@ private:
         return mOperationDesc != NULL && mADesc != NULL && mBDesc != NULL && mCDesc != NULL;
     }
 
+    //! Puts the shared handle in the state a cuBLAS (non-Lt) call here expects: this wrapper's stream, the default math
+    //! mode (no TF32) and host pointer mode. Setting the stream also puts back the handle's default workspace; a call
+    //! with a workspace of its own sets it afterwards. cuBLASLt calls take the stream and workspace as arguments and
+    //! need no preparation.
+    void prepareCublasHandle();
+
 public:
-    CublasMMWrapper(std::shared_ptr<cublasHandle_t> cublasHandle, std::shared_ptr<cublasLtHandle_t> cublasLtHandle,
-        cudaStream_t stream, void* workspace);
+    CublasMMWrapper(cublasHandle_t cublasHandle, cublasLtHandle_t cublasLtHandle, cudaStream_t stream, void* workspace);
 
     ~CublasMMWrapper();
 
-    CublasMMWrapper(CublasMMWrapper const& wrapper);
+    CublasMMWrapper(CublasMMWrapper const&) = delete;
+    CublasMMWrapper& operator=(CublasMMWrapper const&) = delete;
 
     /********************** GEMMs **********************/
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k, void const* A,
@@ -153,14 +161,9 @@ public:
     void setBiasDescriptor(void* bias);
     void destroyDescriptors();
 
-    cublasHandle_t getCublasHandle()
-    {
-        return *(this->mCublasHandle);
-    }
-
     cublasLtHandle_t getCublasLtHandle() const
     {
-        return *(this->mCublasLtHandle);
+        return mCublasLtHandle;
     }
 
     cublasLtMatmulDesc_t getOperationDesc() const

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -155,11 +155,6 @@ std::unordered_map<tensorrt_llm::DataType, ncclDataType_t>* getDtypeMap();
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
-
-//! To save GPU memory, all the plugins share the same cublas and cublasLt handle globally.
-//! Get cublas and cublasLt handle for current cuda context
-std::shared_ptr<cublasHandle_t> getCublasHandle();
-std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 
 TRTLLM_NAMESPACE_END
 

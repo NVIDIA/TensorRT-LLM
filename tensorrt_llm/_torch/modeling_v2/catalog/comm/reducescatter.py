@@ -13,7 +13,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .._op import Arch, Cell, OpWrapper
 
 #: The dtypes whose NCCL mapping performs the sum the caller means by it.
-#: `getDtypeMap` in `cpp/tensorrt_llm/common/opUtils.cpp` is the whole table:
+#: `getDtypeMap` in `cpp/tensorrt_llm/common/ncclCommUtils.cpp` is the whole table:
 #: these entries land on a native NCCL float or int type, so `ncclSum` is a
 #: float or integer sum of the values. Every other entry, and every dtype the
 #: table omits, is refused below -- see `is_valid` for the two distinct ways
