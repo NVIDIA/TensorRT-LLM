@@ -18,7 +18,8 @@
 // Host copy threads and busy-stream skipping of KVCacheManagerV2's copy path.
 //
 // Both settings are process-wide, so every test sets them through the testing hooks and restores the defaults. The
-// async disk I/O pool cannot be stopped once started, so the one test that starts it comes last.
+// async disk I/O pool cannot be stopped once started, so the one test that starts it comes last, and the synchronous
+// disk tests skip themselves when a repeated or shuffled run has already started it.
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/copyUtils.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/cudaEvent.h"
@@ -264,8 +265,12 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, SmallCallbacksStayOnTheCallbackThread)
 
 TEST_F(KvCacheManagerV2CopyUtilsTest, SynchronousDiskCopiesAtOneAndManyThreads)
 {
-    // No async disk I/O pool runs yet in this process, so host <-> disk copies run in the host function.
-    ASSERT_FALSE(asyncDiskIoEnabled());
+    // Without the async disk I/O pool, host <-> disk copies run in the host function. The pool cannot be stopped, so
+    // a repeated or shuffled run that already started it skips this test.
+    if (asyncDiskIoEnabled())
+    {
+        GTEST_SKIP() << "the async disk I/O pool already runs in this process";
+    }
     std::vector<std::byte> src(kNumPages * kPageBytes);
     fillPattern(src, kNumPages, 4);
     for (size_t const threads : {size_t{1}, size_t{16}})
@@ -311,7 +316,10 @@ TEST_F(KvCacheManagerV2CopyUtilsTest, SynchronousDiskCopiesAtOneAndManyThreads)
 
 TEST_F(KvCacheManagerV2CopyUtilsTest, FailedSynchronousWritesAreRecordedPerPage)
 {
-    ASSERT_FALSE(asyncDiskIoEnabled());
+    if (asyncDiskIoEnabled())
+    {
+        GTEST_SKIP() << "the async disk I/O pool already runs in this process";
+    }
     ASSERT_GT(setHostCopyThreadsForTesting(16), 1U);
     std::vector<std::byte> src(kNumPages * kPageBytes);
     fillPattern(src, kNumPages, 5);
