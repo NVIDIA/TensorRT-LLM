@@ -5,11 +5,11 @@ import os
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import (
-    install_flash_attn_tile_scheduler_compatibility,
-    load_flash_attn_cute_forward,
-)
+from tensorrt_llm._torch.cute_dsl_utils import load_flash_attn_cute_forward
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.visual_gen.attention._fa4_compat import (
+    install_flash_attn_tile_scheduler_compatibility,
+)
 
 # FA4 reads this setting when its CuTe interface is first imported.
 os.environ.setdefault("FA_DISABLE_2CTA", "1")

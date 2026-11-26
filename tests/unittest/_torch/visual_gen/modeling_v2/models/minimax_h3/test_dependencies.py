@@ -87,7 +87,7 @@ _H3_PROVIDERS = {
 }
 _CATALOG_PROVIDERS = {
     "attention/flash_attention_4.py": {
-        f"{_TORCH}.cute_dsl_utils.install_flash_attn_tile_scheduler_compatibility",
+        f"{_VG}.attention._fa4_compat.install_flash_attn_tile_scheduler_compatibility",
         f"{_TORCH}.cute_dsl_utils.load_flash_attn_cute_forward",
     },
     "attention/trtllm_context_attention.py": {"tensorrt_llm.bindings.internal.thop.run_context"},

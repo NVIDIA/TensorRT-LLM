@@ -11,7 +11,7 @@ import torch
 
 cute = pytest.importorskip("cutlass.cute")
 
-from tensorrt_llm._torch.cute_dsl_utils import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.attention._fa4_compat import (  # noqa: E402
     install_flash_attn_tile_scheduler_compatibility,
 )
 from tensorrt_llm._torch.visual_gen.attention.backends import flash_attn4, parallel  # noqa: E402

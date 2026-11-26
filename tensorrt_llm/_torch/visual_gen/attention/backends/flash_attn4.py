@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 import torch
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from ....cute_dsl_utils import install_flash_attn_tile_scheduler_compatibility
+from .._fa4_compat import install_flash_attn_tile_scheduler_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
 
 # 2CTA regresses long sequences; must precede the import below.
