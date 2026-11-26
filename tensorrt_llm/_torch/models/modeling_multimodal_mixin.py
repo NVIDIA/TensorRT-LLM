@@ -118,7 +118,7 @@ class EncoderGroup:
 
 
 def _encoder_fields(
-    data: dict[str, Any], partitions: dict[str, MultimodalItemPartition]
+    data: dict[str, Any], partitions: dict[str, MultimodalItemPartition], item_count: int
 ) -> dict[str, tuple[int | None, Any]]:
     fields = {}
     for key, (axis, lengths) in partitions.items():
@@ -135,6 +135,10 @@ def _encoder_fields(
                 size = len(value)
             else:
                 raise MultimodalEncoderContractError(f"Invalid item axis {axis} for {key}")
+            if (size if lengths is None else len(lengths)) != item_count:
+                raise MultimodalEncoderContractError(
+                    f"The {key} item count does not match the request's item metadata"
+                )
             if lengths is not None and sum(lengths) != size:
                 raise MultimodalEncoderContractError(
                     "Packed field size does not match its item lengths"
@@ -239,7 +243,7 @@ def _encode_modality(
             raise MultimodalEncoderContractError(
                 f"The {modality} payload declares no input partitions"
             )
-        payload = _encoder_fields(data, partitions)
+        payload = _encoder_fields(data, partitions, len(item_lengths))
         # A single request may carry a list of items with different shapes.
         if any(
             axis == 0 and isinstance(value, (list, tuple)) and len(_tensor_list_layout(value)) > 1
@@ -765,7 +769,7 @@ class MultimodalModelMixin:
 
         Args:
             encoder_inputs: Tuples returned by `prepare_multimodal_encoder_inputs`. Consecutive
-                inputs with the same modality must be batch-compatible.
+                inputs with the same modality or a shared custom builder are encoded together.
 
         Returns:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
@@ -792,7 +796,16 @@ class MultimodalModelMixin:
             group_lengths.clear()
 
         for multimodal_param, embedding_lengths, modality in encoder_inputs:
-            if group_modality is not None and modality != group_modality:
+            if (
+                group_modality is not None
+                and modality != group_modality
+                and not any(
+                    group.build_batched_input is not None
+                    and group_modality in group.modalities
+                    and modality in group.modalities
+                    for group in self.mm_encoder_groups
+                )
+            ):
                 flush_group()
             group_modality = modality
             group_params.append(multimodal_param)

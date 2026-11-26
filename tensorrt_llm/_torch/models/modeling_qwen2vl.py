@@ -2219,6 +2219,15 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs.")
+        # Inline encoding can batch more image and video segments than the
+        # item scheduler's startup capacity.
+        num_segments = len(seq_lens)
+        if (num_segments > attn_metadata.max_num_requests
+                and not attn_metadata.is_cuda_graph):
+            token_capacity = max(attn_metadata.max_num_tokens, sum(seq_lens))
+            attn_metadata = self.metadata_cls(max_num_requests=num_segments,
+                                              max_num_tokens=token_capacity,
+                                              kv_cache_manager=None)
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens,
                                                      attn_metadata,
                                                      max_seq_len=max_seq_len)
@@ -2360,6 +2369,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     }
 
     supports_mm_encoder_item_scheduling = True
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        if self.mm_encoder is None:
+            return ()
+        return _qwen_vision_groups(self.mm_encoder._encode_batched)
 
     def get_multimodal_item_partitions(
         self,

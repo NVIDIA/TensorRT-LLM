@@ -1033,11 +1033,18 @@ def _gemma4_encode_view(param: MultimodalParams, modality: str) -> MultimodalPar
         if positions is not None:
             payload["image_position_ids"] = positions
 
+    partition = MultimodalItemPartition()
+    if modality == "video" and (metadata := param.item_metadata) is not None:
+        recorded = metadata.input_partitions.get("video", {}).get("pixel_values")
+        if recorded is not None:
+            partition = recorded
+        elif (frame_counts := data.get("num_frames")) is not None:
+            partition = MultimodalItemPartition(item_lengths=tuple(frame_counts))
     refs, lengths = param.get_item_layout()
     layout = MultimodalItemMetadata(
         refs,
         output_embedding_lengths=lengths,
-        input_partitions={modality: {name: MultimodalItemPartition() for name in payload}},
+        input_partitions={modality: {name: partition for name in payload}},
     )
     return MultimodalParams(
         multimodal_data={modality: payload, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: layout}

@@ -531,6 +531,20 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
     assert calls == [(seq_lens, metadata, fixed_max_seq_len)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen2_5_vision_mixed_batch_attention_segments() -> None:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    model = modeling_qwen2vl.Qwen2_5_VisionModel.__new__(modeling_qwen2vl.Qwen2_5_VisionModel)
+    torch.nn.Module.__init__(model)
+    model.metadata_cls = TrtllmAttentionMetadata
+    metadata = model.metadata_cls(max_num_requests=1, max_num_tokens=4, kv_cache_manager=None)
+    # The image and the video each fit on their own. Their combined call has two segments.
+    metadata = model.prepare_attn_metadata([4, 4], metadata, max_seq_len=4)
+    assert metadata.host_request_types_runtime.tolist() == [0, 0]
+    assert metadata.prompt_lens_cpu_runtime.tolist() == [4, 4]
+
+
 @pytest.mark.cpu_only
 def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed

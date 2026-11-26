@@ -482,8 +482,7 @@ def test_profiling_dummy_has_encoder_item_metadata(num_images: int) -> None:
     assert metadata.output_embedding_lengths == (4,) * num_images
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@torch.inference_mode()
+@pytest.mark.cpu_only
 def test_mixed_vision_batch_matches_single_items():
     from tensorrt_llm.inputs.multimodal import (
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -491,11 +490,13 @@ def test_mixed_vision_batch_matches_single_items():
         MultimodalParams,
     )
 
-    model = Glm5NextVisionModelBase(ModelConfig(pretrained_config=_config())).cuda().eval()
-    model.visual.setup_attn_metadata(max_num_tokens=128)
-    torch.manual_seed(17)
-    for weight in model.parameters():
-        weight.normal_(0, 0.01)
+    def encode_patches(pixel_values, grid_thw):
+        widths = grid_thw[:, 2].repeat_interleave(grid_thw.prod(1) // 4)
+        return pixel_values[::4] + widths[:, None]
+
+    model = Glm5NextVisionModelBase.__new__(Glm5NextVisionModelBase)
+    torch.nn.Module.__init__(model)
+    model.encode_batched = encode_patches
     params = []
     for modality, grid, key in (
         ("video", [2, 4, 6], "pixel_values_videos"),
@@ -506,7 +507,7 @@ def test_mixed_vision_batch_matches_single_items():
             MultimodalParams(
                 multimodal_data={
                     modality: {
-                        key: torch.randn(patches, 24, dtype=torch.bfloat16),
+                        key: torch.arange(patches).reshape(-1, 1),
                         f"{modality}_grid_thw": torch.tensor([grid]),
                     },
                     MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
@@ -518,7 +519,7 @@ def test_mixed_vision_batch_matches_single_items():
 
     expected = torch.cat([model([item])[0] for item in params])
     (actual,) = model(params)
-    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.01)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _materialize_meta(module: torch.nn.Module) -> None:

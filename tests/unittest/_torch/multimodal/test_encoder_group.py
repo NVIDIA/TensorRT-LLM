@@ -16,6 +16,7 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     EncoderGroup,
+    MultimodalEncoderContractError,
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
     encode_multimodal_by_groups,
@@ -306,6 +307,16 @@ def test_default_builder_batches_compatible_shapes_within_each_modality():
     assert out.flatten().tolist() == [2, 3, 1, 4, 5]
     assert [tensor.shape for tensor in calls] == [(3, 2), (1, 3), (1, 2)]
     assert calls[1] is wide and calls[2] is video
+
+
+def test_default_builder_rejects_item_counts_that_cancel_across_requests():
+    pixels = torch.tensor([[1], [2]])
+    requests = [
+        _group_request([("image", 0)], [1], {"image": {"pixels": batch}})
+        for batch in (pixels, pixels[:0])
+    ]
+    with pytest.raises(MultimodalEncoderContractError, match="item count"):
+        encode_multimodal_by_groups([EncoderGroup(("image",), lambda pixels: pixels)], requests)
 
 
 @pytest.mark.parametrize("nested", [False, True])

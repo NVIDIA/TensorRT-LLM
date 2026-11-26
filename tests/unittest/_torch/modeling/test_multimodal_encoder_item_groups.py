@@ -651,8 +651,8 @@ def test_full_and_item_encoder_paths_share_item_metadata(
     model.encoder_calls.clear()
     item_outputs, encoder_inputs = _run_items(model, [(request, i) for i in range(len(item_order))])
 
-    assert [modality for _, _, modality in encoder_inputs] == [m for m, _ in expected_runs]
-    assert model.encoder_calls == [rows for _, rows in expected_runs]
+    assert [(modality, sum(lengths)) for _, lengths, modality in encoder_inputs] == expected_runs
+    assert model.encoder_calls == [sum(map(len, expected))]
     assert len(item_outputs) == len(expected)
     for actual, rows in zip(item_outputs, expected, strict=True):
         torch.testing.assert_close(actual, rows, rtol=0, atol=0)
