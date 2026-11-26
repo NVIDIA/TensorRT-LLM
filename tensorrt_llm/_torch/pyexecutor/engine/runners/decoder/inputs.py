@@ -431,7 +431,8 @@ class DecoderInputPreparer:
         self._pinned_host_active = {}
         self._mm_item_scheduler = mm_item_scheduler
         # Mixin models gather attached embeddings chunk-aware, so they can
-        # take a forward's rows; other models read the attachment whole.
+        # take a forward's rows unless they opt out; other models read the
+        # attachment whole.
         self._slices_attached_embeddings = isinstance(model, MultimodalModelMixin)
         self._config = config
         self.mapping = mapping
@@ -1116,7 +1117,7 @@ class DecoderInputPreparer:
         """Attach this forward's item outputs or rows of precomputed embeddings."""
         if self._mm_item_scheduler is not None:
             return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
-        if self._slices_attached_embeddings:
+        if self._slices_attached_embeddings and self.model.slices_attached_embeddings:
             return slice_attached_embedding(request.py_multimodal_data, runtime)
         return request.py_multimodal_data
 

@@ -538,7 +538,8 @@ def get_attached_multimodal_embeddings(
             else:
                 embeds = embeds[start:end]
         elif isinstance(embeds, list):
-            # Legacy paths can attach a list of full-request output pieces.
+            # A list holds full-request output pieces from legacy paths, or a
+            # chunk-local attachment's per-item views, joined here on the device.
             embeds = _join_embeddings(embeds)
             param.multimodal_data["multimodal_embedding"] = embeds
         if not isinstance(embeds, torch.Tensor):

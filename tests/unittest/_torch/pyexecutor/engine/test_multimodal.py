@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     resolve_mm_encoder_output_budget,
     setup_mm_encoder_attn_metadata,
     setup_mm_encoder_cuda_graphs,
+    slice_attached_embedding,
     validate_mm_encoder_scheduling_compatibility,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -40,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     make_mm_encoder_transient_cache_key,
     release_consumed_mm_items,
 )
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
@@ -989,12 +991,33 @@ def test_attached_embedding_is_sliced_to_the_forward_rows(
     multimodal_data = mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
     output = multimodal_data["multimodal_embedding"]
-    assert output.dtype == torch.float32
-    torch.testing.assert_close(output, attachment[rows[0] : rows[1]].float())
+    # A list stays per-item views for the batch to join on the device.
+    assert isinstance(output, list) is as_list
+    pieces = output if as_list else [output]
+    assert all(piece.dtype == torch.float32 for piece in pieces)
+    # Host rows are cast straight into the pinned staging for the H2D copy.
+    assert all(piece.is_pinned() is prefer_pinned() for piece in pieces if piece.numel())
+    torch.testing.assert_close(torch.cat(pieces), attachment[rows[0] : rows[1]].float())
     assert multimodal_data["multimodal_embedding_is_chunk"]
     # The request keeps the whole attachment for later chunks.
     assert request.py_multimodal_data["multimodal_embedding"] is embedding
     assert "multimodal_embedding_is_chunk" not in request.py_multimodal_data
+
+
+def test_encoder_output_stored_on_a_raw_request_is_not_sliced() -> None:
+    """Chunked prefill stores a raw request's encoder output on it; the model's
+    gather slices that itself (EVS videos recount their rows there)."""
+    request = _attached_request(torch.ones(5, 2), [0, 1, 2, 2, 2, 3, 4, 5])
+    request.py_multimodal_data["video"] = {"pixel_values_videos": torch.ones(1)}
+    runtime = MultimodalRuntimeData(
+        embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
+        past_seen_token_num=2,
+        chunk_end_pos=7,
+    )
+
+    assert slice_attached_embedding(request.py_multimodal_data, runtime) is (
+        request.py_multimodal_data
+    )
 
 
 def test_attached_items_on_different_devices_are_attached_whole() -> None:

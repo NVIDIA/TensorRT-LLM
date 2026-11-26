@@ -232,6 +232,25 @@ def test_nemotron_nano_delegates_draft_loading():
     model.llm.load_draft_weights.assert_called_once_with(weights, weight_mapper=mapper)
 
 
+@pytest.mark.parametrize(
+    ("video_pruning_rate", "has_vision_encoder", "slices"),
+    [(0.0, True, True), (0.5, False, True), (0.5, True, False)],
+    ids=["no_evs", "evs_prefill_worker", "evs_with_encoder"],
+)
+def test_nemotron_nano_slices_attachments_unless_evs_meets_raw_videos(
+    video_pruning_rate: float, has_vision_encoder: bool, slices: bool
+) -> None:
+    """EVS recounts a raw video's rows only in the forward, after input
+    preparation sliced any attachment batched with it by the executor's
+    pre-EVS counters, so a worker that encodes videos opts out."""
+    model = object.__new__(NemotronHMultimodalModel)
+    torch.nn.Module.__init__(model)
+    model.video_pruning_rate = video_pruning_rate
+    model.vision_encoder = torch.nn.Identity() if has_vision_encoder else None
+
+    assert model.slices_attached_embeddings is slices
+
+
 def test_nemotron_nano_forward_threads_spec_decoding_args():
     """MTP drafting needs spec_metadata and resource_manager to reach the inner LM."""
     model = _spec_forward_stub()

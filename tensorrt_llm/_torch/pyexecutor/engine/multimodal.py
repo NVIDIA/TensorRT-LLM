@@ -316,35 +316,62 @@ def resolve_mm_encoder_output_budget(
     return max_output_embeddings * bytes_per_embedding, bytes_per_embedding
 
 
+def _cast_rows(rows: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    """Cast rows to ``dtype``; host rows land in pinned memory, ready for the H2D copy."""
+    if dtype is None or rows.dtype == dtype:
+        return rows
+    if rows.is_cuda:
+        return rows.to(dtype)
+    return torch.empty(rows.shape, dtype=dtype, pin_memory=prefer_pinned()).copy_(rows)
+
+
 def slice_attached_embedding(
     multimodal_data: dict[str, Any] | None,
     runtime: MultimodalRuntimeData | None,
     dtype: torch.dtype | None = None,
 ) -> dict[str, Any] | None:
-    """Return a per-forward copy holding only this forward's rows of precomputed embeddings.
+    """Return a per-forward copy holding only this forward's rows of an attachment.
 
+    An attachment is a precomputed embedding on a request without raw media;
+    encoder outputs stored on a raw request are left to the model's gather.
     The request keeps the full attachment, so a host attachment puts at most
     one forward's rows on the device, as with encoder outputs; a device
-    attachment stays resident with its producer until prefill ends. The rows
-    are cast to ``dtype`` when given. The attachment is returned whole when
-    there is no runtime row placement (one-shot prefill uses every row), when
-    its items sit on different devices, or when its rows do not fill the
-    prompt's embedding slots, which the consumer then reports.
+    attachment stays resident with its producer until prefill ends. A list
+    attachment stays a list of per-item views of the window, so the batch
+    joins it on the device. The rows are cast to ``dtype`` when given. The
+    attachment is returned whole when there is no runtime row placement
+    (one-shot prefill uses every row), when its items sit on different
+    devices, or when its rows do not fill the prompt's embedding slots,
+    which the consumer then reports.
     """
     embedding = (
         multimodal_data.get("multimodal_embedding") if isinstance(multimodal_data, dict) else None
     )
     if embedding is None or runtime is None:
         return multimodal_data
-    pieces = list(embedding) if isinstance(embedding, (list, tuple)) else [embedding]
+    if any(multimodal_data.get(modality) is not None for modality in ("image", "video", "audio")):
+        return multimodal_data
+    is_list = isinstance(embedding, (list, tuple))
+    pieces = list(embedding) if is_list else [embedding]
     if len({piece.device for piece in pieces}) > 1:
         return multimodal_data
     if sum(piece.shape[0] for piece in pieces) != runtime.total_embeds_in_request:
         return multimodal_data
     start = runtime.num_cached_mm_tokens
-    rows = _join_embeddings(pieces, start=start, end=start + runtime.num_mm_tokens_in_chunk)
+    end = start + runtime.num_mm_tokens_in_chunk
+    rows = []
+    offset = 0
+    for piece in pieces:
+        if offset >= end:
+            break
+        piece_end = offset + piece.shape[0]
+        if start < piece_end:
+            rows.append(_cast_rows(piece[max(start - offset, 0) : end - offset], dtype))
+        offset = piece_end
+    if not rows:
+        rows = [_cast_rows(pieces[0][:0], dtype)]
     multimodal_data = dict(multimodal_data)
-    multimodal_data["multimodal_embedding"] = rows if dtype is None else rows.to(dtype)
+    multimodal_data["multimodal_embedding"] = rows if is_list else rows[0]
     multimodal_data["multimodal_embedding_is_chunk"] = True
     return multimodal_data
 

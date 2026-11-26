@@ -1819,12 +1819,14 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
     def test_attached_embedding_is_sliced_without_item_scheduling(self) -> None:
         """Without the item scheduler (disable_mm_encoder, an unsupported model
         or PP), a model with the chunk-aware gather still gets only the
-        forward's rows of an attachment; other models get it whole."""
-        for chunk_aware in (True, False):
-            with self.subTest(chunk_aware=chunk_aware):
+        forward's rows of an attachment, unless it opts out; other models get
+        it whole."""
+        for chunk_aware, opts_in in ((True, True), (True, False), (False, True)):
+            with self.subTest(chunk_aware=chunk_aware, opts_in=opts_in):
                 (preparer, _) = self.enterContext(input_preparer_and_kv_cache())
                 preparer._mm_item_scheduler = None
                 preparer._slices_attached_embeddings = chunk_aware
+                preparer.model.slices_attached_embeddings = opts_in
                 attachment = torch.arange(6, dtype=torch.float16).reshape(3, 2)
                 request = _create_request_with_tokens([11, 22, 33, 44], 1)
                 request.py_multimodal_data = {
@@ -1839,7 +1841,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
 
                 multimodal_data = preparer._build_multimodal_data_for_llm(request, runtime)
 
-                if chunk_aware:
+                if chunk_aware and opts_in:
                     torch.testing.assert_close(
                         multimodal_data["multimodal_embedding"], attachment[1:3]
                     )

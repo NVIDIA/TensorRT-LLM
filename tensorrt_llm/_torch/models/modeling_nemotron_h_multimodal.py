@@ -3220,6 +3220,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         if needs_sound_encoder and self.sound_encoder is None:
             raise ValueError("Raw audio inputs require a local Nemotron sound encoder.")
 
+    @property
+    def slices_attached_embeddings(self) -> bool:
+        """EVS refreshes raw videos' row counts only in the forward, so with a
+        vision encoder a batch must not mix chunk-local attachments with them."""
+        return self.video_pruning_rate <= 0 or self.vision_encoder is None
+
     def merge_evs_mm_embeds(
         self,
         num_tokens_in_videos: List[int],
