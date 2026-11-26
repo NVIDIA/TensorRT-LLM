@@ -28,7 +28,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -269,18 +268,16 @@ class CuteDslMlaFmha(PhasedFmha):
 
     @staticmethod
     def _page_size_exclusive_to_cute_dsl(meta: "TrtllmAttentionMetadata") -> bool:
-        """Whether this layer's FP4 MLA 128-token KV pages are read by no other MLA generation library.
+        """Whether this layer's 128-token KV pages lack a later generation provider.
 
         Only ``FP4_MLA_TOKENS_PER_BLOCK`` can count as exclusive; every other
         page size keeps the default routing. The fallback thop op has
         TRTLLM-Gen MLA generation kernels for 32-token pages only. FlashInfer
         TRTLLM-Gen reads 128-token pages only when the KV cache manager lists
-        them in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
-        SMs from an FP8 or BF16 KV cache manager; it is opt-in, but it counts
-        whether or not it is enabled.
+        them in ``trtllm_gen_extra_tokens_per_block``. Earlier providers have
+        already declined the request when default selection reaches this one.
         """
         from ..fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
-        from .prims_ts import PrimsTSFmha
 
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block != FP4_MLA_TOKENS_PER_BLOCK:
@@ -288,11 +285,7 @@ class CuteDslMlaFmha(PhasedFmha):
         kv_cache_manager = meta.kv_cache_manager
         if tokens_per_block in getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()):
             return False
-        return not (
-            get_sm_version() in PrimsTSFmha.SUPPORTED_MLA_SMS
-            and tokens_per_block in PrimsTSFmha.SUPPORTED_PAGE_SIZES
-            and getattr(kv_cache_manager, "dtype", None) in (DataType.FP8, DataType.BF16)
-        )
+        return True
 
     @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
@@ -484,8 +477,8 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
         helix_verify_group = seq_len_q > 1 and meta.helix_position_offsets is not None
-        # Under Helix the only other MLA generation library is the fallback
-        # thop op, since FlashInfer TRTLLM-Gen and PrimTS do not support Helix.
+        # After earlier providers decline Helix, the remaining alternative is
+        # the fallback thop op; FlashInfer TRTLLM-Gen does not support Helix.
         # Its TRTLLM-Gen generation pads 33 to 63 heads to a 64-row Q tile whose
         # kernels exist only precompiled, for 32-token pages.
         helix_decode_without_fallback_kernel = (
@@ -537,7 +530,7 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # No fallback library supports a multi-token Helix verify group.
+        # No later library supports a multi-token Helix verify group.
         # Keep its correctness admission separate from the measured-win table;
         # the metadata checks above and kernel can_implement below still apply.
         # Other single-token Helix shapes retain the performance gate unless

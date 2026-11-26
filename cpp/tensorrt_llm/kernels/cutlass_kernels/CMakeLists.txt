@@ -181,7 +181,7 @@ set(FP8_BLOCKSCALE_GEMM_SRC_CU
 file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
 
 # Get the sources for AllReduce GEMM
-file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
+set(ARGEMM_SRC_CU allreduce_gemm/allreduce_gemm_runner.cu)
 
 message(
   VERBOSE
@@ -232,11 +232,23 @@ if(USING_OSS_CUTLASS_FP4_GEMM)
 endif()
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  file(GLOB MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/*.cu")
-  list(
-    REMOVE_ITEM MOE_GEMM_SRC_CU "${MOE_CUTLASS_DIR}/moe_lora_pointer_expand.cu"
-    "${MOE_CUTLASS_DIR}/moe_lora_problem_builder.cu"
-    "${MOE_CUTLASS_DIR}/moe_lora_slot_expand.cu")
+  set(MOE_GEMM_SRC_CU
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_bf16.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_fp8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_bf16_uint8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_fp16.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp16_uint8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp32_fp32.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp4_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_fp4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_fp8.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_kernels_fp8_uint4.cu"
+      "${MOE_CUTLASS_DIR}/moe_gemm_tma_warp_specialized_input.cu"
+      "${MOE_CUTLASS_DIR}/moe_kernels.cu")
   set(MOE_GEMM_SRC_CU_LAUNCHER ${MOE_GEMM_SRC_CU})
   list(FILTER MOE_GEMM_SRC_CU_LAUNCHER EXCLUDE REGEX ".*moe_gemm_kernels_.*")
   list(FILTER MOE_GEMM_SRC_CU INCLUDE REGEX ".*moe_gemm_kernels_.*")
@@ -253,6 +265,12 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   list(FILTER MOE_GEMM_SRC_CU EXCLUDE REGEX ".*fp8.*")
 
   add_library(moe_gemm_src STATIC ${MOE_GEMM_SRC_CU} ${GROUPED_SRC_CPP})
+  add_library(tllm::kernel_moe ALIAS moe_gemm_src)
+  target_link_libraries(
+    moe_gemm_src
+    PUBLIC tllm::kernel_gemm_utilities tllm::kernel_fp8_block_scale_gemm
+           tllm::kernel_lora tllm::kernel_pre_quant_scale
+           tllm::common_environment)
 
   add_library(_moe_gemm_launcher OBJECT ${MOE_GEMM_SRC_CU_LAUNCHER})
   add_cuda_architectures(_moe_gemm_launcher 89)
@@ -289,7 +307,14 @@ endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
   add_library(ar_gemm_src STATIC ${ARGEMM_SRC_CU})
-  target_link_libraries(ar_gemm_src PRIVATE ipc_nvls_memory_src)
+  add_library(tllm::kernel_gemm_all_reduce ALIAS ar_gemm_src)
+  target_link_libraries(
+    ar_gemm_src
+    PUBLIC tllm::kernel_cutlass_headers
+    PRIVATE tllm::runtime_ipc_nvls)
+  target_compile_features(ar_gemm_src PUBLIC cxx_std_20)
+  set_target_properties(ar_gemm_src PROPERTIES CUDA_STANDARD 20
+                                               CUDA_STANDARD_REQUIRED ON)
   target_include_directories(
     ar_gemm_src
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../internal_cutlass_kernels/include)

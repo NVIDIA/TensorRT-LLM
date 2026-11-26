@@ -106,6 +106,7 @@ def test_forward_selects_current_speculative_rows(
     logits = torch.arange(24).reshape(6, 4)
     metadata = object.__new__(DSparkSpecMetadata) if dspark else SimpleNamespace()
     runner = object.__new__(DecoderRunner)
+    runner._model = None
     runner._config = SimpleNamespace(without_logits=False)
     runner._inputs = SimpleNamespace(preprocess_inputs=lambda inputs, **kwargs: inputs)
     runner.sample_in_graph_callable = None

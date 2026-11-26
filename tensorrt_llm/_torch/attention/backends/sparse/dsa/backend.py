@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 from ..mixed_precision_high_rows import (
     mixed_precision_high_row_indices,
     overlay_mixed_precision_high_rows,
@@ -126,6 +127,8 @@ class DSATrtllmAttention(TrtllmAttention):
         # quantization path in TRTLLMGen. Keep those at their default value and
         # use separate scales for the E2M1 x E4M3 KV representation: its global
         # scale contains an extra factor of six that would otherwise saturate Q.
+        # The cache ops apply it to the residual layout only: the records of the
+        # fp8rope layout keep real-valued block scales and E4M3 RoPE.
         self._nvfp4_mla_kv_scale_quant_orig = self.kv_scale_quant_orig
         self._nvfp4_mla_kv_scale_orig_quant = self.kv_scale_orig_quant
         if quant_config is not None and quant_config.layer_quant_mode.has_fp4_kv_cache():
@@ -182,7 +185,18 @@ class DSATrtllmAttention(TrtllmAttention):
                 is_generation=is_generation,
             )
             preserve_mtp_topk = metadata.in_mtp_draft_loop and self.indexer.mtp_index_share
-            if shared_topk_indices is not None and not preserve_mtp_topk:
+            if (
+                shared_topk_indices is not None
+                and not preserve_mtp_topk
+                and not (
+                    is_generation
+                    and metadata.skip_shared_topk_copy(
+                        self.get_local_layer_idx(metadata),
+                        topk_indices.shape,
+                        group_remap=_GROUP_REMAP,
+                    )
+                )
+            ):
                 shared_topk_indices[
                     phase_start : phase_start + topk_indices.shape[0],
                     : topk_indices.shape[1],
@@ -277,6 +291,11 @@ class DSATrtllmAttention(TrtllmAttention):
             )
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            if prims_ts_reads_nvfp4_mla_records(metadata, self):
+                # PrimTS dequantizes the selected records itself; it takes the global rows.
+                return topk_indices_global, None
+            # Metadata leaves these rows out when it expects PrimTS to read the records.
+            metadata.ensure_nvfp4_mla_generation_buffers()
             scratch = metadata.nvfp4_mla_fp8_scratch
             compact_indices = metadata.nvfp4_mla_compact_indices
             if scratch is None or compact_indices is None:
@@ -522,6 +541,8 @@ class DSATrtllmAttention(TrtllmAttention):
             if grouped is not None:
                 return grouped
 
+        if is_generation and self.indexer is None:
+            metadata.check_shared_topk_fallback(local_layer_idx)
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, local_layer_idx, is_generation
         )
@@ -568,9 +589,7 @@ class DSATrtllmAttention(TrtllmAttention):
             # Shared layer: read the leader's precomputed batch. The batch is
             # cleared at every step boundary, so a present entry is from this
             # forward; still require it to match this layer's group slot and
-            # top-k shape, and otherwise fall back to the per-layer path. This
-            # makes any leader/follower ordering or shape mismatch a safe
-            # per-layer fallback rather than a stale/out-of-bounds read.
+            # top-k shape. A fallback is valid only if the leader published local TopK.
             batched = metadata._group_remap_batched.get(leader, None)
             if (
                 batched is None

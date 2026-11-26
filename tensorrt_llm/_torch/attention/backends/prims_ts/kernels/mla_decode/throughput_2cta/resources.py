@@ -58,9 +58,11 @@ from cutlass.experimental.task_scheduling.resources import consumer_work, produc
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ..helpers.math import final_lse
 from ...mask import kv_tile_needs_right_mask
+from ...task_compat import TS_TREE_WALKING_TASK
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -355,7 +357,8 @@ class MlaWorkQueue(WorkQueue):
     """
 
     tile_sched_params: Any = None
-    cache_seqs: Any = None  # cache_seqs tensor for k_tile_count
+    cache_seqs: Any = None  # global lengths for k_tile_count
+    cp_rank: Any = 0
     split_kv: Any = None  # maximum split slots in the launch/workspace
     block_split_kvs: Any = None  # optional per-batch split caps
     is_var_split_kv: cutlass.Constexpr[bool] = False
@@ -377,6 +380,7 @@ class MlaWorkQueue(WorkQueue):
         self,
         tile_sched_params,
         cache_seqs=None,
+        cp_rank=0,
         split_kv=None,
         block_split_kvs=None,
         is_var_split_kv=False,
@@ -405,6 +409,7 @@ class MlaWorkQueue(WorkQueue):
             self.tile_scheduler_config = None
         self.tile_sched_params = tile_sched_params
         self.cache_seqs = cache_seqs
+        self.cp_rank = cp_rank
         self.split_kv = split_kv
         self.block_split_kvs = block_split_kvs
         self.is_var_split_kv = is_var_split_kv
@@ -469,10 +474,31 @@ class MlaWorkQueue(WorkQueue):
 
     @cute.jit
     def initial_work_tile_info(self):
+        if cutlass.const_expr(TS_TREE_WALKING_TASK and not self.use_clc_dynamic):
+            # The tree-walking work-tile loop starts from the real first tile;
+            # older tasks computed it themselves.
+            return self._initial_static_work_tile()
         work_tile = self.tile_scheduler.initial_work_tile_info()
         if cutlass.const_expr(self.use_clc_dynamic):
             return self._work_tile_from_clc_tile(work_tile)
         return self.wrap_work_tile(work_tile)
+
+    @cute.jit
+    def _initial_static_work_tile(self):
+        """First tile of a static launch: this CTA's block, or grid-stride lane."""
+        if cutlass.const_expr(self.tile_sched_params.is_persistent):
+            return self._work_tile_from_linear_idx(cute.arch.block_idx()[0])
+        return self._work_tile_from_block_idx(cute.arch.block_idx())
+
+    @cute.jit
+    def _next_static_work_tile(self, work_tile):
+        """Grid-stride to the next tile; a non-persistent launch has only one."""
+        if cutlass.const_expr(self.tile_sched_params.is_persistent):
+            return self._work_tile_from_linear_idx(
+                self._linear_idx_from_tile(work_tile.tile_idx)
+                + cute.size(cute.arch.grid_dim())
+            )
+        return MlaTsWorkTileInfo(work_tile.tile_idx, Boolean(False))
 
     @cute.jit
     def wrap_work_tile(self, work_tile):
@@ -508,7 +534,7 @@ class MlaWorkQueue(WorkQueue):
         params = self.tile_sched_params
         _, s_idx, b_idx, split_kv_idx = tile_idx
         safe_b_idx = cute.math.min(b_idx, params.problem_shape_b - Int32(1))
-        if cutlass.const_expr(self.static_seq_len_k is not None):
+        if cutlass.const_expr(self.static_seq_len_k is not None and cfg.cp_world == 1):
             K = Int32(self.static_seq_len_k)
         else:
             K = Int32(self.cache_seqs[safe_b_idx])
@@ -546,6 +572,7 @@ class MlaWorkQueue(WorkQueue):
                 safe_b_idx,
             )
             K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
+        K = local_kv_length(cfg, K, self.cp_rank)
         K = K if query_tile_has_rows else Int32(0)
         k_tile_total = (K + Int32(cfg.mma_qk_tiler[1] - 1)) // Int32(
             cfg.mma_qk_tiler[1]
@@ -666,10 +693,13 @@ class MlaWorkQueue(WorkQueue):
         """Seed captured schedules from the current custom MLA work tile."""
         return stage_info.work_tile, Boolean(False)
 
-    @consumer_work(returns=work_tile)
     @cute.jit
-    def advance_tile(self, stage_info: StageInfo):
-        """Advance CLC through its response pipeline; static is task-owned."""
+    def _get_and_advance_work_tile_impl(self, stage_info: StageInfo):
+        """Return the next tile: from the CLC response, or by static grid-stride.
+
+        The tree-walking work-tile loop calls this directly and carries its
+        ``MlaTsWorkTileInfo`` result as the loop's next tile.
+        """
         if cutlass.const_expr(self.use_clc_dynamic):
             # Decode through the public scheduler/config surfaces so the
             # task-local value keeps its MLA type and cached runtime K-domain
@@ -685,6 +715,14 @@ class MlaWorkQueue(WorkQueue):
                 stage_response_ptr
             )
             return self._work_tile_from_clc_tile(work_tile)
+        return self._next_static_work_tile(stage_info.work_tile)
+
+    @consumer_work(returns=work_tile)
+    @cute.jit
+    def advance_tile(self, stage_info: StageInfo):
+        """Advance CLC through its response pipeline; static is task-owned."""
+        if cutlass.const_expr(self.use_clc_dynamic or TS_TREE_WALKING_TASK):
+            return self._get_and_advance_work_tile_impl(stage_info)
         return stage_info.work_tile
 
 
@@ -2434,6 +2472,7 @@ class TmemSResource(HighThroughputMlaResource):
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
+    cp_rank: Any = 0  # runtime context-parallel rank
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2823,13 +2862,39 @@ class TmemSResource(HighThroughputMlaResource):
         stage_idx = stage_info.stage_idx
 
         work_tile = stage_info.work_tile
-        K = Int32(work_tile.k_len)
+        K = local_kv_length(cfg, Int32(work_tile.k_len), self.cp_rank)
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
+            cfg.cp_world == 1 and cfg.mask_type == MaskType.CAUSAL.value
         )
-        if cutlass.const_expr(needs_row_causal_mask):
+        needs_cp_causal_mask = cutlass.const_expr(
+            cfg.cp_world > 1 and cfg.mask_type == MaskType.CAUSAL.value
+        )
+        row_kv_bound = Int32(0)
+        if cutlass.const_expr(needs_cp_causal_mask):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            batch_idx = Int32(work_tile.tile_idx[2])
+            _, logical_seq_len_q = query_batch_bounds(
+                self.cu_seqlens_q, batch_idx, self.logical_seq_len_q
+            )
+            _, _, logical_q_idx, _, _ = flat_query_row_state(
+                row_in_tile,
+                Int32(work_tile.tile_idx[1]),
+                cfg.mma_qk_tiler[0],
+                self.logical_num_heads_q,
+                self.logical_seq_len_q,
+                self.cu_seqlens_q,
+                batch_idx,
+            )
+            global_bound = mask_visible_k_length(
+                cfg.mask_type, Int32(work_tile.k_len), logical_q_idx, logical_seq_len_q
+            )
+            row_kv_bound = local_kv_length(cfg, global_bound, self.cp_rank)
+            group_needs_mask = True
+        elif cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
             _, logical_seq_len_q = query_batch_bounds(
                 self.cu_seqlens_q,
@@ -2958,7 +3023,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(needs_cp_causal_mask):
+                    token_is_visible = token_idx < row_kv_bound
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )

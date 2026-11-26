@@ -15,6 +15,7 @@ from functools import partial
 from pathlib import Path
 
 import pytest
+from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.configs.deepseek_v41 import encoder_replay_enabled
@@ -56,7 +57,7 @@ def ced_llm():
             if os.environ.get("DSV41_CED_CUDA_GRAPH") == "1"
             else None
         ),
-        moe_config={"backend": "TRTLLM"},
+        moe_config={"tactic": sm100f_moe_tactic_or_cutlass("trtllm_gen")},
         allreduce_strategy=os.environ.get("DSV41_CED_ALLREDUCE_STRATEGY", "AUTO"),
         kv_cache_config=dict(
             dtype="fp8",
