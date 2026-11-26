@@ -1037,6 +1037,13 @@ def test_auto_detect_nemotron_h(tmp_path, model_type):
     assert result == "nemotron-v3"
 
 
+def test_auto_detect_nemotron_shortcut(tmp_path):
+    """The `nemotron4` model type has its own row for the same parser."""
+    _write_config(str(tmp_path), "nemotron4")
+
+    assert resolve_auto_reasoning_parser(str(tmp_path)) == "nemotron-v3"
+
+
 @pytest.mark.parametrize("name", ["nemotron-v3", "nano-v3", "k-exaone"])
 def test_shared_reasoning_parser_registration(name):
     parser = ReasoningParserFactory.create_reasoning_parser(name)

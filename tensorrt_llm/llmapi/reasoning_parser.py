@@ -716,6 +716,8 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",
     "nemotron_h_omni": "nemotron-v3",
+    # The chat template uses the same reasoning delimiters.
+    "nemotron4": "nemotron-v3",
     "exaone_moe": "k-exaone",
     "gemma4": "gemma4",
     "glm_moe_dsa": "glm_moe_dsa",
