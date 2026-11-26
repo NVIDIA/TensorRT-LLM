@@ -38,7 +38,7 @@ import pytest
 import requests
 import yaml
 from datasets import load_dataset
-from defs.common import wait_for_reported_addr
+from defs.common import single_host_ucx_env, wait_for_reported_addr
 from test_common.moe_tactics import (cutedsl_grouped_gemm_moe_tactic,
                                      sm100f_moe_tactic_or_cutlass)
 
@@ -416,8 +416,9 @@ def launch_disaggregated_llm(
 
     for i, port in enumerate(ctx_ports):
         env = base_env.copy()
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env.update(single_host_ucx_env())
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -425,8 +426,6 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -447,16 +446,15 @@ def launch_disaggregated_llm(
         env = base_env.copy()
         if gen_extra_env:
             env.update(gen_extra_env)
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env.update(single_host_ucx_env())
+        if not has_nvlink():
+            env["UCX_TLS"] = "^cuda_ipc"
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         env["UCX_MM_ERROR_HANDLING"] = "y"
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
