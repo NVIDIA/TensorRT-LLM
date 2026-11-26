@@ -9928,6 +9928,10 @@ class PyExecutor:
             if blocked:
                 deferred.append(queue_item)
                 continue
+            if getattr(queue_item.request, "request_type",
+                       None) == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                admitted.append(queue_item)
+                continue
             mm_data = getattr(queue_item.request, "py_multimodal_data", None)
             try:
                 item_metadata = (get_multimodal_item_metadata(mm_data)

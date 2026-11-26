@@ -912,6 +912,31 @@ def _waiting_item(request_id, costs=None):
     )
 
 
+@pytest.mark.parametrize("chunk_unit", [None, 4])
+def test_generation_only_requests_leave_the_encoder_budget_for_prefill(chunk_unit):
+    from tensorrt_llm.bindings.executor import RequestType
+    from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
+
+    active = make_mm_request(1, [8])
+    active.py_llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
+    initialize_multimodal_encoder_request(active, max_num_tokens=8)
+    assert active.py_mm_encoder_state is None
+
+    executor = _executor_for_mm_admission([active], max_batch_size=1)
+    executor.scheduler.context_chunk_unit_size = chunk_unit
+    gen = RequestQueueItem(
+        2,
+        SimpleNamespace(
+            request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+            py_multimodal_data=active.py_multimodal_data,
+        ),
+    )
+    ctx = _waiting_item(3, [8])
+    waiting = FCFSWaitingQueue([])
+    assert executor._apply_mm_encoder_admission(waiting, [gen, ctx]) == [gen, ctx]
+    assert not waiting
+
+
 def test_mm_admission_does_not_charge_ready_active_request():
     active = make_mm_request(1, [8], ready=(0,))
     waiting = FCFSWaitingQueue([_waiting_item(2, [8])])
