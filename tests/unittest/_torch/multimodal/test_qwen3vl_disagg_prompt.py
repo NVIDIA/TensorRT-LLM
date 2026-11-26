@@ -14,6 +14,10 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     _expand_prompt_token_ids_for_mm_handoff,
 )
+from tensorrt_llm._torch.shared_tensor import (
+    SharedTensorContainer,
+    _SharedTensorRebuildMethodRegistry,
+)
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -711,3 +715,73 @@ def test_prefill_drops_consumed_layout_before_executor(video_handoff, preprocess
     assert asdict(original) == expected
     expected["multimodal_input_layout"] = None
     assert asdict(submitted.kwargs["disaggregated_params"]) == expected
+
+
+@pytest.mark.parametrize(
+    "entry,rejection",
+    [
+        ("generate_async", "too_long"),
+        ("generate_async", "invalid_hidden"),
+        ("preprocess", "invalid_hidden"),
+        ("preprocessed_inputs", "too_long"),
+        ("generate_async", None),
+    ],
+)
+def test_prefill_releases_each_handoff_export_it_does_not_submit(
+    video_handoff, monkeypatch, entry, rejection
+):
+    """Release every encoder export exactly once when prefill rejects before submit."""
+    processor, token_ids, params = video_handoff
+    llm = object.__new__(BaseLLM)
+    llm._encode_only = False
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+    llm.input_processor = processor
+    llm._executor = Mock()
+    llm._executor.is_shutdown.return_value = False
+    llm._executor.generate_async.side_effect = RuntimeError("submitted")
+    llm._is_encoder_decoder_model = Mock(return_value=False)
+    llm._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
+    llm._check_arguments = Mock(
+        side_effect=ValueError("too long") if rejection == "too_long" else None
+    )
+
+    def export(size):
+        return {
+            "method_key": _SharedTensorRebuildMethodRegistry.REBUILD_CUDA,
+            "tensor_size": size,
+            "storage_handle": "handle",
+            "storage_device": 0,
+        }
+
+    width = 17 if rejection == "invalid_hidden" else 16
+    handoff = DisaggregatedParams(
+        request_type="context_and_generation",
+        multimodal_embedding_handles=[export([4, width])],
+        multimodal_hashes=[[1] * 8],
+        multimodal_input_layout=processor.get_disagg_prefill_inputs(token_ids, params),
+        mrope_position_ids_handle=export([3, 1, len(token_ids)]),
+        mrope_position_deltas_handle=export([1, 1]),
+    )
+    exports = [
+        *handoff.multimodal_embedding_handles,
+        handoff.mrope_position_ids_handle,
+        handoff.mrope_position_deltas_handle,
+    ]
+    released = Mock()
+    monkeypatch.setattr(SharedTensorContainer, "release_dict", released)
+    inputs = {"prompt": "video prompt"}
+    if entry == "preprocessed_inputs":
+        inputs = llm.preprocess(inputs, disaggregated_params=handoff)
+    run = llm.preprocess if entry == "preprocess" else llm.generate_async
+
+    with pytest.raises((ValueError, RuntimeError), match="too long|hidden size|submitted"):
+        run(inputs, disaggregated_params=handoff)
+
+    if rejection is None:
+        assert llm._executor.generate_async.called
+        released.assert_not_called()
+    else:
+        assert not llm._executor.generate_async.called
+        assert sorted(id(call.args[0]) for call in released.call_args_list) == sorted(
+            map(id, exports)
+        )
