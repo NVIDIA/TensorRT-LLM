@@ -180,7 +180,7 @@ class Glm53FlashFp8Sm10xTp4Core(DecoderModel):  # the ModelCore
         return target.forward(StepSchedule.build(attn_metadata), input_ids, attn_metadata)
 ```
 
-`Glm53FlashFp8Sm10xTp4Core` holds the weights and the two Targets, and picks one Target per step. `PrefillTarget` and `DecodeTarget` are plain Python classes that call ops one after another. The class that `route` returns, `ModelingV2Glm53FlashFp8Sm10xTp4`, is a `DecoderModelForCausalLM` that wraps the ModelCore in the shape the runtime expects. Other models follow the same split under their own names. For example, `DeepseekV3DefaultModelingV2` in the DeepSeek R1 ModelCore and `GptOssDefaultModelingV2` in the GPT-OSS ModelCore each build a `PrefillTarget` and a `DecodeTarget`.
+`Glm53FlashFp8Sm10xTp4Core` holds the weights and the two Targets, and picks one Target per step. `PrefillTarget` and `DecodeTarget` are plain Python classes that call ops one after another. The class that `route` returns, `ModelingV2Glm53FlashFp8Sm10xTp4`, is a `DecoderModelForCausalLM` that wraps the ModelCore in the shape the runtime expects.
 
 The guiding principle is to **provide the thinnest contract that keeps semantics consistent, and nothing more.** Most Modeling V2 code is written by coding agents. The abstractions make sure that every op states what it computes and where it has been verified, that every ModelCore's weights are well defined, and that every ModelCore plugs into the runtime the same way. Beyond that, we deliberately do not constrain how the code is written. A thick framework of base layers and plug-in points would bring back the coupling we set out to remove, and would limit the optimizations an agent can explore.
 
