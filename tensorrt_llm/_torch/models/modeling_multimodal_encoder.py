@@ -45,6 +45,32 @@ if TYPE_CHECKING:
 _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
 
 
+def _has_sharded_encoder_weights(model: nn.Module) -> bool:
+    from ..modules.linear import Linear
+
+    # The decoder can be sharded while every tower is replicated.
+    towers = [
+        module for module in model.modules()
+        if isinstance(module, MultimodalEncoderMixin)
+    ]
+    towers.extend(module for name, module in model.named_children()
+                  if name in ("mm_encoder", "mm_encoders", "vision_tower"))
+    for tower in towers:
+        for layer in tower.modules():
+            if not isinstance(
+                    layer, Linear
+            ) or layer.mapping.tp_size <= 1 or layer.tp_mode is None:
+                continue
+            # Explicit spans can replicate the entire weight on every rank.
+            # Verifying those requires the other ranks' spans or the checkpoint.
+            if layer.tp_sharding is not None and not layer._tp_sharding_is_auto:
+                continue
+            weight = getattr(layer, "weight", None)
+            if weight is not None and weight.numel() and not weight.is_meta:
+                return True
+    return False
+
+
 def prepare_encoder_attn_metadata(seq_lens: list[int],
                                   attn_metadata: AttentionMetadata, *,
                                   max_seq_len: int) -> AttentionMetadata:

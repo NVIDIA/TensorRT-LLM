@@ -11,6 +11,7 @@ Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 3. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
     2. [Model Definition](#model-definition)
+        1. [Multimodal Models](#multimodal-models)
     3. [Weight Loading](#weight-loading)
     4. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
@@ -127,6 +128,46 @@ Optionally, you may replace the native PyTorch modules with our implementations 
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+
+#### Multimodal Models
+
+`tensorrt_llm._torch.models.multimodal.SupportsMultimodal` lists what the runtime
+reads from a multimodal model, and `MultimodalModelMixin` implements it. Subclass
+the mixin: the executor still checks for it until it reads the protocol. The
+`supports_multimodal = True` class marker declares the contract. It does not check
+method signatures and does not turn on any feature.
+
+For a Modeling V2 target that delegates media handling, CPU conformance recognizes
+one pattern without a protocol declaration. The target directly subclasses the
+imported registered model class and defines its own `forward`, which calls
+`super().forward(..., **kwargs)` with its own `**kwargs` as the only keyword
+argument. New targets that inherit the media forward or delegate in another
+form must declare `supports_multimodal = True` and implement `SupportsMultimodal`
+so CI applies the media checks.
+
+- Declare encoder caching and item scheduling separately. Item scheduling also
+  needs the processor's item metadata and a runtime configuration that allows it.
+- Record P1 skips with a reason and tracking ID in `multimodal_opt_outs`. Use
+  the `MultimodalFeature` value, or the guide's `supports_vision_gpu_normalize`
+  and `encoder_attention_backend` keys for those two requirements. Report
+  deployment-specific limits on runtime features in `multimodal_feature_limits`.
+  The [conformance suite](source:tests/unittest/_torch/multimodal/conformance)
+  checks skips against the multimodal onboarding tiers.
+- Declare attention backends in the `supported_encoder_attention_backends`
+  class attribute. Its empty default declares none.
+- Keep the existing `MultimodalParams` inputs and tensor outputs. Selected items
+  are prepared before they are copied to the GPU, and item outputs keep the
+  selection order.
+- `multimodal_data_device_paths` stays optional for every model. Read it through
+  `get_multimodal_data_device_paths()`; without it, every tensor in
+  `multimodal_data` moves to the device.
+- Expose the existing model-owned cache through `multimodal_encoder_cache` and
+  `initialize_multimodal_encoder_cache()`. Item scheduling and encoder output
+  reuse share this cache.
+
+`EncoderGroup` still describes the modalities that share an encoder call, and
+`MultimodalEncoderMixin` still provides encoder attention metadata and CUDA
+graphs. Prompt expansion and disaggregated serving keep their interfaces.
 
 ### Weight Loading
 

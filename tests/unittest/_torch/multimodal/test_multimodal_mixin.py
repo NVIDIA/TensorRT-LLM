@@ -14,6 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +26,15 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
 )
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.multimodal import (
+    MultimodalFeature,
+    SupportsMultimodal,
+    is_multimodal_model,
+    supports_feature,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -33,7 +42,184 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, PrefillCudaGraphBackend, TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
+
+
+@pytest.mark.cpu_only
+def test_model_contract_detection_does_not_evaluate_encoder_properties() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    # The default embedding properties raise: capability detection must not read them.
+    assert is_multimodal_model(model)
+    text_model = torch.nn.Module()
+    text_model.supports_encoder_cache = True
+    assert not is_multimodal_model(text_model)
+
+
+@pytest.mark.cpu_only
+def test_model_contract_defaults_do_not_enable_optional_features() -> None:
+    model: SupportsMultimodal = MultimodalModelMixin()
+    assert not model.supports_encoder_cache
+    assert not model.supports_mm_encoder_item_scheduling
+    assert model.supported_encoder_attention_backends == {}
+    assert not model.support_mm_disagg
+    assert not model.supports_vision_gpu_normalize
+    assert model.multimodal_opt_outs == {}
+    assert model.multimodal_feature_limits(None, None) == {}
+
+
+@pytest.mark.cpu_only
+def test_feature_eligibility_requires_explicit_marker() -> None:
+    class Unmarked:
+        supports_encoder_cache = True
+
+    class Truthy(Unmarked):
+        supports_multimodal = 1
+
+    for model in (Unmarked, Truthy):
+        assert not any(supports_feature(model, feature) for feature in MultimodalFeature)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("feature", "attribute", "enabled"),
+    [
+        (MultimodalFeature.ITEM_SCHEDULING, "supports_mm_encoder_item_scheduling", True),
+        (MultimodalFeature.ENCODER_CACHE, "supports_encoder_cache", True),
+        (MultimodalFeature.DISAGG_E_TO_P, "support_mm_disagg", True),
+        (MultimodalFeature.ENCODER_DP, "supports_mm_encoder_data_parallel", True),
+        (MultimodalFeature.LLM_PIECEWISE_CUDA_GRAPH, "apply_llm_torch_compile", lambda: None),
+    ],
+)
+def test_feature_eligibility_reads_independent_flags(
+    feature: MultimodalFeature, attribute: str, enabled: object
+) -> None:
+    class Model:
+        supports_multimodal = True
+
+    defaults = {
+        MultimodalFeature.ENCODER_CUDA_GRAPH,
+        MultimodalFeature.CHUNKED_PREFILL_MEDIA,
+        MultimodalFeature.KV_REUSE_MEDIA,
+        MultimodalFeature.DISAGG_P_TO_D,
+        MultimodalFeature.UINT8_MEDIA,
+    }
+    assert {f for f in MultimodalFeature if supports_feature(Model, f)} == defaults
+    setattr(Model, attribute, enabled)
+    assert {f for f in MultimodalFeature if supports_feature(Model, f)} == defaults | {feature}
+    setattr(Model, attribute, False)
+    assert not supports_feature(Model, feature)
+
+
+@pytest.mark.cpu_only
+def test_breakable_graph_checks_wrapper_decoder_and_pipeline() -> None:
+    class Model(MultimodalModelMixin, torch.nn.Module):
+        supports_multimodal = True
+        llm_requires_input_ids = True
+
+        @property
+        def language_model(self):
+            return self.llm
+
+    feature = MultimodalFeature.LLM_BREAKABLE_CUDA_GRAPH
+    model = Model()
+    model.llm = object.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model.llm)
+    model.mm_encoder = torch.nn.Identity()
+    model.model_config = ModelConfig()
+    engine = SimpleNamespace(
+        model=model,
+        input_processor=None,
+        mapping=model.model_config.mapping,
+        llm_args=SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+        ),
+    )
+
+    def validate():
+        ModelEngine._validate_breakable_cuda_graph_compatibility(engine)
+
+    assert not supports_feature(model, feature)
+    with pytest.raises(ValueError):
+        validate()
+    Model.supports_multimodal_breakable_cuda_graph = True
+    assert supports_feature(Model, feature)
+    if hasattr(MultimodalModelMixin, "supports_multimodal_breakable_cuda_graph"):
+        validate()
+        model.model_config.extra_attrs["attn_layers"] = {"vision": weakref.ref(model.mm_encoder)}
+        with pytest.raises(ValueError, match="register_to_config"):
+            validate()
+        model.model_config.extra_attrs.clear()
+    else:
+        # Main rejects media replay until the engine gate in #21333 is available.
+        with pytest.raises(ValueError, match="multimodal"):
+            validate()
+
+    engine.mapping = model.model_config.mapping = Mapping(world_size=2, pp_size=2)
+    assert not supports_feature(model, feature)
+    with pytest.raises(ValueError):
+        validate()
+    engine.mapping = model.model_config.mapping = Mapping()
+    model.llm = torch.nn.Identity()
+    with pytest.raises(ValueError):
+        validate()
+
+
+@pytest.mark.cpu_only
+def test_feature_opt_outs_and_deployment_limits_take_precedence() -> None:
+    config = ModelConfig()
+    args = MagicMock(spec=TorchLlmArgs)
+
+    class Model:
+        supports_multimodal = True
+        supports_encoder_cache = True
+        multimodal_opt_outs = {
+            MultimodalFeature.ENCODER_CACHE: "No reusable embeddings (TRTLLM-1)."
+        }
+
+        @classmethod
+        def multimodal_feature_limits(
+            cls, model_config: ModelConfig | None, llm_args: TorchLlmArgs | None
+        ) -> dict[MultimodalFeature, str]:
+            if model_config is config and llm_args is args:
+                return {MultimodalFeature.CHUNKED_PREFILL_MEDIA: "Full prompt needed (TRTLLM-2)."}
+            return {}
+
+    assert not supports_feature(Model, MultimodalFeature.ENCODER_CACHE)
+    assert supports_feature(Model, MultimodalFeature.CHUNKED_PREFILL_MEDIA)
+    assert not supports_feature(Model, MultimodalFeature.CHUNKED_PREFILL_MEDIA, config, args)
+
+
+@pytest.mark.cpu_only
+def test_model_contract_cache_preserves_existing_implementation_hook() -> None:
+    model = MultimodalModelMixin()
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+    contract: SupportsMultimodal = model
+    with patch.object(
+        model,
+        "_initialize_multimodal_encoder_cache",
+        wraps=model._initialize_multimodal_encoder_cache,
+    ) as initialize:
+        cache = contract.initialize_multimodal_encoder_cache(1024)
+    initialize.assert_called_once_with(1024)
+    assert contract.multimodal_encoder_cache is cache
+    assert model._multimodal_encoder_cache is cache
+    assert contract.initialize_multimodal_encoder_cache(1024) is cache
+
+
+@pytest.mark.cpu_only
+def test_mixin_defines_every_model_contract_member() -> None:
+    # CI type checking does not compare the mixin with the Protocol, so compare the names.
+    members = set(SupportsMultimodal.__annotations__) | {
+        name for name in vars(SupportsMultimodal) if not name.startswith("_")
+    }
+    missing = [
+        name
+        for name in sorted(members)
+        if not hasattr(MultimodalModelMixin, name)
+        and name not in MultimodalModelMixin.__annotations__
+    ]
+    assert not missing
 
 
 def make_embedding(
@@ -116,16 +302,16 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         self.encode_calls += 1
-        total_rows = 0
+        total_embeddings = 0
         for param in multimodal_params:
             # Residuals built by the partial-cache path carry `multimodal_embedding_lengths`
             # but no `multimodal_runtime`; fall through to the metadata in that case.
             if param.multimodal_runtime is not None:
-                total_rows += param.multimodal_runtime.total_embeds_in_request
+                total_embeddings += param.multimodal_runtime.total_embeds_in_request
             else:
-                total_rows += sum(param.get_item_layout()[1])
+                total_embeddings += sum(param.get_item_layout()[1])
         return torch.full(
-            (total_rows, self.embedding.embedding_dim),
+            (total_embeddings, self.embedding.embedding_dim),
             float(self.encode_calls),
             dtype=torch.float32,
         )
@@ -520,12 +706,12 @@ def test_chunk_embeddings_mix_with_full_request_embeddings(peer_layout):
     assert all(sum(tensor.shape[0] for tensor in call.args[0]) <= 4 for call in join.call_args_list)
     assert model.encode_calls == int(peer_layout == "raw")
     attached_peer = peer.multimodal_data["multimodal_embedding"]
-    peer_rows = (
+    peer_embedding_count = (
         sum(tensor.shape[0] for tensor in attached_peer)
         if isinstance(attached_peer, list)
         else attached_peer.shape[0]
     )
-    assert peer_rows == 5  # Retained for subsequent chunks, not replaced by a slice.
+    assert peer_embedding_count == 5  # Retained for subsequent chunks, not replaced by a slice.
     if peer_layout == "raw":
         assert model._multimodal_encoder_cache.current_bytes == 5 * 4 * 4
 

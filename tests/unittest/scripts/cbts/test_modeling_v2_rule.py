@@ -610,3 +610,39 @@ def test_stage_coverage_requires_an_affected_stage(
     assert _test_stages(result, index, stages, path)
     result.affected_stages.clear()
     assert not _test_stages(result, index, stages, path)
+
+
+def test_multimodal_contract_users_run_the_conformance_suite(rule):
+    """Routes, shared files and contract importers also run the multimodal conformance suite."""
+    cpu = next(block for block in rule.yaml_index.blocks if block.yaml_stem == "l0_cpu")
+    cpu.tests.append("unittest/_torch/multimodal")
+    target = rule._src_root / "models/kimi_k3_vl/target"
+    (target / "modeling.py").write_text(
+        "from tensorrt_llm._torch.models.multimodal import SupportsMultimodal\n"
+    )
+    (target / "vision.py").write_text("X = 1\n")
+    for path, runs in (
+        (f"{_PY}/models/kimi_k3_vl/target/vision.py", True),
+        (f"{_PY}/models/gpt_oss/{_GPT_OSS_TARGET}/modeling.py", False),
+        (f"{_PY}/models/gpt_oss/routing.py", True),
+        (f"{_PY}/multimodal.py", True),
+    ):
+        assert ("unittest/_torch/multimodal" in _selected(_apply(rule, path))) is runs, path
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/modeling.py", True),
+        ("qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/modeling.py", True),
+        ("minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep/modeling.py", True),
+        ("glm5_next/glm_5_3_flash_fp8__sm_10x__tp4/modeling.py", True),
+        ("kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/weights.py", True),
+        (f"gpt_oss/{_GPT_OSS_TARGET}/modeling.py", False),
+    ],
+)
+def test_routed_implementation_selects_multimodal_conformance(repository_rule, source, expected):
+    rule, index, stages = repository_rule
+    result = _apply(rule, f"{_PY}/models/{source}")
+    selected = _test_stages(result, index, stages, "unittest/_torch/multimodal/conformance")
+    assert bool(selected) is expected

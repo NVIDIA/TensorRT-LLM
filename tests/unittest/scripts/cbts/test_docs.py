@@ -988,6 +988,62 @@ def test_cbts_changes_require_registered_cpu_scripts_tests(
     assert narrowed["l0_cpu"][0]["tests"] == ["unittest/scripts"]
 
 
+@pytest.mark.parametrize("registered", (True, False))
+def test_cpu_test_inputs_select_the_tests_that_read_them(registered: bool) -> None:
+    entry = "unittest/_torch/multimodal" if registered else "unittest/_torch/other"
+    tier_test = f"{entry}/conformance/test_skill_tiers.py"
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", entry]),
+        Block(yaml_stem="l0_cpu", block_index=1, condition={}, tests=[tier_test]),
+        Block(yaml_stem="l0_h100", block_index=0, condition={}, tests=[entry]),
+    ]
+    stages = {"CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1)}
+    rules = [DocsRule(yaml_index, stages), OutOfScopeRule(yaml_index, stages)]
+    features = (
+        "agent-flow/agent_flow/workflows/trtllm_modeling_v2/agents/skills/"
+        "trtllm-modeling-v2-features"
+    )
+    for path, docs_stages in (
+        (".claude/skills/trtllm-model-onboard-multimodal/SKILL.md", set()),
+        (f"{features}/SKILL.md", {DOCS_STAGE}),
+        (f"{features}/references/features.md", {DOCS_STAGE}),
+    ):
+        result = Selector(stages).run(PRInputs(changed_files=[path], diffs={}), rules)
+        if not registered:
+            assert result.scope is None, path
+            continue
+        assert result.scope == "testsonly", path
+        assert result.affected_stages == {"CPU-Generic-x86-1"} | docs_stages, path
+        assert result.block_filters == {
+            ("l0_cpu", 0): {entry: {entry}},
+            ("l0_cpu", 1): {tier_test: {tier_test}},
+        }, path
+
+
+def test_removed_b300_fixture_selects_multimodal_conformance(tmp_path: Path) -> None:
+    path = "tests/integration/test_lists/test-db/l0_b300.yml"
+    test_db = (tmp_path / path).parent
+    test_db.mkdir(parents=True)
+    (tmp_path / path).write_text("l0_b300:\n- tests:\n  - unittest/other\n")
+    suite = "unittest/_torch/multimodal/conformance"
+    (test_db / "l0_cpu.yml").write_text(f"l0_cpu:\n- tests: [{suite}, unittest/other]\n")
+    removed = (
+        "unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default"
+    )
+    diff = f"@@ -3,2 +3 @@\n   - unittest/other\n-  - {removed} TIMEOUT (30)\n"
+    index = YAMLIndex.load(test_db)
+    cpu = Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1)
+    stages = {cpu.name: cpu}
+    result = Selector(stages).run(
+        PRInputs(changed_files=[path], diffs={path: diff}),
+        cbts_main.build_rules(index, stages, repo_root=tmp_path),
+    )
+    assert result.scope == "testsonly"
+    assert result.affected_stages == {cpu.name}
+    assert result.block_filters == {("l0_cpu", 0): {suite: {suite}}}
+
+
 def test_reviewed_noop_does_not_suppress_mixed_docs_validation(tmp_path: Path) -> None:
     input_path = tmp_path / "input.json"
     input_path.write_text(
