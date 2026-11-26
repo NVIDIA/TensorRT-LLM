@@ -9,6 +9,7 @@ What the forms do is the engine's and the QSA metadata's (bitwise by constructio
 against forced full passes) and `tests/unittest/_torch/attention/sparse/qsa/test_qsa_steady_decode.py`
 (the one-launch block-offset copy and the QSA steady step)."""
 
+import dataclasses
 import inspect
 from types import SimpleNamespace
 
@@ -66,6 +67,48 @@ def test_row_table(monkeypatch, layout, sm103, env, expected, warned):
 def test_bad_value_raises(monkeypatch):
     with pytest.raises(ValueError):
         _forms(monkeypatch, "dep", DP_STEPEDGE_ENV="maybe")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "forms",
+    [
+        dict(dp_steady=True, qsa_steady=True, qsa_replay_gap=True),
+        dict(dp_steady=True, qsa_steady=True, qsa_replay_gap=False),
+        dict(dp_steady=False, qsa_steady=True, qsa_replay_gap=False),
+        dict(dp_steady=False, qsa_steady=False, qsa_replay_gap=False),
+    ],
+)
+def test_runtime_hooks_carry_the_forms(monkeypatch, forms):
+    """The row table reaches the engine: each form becomes its RuntimeHooks field, and the core keeps
+    the forms for its decode-forms line. Without a core every form is off."""
+    monkeypatch.setattr(M, "_host_step_forms", lambda core: dict(forms))
+    fields = {field.name for field in dataclasses.fields(M.RuntimeHooks)}
+
+    def runtime_hooks(**kw):
+        # Every keyword is a field of the engine's RuntimeHooks.
+        assert set(kw) <= fields, set(kw) - fields
+        return SimpleNamespace(**kw)
+
+    monkeypatch.setattr(M, "RuntimeHooks", runtime_hooks)
+    monkeypatch.setattr(M, "QsaRuntimePolicy", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(M, "SpecStepMetadataPrologue", lambda: None)
+    monkeypatch.delenv(M.CTX_COLDIDX_ENV, raising=False)
+    core = SimpleNamespace()
+    hooks = M._runtime_hooks(None, core)
+    assert core.host_step_forms == forms
+    assert hooks.steady_decode_prepare is forms["dp_steady"]
+    assert hooks.qsa.steady_decode is forms["qsa_steady"]
+    assert hooks.qsa.steady_replay_gap is forms["qsa_replay_gap"]
+    hooks = M._runtime_hooks(None)
+    assert hooks.steady_decode_prepare is False
+    assert (hooks.qsa.steady_decode, hooks.qsa.steady_replay_gap) == (False, False)
+
+
+@pytest.mark.cpu_only
+def test_the_shell_passes_its_core():
+    src = inspect.getsource(M.ModelingV2Qwen38FlashNextNvfp4Sm10xDefault.__init__)
+    assert "_runtime_hooks(self.spec_config, self.model)" in src
 
 
 @pytest.mark.cpu_only
