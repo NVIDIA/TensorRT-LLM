@@ -1074,9 +1074,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             torch.add(self.helix_position_offsets_cpu[:num_generations],
                       1,
                       out=self.helix_global_kv_lens_cpu[:num_generations])
-            self.helix_global_kv_lens[:num_generations].copy_(
-                self.helix_global_kv_lens_cpu[:num_generations],
-                non_blocking=True)
+            step_inputs.copy_metadata_(
+                self.helix_global_kv_lens[:num_generations],
+                self.helix_global_kv_lens_cpu[:num_generations])
 
     def _prepare_helix_context_slots(
             self, cached_token_lens: Optional[torch.Tensor]) -> None:
