@@ -78,7 +78,8 @@ def test_start_etcd_rejects_foreign_health_endpoint(monkeypatch) -> None:
     owned_session = _healthy_session("http://127.0.0.1:103")
     sessions = iter([foreign_session, owned_session])
     first_process = MagicMock()
-    first_process.poll.side_effect = [None, 1]
+    # Without peer validation, the second poll accepts the foreign member.
+    first_process.poll.side_effect = [None, None, 1]
     first_process.returncode = 1
     owned_process = MagicMock()
     owned_process.poll.return_value = None
@@ -100,5 +101,5 @@ def test_start_etcd_rejects_foreign_health_endpoint(monkeypatch) -> None:
     assert uri == "etcd://127.0.0.1:102"
     stop.assert_called_once()
     assert stop.call_args.args[0] is first_process
-    foreign_session.post.assert_called_once()
+    assert foreign_session.post.call_count == 2
     owned_session.post.assert_called_once()
