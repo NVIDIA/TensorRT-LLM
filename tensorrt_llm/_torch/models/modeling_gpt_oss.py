@@ -64,6 +64,7 @@ class AttentionBlock(Attention):
                 rope_scaling['original_max_position_embeddings'],
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
+                truncate=pretrained_config.rope_scaling.get('truncate', True),
                 duplicate_data=False),
             # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
             # reference. The fused kernel ignores this flag for yarn (which
@@ -607,14 +608,12 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             model_config.pretrained_config.num_local_experts = model_config.pretrained_config.num_experts
             model_config.pretrained_config.num_experts_per_tok = model_config.pretrained_config.experts_per_token
             model_config.pretrained_config.rope_scaling = {
-                'factor':
-                model_config.pretrained_config.rope_scaling_factor,
-                'beta_fast':
-                model_config.pretrained_config.rope_ntk_beta,
-                'beta_slow':
-                model_config.pretrained_config.rope_ntk_alpha,
+                'factor': model_config.pretrained_config.rope_scaling_factor,
+                'beta_fast': model_config.pretrained_config.rope_ntk_beta,
+                'beta_slow': model_config.pretrained_config.rope_ntk_alpha,
                 'original_max_position_embeddings':
                 model_config.pretrained_config.initial_context_length,
+                'truncate': False,
             }
         if model_config.pretrained_config.torch_dtype is None:
             model_config.pretrained_config.torch_dtype = torch.bfloat16
