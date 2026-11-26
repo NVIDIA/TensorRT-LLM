@@ -6630,6 +6630,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "the GPU reports no host NUMA node or that node cannot hold the tiers of all "
         "co-located ranks. Only used by KV cache manager v2 in the PyTorch backend.",
         status="prototype")
+    host_copy_threads: PositiveInt = Field(
+        default=1,
+        le=64,
+        status="prototype",
+        description=
+        "Threads, the CUDA callback thread included, that one host-side KV cache copy (host to host between "
+        "host-memory cache levels, disk to disk, and host to/from disk when `disk_io_threads` is 0) spreads its "
+        "blocks over. GPU-to-host offloads and host-to-GPU restores run on the GPU and do not use it. CUDA runs "
+        "host callbacks one at a time, so "
+        "with 1 every later host callback, and every copy queued behind one, waits for the whole copy. The copy "
+        "still completes only once every block is copied. Process-wide: the first KV cache manager that sets a "
+        "value above 1 sets it for the life of the process. Only used by KV cache manager v2."
+    )
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
@@ -7229,6 +7242,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.disk_write_behind_mib > 0 and self.disk_io_threads == 0:
             raise ValueError(
                 "kv_cache_config.disk_write_behind_mib requires disk_io_threads > 0"
+            )
+        if self.host_copy_threads > 1 and self.use_kv_cache_manager_v2 is False:
+            raise ValueError(
+                "kv_cache_config.host_copy_threads requires use_kv_cache_manager_v2"
             )
         disk_options = [
             name for name, value in (

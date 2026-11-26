@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <pthread.h>
 #include <set>
 #include <thread>
 #include <unistd.h>
@@ -407,11 +408,287 @@ bool readDiskPage(int fd, ssize_t pos, ssize_t offset, void* dst, ssize_t length
 
 } // namespace
 
+// Host copy threads. CUDA runs the host functions of a context one at a time (in practice on one driver thread), so a
+// host-side copy callback that walks its page tasks one after another holds up every later host function on every
+// stream, and with them the copies queued behind those host functions. With hostCopyThreads > 1, the page tasks of one
+// callback (host <-> host, disk <-> disk, and host <-> disk when no async disk I/O pool runs) are spread over a
+// process-wide pool. The callback thread takes tasks too and returns only once every task has finished, so stream order
+// and the events recorded after the callback keep their meaning. Copies are unchanged.
+namespace
+{
+
+// A thread costs more than it saves on a small batch: a callback uses one thread per this many bytes at most.
+constexpr size_t kMinHostCopyBytesPerThread = size_t{4} << 20;
+
+// Testing only: tasks run by pool workers rather than by callback threads.
+std::atomic<uint64_t> gHostCopyHelperTasks{0};
+
+struct HostCopyJob
+{
+    using Fn = bool (*)(void const* context, size_t task) noexcept;
+
+    Fn fn = nullptr;
+    void const* context = nullptr; // valid until every task has finished
+    size_t numTasks = 0;
+    size_t maxHelpers = 0;
+    size_t joined = 0; // pool threads that took this job; guarded by the pool mutex
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> finished{0};
+    std::atomic<bool> success{true};
+
+    //! Runs unclaimed tasks until none is left. Returns how many it ran.
+    size_t work() noexcept
+    {
+        size_t ran = 0;
+        for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < numTasks;
+             i = next.fetch_add(1, std::memory_order_relaxed))
+        {
+            if (!fn(context, i))
+            {
+                success.store(false, std::memory_order_relaxed);
+            }
+            ++ran;
+            // Release: the waiter that sees the last count also sees every task's bytes.
+            if (finished.fetch_add(1, std::memory_order_acq_rel) + 1 == numTasks)
+            {
+                finished.notify_all();
+            }
+        }
+        return ran;
+    }
+
+    void waitFinished() const noexcept
+    {
+        for (size_t done = finished.load(std::memory_order_acquire); done != numTasks;
+             done = finished.load(std::memory_order_acquire))
+        {
+            finished.wait(done, std::memory_order_acquire);
+        }
+    }
+};
+
+// Workers are detached and the pool is leaked, like the disk I/O pool: a callback that runs during process exit still
+// finds it, and no worker is ever joined.
+class HostCopyPool
+{
+public:
+    //! Starts workers until \p numWorkers run. Returns how many run.
+    size_t grow(size_t numWorkers) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        try
+        {
+            while (mNumWorkers < numWorkers)
+            {
+                std::thread([this]() noexcept { run(); }).detach();
+                ++mNumWorkers;
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] started %zu of %zu host copy threads: %s", mNumWorkers, numWorkers, e.what());
+        }
+        return mNumWorkers;
+    }
+
+    //! Queues \p job for up to job->maxHelpers workers. False if it could not be queued: the caller then runs it alone.
+    bool post(std::shared_ptr<HostCopyJob> const& job) noexcept
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mJobs.push_back(job);
+        }
+        catch (std::exception const&)
+        {
+            return false;
+        }
+        mCv.notify_all();
+        return true;
+    }
+
+    //! Takes \p job off the queue if no worker took its last helper place yet: its tasks are all claimed by now.
+    void retract(HostCopyJob const* job) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const it
+            = std::find_if(mJobs.begin(), mJobs.end(), [job](auto const& queued) { return queued.get() == job; });
+        if (it != mJobs.end())
+        {
+            mJobs.erase(it);
+        }
+    }
+
+private:
+    void run() noexcept
+    {
+        for (;;)
+        {
+            std::shared_ptr<HostCopyJob> job;
+            {
+                std::unique_lock<std::mutex> lock(mMutex);
+                mCv.wait(lock, [this] { return !mJobs.empty(); });
+                job = mJobs.front();
+                if (++job->joined >= job->maxHelpers)
+                {
+                    mJobs.pop_front();
+                }
+            }
+            // The shared_ptr keeps next / finished alive after the caller returned; fn and context are only used for
+            // a claimed task, which the caller waits for.
+            size_t const ran = job->work();
+            gHostCopyHelperTasks.fetch_add(ran, std::memory_order_relaxed);
+        }
+    }
+
+    std::mutex mMutex;
+    std::condition_variable mCv;
+    std::deque<std::shared_ptr<HostCopyJob>> mJobs;
+    size_t mNumWorkers = 0;
+};
+
+// Threads a callback may use, the callback thread included: 1 runs every task on the callback thread.
+std::atomic<size_t> gHostCopyThreads{1};
+std::atomic<HostCopyPool*> gHostCopyPool{nullptr};
+// The first value > 1 configureHostCopyThreads was given (0: none yet).
+std::atomic<size_t> gConfiguredHostCopyThreads{0};
+
+void forgetHostCopyPoolInChild() noexcept
+{
+    // A forked child has none of the workers, and the parent's pool mutex may have been held by one of them at the
+    // fork. Leave that pool alone and run every task on the callback thread; a later configure call starts a new one.
+    gHostCopyPool.store(nullptr, std::memory_order_relaxed);
+    gHostCopyThreads.store(1, std::memory_order_relaxed);
+    gConfiguredHostCopyThreads.store(0, std::memory_order_relaxed);
+}
+
+//! Sets the width of every later callback to \p numThreads (callback thread included), starting workers as needed.
+//! Returns the width set, which is smaller when not every worker started.
+size_t setHostCopyThreads(size_t numThreads) noexcept
+{
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (numThreads <= 1)
+    {
+        gHostCopyThreads.store(1, std::memory_order_release);
+        return 1;
+    }
+    auto* pool = gHostCopyPool.load(std::memory_order_acquire);
+    if (pool == nullptr)
+    {
+        pool = new (std::nothrow) HostCopyPool;
+        if (pool == nullptr)
+        {
+            return gHostCopyThreads.load();
+        }
+        static bool const kAtFork = ::pthread_atfork(nullptr, nullptr, forgetHostCopyPoolInChild) == 0;
+        if (!kAtFork)
+        {
+            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] pthread_atfork failed; a forked child may hang in a host copy");
+        }
+        gHostCopyPool.store(pool, std::memory_order_release);
+    }
+    size_t const width = pool->grow(numThreads - 1) + 1;
+    gHostCopyThreads.store(width, std::memory_order_release);
+    return width;
+}
+
+//! Runs fn(i) for every i in [0, numTasks), each exactly once, on the calling thread and up to hostCopyThreads - 1
+//! pool workers, and returns once every call has returned: false if any of them returned false. The calls must be
+//! independent of each other (no task reads what another one of the same callback writes). With one thread, or a
+//! batch too small to share, it is a plain loop on the calling thread.
+template <typename Fn>
+bool forEachHostCopyTask(size_t numTasks, ssize_t numBytes, Fn const& fn) noexcept
+{
+    size_t const totalBytes = numTasks * static_cast<size_t>(std::max<ssize_t>(numBytes, 1));
+    size_t const width = std::min(
+        {gHostCopyThreads.load(std::memory_order_acquire), numTasks, totalBytes / kMinHostCopyBytesPerThread});
+    auto* const pool = gHostCopyPool.load(std::memory_order_acquire);
+    std::shared_ptr<HostCopyJob> job;
+    if (width > 1 && pool != nullptr)
+    {
+        try
+        {
+            job = std::make_shared<HostCopyJob>();
+        }
+        catch (std::exception const&)
+        {
+            job = nullptr; // out of memory: run the tasks here
+        }
+    }
+    if (job == nullptr)
+    {
+        bool success = true;
+        for (size_t i = 0; i < numTasks; ++i)
+        {
+            success = fn(i) && success;
+        }
+        return success;
+    }
+    job->fn = [](void const* context, size_t task) noexcept { return (*static_cast<Fn const*>(context))(task); };
+    job->context = &fn;
+    job->numTasks = numTasks;
+    job->maxHelpers = width - 1;
+    bool const posted = pool->post(job);
+    job->work();
+    if (posted)
+    {
+        pool->retract(job.get());
+    }
+    job->waitFinished();
+    return job->success.load(std::memory_order_relaxed);
+}
+
+//! Whether the callbacks are spread over threads: otherwise each one keeps its single-thread loop exactly.
+bool hostCopyThreaded() noexcept
+{
+    return gHostCopyThreads.load(std::memory_order_acquire) > 1;
+}
+
+} // namespace
+
 CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
 {
-    // @TODO: enable multi-threading with a thread pool
     using Data = UserData<DiskAddress, DiskAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
+    if (hostCopyThreaded())
+    {
+        // Destinations are distinct pages of another level than the sources, so the tasks are independent.
+        ssize_t const numBytes = data->numBytes;
+        bool const success = forEachHostCopyTask(data->tasks.size(), numBytes,
+            [&tasks = data->tasks, numBytes](size_t i) noexcept
+            {
+                thread_local std::vector<std::byte> buffer;
+                auto const& t = tasks[i];
+                try
+                {
+                    if (buffer.size() < static_cast<size_t>(numBytes))
+                    {
+                        buffer.resize(static_cast<size_t>(numBytes));
+                    }
+                    if (!readDiskPage(t.src.fd, t.src.pos, 0, buffer.data(), numBytes))
+                    {
+                        return false;
+                    }
+                    if (diskWriteBehind().numPages() != 0)
+                    {
+                        // This write bypasses staging, so a pending write of the destination must not land after it.
+                        diskWriteBehind().drop(t.dst.fd, t.dst.pos, t.dst.pos);
+                    }
+                }
+                catch (std::exception const&)
+                {
+                    return false;
+                }
+                return writeAll(t.dst.fd, t.dst.pos, buffer.data(), numBytes);
+            });
+        if (!success)
+        {
+            TLLM_LOG_ERROR("[kvCacheManagerV2Utils] hostFnDiskToDiskCopy failed.\n");
+        }
+        return;
+    }
     std::vector<std::byte> buffer(data->numBytes);
     bool success = true;
     for (auto const& t : data->tasks)
@@ -443,9 +720,22 @@ CUDA_CB void hostFnDiskToHostCopy(void* userData) noexcept
     using Data = UserData<MemAddress, DiskAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
     bool success = true;
-    for (auto const& t : data->tasks)
+    if (hostCopyThreaded())
     {
-        success = success && readDiskPage(t.src.fd, t.src.pos, 0, reinterpret_cast<void*>(t.dst), data->numBytes);
+        ssize_t const numBytes = data->numBytes;
+        success = forEachHostCopyTask(data->tasks.size(), numBytes,
+            [&tasks = data->tasks, numBytes](size_t i) noexcept
+            {
+                auto const& t = tasks[i];
+                return readDiskPage(t.src.fd, t.src.pos, 0, reinterpret_cast<void*>(t.dst), numBytes);
+            });
+    }
+    else
+    {
+        for (auto const& t : data->tasks)
+        {
+            success = success && readDiskPage(t.src.fd, t.src.pos, 0, reinterpret_cast<void*>(t.dst), data->numBytes);
+        }
     }
     if (!success)
     {
@@ -459,13 +749,33 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     using Data = UserData<DiskAddress, MemAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
     bool success = true;
-    for (auto const& t : data->tasks)
+    if (hostCopyThreaded())
     {
-        success = success && !takeInjectedWriteFailure()
-            && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), data->numBytes);
-        if (!success)
+        // Each page is written or recorded as failed on its own: a failure does not skip the other pages.
+        ssize_t const numBytes = data->numBytes;
+        success = forEachHostCopyTask(data->tasks.size(), numBytes,
+            [&tasks = data->tasks, numBytes](size_t i) noexcept
+            {
+                auto const& t = tasks[i];
+                bool const written = !takeInjectedWriteFailure()
+                    && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), numBytes);
+                if (!written)
+                {
+                    recordFailedDiskWrite(t.dst.fd, t.dst.pos);
+                }
+                return written;
+            });
+    }
+    else
+    {
+        for (auto const& t : data->tasks)
         {
-            recordFailedDiskWrite(t.dst.fd, t.dst.pos);
+            success = success && !takeInjectedWriteFailure()
+                && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), data->numBytes);
+            if (!success)
+            {
+                recordFailedDiskWrite(t.dst.fd, t.dst.pos);
+            }
         }
     }
     if (!success)
@@ -476,9 +786,21 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
 
 CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 {
-    // @TODO: enable multi-threading with a thread pool
     using Data = UserData<MemAddress, MemAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
+    if (hostCopyThreaded())
+    {
+        // Destinations are distinct slots, none of them another task's source.
+        ssize_t const numBytes = data->numBytes;
+        forEachHostCopyTask(data->tasks.size(), numBytes,
+            [&tasks = data->tasks, numBytes](size_t i) noexcept
+            {
+                auto const& t = tasks[i];
+                memcpy(reinterpret_cast<void*>(t.dst), reinterpret_cast<void const*>(t.src), numBytes);
+                return true;
+            });
+        return;
+    }
     for (auto const& t : data->tasks)
     {
         memcpy(reinterpret_cast<void*>(t.dst), reinterpret_cast<void const*>(t.src), data->numBytes);
@@ -1276,6 +1598,43 @@ void delayDiskWriteBehindFlushesForTesting(double seconds) noexcept
         diskIoPool().delayFlushes(std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(seconds > 0 ? seconds : 0.0)));
     }
+}
+
+void configureHostCopyThreads(size_t numThreads) noexcept
+{
+    if (numThreads <= 1)
+    {
+        return;
+    }
+    size_t expected = 0;
+    if (!gConfiguredHostCopyThreads.compare_exchange_strong(expected, numThreads))
+    {
+        if (expected != numThreads)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] host copy callbacks already use %zu threads in this process; ignoring a "
+                "request for %zu",
+                expected, numThreads);
+        }
+        return;
+    }
+    size_t const width = setHostCopyThreads(numThreads);
+    TLLM_LOG_INFO("[kvCacheManagerV2Utils] host copy callbacks: threads=%zu", width);
+}
+
+size_t hostCopyThreads() noexcept
+{
+    return gHostCopyThreads.load(std::memory_order_acquire);
+}
+
+size_t setHostCopyThreadsForTesting(size_t numThreads) noexcept
+{
+    return setHostCopyThreads(numThreads);
+}
+
+uint64_t hostCopyHelperTasksForTesting() noexcept
+{
+    return gHostCopyHelperTasks.load(std::memory_order_relaxed);
 }
 
 void configureAsyncDiskIo(size_t numThreads) noexcept

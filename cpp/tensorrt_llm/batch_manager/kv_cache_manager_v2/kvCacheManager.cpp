@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
@@ -136,6 +137,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     , mAvgPromptLength(config.poolRebalance.movingAverageDecay)
 {
     mConfig.validate();
+    configureHostCopyThreads(static_cast<size_t>(mConfig.hostCopyThreads)); // validate() bounds it
 
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 

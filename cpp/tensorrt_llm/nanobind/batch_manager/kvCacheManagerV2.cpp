@@ -2025,7 +2025,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep)
+                std::optional<kv::BatchDesc> coldTypicalStep, int hostCopyThreads)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2055,6 +2055,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
+                cfg->hostCopyThreads = hostCopyThreads;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2070,7 +2071,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt)
+            nb::arg("cold_typical_step").none() = std::nullopt, nb::arg("host_copy_threads") = 1)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2107,6 +2108,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)
+        .def_rw("host_copy_threads", &kv::KVCacheManagerConfig::hostCopyThreads,
+            "Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA callback "
+            "thread included. Process-wide: the first manager that sets a value above 1 sets it for the life of "
+            "the process.")
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -2440,6 +2445,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "async_disk_io_enabled", []() { return kv::asyncDiskIoEnabled(); },
         "Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous.");
+    mIntrospection.def(
+        "host_copy_threads", []() { return kv::hostCopyThreads(); },
+        "Threads a host-side copy callback may use now, the callback thread included.");
+    mIntrospection.def(
+        "set_host_copy_threads_for_testing",
+        [](size_t numThreads) { return kv::setHostCopyThreadsForTesting(numThreads); }, nb::arg("num_threads"),
+        "Set the host copy width (1: every task on the callback thread) whatever was configured; returns the width.");
+    mIntrospection.def(
+        "host_copy_helper_tasks_for_testing", []() { return kv::hostCopyHelperTasksForTesting(); },
+        "Page tasks of host-side copy callbacks run by pool workers so far.");
     mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");

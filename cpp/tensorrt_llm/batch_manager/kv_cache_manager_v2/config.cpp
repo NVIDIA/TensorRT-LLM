@@ -338,6 +338,11 @@ void KVCacheManagerConfig::validate() const
 
     poolRebalance.validate();
     hostMemBacking.validate();
+    if (hostCopyThreads < 1 || hostCopyThreads > kMaxHostCopyThreads)
+    {
+        throw std::invalid_argument(
+            "KVCacheManagerConfig: hostCopyThreads must be between 1 and " + std::to_string(kMaxHostCopyThreads));
+    }
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

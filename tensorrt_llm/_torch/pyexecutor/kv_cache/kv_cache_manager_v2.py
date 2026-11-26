@@ -5275,6 +5275,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache_config.cold_tier_offload_min_priority is None
                 else kv_cache_config.cold_tier_offload_min_priority
             ),
+            host_copy_threads=kv_cache_config.host_copy_threads,
         )
 
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:

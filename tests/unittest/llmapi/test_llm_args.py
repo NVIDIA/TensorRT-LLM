@@ -3003,6 +3003,52 @@ def test_KvCacheConfig_disk_write_behind(tmp_path):
         KvCacheConfig(**disk, disk_io_threads=4, disk_write_behind_mib=-1)
 
 
+def _kvcm2_manager_config(**kwargs):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (AttentionLayerConfig,
+                                                          BufferConfig,
+                                                          GpuCacheTierConfig,
+                                                          KVCacheManagerConfig)
+
+    return KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=32 << 20)],
+        layers=[
+            AttentionLayerConfig(layer_id=0,
+                                 buffers=[BufferConfig("key", 8192)])
+        ],
+        **kwargs)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_host_copy_threads(tmp_path):
+    assert KvCacheConfig().host_copy_threads == 1
+    # Host-to-host copies need no disk tier, so neither does the option.
+    assert KvCacheConfig(host_copy_threads=16).host_copy_threads == 16
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    # Composes with the async disk I/O pool and write-behind.
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=16,
+                           disk_write_behind_mib=4096,
+                           host_copy_threads=16)
+    assert config.host_copy_threads == 16
+    KvCacheConfig(host_copy_threads=64)
+    for value in (0, -1, 65):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(host_copy_threads=value)
+    with pytest.raises(
+            ValidationError,
+            match="host_copy_threads requires use_kv_cache_manager_v2"):
+        KvCacheConfig(host_copy_threads=4, use_kv_cache_manager_v2=False)
+    KvCacheConfig(host_copy_threads=1, use_kv_cache_manager_v2=False)
+
+    assert _kvcm2_manager_config().host_copy_threads == 1
+    assert _kvcm2_manager_config(host_copy_threads=64).host_copy_threads == 64
+    for value in (0, 65):
+        with pytest.raises(ValueError,
+                           match="hostCopyThreads must be between 1 and 64"):
+            _kvcm2_manager_config(host_copy_threads=value)
+
+
 @pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 

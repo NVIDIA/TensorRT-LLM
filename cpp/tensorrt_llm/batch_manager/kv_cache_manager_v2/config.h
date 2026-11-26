@@ -764,6 +764,16 @@ struct KVCacheManagerConfig
 
     HostMemBackingConfig hostMemBacking;
 
+    //! Upper bound of hostCopyThreads, matching KvCacheConfig.host_copy_threads.
+    static constexpr int kMaxHostCopyThreads = 64;
+
+    //! Threads, 1 to kMaxHostCopyThreads, that one host-side copy callback (host <-> host, disk <-> disk, and
+    //! host <-> disk without the async disk I/O pool) spreads its page tasks over, the CUDA callback thread included.
+    //! CUDA runs a context's host functions one at a time, so with 1 every later host function, and every copy queued
+    //! behind one, waits for the whole callback. The callback still returns only once every task has finished.
+    //! Process-wide: the first manager that sets a value above 1 sets it for the life of the process.
+    int hostCopyThreads = 1;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

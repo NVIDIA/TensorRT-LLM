@@ -605,6 +605,9 @@ class KVCacheManagerConfig:
     # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
     # per-layer-group slot-count proportions at cold page sizes.
     cold_typical_step: BatchDesc | None = None
+    # Threads, 1 to 64, that one host-side copy callback spreads its page tasks over, the CUDA
+    # callback thread included. Process-wide: the first manager that sets a value above 1 sets it.
+    host_copy_threads: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

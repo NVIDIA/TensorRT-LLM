@@ -70,6 +70,24 @@ def async_disk_io_enabled() -> bool:
     return bool(_cpp().async_disk_io_enabled())
 
 
+def host_copy_threads() -> int:
+    """Threads a host-side copy callback may use now, the CUDA callback thread included."""
+    return int(_cpp().host_copy_threads())
+
+
+def set_host_copy_threads_for_testing(num_threads: int) -> int:
+    """Set the host copy width (1: every task on the callback thread) whatever was configured.
+
+    Returns the width set, which is smaller when not every worker thread started.
+    """
+    return int(_cpp().set_host_copy_threads_for_testing(num_threads))
+
+
+def host_copy_helper_tasks_for_testing() -> int:
+    """Page tasks of host-side copy callbacks run by pool workers (not by the callback thread) so far."""
+    return int(_cpp().host_copy_helper_tasks_for_testing())
+
+
 def inject_disk_write_failures_for_testing(count: int) -> None:
     """Make the next ``count`` disk write pieces fail without writing."""
     _cpp().inject_disk_write_failures_for_testing(count)

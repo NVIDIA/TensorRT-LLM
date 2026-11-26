@@ -473,6 +473,16 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   and a disk -> disk copy drops the destination's. Background writes stage into
   half the bound at most and keep their share of the background cap until their
   flush.
+- Host copy threads (`host_copy_threads` -> `KVCacheManagerConfig::hostCopyThreads`,
+  process-wide, first value above 1 wins): the page tasks of one host-side copy
+  callback (host -> host, disk -> disk, and host <-> disk without the async pool)
+  run on a leaked pool of workers plus the callback thread, which returns only
+  once every task has finished, so stream order and ready events are unchanged.
+  The pieces of the async disk pool are never run there. A callback under 8 MiB,
+  or with 1 thread, keeps the single-thread loop exactly. The tasks of one
+  callback must be independent (distinct destinations, none another's source),
+  which every caller guarantees. A forked child drops the pool and runs every task
+  on the callback thread.
 
 ### Remote cache levels
 
