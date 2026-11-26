@@ -621,22 +621,22 @@ class QSASparseHooks(AttentionSparseHooks):
         req_idx = attn_metadata.qsa_req_idx_per_token[:num_tokens]
         logical = attn_metadata.qsa_logical_positions[:num_tokens]
         tokens_per_block = attn_metadata.kv_cache_manager.tokens_per_block
-        # The direct row-wise kernel removes launch overhead for small decode
-        # batches. Larger batches and prefill chunks have enough work for
-        # PyTorch's vectorized store path.
+        # Mask invalid rows inside the store kernel to avoid synchronizing
+        # when compacting the valid rows in a prefill or mixed batch.
         fused_kv_store = (
-            attn_metadata.num_contexts == 0
-            and k.is_cuda
+            k.is_cuda
             and v.is_cuda
             and k_cache.is_cuda
             and v_cache.is_cuda
+            and k_cache.shape[0] > 0
+            and attn_metadata.qsa_block_table.numel() > 0
         )
         if fused_kv_store:
             from .kernels import triton_qsa_paged_kv_store
 
             logger.info_once(
-                "QSA fused decode paged K/V store Triton kernel is active",
-                key="qsa_fused_decode_paged_kv_store_active",
+                "QSA fused paged K/V store Triton kernel is active",
+                key="qsa_fused_paged_kv_store_active",
             )
             triton_qsa_paged_kv_store(
                 k=k,

@@ -526,30 +526,24 @@ class QSAIndexer(nn.Module):
         # query lengths rather than synchronizing a device reduction per layer.
         if not metadata.is_cuda_graph and not metadata.qsa_needs_speculative_snapshot:
             return
-        seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.long)
-        generation_lens = seq_lens[num_contexts:]
-        if generation_lens.numel() == 0:
+        # QSA maps packed tokens in request order, with all context tokens first.
+        # Slice the generation suffix using its host-known boundary.
+        generation_start = metadata.num_ctx_tokens
+        num_tokens = request_indices.numel()
+        if generation_start >= num_tokens:
             return
-
+        request_indices = request_indices[generation_start:].to(torch.long)
+        pages = pages[generation_start:]
+        within = within[generation_start:]
         token_ids = torch.arange(
-            request_indices.numel(),
+            generation_start,
+            num_tokens,
             device=request_indices.device,
             dtype=torch.long,
         )
+        seq_lens = metadata.seq_lens_cuda[:num_seqs].to(torch.long)
         seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
-        token_ordinals = token_ids - seq_starts[request_indices.to(torch.long)]
-        if num_contexts:
-            generation_mask = request_indices >= num_contexts
-            request_indices = request_indices[generation_mask].to(torch.long)
-            token_ordinals = token_ordinals[generation_mask]
-            pages = pages[generation_mask]
-            within = within[generation_mask]
-            if request_indices.numel() == 0:
-                return
-        else:
-            # Boolean indexing would create a data-dependent shape during a
-            # CUDA-graph target verification batch.
-            request_indices = request_indices.to(torch.long)
+        token_ordinals = token_ids - seq_starts[request_indices]
 
         pending = {
             "request_indices": request_indices,

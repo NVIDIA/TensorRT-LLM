@@ -950,9 +950,9 @@ def test_qsa_metadata_maps_generation_rows_in_one_launch_up_to_the_max(
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_paged_kv_store_matches_advanced_indexing(cache_dtype: torch.dtype) -> None:
+def test_qsa_paged_kv_store_matches_reference_for_packed_rows(cache_dtype: torch.dtype) -> None:
     torch.manual_seed(42)
-    rows = 4
+    rows = 8
     num_pages = 8
     num_kv_heads = 2
     tokens_per_block = 8
@@ -971,8 +971,10 @@ def test_qsa_paged_kv_store_matches_advanced_indexing(cache_dtype: torch.dtype) 
         dtype=torch.int32,
         device="cuda",
     )
-    request_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
-    logical_positions = torch.tensor([0, 5, 9, 15], dtype=torch.int64, device="cuda")
+    # A cached context chunk crosses a page boundary. The verify group follows
+    # it, with one padding row beyond the table's valid requests.
+    request_indices = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2], dtype=torch.int32, device="cuda")
+    logical_positions = torch.tensor([6, 7, 8, 12, 13, 14, 15, 0], dtype=torch.int64, device="cuda")
     kv_cache = torch.full(
         (num_pages, 2, num_kv_heads, tokens_per_block, head_dim),
         -2.0,
@@ -982,13 +984,16 @@ def test_qsa_paged_kv_store_matches_advanced_indexing(cache_dtype: torch.dtype) 
     k_cache = kv_cache[:, 0]
     v_cache = kv_cache[:, 1]
     expected_cache = kv_cache.clone()
-    expected_k = expected_cache[:, 0]
-    expected_v = expected_cache[:, 1]
-    page_columns = logical_positions // tokens_per_block
-    pages = block_table[request_indices.to(torch.long), page_columns]
-    within = logical_positions % tokens_per_block
-    expected_k[pages, :, within, :] = k.to(cache_dtype)
-    expected_v[pages, :, within, :] = v.to(cache_dtype)
+    _store_paged_kv_reference(
+        k,
+        v,
+        expected_cache[:, 0],
+        expected_cache[:, 1],
+        request_indices,
+        logical_positions,
+        block_table,
+        tokens_per_block,
+    )
 
     triton_qsa_paged_kv_store(
         k=k,
@@ -1001,8 +1006,7 @@ def test_qsa_paged_kv_store_matches_advanced_indexing(cache_dtype: torch.dtype) 
         tokens_per_block=tokens_per_block,
     )
 
-    torch.testing.assert_close(k_cache.float(), expected_k.float(), rtol=0, atol=0)
-    torch.testing.assert_close(v_cache.float(), expected_v.float(), rtol=0, atol=0)
+    torch.testing.assert_close(kv_cache.view(torch.uint8), expected_cache.view(torch.uint8))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -2015,40 +2019,94 @@ def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
     assert indexer._pending_speculative_cache is None
 
 
-def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> None:
+@pytest.mark.parametrize(
+    ("seq_lens", "num_contexts", "device", "use_graph"),
+    [
+        ([1, 4], 0, "cpu", False),
+        ([2, 3, 1, 4], 2, "cuda", False),
+        ([4, 4], 0, "cuda", True),
+    ],
+    ids=["generation", "mixed", "generation-graph"],
+)
+def test_qsa_multi_token_generation_captures_speculative_cache_snapshot(
+    seq_lens: list[int], num_contexts: int, device: str, use_graph: bool
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
     indexer._pending_speculative_cache = None
+    num_tokens = sum(seq_lens)
+    num_ctx_tokens = sum(seq_lens[:num_contexts])
     metadata = SimpleNamespace(
-        num_contexts=0,
-        num_seqs=1,
-        num_tokens=4,
-        is_cuda_graph=False,
+        num_contexts=num_contexts,
+        num_ctx_tokens=num_ctx_tokens,
+        num_seqs=len(seq_lens),
+        num_tokens=num_tokens,
+        is_cuda_graph=use_graph,
         qsa_needs_speculative_snapshot=True,
-        seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor(seq_lens, dtype=torch.int32, device=device),
         kv_cache_manager=SimpleNamespace(qsa_position_layer_id=0),
     )
-    request_indices = torch.zeros(4, dtype=torch.long)
-    pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
-    within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
-    index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
-    position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
-
-    indexer._capture_speculative_cache_state(
-        layer_idx=0,
-        request_indices=request_indices,
-        pages=pages,
-        within=within,
-        index_cache=index_cache,
-        position_cache=position_cache,
-        metadata=metadata,
+    request_indices = torch.tensor(
+        [request for request, length in enumerate(seq_lens) for _ in range(length)],
+        dtype=torch.int32,
+        device=device,
     )
+    tokens = torch.arange(num_tokens, device=device)
+    pages, within = tokens // 2, tokens % 2
+    num_pages = (num_tokens + 1) // 2
+    index_cache = torch.arange(num_pages * 8, dtype=torch.float32, device=device).reshape(
+        num_pages, 2, 1, 4
+    )
+    position_cache = torch.arange(num_pages * 6, dtype=torch.int32, device=device).reshape(
+        num_pages, 2, 3
+    )
+
+    def capture_snapshot() -> None:
+        indexer._capture_speculative_cache_state(
+            layer_idx=0,
+            request_indices=request_indices,
+            pages=pages,
+            within=within,
+            index_cache=index_cache,
+            position_cache=position_cache,
+            metadata=metadata,
+        )
+
+    capture_snapshot()
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            capture_snapshot()
+        index_cache.add_(1)
+        position_cache.add_(1)
+        graph.replay()
+    elif device == "cuda":
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            capture_snapshot()
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_mode)
 
     pending = indexer._pending_speculative_cache
     assert pending is not None
-    assert pending["token_ordinals"].tolist() == [0, 1, 2, 3]
-    torch.testing.assert_close(pending["index_values"], index_cache[pages, within])
-    torch.testing.assert_close(pending["position_values"], position_cache[pages, within])
+    generation_rows = request_indices >= num_contexts
+    expected_pages, expected_within = pages[generation_rows], within[generation_rows]
+    torch.testing.assert_close(pending["request_indices"], request_indices[generation_rows].long())
+    assert pending["token_ordinals"].tolist() == [
+        ordinal for length in seq_lens[num_contexts:] for ordinal in range(length)
+    ]
+    torch.testing.assert_close(pending["pages"], expected_pages)
+    torch.testing.assert_close(pending["within"], expected_within)
+    torch.testing.assert_close(
+        pending["index_values"], index_cache[expected_pages, expected_within]
+    )
+    torch.testing.assert_close(
+        pending["position_values"], position_cache[expected_pages, expected_within]
+    )
 
 
 class _QsaPageConverter:
