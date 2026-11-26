@@ -99,8 +99,27 @@ quote dimension names containing spaces on the command line.
 
 ## Video generation evaluation
 
-
 ### Generate references and targets
+
+LPIPS and RMSE compare a target against a reference. To generate both in one
+command, supply the following inputs:
+
+| Input | CLI option | Purpose |
+| --- | --- | --- |
+| Target model | `--model` | Checkpoint used for target generation; placed before the subcommand. |
+| Target generation YAML | `--config` | Target runtime settings and `generation_params`. |
+| Reference generation YAML | `--reference-config` | Baseline runtime settings and `generation_params`; optional `model` overrides the target checkpoint. |
+| Evaluation YAML | `--evaluator-options` | Optional metric settings; omit to use defaults. |
+| Prompt list | `--prompts` | The same ordered prompts are used for both generations. |
+| Report directory | `--output-dir` | Destination for JSON reports. |
+
+Choose the metric with `--evaluator lpips` or `--evaluator rmse`. With these
+inputs, the toolkit handles reference generation, target generation, artifact
+pairing, scoring, aggregation, and report writing. No separate baseline-generation
+script or manually populated reference directory is needed. Both models run in
+the current TRTLLM installation; the reference YAML does not select a different
+TRTLLM version. Generation settings are independent, so the target config does
+not inherit settings from the reference config.
 
 For either LPIPS or RMSE, pass `--reference-config baseline.yaml` to generate the
 baseline as part of evaluation. This YAML uses the same VisualGen arguments and
@@ -133,13 +152,49 @@ quant_config:
   dynamic: true
 ```
 
-```bash
-trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
-  --evaluator rmse --reference-config baseline.yaml --config target.yaml \
-  --prompts prompts.json --output-dir results --media-dir comparisons
+For LPIPS, an optional evaluation config can select the scoring backbone and
+device (these values are also the defaults):
+
+```yaml
+# lpips.yaml
+net: alex
+device: cpu
 ```
 
-Use `--evaluator lpips` for decoded-video comparison. RMSE automatically requests
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --config target.yaml \
+  --reference-config baseline.yaml \
+  --evaluator lpips \
+  --evaluator-options lpips.yaml \
+  --prompts prompts.json \
+  --output-dir results/lpips \
+  --media-dir comparisons
+```
+
+For RMSE, there are currently no additional scoring options in this mode.
+Omit `--evaluator-options`, or pass an `rmse.yaml` containing an empty mapping:
+
+```yaml
+# rmse.yaml
+{}
+```
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --config target.yaml \
+  --reference-config baseline.yaml \
+  --evaluator rmse \
+  --evaluator-options rmse.yaml \
+  --prompts prompts.json \
+  --output-dir results/rmse \
+  --media-dir comparisons
+```
+
+Keep `--config` after `video_generation_eval`: it is a subcommand option.
+Each invocation scores one metric; run the respective command for LPIPS or RMSE.
+
+LPIPS compares decoded video frames; it does not score audio. RMSE automatically requests
 latent outputs for both passes. The command generates one reference and one target
 per prompt: it finishes the reference pass and closes that model before loading
 the target, so both models do not need to fit in GPU memory simultaneously.
@@ -160,8 +215,12 @@ reference-generation mode.
 
 ### LPIPS
 
-Select LPIPS with `video_generation_eval --evaluator lpips`. An
-`--evaluator-options` YAML file is required:
+Select LPIPS with `video_generation_eval --evaluator lpips`. To generate the
+reference automatically, use [Generate references and targets](#generate-references-and-targets)
+above; the evaluator YAML is optional in that mode.
+
+To use existing baseline videos instead, omit `--reference-config` and supply
+an `--evaluator-options` YAML file:
 
 ```yaml
 reference_dir: baselines
@@ -172,7 +231,7 @@ device: cpu               # Optional; default: cpu.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `reference_dir` | Required | Existing directory containing the baseline MP4 videos. |
+| `reference_dir` | Required without `--reference-config` | Existing directory containing the baseline MP4 videos; omit when generating references. |
 | `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped. The root CLI still requires `--model`, but does not load it in this mode. |
 | `net` | `alex` | LPIPS backbone: `alex`, `vgg`, or `squeeze`. Keep the backbone consistent when comparing scores across runs. |
 | `device` | `cpu` | PyTorch device used for scoring, such as `cpu`, `cuda`, or `cuda:0`. |
@@ -212,7 +271,7 @@ trtllm-eval --model /path/to/video-model video_generation_eval \
   --output-dir results
 ```
 
-New videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
+Without `--reference-config`, new videos are saved as `results/generated_videos/0000.mp4`, etc. A supplied
 `generated_dir` is an input directory, not a destination for new generation.
 Both modes write `results.json` and `results.jsonl` under `--output-dir`.
 Completed scores are flushed to `results.jsonl` after each video, so they survive
@@ -243,7 +302,13 @@ saved from normal decoded outputs are not valid latent baselines. Both sides
 must contain the same modalities and exact shapes; no resizing or truncation is
 performed. Empty tensors and nonfinite values are rejected.
 
-For example, to compare H3 dynamic FP8 against a BF16 baseline:
+To generate both H3 BF16 reference latents and dynamic FP8 target latents
+automatically, use the RMSE command in
+[Generate references and targets](#generate-references-and-targets). There is no
+need to save baseline tensors separately.
+
+Alternatively, to reuse existing BF16 baseline latents, omit
+`--reference-config` and configure their directory:
 
 ```yaml
 # rmse.yaml
@@ -279,7 +344,7 @@ and generation parameters in the JSON reports. To score existing tensors, set
 `generated_dir` in `rmse.yaml` and omit `--config`; the root command still requires
 `--model`, although it does not load that model in existing-file mode.
 
-Generate the BF16 reference once using the same checkpoint and generation
+For this existing-reference workflow, generate the BF16 reference once using the same checkpoint and generation
 settings, without `quant_config`. For example, save the matching settings above
 as `bf16.yaml` and use the evaluation helpers:
 
