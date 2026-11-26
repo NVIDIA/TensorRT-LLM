@@ -26,7 +26,6 @@ l0_gb200_multi_gpus:
   - unittest/_torch/modules/test_engram_decode_hash.py
   - unittest/_torch/modules/test_engram_history_uploads.py
   - unittest/_torch/modules/test_engram_replay.py
-  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   # CSA2 kernel, indexer, chunked prefill and prefix-cache parity on Grace Blackwell.
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_packed_attention_parity
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_native_fp8_staging_exact_bytes
@@ -39,8 +38,6 @@ l0_gb200_multi_gpus:
   # Dynamic expert parallelism at attention TP against the static expert split.
   - unittest/_torch/moe/test_moe_ep_dynamic.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
-  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
-  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-groups]
@@ -163,3 +160,6 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
