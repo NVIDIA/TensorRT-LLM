@@ -50,8 +50,8 @@ Each priority model covers these in pre-merge; one entry may cover several:
 | Configuration | Pre-merge | Why |
 |---|---|---|
 | Typical deployment (precision, parallelism, speculative decoding, platform) | Required | A regression here reaches users directly |
-| Attention DP + expert parallelism, with speculative decoding when the model ships it | Required | Rank imbalance, padding, dummy requests and load balancing break most often here |
-| Disaggregated serving (context TEP, generation DEP, NIXL) | Required | KV transfer and cache-manager paths are separate from aggregated serving |
+| Attention DP, with expert parallelism for a model with experts and speculative decoding when the model ships it | Required | Rank imbalance, padding, dummy requests and expert load balancing break most often here |
+| Disaggregated serving (context TP or TEP, generation attention DP or DEP, NIXL) | Required | KV transfer and cache-manager paths are separate from aggregated serving |
 | Tensor parallelism alone | Optional | Simple path; move it to post-merge when other entries cover it |
 
 Full feature matrices (tactic × parallelism × KV dtype × scheduler options) run
