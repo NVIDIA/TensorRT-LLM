@@ -154,6 +154,8 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-1017-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # GLM-5.3-Flash 1P1D on one tray: TEP2 context and DEP2 generation workers, MTP3, NIXL.
+  - accuracy/test_disaggregated_serving.py::TestGLM53FlashFP8::test_tep2_dep2_mtp TIMEOUT (60)
   # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
   # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
   # (l0_gb300_multi_gpus).
