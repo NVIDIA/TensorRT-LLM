@@ -790,9 +790,10 @@ def _load_hf_reference():
         }
 
     # The reference calls create_causal_mask with the transformers-4.57
-    # keyword set (`input_embeds`, `cache_position`); transformers 5.x renamed
-    # the former to `inputs_embeds` and dropped the latter. Wrap the two mask
-    # builders the reference imported so either signature works.
+    # keyword set; later releases renamed `input_embeds` to `inputs_embeds`
+    # and `past_key_values` to `cache`, and dropped `cache_position`. Wrap the
+    # two mask builders the reference imported so any of these signatures
+    # works: known renames are mapped both ways, unknown kwargs are dropped.
     import inspect
 
     def _compat_mask_fn(fn):
@@ -801,10 +802,11 @@ def _load_hf_reference():
         accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
         def wrapped(**kwargs):
-            if "input_embeds" not in params and "input_embeds" in kwargs:
-                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
-            elif "inputs_embeds" not in params and "inputs_embeds" in kwargs:
-                kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+            for old, new in (("input_embeds", "inputs_embeds"), ("past_key_values", "cache")):
+                if old in kwargs and old not in params and new in params:
+                    kwargs[new] = kwargs.pop(old)
+                elif new in kwargs and new not in params and old in params:
+                    kwargs[old] = kwargs.pop(new)
             if not accepts_var_kw:
                 kwargs = {k: v for k, v in kwargs.items() if k in params}
             return fn(**kwargs)

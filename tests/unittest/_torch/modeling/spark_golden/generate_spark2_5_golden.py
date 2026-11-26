@@ -111,10 +111,11 @@ def load_reference(ref_dir: str):
         accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
         def wrapped(**kwargs):
-            if "input_embeds" not in params and "input_embeds" in kwargs:
-                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
-            elif "inputs_embeds" not in params and "inputs_embeds" in kwargs:
-                kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+            for old, new in (("input_embeds", "inputs_embeds"), ("past_key_values", "cache")):
+                if old in kwargs and old not in params and new in params:
+                    kwargs[new] = kwargs.pop(old)
+                elif new in kwargs and new not in params and old in params:
+                    kwargs[old] = kwargs.pop(new)
             if not accepts_var_kw:
                 kwargs = {k: v for k, v in kwargs.items() if k in params}
             return fn(**kwargs)
