@@ -2931,7 +2931,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     public port delegates to it.
     """
     from tensorrt_llm.serve.coordinator_server import CoordinatorServer
-    from tensorrt_llm.serve.coordinator_tls import CoordinatorTLS, is_wildcard_host
+    from tensorrt_llm.serve.coordinator_tls import (CoordinatorTLS,
+                                                    is_wildcard_host)
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
