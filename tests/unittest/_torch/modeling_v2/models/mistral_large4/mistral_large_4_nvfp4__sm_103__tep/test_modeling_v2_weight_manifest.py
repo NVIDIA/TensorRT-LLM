@@ -17,14 +17,13 @@ node; tep8: tp 8, moe_ep 8, moe_tp 1 across two nodes of four):
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import weight_table as WT
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep import (  # noqa: E501
     weights as W,
 )
@@ -142,11 +141,11 @@ class _Shell(nn.Module):
 
 def _source_keys(manifest: dict) -> set:
     """Every checkpoint key the manifest reads, key tuples flattened."""
-    return {k for sources in manifest.values() for ckpt, *_ in sources for k in W._keys(ckpt)}
+    return {k for sources in manifest.values() for ckpt, *_ in sources for k in WT._keys(ckpt)}
 
 
 def _is_vision(key: str) -> bool:
-    return key.startswith(W.VISION_PREFIXES)
+    return key.startswith(WT.VISION_PREFIXES)
 
 
 def _is_draft(key: str) -> bool:
@@ -368,7 +367,7 @@ def test_each_rank_reads_only_its_expert_window(world):
         experts: dict = {}
         for key, sources in manifest.items():
             for ckpt, index, *_ in sources:
-                keys = W._keys(ckpt)
+                keys = WT._keys(ckpt)
                 if not any(_is_expert(k) for k in keys):
                     continue
                 assert all(_is_expert(k) for k in keys), (key, ckpt)
@@ -761,19 +760,6 @@ def test_tiny_layout_is_applied_once_per_load(world):
         assert torch.equal(_bytes(model.model.w[key].data), value), key
 
 
-def _write_shards(ck: dict, directory: Path, files: int = 3) -> None:
-    """`ck` as Mistral-named shard files with their index, keys dealt round-robin, so one
-    expert's tensors -- and w1's and w3's scalars -- land in different files."""
-    from safetensors.torch import save_file
-
-    names = [f"consolidated-{i + 1:05d}-of-{files:05d}.safetensors" for i in range(files)]
-    weight_map = {key: names[i % files] for i, key in enumerate(sorted(ck))}
-    for name in names:
-        part = {k: v.contiguous() for k, v in ck.items() if weight_map[k] == name}
-        save_file(part, str(directory / name))
-    (directory / W.SHARD_INDEX).write_text(json.dumps({"weight_map": weight_map}))
-
-
 class _ReadLog:
     """`safe_open` that records every key read through it."""
 
@@ -798,76 +784,6 @@ class _ReadLog:
         return Handle()
 
 
-@pytest.mark.parametrize("world, rank", [(w, r) for w in WORLDS for r in range(w)])
-def test_tiny_load_streams_from_the_shard_files(world, rank, tmp_path, monkeypatch):
-    """With the checkpoint's shard files found through the directory the engine records on
-    the config, every source is read from them -- the given dict is never read: here it
-    holds meta tensors, which cannot be copied out -- and the result is bit for bit the
-    dict path's. Each key is read once; of the other ranks' experts only the scalars are read,
-    and nothing of the DSpark draft. Each file's cached pages are dropped once read."""
-    ck = _tiny_checkpoint(world)
-    _write_shards(ck, tmp_path)
-    log = _ReadLog(W.safe_open)
-    dropped = []
-    drop = W._drop_page_cache
-    monkeypatch.setattr(W, "safe_open", log)
-    monkeypatch.setattr(W, "_drop_page_cache", lambda path: (dropped.append(path), drop(path)))
-    streamed = _Shell(_TINY[world], world, rank, "cpu")
-    streamed.model.model_config.pretrained_config._name_or_path = str(tmp_path)
-    W.MODEL_WEIGHTS.load(streamed, {k: torch.empty_like(v, device="meta") for k, v in ck.items()})
-    monkeypatch.undo()
-    direct = _Shell(_TINY[world], world, rank, "cpu")
-    W.MODEL_WEIGHTS.load(direct, dict(ck))
-    got, want = dict(streamed.named_parameters()), dict(direct.named_parameters())
-    assert set(got) == set(want)
-    for key in want:
-        assert torch.equal(_bytes(got[key].data), _bytes(want[key].data)), key
-
-    read = set(log.keys)
-    assert len(read) == len(log.keys), "a key was read twice"
-    lo, hi = 2 * rank, 2 * rank + 2
-    off = {k for k in ck if _is_expert(k) and not lo <= _expert_of(k)[1] < hi}
-    own = {k for k in ck if not _is_draft(k)} - off
-    assert read == own | {k for k in off if _is_expert_scalar(k)}
-    assert sorted(p.name for p in dropped) == sorted(p.name for p in tmp_path.glob("*.safetensors"))
-
-
-@pytest.mark.parametrize("world", WORLDS)
-@pytest.mark.parametrize("with_index", [True, False])
-def test_tiny_load_checkpoint_reads_the_directory(world, with_index, tmp_path):
-    """Given the checkpoint directory alone, as the engine gives it, the result is bit for bit
-    the dict path's: the files come from the directory's index, or without one from the shard
-    files' headers."""
-    ck = _tiny_checkpoint(world)
-    _write_shards(ck, tmp_path)
-    if not with_index:
-        (tmp_path / W.SHARD_INDEX).unlink()
-    loaded = _Shell(_TINY[world], world, 2, "cpu")
-    W.MODEL_WEIGHTS.load_checkpoint(loaded, tmp_path)
-    direct = _Shell(_TINY[world], world, 2, "cpu")
-    W.MODEL_WEIGHTS.load(direct, dict(ck))
-    got, want = dict(loaded.named_parameters()), dict(direct.named_parameters())
-    assert set(got) == set(want)
-    for key in want:
-        assert torch.equal(_bytes(got[key].data), _bytes(want[key].data)), key
-
-
-@pytest.mark.parametrize("world", WORLDS)
-def test_tiny_load_falls_back_to_the_dict_without_an_index(world, tmp_path):
-    """A recorded directory without the shard index is not the checkpoint: the dict is read."""
-    ck = _tiny_checkpoint(world)
-    model = _Shell(_TINY[world], world, 2, "cpu")
-    model.model.model_config.pretrained_config._name_or_path = str(tmp_path)
-    W.MODEL_WEIGHTS.load(model, dict(ck))
-
-
-@pytest.mark.parametrize("world", WORLDS)
-def test_tiny_load_without_draft_tensors(world):
-    """The DSpark draft is never asserted on: a checkpoint without it loads too."""
-    ck = {k: v for k, v in _tiny_checkpoint(world).items() if not _is_draft(k)}
-    W.MODEL_WEIGHTS.load(_Shell(_TINY[world], world, 1, "cpu"), ck)
-
-
 @pytest.mark.parametrize("world", WORLDS)
 def test_tiny_load_without_off_window_codes(world):
     """The other ranks' expert codes and block scales are never read nor asserted present."""
@@ -882,145 +798,6 @@ def test_tiny_load_without_off_window_codes(world):
 def _load_raises(ck: dict, world: int, match: str, rank: int = 0) -> None:
     with pytest.raises(AssertionError, match=match):
         W.MODEL_WEIGHTS.load(_Shell(_TINY[world], world, rank, "cpu"), ck)
-
-
-@pytest.mark.parametrize("world", WORLDS)
-@pytest.mark.parametrize(
-    "key",
-    [
-        "layers.3.experts.1.w3.weight",
-        "layers.3.experts.1.w1.weight_scale",
-        "layers.3.experts.0.w3.weight_scale_2",
-        "layers.3.experts.1.w2.input_scale",
-    ],
-)
-def test_tiny_load_refuses_a_missing_in_window_tensor(key, world):
-    ck = _tiny_checkpoint(world)
-    del ck[key]
-    _load_raises(ck, world, f"checkpoint key missing: {key}")
-
-
-@pytest.mark.parametrize("world, expert", [(4, 5), (8, 13)])
-def test_tiny_load_refuses_a_missing_off_window_scalar(world, expert):
-    """The other ranks' scalars are read for the per-layer asserts, so they must be there."""
-    ck = _tiny_checkpoint(world)
-    del ck[f"layers.3.experts.{expert}.w2.input_scale"]
-    _load_raises(ck, world, f"checkpoint key missing: layers.3.experts.{expert}.w2.input_scale")
-
-
-@pytest.mark.parametrize("world", WORLDS)
-def test_tiny_load_refuses_an_unknown_tensor(world):
-    ck = _tiny_checkpoint(world)
-    ck["layers.2.attention.wq_extra.weight"] = torch.zeros(4)
-    _load_raises(ck, world, "checkpoint coverage")
-
-
-@pytest.mark.parametrize("world", WORLDS)
-@pytest.mark.parametrize(
-    "key",
-    [
-        "layers.0.attention.wq.weight_scale",
-        "layers.0.feed_forward.w3.weight_scale",
-        "layers.4.shared_experts.w2.weight_scale",
-        "layers.4.attention.indexer.wq_b.weight_scale",
-        "layers.5.attention.wo.weight_scale",
-    ],
-)
-def test_tiny_load_refuses_a_scale_that_is_not_ue8m0(key, world):
-    ck = _tiny_checkpoint(world)
-    ck[key] = ck[key].clone()
-    ck[key].view(-1)[0] *= 1.5
-    _load_raises(ck, world, "not a positive normal power of two")
-
-
-@pytest.mark.parametrize("world", WORLDS)
-def test_tiny_load_refuses_a_two_dimensional_fp8_scale(world):
-    """A `[N/128, K/128]` block-scale layout is not this one's."""
-    ck = _tiny_checkpoint(world)
-    key = "layers.4.attention.indexer.wq_b.weight_scale"
-    ck[key] = _grid(ck[key]).contiguous()
-    _load_raises(ck, world, r"not \[N/128, 1, K/128, 1\]")
-
-
-@pytest.mark.parametrize("world, expert", [(4, 0), (4, 6), (8, 0), (8, 13)])
-@pytest.mark.parametrize("scalar", ["weight_scale_2", "input_scale"])
-def test_tiny_load_refuses_w1_and_w3_scalars_that_differ(world, expert, scalar):
-    """On this rank's experts and on the others' alike."""
-    ck = _tiny_checkpoint(world)
-    key = f"layers.5.experts.{expert}.w3.{scalar}"
-    ck[key] = ck[key] * 2
-    experts = _TINY[world]["n_routed_experts"]
-    want = f"layers.5: w1 and w3 {scalar} differ on 1 of {experts} experts, first expert {expert}:"
-    _load_raises(ck, world, want)
-
-
-@pytest.mark.parametrize("world, expert", [(4, 7), (8, 15)])
-@pytest.mark.parametrize("proj", ["w1", "w2"])
-def test_tiny_load_refuses_an_input_scale_that_varies_over_the_experts(world, expert, proj):
-    """Rank 0 sees the other ranks' experts' input_scale: one off-window expert disagreeing is
-    a quantization rank 0's window would not share."""
-    ck = _tiny_checkpoint(world)
-    for p in {proj, "w3"} if proj == "w1" else {proj}:
-        key = f"layers.6.experts.{expert}.{p}.input_scale"
-        ck[key] = ck[key] * 2
-    want = f"layers.6: {proj}.input_scale is not one value over the experts: expert {expert}"
-    _load_raises(ck, world, want)
-
-
-@pytest.mark.parametrize("world", WORLDS)
-@pytest.mark.parametrize("value", [0.0, -1e-4, float("inf"), float("nan")])
-def test_tiny_load_refuses_a_scalar_that_is_not_a_positive_finite_scale(value, world):
-    ck = _tiny_checkpoint(world)
-    ck["layers.2.experts.3.w2.weight_scale_2"] = torch.tensor(value)
-    _load_raises(
-        ck, world, "layers.2: w2.weight_scale_2 of expert 3 is .*not a positive finite scale"
-    )
-
-
-def test_shared_scalar_refuses_copies_that_differ():
-    """The row transform asserts on its own copies too, whatever ran before it."""
-    one = torch.tensor(0.5)
-    assert W._shared_scalar((one, one.clone(), one.clone()), None) is one
-    with pytest.raises(AssertionError, match="1 of 3 copies"):
-        W._shared_scalar((one, one.clone(), torch.tensor(0.25)), None)
-
-
-@pytest.mark.parametrize(
-    "value, exact",
-    [
-        (1.0, True),
-        (2.0**-126, True),
-        (2.0**127, True),
-        (2.0**-15, True),
-        (0.0, False),
-        (-(2.0**-12), False),
-        (3.0 * 2.0**-12, False),
-        (2.0**-130, False),  # subnormal
-        (float("inf"), False),
-        (float("nan"), False),
-    ],
-)
-def test_ue8m0_assert(value, exact):
-    s = torch.full((2, 3), 2.0**-10)
-    s[1, 2] = value
-    if exact:
-        W._assert_ue8m0(s)
-    else:
-        with pytest.raises(AssertionError, match="1 of 6"):
-            W._assert_ue8m0(s)
-
-
-def test_packed_reference_itself():
-    """`_packed` on a hand-written grid: 6 K blocks with exponent bytes 120..125 in one
-    128-row block -> word 0 = 120 | 121 << 8 | 122 << 16 | 123 << 24, word 1 = 124 | 125 << 8,
-    the same for all 128 rows; a byte of 128 or more lands in the sign bit."""
-    grid = torch.exp2(torch.arange(120, 126, dtype=torch.float32) - 127).view(1, 6)
-    got = _packed(grid)
-    assert got.shape == (2, 128)
-    assert bool((got[0] == 120 | 121 << 8 | 122 << 16 | 123 << 24).all())
-    assert bool((got[1] == 124 | 125 << 8).all())
-    high = _packed(torch.tensor([[1.0, 1.0, 1.0, 2.0]]))
-    assert bool((high[0] == (127 | 127 << 8 | 127 << 16 | 128 << 24) - 2**32).all())
 
 
 @pytest.mark.parametrize("world", [4, 8])

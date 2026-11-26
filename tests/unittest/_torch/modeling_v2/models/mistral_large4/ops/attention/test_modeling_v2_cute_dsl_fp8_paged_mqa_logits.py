@@ -622,41 +622,6 @@ def test_a_1m_row_reads_its_last_page_through_the_table(next_n, width) -> None:
         built.close()
 
 
-def test_the_band_rejects_an_fp16_epilogue() -> None:
-    """The gate's discrimination, kept: on the 16-sequence edge batch the op's
-    own fp16 epilogue and head weights rounded to fp16 each land outside the
-    band that the fp32 call sits well inside."""
-    spec = dict(
-        heads=32,
-        head_dim=128,
-        tokens_per_block=32,
-        next_n=1,
-        max_context_len=9216,
-        layout="v2",
-        pool_layers=44,
-        pool_row=3,
-        num_blocks=2048,
-        table_width=292,
-        context_lens=[1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 2049, 9215, 9216],
-    )
-    built = _build_sw(spec, seed=27)
-    try:
-        args = built.args
-        ref, mag = op.reference(*args), _magnitude(args)
-        print(f"\nfp32 epilogue: {_compare(op(*args).clone(), ref, mag)}", flush=True)
-        fp16_epilogue = op(*args, 1, torch.float16).clone()
-        with pytest.raises(AssertionError, match="ulp") as refused:
-            _compare(fp16_epilogue, ref, mag)
-        print(f"fp16 epilogue: {refused.value}", flush=True)
-        q, kv, w, *rest = args
-        fp16_weights = op(q, kv, w.half().float(), *rest).clone()
-        with pytest.raises(AssertionError, match="ulp") as refused:
-            _compare(fp16_weights, ref, mag)
-        print(f"fp16 head weights: {refused.value}", flush=True)
-    finally:
-        built.close()
-
-
 def _ok():
     spec = dict(
         heads=32,

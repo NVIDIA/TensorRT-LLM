@@ -177,6 +177,10 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/comm
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm10xDefault::test_mtp3_long_context TIMEOUT (60)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 pre-merge e2e gate: tep4-quick runs
+  # native DSpark (GSM8K + AL), MMMU, and multimodal panel with block reuse on one engine
+  # (~12-15m on 4xGB300). dep4/tp4/llguidance run post-merge (l0_gb300_multi_gpus).
+  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]
 
 # K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
 # NVLink domain.

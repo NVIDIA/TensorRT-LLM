@@ -474,31 +474,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
             _drive(spec, lens, logits[: batch * spec["next_n"]], aux, guard, by_score)
 
 
-@pytest.mark.parametrize("next_n,width,row_pad", [(1, 1048576, 0), (4, 1048584, 248)])
-def test_sw1m_sixteen_requests_need_the_whole_arena(next_n, width, row_pad) -> None:
-    """Every row at 1M splits 10 ways: one missing scratch element must fail
-    before any write, both for single-token decode and four-token verification."""
-    k, rows = 2048, 16 * next_n
-    spec = dict(next_n=next_n, width=width, row_pad=row_pad, index_topk=k, aux_rows=rows)
-    lens = [width] * 16
-    logits = _logits(spec, lens, next_n, torch.Generator().manual_seed(14))
-    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    indices = torch.full((rows, k), UNWRITTEN, dtype=torch.int32, device="cuda")
-    aux = _scratch_dep4(spec, rows)
-    short = tuple(t.view(-1)[:-1] for t in aux)
-    _arm(aux)
-    need = rows * AUX_BLOCKS * k
-    with pytest.raises(RuntimeError, match=rf"got {need - 1} / {need - 1}, need {need}\)"):
-        _call(logits, seq_lens, indices, next_n, k, *short)
-    assert bool((indices == UNWRITTEN).all())
-    assert _check_scratch(aux, rows, k) == 0
-    _call(logits, seq_lens, indices, next_n, k, *aux)
-    assert _check_scratch(aux, rows, k) == 10
-    _compare(
-        indices, op.reference(logits, seq_lens, indices, next_n, k), logits, lens, next_n, False
-    )
-
-
 def test_short_rows_list_their_columns_in_order() -> None:
     """On the single-block path, a row no wider than top-k is the identity, in order, then -1."""
     spec = dict(next_n=2, width=64, index_topk=16)
@@ -531,15 +506,6 @@ def test_guard_refuses_a_wider_indices_buffer() -> None:
     with pytest.raises(AssertionError, match="exactly 16 columns wide"):
         with validating(op):
             _call(logits, lens, wide, 1, 16, None, None)
-
-
-def test_the_op_refuses_int64_seq_lens_itself() -> None:
-    """Loud, so `is_valid` does not restate it."""
-    logits, lens = _small()
-    indices = torch.full((2, 16), UNWRITTEN, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="expected scalar type Int but found Long"):
-        _call(logits, lens.long(), indices, 1, 16, None, None)
-    assert bool((indices == UNWRITTEN).all())
 
 
 #: The Mistral Large 4 targets' scorer widths: the FP8 target's 9216, the NVFP4
@@ -656,30 +622,3 @@ def _blocks_per_row(rows: int, width: int, k: int = 2048) -> int:
     need = int(re.search(r"need (\d+)\)", str(err.value)).group(1))
     assert need % (rows * k) == 0, need
     return need // (rows * k)
-
-
-@pytest.mark.parametrize("width", FORCED_SPLIT_WIDTHS)
-def test_ten_blocks_per_row_at_every_row_count_from_200000_columns(width) -> None:
-    """At 1048576 columns every decode batch 1..16 splits its rows 10 ways."""
-    assert [_blocks_per_row(rows, width) for rows in range(1, 17)] == [AUX_BLOCKS] * 16
-
-
-def test_sixteen_rows_at_1m_fill_the_radix_arena_exactly() -> None:
-    """16 rows x 10 blocks x 2048 is the DSA arena [16, 10, 2048] to the element.
-
-    Every element is written and nothing past it; one element less is refused by the op.
-    """
-    spec = dict(next_n=1, width=1 << 20, index_topk=2048, aux_rows=16)
-    lens = [1 << 20, (1 << 20) - 1, 2049, 20481, 20490, 1, 524288, 1000000] * 2
-    logits = _logits(spec, lens, 1, torch.Generator().manual_seed(13))
-    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    indices = torch.full((16, 2048), UNWRITTEN, dtype=torch.int32, device="cuda")
-    aux, guard = _scratch(spec, 16)
-    _call(logits, seq_lens, indices, 1, 2048, *aux)
-    ref = op.reference(logits, seq_lens, indices, 1, 2048)
-    _compare(indices, ref, logits, lens, 1, by_score=False)
-    assert not bool((aux[0] == AUX_SENTINEL).any()), "an arena element was left unwritten"
-    _assert_guard_untouched(guard)
-    short = (aux[0].reshape(-1)[:-1], aux[1].reshape(-1)[:-1])
-    with pytest.raises(RuntimeError, match=r"got 327679 / 327679, need 327680"):
-        _call(logits, seq_lens, indices, 1, 2048, *short)

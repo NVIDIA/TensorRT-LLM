@@ -78,6 +78,16 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  # ModelingV2 Mistral Large 4 sm_103: 8 GB300 GPUs over two nodes, tep8 and tp8 quick
+  # DSpark profiles (dep8-quick and 1P1D disagg run in L0 post-merge).
+  - case: accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep8-quick]
+    launch:
+      mode: mpi
+      world_size: 8
+  - case: accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp8-quick] TIMEOUT (90)
+    launch:
+      mode: mpi
+      world_size: 8
   # ModelingV2 Qwen3.8-Flash-Next NVFP4: attention DP over two nodes of four GPUs, three drafts.
   - case: accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault::test_mtp3_gsm8k[dep8] TIMEOUT (60)
     launch:

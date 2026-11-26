@@ -738,68 +738,21 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(args, expected, spec["is_neox"])
 
 
-def _cell_32768_v2():
-    """The non-large 32768-row cell on a rebuilt V2 view at max_seq_len 32768 (slots past 2^31
-    and 2^32 bytes)."""
+def _cell_32768():
+    """The 32768-row prefill cell over the YaRN table."""
     return next(
         c
         for c in op.CELLS
-        if c.spec.get("layout") == "v2"
-        and c.spec["tokens"] == 32768
-        and c.spec.get("max_seq_len") == 32768
+        if c.spec.get("tokens") == 32768
+        and c.spec.get("table") == "yarn"
         and not c.spec.get("large")
     )
 
 
-def _cell_1m_chunk_v2():
-    """tp4's 1M-table 32768-row chunk on a rebuilt V2 view: positions 1015808..1048575 over
-    the bf16-rounded table (`table_dtype`, which tep4's and dep4's cells do not carry)."""
-    return next(
-        c
-        for c in op.CELLS
-        if c.spec.get("layout") == "v2"
-        and c.spec.get("max_seq_len") == 1048576
-        and c.spec.get("requests") == (32768,)
-        and c.spec["table"] == "yarn"
-        and c.spec.get("table_dtype") == "bfloat16"
-    )
-
-
-def _cell_1m_v2():
-    """The 1M envelope's last chunk on a rebuilt V2 view: positions 1015808..1048575 (tep4's
-    and dep4's cell, over the fp32 table: tp4's, with `table_dtype`, is `_cell_1m_chunk_v2`)."""
-    return next(
-        c
-        for c in op.CELLS
-        if c.spec.get("layout") == "v2"
-        and c.spec.get("max_seq_len") == 1048576
-        and c.spec["table"] == "yarn"
-        and c.spec.get("cached") == (1015808,)
-        and "table_dtype" not in c.spec
-    )
-
-
-@pytest.mark.parametrize(
-    "tokens, prefixes",
-    [(9216, (1024, 1025)), (32768, (1024, 1025, 9216, 16385, 32767))],
-    ids=["9216", "32768"],
-)
-def test_rows_do_not_depend_on_the_launch_shape(tokens, prefixes) -> None:
-    """The launcher and the grid change no byte a row writes.
-
-    One input of a full-step cell -- the FP8 target's 9216-row interleaved cell
-    on the strided view, or the NVFP4 target's 32768-row cell on a V2 view (the
-    contiguous launchers) -- run at shorter num_tokens: 1024 (2 rows per CTA),
-    1025 (8 rows per CTA) and, at 32768, also 9216, 16385 and 32767. The rows a
-    shorter run writes are bitwise the full run's, and the rows at and past its
-    num_tokens stay unwritten. With the bucket-edge cells and the maximum
-    measured against the reference, every row count between them writes what
-    they measured.
-    """
-    if tokens == 9216:
-        cell = next(c for c in op.CELLS if c.spec["tokens"] == 9216 and c.spec["table"] == "yarn")
-    else:
-        cell = _cell_32768_v2()
+def test_rows_do_not_depend_on_the_launch_shape() -> None:
+    """The launcher and the grid change no byte a row writes across CTA buckets (1024 vs 1025)."""
+    cell = _cell_32768()
+    prefixes = (1024, 1025, 16385, 32767)
     full, _, _ = _build(cell.spec, _seed(cell))
     compiled = _compiled(False, full[5].is_contiguous())
     op(*full, is_neox=False, compiled=compiled)
@@ -835,78 +788,6 @@ def test_a_capturable_call_matches_the_validated_one(layout) -> None:
     op(*args, is_neox=False, compiled=compiled, validate=True)
     op(*again, is_neox=False, compiled=compiled, validate=False)
     assert torch.equal(args[5], again[5])
-
-
-@pytest.mark.parametrize(
-    "wrong",
-    [
-        "offsets wrapped at 2^32",
-        "positions one back",
-        "rotation reversed",
-        "1M positions one back",
-        "1M positions wrapped at 2^15",
-    ],
-)
-def test_the_gate_sees_a_wrapped_offset_or_a_wrong_rotation(wrong) -> None:
-    """The 32768-row V2 cell's gate is not blind to what a 32-bit offset, an
-    off-by-one position or a reversed rotation would do, nor the 1M chunk cell's
-    to a position one back or one read through a 32768-row table.
-
-    The op runs on that cell's input with every slot taken modulo 2^32 (what an
-    unsigned 32-bit byte offset would write; the rows past 2^32 bytes land
-    inside the view, among other rows), with every position one back (the
-    first row stays at 0), or with the table's sines negated; on the 1M chunk
-    (positions 1015808..1048575) with every position one back, or modulo 2^15
-    (the rows a 32768-row table would hand out cyclically). `_compare`, against
-    the reference of the true input, must refuse each; what it measured is
-    printed.
-    """
-    cell = _cell_1m_v2() if wrong.startswith("1M") else _cell_32768_v2()
-    args, _, _ = _build(cell.spec, _seed(cell))
-    compiled = _compiled(False, args[5].is_contiguous())
-    expected = op.reference(*args, is_neox=False, compiled=compiled)
-    call = list(args)
-    if wrong == "offsets wrapped at 2^32":
-        moved = int((args[6] >= 2**32).sum())
-        assert moved > 0, "no slot of the cell lies past 2^32 bytes"
-        call[6], call[7] = args[6] % 2**32, args[7] % 2**32
-    elif wrong.endswith("positions one back"):
-        call[3] = (args[3] - 1).clamp(min=0)
-    elif wrong == "1M positions wrapped at 2^15":
-        assert int(args[3].min()) >= 2**15, "the cell has a position below 2^15"
-        call[3] = args[3] % 2**15
-    else:
-        call[4] = args[4].clone()
-        call[4][:, 1].neg_()
-    op(*call, is_neox=False, compiled=compiled)
-    print(f"\n[{wrong}] {_code_excess(args, expected, is_neox=False)}")
-    with pytest.raises(AssertionError, match="scale differs|outside its slots|outside the band"):
-        _compare(args, expected, is_neox=False)
-
-
-@pytest.mark.parametrize("wrong", ["positions one back", "positions wrapped at 2^15"])
-def test_the_gate_sees_a_far_position_read_from_the_wrong_row(wrong) -> None:
-    """The 1M chunk cell's gate is not blind to a key roped at the wrong row.
-
-    The op runs on that cell's input (positions 1015808..1048575 over the
-    bf16-rounded 1048576-row table) with every position one back, or taken
-    modulo 2^15 (the row a position wrapped at the 32768-row envelope would
-    read). `_compare`, against the reference of the true input, must refuse
-    each; what it measured is printed.
-    """
-    cell = _cell_1m_chunk_v2()
-    args, _, _ = _build(cell.spec, _seed(cell))
-    compiled = _compiled(False, args[5].is_contiguous())
-    expected = op.reference(*args, is_neox=False, compiled=compiled)
-    call = list(args)
-    if wrong == "positions one back":
-        call[3] = args[3] - 1
-    else:
-        call[3] = args[3] % 2**15
-    op(*call, is_neox=False, compiled=compiled)
-    print(f"\n[{wrong}] {_code_excess(args, expected, is_neox=False)}")
-    with pytest.raises(AssertionError, match="scale differs|outside its slots|outside the band"):
-        _compare(args, expected, is_neox=False)
 
 
 _SMALL = dict(

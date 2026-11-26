@@ -94,7 +94,9 @@ _TACTICS = {
 
 @torch.library.custom_op("trtllm::cute_dsl_fused_fp8_block_scale_linear", mutates_args=())
 def _fused(input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
-    from ._fused_fp8_quant_gemv import fused_fp8_quant_gemv
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
+        fused_fp8_quant_gemv,
+    )
 
     if input.data_ptr() % 16 or input.stride(0) % 8:
         return baseline(input.contiguous(), weight, weight_scale)

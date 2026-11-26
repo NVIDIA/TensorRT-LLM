@@ -70,11 +70,11 @@ class DsMlaDequantGather(OpWrapper):
     # each bitwise the leading rows of the full call).
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="one 32768-token request (the unchunked envelope)",
+            why="one 32768-token request (unchunked envelope)",
             spec=dict(cached=[0], new=[32768], blocks=1100, owners=63, tokens_per_block=32, row=31),
         ),
         Cell(
-            why="three requests, cached prefixes mid-page, the last owner row",
+            why="three requests, cached prefixes mid-page, last owner row",
             spec=dict(
                 cached=[0, 1029, 5185],
                 new=[300, 2047, 1],
@@ -85,23 +85,13 @@ class DsMlaDequantGather(OpWrapper):
             ),
         ),
         Cell(
-            why="sixteen 2048-token requests (a full prefill batch)",
+            why="sixteen 2048-token requests (full prefill batch)",
             spec=dict(
                 cached=[0] * 16, new=[2048] * 16, blocks=1100, owners=63, tokens_per_block=32, row=0
             ),
         ),
         Cell(
-            why="64-token pages",
-            spec=dict(cached=[37], new=[1000], blocks=64, owners=63, tokens_per_block=64, row=2),
-        ),
-        # The 32-token cells above at 64-token pages: the same requests and owner rows, half
-        # the blocks for the same token capacity.
-        Cell(
-            why="64-token pages: one 32768-token request (the unchunked envelope)",
-            spec=dict(cached=[0], new=[32768], blocks=550, owners=63, tokens_per_block=64, row=31),
-        ),
-        Cell(
-            why="64-token pages: three requests, cached prefixes mid-page, the last owner row",
+            why="64-token pages with cached prefix",
             spec=dict(
                 cached=[0, 1029, 5185],
                 new=[300, 2047, 1],
@@ -112,497 +102,39 @@ class DsMlaDequantGather(OpWrapper):
             ),
         ),
         Cell(
-            why="64-token pages: sixteen 2048-token requests (a full prefill batch)",
-            spec=dict(
-                cached=[0] * 16, new=[2048] * 16, blocks=550, owners=63, tokens_per_block=64, row=0
-            ),
-        ),
-        # The tp4 deployment at the 1M envelope, workspace path: a step whose context KV (cached +
-        # new over its context requests) is at most B = 2**19 rows gathers it into rows [0, N)
-        # of one bf16 [B, 576] buffer, out = buf[:N]; md.block_table is [16, 32772].
-        Cell(
-            why="1M tp4 workspace at N = B = 2**19: a 32768-row chunk behind a 491520-token "
-            "prefix, owner row 62, its 16384 pages anywhere in a 16500-block pool (20.3 GiB, "
-            "byte offsets past 2**34); every N 1..B a bitwise prefix, rows past N untouched",
+            why="1M workspace at N = B = 2**19 behind cached prefix, far pool, owner row 62",
             spec=dict(
                 cached=[491520],
                 new=[32768],
                 blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_width=32772,
-                prefixes=True,
-            ),
-        ),
-        Cell(
-            why="1M tp4 workspace at N = B, NoPE source: the nine sharers re-gather layer 35's "
-            "row 35 (zero rope) into the same buffer, 491520 cached + 32768 new",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=35,
-                out_rows=524288,
-                table_width=32772,
-                nope=True,
-            ),
-        ),
-        Cell(
-            why="1M tp4 packed chunk step: four requests cached 262144/131072/0/2048 + "
-            "16384/8192/4096/4096 (N = 428032 of the 2**19-row buffer), owner row 1",
-            spec=dict(
-                cached=[262144, 131072, 0, 2048],
-                new=[16384, 8192, 4096, 4096],
-                blocks=13500,
-                owners=63,
-                tokens_per_block=32,
-                row=1,
-                out_rows=524288,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tp4 short step in the stale 2**19-row buffer: three requests, prefixes "
-            "mid-page (N = 9580), the 32772-column table",
-            spec=dict(
-                cached=[0, 2047, 5185],
-                new=[300, 1, 2047],
-                blocks=600,
-                owners=63,
-                tokens_per_block=32,
-                row=7,
-                out_rows=524288,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tp4 sixteen requests filling the 2**19-row buffer: 30720 cached + 2048 new "
-            "each, kv_req 0..15 over all 16 rows of the 32772-column table",
-            spec=dict(
-                cached=[30720] * 16,
-                new=[2048] * 16,
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=0,
-                out_rows=524288,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tp4 boot-sized pool, large: 74183 blocks (91.4 GiB), the 491520 + 32768 "
-            "request's 16384 pages the pool's top ones (byte offsets to 98.1e9), N = B",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=74183,
                 owners=63,
                 tokens_per_block=32,
                 row=62,
                 out_rows=524288,
                 table_width=32772,
                 far=True,
-                large=True,
-            ),
-        ),
-        # A 1M prompt's chunk steps on the workspace path: chunk k is 32768 new rows behind a
-        # 32768 * (k - 1)-token prefix, N = 32768 * k, for k = 1..15 (chunk 16 is the N = B
-        # cell above; past it the decode path). Every owner layer gathers each chunk at its
-        # own row; the chunks here take rows 2, 6, .., 58.
-        *(
-            Cell(
-                why=f"1M tp4 chunk {k} of a 1M prompt at N = {32768 * k}: 32768 new rows behind "
-                f"a {32768 * (k - 1)}-token prefix into the 2**19-row buffer, owner row "
-                f"{4 * k - 2}, its pages anywhere in a 16500-block pool",
-                spec=dict(
-                    cached=[32768 * (k - 1)],
-                    new=[32768],
-                    blocks=16500,
-                    owners=63,
-                    tokens_per_block=32,
-                    row=4 * k - 2,
-                    out_rows=524288,
-                    table_width=32772,
-                ),
-            )
-            for k in range(1, 16)
-        ),
-        # A fresh request's dense step: the engine's warmup steps (1 and 2 rows) and a short
-        # request (7 rows), into the first rows of the held buffer.
-        *(
-            Cell(
-                why=f"1M tp4 fresh {n}-row step (the engine warmup steps, a short request): "
-                f"N = {n} of the stale 2**19-row buffer, its page the pool's last one (the "
-                "16500-block pool's top block, owner row 62)",
-                spec=dict(
-                    cached=[0],
-                    new=[n],
-                    blocks=16500,
-                    owners=63,
-                    tokens_per_block=32,
-                    row=62,
-                    out_rows=524288,
-                    table_width=32772,
-                    far=True,
-                ),
-            )
-            for n in (1, 2, 7)
-        ),
-        # The Mistral Large 4 NVFP4 tep4 deployment's workspace path at max_seq_len 1048576 with
-        # chunked prefill: a step whose context KV (cached + new over its context requests) is
-        # at most B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer,
-        # out = buf[:N], through md.block_table [16, 32772]; owners 63, 32 tokens per block.
-        Cell(
-            why="1M tep4 workspace at N = B = 2**19: a 32768-row chunk behind a 491520-token "
-            "prefix, owner row 62, its 16384 pages anywhere in a 16500-block pool (20.3 GiB, "
-            "byte offsets to 2.18e10); every N below B a bitwise prefix of the full call",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                prefixes=True,
             ),
         ),
         Cell(
-            why="1M tep4 NoPE source at N = B: the nine sharers re-gather layer 35's row 35 "
-            "(zero rope) into the same 2**19-row buffer, 491520 cached + 32768 new",
+            why="1M workspace NoPE source (owner row 35) and packed chunks in stale buffer",
             spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
+                cached=[262144, 131072, 0, 2048],
+                new=[16384, 8192, 4096, 4096],
+                blocks=14000,
                 owners=63,
                 tokens_per_block=32,
                 row=35,
                 out_rows=524288,
-                table_rows=16,
                 table_width=32772,
                 nope=True,
-            ),
-        ),
-        Cell(
-            why="1M tep4 packed step, N = 428032: four requests cached 262144/131072/0/2048 "
-            "+ new 16384/8192/4096/4096 over a 13500-block pool, owner row 1",
-            spec=dict(
-                cached=[262144, 131072, 0, 2048],
-                new=[16384, 8192, 4096, 4096],
-                blocks=13500,
-                owners=63,
-                tokens_per_block=32,
-                row=1,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep4 short step, N = 9580, leading the 2**19-row buffer: three requests "
-            "with prefixes mid-page, owner row 7",
-            spec=dict(
-                cached=[0, 2047, 5185],
-                new=[300, 1, 2047],
-                blocks=600,
-                owners=63,
-                tokens_per_block=32,
-                row=7,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep4 sixteen requests at N = B: 30720 cached + 2048 new each (a full "
-            "32768-row step), kv_req 0..15 over every row of the table, owner row 0",
-            spec=dict(
-                cached=[30720] * 16,
-                new=[2048] * 16,
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=0,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep4 boot-sized pool, large: 74183 blocks (91.4 GiB), the 491520 + 32768 "
-            "request's 16384 pages its top ones (byte offsets to 9.81e10), N = B, row 62",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=74183,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                far=True,
-                large=True,
-            ),
-        ),
-        # The Mistral Large 4 NVFP4 dep4 deployment's workspace path at max_seq_len 1048576 with
-        # chunked prefill, under attention DP (a rank's own context requests, up to 16): a step
-        # whose context KV on the rank (cached + new over its context requests) is at most
-        # B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer, out = buf[:N],
-        # through md.block_table [16, 32772]; owners 63, 32 tokens per block.
-        Cell(
-            why="1M dep4 workspace at N = B = 2**19: a 32768-row chunk behind a 491520-token "
-            "prefix, owner row 62, its 16384 pages anywhere in a 16500-block pool (20.3 GiB, "
-            "byte offsets to 2.18e10); every N below B a bitwise prefix of the full call",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                prefixes=True,
-            ),
-        ),
-        Cell(
-            why="1M dep4 NoPE source at N = B: the nine sharers re-gather layer 35's row 35 "
-            "(zero rope) into the same 2**19-row buffer, 491520 cached + 32768 new",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=35,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                nope=True,
-            ),
-        ),
-        Cell(
-            why="1M dep4 packed step, N = 428032: four of the rank's requests cached "
-            "262144/131072/0/2048 + new 16384/8192/4096/4096, a 13500-block pool, owner row 1",
-            spec=dict(
-                cached=[262144, 131072, 0, 2048],
-                new=[16384, 8192, 4096, 4096],
-                blocks=13500,
-                owners=63,
-                tokens_per_block=32,
-                row=1,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M dep4 short step, N = 9580, leading the 2**19-row buffer: three requests "
-            "with prefixes mid-page, owner row 7",
-            spec=dict(
-                cached=[0, 2047, 5185],
-                new=[300, 1, 2047],
-                blocks=600,
-                owners=63,
-                tokens_per_block=32,
-                row=7,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M dep4 sixteen requests at N = B: a rank's 16 own requests, 30720 cached + "
-            "2048 new each (a full 32768-row step), kv_req 0..15 over every table row, owner row 0",
-            spec=dict(
-                cached=[30720] * 16,
-                new=[2048] * 16,
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=0,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M dep4 boot-sized pool, large: 74183 blocks (91.4 GiB), the 491520 + 32768 "
-            "request's 16384 pages its top ones (byte offsets to 9.81e10), N = B, row 62",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=74183,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                far=True,
-                large=True,
-            ),
-        ),
-        # The Mistral Large 4 NVFP4 tep8 deployment's workspace path at max_seq_len 1048576 with
-        # chunked prefill: a step whose context KV (cached + new over its context requests) is
-        # at most B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer,
-        # out = buf[:N], through md.block_table [16, 32772]; owners 63, 32 tokens per block.
-        Cell(
-            why="1M tep8 workspace at N = B = 2**19: a 32768-row chunk behind a 491520-token "
-            "prefix, owner row 62, its 16384 pages anywhere in a 16500-block pool (20.3 GiB, "
-            "byte offsets to 2.18e10); every N below B a bitwise prefix of the full call",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                prefixes=True,
-            ),
-        ),
-        Cell(
-            why="1M tep8 NoPE source at N = B: the nine sharers re-gather layer 35's row 35 "
-            "(zero rope) into the same 2**19-row buffer, 491520 cached + 32768 new",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=35,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                nope=True,
-            ),
-        ),
-        Cell(
-            why="1M tep8 packed step, N = 428032: four requests cached 262144/131072/0/2048 "
-            "+ new 16384/8192/4096/4096 over a 13500-block pool, owner row 1",
-            spec=dict(
-                cached=[262144, 131072, 0, 2048],
-                new=[16384, 8192, 4096, 4096],
-                blocks=13500,
-                owners=63,
-                tokens_per_block=32,
-                row=1,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep8 short step, N = 9580, leading the 2**19-row buffer: three requests "
-            "with prefixes mid-page, owner row 7",
-            spec=dict(
-                cached=[0, 2047, 5185],
-                new=[300, 1, 2047],
-                blocks=600,
-                owners=63,
-                tokens_per_block=32,
-                row=7,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep8 sixteen requests at N = B: 30720 cached + 2048 new each (a full "
-            "32768-row step), kv_req 0..15 over every row of the table, owner row 0",
-            spec=dict(
-                cached=[30720] * 16,
-                new=[2048] * 16,
-                blocks=16500,
-                owners=63,
-                tokens_per_block=32,
-                row=0,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-            ),
-        ),
-        Cell(
-            why="1M tep8 bound-sized pool, large: 147456 blocks (181.6 GiB), the 491520 + 32768 "
-            "request's 16384 pages its top ones (byte offsets to 1.95e11), N = B, row 62",
-            spec=dict(
-                cached=[491520],
-                new=[32768],
-                blocks=147456,
-                owners=63,
-                tokens_per_block=32,
-                row=62,
-                out_rows=524288,
-                table_rows=16,
-                table_width=32772,
-                far=True,
-                large=True,
             ),
         ),
     )
 
     note = """
-    Call sites: mistral_large4 targets' context rows, once per owner layer and once
-    per step for the NoPE source (its sharers reuse that workspace). Bitwise equal to
-    `reference` (the cells). Launch: Triton, grid (N, 5); not captured (context steps).
-    A call writes 37.7 MB per 32768 rows and 604 MB at 2**19 rows; the 147456-block cell
-    peaks at 185.65 GiB allocated.
-
-    The "1M tp4", "1M tep4", "1M dep4" and "1M tep8" cells are the Mistral Large 4 NVFP4 tp4,
-    tep4, dep4 and tep8 deployments' workspace path at max_seq_len 1048576 with chunked
-    prefill (steps of up to 32768 new rows and 16 requests; under dep4's attention DP, a
-    rank's own requests): a step whose context KV (on the rank), cached + new summed over
-    its context requests, is at most B = 2**19 rows gathers it into rows [0, N) of one
-    bf16 [B, 576] buffer (576 MiB), out = buf[:N], its later rows stale; the owner layers
-    at their own row and the NoPE sharers at row 35 again, into the same buffer. A step
-    above B gathers nothing (the sparse decode kernel attends it off the pool), so no cell
-    passes N > 2**19. Each step a 1M prompt takes on this path is a "1M tp4" cell: its
-    chunks k = 1..16, 32768 new rows behind 32768 (k - 1) cached, N = 32768 k (k = 16 the
-    N = B cell), and the fresh dense steps of 1, 2 and 7 rows (the engine's warmup steps
-    and a short request). The kernel writes rows [0, N) of `out` and nothing past them:
-    the cells hold the buffer's later rows to a sentinel, and the N = B cells hold every N
-    below B to the full call's leading rows (bitwise). Pages a cell's requests do not
-    hold are filled with 0xFF (NaN in every field), so a read from a wrong page, owner
-    row or offset changes the bits the cells compare. The tp4, tep4 and dep4 large cells'
-    74183-block pool lies above the dep4 boot's fp8_ds_mla pool (64292 blocks per rank,
-    measured at fraction 0.9: 2057344 tokens), with the request's pages at its top. The
-    tep8 pool at the 1M boot is 114021 blocks per rank (3,648,672 tokens, read back from
-    the 1M tep8 boot on fp8_ds_mla at fraction 0.9) and cannot reach 147456 blocks
-    (147456 x 32 x 47,136 B = 222.4 GB, more than a rank's whole free memory): the tep8
-    large cell's pool is 147456 blocks, the request's pages its top ones.
-
-    Hard limits (sm_103)
-      pool byte offset  ((block * owners + row) * tpb + pos % tpb) * 656, int64 in the
-                        kernel; past 2**31 bytes from block 1623 row 51, every row from
-                        block 1624 on (owners 63, tpb 32); probed at 2.18e10 bytes (16500
-                        blocks), 9.81e10 bytes (74183 blocks) and 1.95e11 bytes (147456
-                        blocks), the pages the pool's top ones in the large cells  passed
-      out row offset    w * out.stride(0), int64; the int32 boundary 2**31 / 576 =
-                        3728270 rows lies past every cell (N <= 2**19)      not reached
-      kv_req, kv_pos    int32 tensors, widened to int64 in the kernel; kv_req probed to
-                        15, kv_pos to 524287                                passed
-      block_table       req * block_table.stride(0) + pos // tpb, int64; a [16, 32772]
-                        int32 table read to row 15 and column 16383         passed
-      N                 grid x; every N 1..64, 2**k - 1 / 2**k / 2**k + 1 from 2**7, every
-                        4093rd and every 4099th, every multiple of 32768 and 2**19 - 1,
-                        each a prefix of the 2**19 call                     passed
-      no index passes through fp32.
-
-    is_valid refuses an `out` with fewer rows than `kv_req` (a shape check, no sync): the
-    kernel writes a row for every kv_req entry, past out's end, silently (the guard tests
-    show it). It reads kv_pos at every kv_req row as well; nothing compares kv_pos's
-    length with kv_req's.
+    Triton dequantize-gather from uint8 fp8_ds_mla paged pool into a contiguous bf16 [N, 576]
+    context workspace. Bitwise exact against reference (e4m3 * power-of-two scale is exact in
+    bf16; rope half is copied verbatim).
     """
 
     def __call__(

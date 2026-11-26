@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the sm_107 tp target's low_m_cublas_mm entry."""
+"""GPU test for the sm_107 low_m_cublas_mm entry."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
-from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm.low_m_cublas_mm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.gemm.low_m_cublas_mm import (  # noqa: E501
     _LOW_M_DIRECT_TACTICS,
     _low_m_direct_tactic,
 )
-from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm.low_m_cublas_mm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.gemm.low_m_cublas_mm import (  # noqa: E501
     low_m_cublas_mm as low_m_op,
 )
 

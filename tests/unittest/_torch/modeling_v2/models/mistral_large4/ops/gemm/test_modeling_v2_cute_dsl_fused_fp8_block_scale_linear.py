@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm.cute_dsl_fused_fp8_block_scale_linear import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.gemm.cute_dsl_fused_fp8_block_scale_linear import (  # noqa: E501
     cute_dsl_fused_fp8_block_scale_linear as op,
 )
 
@@ -41,7 +41,7 @@ def _weights(n, k, seed):
 def test_fused_matches_k128_reference(m, k, seed):
     weight, scale = _weights(128, k, seed + 1)
     x = _input(m, k, seed)
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
         fused_fp8_quant_gemv,
     )
 
@@ -54,7 +54,7 @@ def test_fused_matches_k128_reference(m, k, seed):
 def test_fused_changing_input_graph(m, k):
     weight, scale = _weights(128, k, 23)
     x = _input(m, k, 11)
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
         fused_fp8_quant_gemv,
     )
 
@@ -74,7 +74,7 @@ def test_fused_changing_input_graph(m, k):
 @pytest.mark.parametrize("k", (768, 1024, 1536, 2048, 3072, 6144))
 @pytest.mark.parametrize("seed", (11, 23, 47))
 def test_fused_quantization_byte_contract(m, k, seed):
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
         debug_quantization,
     )
 
@@ -93,7 +93,7 @@ def test_fused_quantization_byte_contract(m, k, seed):
 
 
 def test_fused_quantization_finite_extremes():
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
         debug_quantization,
     )
 
@@ -126,7 +126,7 @@ def test_fused_opposite_scale_exponents():
     logical = torch.full((128, 24), 17, device="cuda", dtype=torch.uint8)
     scale = torch.ops.trtllm.block_scale_interleave(logical)
     x = torch.full((4, 768), 2.0**118, device="cuda", dtype=torch.bfloat16)
-    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.ops.gemm._fused_fp8_quant_gemv import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4.kernels._fused_fp8_quant_gemv import (  # noqa: E501
         fused_fp8_quant_gemv,
     )
 

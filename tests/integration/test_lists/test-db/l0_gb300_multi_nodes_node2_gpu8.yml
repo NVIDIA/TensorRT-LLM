@@ -36,8 +36,6 @@ l0_gb300_multi_nodes_node2_gpu8:
   # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
   # Measured 34 min on 2x4 GB300 (batch 1).
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
-  # ModelingV2 Mistral Large 4 sm_103 on 2x4 GB300: native DSpark quick coverage across
-  # tep8/dep8/tp8 (GSM8K + acceptance length, MMMU and multimodal panel with block reuse).
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep8-quick]
+  # ModelingV2 Mistral Large 4 sm_103 on 2x4 GB300: native DSpark quick coverage on dep8
+  # (GSM8K + acceptance length, MMMU and multimodal panel with block reuse). tep8/tp8 run in QA.
   - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep8-quick]
-  - accuracy/modeling_v2/mistral_large4/mistral_large_4_nvfp4__sm_103__tp/test_accuracy.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp8-quick] TIMEOUT (90)

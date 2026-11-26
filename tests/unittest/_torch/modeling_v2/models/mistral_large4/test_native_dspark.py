@@ -209,8 +209,10 @@ def test_native_shell_connects_guided_decoder_to_worker(modeling, enabled, targe
 
 
 def test_rnn_uses_hidden_and_resets_each_proposal(modeling, monkeypatch):
+    from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import draft as draft_mod
+
     monkeypatch.setattr(
-        modeling, "cublas_mm", lambda x, w, bias, dtype: x @ w + (0 if bias is None else bias)
+        draft_mod, "cublas_mm", lambda x, w, bias, dtype: x @ w + (0 if bias is None else bias)
     )
     # Rank-one head with explicit scalar equations: the candidate reads the
     # token and h0, the output reads the previous state, token and h1.

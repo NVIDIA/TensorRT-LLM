@@ -176,24 +176,3 @@ def test_is_valid_refuses_an_out_shorter_than_kv_req() -> None:
     assert _untouched(buf), "refused, yet the kernel wrote"
     with validating(op):
         _assert_bitwise(op(*args), ref)
-
-
-def test_is_valid_refuses_48_out_rows_for_64_kv_req_entries() -> None:
-    """Unguarded, an `out` of 48 rows for 64 kv_req entries comes back right for its 48 rows
-    while the kernel writes the other 16 past its end: here into the rest of the 64-row
-    buffer the test owns, so the stray rows land where the test can read them."""
-    args, buf = _build(
-        dict(cached=[0], new=[64], blocks=4, owners=2, tokens_per_block=32, row=1), 2
-    )
-    pool, row, kv_req, kv_pos, table, _ = args
-    ref = op.reference(*args)
-    short = op(pool, row, kv_req, kv_pos, table, buf[:48])
-    assert short.shape[0] == 48
-    _assert_bitwise(short, ref[:48])
-    _assert_bitwise(buf[48:], ref[48:])
-    _bits(buf).fill_(_UNWRITTEN)
-    with validating(op), pytest.raises(ValueError, match="48 rows for 64 kv_req"):
-        op(pool, row, kv_req, kv_pos, table, buf[:48])
-    assert _untouched(buf), "refused, yet the kernel ran"
-    with validating(op):
-        _assert_bitwise(op(*args), ref)

@@ -59,31 +59,22 @@ and selected with the self-sampling GVR
 top-k (`_select_ctx`), and the expert path's calls take the world's `_EXPERT_CALL_TOKENS`, or
 `_EXPERT_CALL_TOKENS_CHUNKED` under chunked prefill."""
 
-from __future__ import annotations
-
-import itertools
-import math
-import os
 import time
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import NamedTuple, Optional, cast
+from typing import Optional, cast
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.params import (
-    get_indexer_mqa_logits_workspace_bytes,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
@@ -91,15 +82,11 @@ from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
-from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
-    flashinfer_fused_add_rmsnorm,
-)
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.dspark.worker import (
     MistralLarge4DSparkWorker,
 )
-from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.activation.tanh_softcap import (
     tanh_softcap,
 )
@@ -173,113 +160,49 @@ from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.moe.renorm_moe_ro
     renorm_moe_routing_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.norm.layer_norm import layer_norm
-from tensorrt_llm._torch.modeling_v2.models.mistral_large4.ops.vision.pixtral_rope_2d import (
-    pixtral_rope_2d,
-)
-from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds,
-    get_multimodal_embeddings,
-)
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.flash_mla import get_mla_metadata
-from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..common import (
+    _CTX_DECODE_ROWS,
+    _FLASH_MLA_HEADS,
+    _LATENT_LAYOUT,
+    _MOE_ACT_SWIGLU,
+    _MOE_ROUTING_METHOD,
+    _NVFP4_SF_LINEAR,
+    _NVFP4_SF_VEC,
+    _TOPK_DECODE_COLUMNS,
+    _TOPK_DECODE_CUTE_DSL,
+    _UNFUSED_GLUE,
+    _ctx_host_offsets,
+    _ctx_kv_offsets,
+    _ctx_workspace_rows,
+    _moe_scalars,
+    _padded_rows,
+    _padding_rows,
+    _prefill_blocks,
+    _rope_tables,
+)
+from ..common import _prefill_logits_budget as _shared_prefill_logits_budget
+from ..common import _step_common as _shared_step_common
+from ..draft import DraftModel
+from ..vision import VisionTower, _image_rows, _splice_image_rows
 from . import weights as _weights
 
-#: eps 1e-5, the reference's value; params.json's `vision_encoder` states none.
-_VISION_EPS = 1e-5
 
-#: The thop attention arguments the vision tower's call holds fixed: the no-KV-cache
-#: mode (an encoder: the three cache-addressing arguments None), one context sequence
-#: per image, the fused `[q | k | v]` rows already rotated (no rope in the op),
-#: bidirectional within each sequence (mask_type 0), softmax scale head_dim^-0.5.
-_VISION_ATTN = dict(
-    k=None,
-    v=None,
-    output_sf=None,
-    max_context_q_len_override=None,
-    kv_cache_block_offsets=None,
-    host_kv_cache_pool_pointers=None,
-    host_kv_cache_pool_mapping=None,
-    cache_indirection=None,
-    kv_scale_orig_quant=None,
-    kv_scale_quant_orig=None,
-    out_scale=None,
-    rotary_inv_freq=None,
-    rotary_cos_sin=None,
-    latent_cache=None,
-    q_pe=None,
-    block_ids_per_seq=None,
-    attention_sinks=None,
-    is_fused_qkv=True,
-    update_kv_cache=True,
-    predicted_tokens_per_seq=1,
-    local_layer_idx=0,
-    tokens_per_block=None,
-    beam_width=1,
-    mask_type=0,
-    quant_mode=0,
-    q_scaling=1.0,
-    position_embedding_type=0,
-    rope_dim=0,
-    rope_base=10000.0,
-    rope_scale_type=0,
-    rope_scale=1.0,
-    rope_short_m_scale=1.0,
-    rope_long_m_scale=1.0,
-    rope_max_positions=1024,
-    rope_original_max_positions=1024,
-    use_paged_context_fmha=False,
-    attention_input_type=0,
-    is_mla_enable=False,
-    chunked_prefill_buffer_batch_size=1,
-    q_lora_rank=None,
-    kv_lora_rank=None,
-    qk_nope_head_dim=None,
-    qk_rope_head_dim=None,
-    v_head_dim=None,
-    rope_append=None,
-    mrope_rotary_cos_sin=None,
-    mrope_position_deltas=None,
-    helix_position_offsets=None,
-    helix_is_inactive_rank=None,
-    attention_chunk_size=None,
-    softmax_stats_tensor=None,
-    is_spec_decoding_enabled=False,
-    use_spec_decoding=False,
-    is_spec_dec_tree=False,
-    spec_decoding_generation_lengths=None,
-    spec_decoding_position_offsets=None,
-    spec_decoding_packed_mask=None,
-    spec_decoding_bl_tree_mask_offset=None,
-    spec_decoding_bl_tree_mask=None,
-    spec_bl_tree_first_sparse_mask_offset_kv=None,
-    sparse_kv_indices=None,
-    sparse_kv_offsets=None,
-    sparse_attn_indices=None,
-    sparse_attn_offsets=None,
-    sparse_attn_indices_block_size=0,
-)
+def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
+    return _shared_prefill_logits_budget(max_num_tokens, max_seq_len, _PREFILL_LOGITS_CEILING)
 
-# The latent pool layout this target addresses (`MistralLarge4CacheManager.latent_layout`).
-_LATENT_LAYOUT = "fp8_ds_mla"
-# The query heads FlashMLA's sm100 sparse kernels run: under attention DP a rank's own 64.
-_FLASH_MLA_HEADS = 64
-# The pre-routed MoE call: the runner's routing method is inert once ids and weights are
-# given; 1 (renormalize) is the value its cells drive.
-_MOE_ROUTING_METHOD = 1
-# The routed experts' SwiGLU, the runner's `act_type` 0.
-_MOE_ACT_SWIGLU = 0
-# NVFP4: one e4m3 scale per 16 activations, laid out row-major (linear), the order the MoE
-# runner reads; the 128x4-swizzled order is another buffer of the same length at 128-row
-# multiples, and silently wrong there.
-_NVFP4_SF_VEC = 16
-_NVFP4_SF_LINEAR = False
+
+def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict:
+    return _shared_step_common(md, indexer_layers, include_all_rank_num_tokens=True)
+
+
 # triton_fp8_mqa_logits allocates a `[q_rows, kv_rows]` fp32 score matrix per call; the context
 # queries are tiled to keep it under the engine's budget (`_prefill_logits_budget`). Context
 # steps are not captured.
@@ -288,22 +211,6 @@ _NVFP4_SF_LINEAR = False
 # 1 GiB tile (1 << 28) left a dep4 rank under the 2%-of-device free-memory margin at 0.9 of free
 # memory to KV at max_seq_len 1048576.
 _PREFILL_LOGITS_CEILING = 1 << 26
-# The decode indexer's top-k: True runs cute_dsl_radix_topk_decode, one launch that selects the
-# trtllm indexer_topk_decode op's set (up to exact ties), False that op itself. The CuTe DSL
-# selector serves scorer rows from 4096 columns (where the op splits each row) to 65536 (one
-# CTA scans a whole row), the widths its cells cover; the scorer's column count is the engine's
-# max_seq_len, so an engine outside that range keeps the op (`_derive_first_step`).
-_TOPK_DECODE_CUTE_DSL = True
-_TOPK_DECODE_COLUMNS = (4096, 65536)
-# The attention block's glue as separate ops instead of the fused entries, for old-versus-new
-# verification (both compute the same bits; the fused entries' tests hold each pair equal):
-# ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
-# ssmax_scaling, the head weights' fp32 copy and cute_dsl_indexer_q_side_fused for
-# ssmax_indexer_q_side_fused; a fresh RMSNorm and torch.cat for the in-place latent; the copy
-# out of FlashMLA's 64-head output for the in-place read. Set
-# TRTLLM_MODELING_V2_UNFUSED_GLUE=1 in every rank's environment at launch; off by default.
-# It sets the core's `unfused_glue`, which every site reads.
-_UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
 # capacity: fixed: by attention-DP world size, the most gathered tokens one router / routing /
 # NVFP4-quantize / expert call takes, the token column those entries are certified to at that
 # world's expert window. At 4 ranks (32 local experts) the gathered set is up to
@@ -321,272 +228,6 @@ _EXPERT_CALL_TOKENS = {4: 131072, 8: 32768}
 # 1048576's margin spares; so the 131072 rows run in four calls. The chunks give one call's bits
 # (test_modeling_v2_routed_experts.py).
 _EXPERT_CALL_TOKENS_CHUNKED = {4: 32768, 8: 32768}
-# The context path's crossover, chosen once per step on this rank's host ints, and the held
-# context workspace's ceiling (`_ctx_workspace_rows`). A step whose context KV (every context
-# request's cached and new rows) fits the held workspace has it gathered, dequantized, into it
-# (bf16 [rows, 576]) for FlashMLA's sparse prefill; a longer one attends its context rows
-# straight off the pool with the sparse decode kernel, whose cost does not grow with the prefix
-# as the gather's does.
-# capacity: fixed: 2**19 rows, 576 MiB, the gather-vs-decode crossover.
-_CTX_WORKSPACE_ROWS = 1 << 19
-# The most context rows one sparse-decode call takes on that path: FlashMLA's decode scheduler
-# exits the process, raising nothing, past 11622 one-row sequences of 64 heads on sm_103.
-# capacity: fixed: the kernel's scheduler, not an engine limit.
-_CTX_DECODE_ROWS = 8192
-
-
-def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
-    """The most fp32 logits one indexer prefill tile holds, from the engine's max_num_tokens and
-    max_seq_len: mainline's reachable MQA-logits tile (`get_indexer_mqa_logits_workspace_bytes`,
-    4 bytes a logit; TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET lowers it), within
-    `_PREFILL_LOGITS_CEILING`, and within max_seq_len / 64 query rows at max_seq_len keys.
-
-    The last bound grows the tile with the engine's longest request, which it scores in at
-    least 64 tiles: 2**24 logits (512 rows of 32768 keys) at max_seq_len 32768, the ceiling
-    (64 rows of 1048576 keys) from max_seq_len 65536 on. Those are the budgets the 32768 and
-    1048576 serving configs were certified at, so their tiles, and the fp8_mqa_logits and
-    prefill top-k cells that cover them, stay as they were."""
-    reachable = get_indexer_mqa_logits_workspace_bytes(max_num_tokens, max_seq_len) // 4
-    return min(reachable, _PREFILL_LOGITS_CEILING, max_seq_len * (max_seq_len >> 6))
-
-
-def _most_ctx_kv(md) -> int:
-    """The most context KV (cached and new rows over a step's context requests) one step can
-    attend, from the attention metadata alone. `runtime_features` is built once by the executor
-    for the service (chunked prefill from enable_chunked_prefill, cache reuse from the
-    KvCacheConfig's enable_block_reuse). With neither, every context row is new:
-    max_num_tokens. Otherwise mainline's never-stall worst case for a workspace chunked prefill
-    does not bound (`get_mla_context_workspace_kv_len_cap` without an
-    fp8_context_mla_kv_len_cap override; the gather reads every attended row, cached ones
-    included): min(max_num_requests, max_num_tokens) * max_seq_len. The target does not read
-    fp8_context_mla_kv_len_cap: the KvCacheConfig is not reachable from the model, and for these
-    targets the engine installs no admission cap that would bound a step to it."""
-    features = md.runtime_features
-    if not (features.chunked_prefill or features.cache_reuse):
-        return md.max_num_tokens
-    return min(md.max_num_requests, md.max_num_tokens) * md.max_seq_len
-
-
-def _ctx_workspace_rows(md) -> int:
-    """The held context workspace's rows: the most context KV one step can attend
-    (`_most_ctx_kv`) twice over, a step's rows and a shared owner's (layer 35's) kept beside
-    them, up to `_CTX_WORKSPACE_ROWS`. At max_num_tokens 32768 with neither chunked prefill nor
-    block reuse that is 65536 rows, the two `[32768, 576]` gathers a step there makes; with either,
-    at 16 requests of max_seq_len 32768 or more, 2**19."""
-    return min(2 * _most_ctx_kv(md), _CTX_WORKSPACE_ROWS)
-
-
-def _step_common(md: TrtllmAttentionMetadata, indexer_layers: list[int]) -> dict:
-    """The batch state both targets read: KV lengths and pool addressing for the MLA ops, the
-    indexer's key pools and slot mappings, the top-k conversion tables, the decode scorer's
-    schedule, and every rank's token count this step (attention DP: identical on every rank,
-    in rank order, unpadded). The indexer pool views are taken per step: the engine replaces its
-    KV cache manager during boot, and a view of the old one writes into a dead allocation."""
-    mgr = md.kv_cache_manager
-    latent_pool = mgr.get_latent_pool()
-    return dict(
-        num_seqs=md.num_seqs,
-        num_tokens=md.num_tokens,
-        all_rank_num_tokens=[int(n) for n in md.all_rank_num_tokens],
-        kv_lens_cuda=md.kv_lens_cuda_runtime,
-        kv_lens_host=md.kv_lens_runtime,
-        prompt_lens_host=md.prompt_lens_cpu_runtime,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        tokens_per_block=md.tokens_per_block,
-        max_seq_len=md.max_seq_len,
-        # [blocks, owners, tokens_per_block, 656] bytes, and the same bytes as FlashMLA's
-        # pages: page `block * owners + row`, slot `page * tokens_per_block + offset`.
-        latent_pool=latent_pool,
-        latent_kv=latent_pool.view(-1, latent_pool.shape[2], 1, latent_pool.shape[3]),
-        ix_pools={i: mgr.get_indexer_k_cache_buffers(i) for i in indexer_layers},
-        block_table=md.block_table,
-        req_idx_per_token=md.req_idx_per_token,
-        slot_mapping_fp8=md.slot_mapping_fp8,
-        slot_mapping_scale=md.slot_mapping_scale,
-        skip_gen=bool(md.skip_indexer_for_gen_reqs),
-        # Allocated only while the engine's short-sequence indexer skip is on; the two skip
-        # flags are False whenever it is off.
-        topk_indices_buffer=md.topk_indices_buffer if md.enable_indexer_skip else None,
-        indexer_k_cache_block_offsets=md.indexer_k_cache_block_offsets,
-        scheduler_metadata_buffer=md.scheduler_metadata_buffer,
-        radix_aux_indices=md.radix_aux_indices,
-        radix_aux_logits=md.radix_aux_logits,
-    )
-
-
-def _padded_rows(core: "MistralLarge4DepModelingV2", step: dict, rows: int) -> int:
-    """The row count every rank pads its block to before the expert path's collectives: the
-    largest rank's count this step. Every rank reads the same list, so every rank's collectives
-    move the same bytes; this rank's own entry must be the rows it holds, or its block would
-    be cut or overrun."""
-    counts = step["all_rank_num_tokens"]
-    assert len(counts) == len(core.dp_group) and counts[core.dp_rank] == rows, (
-        f"rank {core.dp_rank} holds {rows} rows; all_rank_num_tokens is {counts}"
-    )
-    return max(counts)
-
-
-def _padding_rows(counts: list[int], padded: int, device) -> torch.Tensor | None:
-    """Which of the gathered rows are padding: bool `[len(counts) * padded]` on `device`, or None
-    when no rank pads (every count is `padded`). Rank r's segment is rows `[r * padded,
-    (r + 1) * padded)`, its first `counts[r]` its own and the rest the zero rows `_moe` pads it
-    with, at `[r * padded + counts[r], (r + 1) * padded)`. Built from the step's host counts."""
-    if all(n == padded for n in counts):
-        return None
-    own = torch.tensor(counts, dtype=torch.int64, device=device)
-    return (torch.arange(padded, device=device)[None, :] >= own[:, None]).reshape(-1)
-
-
-def _ctx_kv_offsets(md: TrtllmAttentionMetadata, num_contexts: int) -> dict:
-    """The context rope/append op's per-request offsets: int64 prefix sums of the cached and
-    of the total (cached + new) lengths over the context requests, and the longest new run.
-
-    The engine keeps them only under `enable_context_mla_with_cached_kv` (KV reuse or chunked
-    prefill). Without either, no context request has a cached prefix, so the cached sums are
-    zero and the totals are the new lengths: the int32 prefix sum of `seq_lens_cuda` the
-    metadata always builds, widened to the op's int64.
-    """
-    if md.enable_context_mla_with_cached_kv:
-        return dict(
-            cu_ctx_cached=md.ctx_cached_token_indptr[: num_contexts + 1],
-            cu_ctx_kv=md.ctx_kv_indptr[: num_contexts + 1],
-            max_ctx_new=int(md.max_ctx_seq_len),
-            ctx_cached_tokens=int(md.num_ctx_cached_tokens),
-        )
-    cu = md.mla_prepare_ctx_cu_seqlens()
-    return dict(
-        cu_ctx_cached=torch.zeros(num_contexts + 1, dtype=torch.int64, device=cu.device),
-        cu_ctx_kv=cu.to(torch.int64),
-        max_ctx_new=int(md.seq_lens[:num_contexts].max()),
-        ctx_cached_tokens=0,
-    )
-
-
-def _ctx_host_offsets(md: TrtllmAttentionMetadata, num_contexts: int) -> dict:
-    """The host lists over the context requests: the prefix sums of the new and of the total
-    (cached + new) lengths, which place each context request's rows in the step and its keys in
-    the indexer's full-KV gather mappings (`_prefill_blocks`).
-
-    The engine's host copies under `enable_context_mla_with_cached_kv`; without it no request
-    has a cached prefix, so both are the prefix sum of the host `seq_lens`. Every source is a
-    host tensor the metadata fills on the host, so taking them each context step syncs nothing.
-    """
-    if md.enable_context_mla_with_cached_kv:
-        return dict(
-            host_cu_ctx_new=md.host_ctx_uncached_token_indptr[: num_contexts + 1].tolist(),
-            host_cu_ctx_kv=md.host_ctx_kv_indptr[: num_contexts + 1].tolist(),
-        )
-    host_cu = [0, *itertools.accumulate(md.seq_lens[:num_contexts].tolist())]
-    return dict(host_cu_ctx_new=host_cu, host_cu_ctx_kv=host_cu)
-
-
-def _prefill_blocks(
-    chunk, cu_new: list[int], cu_kv: list[int], max_keys: int
-) -> list[tuple[int, int, int, int]]:
-    """The indexer's scoring blocks over one engine prefill chunk, as host ints
-    `(token_start, token_end, k_token_start, n_k)`: rows `[token_start, token_end)` of the
-    step's context rows scored against keys `[k_token_start, k_token_start + n_k)` of its
-    full-KV gather mappings.
-
-    One block, the chunk itself, while it holds at most `max_keys` keys (max_seq_len, the most
-    one request holds). The engine packs requests into one chunk while (summed new tokens) x
-    (summed KV) stays within its packed-logits budget, so a few short last chunks over long
-    prefixes pack past max_seq_len (two 5-token chunks over 983040 cached keys each: 1966090
-    keys). Such a chunk is cut at its request boundaries, each request's rows against its own
-    keys: a row's window lies inside its own request's keys. `cu_new` / `cu_kv` are the
-    step's prefix sums of the new and of the cached + new tokens over its context requests,
-    in the order of the context rows and of the full-KV mappings."""
-    n_k = chunk.k_token_end - chunk.k_token_start
-    if n_k <= max_keys:
-        return [(chunk.token_start, chunk.token_end, chunk.k_token_start, n_k)]
-    blocks = []
-    for r in range(len(cu_new) - 1):
-        lo, hi = max(chunk.token_start, cu_new[r]), min(chunk.token_end, cu_new[r + 1])
-        if lo >= hi:
-            continue
-        k_lo, k_hi = max(chunk.k_token_start, cu_kv[r]), min(chunk.k_token_end, cu_kv[r + 1])
-        assert 0 < k_hi - k_lo <= max_keys, (
-            f"context request {r} of an indexer chunk holds keys [{k_lo}, {k_hi}), past "
-            f"max_seq_len {max_keys}"
-        )
-        blocks.append((lo, hi, k_lo, k_hi - k_lo))
-    assert blocks and blocks[0][0] == chunk.token_start and blocks[-1][1] == chunk.token_end, (
-        f"the requests {cu_new} do not tile the chunk's rows "
-        f"[{chunk.token_start}, {chunk.token_end})"
-    )
-    return blocks
-
-
-def _yarn_lerope_inv_freq(cfg, alpha: torch.Tensor) -> torch.Tensor:
-    """The rotary inverse frequencies, fp32, as the reference implementation builds
-    them: YaRN's blend of the extrapolated and the interpolated frequency, both scaled by
-    LeRoPE's `exp(alpha)`, over a ramp taken on the frequencies without LeRoPE."""
-    rope = cfg.rope_parameters
-    dim = cfg.qk_rope_head_dim
-    theta = float(rope["rope_theta"])
-    factor = float(rope["factor"])
-    original = float(rope["original_max_position_embeddings"])
-    pos_freqs = theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-    lerope = torch.exp(alpha.detach().to(device="cpu", dtype=torch.float32))
-    extrapolated = 1.0 / pos_freqs * lerope
-    interpolated = 1.0 / (factor * pos_freqs) * lerope
-
-    def correction_dim(rotations: float) -> float:
-        return dim * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(theta))
-
-    low = max(math.floor(correction_dim(float(rope.get("beta_fast", 32)))), 0)
-    high = min(math.ceil(correction_dim(float(rope.get("beta_slow", 1)))), dim - 1)
-    if low == high:
-        high += 0.001
-    ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(0, 1)
-    extrapolation = 1 - ramp
-    return interpolated * (1 - extrapolation) + extrapolated * extrapolation
-
-
-def _rope_tables(cfg, alpha: torch.Tensor, positions: int, dtype, device) -> SimpleNamespace:
-    """The tables the rope consumers read, built from one fp32 angle grid and rounded to the
-    activation dtype first, as the reference's cos/sin cache is held.
-
-    `indexer` is `[rows, 64]`, `[cos(32) | sin(32)]`: the layout the indexer q side and
-    `ds_mla_rope_append` (the MLA query tail and the latent's rope key) read; the indexer key
-    side reads the same storage as `[rows, 2, 32]`. `identity` (cos 1, sin 0) is the table of a
-    NoPE indexer layer, whose kernels have no no-rope mode. Every row depends only on its own
-    index, so a longer table is the same table with more rows.
-    """
-    inv = _yarn_lerope_inv_freq(cfg, alpha)
-    t = torch.arange(positions, dtype=torch.float32)
-    angle = torch.einsum("i,j -> ij", t, inv)
-    cos = angle.cos().to(dtype).float()
-    sin = angle.sin().to(dtype).float()
-    identity = torch.cat([torch.ones_like(cos), torch.zeros_like(sin)], dim=1)
-    return SimpleNamespace(
-        rows=positions,
-        indexer=torch.cat([cos, sin], dim=1).to(device).contiguous(),
-        identity=identity.to(device).contiguous(),
-    )
-
-
-def _moe_scalars(isc1, isc2, ws2_13, ws2_2) -> SimpleNamespace:
-    """The NVFP4 MoE's call scalars from the checkpoint's per-tensor ones, fp32.
-
-    ModelOpt stores `input_scale` and `weight_scale_2` as the reciprocals of the global scales a
-    quantizer divides by (`amax / (448 * 6)`), one `isc1` / `isc2` per layer and one
-    `ws2_13[e]` / `ws2_2[e]` per local expert. So the activation quantizer's global scale is
-    `1 / isc1`; FC1's accumulator dequantizes by `isc1 * ws2_13[e]` (the gate half,
-    `output1_scale_gate_scalar`) and, because the FC1 epilogue requantizes the SwiGLU output to
-    NVFP4 under `1 / isc2`, the linear half by `isc1 * ws2_13[e] / isc2`
-    (`output1_scale_scalar`); FC2's accumulator dequantizes by `isc2 * ws2_2[e]`
-    (`output2_scale_scalar`). The reference's TRT-LLM-Gen path folds the same three
-    (`g1_alphas`, `g1_scale_c`, `g2_alphas`)."""
-    gate1 = (isc1 * ws2_13).contiguous()
-    return SimpleNamespace(
-        gscale=(1.0 / isc1).contiguous(),
-        out1=(gate1 / isc2).contiguous(),
-        out1_gate=gate1,
-        out2=(isc2 * ws2_2).contiguous(),
-    )
 
 
 def _layer_views(core: "MistralLarge4DepModelingV2") -> list[SimpleNamespace]:
@@ -1963,479 +1604,6 @@ class DecodeTarget:
             residual = residual + mlp
             x = flashinfer_rmsnorm(residual, layer.next_norm, core.eps)
         return x
-
-
-class DraftModel(nn.Module):
-    """This specialization's BF16 DSpark backbone and recurrent head.
-
-    Runtime owns accepted-token bookkeeping and the paged context pool. The
-    draft attends the last trained window of captured target features plus
-    its whole non-causal query block. All parameters live in the core table.
-    """
-
-    _uses_worker_attention_backend = False
-    _paged_ctx_cache = True
-    _kv_factor = 1
-    _dspark_shift_label = True
-    has_markov_head = True
-
-    def __init__(self, shell, draft_config):
-        super().__init__()
-        # Keep references without registering the parent as a child module.
-        object.__setattr__(self, "_shell", shell)
-        self.model_config = draft_config
-        self.config = draft_config.pretrained_config
-        core = shell.model
-        spec = shell.spec_config
-        native = spec._draft_model_config
-        self.block_size = spec.block_size
-        self.mask_token_id = spec.mask_token_id
-        self.target_layer_ids = tuple(spec.target_layer_ids)
-        self.window = int(native["ragged_attention"].split(",")[0])
-        self._num_attn_layers = int(native["n_layers"])
-        self._num_heads = core.heads
-        self._num_kv_heads = 1
-        self._head_dim = core.lat_dim
-        self.dflash_attention_backend = "VANILLA"
-        self._runtime_position_ceiling = None
-        self._rope = None
-        self._layers = None
-
-    @property
-    def core(self):
-        return self._shell.model
-
-    @property
-    def lm_head(self):
-        return self._shell.lm_head
-
-    @property
-    def markov_w2(self):
-        return self.core.w["draft_markov_output"]
-
-    def logits_processor(self, hidden, lm_head, attn_metadata, gather):
-        logits = self._shell.logits_processor(hidden, lm_head, attn_metadata, gather)
-        # The shared-head logits are soft-capped before the RNN bias is added.
-        return tanh_softcap(logits, self._shell.softcap)
-
-    def apply_draft_logit_transform(self, logits):
-        """Return ``logits`` unchanged: :meth:`logits_processor` already soft-caps them.
-
-        The worker calls this on the block logits after ``logits_processor``.
-        This drafter declares no ``logit_multiplier`` or ``logit_softcap``, so the
-        cap is applied once, in ``logits_processor``.
-        """
-        return logits
-
-    def _build_fused_kv_buffers(self):
-        # The worker calls this before sizing its cache. Take views once after
-        # materialization; context projection is explicit per layer here.
-        if self._layers is not None:
-            return
-        w, core = self.core.w, self.core
-        self._layers = []
-        for i in range(self._num_attn_layers):
-            prefix = f"l{i}_draft_"
-            kv_b = w[prefix + "wkv_b"].view(core.heads, core.nope + core.v_dim, core.kv_lora)
-            self._layers.append(
-                SimpleNamespace(
-                    attn_norm=w[prefix + "attn_norm"],
-                    q=w[prefix + "wq"].t(),
-                    kv_a=w[prefix + "wkv_a"].t(),
-                    kv_norm=w[prefix + "kv_a_norm"],
-                    k_b=kv_b[:, : core.nope].contiguous(),
-                    v_b=kv_b[:, core.nope :].contiguous(),
-                    out=w[prefix + "wo"].t(),
-                    ffn_norm=w[prefix + "ffn_norm"],
-                    gate=w[prefix + "w1"].t(),
-                    up=w[prefix + "w3"].t(),
-                    down=w[prefix + "w2"].t(),
-                    next_norm=(
-                        w[f"l{i + 1}_draft_attn_norm"]
-                        if i + 1 < self._num_attn_layers
-                        else w["draft_final_norm"]
-                    ),
-                )
-            )
-
-    def _ensure_rope(self):
-        cap = self._runtime_position_ceiling or self.core.rope_rows
-        if self._rope is None or self._rope.rows != cap:
-            w = self.core.w["draft_final_norm"]
-            # alpha=0 removes LeRoPE; all draft layers use plain YaRN.
-            self._rope = _rope_tables(
-                self.core.model_config.pretrained_config,
-                torch.zeros(self.core.rope_dim // 2),
-                cap,
-                w.dtype,
-                w.device,
-            )
-
-    def _rotate(self, x, positions):
-        table = self._rope.indexer[positions.long()]
-        cos, sin = table.chunk(2, dim=-1)
-        # One head axis for Q, none for the shared latent K.
-        if x.ndim == positions.ndim + 2:
-            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-        even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
-        return (
-            torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1)
-            .flatten(-2)
-            .to(x.dtype)
-        )
-
-    def embed_draft_block(self, anchors, block_size):
-        # The route pins the trained block width; no mask token is looked up
-        # in the vocabulary (its sentinel is deliberately out of range).
-        weight = self.core.w["embed"]
-        valid = (anchors >= 0) & (anchors < weight.shape[0])
-        embedded = nn.functional.embedding(anchors.clamp(0, weight.shape[0] - 1), weight)
-        embedded = embedded.masked_fill(~valid.unsqueeze(-1), 0)
-        masks = self.core.w["draft_mask"].unsqueeze(0).expand(anchors.shape[0], -1, -1)
-        return torch.cat((embedded.unsqueeze(1), masks), dim=1)
-
-    def project_target_hidden(self, hidden):
-        w = self.core.w
-        projected = cublas_mm(hidden, w["draft_target_projection"].t(), None, None)
-        return flashinfer_rmsnorm(projected, w["draft_target_norm"], self.core.eps)
-
-    def precompute_context_kv(self, projected_hidden, positions):
-        self._build_fused_kv_buffers()
-        self._ensure_rope()
-        core = self.core
-        latent = []
-        for layer in self._layers:
-            kv = cublas_mm(projected_hidden, layer.kv_a, None, None)
-            content = flashinfer_rmsnorm(
-                kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
-            )
-            rope = self._rotate(kv[:, core.kv_lora :], positions.reshape(-1))
-            latent.append(torch.cat((content, rope), dim=-1))
-        return torch.stack(latent, dim=1).unsqueeze(2), None
-
-    def dflash_forward_with_metadata(self, *, attn_metadata, **kwargs):
-        # The phase belongs to this engine step, including mixed batches.
-        return self.core._select_target(attn_metadata).dspark_forward(self, **kwargs)
-
-    def apply_markov_chain_logits(self, base_logits, first_prev_tokens, *, hidden_states):
-        """The recurrent Markov bias over full-vocab ``[B, K, vocab]`` block logits.
-
-        Each position's greedy token (the argmax of its biased logits) is the
-        next position's previous token; ``hidden_states`` is the ``[B, K,
-        hidden]`` block output the logits were projected from.
-        """
-        w = self.core.w
-        output = w["draft_markov_output"]
-        previous = first_prev_tokens.long()
-        state = None
-        refined = []
-        for i in range(base_logits.shape[1]):
-            weight = w["draft_markov_embedding"]
-            valid = (previous >= 0) & (previous < weight.shape[0])
-            embedding = nn.functional.embedding(previous.clamp(0, weight.shape[0] - 1), weight)
-            embedding = embedding.masked_fill(~valid.unsqueeze(-1), 0)
-            if state is None:
-                state = torch.zeros_like(embedding)
-            joint = cublas_mm(
-                torch.cat((state, embedding, hidden_states[:, i]), dim=-1),
-                w["draft_joint"].t(),
-                w["draft_joint_bias"],
-                None,
-            )
-            gate, candidate, emitted = joint.chunk(3, dim=-1)
-            gate = torch.sigmoid(gate)
-            state = gate * state + (1 - gate) * torch.tanh(candidate)
-            bias = cublas_mm(torch.tanh(emitted), output.t(), None, None)
-            logits = base_logits[:, i] + bias
-            refined.append(logits)
-            previous = logits.argmax(dim=-1)
-        return torch.stack(refined, dim=1)
-
-
-class _VisionBlock(NamedTuple):
-    """One vision transformer block's weights, as the views the ops read: the GEMM
-    operands column-major (`.t()` of the stored rows)."""
-
-    attn_norm: torch.Tensor
-    qkv: torch.Tensor
-    wo: torch.Tensor
-    ffn_norm: torch.Tensor
-    w13: torch.Tensor
-    w2: torch.Tensor
-
-
-def _vision_step(seg_lens: list[int], device, workspace: torch.Tensor) -> dict:
-    """The batch state of one vision attention call: one context sequence per image,
-    no KV cache. Every value is host-known from the images' patch counts."""
-    total = sum(seg_lens)
-    longest = max(seg_lens)
-    lens_dev = torch.tensor(seg_lens, dtype=torch.int32, device=device)
-    lens_host = torch.tensor(seg_lens, dtype=torch.int32)
-    return dict(
-        workspace=workspace,
-        sequence_length=lens_dev,
-        host_past_key_value_lengths=lens_host,
-        host_total_kv_lens=torch.tensor([total, 0], dtype=torch.int32),
-        context_lengths=lens_dev,
-        host_context_lengths=lens_host,
-        host_request_types=torch.zeros(len(seg_lens), dtype=torch.int32),
-        max_num_requests=len(seg_lens),
-        max_context_length=longest,
-        max_seq_len=longest,
-        attention_window_size=longest,
-        num_contexts=len(seg_lens),
-        num_ctx_tokens=total,
-    )
-
-
-def _vision_attention(
-    x: torch.Tensor,
-    B: _VisionBlock,
-    positions: torch.Tensor,
-    step: dict,
-    heads: int,
-    head_dim: int,
-    theta: float,
-) -> torch.Tensor:
-    """One vision block's attention over the patch rows of every image of the call:
-    `[wq ; wk ; wv]` as one GEMM, q and k rotated by each patch's (row, col) in its
-    own image, attention bidirectional within each image, then `wo`."""
-    rows = x.shape[0]
-    width = heads * head_dim
-    qkv = cublas_mm(x, B.qkv)
-    q, k = pixtral_rope_2d(
-        torch.reshape(qkv[:, :width], [rows, heads, head_dim]),
-        torch.reshape(qkv[:, width : 2 * width], [rows, heads, head_dim]),
-        positions,
-        theta,
-    )
-    qkv = torch.cat(
-        [torch.reshape(q, [rows, width]), torch.reshape(k, [rows, width]), qkv[:, 2 * width :]], -1
-    )
-    out = torch.empty([rows, width], dtype=x.dtype, device=x.device)
-    out = thop_attention(
-        q=qkv,
-        output=out,
-        num_heads=heads,
-        num_kv_heads=heads,
-        head_size=head_dim,
-        **step,
-        **_VISION_ATTN,
-    )
-    return cublas_mm(out, B.wo)
-
-
-def _merge_tiles(x: torch.Tensor, grid_h: int, grid_w: int, merge: int) -> torch.Tensor:
-    """One image's `[grid_h * grid_w, d]` patch rows -> `[grid_h * grid_w / merge^2,
-    d * merge^2]`: each merge x merge tile of the grid as one row, tiles row-major (the
-    order of the image's [IMG] tokens), each row laid out (channel, tile row, tile
-    column) as the merging layer's input columns are."""
-    d = x.shape[-1]
-    grid = torch.permute(torch.reshape(x, [grid_h, grid_w, d]), [2, 0, 1])
-    tiles = nn.functional.unfold(torch.unsqueeze(grid, 0), kernel_size=merge, stride=merge)
-    return torch.t(tiles[0])
-
-
-class VisionTower:
-    """The image input path: a request's pixels -> one row per [IMG] token, in the
-    language model's hidden width. Run by the shell, in context steps only, never
-    captured; every rank runs the whole tower (all heads) over its own requests.
-
-    Per image: the 14x14 patch embedding as an unfold and one GEMM, `ln_pre`, the
-    transformer blocks (RMSNorm, attention with 2-D RoPE, RMSNorm, SwiGLU, each with
-    its residual), the pre-projector RMSNorm, the 2x2 patch merger and the adapter
-    (`w_in`, exact GELU, `w_out`). The images of one call are concatenated along the
-    rows; only the attention needs their boundaries."""
-
-    def __init__(self, core) -> None:
-        """Take the tower's weight views and geometry, once, off the real weights."""
-        d = _weights.MODEL_WEIGHTS.dims(core)
-        w = core.w
-        self.hidden = d.v_hidden
-        self.heads = d.v_heads
-        self.head_dim = d.v_head_dim
-        self.patch = d.v_patch
-        self.merge = d.v_merge
-        self.theta = d.v_theta
-        self.dtype = d.dtype
-        self.out_hidden = d.hidden
-        self._validate = step_contract_enabled()
-        self._rank = core.model_config.mapping.rank
-        self.patch_w = w["vis_patch"].t()
-        self.ln_pre = w["vis_ln_pre"]
-        self.blocks = [
-            _VisionBlock(
-                attn_norm=w[f"v{j}_attn_norm"],
-                qkv=w[f"v{j}_qkv"].t(),
-                wo=w[f"v{j}_wo"].t(),
-                ffn_norm=w[f"v{j}_ffn_norm"],
-                w13=w[f"v{j}_w13"].t(),
-                w2=w[f"v{j}_w2"].t(),
-            )
-            for j in range(d.v_layers)
-        ]
-        self.proj_norm = w["vis_proj_norm"]
-        self.merge_w = w["vis_merge"].t()
-        self.w_in = w["vis_w_in"].t()
-        self.w_out = w["vis_w_out"].t()
-        # The prompt token the tower's rows replace, on the host: the executor finds a
-        # step's image positions with it before anything reaches the device.
-        self.image_token_ids = torch.tensor([d.image_token_id], dtype=torch.int32)
-        # The attention op sizes its workspace in place per call and never shrinks it.
-        self._workspace = torch.empty(0, dtype=torch.int8, device=self.ln_pre.device)
-
-    def _images(self, multimodal_params: list[MultimodalParams]) -> list[tuple]:
-        """`(pixels [C, H, W], grid rows, grid cols)` of every image, in order. The
-        mistral-native processor pads the batch and preserves each image's true size."""
-        images = []
-        unit = self.patch * self.merge
-        for param in multimodal_params:
-            image = (param.multimodal_data or {}).get("image")
-            if image is None:
-                continue
-            pixels = image["pixel_values"]
-            sizes = image.get("image_sizes")
-            if pixels.ndim != 4 or pixels.shape[1] != 3:
-                raise ValueError("Image pixels must have shape [N, 3, H, W]")
-            if sizes is None or len(sizes) != pixels.shape[0]:
-                raise ValueError("Image sizes must describe every image in the padded batch")
-            for b in range(pixels.shape[0]):
-                if len(sizes[b]) != 2:
-                    raise ValueError("Each image size must be [height, width]")
-                height, width = int(sizes[b][0]), int(sizes[b][1])
-                if not (0 < height <= pixels.shape[-2] and 0 < width <= pixels.shape[-1]):
-                    raise ValueError("Image sizes must fit within their padded pixels")
-                if height % unit or width % unit:
-                    raise ValueError(
-                        f"image {height}x{width} is not a whole number of {unit}-pixel "
-                        "merge tiles; the processor resizes to them"
-                    )
-                images.append(
-                    (pixels[b, :, :height, :width], height // self.patch, width // self.patch)
-                )
-        return images
-
-    def forward(self, multimodal_params: list[MultimodalParams]) -> torch.Tensor:
-        """The rows of every image of `multimodal_params`, request by request, image by
-        image: `[sum of merged tiles, text hidden]`."""
-        images = self._images(multimodal_params)
-        dev = self.ln_pre.device
-        if not images:
-            return torch.empty([0, self.out_hidden], dtype=self.dtype, device=dev)
-        seg = [gh * gw for _, gh, gw in images]
-        if self._validate:
-            logger.info(
-                "modeling_v2 image forward target=%s rank=%d grids=%s merged_rows=%d",
-                __name__.rsplit(".", 1)[0],
-                self._rank,
-                [(gh, gw) for _, gh, gw in images],
-                sum(seg) // self.merge**2,
-            )
-        # Each patch as one row, (channel, row, col) within it, patches row-major.
-        patches = torch.cat(
-            [
-                torch.t(
-                    nn.functional.unfold(
-                        torch.unsqueeze(px.to(device=dev, dtype=self.dtype), 0),
-                        kernel_size=self.patch,
-                        stride=self.patch,
-                    )[0]
-                )
-                for px, _, _ in images
-            ],
-            0,
-        )
-        positions = torch.cat(
-            [
-                torch.reshape(
-                    torch.stack(
-                        torch.meshgrid(
-                            torch.arange(gh, device=dev),
-                            torch.arange(gw, device=dev),
-                            indexing="ij",
-                        ),
-                        -1,
-                    ),
-                    [-1, 2],
-                )
-                for _, gh, gw in images
-            ],
-            0,
-        )
-        step = _vision_step(seg, dev, self._workspace)
-
-        h = flashinfer_rmsnorm(cublas_mm(patches, self.patch_w), self.ln_pre, _VISION_EPS)
-        x = flashinfer_rmsnorm(h, self.blocks[0].attn_norm, _VISION_EPS)
-        residual = h
-        for j, B in enumerate(self.blocks):
-            attn = _vision_attention(x, B, positions, step, self.heads, self.head_dim, self.theta)
-            x, residual = flashinfer_fused_add_rmsnorm(attn, residual, B.ffn_norm, _VISION_EPS)
-            mlp = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, B.w13)), B.w2)
-            norm_next = self.blocks[j + 1].attn_norm if j + 1 < len(self.blocks) else self.proj_norm
-            x, residual = flashinfer_fused_add_rmsnorm(mlp, residual, norm_next, _VISION_EPS)
-
-        # x is the pre-projector-normed tower output.
-        tiles = torch.cat(
-            [
-                _merge_tiles(xi, gh, gw, self.merge)
-                for xi, (_, gh, gw) in zip(torch.split(x, seg, 0), images)
-            ],
-            0,
-        )
-        merged = cublas_mm(tiles, self.merge_w)
-        return cublas_mm(gelu_erf(cublas_mm(merged, self.w_in)), self.w_out)
-
-
-def _image_rows(
-    vision: Optional[VisionTower], multimodal_params: list[MultimodalParams]
-) -> Optional[torch.Tensor]:
-    """This step's image rows, one per [IMG] position its context chunks cover, in
-    the order those positions appear; None when the step covers none.
-
-    The tower runs once per request, on the first step that needs it; its rows stay
-    on the request's multimodal data for the later chunks. A chunk -- under chunked
-    prefill, or resuming after a reused prefix -- takes rows `[cached, cached + in
-    chunk)` of its request's, counted by the request's [IMG] cumsum."""
-    if vision is None:
-        if any((p.multimodal_data or {}).get("image") is not None for p in multimodal_params):
-            raise ValueError(
-                "an image reached a Mistral Large 4 target whose checkpoint has no vision encoder"
-            )
-        return None
-    # Filter before encoding and gathering so inactive requests neither run the
-    # tower nor shift the embedding offsets of active requests in a mixed batch.
-    multimodal_params = [
-        param
-        for param in multimodal_params
-        if param.multimodal_runtime is None or param.multimodal_runtime.num_mm_tokens_in_chunk > 0
-    ]
-    embeds = find_input_mm_embeds(
-        get_multimodal_embeddings(vision.forward, multimodal_params), multimodal_params
-    )
-    if not embeds:
-        return None
-    rows = embeds[0] if len(embeds) == 1 else torch.cat(embeds, 0)
-    return rows if rows.shape[0] else None
-
-
-def _splice_image_rows(
-    embed: torch.Tensor,
-    input_ids: torch.Tensor,
-    rows: torch.Tensor,
-    mm_token_indices: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """The step's input embeddings with `rows` written over its [IMG] positions,
-    `mm_token_indices` (which the executor computes on the host from the shell's
-    `multimodal_token_ids`); every other position keeps its token embedding."""
-    if mm_token_indices is None:
-        raise ValueError("an image step arrived without the executor's mm_token_indices")
-    if mm_token_indices.shape[0] != rows.shape[0]:
-        raise ValueError(
-            f"{mm_token_indices.shape[0]} [IMG] positions in this step but "
-            f"{rows.shape[0]} image rows for them"
-        )
-    h = nn.functional.embedding(input_ids, embed)
-    return h.index_copy_(0, mm_token_indices, rows.to(h.dtype))
 
 
 class ModelingV2MistralLarge4Nvfp4Sm107Dep(

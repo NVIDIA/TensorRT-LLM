@@ -32,6 +32,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.modeling_v2.models.mistral_large4 import weight_table as WT
 from tensorrt_llm._torch.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp import (  # noqa: E501
     weights as W,
 )
@@ -312,11 +313,11 @@ class _Shell(nn.Module):
 
 def _source_keys(manifest: dict) -> set:
     """Every checkpoint key the manifest reads, key tuples flattened."""
-    return {k for sources in manifest.values() for ckpt, *_ in sources for k in W._keys(ckpt)}
+    return {k for sources in manifest.values() for ckpt, *_ in sources for k in WT._keys(ckpt)}
 
 
 def _is_vision(key: str) -> bool:
-    return key.startswith(W.VISION_PREFIXES)
+    return key.startswith(WT.VISION_PREFIXES)
 
 
 def _is_draft(key: str) -> bool:
@@ -527,7 +528,7 @@ def test_each_rank_reads_every_expert_through_its_width_slice(manifests, world):
         experts: dict = {}
         for key, sources in manifest.items():
             for ckpt, index, _, shard in sources:
-                keys = W._keys(ckpt)
+                keys = WT._keys(ckpt)
                 if not any(_is_expert(k) for k in keys):
                     continue
                 assert all(_is_expert(k) for k in keys), (key, ckpt)
@@ -582,7 +583,7 @@ def test_the_per_rank_slices_are_laid_out_unpadded(world):
     of the 128 its scale shuffle needs -- which both meet, so it pads nothing either: the
     unpadded chain `_stock` runs below is what it builds here."""
     d = W.MODEL_WEIGHTS.dims(_core(_CONFIG, world, 0))
-    assert d.moe_inter % W.NVFP4_BLOCK == 0 and d.moe_inter % W.E2M1_PER_BYTE == 0
+    assert d.moe_inter % WT.NVFP4_BLOCK == 0 and d.moe_inter % WT.E2M1_PER_BYTE == 0
     per_rank = {
         4: {
             "fc1_w": (3072, 3072),
@@ -989,7 +990,7 @@ def _write_shards(ck: dict, directory: Path, files: int = 3) -> None:
     for name in names:
         part = {k: v.contiguous() for k, v in ck.items() if weight_map[k] == name}
         save_file(part, str(directory / name))
-    (directory / W.SHARD_INDEX).write_text(json.dumps({"weight_map": weight_map}))
+    (directory / WT.SHARD_INDEX).write_text(json.dumps({"weight_map": weight_map}))
 
 
 class _ReadLog:
@@ -1037,11 +1038,11 @@ def test_tiny_load_streams_from_the_shard_files(world, rank, tmp_path, monkeypat
     per-tensor scalars whole. Each file's cached pages are dropped once read."""
     ck = _tiny_checkpoint(world)
     _write_shards(ck, tmp_path)
-    log = _ReadLog(W.safe_open)
+    log = _ReadLog(WT.safe_open)
     dropped = []
-    drop = W._drop_page_cache
-    monkeypatch.setattr(W, "safe_open", log)
-    monkeypatch.setattr(W, "_drop_page_cache", lambda path: (dropped.append(path), drop(path)))
+    drop = WT._drop_page_cache
+    monkeypatch.setattr(WT, "safe_open", log)
+    monkeypatch.setattr(WT, "_drop_page_cache", lambda path: (dropped.append(path), drop(path)))
     streamed = _Shell(_TINY[world], world, rank, "cpu")
     streamed.model.model_config.pretrained_config._name_or_path = str(tmp_path)
     W.MODEL_WEIGHTS.load(streamed, {k: torch.empty_like(v, device="meta") for k, v in ck.items()})
@@ -1086,7 +1087,7 @@ def test_tiny_load_checkpoint_reads_the_directory(world, with_index, tmp_path):
     ck = _tiny_checkpoint(world)
     _write_shards(ck, tmp_path)
     if not with_index:
-        (tmp_path / W.SHARD_INDEX).unlink()
+        (tmp_path / WT.SHARD_INDEX).unlink()
     loaded = _Shell(_TINY[world], world, 2, "cpu")
     W.MODEL_WEIGHTS.load_checkpoint(loaded, tmp_path)
     direct = _Shell(_TINY[world], world, 2, "cpu")
@@ -1213,9 +1214,9 @@ def test_tiny_load_refuses_a_scalar_that_is_not_a_positive_finite_scale(world, v
 def test_shared_scalar_refuses_copies_that_differ():
     """The row transform asserts on its own copies too, whatever ran before it."""
     one = torch.tensor(0.5)
-    assert W._shared_scalar((one, one.clone(), one.clone()), None) is one
+    assert WT.shared_scalar((one, one.clone(), one.clone()), None) is one
     with pytest.raises(AssertionError, match="1 of 3 copies"):
-        W._shared_scalar((one, one.clone(), torch.tensor(0.25)), None)
+        WT.shared_scalar((one, one.clone(), torch.tensor(0.25)), None)
 
 
 @pytest.mark.parametrize(
@@ -1237,23 +1238,10 @@ def test_ue8m0_assert(value, exact):
     s = torch.full((2, 3), 2.0**-10)
     s[1, 2] = value
     if exact:
-        W._assert_ue8m0(s)
+        WT._assert_ue8m0(s)
     else:
         with pytest.raises(AssertionError, match="1 of 6"):
-            W._assert_ue8m0(s)
-
-
-def test_packed_reference_itself():
-    """`_packed` on a hand-written grid: 6 K blocks with exponent bytes 120..125 in one
-    128-row block -> word 0 = 120 | 121 << 8 | 122 << 16 | 123 << 24, word 1 = 124 | 125 << 8,
-    the same for all 128 rows; a byte of 128 or more lands in the sign bit."""
-    grid = torch.exp2(torch.arange(120, 126, dtype=torch.float32) - 127).view(1, 6)
-    got = _packed(grid)
-    assert got.shape == (2, 128)
-    assert bool((got[0] == 120 | 121 << 8 | 122 << 16 | 123 << 24).all())
-    assert bool((got[1] == 124 | 125 << 8).all())
-    high = _packed(torch.tensor([[1.0, 1.0, 1.0, 2.0]]))
-    assert bool((high[0] == (127 | 127 << 8 | 127 << 16 | 128 << 24) - 2**32).all())
+            WT._assert_ue8m0(s)
 
 
 @pytest.mark.parametrize("world", [4, 8])
