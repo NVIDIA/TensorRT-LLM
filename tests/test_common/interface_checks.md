@@ -41,8 +41,8 @@ The checker reads Python source with the AST and never imports or executes the
 registered modules. Both helpers preserve the supplied object at runtime.
 
 The mock check compares member names and kinds, callable parameter names, order
-and kinds, literal defaults, async/generator behavior, and which fields have
-been initialized at the registration point. Field value types and callable
+and kinds, literal defaults, async/generator behavior, and field initialization
+inferred from construction and supported setup. Field value types and callable
 annotations are outside this check. Pyrefly still checks product and test
 source normally through the same hook.
 
@@ -122,9 +122,9 @@ available to the analyzer.
 
 ## Instances that bypass initialization
 
-Place a separate `verify_instance` statement after setup, at the point where the
-object must be ready for use. Class identity alone does not prove its fields were
-initialized.
+Place `verify_instance` immediately after constructing the fixture and completing
+its direct setup, before exercising it in the test. The check looks for evidence
+that the fixture's required fields were initialized.
 
 ```python
 from production.client import Client
@@ -148,14 +148,19 @@ Existing class defaults are available to an instance. A bare annotation in the
 test (`client.endpoint: str`) does not initialize the field.
 
 The checker follows direct assignments, simple aliases, literal `setattr`, field
-deletions and `if`/`else` joins. A field written on only one branch is not definitely
-initialized after the join. An unresolved mutation helper prevents a
-successful verification; it is not assumed to initialize or preserve fields.
-This covers objects reachable through nested fields and containers. A helper
-can mutate an object captured by a callback, including an object retained by a
-default argument after its original name is rebound. A conditional alias can
-also leave the affected objects unverified after a mutation.
-The checkpoint describes that program point only, not later mutations.
+deletions, and `if`/`else` joins. A field written on one branch is conditional
+after the join. A call with unresolved effects can make a registration
+`unverified` when the checker traces a reference to the fixture through a
+tracked field, container, or callback. Mutations through a conditional alias
+can also make the result `unverified`.
+
+An instance result describes the construction and setup the checker tracked.
+Calls to local class methods, including `__init__` and `__call__`, and aliases
+formed by list comprehensions or sequence concatenation can change the fixture
+outside that model. If such an operation changes a field before registration,
+the checker can still report `matched` based on the tracked setup. Use runtime
+test assertions to check the fixture's state after those operations.
+
 An instance checkpoint can also be used inline, for example
 `consume(verify_instance(state, "production.client:Client"))`; the checker
 uses the tracked fields at that point, and the helper returns `state` unchanged.
@@ -185,7 +190,7 @@ verify_instance(creator, "production.cache:KvCacheCreator", members=("_cache_tra
 ```
 
 `selected-members` checks that each named member is declared on the production
-class and available on the fixture at the checkpoint. Additional fields are
+class and available in the inferred fixture state. Additional fields are
 allowed. For a `Mock`, assign the selected fields explicitly before the
 checkpoint. Attributes synthesized by the mock do not establish initialization.
 
@@ -229,16 +234,16 @@ python3 scripts/check_mock_interfaces.py --search-path /path/to/source-or-stubs 
 
 The standalone command's default report is `mock_interface_report.json` in the working directory.
 Console output identifies the registration, target and individual discrepancies.
-JSON records include location, diagnostics, status and whether analysis was
-complete. `verification` is `ast-only`. A file without registrations is not
-checked for mock consistency. A scan with zero registrations reports that no
-interfaces were verified.
+JSON records include location, diagnostics, status, and whether the check
+reported incomplete verification. `verification` is `ast-only`. A file without
+registrations is not checked for mock consistency. A scan with zero registrations
+reports that no interfaces were verified.
 
 | Result | Meaning |
 |---|---|
-| `matched` | The supported static declarations/state agree. |
+| `matched` | The declarations or tracked fixture setup agree with the target interface. |
 | `mismatched` | At least one definite difference was found. |
-| `unverified` | Available source or supported analysis cannot establish agreement. |
+| `unverified` | The checker identified an uncertainty that prevents it from establishing agreement. |
 
 Exit status is `0` for completed checks with no differences, `1` for definite
 mismatches, or `2` for analysis errors or incomplete verification. A mismatch can
