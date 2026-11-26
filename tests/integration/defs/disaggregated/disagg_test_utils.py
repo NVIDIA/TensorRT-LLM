@@ -536,7 +536,7 @@ def _stop_etcd(proc: subprocess.Popen, data_dir: str) -> None:
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
-def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> bool:
+def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str, peer_url: str) -> bool:
     deadline = time.monotonic() + ETCD_READY_TIMEOUT_S
     with requests.Session() as session:
         # Avoid proxies and redirects so health reflects the local etcd endpoint.
@@ -551,8 +551,16 @@ def _wait_for_etcd_ready(proc: subprocess.Popen, client_url: str) -> bool:
                     allow_redirects=False,
                 )
                 if response.status_code == 200:
-                    # A foreign service can answer if etcd lost a bind race and exited.
-                    return proc.poll() is None
+                    members_response = session.post(
+                        f"{client_url}/v3/cluster/member/list",
+                        json={},
+                        timeout=min(1.0, max(0.1, deadline - time.monotonic())),
+                        allow_redirects=False,
+                    )
+                    if members_response.status_code == 200:
+                        members = members_response.json().get("members", [])
+                        if any(peer_url in member.get("peerURLs", []) for member in members):
+                            return proc.poll() is None
             except requests.RequestException:
                 pass
             if time.monotonic() >= deadline:
@@ -596,7 +604,7 @@ def _start_etcd(work_dir: str) -> tuple[subprocess.Popen, str, str]:
             ]
         )
         try:
-            ready = _wait_for_etcd_ready(proc, client_url)
+            ready = _wait_for_etcd_ready(proc, client_url, peer_url)
         except BaseException:
             _stop_etcd(proc, data_dir)
             raise

@@ -12,12 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU-free unit test for the disaggregated readiness budget.
+"""GPU-free unit tests for disaggregated startup helpers.
 
 pytest -sv disaggregated/test_server_start_timeout.py
 """
 
-from disagg_test_utils import resolve_server_start_timeout
+from unittest.mock import MagicMock
+
+import disagg_test_utils
+from disagg_test_utils import _start_etcd, resolve_server_start_timeout
 
 
 def _config(ctx_pp: int, gen_pp: int) -> dict:
@@ -58,3 +61,44 @@ def test_resolve_server_start_timeout():
         if (actual := resolve_server_start_timeout(config, explicit, sm_version)) != expected
     ]
     assert not failures, "\n".join(failures)
+
+
+def _healthy_session(peer_url: str) -> MagicMock:
+    session = MagicMock()
+    session.__enter__.return_value = session
+    session.get.return_value.status_code = 200
+    session.post.return_value.status_code = 200
+    session.post.return_value.json.return_value = {"members": [{"peerURLs": [peer_url]}]}
+    return session
+
+
+def test_start_etcd_rejects_foreign_health_endpoint(monkeypatch) -> None:
+    """A healthy foreign member must not complete this attempt's readiness check."""
+    foreign_session = _healthy_session("http://127.0.0.1:2380")
+    owned_session = _healthy_session("http://127.0.0.1:103")
+    sessions = iter([foreign_session, owned_session])
+    first_process = MagicMock()
+    first_process.poll.side_effect = [None, 1]
+    first_process.returncode = 1
+    owned_process = MagicMock()
+    owned_process.poll.return_value = None
+    owned_process.returncode = None
+    stop = MagicMock()
+
+    monkeypatch.setattr(disagg_test_utils.requests, "Session", lambda: next(sessions))
+    monkeypatch.setattr(
+        disagg_test_utils.subprocess, "Popen", MagicMock(side_effect=[first_process, owned_process])
+    )
+    monkeypatch.setattr(
+        disagg_test_utils, "get_free_port", MagicMock(side_effect=[100, 101, 102, 103])
+    )
+    monkeypatch.setattr(disagg_test_utils, "_stop_etcd", stop)
+
+    process, uri, _ = _start_etcd("/unused")
+
+    assert process is owned_process
+    assert uri == "etcd://127.0.0.1:102"
+    stop.assert_called_once()
+    assert stop.call_args.args[0] is first_process
+    foreign_session.post.assert_called_once()
+    owned_session.post.assert_called_once()
