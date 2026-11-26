@@ -136,8 +136,9 @@ def test_an_adaptive_route_launch_builds_its_dsl_scalars_once():
 
 
 def test_only_a_bucket_whose_kernel_has_the_adaptive_route_maps_routes_in_its_router(monkeypatch):
-    """An SM107 bucket's kernel has no adaptive route in its dispatch router: its adaptive layers
-    route through the adaptive EPLB route op, with a log line naming the bucket."""
+    """A bucket whose kernel has no adaptive route in its dispatch router (an SM107 generic
+    bucket on the dedup combine, for one): its adaptive layers route through the adaptive EPLB
+    route op, with a log line naming the bucket."""
     logged = []
     monkeypatch.setattr(mm, "IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(mm, "get_sm_version", lambda: 107)
@@ -206,3 +207,53 @@ def test_home_slots_launch_the_kernel_and_weights_of_a_layer_without_a_balancer(
         full = getattr(backend, name)
         assert tensor.shape[0] == 4 and tensor.data_ptr() == full.data_ptr()
         assert torch.equal(tensor, full[:4])
+
+
+def test_an_sm107_generation_phase_bucket_takes_the_adaptive_route_in_its_kernel(monkeypatch):
+    """An SM107 generation-phase bucket reads its inputs where the fused route+quant leaves them and
+    its kernel maps and counts the expert ids itself: its adaptive layers skip the route op too. A
+    staged bucket the fused launch cannot write still routes through it."""
+    monkeypatch.setattr(mm, "IS_CUTLASS_DSL_AVAILABLE", True)
+    backend = SimpleNamespace(
+        _active_launch_max_tokens=128,
+        tactic_autotune=False,
+        _select_launch_max_tokens=lambda hint: hint,
+        _genphase_direct_input_buckets={128},
+        _adaptive_router_buckets=set(),
+        _padding_drop_buckets=set(),
+        _slot_of_expert=None,
+        _replicated=False,
+        _route_quant_fuses=lambda: True,
+        _route_quant_bucket=lambda *args: None,
+        _shared_activation_target=lambda num_tokens: None,
+        _adaptive_route_launch=None,
+        routing_method=SimpleNamespace(
+            top_k=6, e_score_correction_bias=None, routed_scaling_factor=2.5
+        ),
+        fc31_input_scale=None,
+    )
+    for name in ("_router_launch_max_tokens", "routes_adaptive_in_router"):
+        setattr(backend, name, getattr(IMPL, name).__get__(backend))
+    assert backend._router_launch_max_tokens(64) == 128
+    assert backend._router_launch_max_tokens(256) is None
+    assert not backend.routes_adaptive_in_router(64)  # the bucket's kernel has no adaptive route
+    backend._adaptive_router_buckets.add(128)
+    assert backend.routes_adaptive_in_router(64) and not backend.routes_adaptive_in_router(0)
+
+    def route_quant(*args, staged=None, slot_of_expert=None, **kwargs):
+        # Expert ids, left where the kernel reads them.
+        assert staged is None and slot_of_expert is None
+        ids = torch.zeros((args[2].shape[0], 6), dtype=torch.int32)
+        return ids, torch.zeros(ids.shape), args[2], args[2], None
+
+    monkeypatch.setattr(mm, "dsv4_route_nvfp4_quant", route_quant, raising=False)
+    x, logits = torch.zeros((64, 8)), torch.zeros((64, 384))
+    route = ("table", "rows", "fw", "on", True)
+    result = IMPL.try_fused_route_quant(backend, x, logits, adaptive_route=route)
+    assert result is not None and result.routes_mapped
+    assert backend._adaptive_route_launch == ("table", "rows", "fw", "on", 64, True)
+    # A staged bucket the fused launch cannot write (no hint yet, say) keeps the route op.
+    backend._genphase_direct_input_buckets = set()
+    backend._adaptive_route_launch = None
+    assert IMPL.try_fused_route_quant(backend, x, logits, adaptive_route=route) is None
+    assert backend._adaptive_route_launch is None

@@ -303,18 +303,15 @@ def test_dedup_never_reaches_a_kernel_without_the_option(
 def test_an_adaptive_route_never_reaches_a_kernel_without_it(
     op: types.ModuleType, capacity: int
 ) -> None:
-    """The SM107 kernels declare no adaptive route. The generic one still forwards the option to its
-    router, which then maps expert ids while the kernel passes it no route table (the router's
-    "adaptive_route is passed iff" ValueError at the first launch); the gen-phase one refuses it,
-    which would fall back to the generic kernel. Both are refused at construction, and the
-    properties tell the backend to route those buckets through the adaptive EPLB route op."""
+    """A kernel class that declares no adaptive route (the stubs here) may still forward the option
+    to a router that then maps expert ids while the kernel passes it no route table, or refuse it
+    in a gen-phase bucket, which would fall back to the generic kernel. Both are refused at
+    construction."""
     common = _kernel_common(capacity, adaptive_route_experts=384)
     with pytest.raises(NotImplementedError, match="no adaptive route in its dispatch router"):
         op._construct_megamoe_kernel(sm_version=107, common=common, combine_format="bf16")
     kernel = op._construct_megamoe_kernel(sm_version=100, common=common, combine_format="bf16")
     assert kernel.implementation["adaptive_route_experts"] == 384
-    assert not any(map(op.megamoe_kernel_routes_adaptive, (_GenphaseMetadata, _GenericMetadata)))
-    assert op.megamoe_kernel_routes_adaptive(_AdaptiveRouteMetadata)
 
 
 def test_a_built_kernel_routes_adaptively_only_through_a_router_that_declares_it(
@@ -341,7 +338,7 @@ def test_a_built_kernel_routes_adaptively_only_through_a_router_that_declares_it
     assert op.megamoe_kernel_routes_adaptive(_AdaptiveRouteMetadata)
     assert op.megamoe_kernel_routes_adaptive(built(_AdaptiveRouter))
     assert not op.megamoe_kernel_routes_adaptive(built(_Router))
-    assert not op.megamoe_kernel_routes_adaptive(_GenericMetadata)
+    assert not any(map(op.megamoe_kernel_routes_adaptive, (_GenphaseMetadata, _GenericMetadata)))
 
 
 def test_the_properties_tell_whether_a_bucket_routes_adaptively(op: types.ModuleType) -> None:

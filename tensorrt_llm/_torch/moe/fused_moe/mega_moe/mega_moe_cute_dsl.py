@@ -1954,20 +1954,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         return ids, weights
 
     def _router_launch_max_tokens(self, num_tokens: int) -> Optional[int]:
-        """The launch bucket a fused route+quant of ``num_tokens`` rows writes, or None."""
+        """The launch bucket whose kernel gets the routes of a fused route+quant of ``num_tokens``
+        rows, or None: the bucket the fused launch writes, or a generation-phase bucket, which takes
+        them where the fused launch leaves them (``_genphase_direct_input_buckets``)."""
         if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
             return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
-        if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
-            return None
-        return launch_max_T
+        return None if num_tokens > launch_max_T else launch_max_T
 
     def routes_adaptive_in_router(self, num_tokens: int) -> bool:
         """Whether a launch of ``num_tokens`` rows can take an adaptive balancer's routes as expert
         ids, mapped to slots and counted by its dispatch router (either router: the one-round push
-        and the metadata push carry the same adaptive route): the model's fused route+quant writes
-        the launch bucket, whose kernel has the adaptive route (``_adaptive_router_buckets``).
-        Otherwise the balancer stages the slots itself."""
+        and the metadata push carry the same adaptive route, and so does the SM107 generation-phase
+        token comm): the model's fused route+quant writes the launch bucket, or leaves the routes
+        for a generation-phase bucket, whose kernel has the adaptive route
+        (``_adaptive_router_buckets``). Otherwise the balancer stages the slots itself."""
         if not IS_CUTLASS_DSL_AVAILABLE or self._slot_of_expert is not None:
             return False
         if not self._route_quant_fuses():
@@ -1990,8 +1991,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             return None
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
         if adaptive_route is not None and (
-            bucket is None or not self.routes_adaptive_in_router(x.shape[0])
+            not self.routes_adaptive_in_router(x.shape[0])
+            or (
+                bucket is None
+                and self._router_launch_max_tokens(x.shape[0])
+                not in self._genphase_direct_input_buckets
+            )
         ):
+            # A generation-phase bucket takes the expert ids this launch returns; any other bucket
+            # takes them in its staging only.
             return None
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])

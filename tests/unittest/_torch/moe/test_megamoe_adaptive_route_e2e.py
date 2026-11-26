@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4 MegaMoE layers on four GPUs (attention DP, EP4, 384 experts) with and without an adaptive load
-balancer (512 slots, home route tables, no runtime), at decode (8 / 64 / 128 rows per rank, the one-round router)
-and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
+balancer (512 slots, home route tables, no runtime), at decode (8 / 64 / 128 rows per rank, the one-round router;
+on SM107 the generation-phase kernel up to 1024) and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
 
 Bit for bit: an adaptive layer whose dispatch router maps and counts its routes returns what the same layer returns
 on the staged route, and what a layer without the balancer returns; its statistics are the routing's picks of the
@@ -54,6 +54,15 @@ def _init_worker(paths: list[str]) -> None:
 def _assert_on_all_ranks(problem: Optional[str]) -> None:
     problems = mpi_allgather(problem)
     assert not any(problems), problems
+
+
+def _same(backend, rows: int, got, want) -> bool:
+    """Bit for bit, except in a bucket whose kernel sums the top-k picks in its FC2 epilogue (the SM107
+    32-row bucket): there the picks add in arrival order, so the outputs agree within bf16 rounding."""
+    bucket = backend._select_launch_max_tokens(rows)
+    if not backend._use_in_kernel_fc2_reduce(bucket):
+        return all(torch.equal(a, b) for a, b in zip(got, want))
+    return all(torch.allclose(a, b, rtol=1.6e-2, atol=1e-5) for a, b in zip(got, want))
 
 
 def _replica_row(packed: list) -> torch.Tensor:
@@ -224,7 +233,7 @@ def _run() -> None:
             picks = torch.bincount(picked[0].reshape(-1).long(), minlength=_NUM_EXPERTS).float()
             problem = None
             for name, got in (("staged", staged), ("router", routed)):
-                if not all(torch.equal(a, b) for a, b in zip(got, want)):
+                if not _same(backends[0], rows, got, want):
                     problem = f"{rows} rows: the {name} route's output differs from the layer without a balancer"
             if problem is None and not torch.equal(stats["rows"][0].cpu(), picks.cpu()):
                 problem = f"{rows} rows: the router's statistics differ from the routing's picks"
@@ -313,7 +322,7 @@ def _run() -> None:
             torch.cuda.synchronize()
             eager = adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
             torch.cuda.synchronize()
-            same = torch.equal(slot, eager)
+            same = _same(backends[0], rows, [slot], [eager])
             _assert_on_all_ranks(
                 None if same else f"{rows} rows: the replay after an install differs from eager"
             )
@@ -344,7 +353,7 @@ def _run() -> None:
             if problem is None:
                 graph.replay()
                 torch.cuda.synchronize()
-                if not all(torch.equal(a, b) for a, b in zip(got, want)):
+                if not _same(backends[0], rows, got, want):
                     problem = f"{rows} rows: the captured mixed forward differs from eager"
             del graph
             _assert_on_all_ranks(problem)
@@ -376,7 +385,9 @@ def _launches(layer, rows: int) -> list:
     not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD_SIZE,
     reason=f"Requires {_WORLD_SIZE} GPUs",
 )
-@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="MegaMoE CuteDSL on SM100/SM103")
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103, 107), reason="MegaMoE CuteDSL on SM100/SM103/SM107"
+)
 def test_megamoe_adaptive_route_matches() -> None:
     # The workers spawn before this process touches CUDA, as test_megamoe_e2e's do: the run lists this
     # module first and nothing here launches work on the parent's device.
