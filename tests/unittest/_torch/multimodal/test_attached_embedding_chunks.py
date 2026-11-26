@@ -23,6 +23,7 @@ _MODEL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _TEST_DATA = llm_models_root() / "multimodals" / "test_data"
 _CHUNK_TOKENS = 1024
 _IMAGE_TOKEN_ID = 151655
+_COMMON = dict(model=_MODEL_DIR, trust_remote_code=True, max_batch_size=4)
 
 
 @pytest.fixture(scope="module")
@@ -43,15 +44,14 @@ def images(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
 @pytest.fixture(scope="module")
 def engines() -> Generator[tuple[LLM, LLM, MultimodalEncoder], None, None]:
     """An unchunked LLM, a chunked LLM with block reuse, and an encoder."""
-    common = dict(model=_MODEL_DIR, trust_remote_code=True, max_batch_size=4)
     with (
         LLM(
-            **common,
+            **_COMMON,
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.2),
             max_num_tokens=16384,
         ) as llm,
         LLM(
-            **common,
+            **_COMMON,
             kv_cache_config=KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.2),
             enable_chunked_prefill=True,
             max_num_tokens=_CHUNK_TOKENS,
@@ -164,3 +164,27 @@ def test_sequences_above_the_old_attachment_bound_are_served(
 
     assert len(output.outputs) == num_sequences
     assert all(sequence.token_ids for sequence in output.outputs)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_chunked_attachment_without_item_scheduling(
+    engines: tuple[LLM, LLM, MultimodalEncoder], images: dict[str, str]
+) -> None:
+    """A prefill-only worker (no MM encoder, so no item scheduler) slices too."""
+    llm, _, encoder = engines
+    media = [images["large"]]
+    params = SamplingParams(max_tokens=32)
+    raw_inputs = _load_inputs(llm, "Describe the image in detail.", media)
+    inputs = _attached_inputs(encoder, raw_inputs, media, "cpu")
+    expected = llm.generate(raw_inputs, params)
+
+    with LLM(
+        **_COMMON,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.1),
+        enable_chunked_prefill=True,
+        max_num_tokens=_CHUNK_TOKENS,
+        disable_mm_encoder=True,
+    ) as prefill_llm:
+        output = prefill_llm.generate(inputs, params)
+
+    assert output.outputs[0].token_ids == expected.outputs[0].token_ids

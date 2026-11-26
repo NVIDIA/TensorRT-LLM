@@ -25,7 +25,10 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalModelMixin,
+    _build_request_multimodal_input,
+)
 from tensorrt_llm._torch.pyexecutor import device_copy, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -84,7 +87,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ...input_buffers import InputBuffers
 from ...lora import LoraParamBuilder
-from ...multimodal import MultimodalItemScheduler
+from ...multimodal import MultimodalItemScheduler, slice_attached_embedding
 from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
@@ -427,6 +430,9 @@ class DecoderInputPreparer:
         self._pinned_host_cache = {}
         self._pinned_host_active = {}
         self._mm_item_scheduler = mm_item_scheduler
+        # Mixin models gather attached embeddings chunk-aware, so they can
+        # take a forward's rows; other models read the attachment whole.
+        self._slices_attached_embeddings = isinstance(model, MultimodalModelMixin)
         self._config = config
         self.mapping = mapping
         self.dist = dist
@@ -1107,10 +1113,12 @@ class DecoderInputPreparer:
         request: LlmRequest,
         runtime: MultimodalRuntimeData | None = None,
     ) -> dict[str, Any] | None:
-        """Attach cached item outputs when item scheduling owns the request."""
-        if self._mm_item_scheduler is None:
-            return request.py_multimodal_data
-        return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+        """Attach this forward's item outputs or rows of precomputed embeddings."""
+        if self._mm_item_scheduler is not None:
+            return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
+        if self._slices_attached_embeddings:
+            return slice_attached_embedding(request.py_multimodal_data, runtime)
+        return request.py_multimodal_data
 
     @nvtx_range("_prepare_inputs")
     def prepare_inputs(
@@ -1639,10 +1647,10 @@ class DecoderInputPreparer:
                     mrope_delta_write_seq_slots.append(request.py_seq_slot)
                     request.py_mrope_delta_cache_slot = request.py_seq_slot
 
-            # Item scheduling builds a per-forward prompt-window copy with this chunk's
-            # joined rows. Keep it off the request so chunked prefill does not retain rows
-            # outside the encoder-cache budget, and keeps its full CPU payload for later
-            # items and a restarted prefill. Legacy requests keep their generation payload.
+            # A per-forward copy with this chunk's rows (item outputs or attached
+            # embeddings) stays off the request, so chunked prefill does not retain
+            # rows outside one forward and keeps the full payload for later chunks
+            # and a restarted prefill. Legacy requests keep their generation payload.
             if request.py_mm_encoder_state is None and not multimodal_params.multimodal_data.get(
                 "multimodal_embedding_is_chunk", False
             ):

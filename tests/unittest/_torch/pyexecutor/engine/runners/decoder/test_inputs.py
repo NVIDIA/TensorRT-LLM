@@ -53,6 +53,7 @@ from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalRuntimeData,
     strip_mm_data_for_generation,
 )
 from tensorrt_llm.llmapi import (
@@ -1814,6 +1815,38 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         for attached in (False, True):
             with self.subTest(attached=attached):
                 self._check_chunk_embedding_is_not_retained(attached)
+
+    def test_attached_embedding_is_sliced_without_item_scheduling(self) -> None:
+        """Without the item scheduler (disable_mm_encoder, an unsupported model
+        or PP), a model with the chunk-aware gather still gets only the
+        forward's rows of an attachment; other models get it whole."""
+        for chunk_aware in (True, False):
+            with self.subTest(chunk_aware=chunk_aware):
+                (preparer, _) = self.enterContext(input_preparer_and_kv_cache())
+                preparer._mm_item_scheduler = None
+                preparer._slices_attached_embeddings = chunk_aware
+                attachment = torch.arange(6, dtype=torch.float16).reshape(3, 2)
+                request = _create_request_with_tokens([11, 22, 33, 44], 1)
+                request.py_multimodal_data = {
+                    "multimodal_embedding": attachment,
+                    "multimodal_embed_mask_cumsum": torch.tensor([0, 1, 2, 3]),
+                }
+                runtime = MultimodalRuntimeData(
+                    embed_mask_cumsum=request.py_multimodal_data["multimodal_embed_mask_cumsum"],
+                    past_seen_token_num=2,
+                    chunk_end_pos=4,
+                )
+
+                multimodal_data = preparer._build_multimodal_data_for_llm(request, runtime)
+
+                if chunk_aware:
+                    torch.testing.assert_close(
+                        multimodal_data["multimodal_embedding"], attachment[1:3]
+                    )
+                    self.assertTrue(multimodal_data["multimodal_embedding_is_chunk"])
+                    self.assertIs(request.py_multimodal_data["multimodal_embedding"], attachment)
+                else:
+                    self.assertIs(multimodal_data, request.py_multimodal_data)
 
     def _check_chunk_embedding_is_not_retained(self, attached: bool) -> None:
         (preparer, kv_cache_manager) = self.enterContext(input_preparer_and_kv_cache())
