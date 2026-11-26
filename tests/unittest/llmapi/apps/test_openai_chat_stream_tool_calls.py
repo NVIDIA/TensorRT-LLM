@@ -98,6 +98,7 @@ class _GenerationStream:
     """What ``generate_async`` returns: one engine result per text increment."""
 
     def __init__(self, increments: list[str]) -> None:
+        self.request_id = 1
         self.prompt_token_ids = [1, 2, 3]
         last = len(increments) - 1
         self._steps = iter(
@@ -277,10 +278,16 @@ def test_name_and_arguments_in_separate_steps_stream_as_parsed(tool_parser, text
     parser = ToolParserFactory.create_tool_parser(tool_parser)
     tools = [ChatCompletionToolsParam.model_validate(tool) for tool in TOOLS]
     expected = []
+    last_step_carries_output = False
     for step, increment in enumerate(increments):
-        items = parser.parse_streaming_increment(increment, tools).calls
+        parsed = parser.parse_streaming_increment(increment, tools)
+        items = list(parsed.calls)
+        normal_text = parsed.normal_text
         if step == len(increments) - 1:
-            items += parser.finish(tools).calls
+            finished = parser.finish(tools)
+            items += finished.calls
+            normal_text += finished.normal_text
+            last_step_carries_output = bool(normal_text or items)
         expected.append([(item.tool_index, item.name, item.parameters) for item in items])
     # The parser names the call in one step and streams its arguments in later ones.
     named_steps = [step for step, items in enumerate(expected) if any(item[1] for item in items)]
@@ -291,12 +298,17 @@ def test_name_and_arguments_in_separate_steps_stream_as_parsed(tool_parser, text
 
     chunks = _stream_post_processor(tool_parser, increments)
 
-    # The first chunk announces the role; each step then sends one chunk.
-    assert len(chunks) == 1 + len(increments)
+    # The first chunk announces the role; each step then sends one chunk, plus a
+    # trailing empty finish chunk when the final step itself carries output.
+    assert len(chunks) == 1 + len(increments) + int(last_step_carries_output)
+    step_chunks = chunks[1:-1] if last_step_carries_output else chunks[1:]
     assert [
         [
             (entry["index"], entry["function"].get("name"), entry["function"]["arguments"])
             for entry in chunk["choices"][0]["delta"].get("tool_calls") or []
         ]
-        for chunk in chunks[1:]
+        for chunk in step_chunks
     ] == expected
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    if last_step_carries_output:
+        assert chunks[-1]["choices"][0]["delta"] == {}
