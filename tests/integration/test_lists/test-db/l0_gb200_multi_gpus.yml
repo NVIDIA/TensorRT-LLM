@@ -59,12 +59,8 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_rms_norm_without_residual
   # ---- curated pre-merge smoke set: diversify moe_tactic across cutlass/trtllm_gen/cutedsl.grouped_gemm ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=trtllm_gen-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=0-tp2pp2-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=trtllm_gen-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=2-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_tactic=trtllm_gen]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_ON]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[ADP4_MTP]
@@ -80,11 +76,7 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] TIMEOUT (90)
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform]
-  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_b_overlap]
-  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
-  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
-  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_capability_e2e
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
@@ -163,3 +155,11 @@ l0_gb200_multi_gpus:
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=2-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=trtllm_gen-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutlass-mtp_nextn=0-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_tactic=cutedsl.grouped_gemm-mtp_nextn=2-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_b_overlap]
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
+  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
+  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
