@@ -20,7 +20,7 @@ pytestmark = pytest.mark.cpu_only
 def worker() -> Iterator[TransferWorker]:
     worker = object.__new__(TransferWorker)
     worker._retirement_watchdog = Mock()
-    worker._sender = Mock()
+    worker._sender = Mock(_recover_agent=None, _unreleased_statuses=[])
     worker._receiver = Mock()
     worker._rank_info_server = Mock()
     worker._agent = Mock(bounce_enabled=False)
