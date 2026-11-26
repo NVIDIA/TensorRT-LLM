@@ -30,6 +30,19 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 | `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
 
+Plain, non-speculative, single-node aggregated clients at concurrency one also
+gate `d_mean_ttft`. This selection is per client, including in mixed batches;
+higher-concurrency, speculative, multi-node, disaggregated and context-only
+clients keep their existing metric gates. Mean TTFT uses the matched case's
+latency baseline and configured pre-merge or post-merge tolerance (10% and 5%
+by default). Without a stored TTFT baseline override, healthy TTFT history can
+still supply the baseline; without either, TTFT remains ungated. For these
+TTFT-eligible rows, an existing mainline regression exempts a pre-merge row only
+when every currently regressive metric already misses the same gate on main,
+so an old TTFT miss cannot excuse a new throughput loss (or vice versa). All
+other rows retain their whole-case exemption when any gated mainline metric
+misses the pre-merge threshold.
+
 TPOT is time per output token, so lower values are better. Its reported delta is
 negative when latency exceeds the selected baseline. A stored `d_baseline_*`
 override takes precedence; otherwise, the baseline is recalculated as P5 of the
@@ -509,14 +522,22 @@ Post-merge perf-sanity stages (stages whose names contain both `PerfSanity` and 
 
 By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
 
-**A pre-merge case does not fail when `main` has already regressed.** Both pipelines
+**A pre-merge case may be exempt when `main` has already regressed.** Both pipelines
 compare against the same post-merge baseline, so once a regression lands on `main`
 every PR measures the same regressed value and every PR fails a test it did not
 break — blocking the whole queue until a fix merges and everyone rebases. To avoid
 that, `prepare_regressive_test_cases` checks the **latest post-merge document** for
-the same test case: if that value misses the same baseline by more than the same
-pre-merge threshold (10%), the pre-merge case is reported as a warning but does not
-raise. Functional failures still fail the stage as usual.
+the same test case, comparing against the same baseline and pre-merge threshold
+(10% by default):
+
+- Plain, non-speculative, single-node aggregated concurrency-one clients receive
+  the additional TTFT gate. They are exempt only when **every currently regressive
+  metric** already misses its corresponding gate on `main`.
+- All other clients retain the existing **whole-case exemption** when **any gated
+  metric** already misses on `main`, including when that metric recovers on the PR.
+
+Exempt cases are reported as warnings without raising. Functional failures still
+fail the stage as usual.
 
 The comparison deliberately re-evaluates `main`'s value rather than reusing the
 `b_is_regression` the post-merge run recorded, because that verdict was computed at
@@ -526,10 +547,10 @@ value never fails the 10% gate, so the gate stays armed.
 
 Two things to be aware of when you see that warning:
 
-- While a case is exempt it is exempt **entirely**: a genuine new regression the PR
-  adds on top of `main`'s passes silently. The exempt band is only the range where
-  the gate would have fired on `main`'s own value anyway, but inside it there is no
-  coverage.
+- For TTFT-eligible clients, further worsening of an already regressive metric
+  remains exempt, but a new regression in a different metric still fails. Other
+  clients remain exempt **entirely** after any qualifying mainline miss: even a
+  new regression in a different metric can pass. Their existing policy is unchanged.
 - The exemption clears itself as the rolling baseline absorbs the regression, which
   also means the regression stops being reported. If you land the fix, the baseline
   recovers and the gate re-arms at the original level; if nobody does, it re-arms at

@@ -355,11 +355,16 @@ def prepare_regressive_test_cases(
     minimize_metrics,
     regression_metrics,
     metric_history_floors_ms=None,
+    regression_metrics_by_cmd_idx=None,
 ):
     """Update regression info for all data in new_data_dict.
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
+    regression_metrics_by_cmd_idx replaces the default gate metrics for individual
+    cases. Overridden cases require all current regressive metrics to predate the
+    change before exempting a pre-merge row. Cases without an override keep
+    regression_metrics and the whole-case exemption for any mainline gate miss.
     For a metric listed in metric_history_floors_ms, a stored baseline is used only
     when the record it came from (its ts_created) is at or after the metric's floor;
     otherwise the floor-filtered calculation is used (see calculate_baseline_metrics).
@@ -367,7 +372,8 @@ def prepare_regressive_test_cases(
 
     Returns the set of pre-merge cmd_idx whose regression must not fail the
     stage because the latest post-merge record for the same case is itself
-    beyond the pre-merge threshold. Both pipelines compare against one shared
+    beyond the pre-merge threshold under that case's exemption rule.
+    Both pipelines compare against one shared
     baseline, so a regression landed on main would otherwise make every
     subsequent PR measure the same regressed value and fail for a change it did
     not introduce.
@@ -387,6 +393,9 @@ def prepare_regressive_test_cases(
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
+        case_regression_metrics = (regression_metrics_by_cmd_idx or {}).get(
+            cmd_idx, regression_metrics
+        )
         baseline_threshold = (
             latest_baseline_threshold_dict.get(cmd_idx) if latest_baseline_threshold_dict else None
         )
@@ -461,7 +470,7 @@ def prepare_regressive_test_cases(
             )
 
             # Check if this metric is regressive (only for key regression metrics)
-            if metric in regression_metrics:
+            if metric in case_regression_metrics:
                 maximize = metric in maximize_metrics
                 if _is_regressive(new_value, baseline_value, threshold, maximize):
                     regressive_metrics.append(metric)
@@ -484,16 +493,23 @@ def prepare_regressive_test_cases(
         new_data["s_regression_info"] = "\n".join([header] + info_lines)
         new_data["b_is_regression"] = len(regressive_metrics) > 0
 
-        # A pre-merge regression is not this PR's fault when main's own latest
-        # value already misses the same gate. post_merge_regressive_metrics is
-        # only ever populated on a pre-merge run, so post-merge is unaffected.
-        if post_merge_regressive_metrics:
+        # Per-case metric overrides require every current miss to predate the PR.
+        # Other cases retain the whole-case exemption for any mainline gate miss.
+        # post_merge_regressive_metrics is empty on post-merge runs.
+        exemption_metrics = post_merge_regressive_metrics
+        if cmd_idx in (regression_metrics_by_cmd_idx or {}):
+            exemption_metrics = (
+                regressive_metrics
+                if set(regressive_metrics).issubset(post_merge_regressive_metrics)
+                else []
+            )
+        if exemption_metrics:
             exempt_cmd_idxs.add(cmd_idx)
             if new_data["b_is_regression"]:
                 new_data["s_regression_info"] += (
                     "\n  Not failing this stage: the latest post-merge run of this test "
                     "case already misses the same threshold against the same baseline "
-                    f"({', '.join(post_merge_regressive_metrics)}), so this regression "
+                    f"({', '.join(exemption_metrics)}), so this regression "
                     "predates the change under test."
                 )
 
@@ -628,6 +644,7 @@ def process_and_upload_test_results(
     upload_to_db: bool = True,
     fail_on_regression: Optional[bool] = None,
     metric_history_floors_ms: Optional[Dict[str, int]] = None,
+    regression_metrics_by_cmd_idx: Optional[Dict[int, List[str]]] = None,
 ):
     """Generic regression pipeline: enrich data, query history, detect regression, upload.
 
@@ -637,6 +654,10 @@ def process_and_upload_test_results(
         maximize_metrics: Metrics where larger is better (e.g. throughput).
         minimize_metrics: Metrics where smaller is better (e.g. latency).
         regression_metrics: Subset of metrics to check for regression.
+        regression_metrics_by_cmd_idx: Optional per-case replacements for
+            regression_metrics, with an exemption only when every current
+            regressive metric already misses its gate on main. Cases not listed
+            retain regression_metrics and the whole-case mainline exemption.
         extra_fields: Additional fields to merge into each data entry
             (e.g. {"s_stage_name": ..., "s_test_list": ...}).
         upload_to_db: Whether to post results to the database.
@@ -653,6 +674,8 @@ def process_and_upload_test_results(
     # Validate that regression_metrics is a subset of all metrics
     all_metrics = set(maximize_metrics) | set(minimize_metrics)
     invalid_metrics = set(regression_metrics) - all_metrics
+    for case_metrics in (regression_metrics_by_cmd_idx or {}).values():
+        invalid_metrics.update(set(case_metrics) - all_metrics)
     if invalid_metrics:
         raise ValueError(
             f"regression_metrics {sorted(invalid_metrics)} are not in "
@@ -699,6 +722,7 @@ def process_and_upload_test_results(
         minimize_metrics,
         regression_metrics,
         metric_history_floors_ms=metric_history_floors_ms,
+        regression_metrics_by_cmd_idx=regression_metrics_by_cmd_idx,
     )
 
     # Step 7: For post-merge, embed baseline fields

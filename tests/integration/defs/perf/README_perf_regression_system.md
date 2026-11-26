@@ -81,8 +81,8 @@ since the history window then no longer reaches back past it.
 Both pipelines compare against the same baseline, so a regression that lands on
 `main` makes every subsequent PR measure the same regressed value and fail a
 test it did not break — blocking all PRs until a fix merges and everyone
-rebases. To prevent that, a pre-merge case does not fail the stage when the
-latest post-merge record for the same case would itself miss the pre-merge gate:
+rebases. To prevent that, a pre-merge case may be exempt when the latest
+post-merge record for the same case misses the pre-merge gate, under its rule:
 
 - The latest post-merge **value** is re-evaluated here, against the same baseline
   and the same **pre-merge** threshold (10%) used for the pre-merge verdict. The
@@ -91,7 +91,13 @@ latest post-merge record for the same case would itself miss the pre-merge gate:
 - That makes the exemption exactly as wide as the failure it prevents. If `main`
   sits within the pre-merge threshold, a PR reproducing `main`'s value does not
   fail the gate, so there is nothing to exempt and the gate stays armed.
-- Granularity is the whole test case (per `cmd_idx`), not per metric.
+- Cases with a `regression_metrics_by_cmd_idx` override require **every currently
+  regressive metric** to already miss that same gate on `main`. A prior miss in
+  one metric cannot excuse a new regression in another. Perf-sanity uses these
+  overrides only for its additional TTFT-eligible clients.
+- Cases without an override retain the **whole-case exemption**: **any gated
+  metric** already missing on `main` exempts the row, including when that metric
+  recovers on the PR. Other callers' existing behavior is unchanged.
 - Anything unusable in that record — metric absent, null, non-numeric, or
   non-positive — does **not** exempt, so a broken post-merge document leaves the
   gate armed rather than silently disarming it.
@@ -103,9 +109,11 @@ latest post-merge record for the same case would itself miss the pre-merge gate:
 
 Consequences worth knowing:
 
-- Within the exempt band the case is **fully** exempt: once `main` is more than
-  10% off baseline, a PR that makes the same case worse still passes. This is
-  inherent to exempting a whole case rather than diffing against `main`'s value.
+- Within a metric's exempt band, further worsening of that same metric still
+  passes. For per-case overrides, independent regressive metrics still fail;
+  without an override, the entire case remains exempt and a new loss in another
+  metric can pass. The comparison uses the shared baseline rather than the latest
+  value on `main`.
 - It **self-clears**, which also hides the regression. Nothing seeds
   `d_baseline_*` automatically, so the effective baseline is the rolling
   P95/P5 window; within a few days it drifts down to the regressed level, the
@@ -209,6 +217,7 @@ process_and_upload_test_results(
 | `maximize_metrics` | `List[str]` | Metrics where larger is better (baseline = P95) |
 | `minimize_metrics` | `List[str]` | Metrics where smaller is better (baseline = P5) |
 | `regression_metrics` | `List[str]` | Subset of `maximize_metrics + minimize_metrics` checked for pass/fail regression. Raises `ValueError` if any entry is not in those lists |
+| `regression_metrics_by_cmd_idx` | `Dict[int, List[str]]` or `None` | Optional per-case metric replacements with an exemption only if every current regressive metric already misses its gate on main. Metric names are validated against the same definitions. Cases not listed retain the default gates and whole-case mainline exemption |
 | `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
 | `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
 | `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |

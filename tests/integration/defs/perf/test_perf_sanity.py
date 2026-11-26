@@ -6359,6 +6359,15 @@ class PerfSanityTestConfig:
             if has_spec_decoding:
                 regression_metrics.append("d_al")
 
+        regression_metrics_by_cmd_idx = {
+            cmd_idx: [*regression_metrics, "d_mean_ttft"]
+            for cmd_idx, data in new_data_dict.items()
+            if self.benchmark_mode is None
+            and data["l_gpus"] <= data["l_gpus_per_node"]
+            and data["l_concurrency"] == 1
+            and not data["b_eos"]
+        }
+
         process_and_upload_test_results(
             new_data_dict=new_data_dict,
             match_keys=match_keys,
@@ -6369,6 +6378,7 @@ class PerfSanityTestConfig:
             upload_to_db=self.upload_to_db,
             fail_on_regression=fail_on_regression,
             metric_history_floors_ms=metric_history_floors_ms,
+            regression_metrics_by_cmd_idx=regression_metrics_by_cmd_idx,
         )
 
 
