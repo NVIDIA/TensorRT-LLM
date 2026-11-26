@@ -73,4 +73,6 @@ extension builds during test discovery, setup, or execution.
 - Python unit tests: [unit-test guidance](unittest/AGENTS.md)
 - CI test lists, batching, and waives: [test-list guidance](integration/test_lists/AGENTS.md)
   (detailed matching and batching reference in [test-list README](integration/test_lists/README.md))
+- Model tests (which models, configurations and platforms run pre-merge):
+  [model test policy](integration/test_lists/MODEL_TEST_POLICY.md)
 - C++ tests and wrappers: [C++ test guidance](../cpp/tests/AGENTS.md)
