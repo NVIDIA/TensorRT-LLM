@@ -913,6 +913,7 @@ def test_event_manager_disabled_queue_and_blocking_read():
 
 def test_updated_data_requires_a_cache_level_diff():
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         KVCacheUpdatedData("block")
 
 

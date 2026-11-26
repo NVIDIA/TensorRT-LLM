@@ -31,10 +31,6 @@ class MoEDep(str, Enum):
     #: ``import flashinfer`` succeeds. Gates the SM120/SM121 NVFP4 decode
     #: backend (``CuteDslB12xFusedMoE``).
     FLASHINFER = "flashinfer"
-    #: FlashInfer additionally exposes ``trtllm_bf16_moe`` /
-    #: ``trtllm_bf16_routed_moe``. Strictly stronger than :attr:`FLASHINFER`
-    #: and gates the TRTLLM-Gen unquantized BF16 path.
-    FLASHINFER_BF16_MOE = "flashinfer_bf16_moe"
     #: The bundled DeepGEMM build exposes the ``fp8_fp4_mega_moe`` kernel.
     DEEPGEMM_MEGAMOE = "deepgemm_megamoe"
     #: ``nvidia-cutlass-dsl[cu13]`` is new enough for the MegaMoE CuteDSL ABI.
@@ -44,6 +40,10 @@ class MoEDep(str, Enum):
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
     #: kernels are written against.
     CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: The installed CuTe DSL also ships the ``cutlass.memory`` /
+    #: ``cutlass.tensor_utils`` submodules the Rubin MXFP8 fused FC12 kernel
+    #: needs; older Rubin builds miscompile its MXFP8 path.
+    CUTEDSL_MXFP8_FUSED_FC12_RUBIN = "cutedsl_mxfp8_fused_fc12_rubin"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -52,14 +52,16 @@ class MoEDep(str, Enum):
 class MoEEnvFlag(str, Enum):
     """Environment variables that MoE selection is allowed to read."""
 
-    #: Opt-in to the FlashInfer provider for quantized TRTLLM-Gen. Changes the
-    #: routing split, which is why load-balancer eligibility depends on it.
-    TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
     #: Opt-in to folding the shared experts into the routed grouped GEMM.
     #: Collected rather than read from ``os.environ`` because it changes how
     #: many expert slots the GEMM builds: two ranks disagreeing on it would
     #: otherwise share a fingerprint while building differently shaped layers.
     SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
+    #: Opt-in to the SM90 FP8 block-scale leaf that runs decode-sized batches
+    #: through Triton FP8-activation kernels
+    #: (``TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl``). Collected for the
+    #: same reason: it decides which leaf every rank builds.
+    SM90_TRITON_FP8_DECODE = "TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE"
 
 
 # Probe details are logged but excluded from the stable fingerprint.
@@ -71,21 +73,6 @@ def _probe_flashinfer() -> Tuple[bool, str]:
         import flashinfer  # noqa: F401
     except Exception as exc:  # noqa: BLE001 - any import failure means absent
         return False, f"import flashinfer failed: {exc}"
-    return True, ""
-
-
-def _probe_flashinfer_bf16_moe() -> Tuple[bool, str]:
-    try:
-        from flashinfer.fused_moe import core as _core
-    except Exception as exc:  # noqa: BLE001 - any import failure means absent
-        return False, f"import flashinfer.fused_moe.core failed: {exc}"
-    missing = [
-        symbol
-        for symbol in ("trtllm_bf16_moe", "trtllm_bf16_routed_moe")
-        if not hasattr(_core, symbol)
-    ]
-    if missing:
-        return False, f"flashinfer.fused_moe.core lacks {', '.join(missing)}"
     return True, ""
 
 
@@ -114,6 +101,21 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks Rubin helpers"
 
 
+def _probe_cutedsl_mxfp8_fused_fc12_rubin() -> Tuple[bool, str]:
+    # Import the op module first: it clears the flag if the vendored kernel
+    # fails to import with this CuTe DSL build.
+    from ...custom_ops import cute_dsl_custom_ops  # noqa: F401
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
+
+    if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
+        return True, ""
+    return (
+        False,
+        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils or another "
+        "module the Rubin MXFP8 fused FC12 kernel imports",
+    )
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -133,22 +135,35 @@ def _probe_megamoe_cutedsl_op() -> Tuple[bool, str]:
 
 _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.FLASHINFER: _probe_flashinfer,
-    MoEDep.FLASHINFER_BF16_MOE: _probe_flashinfer_bf16_moe,
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN: _probe_cutedsl_mxfp8_fused_fc12_rubin,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
-    MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
     MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
+    MoEEnvFlag.SM90_TRITON_FP8_DECODE: "0",
 }
+
+#: Removed in 1.4 (TRTLLM-17328); kept only to warn deployments that still
+#: export it, since setting it no longer changes which TRTLLM-Gen leaf runs.
+_REMOVED_TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
 
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None
 _OVERRIDE_ENVIRONMENT: Optional[MoEEnvironment] = None
+
+
+def _warn_on_removed_env_flags() -> None:
+    if _REMOVED_TRTLLM_GEN_USE_FLASHINFER in os.environ:
+        logger.warning_once(
+            f"{_REMOVED_TRTLLM_GEN_USE_FLASHINFER} was removed and has no effect: "
+            "TRTLLM-Gen MoE always runs the native TRT-LLM kernels.",
+            key=f"removed_env_{_REMOVED_TRTLLM_GEN_USE_FLASHINFER}",
+        )
 
 
 def _run_probe(dep: MoEDep, probe: DepProbe) -> bool:
@@ -186,6 +201,7 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
 
     from tensorrt_llm._utils import get_sm_version
 
+    _warn_on_removed_env_flags()
     available = tuple(
         sorted(dep.value for dep, probe in _DEP_PROBES.items() if _run_probe(dep, probe))
     )

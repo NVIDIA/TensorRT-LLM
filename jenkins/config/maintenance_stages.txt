@@ -27,3 +27,6 @@
 # Reason: The H100 cluster is under maintenance.
 # H100_PCIe-*
 # DGX_H100-*
+
+Reason: H100_PCIe-PyTorch-Perf-1 was retired from main; skip the legacy stage in older PR revisions.
+H100_PCIe-PyTorch-Perf-1

@@ -153,6 +153,10 @@ _DEFAULT_PROFILE_CONFIG: Dict[str, Dict[Optional[str], List[str]]] = {
             "_enqueue_responses",
         ],
     },
+    f"{_PYEXEC}.scheduled_encoder_executor": {
+        "ScheduledEncoderExecutor": ["_receive", "_run", "_complete", "_publish"],
+        None: ["fit_batch"],
+    },
     f"{_PYEXEC}.sampler": {
         "TorchSampler": [
             "sample_async",

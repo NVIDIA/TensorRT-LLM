@@ -269,6 +269,7 @@ class Cohere2ForCausalLM(DecoderModelForCausalLM[Cohere2Model, Cohere2Config]):
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
         )
+        self.logits_processor.allow_context_logits_plan = False
         self.logit_scale = model_config.pretrained_config.logit_scale
 
     @torch.inference_mode()

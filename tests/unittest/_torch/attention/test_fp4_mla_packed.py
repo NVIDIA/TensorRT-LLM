@@ -12,6 +12,7 @@ import torch
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan as fp4_mla_packed_plan
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
@@ -19,43 +20,68 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize(
-    "num_heads,query_len,expected",
-    [
-        (96, 8, 768),
-        (12, 8, 128),
-        (6, 6, 128),
-        (128, 4, 512),
-        (128, 8, 1024),
-        (128, 9, 0),
-        (0, 1, 0),
-    ],
-)
-def test_packed_rows_per_seq_pads_each_request_to_128_rows(
-    monkeypatch, num_heads: int, query_len: int, expected: int
-) -> None:
-    monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_Q_ENV, "1")
-    monkeypatch.setenv(fp4_mla_config.FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
-    monkeypatch.setattr(fp4_mla_config, "_fp4_mla_attention_backend", lambda: "cutedsl")
-    assert fp4_mla_config._fp4_mla_packed_rows_per_seq(num_heads, query_len) == expected
-    monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_Q_ENV, "0")
-    assert fp4_mla_config._fp4_mla_packed_rows_per_seq(num_heads, query_len) == 0
+def test_packed_split_needed_mirrors_the_kernel_plan() -> None:
+    def needed(kv_lens, **kwargs) -> bool:
+        # DeepSeek-R1 q4 rows (4 m-tiles) on 212 SMs: 26 tasks per wave of 2-CTA clusters.
+        return fp4_mla_packed_plan.packed_split_needed(
+            kv_lens, query_len=4, m_tiles=4, sm_count=212, **kwargs
+        )
+
+    # An even batch that fills two thirds of a wave keeps every request whole at any KV length.
+    assert not needed([2048] * 32)
+    assert not needed([32768] * 32)
+    assert not needed([4096] * 128)
+    # A smaller even batch splits to fill the machine.
+    assert needed([4096] * 16)
+    # One long request among short ones splits, first or last.
+    assert needed([2048] * 31 + [32768])
+    assert needed([32768] + [2048] * 127)
+    # Lengths spread over a large batch stay whole.
+    assert not needed([1024 + 76 * i for i in range(256)])
+    # One slot per request never splits; neither does an empty step.
+    assert not needed([2048] * 31 + [32768], splits=1)
+    assert not needed([])
 
 
-def test_packed_split_count_fills_one_cluster_wave(monkeypatch) -> None:
+def test_on_demand_split_count_launches_the_budget_only_for_a_split(monkeypatch) -> None:
     monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", raising=False)
     monkeypatch.setattr(fp4_mla_packed_plan, "_get_sm_count", lambda device: 212)
-    device = torch.device("cuda")
-    select = fp4_mla_packed_plan._select_packed_split_count
-    # helix16 B4 MTP7 (6 m-tiles): two waves = 34 tasks / 4 requests + 1 rounding slot -> 10.
-    assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 10
-    # A single short request is capped by the KV length when it is known.
-    assert select(1, 6, device, max_kv_len=512, is_cuda_graph=False) == 1
-    assert select(1, 6, device, max_kv_len=999424, is_cuda_graph=True) == 16
-    # Large batches keep a two-slot budget so one long request can still split.
-    assert select(32, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
+    count = fp4_mla_packed_plan._on_demand_split_count
+
+    def metadata(kv_lens=None, *, packed_split=None, is_cuda_graph=False) -> SimpleNamespace:
+        return SimpleNamespace(
+            fp4_mla_state=Fp4MlaState(packed_split=packed_split),
+            is_cuda_graph=is_cuda_graph,
+            kv_lens_runtime=None if kv_lens is None else torch.tensor(kv_lens, dtype=torch.int32),
+        )
+
+    even, skewed = [4096] * 32, [2048] * 31 + [32768]
+    shape = dict(num_requests=32, m_tiles=4, query_len=4, device=torch.device("cuda"))
+    # Eager steps decide on their host KV lengths.
+    assert count(3, metadata(even), helix=False, **shape) == 1
+    assert count(3, metadata(skewed), helix=False, **shape) == 3
+    # The generation rows are the last kv_lens_runtime entries (context rows come first).
+    assert count(3, metadata([100000] + even), helix=False, **shape) == 1
+    # A keyed graph replays its decision; a graph without one keeps the budget.
+    assert (
+        count(3, metadata(skewed, packed_split=False, is_cuda_graph=True), helix=False, **shape)
+        == 1
+    )
+    assert (
+        count(3, metadata(even, packed_split=True, is_cuda_graph=True), helix=False, **shape) == 3
+    )
+    assert count(3, metadata(even, is_cuda_graph=True), helix=False, **shape) == 3
+    # Without host KV lengths, under Helix and with one slot the count stays.
+    assert count(3, metadata(), helix=False, **shape) == 3
+    assert count(3, metadata(even), helix=True, **shape) == 3
+    assert count(1, metadata(even), helix=False, **shape) == 1
+    # A fixed TRTLLM_FP4_MLA_SPLIT_KV and TRTLLM_FP4_MLA_SPLIT_ON_DEMAND=0 keep the budget.
     monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
-    assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
+    assert count(3, metadata(even), helix=False, **shape) == 3
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", "0")
+    assert count(3, metadata(even), helix=False, **shape) == 3
 
 
 def _plan_mod():
@@ -65,52 +91,58 @@ def _plan_mod():
 
 
 @pytest.mark.parametrize(
-    "tiles,capacity,wave_tasks,expected_tiles_per_task,expected_begins",
+    "tiles,capacity,wave_tasks,wave_plan,expected_tiles_per_task,expected_begins",
     [
         # Even batch under one wave (helix16 B4, 6 m-tiles -> 17 wave tasks): one wave of 32-tile tasks.
-        ([128, 128, 128, 128], 24, 17, 32, [0, 4, 8, 12, 16]),
-        # One long request among short ones takes most of the slots (two-wave target, fit by the fallback share).
-        ([1, 79, 3, 176], 24, 17, 13, [0, 1, 8, 9, 23]),
-        # Full machine, longest 1.5x above the wave share: two-wave target, the short requests also halve.
-        ([128] * 15 + [200], 48, 17, 67, list(range(0, 32, 2)) + [33]),
+        ([128, 128, 128, 128], 24, 17, True, 32, [0, 4, 8, 12, 16]),
+        ([128, 128, 128, 128], 24, 17, False, 32, [0, 4, 8, 12, 16]),
+        # One long request among short ones: 16-tile tasks; the one task past the wave is a short tail.
+        ([1, 79, 3, 176], 24, 17, True, 16, [0, 1, 6, 7, 18]),
+        # The rule takes most of the slots (two-wave target, fit by the fallback share).
+        ([1, 79, 3, 176], 24, 17, False, 13, [0, 1, 8, 9, 23]),
+        # Full machine, longest 1.5x above the wave share: 100-tile tasks, the tails in a second wave.
+        ([128] * 15 + [200], 48, 17, True, 100, list(range(0, 34, 2))),
+        # The rule's two-wave target also halves the short requests.
+        ([128] * 15 + [200], 48, 17, False, 67, list(range(0, 32, 2)) + [33]),
         # Full machine, longest within 1.5x of the wave share: no split at all.
-        ([128] * 15 + [130], 48, 17, 130, list(range(17))),
-        # Strong skew in a full machine: the long request gets twelve tasks.
-        ([128] * 15 + [1024], 48, 17, 86, list(range(0, 32, 2)) + [42]),
-        # Strong skew in a small batch: two-wave target, fit by the fallback share.
-        ([128, 128, 128, 1024], 24, 17, 71, [0, 2, 4, 6, 21]),
-        # A single request fills one wave with 16 tasks, or honours the minimum.
-        ([128], 16, 17, 8, [0, 16]),
-        ([8], 16, 17, 2, [0, 4]),
+        ([128] * 15 + [130], 48, 17, True, 130, list(range(17))),
+        ([128] * 15 + [130], 48, 17, False, 130, list(range(17))),
+        # Strong skew in a full machine: eleven 94-tile tasks for the long request, short tails behind.
+        ([128] * 15 + [1024], 48, 17, True, 94, list(range(0, 32, 2)) + [41]),
+        # The rule gives the long request twelve tasks.
+        ([128] * 15 + [1024], 48, 17, False, 86, list(range(0, 32, 2)) + [42]),
+        # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
+        ([128, 128, 128, 1024], 24, 17, True, 94, [0, 2, 4, 6, 17]),
+        # The rule's two-wave target, fit by the fallback share.
+        ([128, 128, 128, 1024], 24, 17, False, 71, [0, 2, 4, 6, 21]),
+        # A single request fills one wave with 16 tasks; a short one is not worth splitting.
+        ([128], 16, 17, True, 8, [0, 16]),
+        ([8], 16, 17, True, 8, [0, 1]),
+        # The rule fills one wave too, or honours the minimum task length.
+        ([128], 16, 17, False, 8, [0, 16]),
+        ([8], 16, 17, False, 2, [0, 4]),
         # No spare slots: one task per request, however long.
-        ([5, 900], 2, 17, 900, list(range(3))),
+        ([5, 900], 2, 17, True, 900, list(range(3))),
+        ([5, 900], 2, 17, False, 900, list(range(3))),
     ],
 )
 def test_plan_packed_tasks_balances_by_kv_length(
     tiles: list[int],
     capacity: int,
     wave_tasks: int,
+    wave_plan: bool,
     expected_tiles_per_task: int,
     expected_begins: list[int],
 ) -> None:
-    tiles_per_task, begins = _plan_mod().plan_packed_tasks(tiles, capacity, wave_tasks)
+    tiles_per_task, begins = _plan_mod().plan_packed_tasks(
+        tiles, capacity, wave_tasks, wave_plan=wave_plan
+    )
     assert tiles_per_task == expected_tiles_per_task
     assert begins == expected_begins
     assert begins[-1] <= capacity
     for request_tiles, begin, end in zip(tiles, begins, begins[1:]):
         assert end > begin
         assert (end - begin - 1) * tiles_per_task < request_tiles <= (end - begin) * tiles_per_task
-
-
-def test_plan_packed_tasks_one_wave_for_helix() -> None:
-    plan = _plan_mod().plan_packed_tasks
-    # helix16 bs16 (6 m-tiles, 17 wave tasks), per-rank KV skewed 3.5x: the two-wave
-    # target cuts 12-tile pieces (42 tasks); a Helix rank keeps one wave of 28-tile tasks.
-    tiles = [16] * 12 + [40, 48, 56, 56]
-    assert plan(tiles, 48, 17) == (12, list(range(0, 26, 2)) + [28, 32, 37, 42])
-    assert plan(tiles, 48, 17, one_wave=True) == (28, list(range(13)) + [14, 16, 18, 20])
-    # Even Helix batches are unchanged.
-    assert plan([128] * 4, 24, 17, one_wave=True) == plan([128] * 4, 24, 17)
 
 
 def test_plan_packed_tasks_honours_the_runtime_profile_cap() -> None:
@@ -140,22 +172,38 @@ def test_plan_packed_tasks_random_batches_fit_their_budget() -> None:
         )
 
 
+# Skewed request lengths for planner coverage.
+_DEP16_RANK_KV_LENS = [473000, 320000, 250000, 190000, 150000, 110000, 80000, 50000, 27000]
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 7) if torch.cuda.is_available() else True,
     reason="the CuTe DSL plan kernel is compiled for Rubin SM107",
 )
 @pytest.mark.parametrize(
-    "kv_lens,splits,wave_tasks,query_len,helix",
+    "kv_lens,splits,wave_tasks,query_len,helix,wave_plan",
     [
-        ([32768] * 15 + [262144], 4, 17, 8, False),
-        ([131, 20000, 600, 45000], 10, 17, 8, False),
-        ([131, 20000, 600, 45000], 10, 17, 8, True),
-        ([300, 70000, 2200], 16, 106, 1, False),
-        ([5, 5, 5], 2, 106, 4, False),
+        ([32768] * 15 + [262144], 4, 17, 8, False, True),
+        ([131, 20000, 600, 45000], 10, 17, 8, False, True),
+        ([131, 20000, 600, 45000], 10, 17, 8, True, True),
+        ([300, 70000, 2200], 16, 106, 1, False, True),
+        ([5, 5, 5], 2, 106, 4, False, True),
+        # DEP16 rank shapes (3 m-tiles, 35 wave tasks): the simulated task length.
+        (_DEP16_RANK_KV_LENS, 9, 35, 4, False, True),
+        ([183000] * 9, 9, 35, 4, False, True),
+        ([103000] * 16, 6, 35, 4, False, True),
+        # Two cached requests per lane; larger batches take the existing fallback.
+        ([32768] * 31 + [262144], 2, 35, 4, False, True),
+        ([32768] * 32 + [262144], 2, 35, 4, False, True),
+        ([32768] * 63 + [262144], 2, 35, 4, False, True),
+        ([32768] * 64 + [262144], 2, 35, 4, False, True),
+        # TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0, off and on Helix: the rule's length, request order.
+        (_DEP16_RANK_KV_LENS, 9, 35, 4, False, False),
+        ([131, 20000, 600, 45000], 10, 17, 8, True, False),
     ],
 )
 def test_packed_plan_kernel_matches_host_mirror(
-    kv_lens: list[int], splits: int, wave_tasks: int, query_len: int, helix: bool
+    kv_lens: list[int], splits: int, wave_tasks: int, query_len: int, helix: bool, wave_plan: bool
 ) -> None:
     reduce_mod = _plan_mod()
     requests = len(kv_lens)
@@ -174,7 +222,7 @@ def test_packed_plan_kernel_matches_host_mirror(
     tiles = reduce_mod.request_kv_tiles(kv_lens, query_len, bounds_list)
     cap = max(tiles)
     expected_tiles, expected_begins = reduce_mod.plan_packed_tasks(
-        tiles, tasks, wave_tasks, cap, one_wave=helix
+        tiles, tasks, wave_tasks, cap, one_wave=helix, wave_plan=wave_plan
     )
     plan = torch.full(
         (reduce_mod.packed_plan_length(requests, tasks),), -7, dtype=torch.int32, device="cuda"
@@ -188,6 +236,7 @@ def test_packed_plan_kernel_matches_host_mirror(
         max_tiles_per_task=cap,
         query_len=query_len,
         helix_kv_bounds=bounds,
+        wave_plan=wave_plan,
     )
     torch.cuda.synchronize()
     plan = plan.tolist()
@@ -200,13 +249,15 @@ def test_packed_plan_kernel_matches_host_mirror(
         plan[tables + tasks : tables + 2 * tasks],
         plan[tables + 2 * tasks : tables + 3 * tasks],
     )
-    for request, (begin, end) in enumerate(zip(expected_begins, expected_begins[1:])):
-        for task in range(begin, end):
-            assert (request_of[task], split_of[task], count_of[task]) == (
-                request,
-                task - begin,
-                end - begin,
-            )
+    # Tasks are listed in grid order; each request still owns begins[r + 1] - begins[r] of them.
+    order = reduce_mod.plan_task_order(tiles, expected_tiles, wave_plan)
+    assert len(order) == expected_begins[-1]
+    for task, (request, split) in enumerate(order):
+        assert (request_of[task], split_of[task], count_of[task]) == (
+            request,
+            split,
+            expected_begins[request + 1] - expected_begins[request],
+        )
     # Unused slots point past every request's tiles and are never scheduled.
     for task in range(expected_begins[-1], tasks):
         assert request_of[task] == requests - 1 and split_of[task] * expected_tiles >= tiles[-1]
@@ -274,13 +325,14 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
         kv_lens_cuda_runtime=torch.tensor([17, 25], dtype=torch.int32, device="cuda"),
         prompt_lens_cuda_runtime=torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
         is_cuda_graph=False,
-        fp4_mla_state=SimpleNamespace(
+        fp4_mla_state=Fp4MlaState(
             generation_kv_lens=corrected,
             generation_append_lens=generation_lens,
             generation_lengths_num_tokens=-1,
             generation_lengths_num_seqs=-1,
             generation_lengths_num_contexts=-1,
             generation_lengths_capture_recorded=False,
+            generation_lengths_serial=0,
             packed_plan_key=None,
         ),
     )
@@ -336,7 +388,7 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
         num_seqs=4,
         page_size=256,
         is_cuda_graph=True,
-        fp4_mla_state=SimpleNamespace(
+        fp4_mla_state=Fp4MlaState(
             device_page_table=True,
             page_table_stride=3904,
             generation_kv_lens=torch.zeros(4, dtype=torch.int32, device=device),
@@ -381,13 +433,6 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
         metadata, num_heads=96, query_len=8, num_requests=4, device=device, helix_kv_bounds=None
     )
     assert single.splits == 1 and single.key is None and single.plan is None
-
-
-def test_request_kv_tiles_follow_helix_bounds() -> None:
-    tiles = _plan_mod().request_kv_tiles
-    assert tiles([1, 256, 257, 0], 1) == [1, 1, 2, 1]
-    # Helix: the last query token's bound of each request decides.
-    assert tiles([5000, 5000], 2, [100, 512, 5000, 1000]) == [2, 4]
 
 
 @pytest.mark.skipif(

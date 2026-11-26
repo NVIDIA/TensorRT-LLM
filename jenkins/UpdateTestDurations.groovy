@@ -96,7 +96,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "UpdateTestDurations"])
 }
 
 pipeline {
@@ -107,9 +107,6 @@ pipeline {
         timestamps()
         timeout(time: 1, unit: 'HOURS')
         disableConcurrentBuilds(abortPrevious: true)
-    }
-    triggers {
-        cron('H 2 * * 1')
     }
     parameters {
         string(

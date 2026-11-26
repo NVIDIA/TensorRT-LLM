@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -57,18 +57,13 @@ from .encoder import EncoderConfig, EncoderMixin, EncoderPreparedInputs
 from .interface import PreparedInputs, ScheduledInputs
 
 
-@dataclass(frozen=True)
-class EncoderStageConfig(EncoderConfig):
-    """Configuration for the encoder stage of an encoder-decoder model."""
-
-
 class EncoderStage(EncoderMixin):
     """Run the independent encoder phase of an encoder-decoder model."""
 
     def __init__(
         self,
         model: nn.Module,
-        config: EncoderStageConfig,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -952,6 +947,9 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
     from the encoder graph shapes.
     """
 
+    # Mixed shapes need the warmup-only pass; the move check misses the cross-attention metadata.
+    supports_single_pass_capture: ClassVar[bool] = False
+
     def __init__(
         self,
         *,
@@ -1330,7 +1328,7 @@ class EncoderDecoderRunner(DecoderRunner):
         model: nn.Module,
         config: EncoderDecoderRunnerConfig,
         *,
-        encoder_config: EncoderStageConfig,
+        encoder_config: EncoderConfig,
         input_processor: InputProcessor | BaseMultimodalInputProcessor,
         attention_runtime_features: AttentionRuntimeFeatures,
         mapping: Mapping,

@@ -223,12 +223,12 @@ class TestRenderChat:
         assert not [w for w in caught if "never awaited" in str(w.message)]
 
         # A model with its own input processor is refused; its length uses the text tokenizer.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         class OwnProcessor:
             tokenizer = None
 
-        own = resources(tokenizer, model_type="mistral_common", input_processor=OwnProcessor())
+        own = resources(tokenizer, model_type="llava_llama", input_processor=OwnProcessor())
         with pytest.raises(UnsupportedRenderError):
             render_chat(chat_request(), own)
         assert (
@@ -482,10 +482,10 @@ class TestExtensions:
         self, tokenizer
     ) -> None:
         # Registers the passthrough content format for this model type.
-        import tensorrt_llm._torch.models.modeling_mistral  # noqa: F401
+        import tensorrt_llm._torch.models.modeling_vila  # noqa: F401
 
         with pytest.raises(UnsupportedRenderError, match="own input processor"):
-            render_chat(chat_request(), resources(tokenizer, model_type="mistral_common"))
+            render_chat(chat_request(), resources(tokenizer, model_type="llava_llama"))
 
     def test_a_named_tool_choice_is_refused_for_harmony_like_the_chat_route(
         self, harmony_vocab
@@ -1058,6 +1058,59 @@ class TestPreparationContext:
 
         assert context["resolved_thinking"] == {}
 
+    @staticmethod
+    def _usage_extension(asked: list) -> ServingExtension:
+        """An extension that leaves 3 tokens out of usage and records what it was asked."""
+
+        class UsageExtension(ServingExtension):
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
+                asked.append(facts)
+                return 3
+
+        return UsageExtension()
+
+    @pytest.mark.parametrize(
+        ("overrides", "add_generation_prompt", "request_chat_template"),
+        [
+            pytest.param({}, True, None, id="generation_prompt"),
+            pytest.param({"add_generation_prompt": False}, False, None, id="no_generation_prompt"),
+            pytest.param(
+                {"chat_template": REQUEST_TEMPLATE}, True, REQUEST_TEMPLATE, id="request_template"
+            ),
+        ],
+    )
+    def test_the_usage_offset_is_asked_with_the_rendering_facts(
+        self, tokenizer, overrides, add_generation_prompt, request_chat_template
+    ) -> None:
+        asked: list = []
+        res = resources(
+            tokenizer, extension=self._usage_extension(asked), allow_request_chat_template=True
+        )
+
+        context = render_chat(chat_request(**overrides), res).context
+
+        assert context["prompt_tokens_excluded_from_usage"] == 3
+        assert asked == [
+            {
+                "add_generation_prompt": add_generation_prompt,
+                "pre_tokenized": False,
+                "request_chat_template": request_chat_template,
+            }
+        ]
+
+    def test_a_server_template_keeps_the_whole_prompt_in_usage(self, tokenizer) -> None:
+        asked: list = []
+        res = resources(
+            tokenizer,
+            extension=self._usage_extension(asked),
+            default_chat_template=SERVER_TEMPLATE,
+        )
+
+        context = render_chat(chat_request(), res).context
+
+        assert context["prompt_tokens_excluded_from_usage"] == 0
+        assert asked == []
+
     def test_only_a_context_without_decisions_is_trivial(self) -> None:
         from tensorrt_llm.serve.render import PreparedContext
 
@@ -1105,6 +1158,7 @@ class TestRenderedRequest:
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(token_ids=[1], surprise=True)
 
     def test_an_unset_request_id_is_generated(self) -> None:
@@ -1114,4 +1168,5 @@ class TestRenderedRequest:
 
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])

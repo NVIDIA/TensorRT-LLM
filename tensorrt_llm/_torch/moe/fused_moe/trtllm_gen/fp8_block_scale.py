@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSeek-style FP8 with 1x128 block scales, served on both providers.
+"""DeepSeek-style FP8 with 1x128 block scales.
 
 ``run_fp8_block_scale_moe`` is its own kernel ABI, and this format is also the
 only one that narrows the family's activation support and the only one whose
@@ -80,10 +80,6 @@ class TRTLLMGenFp8BlockScalesBase(TrtllmGenFusedMoEBase):
         choices that decide which leaf is eligible.
         """
         if collect_moe_environment().env_flag(MoEEnvFlag.SHARED_EXPERT_FUSION) != "1":
-            return 0
-        # Only the trtllm op backend implements fused shared experts, so the
-        # FlashInfer leaf on this same format stays unfused.
-        if cls.use_flashinfer:
             return 0
         # Expert parallelism (moe_ep_size > 1) is not supported by the fused
         # path yet (the routing kernel's shared-expert append assumes the full

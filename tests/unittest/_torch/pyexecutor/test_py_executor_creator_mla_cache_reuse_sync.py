@@ -113,6 +113,7 @@ class _DummyPyExecutor:
         self.execution_stream = execution_stream
         self.started = False
         self.closed = False
+        self.device_id = 0
 
     def shutdown(self):
         self.closed = True
@@ -154,6 +155,9 @@ class _DummyKvCacheCreator:
             enable_block_reuse=self._kv_cache_config.enable_block_reuse,
             _stream=self._execution_stream,
         )
+
+    def close_remote_donor(self, error=None):
+        """No remote donation is started (no-op)."""
 
 
 class _DummyModelEngine:
@@ -228,6 +232,7 @@ def _make_llm_args():
         ),
     )
     scheduler_config = SimpleNamespace(
+        gen_preemption=None,
         context_chunking_policy=None,
         capacity_scheduler_policy=None,
     )
@@ -258,7 +263,8 @@ def _make_llm_args():
             calibration_layer_indices=None,
         ),
         cuda_graph_config=None,
-        parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
+        parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace(), world_size=1),
+        memory_monitor_config=None,
         get_runtime_sizes=lambda: (1, 128, 128, 4),
     )
 
@@ -321,7 +327,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(
         py_executor_creator,
         "_load_config_and_create_checkpoint_loader",
-        lambda llm_args, checkpoint_dir: (llm_args, None),
+        lambda llm_args, checkpoint_dir: (llm_args, None, True),
     )
     monkeypatch.setattr(py_executor_creator, "_get_mapping", lambda _: fake_mapping)
     monkeypatch.setattr(
@@ -335,7 +341,9 @@ def _run_create_py_executor(
         py_executor_creator, "get_spec_resource_manager", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda: None)
+    monkeypatch.setattr(
+        py_executor_creator, "_adjust_torch_mem_fraction", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(
@@ -349,6 +357,7 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
     monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(py_executor_creator.torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(py_executor_creator.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         py_executor_creator.torch.cuda, "memory_stats", lambda: {"allocated_bytes.all.current": 0}
     )
@@ -492,13 +501,17 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
     monkeypatch.setattr(py_executor_creator, "timing_metric", _timing_metric)
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _raise_during_creation)
 
+    llm_args = SimpleNamespace(
+        memory_monitor_config=None, parallel_config=SimpleNamespace(world_size=1)
+    )
     with pytest.raises(RuntimeError, match="creation failed"):
-        py_executor_creator.create_py_executor(SimpleNamespace())
+        py_executor_creator.create_py_executor(llm_args)
 
     assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
 
     py_executor = object.__new__(PyExecutor)
     py_executor._metrics = {"worker_start_seconds": 0.25}
+    py_executor.device_id = 0
 
     def _return_executor(*, creation_metrics: dict[str, float], **kwargs: object) -> PyExecutor:
         assert "total_py_executor_creation_seconds" not in creation_metrics
@@ -506,7 +519,7 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         return py_executor
 
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _return_executor)
-    result = py_executor_creator.create_py_executor(SimpleNamespace())
+    result = py_executor_creator.create_py_executor(llm_args)
 
     assert result is py_executor
     assert result.metrics == {
@@ -551,7 +564,7 @@ def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill", "supported"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+    [(True, True, True), (True, False, False), (False, True, True), (False, False, True)],
 )
 def test_fp4_mla_block_reuse_blocker(
     monkeypatch: pytest.MonkeyPatch,
@@ -566,9 +579,7 @@ def test_fp4_mla_block_reuse_blocker(
     )
 
     assert (blocker is None) == supported
-    if not is_hybrid:
-        assert "hybrid linear-attention" in blocker
-    elif not enable_chunked_prefill:
+    if not supported:
         assert "enable_chunked_prefill" in blocker
 
 
@@ -594,8 +605,8 @@ def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_v
 
 @pytest.mark.parametrize(
     ("is_hybrid", "enable_chunked_prefill"),
-    [(True, False), (False, True), (False, False)],
-    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
+    [(True, False)],
+    ids=["hybrid_without_chunked_prefill"],
 )
 def test_fp4_mla_disables_unsupported_block_reuse(
     monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool
@@ -849,6 +860,37 @@ def test_startup_allocation_phases(monkeypatch, estimate):
         assert allocation_phases == ["final_kv_cache_allocation", "final_executor_creation"]
     assert phases[-1] == "executor_start_worker"
     assert timers[0].depth == 0
+
+
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_worker_skips_kv_cache_estimation(monkeypatch, decode_only):
+    """A decode-only worker cannot run the dummy-prompt profiling forward."""
+    skip_est_args = []
+
+    class RecordingCacheCreator(_DummyKvCacheCreator):
+        """Record whether estimation was disabled at construction."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            skip_est_args.append(kwargs["skip_est"])
+
+    monkeypatch.delenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", raising=False)
+    monkeypatch.setattr(py_executor_creator, "is_decode_only", lambda config: decode_only)
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=100,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        kv_cache_creator_cls=RecordingCacheCreator,
+        # A decode-only worker is a disaggregated generation server; creation refuses
+        # one without a cache transceiver.
+        cache_transceiver_config=(
+            CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+            if decode_only
+            else None
+        ),
+    )
+
+    assert skip_est_args == [decode_only]
 
 
 @pytest.mark.parametrize("failure_stage", ["profiling", "allocation", "rebind"])

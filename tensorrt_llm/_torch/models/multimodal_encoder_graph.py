@@ -448,7 +448,10 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
                 )
             return None
         self._io_adapter.copy_inputs(captured.inputs, inputs, seq_lengths)
-        self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths)
+        # Capture ran under inference_mode, so buffers the attention backend allocated during its
+        # first plan are inference tensors and may only be refreshed in place under it.
+        with torch.inference_mode():
+            self._metadata_provider.refresh_in_place(captured.metadata, padded_seq_lengths)
         self._assert_metadata_buffers_stable(captured.metadata, captured.metadata_tensor_ptrs)
         captured.graph.replay()
         if self._replay_stats_enabled:

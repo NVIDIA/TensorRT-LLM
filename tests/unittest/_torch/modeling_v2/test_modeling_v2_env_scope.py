@@ -107,17 +107,29 @@ def test_scope_restores_partial_setup_failure(monkeypatch) -> None:
     assert os.environ[_KEY] == "original"
 
 
-@pytest.mark.parametrize(
-    "source", sorted(_ACCURACY_ROOT.glob("test_*.py")), ids=lambda path: path.name
+# Accuracy tests live in <family>/<target>/test_*.py; code shared by a family's
+# targets lives in <family>/_*.py and may construct the engine itself.
+_ACCURACY_SOURCES = sorted(
+    path for path in _ACCURACY_ROOT.rglob("*.py") if path.name != "__init__.py" and path != _SOURCE
 )
-def test_accuracy_engines_are_inside_environment_scopes(source: Path) -> None:
-    tree = ast.parse(source.read_text())
-    calls = [
+
+
+def _relative(path: Path) -> str:
+    return path.relative_to(_ACCURACY_ROOT).as_posix()
+
+
+def _llm_calls(tree: ast.AST) -> list[ast.Call]:
+    return [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "LLM"
     ]
-    assert calls, f"{source.name} contains no accuracy engine"
+
+
+@pytest.mark.parametrize("source", _ACCURACY_SOURCES, ids=_relative)
+def test_accuracy_engines_are_inside_environment_scopes(source: Path) -> None:
+    tree = ast.parse(source.read_text())
+    calls = _llm_calls(tree)
     scoped = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.With):
@@ -132,6 +144,6 @@ def test_accuracy_engines_are_inside_environment_scopes(source: Path) -> None:
             elif context.func.id == "LLM" and has_scope:
                 scoped.add(context)
     assert set(calls) <= scoped, (
-        f"{source.name} constructs LLM outside an environment scope at lines "
+        f"{_relative(source)} constructs LLM outside an environment scope at lines "
         f"{sorted(call.lineno for call in set(calls) - scoped)}"
     )

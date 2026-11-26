@@ -169,7 +169,7 @@ def test_context_first_profile_rejects_unqualified_environment(
         (0, "cp_size", 2),
         (1, "dtype", DataType.HALF),
         (1, "kv_cache_type", CacheTypeCpp.SELFKONLY),
-        (1, "low_precision_dtype", DataType.NVFP4),
+        (1, "mixed_precision_low_dtype", DataType.NVFP4),
         (2, "backend", "UCX"),
         (2, "transceiver_runtime", "CPP"),
         (2, "kv_transfer_timeout_ms", None),

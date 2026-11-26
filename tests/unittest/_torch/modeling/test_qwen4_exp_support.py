@@ -3,6 +3,7 @@
 
 import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
@@ -156,6 +157,82 @@ def test_composite_config_preserves_vision_without_remote_code(tmp_path) -> None
     assert config.text_config.architectures == ["Qwen4ExpForCausalLM"]
     assert config.vision_config.model_type == "qwen4_exp_vision"
     assert config.vision_config.out_hidden_size == config.text_config.hidden_size
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("language_model_only", [False, True])
+def test_fp8_config_preserves_mtp_exclusions(tmp_path: Path, language_model_only: bool) -> None:
+    """Preserve layer and top-level MTP exclusions in both checkpoint loader modes.
+
+    Args:
+        tmp_path: Directory for the synthetic checkpoint configuration.
+        language_model_only: Whether to load only the checkpoint's text model.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import _normalize_qwen35_exclude_modules
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    text_config = _text_config_dict()
+    config_dict = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "language_model_only": language_model_only,
+        "text_config": text_config,
+        "vision_config": {
+            "model_type": "qwen4_exp_vision",
+            "depth": 2,
+            "hidden_size": 64,
+            "num_heads": 4,
+            "out_hidden_size": text_config["hidden_size"],
+        },
+        "quantization_config": {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "model.language_model.layers.0.mlp.shared_expert.down_proj",
+                "model.visual.blocks.0.attn.qkv",
+                "mtp.layers.0.mlp.shared_expert.down_proj",
+                "mtp.layers.0.self_attn.q_proj",
+                "mtp.fc_embedding",
+                "mtp.fc_hidden",
+                "mtp.hyper_connection_mixer.input_mix_weight_down",
+                "mtp.hyper_connection_mixer.input_mix_weight_up",
+            ],
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config_dict))
+
+    model_config = ModelConfig.from_pretrained(str(tmp_path), moe_backend="CUTLASS")
+    _normalize_qwen35_exclude_modules(model_config)
+
+    quant_config = model_config.quant_config
+    mtp_layer = text_config["num_hidden_layers"]
+    assert quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert quant_config.is_module_excluded_from_quantization(
+        "model.layers.0.mlp.shared_expert.down_proj"
+    )
+    assert not quant_config.is_module_excluded_from_quantization("model.visual.blocks.0.attn.qkv")
+    assert not quant_config.is_module_excluded_from_quantization("model.layers.0.mlp.experts")
+    assert not quant_config.is_module_excluded_from_quantization(
+        f"model.layers.{mtp_layer}.mlp.experts"
+    )
+    assert quant_config.is_module_excluded_from_quantization(
+        f"model.layers.{mtp_layer}.mlp.shared_expert.down_proj"
+    )
+    assert quant_config.is_module_excluded_from_quantization(
+        f"model.layers.{mtp_layer}.self_attn.q_proj"
+    )
+    for module_name in (
+        "fc_embedding",
+        "fc_hidden",
+        "shared_head.hyper_connection_mixer.input_mix_weight_down",
+        "shared_head.hyper_connection_mixer.input_mix_weight_up",
+    ):
+        assert quant_config.is_module_excluded_from_quantization(
+            f"model.layers.{mtp_layer}.{module_name}"
+        )
 
 
 def test_vision_attention_does_not_inherit_text_sparse_config(monkeypatch) -> None:
@@ -823,17 +900,17 @@ def test_runtime_config_rejects_unsupported_semantics(
 def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         _normalize_moe_module_weights,
-        _rank_block,
     )
+    from tensorrt_llm._torch.models.modeling_utils import concatenate_weights_by_tp_rank
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 
     q = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     z = torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
-    blocked = _rank_block([q, z], tp_size=2)
+    blocked = concatenate_weights_by_tp_rank([q, z], tp_size=2)
     expected = torch.cat((q[:2], z[:2], q[2:], z[2:]))
     torch.testing.assert_close(blocked, expected)
     with pytest.raises(ValueError, match="not divisible"):
-        _rank_block([torch.empty(3, 2)], tp_size=2)
+        concatenate_weights_by_tp_rank([torch.empty(3, 2)], tp_size=2)
 
     config = SimpleNamespace(hidden_size=4, moe_intermediate_size=3, num_experts=2)
     fused, mode = _normalize_moe_module_weights(

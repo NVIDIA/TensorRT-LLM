@@ -83,7 +83,9 @@ def _formatting_pr(tmp_path: Path, path: str = "tensorrt_llm/example.py") -> PRI
     "path",
     ["tensorrt_llm/example.py", "tensorrt_llm/visual_gen/args.py", "tests/unittest/example.py"],
 )
-def test_formatting_bypasses_source_rules_and_keeps_cpu_baseline(tmp_path: Path, path: str) -> None:
+def test_formatting_bypasses_source_rules_without_adding_cpu_tests(
+    tmp_path: Path, path: str
+) -> None:
     pr = _formatting_pr(tmp_path, path)
     assert pr.formatting_only_files == {path}
     result = CliRunner().invoke(
@@ -101,8 +103,7 @@ def test_formatting_bypasses_source_rules_and_keeps_cpu_baseline(tmp_path: Path,
     assert result.exit_code == 0, result.output
     decision = json.loads(result.stdout)
     assert decision["scope"] == "noop"
-    assert decision["affected_stages"]
-    assert all(name.startswith("CPU-Generic-") for name in decision["affected_stages"])
+    assert decision["affected_stages"] == []
     assert not decision["sanity_required"]
     assert not decision["perfsanity_required"]
 
@@ -294,16 +295,9 @@ def test_public_api_does_not_claim_unrelated_core_changes() -> None:
 @pytest.mark.parametrize(
     "name", ["A10-PyTorch-Post-Merge-1", "A10-OnDemand-PyTorch-1", "A10-2_GPUs-PyTorch-1"]
 )
-def test_public_api_requires_serving_check_in_baseline_trigger_mode(name: str) -> None:
+def test_public_api_accepts_validation_in_any_candidate_stage(name: str) -> None:
     rule = _public_vg_rule()
     rule._stages_by_yaml["l0_a10"] = [(name, Stage(name, "l0_a10", "x86_64", 1, 1))]
     result = rule.apply(PRInputs(["tensorrt_llm/visual_gen/args.py"], {}))
-    assert result is not None and result.scope is None
-
-
-def test_public_api_post_merge_can_use_post_merge_validation() -> None:
-    rule = _public_vg_rule()
-    name = "A10-PyTorch-Post-Merge-1"
-    rule._stages_by_yaml["l0_a10"] = [(name, Stage(name, "l0_a10", "x86_64", 1, 1))]
-    result = rule.apply(PRInputs(["tensorrt_llm/visual_gen/args.py"], {}, post_merge=True))
     assert result is not None and result.scope == "visualgenonly"
+    assert name in result.affected_stages
