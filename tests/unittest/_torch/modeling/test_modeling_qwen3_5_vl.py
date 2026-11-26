@@ -604,7 +604,7 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
     """The bf16 lm_head fallback infers the scale block width from ``weight_scale``,
     so 32-element weight-only exports dequantize correctly, and a scale shape that
     does not divide the input width is rejected."""
-    out_features, in_features = 2, 64
+    out_features, in_features = 1025, 64  # Include a partial final row chunk.
     mapper = SimpleNamespace(
         config=SimpleNamespace(
             quant_config_dict={},
@@ -615,9 +615,11 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
     torch.manual_seed(0)
     packed = torch.randint(0, 256, (out_features, in_features // 2), dtype=torch.uint8)
     num_groups = in_features // group_size
-    # Distinct, exactly representable E4M3 values so a mis-mapped block shows up.
+    # Cycle through exactly representable scales so a mis-mapped block shows up.
     block_scale = (
-        torch.arange(1, out_features * num_groups + 1, dtype=torch.float32)
+        torch.arange(out_features * num_groups, dtype=torch.float32)
+        .remainder(13)
+        .add(1)
         .view(out_features, num_groups)
         .to(torch.float8_e4m3fn)
     )
