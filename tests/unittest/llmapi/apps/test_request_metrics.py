@@ -19,6 +19,7 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
+from starlette.responses import StreamingResponse
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer
@@ -527,6 +528,36 @@ async def test_record_is_submitted_when_stream_is_cancelled_before_final_body(
     else:
         await middleware({"type": "http", "headers": [], "state": {}}, None, discard)
 
+    writer.submit.assert_called_once_with(record)
+
+
+@pytest.mark.asyncio
+async def test_record_is_submitted_when_client_disconnects_at_done():
+    writer = MagicMock(spec=PerfMetricsJsonlWriter)
+    record = _record()
+    done_sent = asyncio.Event()
+
+    async def app(scope, receive, send):
+        async def body():
+            yield b'data: "tok"\n\n'
+            scope["state"]["perf_metrics_records"].append(record)
+            yield b"data: [DONE]\n\n"
+            await asyncio.sleep(5)  # Cover the trailer read cancelled by the disconnect.
+
+        await StreamingResponse(body(), media_type="text/event-stream")(scope, receive, send)
+
+    async def receive():
+        await done_sent.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if b"[DONE]" in message.get("body", b""):
+            done_sent.set()
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.3"}, "headers": [], "state": {}}
+    await asyncio.wait_for(
+        PerfMetricsMiddleware(app, expose_headers=False, writer=writer)(scope, receive, send), 2
+    )
     writer.submit.assert_called_once_with(record)
 
 

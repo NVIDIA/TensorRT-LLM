@@ -763,7 +763,6 @@ class OpenAIHttpClient(OpenAIClient):
         )
         # Also read by the except block below.
         pending = b""
-        recovered_after_done = False
         try:
             last_token_time = start_time
             chunk_count = 0
@@ -820,7 +819,8 @@ class OpenAIHttpClient(OpenAIClient):
             # The upstream broke after [DONE], while its trailing metrics event was
             # arriving. The client has every token, so end its stream normally.
             logger.warning(f"{self._role} client {server} error after [DONE]: {e}")
-            recovered_after_done = True
+            # Forward only the held [DONE]; drop any partial metrics trailer.
+            pending = _SSE_DONE_EVENT
 
         if hooks and metrics_event:
             data_prefix = b"data: "
@@ -854,9 +854,7 @@ class OpenAIHttpClient(OpenAIClient):
             hooks.on_resp_done(server, request, None)
         # pending holds the held-back [DONE]. Clients disconnect at [DONE], and that
         # cancels this generator, so forward it only after on_resp_done has recorded
-        # the request. Drop any partial metrics trailer left by an upstream error.
-        if recovered_after_done:
-            pending = _SSE_DONE_EVENT
+        # the request.
         self._metrics_collector.complete_latency_seconds.observe(
             get_steady_clock_now_in_seconds() - start_time
         )
