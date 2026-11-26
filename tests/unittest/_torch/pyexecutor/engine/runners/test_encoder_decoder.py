@@ -9,6 +9,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
+from _torch.pyexecutor.llm_request_factory import make_llm_request
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import executor as trtllm
 
 pytestmark = pytest.mark.cpu_only
 
@@ -656,3 +658,39 @@ def test_encoder_lifetime_scope_covers_embedding_and_preserves_output(
     assert events == (
         ["begin", "encoder", "end"] if feature_mode else ["begin", "embedding", "encoder", "end"]
     )
+
+
+def test_capture_batch_preparation_restores_reported_cached_tokens() -> None:
+    request = make_llm_request(1, trtllm.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    batch = ScheduledRequests()
+    batch.generation_requests = [request]
+
+    def prepare_inputs(projection_batch, *args, **kwargs):
+        # The projection's one-token context chunk records a prefix hit, as a prefill does.
+        for context_request in projection_batch.context_requests:
+            context_request.cached_tokens = 1
+        return SimpleNamespace(kwargs={})
+
+    graphs = object.__new__(EncoderDecoderCudaGraphs)
+    graphs._config = SimpleNamespace(dtype=torch.float32, spec_config=None)
+    graphs._metadata = Mock()
+    graphs._inputs = Mock(prepare_inputs=Mock(side_effect=prepare_inputs))
+    graphs._get_enc_dec_hidden_size = lambda: 4
+    graphs._populate_cross_kv_cache = Mock()
+    graphs.no_cuda_graph = nullcontext
+
+    with (
+        patch.object(encoder_decoder_module, "_get_max_encoder_output_len", return_value=2),
+        patch.object(encoder_decoder_module, "get_draft_kv_cache_manager", return_value=None),
+        patch.object(torch, "ones", return_value=torch.zeros(2, 4)),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        graphs._prepare_capture_batch(batch, Mock(), enable_spec_decode=False, runtime_draft_len=0)
+
+    graphs._inputs.prepare_inputs.assert_called_once()
+    assert request.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert request.reported_cached_tokens == 0
+    # The request's first real prefill sets what usage reports.
+    request.cached_tokens = 3
+    assert request.reported_cached_tokens == 3
