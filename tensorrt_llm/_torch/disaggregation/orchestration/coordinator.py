@@ -632,12 +632,23 @@ class DisaggTransferCoordinator:
             for request in active
             if not request.is_finished
         ]
-        payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients)
+        # Each rank's committed transfer cause for its ready receives. A peer
+        # shard can time out or fail while this one completes.
+        causes = {}
+        for request in ready:
+            if not request.is_generation_only_request:
+                continue
+            timed_out = self._has_observed_transfer_timeout(request)
+            failed = getattr(request, "py_kv_transfer_backend_failed", False) is True
+            if timed_out or failed:
+                client = request.parent_request_id if request.is_child else request.py_request_id
+                causes[client] = (timed_out, failed)
+        payload = (list(cancel_ids), gen_active, list(gen_ready), active_clients, causes)
         gather = self._dist.tp_cp_allgather if self._dist.cp_size > 1 else self._dist.tp_allgather
         peers = gather(payload, small_payload=True)
         all_cancel_ids = set().union(*(set(peer[0]) for peer in peers))
         requests = {
-            rid: client for _, active_ids, _, _ in peers for rid, client in active_ids.items()
+            rid: client for _, active_ids, _, _, _ in peers for rid, client in active_ids.items()
         }
         all_active_clients = set(requests.values()) | set().union(*(set(peer[3]) for peer in peers))
         complete = {
@@ -646,7 +657,7 @@ class DisaggTransferCoordinator:
             if any(owner == client for owner in requests.values())
             and all(
                 rid in set(peer_ready)
-                for _, peer_active, peer_ready, _ in peers
+                for _, peer_active, peer_ready, _, _ in peers
                 for rid, owner in peer_active.items()
                 if owner == client
             )
@@ -659,6 +670,18 @@ class DisaggTransferCoordinator:
             or (request.parent_request_id if request.is_child else request.py_request_id)
             in complete
         ]
+        # Count the group's agreed cause once on every rank, so the counts match
+        # those of a receive poll whichever runs first. A timeout wins over a
+        # failure; cancellation alone counts nothing.
+        for request in aligned:
+            if not request.is_generation_only_request:
+                continue
+            client = request.parent_request_id if request.is_child else request.py_request_id
+            peer_causes = [peer[4][client] for peer in peers if client in peer[4]]
+            if any(timed_out for timed_out, _ in peer_causes):
+                self._record_transfer_outcome(request, "timeout")
+            elif any(failed for _, failed in peer_causes):
+                self._record_transfer_outcome(request, "error", backend_failure=True)
         propagated = set(cancel_ids) | (all_cancel_ids & set(requests.values()))
         return aligned, propagated, complete
 
@@ -1366,14 +1389,17 @@ class DisaggTransferCoordinator:
             self._gen_termination_requested.remove(request_id)
             self._effects.terminate_request(request)
 
-    def record_cancelled_transfer_timeout(self, request: LlmRequest) -> None:
-        """Count a committed transfer timeout before cancellation finishes the request.
+    def record_cancelled_transfer_outcome(self, request: LlmRequest) -> None:
+        """Count a committed transfer timeout or failure before cancellation finishes the request.
 
-        The client still receives a cancellation response. The latch keeps a
-        timeout that an earlier poll already counted from being counted again.
+        The client still receives a cancellation response. The latch keeps an
+        outcome that an earlier poll or cancellation vote already counted from
+        being counted again.
         """
         if self._has_observed_transfer_timeout(request):
             self._record_transfer_outcome(request, "timeout")
+        elif getattr(request, "py_kv_transfer_backend_failed", False) is True:
+            self._record_transfer_outcome(request, "error", backend_failure=True)
 
     def request_cancellation(self, request: LlmRequest) -> bool:
         """Cancel transfers, retaining unpublished fences and resources until safe.

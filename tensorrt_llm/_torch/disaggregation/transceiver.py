@@ -2329,10 +2329,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif session.close() is False:
                 has_transferring = True
             else:
-                # Keep a committed timeout cause; the session that records it is
-                # removed below.
+                # Keep a committed timeout or failure cause; the session that
+                # records it is removed below.
                 if getattr(session, "timed_out", False) is True:
                     req.py_kv_transfer_timed_out = True
+                elif session.status == SessionStatus.ERROR:
+                    req.py_kv_transfer_backend_failed = True
                 # The bridge has a stable, rank-local receive outcome. Keep
                 # an earlier failure when cancellation retires the session.
                 if (

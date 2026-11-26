@@ -2281,23 +2281,39 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     )
 
 
-@pytest.mark.parametrize("reaper_counted", [False, True], ids=["abort-first", "poll-first"])
-def test_replicated_cancel_counts_a_committed_receive_timeout_once(
-    executor: PyExecutor, reaper_counted: bool
+@pytest.mark.parametrize("poll_counted", [False, True], ids=["abort-first", "poll-first"])
+@pytest.mark.parametrize(
+    ("peer_cause", "expected"),
+    [("timeout", (0, 0, 1)), ("failure", (0, 1, 0)), (None, (0, 0, 0))],
+    ids=["peer-timeout", "peer-failure", "cancel-only"],
+)
+def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
+    executor: PyExecutor,
+    poll_counted: bool,
+    peer_cause: str | None,
+    expected: tuple[int, int, int],
 ) -> None:
-    """Each TP rank counts one timeout when an agreed cancellation retires a timed-out receive.
+    """The cancellation vote carries a peer shard's committed cause to every rank.
+
+    Rank 0's shard completes; only rank 1's shard times out or fails before the
+    client abort. Every rank counts the agreed cause once, as a receive poll does.
 
     Args:
         executor: Template executor whose state each rank copies.
-        reaper_counted: Whether a receive poll already counted the timeout before the abort.
+        poll_counted: Whether a receive poll already counted the agreed outcome.
+        peer_cause: Rank 1's committed cause, or None for a cancellation alone.
+        expected: Per-rank (success, error, timeout) counts.
     """
     group = FakeDistGroup(world_size=2, tp_size=2)
     engines = []
     requests = []
 
-    def retire(req: LlmRequest) -> bool:
-        """Retire the drained session, copying its committed timeout as cancel_request does."""
-        req.py_kv_transfer_timed_out = True
+    def retire(req: LlmRequest, rank: int) -> bool:
+        """Retire the drained session, copying its committed cause as cancel_request does."""
+        if rank == 1 and peer_cause == "timeout":
+            req.py_kv_transfer_timed_out = True
+        elif rank == 1 and peer_cause == "failure":
+            req.py_kv_transfer_backend_failed = True
         return True
 
     for rank in range(2):
@@ -2328,29 +2344,27 @@ def test_replicated_cancel_counts_a_committed_receive_timeout_once(
             enable_attention_dp=False,
             enable_transfer_metrics=True,
         )
-        engine.disagg.request_cancellation = Mock(side_effect=retire)
-        engine._try_cancel_request = Mock(side_effect=retire)
-        if reaper_counted:
-            request.py_kv_transfer_timed_out = True
-            engine.disagg._record_transfer_outcome(request, "timeout")
+        engine.disagg.request_cancellation = Mock(side_effect=lambda req, r=rank: retire(req, r))
+        engine._try_cancel_request = Mock(side_effect=lambda req, r=rank: retire(req, r))
+        if poll_counted and peer_cause is not None:
+            # The receive poll's rank-synchronized outcome already counted the cause.
+            outcome = "timeout" if peer_cause == "timeout" else "error"
+            engine.disagg._record_transfer_outcome(request, outcome, backend_failure=True)
         engines.append(engine)
         requests.append(request)
 
-    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
-
-    for rank, engine in enumerate(engines):
-        request = requests[rank]
-        assert engine.disagg.transfer_outcomes == (0, 0, 1)
-        assert request.is_finished_due_to_cancellation
-        assert not request.py_kv_transfer_timed_out
-        assert engine.active_requests == []
-        assert engine.canceled_req_ids == []
-        assert engine._pending_response_terminations == [request]
-
-    group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
-    for rank, engine in enumerate(engines):
-        assert engine.disagg.transfer_outcomes == (0, 0, 1)
-        assert engine._pending_response_terminations == [requests[rank]]
+    for _ in range(2):
+        group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
+        for rank, engine in enumerate(engines):
+            request = requests[rank]
+            assert engine.disagg.transfer_outcomes == expected
+            assert request.is_finished_due_to_cancellation
+            assert not request.py_kv_transfer_timed_out
+            assert engine.active_requests == []
+            assert engine.canceled_req_ids == []
+            # One cancellation response and one release per rank, none added by the repeat.
+            assert [rid for rid, _ in engine._pending_transfer_responses] == [1]
+            assert engine._pending_response_terminations == [request]
 
 
 @pytest.mark.parametrize("peer_owns_receive", [False, True])

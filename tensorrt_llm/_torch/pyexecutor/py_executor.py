@@ -13389,9 +13389,11 @@ class PyExecutor:
                 # block the coordinator's rank-synchronized error cleanup.
                 failed_ids.add(request.py_request_id)
                 continue
-            if request.py_kv_transfer_timed_out:
-                # Count a committed timeout; the client still sees a cancellation.
-                self.disagg.record_cancelled_transfer_timeout(request)
+            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
+                    request, "py_kv_transfer_backend_failed", False)):
+                # Count a committed transfer outcome; the client still sees a
+                # cancellation.
+                self.disagg.record_cancelled_transfer_outcome(request)
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
@@ -13478,9 +13480,11 @@ class PyExecutor:
                 # Its prior result is immutable; only transfer obligations
                 # remain. The reaper, not this notification, retires them.
                 continue
-            if request.py_kv_transfer_timed_out:
-                # Count a committed timeout; the client still sees a cancellation.
-                self.disagg.record_cancelled_transfer_timeout(request)
+            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
+                    request, "py_kv_transfer_backend_failed", False)):
+                # Count a committed transfer outcome; the client still sees a
+                # cancellation.
+                self.disagg.record_cancelled_transfer_outcome(request)
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             response = prepare_response(request, publish_metadata=True)
@@ -13629,9 +13633,11 @@ class PyExecutor:
                 continue
             # Mark requests as finished, then, we reuse all existing code
             # to clean up the KV cache resources.
-            if request.py_kv_transfer_timed_out:
-                # Count a committed timeout; the client still sees a cancellation.
-                self.disagg.record_cancelled_transfer_timeout(request)
+            if (getattr(request, "py_kv_transfer_timed_out", False) or getattr(
+                    request, "py_kv_transfer_backend_failed", False)):
+                # Count a committed transfer outcome; the client still sees a
+                # cancellation.
+                self.disagg.record_cancelled_transfer_outcome(request)
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
             request.decoding_iter = request.py_decoding_iter
