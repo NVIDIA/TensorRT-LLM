@@ -3,12 +3,12 @@
 """GPU test: the wide decode expert replicas (MTP3 / MTP5 decode rows 65..128) through the
 target's own routed-experts ops.
 
-On a wide decode step `Moe.topk` runs the wide replica top-k for a trunk layer with hot ids
-(`Moe.topk_wide_rep`) and `Moe.experts` runs its maps on the context replicas' `64 + R` deep
-prefill pair. A rank then computes the hot experts the assignment gave it from replica slots
-`64 + h`, and none from their home slots. This drives `Moe.open_layer` / `Moe.routed` (as
-`WideDecodeTarget.forward` calls them) on a core holding only the MoE state (as the wide
-decode capture test does) and checks:
+On a wide decode step `moe_topk` runs the wide replica top-k for a trunk layer with hot ids
+(`routed_moe._topk_wide_rep`) and `moe_experts` runs its maps on the context replicas'
+`64 + R` deep prefill pair. A rank then computes the hot experts the assignment gave it from
+replica slots `64 + h`, and none from their home slots. This drives the routed ops
+(`ops/moe/routed_moe.py`, in the order `WideDecodeTarget.forward` calls them) on a handle
+holding only the MoE state (as the wide decode capture test does) and checks:
 
 * the four EP ranks emulated on one GPU (the expert offset per call): the sum of their outputs
   -- what the post-MoE all-reduce adds -- within the experts test's band of the fp32 reference
@@ -24,6 +24,7 @@ computed on two ranks or none, moves the sum far outside the band.
 """
 
 import zlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -36,10 +37,10 @@ from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import ( 
     fp4_quantize,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    forward_ops as _ops,
+    modeling as _modeling,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    modeling as _modeling,
+    step as _step,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
@@ -48,7 +49,13 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_copy as _copy_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
+    cute_dsl_hidden_add as _add_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     order_fence as _fence_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    projection as _proj,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_nvfp4_experts as _experts_op,
@@ -60,6 +67,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_routing as _routing_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    cute_dsl_moe_sigmoid_topk as _sigmoid_topk_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing as _topk_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
@@ -67,6 +77,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing_wide_rep as _wrep_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    routed_moe as _routed_moe,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E402, E501
     cute_dsl_moe_quantize_nvfp4 as _quant_op,
@@ -89,11 +102,16 @@ TIED = tuple((WIN + 20 + 2 * p, WIN + 21 + 2 * p) for p in range(16))
 #: favoured window and the other windows, and an unused slot.
 HOT_IDS = (HOT, EMPTY[0], WIN + 2, WIN + 3, 3, 130, 200, -1)
 LAYERS = (3, 4)
+#: The trunk's MoE layer count: the MTP layer's call site.
+NUM_LAYERS = 78
+#: The rows the routed buffers hold.
+MAX_ROWS = _routed_moe.MAX_ROWS
 ROUTED_SCALE = 2.5
 FC1_KBLK = _fc1_kblock.enabled()
 FC2_KBLK = _fc1_kblock.fc2_enabled()
-#: The rows the target runs with replicas (`_WIDE_REP_MAX_ROWS`, the wide top-k's 65..128 range):
-#: MTP3 verify / draft-step-0 rows at padded batches 17..32 (and MTP5's at 11..21) and the edges.
+#: The rows the target runs with replicas (`routed_moe.WIDE_REP_MAX_ROWS`, the wide top-k's
+#: 65..128 range): MTP3 verify / draft-step-0 rows at padded batches 17..32 (and MTP5's at
+#: 11..21) and the edges.
 ODD_ROWS = (65, 68, 96, 126, 127, 128)
 #: Wider decode steps (MTP5 at batch 22..32): no replicas, the wide top-k.
 WIDE_ROWS = (129, 144, 150, 191, 192, 200, 256)
@@ -191,7 +209,7 @@ def _rank_weights(lw: SimpleNamespace, offset: int) -> SimpleNamespace:
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _ops._MOE_MAX_T
+    rows = MAX_ROWS
     counts, barrier = _routing_op.allocate_workspace(dev)
     return SimpleNamespace(
         out=torch.zeros((rows, HIDDEN), dtype=torch.bfloat16, device=dev),
@@ -214,40 +232,26 @@ def _slot(dev) -> SimpleNamespace:
 
 
 def state() -> SimpleNamespace:
-    """A core holding the MoE state an MTP3 decode step above 64 rows reads, with the context
-    replicas' pair and hot ids, and the wide replica top-k `_build_moe_wide_rep` builds."""
+    """The routed ops' handle over the MoE state an MTP3 decode step above 64 rows reads, with
+    the context replicas' pair and hot ids, and the wide replica top-k
+    `routed_moe._build_wide_rep` builds; beside it the slot parity, the shared expert's fence
+    and side stream, as the core holds them."""
     if "state" in _STATE:
         return _STATE["state"]
     dev = torch.cuda.current_device()
     core = _modeling.GlmMoeDsaTep4ModelingV2.__new__(_modeling.GlmMoeDsaTep4ModelingV2)
     torch.nn.Module.__init__(core)
     core.route_hits, core.route_misses = {}, {}
-    core.expert_offset = WIN
-    core.routed_scale = ROUTED_SCALE
-    core.max_draft_len = 3
-    core.wide_cells = core.max_draft_len > 1
-    core.fc1_kblk, core.fc2_kblk = FC1_KBLK, FC2_KBLK
-    core.ctx_replicas = NREP
-    core.wide_dec_replicas = True
-    # The row ops' handles, none compiled but the ones the MoE path launches.
-    core._rows = core._build_row_ops(compile=False)
-    core._rows.copy = _copy_op.build(core._count)
-    core._shared_fence = _fence_op.build(dev, "moe_shared_after_ar", core._count)
-    core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _ops._MOE_MAX_T
-    core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
-    core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
+    count = core._count
+    copy = _copy_op.build(count)
+    rows = MAX_ROWS
     hot = torch.tensor(HOT_IDS, dtype=torch.int32, device=dev)
-    core._ctx_hot_ids = {i: hot.clone() for i in LAYERS}
-    core._dec_hot_ids = {}
-    core._pf = None
-    core.op = SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
-        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
-    )  # fmt: skip
     k = SimpleNamespace(
+        slots=[_slot(dev) for _ in range(2)],
+        xq=torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev),
+        xsf=torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev),
         routing=None,
+        experts=None,
         pair=_experts_op.build_prefill_pair(
             HIDDEN, INTER, LOCAL, dev, fc1_kblk=FC1_KBLK, fc2_kblk=FC2_KBLK
         ),
@@ -255,77 +259,112 @@ def state() -> SimpleNamespace:
             HIDDEN, INTER, LOCAL + NREP, dev, fc1_kblk=FC1_KBLK, fc2_kblk=FC2_KBLK
         ),
         topk_pre_rep=None,
+        ctx_hot_ids={i: hot.clone() for i in LAYERS},
         router_pre=None,
         topk_pre=_topk_op.build_prefill(dev),
+        quant_pre=_quant_op.build_prefill(dev),
+        zero_pre=None,
+        merge=None,
+        quant={},
+        zero={},
+        pf=None,
+        topk={},
+        topk_rep={},
+        dec_hot_ids={},
+        dec_hot_none=None,
+        topk_sig={},
         router_wide=_router_op.build_wide(dev),
         topk_wide={
             r: _topk_op.build_wide(r[1], _router_op.SPLIT_K, dev) for r in _topk_op.WIDE_RANGES
         },
-        quant_pre=_quant_op.build_prefill(dev),
-        zero_pre=None,
-        merge=None,
-        experts=None,
-        topk={},
-        topk_rep={},
-        quant={},
-        zero={},
         router={},
     )
-    core._build_moe_wide_rep(k, dev)
+    _routed_moe._build_wide_rep(k, True, NREP, dev)
     assert sorted(k.topk_wide_rep) == [(65, 128)], (
         f"wide replicas built for {sorted(k.topk_wide_rep)}"
     )
-    core._moe_k = k
+    router_proj = _proj.build(
+        "router", cells={}, mtp_cells={}, prefill=None, mxf8=None, dec8=None, dec8w=None,
+        wide_bucket=False, copy=copy, count=count,
+    )  # fmt: skip
+    h = _routed_moe.build(
+        k,
+        expert_offset=WIN,
+        routed_scale=ROUTED_SCALE,
+        n_group=1,
+        topk_group=1,
+        topk=TOP_K,
+        num_layers=NUM_LAYERS,
+        # MTP3: decode steps above 64 rows run unpadded (`routed_moe.decode_exact`).
+        wide_cells=True,
+        dec_unpad=True,
+        acc_padded=True,
+        router_proj=router_proj,
+        route=_sigmoid_topk_op.build(count, False),
+        copy=copy,
+        add=_add_op.build(count, False),
+        count=count,
+    )
     stacks = _stacks()
-    st = SimpleNamespace(core=core, layers=[_layer(i, stacks) for i in LAYERS])
+    st = SimpleNamespace(
+        core=core,
+        h=h,
+        parity=_routed_moe.SlotParity(),
+        fence=_fence_op.build(dev, "moe_shared_after_ar", count),
+        side=torch.cuda.Stream(device=dev),
+        layers=[_layer(i, stacks) for i in LAYERS],
+    )
     _STATE["state"] = st
     return st
 
 
-def moe_layer(core, x, partial, m, rows: int, layer: int):
+def moe_layer(st, h, x, partial, m, rows: int, layer: int):
     """`WideDecodeTarget.forward`'s trunk MoE layer on an MTP3 decode step's exact rows
-    (prequantized off: the routed experts quantize): the shared expert's partial copied on the
-    side stream into the routed output, FC2 accumulating onto it. Returns `(out, slot)`."""
-    op = core.op
-    exact = op.moe.wide_exact(rows)
+    (prequantized off: the routed experts quantize), on the routed ops' handle `h` (its
+    `expert_offset` the EP rank's window): the shared expert's partial copied on the side
+    stream into the routed output, FC2 accumulating onto it. Returns `(out, slot)`."""
+    exact = _routed_moe.moe_exact(rows, h)
     assert exact
-    began, acc = op.moe.open_layer(rows, exact)
-    assert began and acc is not None
-    slot = op.moe.slot
+    pf = _routed_moe.moe_l2_prefetch(layer, m, rows, exact, h)
+    slot, acc = _routed_moe.moe_open(rows, exact, h, st.parity)
+    assert slot is not None and acc is not None
     main = torch.cuda.current_stream()
-    side = core._side_stream
+    side = st.side
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        _fence_op.order_fence(exact, core._shared_fence)
-        op.rows.copy(acc, partial)
-    routed = op.moe.routed(
-        _ops.Phase(wide=True), x, m, rows, False, side, began, True, layer, exact
-    )
-    return op.moe.combine(routed, None, acc, rows, main, side), slot
+        _fence_op.order_fence(exact, st.fence)
+        _copy_op.row_copy(acc, partial, h.copy)
+    ph = _step.Phase(wide=True)
+    quantized = _routed_moe.moe_quantize_first(x, m, False, h)
+    logits, in_slot = _routed_moe.moe_router(ph, x, m, slot, exact, h)
+    routing = _routed_moe.moe_topk(logits, in_slot, m, slot, layer, exact, h)
+    routed = _routed_moe.moe_experts(x, routing, m, quantized, slot, acc, side, pf, layer, exact, h)
+    return _routed_moe.moe_combine(routed, None, acc, rows, main, side, h), slot
 
 
-def _snapshot(core, results, rows: int) -> dict:
+def _snapshot(st, results, rows: int) -> dict:
+    k = st.h.k
     snap = {}
     for j, (out, slot) in enumerate(results):
-        s = core._moe_slots[slot]
+        s = k.slots[slot]
         snap[f"out{j}"] = out.clone()
         snap[f"partials{j}"] = s.router_wide_out[:rows].clone()
         snap[f"w{j}"] = s.w[:rows].clone()
         snap[f"ids{j}"] = s.sel[: rows * TOP_K].clone()
-        for k, t in _rep_op.canonical_slot_maps(s.maps, rows * TOP_K, LOCAL + NREP).items():
-            snap[f"maps{j}.{k}"] = t
-    snap["xq"] = core._moe_xq[:rows].clone()
-    snap["xsf"] = core._moe_xsf[:rows].clone()
+        for key, t in _rep_op.canonical_slot_maps(s.maps, rows * TOP_K, LOCAL + NREP).items():
+            snap[f"maps{j}.{key}"] = t
+    snap["xq"] = k.xq[:rows].clone()
+    snap["xsf"] = k.xsf[:rows].clone()
     return snap
 
 
-def _reference(core, snap: dict, j: int, partial, m, maps_key: str = "maps") -> torch.Tensor:
+def _reference(st, snap: dict, j: int, partial, m, maps_key: str = "maps") -> torch.Tensor:
     """fp32 grouped GEMMs on the maps, weights and NVFP4 input the step wrote, onto the
     shared partial, on the replica stacks."""
-    maps = {k: snap[f"{maps_key}{j}.{k}"] for k in _routing_op.MAP_KEYS}
+    maps = {key: snap[f"{maps_key}{j}.{key}"] for key in _routing_op.MAP_KEYS}
     return _experts_op.cute_dsl_moe_nvfp4_experts.reference(
         snap["xq"], snap["xsf"], maps, snap[f"w{j}"], m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s,
-        m.norm_const, m.alpha1, m.alpha2, partial, None, None, None, core._moe_k.pair_rep,
+        m.norm_const, m.alpha1, m.alpha2, partial, None, None, None, st.h.k.pair_rep,
     )  # fmt: skip
 
 
@@ -350,42 +389,42 @@ def test_four_ranks_sum_to_the_whole_layer(rows: int) -> None:
     on none."""
     st = state()
     core = st.core
+    k = st.h.k
     lw = st.layers[0]
     layer = LAYERS[0]
     x, partials = _inputs(rows, f"sum {rows}")
-    hot = core._ctx_hot_ids[layer]
+    hot = k.ctx_hot_ids[layer]
     sums, refs, ids_by_arm, hot_tiles = {}, [], {}, {}
     try:
         for arm in ("rep", "home"):
-            core._ctx_hot_ids = {layer: hot} if arm == "rep" else {}
+            k.ctx_hot_ids = {layer: hot} if arm == "rep" else {}
             hits = dict(core.route_hits)
             total = torch.zeros(rows, HIDDEN, dtype=torch.float32, device="cuda")
             for r, off in enumerate((0, 64, 128, 192)):
-                core.expert_offset = off
+                h = replace(st.h, expert_offset=off)
                 m = _rank_weights(lw, off)
                 xin = x.clone()
                 with validating(_wrep_op.cute_dsl_moe_topk_routing_wide_rep):
-                    out, slot = moe_layer(core, xin, partials[r], m, rows, layer)
+                    out, slot = moe_layer(st, h, xin, partials[r], m, rows, layer)
                 torch.cuda.synchronize()
-                snap = _snapshot(core, [(out, slot)], rows)
-                ref = _reference(core, snap, 0, partials[r], m)
+                snap = _snapshot(st, [(out, slot)], rows)
+                ref = _reference(st, snap, 0, partials[r], m)
                 assert_within_ulp(out, ref, element_ulp=32.0, rms_ulp=2.0)
                 total += out.float()
                 if arm == "home":
                     # This rank's routed part alone (onto zeros), for the whole-layer sum.
                     zero = torch.zeros_like(partials[r])
-                    refs.append(_reference(core, snap, 0, zero, m).float())
+                    refs.append(_reference(st, snap, 0, zero, m).float())
                 ids_by_arm.setdefault(arm, []).append((snap["ids0"].clone(), snap["w0"].clone()))
                 tiles = snap["maps0.tile_idx_to_expert_idx"].tolist()
-                hot_tiles.setdefault(arm, []).append([tiles.count(LOCAL + h) for h in range(NREP)])
+                hot_tiles.setdefault(arm, []).append([tiles.count(LOCAL + i) for i in range(NREP)])
                 if arm == "rep":
                     assert (HOT - WIN) not in tiles or off != WIN, "the hot expert ran at home"
             took = core.route_hits.get("moe_wide_replica", 0) - hits.get("moe_wide_replica", 0)
             assert took == (4 if arm == "rep" else 0), f"{arm}: {took} replica top-k calls"
             sums[arm] = total
     finally:
-        core._ctx_hot_ids = {i: hot for i in LAYERS}
-        core.expert_offset = WIN
+        k.ctx_hot_ids = {i: hot for i in LAYERS}
     for (ia, wa), (ib, wb) in zip(ids_by_arm["rep"], ids_by_arm["home"]):
         assert torch.equal(ia, ib) and torch.equal(wa, wb), "selection differs between arms"
     # The whole layer: every selection once (the home maps of the four ranks), plus the four
@@ -428,7 +467,7 @@ def test_capture_replays_match_eager(rows: int) -> None:
             )
 
     def step():
-        return [moe_layer(core, x, p, m, rows, i) for (x, p), m, i in zip(inputs, ms, LAYERS)]
+        return [moe_layer(st, st.h, x, p, m, rows, i) for (x, p), m, i in zip(inputs, ms, LAYERS)]
 
     fill(f"warm {rows}")
     hits = dict(core.route_hits)
@@ -443,17 +482,17 @@ def test_capture_replays_match_eager(rows: int) -> None:
         fill(f"replay {rows} {rep}")
         graph.replay()
         torch.cuda.synchronize()
-        got = _snapshot(core, results, rows)
+        got = _snapshot(st, results, rows)
         eager = step()
         torch.cuda.synchronize()
-        want = _snapshot(core, eager, rows)
+        want = _snapshot(st, eager, rows)
         for k in want:
             if k.startswith("out"):
                 assert_within_ulp(got[k], want[k], REPLAY_ELEMENT_ULP, REPLAY_RMS_ULP)
             else:
                 assert torch.equal(got[k], want[k]), f"{k}: replay differs from eager"
         j = len(LAYERS) - 1
-        ref = _reference(core, want, j, inputs[-1][1], ms[-1])
+        ref = _reference(st, want, j, inputs[-1][1], ms[-1])
         assert_within_ulp(want[f"out{j}"], ref, element_ulp=32.0, rms_ulp=2.0)
 
 
@@ -464,21 +503,22 @@ def test_wider_steps_keep_the_wide_top_k(rows: int) -> None:
     band (FC2's bf16 atomics add in a run-dependent order)."""
     st = state()
     core = st.core
+    k = st.h.k
     layer, m = LAYERS[0], _rank_weights(st.layers[0], WIN)
     x, partials = _inputs(rows, f"wider {rows}")
-    hot = core._ctx_hot_ids[layer]
+    hot = k.ctx_hot_ids[layer]
     snaps = {}
     try:
         for arm in ("on", "off"):
-            core._ctx_hot_ids = {layer: hot} if arm == "on" else {}
+            k.ctx_hot_ids = {layer: hot} if arm == "on" else {}
             hits = dict(core.route_hits)
-            out, slot = moe_layer(core, x.clone(), partials[0], m, rows, layer)
+            out, slot = moe_layer(st, st.h, x.clone(), partials[0], m, rows, layer)
             torch.cuda.synchronize()
             assert core.route_hits.get("moe_wide_replica", 0) == hits.get("moe_wide_replica", 0)
             assert core.route_hits.get("moe_topk_wide", 0) == hits.get("moe_topk_wide", 0) + 1
-            snaps[arm] = _snapshot(core, [(out, slot)], rows)
+            snaps[arm] = _snapshot(st, [(out, slot)], rows)
     finally:
-        core._ctx_hot_ids = {i: hot for i in LAYERS}
+        k.ctx_hot_ids = {i: hot for i in LAYERS}
     for k in snaps["off"]:
         if k.startswith("out"):
             assert_within_ulp(snaps["on"][k], snaps["off"][k], REPLAY_ELEMENT_ULP, REPLAY_RMS_ULP)
@@ -488,21 +528,21 @@ def test_wider_steps_keep_the_wide_top_k(rows: int) -> None:
 
 
 def test_only_trunk_layers_with_hot_ids_on_wide_steps_take_replicas() -> None:
-    """`Moe.topk_wide_rep` answers only for a trunk layer with hot ids (not the MTP layer,
-    which has none) and a built handle; `_build_moe_wide_rep` builds nothing without the wide
-    top-k (MTP1, no speculation), the context replicas' pair, `ctx_replicas` or the switch.
-    MTP1 and no speculation never run a wide decode step (`Moe.decode_exact`)."""
-    core = state().core
-    k = core._moe_k
-    assert core.op.moe.topk_wide_rep(128, LAYERS[0]) is not None
-    assert core.op.moe.topk_wide_rep(65, LAYERS[1]) is not None
-    assert core.op.moe.topk_wide_rep(128, 78) is None, "the MTP layer has no hot ids"
+    """`routed_moe._topk_wide_rep` answers only for a trunk layer with hot ids (not the MTP
+    layer, which has none) and a built handle; `routed_moe._build_wide_rep` builds nothing
+    without the wide top-k (MTP1, no speculation), the context replicas' pair, `ctx_replicas`,
+    the switch or hot ids. MTP1 and no speculation never run a wide decode step
+    (`routed_moe.decode_exact`)."""
+    st = state()
+    h, k = st.h, st.h.k
+    assert _routed_moe._topk_wide_rep(128, LAYERS[0], h) is not None
+    assert _routed_moe._topk_wide_rep(65, LAYERS[1], h) is not None
+    assert _routed_moe._topk_wide_rep(128, NUM_LAYERS, h) is None, "the MTP layer has no hot ids"
     for rows in WIDE_ROWS:
-        assert core.op.moe.topk_wide_rep(rows, LAYERS[0]) is None, f"replicas at {rows} rows"
+        assert _routed_moe._topk_wide_rep(rows, LAYERS[0], h) is None, f"replicas at {rows} rows"
     dev = torch.cuda.current_device()
     base = dict(
-        topk_wide=k.topk_wide, pair_rep=k.pair_rep, ctx=core.ctx_replicas, sw=True,
-        hot=core._ctx_hot_ids,
+        topk_wide=k.topk_wide, pair_rep=k.pair_rep, ctx=NREP, sw=True, hot=k.ctx_hot_ids,
     )  # fmt: skip
     cases = (
         dict(base, topk_wide={}),
@@ -511,19 +551,9 @@ def test_only_trunk_layers_with_hot_ids_on_wide_steps_take_replicas() -> None:
         dict(base, sw=False),
         dict(base, hot={}),
     )
-    try:
-        for c in cases:
-            kk = SimpleNamespace(topk_wide=c["topk_wide"], pair_rep=c["pair_rep"])
-            core.ctx_replicas, core.wide_dec_replicas = c["ctx"], c["sw"]
-            core._ctx_hot_ids = c["hot"]
-            core._build_moe_wide_rep(kk, dev)
-            assert kk.topk_wide_rep == {}, c
-        for draft_len in (0, 1):
-            core.max_draft_len = draft_len
-            core.wide_cells = core.max_draft_len > 1
-            assert not any(core.op.moe.decode_exact(r) for r in range(1, 257))
-    finally:
-        core.ctx_replicas, core.wide_dec_replicas = NREP, True
-        core._ctx_hot_ids = base["hot"]
-        core.max_draft_len = 3
-        core.wide_cells = core.max_draft_len > 1
+    for c in cases:
+        kk = SimpleNamespace(topk_wide=c["topk_wide"], pair_rep=c["pair_rep"], ctx_hot_ids=c["hot"])
+        _routed_moe._build_wide_rep(kk, c["sw"], c["ctx"], dev)
+        assert kk.topk_wide_rep == {}, c
+    narrow = replace(h, wide_cells=False)
+    assert not any(_routed_moe.decode_exact(r, narrow) for r in range(1, 257))

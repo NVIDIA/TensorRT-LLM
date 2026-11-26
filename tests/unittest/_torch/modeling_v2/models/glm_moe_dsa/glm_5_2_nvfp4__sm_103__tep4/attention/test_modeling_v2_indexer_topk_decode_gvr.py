@@ -4,8 +4,9 @@
 
 When the engine's sparse config sets `enable_heuristic_topk` (and the self-sampling GVR
 prerequisites hold), the target's generation rows take the stock `TopK` module's GVR decode
-(`Indexer.gvr_launch`) instead of our one-CTA-per-row kernel. The engine claims an exact
-top-k set; here, through `Indexer.decode` with the scorer replaced by prepared logits:
+(`indexer._gvr_launch`) instead of our one-CTA-per-row kernel. The engine claims an exact
+top-k set; here, through `indexer_decode_logits` + `indexer_decode_topk` with the scorer
+replaced by prepared logits:
 
 - the set equals `torch.topk`'s on tie-free rows (each causal prefix a permutation of distinct
   integers) at 8k / 64k / 160k / 200k columns, 1..12 rows with next_n 1, 2 and 6, short rows
@@ -17,7 +18,7 @@ top-k set; here, through `Indexer.decode` with the scorer replaced by prepared l
   `gvr_deterministic_topk` the set is exactly the lower-column tie break;
 - a captured launch replays with new logits and longer KV to the eager answer.
 
-The decision (`_dec_topk_gvr_choice`: ours by default, GVR with TRTLLM_GLM52_DEC_TOPK_GVR=1) is
+The decision (`indexer.gvr_choice`: ours by default, GVR with TRTLLM_GLM52_DEC_TOPK_GVR=1) is
 pinned for the config on / off, the env opt-in and each missing prerequisite, from the engine's
 real `DeepSeekSparseAttentionConfig`; the dispatch with recorders, including a capture whose
 launcher is missing (that graph keeps ours).
@@ -32,10 +33,10 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("the vendored CuTe DSL kernel is built for sm_103", allow_module_level=True)
 
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    forward_ops as F,
-)
-from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+    indexer as IX,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_indexer_topk_decode import (  # noqa: E402, E501
     select_rows,
@@ -127,28 +128,40 @@ class _Ours(str):
 
 
 def _core(width: int, gvr, built=()):
-    """A core with only what `Indexer.decode` reads, and its ops (`core.op`)."""
-    core = object.__new__(M.GlmMoeDsaTep4ModelingV2)
-    core.route_hits, core.route_misses = {}, {}
-    core.idx_heads, core.idx_dim, core.idx_topk = 1, 1, TOP_K
-    core._max_ctx_len = width
-    # Not `Module.__init__`-ed, so a `TopK` cannot be registered as a submodule: set it plainly.
-    object.__setattr__(core, "_dec_topk_gvr", gvr)
-    core._dec_topk_gvr_live = gvr is not None
-    core._ix_topk_dec_compiled = {n: _Ours(f"ours{n}") for n in built}
-    core.op = SimpleNamespace(
-        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core),
-        indexer=F.Indexer(core), moe=F.Moe(core), mtp=F.Mtp(core),
+    """A route counter (the core's `route_hits`) and the indexer handle (`core._ix_h`) with only
+    what the decode ops read: the scorer's width, our decode top-k by width, and the GVR
+    decode top-k (None: ours)."""
+    core = SimpleNamespace(route_hits={}, route_misses={})
+
+    def count(route: str, hit: bool) -> None:
+        counts = core.route_hits if hit else core.route_misses
+        counts[route] = counts.get(route, 0) + 1
+
+    kernels = SimpleNamespace(
+        q_side=None, q_side_p160=None, q_side_k={}, k_update={},
+        topk_decode={n: _Ours(f"ours{n}") for n in built}, gvr=gvr, topk_prefill=None,
+    )  # fmt: skip
+    core.h = IX.build(
+        kernels, pre_proj=None, ix_qb=None, cos_sin=None, weight_scale=1.0, is_neox=False,
+        rope_dim=0, heads=1, dim=1, top_k=TOP_K, max_ctx_len=width, copy=None, count=count,
     )  # fmt: skip
     return core
 
 
+def _decode(core, md, q_fp8, out, seqs: int, gen_p: int) -> None:
+    """The generation rows' indexer decode as the Targets call it: the scorer, then the top-k."""
+    if out is None:
+        out = torch.empty((seqs * gen_p, TOP_K), dtype=torch.int32)
+    logits = IX.indexer_decode_logits(md, None, q_fp8, None, 0, gen_p, None, core.h)
+    IX.indexer_decode_topk(md, logits, out, 0, gen_p, core.h)
+
+
 def _run(monkeypatch, core, logits, seq_lens, next_n, out=None):
-    monkeypatch.setattr(F, "cute_dsl_fp8_paged_mqa_logits", _Logits(logits))
+    monkeypatch.setattr(IX, "cute_dsl_fp8_paged_mqa_logits", _Logits(logits))
     rows = logits.shape[0]
     out = torch.full((rows, TOP_K), -7, dtype=torch.int32, device="cuda") if out is None else out
     q_fp8 = torch.zeros(rows, 1, 1)
-    core.op.indexer.decode(_md(seq_lens), None, q_fp8, None, out, 0, seq_lens.shape[0], next_n)
+    _decode(core, _md(seq_lens), q_fp8, out, seq_lens.shape[0], next_n)
     return out
 
 
@@ -220,21 +233,23 @@ def test_gvr_deterministic_breaks_ties_to_the_lower_column(monkeypatch, width) -
 
 
 def test_gvr_replays_in_a_graph(monkeypatch) -> None:
-    """Warm as `_derive_first_step` does, capture, then replay with new logits and longer KV."""
+    """Warm as `indexer.compile_for_engine` does, capture, then replay with new logits and
+    longer KV."""
     width, next_n, seqs = 163840, 6, 2
     core = _core(width, _gvr())
-    core.mtp_widths = (2, next_n)
-    core._warm_dec_topk_gvr(SimpleNamespace(max_num_requests=seqs, max_seq_len=width))
+    IX._warm_gvr(
+        core.h.gvr, SimpleNamespace(max_num_requests=seqs, max_seq_len=width), TOP_K, (2, next_n)
+    )
     lens = [100000, 3000]
     logits, seq_lens = _build(width, lens, next_n, seed=13)
     md = _md(seq_lens)
-    monkeypatch.setattr(F, "cute_dsl_fp8_paged_mqa_logits", _Logits(logits))
+    monkeypatch.setattr(IX, "cute_dsl_fp8_paged_mqa_logits", _Logits(logits))
     rows = logits.shape[0]
     out = torch.full((rows, TOP_K), -7, dtype=torch.int32, device="cuda")
     q_fp8 = torch.zeros(rows, 1, 1)
 
     def run():
-        core.op.indexer.decode(md, None, q_fp8, None, out, 0, seqs, next_n)
+        _decode(core, md, q_fp8, out, seqs, next_n)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -289,7 +304,7 @@ _ON = dict(enable_heuristic_topk=True, use_cute_dsl_topk=True, use_cute_dsl_page
     ],
 )
 def test_gvr_choice(cfg, topk, sm, dsl, env, want) -> None:
-    got = M._dec_topk_gvr_choice(_params(**cfg), topk, sm_version=sm, dsl_available=dsl, env=env)
+    got = IX.gvr_choice(_params(**cfg), topk, sm_version=sm, dsl_available=dsl, env=env)
     assert got is want
 
 
@@ -297,9 +312,7 @@ def test_gvr_choice_without_sparse_config() -> None:
     mc = SimpleNamespace(sparse_attention_config=None, pretrained_config=SimpleNamespace())
     params = M._engine_sparse_params(mc, 0)
     assert params is None
-    assert (
-        M._dec_topk_gvr_choice(params, TOP_K, sm_version=103, dsl_available=True, env=None) is None
-    )
+    assert IX.gvr_choice(params, TOP_K, sm_version=103, dsl_available=True, env=None) is None
 
 
 class _Gvr:
@@ -326,10 +339,10 @@ class _Gvr:
 )
 def test_indexer_decode_dispatch(monkeypatch, gvr, capturing, gen_p, want, counted) -> None:
     calls = []
-    monkeypatch.setattr(F, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
-    monkeypatch.setattr(F, "indexer_topk_decode", lambda *a, **k: calls.append("stock"))
+    monkeypatch.setattr(IX, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
+    monkeypatch.setattr(IX, "indexer_topk_decode", lambda *a, **k: calls.append("stock"))
     monkeypatch.setattr(
-        F, "cute_dsl_indexer_topk_decode", lambda *a, compiled, **k: calls.append(compiled)
+        IX, "cute_dsl_indexer_topk_decode", lambda *a, compiled, **k: calls.append(compiled)
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     topk = None if gvr == "off" else _Gvr(calls, raise_missing=gvr == "missing")
@@ -343,7 +356,7 @@ def test_indexer_decode_dispatch(monkeypatch, gvr, capturing, gen_p, want, count
         radix_aux_logits=None,
     )
     q_fp8 = torch.zeros(seqs * gen_p, 1, 1)
-    core.op.indexer.decode(md, None, q_fp8, None, None, 0, seqs, gen_p)
+    _decode(core, md, q_fp8, None, seqs, gen_p)
     assert calls == want, calls
     assert core.route_hits.get("ix_topk_dec_gvr", 0) == int(counted)
     assert core.route_hits.get("ix_topk_dec", 0) == int(not counted)
@@ -369,18 +382,20 @@ def test_gvr_serves_by_width(monkeypatch, width, env, want) -> None:
         monkeypatch.delenv("TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE", raising=False)
     else:
         monkeypatch.setenv("TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE", env)
-    assert M._dec_topk_gvr_serves(width) is want
+    assert IX.gvr_serves(width) is want
 
 
 def test_config_on_narrow_engine_keeps_ours(monkeypatch) -> None:
-    """GVR configured but not live (a width at or below the bound): ours, counted as ours."""
+    """GVR configured but not serving (a width at or below the bound): the handle carries no GVR
+    (`indexer.compile_for_engine`), so ours, counted as ours."""
     calls = []
-    monkeypatch.setattr(F, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
+    monkeypatch.setattr(IX, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
     monkeypatch.setattr(
-        F, "cute_dsl_indexer_topk_decode", lambda *a, compiled, **k: calls.append(compiled)
+        IX, "cute_dsl_indexer_topk_decode", lambda *a, compiled, **k: calls.append(compiled)
     )
-    core = _core(16384, _Gvr(calls), built=(6,))
-    core._dec_topk_gvr_live = False
+    monkeypatch.delenv("TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE", raising=False)
+    gvr = _Gvr(calls)
+    core = _core(16384, gvr if IX.gvr_serves(16384) else None, built=(6,))
     md = SimpleNamespace(
         kv_lens_cuda_runtime=torch.zeros(2, dtype=torch.int32),
         indexer_k_cache_block_offsets=torch.zeros(2, 1, dtype=torch.int32),
@@ -388,13 +403,13 @@ def test_config_on_narrow_engine_keeps_ours(monkeypatch) -> None:
         radix_aux_indices=None,
         radix_aux_logits=None,
     )
-    core.op.indexer.decode(md, None, torch.zeros(12, 1, 1), None, None, 0, 2, 6)
+    _decode(core, md, torch.zeros(12, 1, 1), None, 2, 6)
     assert calls == ["ours6"]
     assert core.route_hits.get("ix_topk_dec") == 1 and "ix_topk_dec_gvr" not in core.route_hits
 
 
 def test_missing_launcher_outside_capture_raises(monkeypatch) -> None:
-    monkeypatch.setattr(F, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
+    monkeypatch.setattr(IX, "cute_dsl_fp8_paged_mqa_logits", _Logits("logits"))
     core = _core(163840, _Gvr([], raise_missing=True), built=(6,))
     md = SimpleNamespace(
         kv_lens_cuda_runtime=torch.zeros(1, dtype=torch.int32),
@@ -404,7 +419,7 @@ def test_missing_launcher_outside_capture_raises(monkeypatch) -> None:
         radix_aux_logits=None,
     )
     with pytest.raises(RuntimeError, match="not compiled"):
-        core.op.indexer.decode(md, None, torch.zeros(6, 1, 1), None, None, 0, 1, 6)
+        _decode(core, md, torch.zeros(6, 1, 1), None, 1, 6)
 
 
 def test_warm_covers_every_decode_row_count(monkeypatch) -> None:
@@ -414,9 +429,9 @@ def test_warm_covers_every_decode_row_count(monkeypatch) -> None:
 
     seen = []
     monkeypatch.setattr(gvr_host, "warmup_varlen", lambda k, msl, **kw: seen.append((k, msl, kw)))
-    core = _core(172032, _gvr(det=True))
-    core.mtp_widths = (2, 6)
-    core._warm_dec_topk_gvr(SimpleNamespace(max_num_requests=3, max_seq_len=172000))
+    IX._warm_gvr(
+        _gvr(det=True), SimpleNamespace(max_num_requests=3, max_seq_len=172000), TOP_K, (2, 6)
+    )
     assert [s[2]["next_n"] for s in seen] == [1, 2, 6]
     for k, msl, kw in seen:
         assert (k, msl) == (TOP_K, 172000)

@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: the trunk's routed MoE layer at a decode width up to 64 that is not a power of
-two, run unpadded on the fused top-k's own maps (`Moe.dec_unpadded`,
+two, run unpadded on the fused top-k's own maps (`routed_moe.dec_unpadded`,
 `TRTLLM_GLM52_MOE_DEC_UNPAD`).
 
-MTP5 at 1-3 requests carries 6 / 12 / 18 rows per decode step. Before, `Moe.experts` padded
+MTP5 at 1-3 requests carries 6 / 12 / 18 rows per decode step. Before, `moe_experts` padded
 them to 8 / 16 / 32: two fills and two cats for the padding ids and weights, two staging
 copies and the routing kernel rebuilding the maps the top-k had already written, seven
 launches between the top-k and FC1 (8.3 us of each MoE layer's critical chain at 12 rows on
@@ -12,9 +12,10 @@ B300). Unpadded, FC1 takes the top-k's maps and weights directly; on an MTP3 / M
 the step widths (multiples of `max_draft_len + 1`) also select on a top-k handle that
 releases FC1 early (`k.topk_sig`), as the power-of-two widths do.
 
-This drives the target's own ops (`Moe.begin_layer`, `Moe.routed`) on a core holding only
-the decode MoE state (as `test_modeling_v2_moe_decode_acc_padded.py`), prequantized as the
-pre-MoE collective leaves a decode width, and checks:
+This drives the target's own routed ops (`routed_moe.moe_open`, `moe_router`, `moe_topk`,
+`moe_experts`, `moe_combine`) in `DecodeTarget`'s order, on a handle holding only the decode
+MoE kernels (as `test_modeling_v2_moe_decode_acc_padded.py`), prequantized as the pre-MoE
+collective leaves a decode width, and checks:
 
 * unpadded against padded on the same inputs: the same selection, weights and maps (the
   padded maps restricted to the real rows), both within the experts band of the fp32
@@ -28,6 +29,7 @@ pre-MoE collective leaves a decode width, and checks:
 """
 
 import zlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -39,12 +41,6 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E402, E501
     fp4_quantize,
 )
-from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    forward_ops as _ops,
-)
-from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    modeling as _modeling,
-)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
 )
@@ -53,6 +49,9 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     cute_dsl_hidden_add as _add_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    projection as _proj,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_nvfp4_experts as _experts_op,
@@ -64,19 +63,29 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_routing as _routing_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    cute_dsl_moe_sigmoid_topk as _sigmoid_topk_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing as _topk_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_zero as _zero_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    routed_moe as _moe,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E402, E501
     cute_dsl_moe_quantize_nvfp4 as _quant_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.step import (  # noqa: E402, E501
+    PREFILL,
 )
 
 __extra_import_path__ = ["../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 HIDDEN, INTER, EXPERTS, LOCAL = 6144, 2048, 256, 64
+DECODE_MAX_ROWS = _proj.DECODE_MAX_ROWS
 TOP_K = _routing_op.TOP_K
 #: EP rank 2's window.
 OFFSET = 128
@@ -169,7 +178,7 @@ def _layer_weights(layer: int, stacks) -> SimpleNamespace:
 
 
 def _slot(dev) -> SimpleNamespace:
-    rows = _ops._MOE_MAX_T
+    rows = _moe.MAX_ROWS
     counts, barrier = _routing_op.allocate_workspace(dev)
     f32 = {"dtype": torch.float32, "device": dev}
     return SimpleNamespace(
@@ -180,124 +189,128 @@ def _slot(dev) -> SimpleNamespace:
         maps=_routing_op.allocate_maps(rows, dev),
         counts=counts,
         barrier=barrier,
-        router_out=torch.zeros((_ops._DECODE_MAX_ROWS, EXPERTS), **f32),
-        router_partials=torch.zeros((_ops._DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
-        router_x=torch.zeros((_ops._DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
+        router_out=torch.zeros((DECODE_MAX_ROWS, EXPERTS), **f32),
+        router_partials=torch.zeros((DECODE_MAX_ROWS, _router_op.SPLIT_K, EXPERTS), **f32),
+        router_x=torch.zeros((DECODE_MAX_ROWS, HIDDEN), dtype=torch.bfloat16, device=dev),
         topk_out={w: _topk_op.allocate_decode_outputs(w, dev) for w in ROWS},
         c=_experts_op.allocate_decode_c(rows, INTER, dev),
         sfc=_experts_op.allocate_sfc(rows, INTER, dev),
     )
 
 
-def _attach_ops(core) -> SimpleNamespace:
-    """The core's ops, as its `__init__` builds them (`core.op`)."""
-    return SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
-        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
-    )  # fmt: skip
+class _Counts:
+    """The route counter the handles report to (`count(route, hit)`), as the core's."""
+
+    def __init__(self) -> None:
+        self.hits: dict = {}
+        self.misses: dict = {}
+
+    def __call__(self, route: str, hit: bool) -> None:
+        counts = self.hits if hit else self.misses
+        counts[route] = counts.get(route, 0) + 1
 
 
 def state() -> SimpleNamespace:
-    """A core holding only the decode MoE state, with `_build_moe`'s handles at ROWS: the
-    plain top-k (early release at the powers of two) and the early-release handles at the
-    step widths (`k.topk_sig`)."""
+    """The routed ops' handle holding only the decode MoE kernels, as `build_kernels` builds
+    them at ROWS: the plain top-k (early release at the powers of two) and the early-release
+    handles at the step widths (`k.topk_sig`); the trunk's slot parity."""
     if "state" in _STATE:
         return _STATE["state"]
     dev = torch.cuda.current_device()
-    core = _modeling.GlmMoeDsaTep4ModelingV2.__new__(_modeling.GlmMoeDsaTep4ModelingV2)
-    torch.nn.Module.__init__(core)
-    core.route_hits, core.route_misses = {}, {}
-    core.expert_offset = OFFSET
-    core.routed_scale = ROUTED_SCALE
-    core.max_draft_len = MAX_DRAFT_LEN
-    core.wide_cells = core.max_draft_len > 1
-    core.num_layers = NUM_LAYERS
-    core.fc1_kblk = FC1_KBLK
-    core.fc2_kblk = FC2_KBLK
-    core._moe_acc_padded = True
-    core._moe_dec_unpad = True
-    core._moe_dec_unpad_signal = True
-    # The row ops' handles, none compiled but the ones the MoE path launches.
-    core._rows = core._build_row_ops(compile=False)
-    core._rows.add = _add_op.build(core._count)
-    core._rows.copy = _copy_op.build(core._count)
-    core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _ops._MOE_MAX_T
-    core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
-    core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._ctx_hot_ids = {}
-    core._dec_hot_ids = {}
-    core._pf = None
-    s0 = core._moe_slots[0]
+    counts = _Counts()
+    copy = _copy_op.build(counts)
+    rows = _moe.MAX_ROWS
+    k = SimpleNamespace()
+    k.slots = [_slot(dev) for _ in range(2)]
+    k.xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
+    k.xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
+    s0 = k.slots[0]
     padded = sorted({_pow2(r) for r in ROWS})
-    core._moe_k = SimpleNamespace(
-        routing=_routing_op.build(padded, dev),
-        experts=_experts_op.build_decode(
-            c=s0.c,
-            sfc=s0.sfc,
-            maps=s0.maps,
-            xq=core._moe_xq,
-            xsf=core._moe_xsf,
-            out=s0.out,
-            hidden=HIDDEN,
-            inter=INTER,
-            experts=LOCAL,
-            max_rows=rows,
-            fc1_kblk=FC1_KBLK,
-            fc2_kblk=FC2_KBLK,
-            dyn_slots=NUM_LAYERS + 1,
-        ),
-        topk={
-            w: _topk_op.build_decode(
-                w, _router_op.decode_splits(w), dev, signal_gg1=(w & (w - 1)) == 0
-            )
-            for w in ROWS
-        },
-        topk_sig={
-            w: _topk_op.build_decode(w, _router_op.decode_splits(w), dev, signal_gg1=True)
-            for w in SIG_ROWS
-        },
-        topk_rep={},
-        router={w: _router_op.build(w, dev) for w in ROWS},
-        # The collective's NVFP4 epilogue stand-in at the exact rows; the MTP layer's own
-        # quantize and clear at the padded widths.
-        quant={w: _quant_op.build_decode(w, dev) for w in sorted(set(ROWS) | set(padded))},
-        zero={w: _zero_op.build_decode(w, dev) for w in padded},
-        pair=None,
-        pair_rep=None,
-        topk_pre=None,
-        topk_pre_rep=None,
-        quant_pre=None,
-        zero_pre=None,
-        merge=None,
+    k.routing = _routing_op.build(padded, dev)
+    k.experts = _experts_op.build_decode(
+        c=s0.c,
+        sfc=s0.sfc,
+        maps=s0.maps,
+        xq=k.xq,
+        xsf=k.xsf,
+        out=s0.out,
+        hidden=HIDDEN,
+        inter=INTER,
+        experts=LOCAL,
+        max_rows=rows,
+        fc1_kblk=FC1_KBLK,
+        fc2_kblk=FC2_KBLK,
+        dyn_slots=NUM_LAYERS + 1,
     )
-    core.op = _attach_ops(core)
+    k.pair = k.pair_rep = k.topk_pre = k.topk_pre_rep = k.router_pre = None
+    k.quant_pre = k.zero_pre = k.merge = k.pf = k.router_wide = k.dec_hot_none = None
+    k.ctx_hot_ids, k.dec_hot_ids = {}, {}
+    k.topk_rep, k.topk_wide, k.topk_wide_rep = {}, {}, {}
+    k.topk = {
+        w: _topk_op.build_decode(w, _router_op.decode_splits(w), dev, signal_gg1=(w & (w - 1)) == 0)
+        for w in ROWS
+    }
+    k.topk_sig = {
+        w: _topk_op.build_decode(w, _router_op.decode_splits(w), dev, signal_gg1=True)
+        for w in SIG_ROWS
+    }
+    k.router = {w: _router_op.build(w, dev) for w in ROWS}
+    # The collective's NVFP4 epilogue stand-in at the exact rows; the MTP layer's own
+    # quantize and clear at the padded widths.
+    k.quant = {w: _quant_op.build_decode(w, dev) for w in sorted(set(ROWS) | set(padded))}
+    k.zero = {w: _zero_op.build_decode(w, dev) for w in padded}
+    h = _moe.build(
+        k,
+        expert_offset=OFFSET,
+        routed_scale=ROUTED_SCALE,
+        n_group=1,
+        topk_group=1,
+        topk=TOP_K,
+        num_layers=NUM_LAYERS,
+        wide_cells=MAX_DRAFT_LEN > 1,
+        dec_unpad=True,
+        acc_padded=True,
+        router_proj=_proj.build(
+            "router", cells={}, mtp_cells={}, prefill=None, mxf8=None, dec8=None, dec8w=None,
+            wide_bucket=False, copy=copy, count=counts,
+        ),
+        route=_sigmoid_topk_op.build(counts, False),
+        copy=copy,
+        add=_add_op.build(counts),
+        count=counts,
+    )  # fmt: skip
     stacks = _experts()
-    st = SimpleNamespace(core=core, layers=[_layer_weights(i, stacks) for i in LAYERS])
+    st = SimpleNamespace(
+        h=h,
+        counts=counts,
+        parity=_moe.SlotParity(),
+        side=torch.cuda.Stream(device=dev),
+        layers=[_layer_weights(i, stacks) for i in LAYERS],
+    )
     _STATE["state"] = st
     return st
 
 
-def moe_layer(core, x, partial, m, rows: int, layer: int):
+def moe_layer(st, h, x, partial, m, rows: int, layer: int):
     """A decode Target's trunk MoE layer (`DecodeTarget.forward`) at a decode width, from the
     pre-MoE collective's output on (its NVFP4 epilogue stood in for by the quantize at the
     exact rows); the shared expert's result `partial` copied on the side stream into the
-    buffer `Moe.begin_layer` hands out (`Moe.open_layer`). Returns `(mlp_out, slot)`."""
-    op = core.op
-    _quant_op.cute_dsl_moe_quantize_nvfp4(
-        x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
-    )
-    began, acc = op.moe.open_layer(rows)
-    assert began and acc is not None, "a decode width always accumulates here"
-    slot = op.moe.slot
+    buffer `moe_open` hands out. Returns `(mlp_out, slot)`."""
+    k = h.k
+    _quant_op.cute_dsl_moe_quantize_nvfp4(x, m.g1, k.xq[:rows], k.xsf[:rows], k.quant[rows])
+    pf = _moe.moe_l2_prefetch(layer, m, rows, False, h)
+    slot, acc = _moe.moe_open(rows, False, h, st.parity)
+    assert slot is not None and acc is not None, "a decode width always accumulates here"
     main = torch.cuda.current_stream()
-    side = core._side_stream
+    side = st.side
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        op.rows.copy(acc, partial)
-    routed = op.moe.routed(_ops.PREFILL, x, m, rows, True, side, began, True, layer)
-    return op.moe.combine(routed, None, acc, rows, main, side), slot
+        _copy_op.row_copy(acc, partial, h.copy)
+    quantized = _moe.moe_quantize_first(x, m, True, h)
+    logits, in_slot = _moe.moe_router(PREFILL, x, m, slot, False, h)
+    routing = _moe.moe_topk(logits, in_slot, m, slot, layer, False, h)
+    routed = _moe.moe_experts(x, routing, m, quantized, slot, acc, side, pf, layer, False, h)
+    return _moe.moe_combine(routed, None, acc, rows, main, side, h), slot
 
 
 def layer_inputs(rows: int) -> list:
@@ -312,16 +325,17 @@ def fill(inputs, rows: int, tag: str) -> None:
         p.copy_((torch.randn(rows, HIDDEN, generator=g, device="cuda") * 0.5).to(torch.bfloat16))
 
 
-def poison(core) -> None:
-    for s in core._moe_slots:
-        s.out[: _ops._DECODE_MAX_ROWS].fill_(float("nan"))
+def poison(h) -> None:
+    for s in h.k.slots:
+        s.out[:DECODE_MAX_ROWS].fill_(float("nan"))
 
 
-def run_step(st, inputs, rows: int) -> list:
-    return [moe_layer(st.core, x, p, m, rows, i) for (x, p), m, i in zip(inputs, st.layers, LAYERS)]
+def run_step(st, inputs, rows: int, h=None) -> list:
+    h = st.h if h is None else h
+    return [moe_layer(st, h, x, p, m, rows, i) for (x, p), m, i in zip(inputs, st.layers, LAYERS)]
 
 
-def _snapshot(core, results, rows: int, unpadded: bool) -> dict:
+def _snapshot(h, results, rows: int, unpadded: bool) -> dict:
     """Per layer its output, the slot's rows past it up to the padded width, and the weights,
     ids and canonical maps FC2 read: the top-k's own outputs unpadded or at a power of two,
     else the staged weights and ids and the routing kernel's maps (all over the padded
@@ -329,7 +343,7 @@ def _snapshot(core, results, rows: int, unpadded: bool) -> dict:
     padded = _pow2(rows)
     snap = {}
     for j, (out, slot) in enumerate(results):
-        s = core._moe_slots[slot]
+        s = h.k.slots[slot]
         if unpadded or padded == rows:
             t = s.topk_out[rows]
             w, ids, maps, n = t["topk_weights"].view(rows, TOP_K), t["topk_indices"], t, rows
@@ -344,13 +358,12 @@ def _snapshot(core, results, rows: int, unpadded: bool) -> dict:
     return snap
 
 
-def _reference(core, snap: dict, x, partial, m, rows: int, j: int) -> torch.Tensor:
+def _reference(h, snap: dict, x, partial, m, rows: int, j: int) -> torch.Tensor:
     """Layer `j`'s fp32 reference of the grouped GEMMs on the maps and weights the step
     wrote (over the real rows), onto the shared partial, rounded once to bf16."""
-    _quant_op.cute_dsl_moe_quantize_nvfp4(
-        x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], core._moe_k.quant[rows]
-    )
-    xq, xsf = core._moe_xq[:rows].clone(), core._moe_xsf[:rows].clone()
+    k = h.k
+    _quant_op.cute_dsl_moe_quantize_nvfp4(x, m.g1, k.xq[:rows], k.xsf[:rows], k.quant[rows])
+    xq, xsf = k.xq[:rows].clone(), k.xsf[:rows].clone()
     n = snap[f"w{j}"].shape[0]
     maps = {k: snap[f"maps{j}.{k}"] for k in _routing_op.MAP_KEYS}
     if n != rows:
@@ -358,7 +371,7 @@ def _reference(core, snap: dict, x, partial, m, rows: int, j: int) -> torch.Tens
     ref = _experts_op.cute_dsl_moe_nvfp4_experts.reference(
         xq, xsf, maps, snap[f"w{j}"][:rows].contiguous(), m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s,
         m.norm_const, m.alpha1, m.alpha2, partial.clone(), None, None, None,
-        core._moe_k.experts,
+        k.experts,
     )  # fmt: skip
     return ref[:rows]
 
@@ -370,8 +383,8 @@ def _assert_not_degenerate(ref, partial, ids, rows: int) -> None:
     assert bool((ids[:rows] == HOT).any(1).all()), "a real row missed the hot expert"
 
 
-def _took(core, before: dict, route: str) -> int:
-    return core.route_hits.get(route, 0) - before.get(route, 0)
+def _took(counts, before: dict, route: str) -> int:
+    return counts.hits.get(route, 0) - before.get(route, 0)
 
 
 def _same_maps(a: dict, ja: int, b: dict, jb: int, rows: int) -> None:
@@ -388,17 +401,17 @@ def _same_maps(a: dict, ja: int, b: dict, jb: int, rows: int) -> None:
 
 
 @pytest.mark.parametrize("rows", ROWS)
-def test_unpadded_matches_padded_and_the_reference(rows: int, monkeypatch) -> None:
+def test_unpadded_matches_padded_and_the_reference(rows: int) -> None:
     st = state()
-    core = st.core
+    counts = st.counts
     padded = _pow2(rows)
     inputs = layer_inputs(rows)
     fill(inputs, rows, f"pair {rows}")
     results = {}
     for unpad in (False, True):
-        monkeypatch.setattr(core, "_moe_dec_unpad", unpad)
-        before = dict(core.route_hits)
-        poison(core)
+        h = replace(st.h, dec_unpad=unpad)
+        before = dict(counts.hits)
+        poison(h)
         with validating(
             _router_op.cute_dsl_moe_router,
             _topk_op.cute_dsl_moe_topk_routing,
@@ -407,14 +420,14 @@ def test_unpadded_matches_padded_and_the_reference(rows: int, monkeypatch) -> No
             _experts_op.cute_dsl_moe_nvfp4_experts,
             _copy_op.cute_dsl_copy,
         ):
-            snap = _snapshot(core, run_step(st, inputs, rows), rows, unpad)
+            snap = _snapshot(h, run_step(st, inputs, rows, h), rows, unpad)
         torch.cuda.synchronize()
         moved = unpad and padded != rows
-        assert _took(core, before, "moe_dec_unpad") == (len(LAYERS) if moved else 0)
-        assert _took(core, before, "moe_dec_unpad_signal") == (
+        assert _took(counts, before, "moe_dec_unpad") == (len(LAYERS) if moved else 0)
+        assert _took(counts, before, "moe_dec_unpad_signal") == (
             len(LAYERS) if moved and rows in SIG_ROWS else 0
         )
-        assert _took(core, before, "moe_acc_padded") == (
+        assert _took(counts, before, "moe_acc_padded") == (
             0 if unpad or padded == rows else len(LAYERS)
         )
         for j in range(len(LAYERS)):
@@ -429,7 +442,7 @@ def test_unpadded_matches_padded_and_the_reference(rows: int, monkeypatch) -> No
         assert torch.equal(new[f"ids{j}"], old[f"ids{j}"][:rows]), "ids differ"
         _same_maps(new, j, old, j, rows)
     for j, ((x, partial), m) in enumerate(zip(inputs, st.layers)):
-        ref = _reference(core, new, x, partial, m, rows, j)
+        ref = _reference(st.h, new, x, partial, m, rows, j)
         _assert_not_degenerate(ref, partial, new[f"ids{j}"], rows)
         assert_within_ulp(new[f"out{j}"], ref, element_ulp=REF_ELEMENT_ULP, rms_ulp=REF_RMS_ULP)
         assert_within_ulp(old[f"out{j}"], ref, element_ulp=REF_ELEMENT_ULP, rms_ulp=REF_RMS_ULP)
@@ -447,8 +460,8 @@ def test_capture_replays_match_eager(rows: int) -> None:
     graph, replayed three times on fresh inputs against the same calls eagerly: selection
     and maps bitwise, outputs within the pair band, the eager output against the reference."""
     st = state()
-    core = st.core
-    core._moe_dec_unpad = True
+    h = st.h
+    assert h.dec_unpad
     inputs = layer_inputs(rows)
     fill(inputs, rows, f"warm {rows}")
     run_step(st, inputs, rows)
@@ -458,14 +471,14 @@ def test_capture_replays_match_eager(rows: int) -> None:
         results = run_step(st, inputs, rows)
     for rep in range(3):
         fill(inputs, rows, f"replay {rows} {rep}")
-        poison(core)
+        poison(h)
         graph.replay()
         torch.cuda.synchronize()
-        got = _snapshot(core, results, rows, True)
-        poison(core)
+        got = _snapshot(h, results, rows, True)
+        poison(h)
         eager = run_step(st, inputs, rows)
         torch.cuda.synchronize()
-        want = _snapshot(core, eager, rows, True)
+        want = _snapshot(h, eager, rows, True)
         assert [s for _, s in eager] == [s for _, s in results], "slot parity drifted"
         for k in want:
             if k.startswith("out"):
@@ -477,62 +490,66 @@ def test_capture_replays_match_eager(rows: int) -> None:
                 assert torch.equal(got[k], want[k]), f"{k}: replay differs from eager"
         j = len(LAYERS) - 1
         x, partial = inputs[j]
-        ref = _reference(core, want, x, partial, st.layers[j], rows, j)
+        ref = _reference(h, want, x, partial, st.layers[j], rows, j)
         _assert_not_degenerate(ref, partial, want[f"ids{j}"], rows)
         assert_within_ulp(want[f"out{j}"], ref, element_ulp=REF_ELEMENT_ULP, rms_ulp=REF_RMS_ULP)
 
 
 @pytest.mark.parametrize("rows", [r for r in ROWS if r & (r - 1)])
-def test_mtp_layer_keeps_the_padded_path(rows: int, monkeypatch) -> None:
-    """The MTP layer's call (`Mtp.moe` on the trunk's NVFP4 path, as the Targets' MTP close
-    makes it: not prequantized, no shared partial, layer slot `num_layers`) at a width that
-    is not a power of two: the plain top-k handle, the padded path with its own quantize and
-    clear, and a result within the band of the reference."""
+def test_mtp_layer_keeps_the_padded_path(rows: int) -> None:
+    """The MTP layer's call on the trunk's NVFP4 path (`mtp_moe_open`, then the routed ops as
+    the Targets' MTP layer makes them: not prequantized, no shared partial, its own slot from
+    the parity, layer slot `num_layers`) at a width that is not a power of two: the plain
+    top-k handle (not signaled), the padded path with its own quantize and clear, and a
+    result within the band of the reference."""
     st = state()
-    core = st.core
-    core._moe_dec_unpad = True
+    h, counts = st.h, st.counts
+    assert h.dec_unpad and h.mtp_bf16 is None
     m = st.layers[0]
-    monkeypatch.setattr(core, "_mtp_fp4", m, raising=False)
     x = layer_inputs(rows)[0][0]
     fill([(x, torch.empty_like(x))], rows, f"mtp {rows}")
-    before = dict(core.route_hits)
-    poison(core)
-    routed = core.op.mtp.moe(_ops.PREFILL, x, rows)
+    before = dict(counts.hits)
+    poison(h)
+    exact = _moe.mtp_moe_open(rows, False, h)
+    assert not exact
+    slot = st.parity.take()
+    quantized = _moe.moe_quantize_first(x, m, False, h)
+    logits, in_slot = _moe.moe_router(PREFILL, x, m, slot, exact, h)
+    sel = _moe.moe_topk(logits, in_slot, m, slot, NUM_LAYERS, exact, h)
+    routed = _moe.moe_experts(x, sel, m, quantized, slot, None, None, None, NUM_LAYERS, exact, h)
     torch.cuda.synchronize()
-    assert _took(core, before, "mtp_moe_fp4") == 1
-    assert not core.op.moe._topk_signaled
-    assert _took(core, before, "moe_dec_unpad") == 0
-    assert _took(core, before, "moe_dec_unpad_signal") == 0
+    assert _took(counts, before, "mtp_moe_fp4") == 1
+    assert not sel.signaled
+    assert _took(counts, before, "moe_dec_unpad") == 0
+    assert _took(counts, before, "moe_dec_unpad_signal") == 0
     assert bool(torch.isfinite(routed).all())
-    slot = core.op.moe.slot ^ 1  # `Moe.routed` advanced it after (began False)
-    snap = _snapshot(core, [(routed, slot)], rows, False)
-    ref = _reference(core, snap, x, torch.zeros_like(x), m, rows, 0)
+    snap = _snapshot(h, [(routed, slot)], rows, False)
+    ref = _reference(h, snap, x, torch.zeros_like(x), m, rows, 0)
     assert_within_ulp(routed, ref, element_ulp=REF_ELEMENT_ULP, rms_ulp=REF_RMS_ULP)
 
 
-def test_gate_and_fail_fast(monkeypatch) -> None:
-    """`Moe.dec_unpadded` holds for every decode width with a top-k handle and only with the
+def test_gate_and_fail_fast() -> None:
+    """`dec_unpadded` holds for every decode width with a top-k handle and only with the
     switch on; an early-release top-k followed by the padded path raises instead of
     launching the routing kernel on ids still being written."""
     st = state()
-    core = st.core
     for on in (True, False):
-        monkeypatch.setattr(core, "_moe_dec_unpad", on)
+        h = replace(st.h, dec_unpad=on)
         for rows in ROWS:
-            assert core.op.moe.dec_unpadded(rows) == on, rows
-        assert not core.op.moe.dec_unpadded(65)
-    monkeypatch.setattr(core, "_moe_dec_unpad", False)
+            assert _moe.dec_unpadded(rows, h) == on, rows
+        assert not _moe.dec_unpadded(65, h)
+    h = replace(st.h, dec_unpad=False)
     rows = 12
     m = st.layers[0]
     x = layer_inputs(rows)[0][0]
     fill([(x, torch.empty_like(x))], rows, "fail fast")
-    monkeypatch.setattr(core.op.moe, "_topk_signaled", True)
-    s = core._moe_slots[core.op.moe.slot]
-    t = s.topk_out[rows]
+    slot = 0
+    t = h.k.slots[slot].topk_out[rows]
+    sel = _moe.MoeSelection(
+        t["topk_weights"].view(rows, TOP_K),
+        t["topk_indices"].view(rows, TOP_K),
+        {k: t[k] for k in _routing_op.MAP_KEYS},
+        signaled=True,
+    )
     with pytest.raises(RuntimeError, match="early-release top-k"):
-        core.op.moe.experts(
-            x, t["topk_indices"].view(rows, TOP_K), t["topk_weights"].view(rows, TOP_K),
-            {k: t[k] for k in _routing_op.MAP_KEYS}, m, rows, False, None, False, False,
-            NUM_LAYERS,
-        )  # fmt: skip
-    assert core.op.moe._topk_signaled is False
+        _moe.moe_experts(x, sel, m, False, slot, None, None, None, NUM_LAYERS, False, h)

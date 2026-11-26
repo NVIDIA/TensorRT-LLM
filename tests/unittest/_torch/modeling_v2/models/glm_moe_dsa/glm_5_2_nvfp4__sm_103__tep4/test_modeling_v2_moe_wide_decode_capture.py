@@ -8,24 +8,27 @@ smaller padded batch), and the engine runs them inside its captured decode graph
 rows the routed experts take the context kernels -- prefill router, prefill top-k, the
 routing kernel on padded rows, the segmented quantize, the byte clear, the merge and the
 prefill grouped GEMM pair -- which a context step only ever runs eagerly. This drives the
-target's own ops (`Moe.open_layer`, `Moe.routed` and `Moe.combine`, as `WideDecodeTarget` and
-`PrefillTarget._mlp_and_close` call them) on a core holding only the MoE state, captures two
+target's own routed ops (`ops/moe/routed_moe.py`: `moe_open`, `moe_router`, `moe_topk`,
+`moe_experts`, `moe_combine`, in the order `WideDecodeTarget.forward` and
+`PrefillTarget._mlp_and_close` call them) on a handle holding only the MoE state, captures two
 consecutive layers (the two operand slots), replays them on fresh inputs, and compares with
 the same calls run eagerly.
 
 Two paths. `pow2`: a context step's, and every decode step's above 64 rows before MTP3 /
 MTP5 decode ran exact: the rows padded to a power of two below 513, the top-k's maps
 discarded for the routing kernel's, the output cleared and the shared expert merged after.
-`exact`: the wide decode target's at MTP3 / MTP5 (`Moe.decode_exact`): the row count unpadded,
+`exact`: the wide decode target's at MTP3 / MTP5 (`routed_moe.decode_exact`): the row count unpadded,
 the wide decode top-k's maps used as written, the shared expert accumulated by FC2;
 `exact_pre` the same on the prefill top-k (the wide one not built). `exact_prequant`: `exact`
 with the routed experts' NVFP4 input written ahead of the layer, as the pre-MoE collective
 writes it on those steps (`allreduce_add_rmsnorm_quant`): the routed experts then neither
-stage nor quantize. One GPU has no collective, so the routed experts' own prefill quantize stands in
-for it; the 4-GPU comm matrix proves the collective's bytes equal that quantize's bit for bit.
+stage nor quantize. One GPU has no collective, so the routed experts' own prefill quantize
+stands in for it; the 4-GPU comm matrix proves the collective's bytes equal that quantize's
+bit for bit.
 """
 
 import zlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -38,10 +41,13 @@ from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import ( 
     fp4_quantize,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    forward_ops as _ops,
+    modeling as _modeling,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    modeling as _modeling,
+    step as _step,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.decode import (  # noqa: E402, E501
+    DecodeTarget,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.moe import (  # noqa: E402, E501
     moe_fc1_kblock as _fc1_kblock,
@@ -59,7 +65,13 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_copy as _copy_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
+    cute_dsl_hidden_add as _add_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.elementwise import (  # noqa: E402, E501
     order_fence as _fence_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    projection as _proj,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_merge as _merge_op,
@@ -74,13 +86,25 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     cute_dsl_moe_routing as _routing_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    cute_dsl_moe_sigmoid_topk as _sigmoid_topk_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_topk_routing as _topk_op,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
     cute_dsl_moe_zero as _zero_op,
 )
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    routed_moe as _routed_moe,
+)
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E402, E501
     cute_dsl_moe_quantize_nvfp4 as _quant_op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.prefill import (  # noqa: E402, E501
+    PrefillTarget,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.wide_decode import (  # noqa: E402, E501
+    WideDecodeTarget,
 )
 
 __extra_import_path__ = ["../../.."]
@@ -99,6 +123,11 @@ LAYERS = (3, 4)
 #: Hot expert (every token selects it: > 64 rows from 65 rows up, two tiles past 128), the
 #: never-selected ones, and the 16 tied pairs (identical router rows and bias, so their
 #: scores are bitwise equal and selection breaks the tie toward the lower id).
+#: The trunk's MoE layer count (the MTP layer's FC2 tile-counter slot is this one).
+NUM_LAYERS = 78
+#: The rows the routed buffers hold, and the decode kernels' widest.
+MAX_ROWS = _routed_moe.MAX_ROWS
+DECODE_MAX_ROWS = _proj.DECODE_MAX_ROWS
 HOT = OFFSET + 1
 EMPTY = tuple(range(OFFSET + 10, OFFSET + 14))
 TIED = tuple((OFFSET + 20 + 2 * p, OFFSET + 21 + 2 * p) for p in range(16))
@@ -184,8 +213,8 @@ def _layer_weights(layer: int, stacks) -> SimpleNamespace:
 
 
 def _slot(dev) -> SimpleNamespace:
-    """The fields of `_build_moe`'s trunk slot that a row count above 64 reads."""
-    rows = _ops._MOE_MAX_T
+    """The fields of `routed_moe.allocate_slot`'s trunk slot that a row count above 64 reads."""
+    rows = MAX_ROWS
     counts, barrier = _routing_op.allocate_workspace(dev)
     ns = SimpleNamespace(
         out=torch.zeros((rows, HIDDEN), dtype=torch.bfloat16, device=dev),
@@ -208,113 +237,158 @@ def _slot(dev) -> SimpleNamespace:
     return ns
 
 
-def state() -> SimpleNamespace:
-    """A target core holding only what the routed experts read above 64 rows (built once a
-    session): the context kernels `_build_moe` builds, the two slots, and two layers."""
-    if "state" in _STATE:
-        return _STATE["state"]
-    dev = torch.cuda.current_device()
+def _counter():
+    """A core that only counts routes (`_count` into `route_hits` / `route_misses`)."""
     core = _modeling.GlmMoeDsaTep4ModelingV2.__new__(_modeling.GlmMoeDsaTep4ModelingV2)
     torch.nn.Module.__init__(core)
     core.route_hits, core.route_misses = {}, {}
-    core.expert_offset = OFFSET
-    core.routed_scale = ROUTED_SCALE
-    # MTP3: decode steps above 64 rows run unpadded (`Moe.decode_exact`).
-    core.max_draft_len = 3
-    core.wide_cells = core.max_draft_len > 1
-    core.fc1_kblk = FC1_KBLK
-    core.fc2_kblk = FC2_KBLK
-    # The row ops' handles, none compiled but the ones the MoE path launches.
-    core._rows = core._build_row_ops(compile=False)
-    core._rows.copy = _copy_op.build(core._count)
-    core._shared_fence = _fence_op.build(dev, "moe_shared_after_ar", core._count)
-    core._side_stream = torch.cuda.Stream(device=dev)
-    core._moe_slots = [_slot(dev) for _ in range(2)]
-    rows = _ops._MOE_MAX_T
-    core._moe_xq = torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev)
-    core._moe_xsf = torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev)
-    core._ctx_hot_ids = {}
-    core._dec_hot_ids = {}
-    core._pf = None
-    core._moe_k = SimpleNamespace(
+    return core
+
+
+def _quant_rows(target_cls, wide_cells: bool, k) -> int:
+    """The NVFP4 prequant window a Target's `on_load` computes (`_quant_rows`) on an engine
+    with (`wide_cells`) or without the wide decode cells, over the routed kernels `k`; no
+    attention layer, so only the MoE facts are read."""
+    core = SimpleNamespace(
+        num_layers=0, _attn=[], _dense_w8=[], _moe=[], _shared_w8=[], _moe_k=k,
+        wide_cells=wide_cells, dec_cell_up=False,
+        _attn_h=SimpleNamespace(norm=SimpleNamespace(q8=None)),
+        _proj_h=SimpleNamespace(q_b=SimpleNamespace(dec8=None), qkva=SimpleNamespace(mxf8=None)),
+    )  # fmt: skip
+    target = target_cls(core)
+    target.on_load()
+    return target._quant_rows
+
+
+def state() -> SimpleNamespace:
+    """The routed ops' handle holding only what they read above 64 rows (built once a
+    session): the context kernels `routed_moe.build_kernels` builds, the two slots, and two
+    layers; beside it the slot parity, the shared expert's fence and side stream, as the core
+    holds them."""
+    if "state" in _STATE:
+        return _STATE["state"]
+    dev = torch.cuda.current_device()
+    core = _counter()
+    count = core._count
+    copy = _copy_op.build(count)
+    rows = MAX_ROWS
+    k = SimpleNamespace(
+        slots=[_slot(dev) for _ in range(2)],
+        xq=torch.zeros((rows, HIDDEN // 2), dtype=torch.uint8, device=dev),
+        xsf=torch.zeros((rows, HIDDEN // 16), dtype=torch.uint8, device=dev),
         # The padded counts ROWS reach: 128 and 256 (the routing kernel's other buckets
         # are minutes of compile and unreachable here).
         routing=_routing_op.build((128, 256), dev),
+        experts=None,
         pair=_experts_op.build_prefill_pair(
             HIDDEN, INTER, LOCAL, dev, fc1_kblk=FC1_KBLK, fc2_kblk=FC2_KBLK
         ),
         pair_rep=None,
         topk_pre_rep=None,
+        ctx_hot_ids={},
         router_pre=_router_op.build_prefill(dev),
         topk_pre=_topk_op.build_prefill(dev),
-        # As `_build_moe` builds them at MTP3 / MTP5 (no L2 prefetch here: no counts); the
-        # one-plane top-k is what it builds when the wide router does not build.
+        quant_pre=_quant_op.build_prefill(dev),
+        zero_pre=_zero_op.build_prefill(dev),
+        merge=_merge_op.build(dev),
+        quant={},
+        zero={},
+        # No L2 prefetch here: no counts.
+        pf=None,
+        topk={},
+        topk_rep={},
+        dec_hot_ids={},
+        dec_hot_none=None,
+        topk_sig={},
+        # As `build_kernels` builds them at MTP3 / MTP5; the one-plane top-k (`topk_wide1`
+        # below) is what it builds when the wide router does not build.
         router_wide=_router_op.build_wide(dev),
         topk_wide={
             r: _topk_op.build_wide(r[1], _router_op.SPLIT_K, dev) for r in _topk_op.WIDE_RANGES
         },
-        topk_wide1={r: _topk_op.build_wide(r[1], 1, dev) for r in _topk_op.WIDE_RANGES},
-        quant_pre=_quant_op.build_prefill(dev),
-        zero_pre=_zero_op.build_prefill(dev),
-        merge=_merge_op.build(dev),
-        experts=None,
-        topk={},
-        topk_rep={},
-        quant={},
-        zero={},
+        topk_wide_rep={},
         router={},
     )
-    core.op = SimpleNamespace(
-        rows=_ops.Rows(core), comm=_ops.Comm(core), gemm=_ops.Gemm(core),
-        indexer=_ops.Indexer(core), moe=_ops.Moe(core), mtp=_ops.Mtp(core),
+    router_proj = _proj.build(
+        "router", cells={}, mtp_cells={}, prefill=None, mxf8=None, dec8=None, dec8w=None,
+        wide_bucket=False, copy=copy, count=count,
     )  # fmt: skip
+    # MTP3: decode steps above 64 rows run unpadded (`routed_moe.decode_exact`).
+    h = _routed_moe.build(
+        k,
+        expert_offset=OFFSET,
+        routed_scale=ROUTED_SCALE,
+        n_group=1,
+        topk_group=1,
+        topk=TOP_K,
+        num_layers=NUM_LAYERS,
+        wide_cells=True,
+        dec_unpad=True,
+        acc_padded=True,
+        router_proj=router_proj,
+        route=_sigmoid_topk_op.build(count, False),
+        copy=copy,
+        add=_add_op.build(count, False),
+        count=count,
+    )
     stacks = _experts()
-    st = SimpleNamespace(core=core, layers=[_layer_weights(i, stacks) for i in LAYERS])
+    st = SimpleNamespace(
+        core=core,
+        h=h,
+        topk_wide1={r: _topk_op.build_wide(r[1], 1, dev) for r in _topk_op.WIDE_RANGES},
+        parity=_routed_moe.SlotParity(),
+        fence=_fence_op.build(dev, "moe_shared_after_ar", count),
+        side=torch.cuda.Stream(device=dev),
+        layers=[_layer_weights(i, stacks) for i in LAYERS],
+        # The prequant window each decode Target passes its pre-MoE collective (`on_load`).
+        wide_quant_rows=_quant_rows(WideDecodeTarget, True, k),
+        decode_quant_rows=_quant_rows(DecodeTarget, True, k),
+    )
     _STATE["state"] = st
     return st
 
 
-def prequantize(core, x, m, rows: int) -> None:
+def prequantize(st, x, m, rows: int) -> None:
     """Stand in for the pre-MoE collective's NVFP4 epilogue on one GPU: the routed experts'
     prefill quantize of `x` into `xq` / `xsf`, the bytes the collective writes there."""
-    k = core._moe_k
-    _quant_op.cute_dsl_moe_quantize_nvfp4(
-        x, m.g1, core._moe_xq[:rows], core._moe_xsf[:rows], k.quant_pre
-    )
+    k = st.h.k
+    _quant_op.cute_dsl_moe_quantize_nvfp4(x, m.g1, k.xq[:rows], k.xsf[:rows], k.quant_pre)
 
 
 def moe_layer(
-    core, x, partial, m, rows: int, layer: int, decode: bool = False, prequant: bool = False
+    st, x, partial, m, rows: int, layer: int, decode: bool = False, prequant: bool = False
 ):
     """A trunk MoE layer from the pre-MoE collective's output `x` on, at a row count above 64
     (no decode L2 prefetch), as the wide decode target (`decode`: `WideDecodeTarget.forward`)
     or the prefill target (`PrefillTarget._mlp_and_close`) runs it. `prequant`: the
     collective also wrote the routed experts' NVFP4 input (an exact decode step,
     `allreduce_add_rmsnorm_quant`); otherwise it wrote none. The shared expert's result is
-    `partial`, copied on the side stream into the buffer its GEMM writes: the routed output when
-    `Moe.open_layer` hands one out, else a fresh tensor that `Moe.combine` merges after.
+    `partial`, copied on the side stream into the buffer its GEMM writes: the routed output
+    when `moe_open` hands one out, else a fresh tensor that `moe_combine` merges after.
     Returns `(mlp_out, slot)`."""
-    op = core.op
-    exact = decode and op.moe.wide_exact(rows)
-    began, acc = op.moe.open_layer(rows, exact)
-    assert began == (rows <= _ops._MOE_MAX_T)
-    slot = op.moe.slot
+    h = st.h
+    exact = decode and _routed_moe.moe_exact(rows, h)
+    pf = _routed_moe.moe_l2_prefetch(layer, m, rows, exact, h)
+    assert pf is None, "no decode L2 prefetch above 64 rows"
+    slot, acc = _routed_moe.moe_open(rows, exact, h, st.parity)
+    assert (slot is not None) == (rows <= MAX_ROWS)
     main = torch.cuda.current_stream()
-    side = core._side_stream
+    side = st.side
     side.wait_stream(main)
     with torch.cuda.stream(side):
-        _fence_op.order_fence(exact, core._shared_fence)
+        _fence_op.order_fence(exact, st.fence)
         shared = acc if acc is not None else torch.empty_like(partial)
-        op.rows.copy(shared, partial)
-    routed = op.moe.routed(
-        _ops.Phase(wide=True) if decode else _ops.PREFILL, x, m, rows, prequant,
-        side if acc is not None else None, began, acc is not None, layer, exact,
-    )  # fmt: skip
+        _copy_op.row_copy(shared, partial, h.copy)
+    ph = _step.Phase(wide=True) if decode else _step.PREFILL
+    quantized = _routed_moe.moe_quantize_first(x, m, prequant, h)
+    logits, in_slot = _routed_moe.moe_router(ph, x, m, slot, exact, h)
+    routing = _routed_moe.moe_topk(logits, in_slot, m, slot, layer, exact, h)
+    routed = _routed_moe.moe_experts(x, routing, m, quantized, slot, acc, side, pf, layer, exact, h)
     if acc is None:
-        # `Moe.combine` takes the merge kernel only on these; anything else would add instead.
-        assert core._moe_k.merge is not None and 64 < rows <= _ops._MOE_MAX_T
+        # `moe_combine` takes the merge kernel only on these; anything else would add instead.
+        assert h.k.merge is not None and 64 < rows <= MAX_ROWS
         assert routed.shape == shared.shape and routed.is_contiguous() and shared.is_contiguous()
-    return op.moe.combine(routed, shared, acc, rows, main, side), slot
+    return _routed_moe.moe_combine(routed, shared, acc, rows, main, side, h), slot
 
 
 def fill(inputs, rows: int, tag: str) -> None:
@@ -325,23 +399,24 @@ def fill(inputs, rows: int, tag: str) -> None:
         p.copy_((torch.randn(rows, HIDDEN, generator=g, device="cuda") * 0.5).to(torch.bfloat16))
 
 
-def _snapshot(core, results, rows: int, exact: bool) -> dict:
+def _snapshot(st, results, rows: int, exact: bool) -> dict:
     """Everything the step wrote that the next step overwrites: per layer its output, router
     logits, top-k weights and ids (as FC2 read them: padded rows included), and maps in
     canonical form; the NVFP4 input of the last layer (one buffer for both)."""
-    padded = core.op.moe.padded_rows(rows, exact)
+    k = st.h.k
+    padded = _routed_moe.padded_rows(rows, st.h, exact)
     snap = {}
     for j, (out, slot) in enumerate(results):
-        s = core._moe_slots[slot]
+        s = k.slots[slot]
         snap[f"out{j}"] = out.clone()
         snap[f"logits{j}"] = s.logits[:rows].clone()
         snap[f"partials{j}"] = s.router_wide_out[:rows].clone()
         snap[f"w{j}"] = s.w[:padded].clone()
         snap[f"ids{j}"] = s.sel[: padded * TOP_K].clone()
-        for k, t in _routing_op.canonical_maps(s.maps, padded * TOP_K).items():
-            snap[f"maps{j}.{k}"] = t
-    snap["xq"] = core._moe_xq[:padded].clone()
-    snap["xsf"] = core._moe_xsf[:padded].clone()
+        for key, t in _routing_op.canonical_maps(s.maps, padded * TOP_K).items():
+            snap[f"maps{j}.{key}"] = t
+    snap["xq"] = k.xq[:padded].clone()
+    snap["xsf"] = k.xsf[:padded].clone()
     return snap
 
 
@@ -362,11 +437,11 @@ def _compare(got: dict, want: dict) -> None:
             assert torch.equal(got[k], want[k]), f"{k}: replay differs from eager"
 
 
-def _check_reference(core, snap: dict, partial, m, rows: int, exact: bool) -> None:
+def _check_reference(st, snap: dict, partial, m, rows: int, exact: bool) -> None:
     """The last layer's eager output against the fp32 reference of the grouped GEMMs on the
     maps, weights and NVFP4 input the step wrote, onto the shared partial (accumulated by
     FC2, or merged after a padded launch). The experts test's band: 32 ulp, 2 RMS."""
-    padded = core.op.moe.padded_rows(rows, exact)
+    padded = _routed_moe.padded_rows(rows, st.h, exact)
     j = len(LAYERS) - 1
     maps = {k: snap[f"maps{j}.{k}"] for k in _routing_op.MAP_KEYS}
     xq, xsf, w = snap["xq"], snap["xsf"], snap[f"w{j}"]
@@ -376,7 +451,7 @@ def _check_reference(core, snap: dict, partial, m, rows: int, exact: bool) -> No
         initial = torch.zeros(padded, HIDDEN, dtype=torch.bfloat16, device="cuda")
     ref = _experts_op.cute_dsl_moe_nvfp4_experts.reference(
         xq, xsf, maps, w, m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s, m.norm_const, m.alpha1,
-        m.alpha2, initial, None, None, None, core._moe_k.pair,
+        m.alpha2, initial, None, None, None, st.h.k.pair,
     )  # fmt: skip
     if padded != rows:
         ref = (ref[:rows].float() + partial.float()).to(torch.bfloat16)
@@ -426,17 +501,17 @@ def _refuse_quant(*args, **kwargs):
     raise AssertionError("the routed experts quantized a step the collective prequantized")
 
 
-def _refuse_stage(core, monkeypatch) -> None:
-    """Make a copy into a slot's staged activation (`s.x`) raise: a prequantized step has
-    nothing to stage. Every other copy goes through."""
-    staged = {s.x.data_ptr() for s in core._moe_slots}
-    copy = core.op.rows.copy
+def _refuse_stage(st, monkeypatch) -> None:
+    """Make the routed ops' copy into a slot's staged activation (`s.x`) raise: a
+    prequantized step has nothing to stage. Every other copy goes through."""
+    staged = {s.x.data_ptr() for s in st.h.k.slots}
+    copy = _routed_moe.row_copy
 
-    def guarded(dst, src):
+    def guarded(dst, src, handle):
         assert dst.data_ptr() not in staged, "a prequantized step staged its activation"
-        return copy(dst, src)
+        return copy(dst, src, handle)
 
-    monkeypatch.setattr(core.op.rows, "copy", guarded)
+    monkeypatch.setattr(_routed_moe, "row_copy", guarded)
 
 
 def layer_inputs(rows: int) -> list:
@@ -450,8 +525,8 @@ def run_step(st, inputs, rows: int, decode: bool, prequant: bool) -> list:
     results = []
     for (x, p), m, i in zip(inputs, st.layers, LAYERS):
         if prequant:
-            prequantize(st.core, x, m, rows)
-        results.append(moe_layer(st.core, x, p, m, rows, i, decode, prequant))
+            prequantize(st, x, m, rows)
+        results.append(moe_layer(st, x, p, m, rows, i, decode, prequant))
     return results
 
 
@@ -465,22 +540,25 @@ def test_capture_replays_match_eager(rows: int, path: str, monkeypatch) -> None:
     the prequantized path the routed experts neither stage nor quantize."""
     st = state()
     core = st.core
+    k = st.h.k
     decode, built, prequant = PATHS[path]
-    exact = decode and core.op.moe.decode_exact(rows)
+    exact = decode and _routed_moe.decode_exact(rows, st.h)
     assert exact == decode, "every row count here is a wide decode width at MTP3"
-    # `exact` without the prequant is the target's path for exact rows past
-    # `_MOE_PREQUANT_WIDE_MAX` (257..512), and what MTP3 / MTP5 ran before it widened.
-    assert not prequant or rows <= core._prequant_rows(exact), "the gate refuses this path"
+    # `exact` without the prequant is the target's path for exact rows past its prequant
+    # window (`wide_decode._PREQUANT_MAX_ROWS`: 257..512), and what MTP3 / MTP5 ran before it
+    # widened.
+    window = st.wide_quant_rows if exact else st.decode_quant_rows
+    assert not prequant or rows <= window, "the gate refuses this path"
     if exact:
-        monkeypatch.setattr(_ops, "cute_dsl_moe_routing", _refuse)
-        monkeypatch.setattr(_ops, "cute_dsl_moe_zero", _refuse)
+        monkeypatch.setattr(_routed_moe, "cute_dsl_moe_routing", _refuse)
+        monkeypatch.setattr(_routed_moe, "cute_dsl_moe_zero", _refuse)
     if prequant:
-        monkeypatch.setattr(_ops, "cute_dsl_moe_quantize_nvfp4", _refuse_quant)
-        _refuse_stage(core, monkeypatch)
+        monkeypatch.setattr(_routed_moe, "cute_dsl_moe_quantize_nvfp4", _refuse_quant)
+        _refuse_stage(st, monkeypatch)
     if built != "full":
-        monkeypatch.setattr(core._moe_k, "router_wide", None)
-        topk = core._moe_k.topk_wide1 if built == "topk1" else {}
-        monkeypatch.setattr(core._moe_k, "topk_wide", topk)
+        monkeypatch.setattr(k, "router_wide", None)
+        topk = st.topk_wide1 if built == "topk1" else {}
+        monkeypatch.setattr(k, "topk_wide", topk)
     hits = dict(core.route_hits)
     inputs = layer_inputs(rows)
 
@@ -513,14 +591,14 @@ def test_capture_replays_match_eager(rows: int, path: str, monkeypatch) -> None:
         fill(inputs, rows, f"replay {rows} {rep}")
         graph.replay()
         torch.cuda.synchronize()
-        got = _snapshot(core, results, rows, exact)
+        got = _snapshot(st, results, rows, exact)
         eager = step()
         torch.cuda.synchronize()
-        want = _snapshot(core, eager, rows, exact)
+        want = _snapshot(st, eager, rows, exact)
         assert [s for _, s in eager] == [s for _, s in results], "slot parity drifted"
         _compare(got, want)
         _assert_not_degenerate(want, rows)
-        _check_reference(core, want, inputs[-1][1], st.layers[-1], rows, exact)
+        _check_reference(st, want, inputs[-1][1], st.layers[-1], rows, exact)
 
 
 @pytest.mark.parametrize("rows", ROWS)
@@ -531,14 +609,13 @@ def test_prequant_matches_the_quantizing_path(rows: int, monkeypatch) -> None:
     weights and ids, the canonical maps, the NVFP4 input FC1 reads -- equal bit for bit, and
     FC2's output within the replay band (its bf16 atomics add in a run-dependent order)."""
     st = state()
-    core = st.core
     inputs = layer_inputs(rows)
     fill(inputs, rows, f"prequant {rows}")
-    want = _snapshot(core, run_step(st, inputs, rows, True, False), rows, True)
+    want = _snapshot(st, run_step(st, inputs, rows, True, False), rows, True)
     torch.cuda.synchronize()
-    monkeypatch.setattr(_ops, "cute_dsl_moe_quantize_nvfp4", _refuse_quant)
-    _refuse_stage(core, monkeypatch)
-    got = _snapshot(core, run_step(st, inputs, rows, True, True), rows, True)
+    monkeypatch.setattr(_routed_moe, "cute_dsl_moe_quantize_nvfp4", _refuse_quant)
+    _refuse_stage(st, monkeypatch)
+    got = _snapshot(st, run_step(st, inputs, rows, True, True), rows, True)
     torch.cuda.synchronize()
     _compare(got, want)
     _assert_not_degenerate(want, rows)
@@ -547,33 +624,35 @@ def test_prequant_matches_the_quantizing_path(rows: int, monkeypatch) -> None:
 def test_prequant_only_on_decode_widths_and_wide_decode_steps() -> None:
     """The collective writes the routed experts' NVFP4 input at 1..64 rows in every
     configuration, as before; above 64 only on an MTP3 / MTP5 decode step's exact rows up to
-    256 (the window `WideDecodeTarget.forward` passes, `_quant_rows_wide`). MTP1, no
-    speculation and every context step keep the plain collective above 64 rows."""
-    core = state().core
-    try:
-        for draft_len in (0, 1, 3, 5):
-            core.max_draft_len = draft_len
-            core.wide_cells = core.max_draft_len > 1
-            for decode in (False, True):
-                # The Target the step routes to (`_select_target`) and the window it passes.
-                got = [
-                    r
-                    for r in range(1, _ops._MOE_MAX_T + 1)
-                    if r <= core._prequant_rows(decode and core.wide_cells and r > 64)
-                ]
-                wide = list(range(65, 257)) if decode and draft_len > 1 else []
-                assert got == list(range(1, 65)) + wide, (draft_len, decode)
-    finally:
-        core.max_draft_len = 3
-        core.wide_cells = core.max_draft_len > 1
+    256 (the window `WideDecodeTarget.on_load` computes, `_quant_rows`). MTP1, no speculation
+    and every context step keep the plain collective above 64 rows."""
+    k = state().h.k
+    for draft_len in (0, 1, 3, 5):
+        wide_cells = draft_len > 1
+        windows = {
+            cls: _quant_rows(cls, wide_cells, k)
+            for cls in (PrefillTarget, DecodeTarget, WideDecodeTarget)
+        }
+        for decode in (False, True):
+
+            def target(r: int):
+                # The Target the step routes to (`_select_target`).
+                if not decode:
+                    return PrefillTarget
+                return WideDecodeTarget if wide_cells and r > DECODE_MAX_ROWS else DecodeTarget
+
+            got = [r for r in range(1, MAX_ROWS + 1) if r <= windows[target(r)]]
+            wide = list(range(65, 257)) if decode and draft_len > 1 else []
+            assert got == list(range(1, 65)) + wide, (draft_len, decode)
 
 
 def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypatch) -> None:
     """`allreduce_add_rmsnorm_quant` calls the quant entry exactly up to the window its Target
-    passes (`_prequant_rows`: 64, or 256 on a wide decode step's exact rows), into the first
+    passes (`_quant_rows`: 64, or 256 on a wide decode step's exact rows), into the first
     `rows` rows of the routed experts' `xq` / `xsf` (the buffers FC1 reads), and the plain
     entry everywhere else. The entries are recorded, not run: one GPU has no collective."""
-    core = state().core
+    st = state()
+    k = st.h.k
     calls = []
 
     def quant(partial, residual, weight, g1, out, xq, xsf, workspace):
@@ -586,8 +665,8 @@ def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypat
 
     monkeypatch.setattr(_arq_op, "cute_dsl_allreduce_add_rmsnorm_quant_nvfp4", quant)
     monkeypatch.setattr(_arn_op, "cute_dsl_allreduce_add_rmsnorm", plain)
-    lamport = SimpleNamespace(max_rows=_ops._MOE_MAX_T, fused_twoshot_x8=None)
-    handle = _arq_op.build(_ar_op.build(lamport, core._count), core._moe_xq, core._moe_xsf)
+    lamport = SimpleNamespace(max_rows=MAX_ROWS, fused_twoshot_x8=None)
+    handle = _arq_op.build(_ar_op.build(lamport, st.core._count), k.xq, k.xsf)
     bf = {"dtype": torch.bfloat16, "device": "cuda"}
     weight = torch.ones(HIDDEN, **bf)
     g1 = torch.ones(1, dtype=torch.float32, device="cuda")
@@ -599,8 +678,9 @@ def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypat
     for rows, exact, want in cases:
         calls.clear()
         partial, residual = torch.zeros(rows, HIDDEN, **bf), torch.zeros(rows, HIDDEN, **bf)
+        window = st.wide_quant_rows if exact else st.decode_quant_rows
         _, x8, pre = _arq_op.allreduce_add_rmsnorm_quant(
-            partial, residual, weight, g1, handle, core._prequant_rows(exact)
+            partial, residual, weight, g1, handle, window
         )
         assert (pre is not None) == want and x8 is None, (rows, exact)
         if not want:
@@ -608,7 +688,7 @@ def test_reduce_norm_quant_writes_the_routed_input_where_the_gate_says(monkeypat
             continue
         assert calls == [
             (
-                "quant", core._moe_xq.data_ptr(), (rows, HIDDEN // 2), core._moe_xsf.data_ptr(),
+                "quant", k.xq.data_ptr(), (rows, HIDDEN // 2), k.xsf.data_ptr(),
                 (rows, HIDDEN // 16),
             )
         ], (rows, exact, calls)  # fmt: skip
@@ -618,22 +698,13 @@ def test_only_wide_decode_steps_run_exact() -> None:
     """MTP1 and no speculation never run a decode row count unpadded (their decode steps stay
     within 64 rows, and the gate refuses anyway); MTP3 / MTP5 do from 65 up to 512 rows,
     from where every count is exact already."""
-    core = state().core
-    try:
-        for draft_len in (0, 1):
-            core.max_draft_len = draft_len
-            core.wide_cells = core.max_draft_len > 1
-            assert not any(core.op.moe.decode_exact(r) for r in range(1, 1025))
-        for draft_len in (3, 5):
-            core.max_draft_len = draft_len
-            core.wide_cells = core.max_draft_len > 1
-            exact = [r for r in range(1, 1025) if core.op.moe.decode_exact(r)]
-            assert exact == list(range(65, 513))
-            assert all(core.op.moe.padded_rows(r, True) == r for r in exact)
-            assert core.op.moe.padded_rows(192) == 256, "a context step still pads below 513"
-    finally:
-        core.max_draft_len = 3
-        core.wide_cells = core.max_draft_len > 1
+    h = state().h
+    narrow = replace(h, wide_cells=False)
+    assert not any(_routed_moe.decode_exact(r, narrow) for r in range(1, 1025))
+    exact = [r for r in range(1, 1025) if _routed_moe.decode_exact(r, h)]
+    assert exact == list(range(65, 513))
+    assert all(_routed_moe.padded_rows(r, h, True) == r for r in exact)
+    assert _routed_moe.padded_rows(192, h) == 256, "a context step still pads below 513"
 
 
 @pytest.mark.parametrize("decode", (False, True), ids=("pow2", "exact"))
@@ -643,40 +714,39 @@ def test_each_selection_is_routed_on_exactly_one_rank(rows: int, decode: bool) -
     padding rows none: the router and top-k on each rank's window, and the maps FC1 reads
     (the top-k's own at an unpadded count, else the routing kernel's on the padded ids)."""
     st = state()
-    core = st.core
     m = st.layers[0]
     g = torch.Generator(device="cuda").manual_seed(_seed(f"coverage {rows}"))
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
-    exact = decode and core.op.moe.decode_exact(rows)
-    padded = core.op.moe.padded_rows(rows, exact)
+    exact = decode and _routed_moe.decode_exact(rows, st.h)
+    padded = _routed_moe.padded_rows(rows, st.h, exact)
+    ph = _step.Phase(wide=True) if decode else _step.PREFILL
     seen = torch.zeros(padded * TOP_K, dtype=torch.long, device="cuda")
-    try:
-        for offset in (0, 64, 128, 192):
-            core.expert_offset = offset
-            slot = core.op.moe.slot
-            logits = core.op.moe.router(x, m, slot, exact)
-            w, ids, maps = core.op.moe.topk(logits, True, m, slot, LAYERS[0], exact)
-            if padded != rows:
-                pad = torch.full(
-                    (padded - rows, TOP_K), _routing_op.pad_expert_id(offset), dtype=ids.dtype,
-                    device="cuda",
-                )  # fmt: skip
-                s = core._moe_slots[slot]
-                sel = s.sel[: padded * TOP_K]
-                sel.copy_(torch.cat([ids, pad]).reshape(-1))
-                maps = _routing_op.cute_dsl_moe_routing(
-                    sel, offset, s.maps, s.counts, s.barrier, core._moe_k.routing
-                )
-                ids = sel.view(padded, TOP_K)
-            torch.cuda.synchronize()
-            _routing_op.check_maps(maps, ids, offset)
-            tiles = int(maps["num_non_exiting_tiles"][0])
-            limit = maps["tile_idx_to_mn_limit"][:tiles].tolist()
-            p2e = maps["permuted_idx_to_expanded_idx"]
-            for t, hi in enumerate(limit):
-                seen.index_add_(0, p2e[t * TILE : hi].long(), torch.ones(hi - t * TILE, **_i64()))
-    finally:
-        core.expert_offset = OFFSET
+    for offset in (0, 64, 128, 192):
+        h = replace(st.h, expert_offset=offset)
+        slot = st.parity.slot
+        logits, in_slot = _routed_moe.moe_router(ph, x, m, slot, exact, h)
+        assert in_slot, "a router kernel takes every row count here"
+        chosen = _routed_moe.moe_topk(logits, in_slot, m, slot, LAYERS[0], exact, h)
+        ids, maps = chosen.ids, chosen.maps
+        if padded != rows:
+            pad = torch.full(
+                (padded - rows, TOP_K), _routing_op.pad_expert_id(offset), dtype=ids.dtype,
+                device="cuda",
+            )  # fmt: skip
+            s = h.k.slots[slot]
+            sel = s.sel[: padded * TOP_K]
+            sel.copy_(torch.cat([ids, pad]).reshape(-1))
+            maps = _routing_op.cute_dsl_moe_routing(
+                sel, offset, s.maps, s.counts, s.barrier, h.k.routing
+            )
+            ids = sel.view(padded, TOP_K)
+        torch.cuda.synchronize()
+        _routing_op.check_maps(maps, ids, offset)
+        tiles = int(maps["num_non_exiting_tiles"][0])
+        limit = maps["tile_idx_to_mn_limit"][:tiles].tolist()
+        p2e = maps["permuted_idx_to_expanded_idx"]
+        for t, hi in enumerate(limit):
+            seen.index_add_(0, p2e[t * TILE : hi].long(), torch.ones(hi - t * TILE, **_i64()))
     assert bool((seen[: rows * TOP_K] == 1).all()), "a selection is routed on 0 or 2+ ranks"
     assert bool((seen[rows * TOP_K :] == 0).all()), "a padding row is routed"
 

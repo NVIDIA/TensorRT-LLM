@@ -6,15 +6,15 @@ MTP3 / MTP5 decode steps carry 128 / 192 rows (32 sequences x 4 / 6), above the 
 otherwise tell a decode step from a context one. The model routes such a step to its own
 Target (`_select_target(md, rows)`: `WideDecodeTarget`), whose ops run at `Phase(wide=True)`,
 and only then send rows above 64 to the MTP decode cells. What this pins, on a core built
-without weights (`object.__new__`), its ops (`forward_ops`) called at the phase of the Target
-the step routes to, and with every entry replaced by a recorder:
+without weights (`object.__new__`), the ops under `ops/` called on its handles at the phase of
+the Target the step routes to, and with every entry replaced by a recorder:
 
 * no speculation and MTP1 take exactly the paths they took before the MTP cells existed, at
   every row count and phase, even with MTP cells present;
 * MTP3 / MTP5 context steps do too;
 * MTP3 / MTP5 decode steps keep the numerics of the call's 64-row decode path above 64 rows:
   where that is bf16, the MTP cell at 128 / 192 rows, and at any other count up to 192 (a batch
-  of fewer than 32 sequences: 96, 150) the next cell up on the exact rows (`Gemm.wide_cell`: a
+  of fewer than 32 sequences: 96, 150) the next cell up on the exact rows (`projection.wide_cell`: a
   re-pinned projection runner, the K-B object itself, the runtime-M indexer split); with
   `_wide_bucket` off bf16 elsewhere (the prefill GEMM, or cuBLAS where a projection has no
   prefill entry); never the MXF8 context GEMM; where it is the decode MXF8 GEMM (the trunk
@@ -36,19 +36,22 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     decode as DT,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    forward_ops as F,
-)
-from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     modeling as M,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     prefill as PT,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    step as S,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
     wide_decode as W,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.activation import (  # noqa: E402, E501
     cute_dsl_swiglu_rows as SR,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
+    indexer as IX,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention import (  # noqa: E402, E501
     mla_rope as MR,
@@ -69,10 +72,19 @@ from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__t
     indexer_fold as IF,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    indexer_pre_proj as IPP,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
+    mtp_eh_proj as EH,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
     projection as P,
 )
 from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm import (  # noqa: E402, E501
     shared_mlp as SM,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe import (  # noqa: E402, E501
+    routed_moe as RM,
 )
 
 BF16 = torch.bfloat16
@@ -119,8 +131,8 @@ def core_for(monkeypatch):
     monkeypatch.setattr(M, "cute_dsl_projection", projection)
     # A cell re-pinned to fewer rows (`_projection_op.at_rows`): the cell's tag plus the rows.
     # Read when the handles are built (`_build_gemm_handles`, by `_step`).
-    monkeypatch.setattr(F._projection_op, "at_rows", lambda r, rows: _runner(f"{r.tag}@{rows}"))
-    for mod in (P, F):
+    monkeypatch.setattr(P._projection_op, "at_rows", lambda r, rows: _runner(f"{r.tag}@{rows}"))
+    for mod in (P, EH):
         monkeypatch.setattr(mod, "cute_dsl_projection_mxf8", record(lambda *a, **k: "mxf8"))
     monkeypatch.setattr(
         P, "cute_dsl_projection_mxf8_decode", record(lambda x, w, out, r, pre=False: r.tag)
@@ -130,17 +142,22 @@ def core_for(monkeypatch):
     monkeypatch.setattr(AB, "bmm_out", record(lambda *a: "bmm_out"))
     # A fold's plain-projection fallback (`indexer_fold`): the fold tests see only the fold.
     monkeypatch.setattr(IF, "projection", lambda *a, **k: None)
-    monkeypatch.setattr(F, "cute_dsl_indexer_pre_proj_split", record(lambda x, w, kb, wq, h: h.tag))
-    monkeypatch.setattr(SM, "cute_dsl_shared_gate_up_swiglu", record(lambda x, w, o, r: r.tag))
-    monkeypatch.setattr(F, "cute_dsl_mtp_norm_shard", record(lambda *a: "norm_shard"))
     monkeypatch.setattr(
-        F, "cute_dsl_mtp_eh_proj", lambda local, w, r: calls.append("ksplit" if r is None else r)
+        IPP, "cute_dsl_indexer_pre_proj_split", record(lambda x, w, kb, wq, h: h.tag)
     )
-    # The K-split re-pinned to fewer rows (`_mtp_eh.at_rows`): tagged with the rows.
-    monkeypatch.setattr(F._mtp_eh, "at_rows", lambda r, rows: f"ksplit@{rows}")
-    monkeypatch.setattr(F, "cute_dsl_mtp_eh_norm_cat_mxf8", record(lambda *a: "eh_norm_cat8"))
-    monkeypatch.setattr(F._eh8_op, "supports", lambda e, h: True)
-    monkeypatch.setattr(F._eh8_op, "operand", lambda rows, dev: (None, None))
+    monkeypatch.setattr(SM, "cute_dsl_shared_gate_up_swiglu", record(lambda x, w, o, r: r.tag))
+    monkeypatch.setattr(EH, "cute_dsl_mtp_norm_shard", record(lambda *a: "norm_shard"))
+    monkeypatch.setattr(EH, "cute_dsl_mtp_eh_proj", lambda local, w, r: calls.append(r))
+    # The K-split re-pinned to fewer rows (`_mtp_eh.at_rows`): tagged with the rows. Read when
+    # the front end's handle is built (`_eh_front`).
+    monkeypatch.setattr(EH._mtp_eh, "at_rows", lambda r, rows: f"ksplit@{rows}")
+    monkeypatch.setattr(EH, "cute_dsl_mtp_eh_norm_cat_mxf8", record(lambda *a: "eh_norm_cat8"))
+    monkeypatch.setattr(EH._eh8_op, "supports", lambda e, h: True)
+    monkeypatch.setattr(EH._eh8_op, "operand", lambda rows, dev: (torch.zeros(rows, 1), None))
+    # The front end's collective, norms and concat copies: identities.
+    monkeypatch.setattr(EH, "allreduce", lambda t, h: t)
+    monkeypatch.setattr(EH, "hidden_rmsnorm", lambda x, *a: x)
+    monkeypatch.setattr(EH, "row_copy", lambda dst, src, h: dst)
     # A new contiguous tensor, as the real SwiGLU returns (the down GEMM's paths check it).
     monkeypatch.setattr(
         SR, "flashinfer_silu_and_mul", lambda t: t[:, : t.shape[1] // 2].contiguous()
@@ -161,10 +178,9 @@ def core_for(monkeypatch):
         core.tp_rank, core.eps = 0, 1e-5
         core.idx_heads, core.idx_dim = 32, 128
         core._rows = core._build_row_ops(compile=False)
-        core.op = _ops(core)
-        core.op.comm.reduce = lambda t: t
-        core.op.rows.rmsnorm = lambda x, w: x
-        core.op.rows.copy = lambda dst, src: dst
+        # The indexer's cross-step state: the K update's slot mappings not yet validated.
+        core._ix_state = IX.IndexerState()
+        core._lm_head_at_rows = {}
         # The trunk layers' decode MXF8 GEMMs (taken with a decode weight `wd8`, up to 64 rows),
         # and the trunk o_proj's wide one (MTP3 / MTP5 decode rows 65..192; present for every
         # engine, as a path an engine must not take).
@@ -204,12 +220,70 @@ def core_for(monkeypatch):
     return build
 
 
-def _ops(core) -> SimpleNamespace:
-    """The core's ops, as its `__init__` builds them (`core.op`)."""
-    return SimpleNamespace(
-        rows=F.Rows(core), comm=F.Comm(core), gemm=F.Gemm(core),
-        indexer=F.Indexer(core), moe=F.Moe(core), mtp=F.Mtp(core), ctx=F.Ctx(core),
+def _project(core, ph, name: str, x, w, **kw):
+    """`projection` on the core's `name` handle, as the Targets call it."""
+    return P.projection(ph, x, w, getattr(core._proj_h, name), **kw)
+
+
+def _ix_handle(core) -> IX.IndexerHandle:
+    """The indexer ops' handle over the core's split / q-side / K-update tables, as
+    `_build_ix_handle` builds it (`indexer_pre_proj.compile_cells`' kernels from the tables)."""
+    pre = core._ix_pre_split_pre
+    kernels = SimpleNamespace(
+        cells=core._ix_pre_split,
+        mtp_cells=core._ix_pre_split_mtp,
+        ragged=core._ix_pre_split_rag,
+        prefill=pre,
+        unsplit=pre is not None and core._ix_nosplit,
+    )
+    pre_proj = IPP.build(
+        kernels, core._proj_h.ix_fused, core.idx_dim, core.idx_heads, core._wide_bucket,
+        core._rows.copy, core._count,
     )  # fmt: skip
+    ix_kernels = SimpleNamespace(
+        q_side=core._ix_qside_compiled,
+        q_side_p160=getattr(core, "_ix_qside_compiled_p160", None),
+        q_side_k=getattr(core, "_ix_qk_compiled", {}),
+        k_update=getattr(core, "_ix_k_compiled", {}),
+        topk_decode={},
+        gvr=None,
+        topk_prefill=None,
+    )
+    return IX.build(
+        ix_kernels, pre_proj=pre_proj, ix_qb=core._proj_h.ix_qb,
+        cos_sin=getattr(core, "_idx_cos_sin", None),
+        weight_scale=getattr(core, "idx_weight_scale", 1.0),
+        is_neox=getattr(core, "indexer_is_neox", False), rope_dim=getattr(core, "rope_dim", 64),
+        heads=core.idx_heads, dim=core.idx_dim, top_k=2048, max_ctx_len=0,
+        copy=core._rows.copy, count=core._count,
+    )  # fmt: skip
+
+
+def _ix_front(core, ph, x, q_a, ix, need_q: bool, kw=None, ixq=None, kc=None):
+    """The indexer front as the Targets call it: `indexer_pre_proj` (keys and head weights, or
+    the caller's `kw`), then where the step selects (`need_q`) `indexer_q_side` with the
+    layer's cache `kc = (md, k_pool)`. Returns `(q_fp8, weights, kb)`: `kb` the keys for
+    `indexer_write_k`, None where the q side wrote them."""
+    h = _ix_handle(core)
+    kb, wq = IPP.indexer_pre_proj(ph, x, getattr(ix, "fused", None), ix.fused_bf16, kw, h.pre_proj)
+    if not need_q:
+        return None, None, kb
+    md, pool = kc if kc is not None else (None, None)
+    return IX.indexer_q_side(
+        ph, q_a, ixq, ix.qb, None, wq, kb, ix.kn_w, ix.kn_b, md, pool, core._ix_state, h
+    )
+
+
+def _eh_front(core, ph, e, hs):
+    """The MTP front end as the Targets call it (`mtp_eh_norm`, then `mtp_eh_proj`), on a
+    handle over the core's tables with a K-split runner tagged "ksplit"."""
+    h = EH.build(
+        ehproj="ksplit", eh_local=None, norm_shard=None, tp_rank=core.tp_rank, enorm=None,
+        hnorm=None, eh=core._mtp["eh"], eps=core.eps, eh8=core._mtp_eh8,
+        proj=core._proj_h.mtp_eh, norm=core._rows.norm, copy=core._rows.copy, comm=None,
+        wide_bucket=core._wide_bucket, count=core._count,
+    )  # fmt: skip
+    return EH.mtp_eh_proj(ph, EH.mtp_eh_norm(ph, e, hs, h), h)
 
 
 def _absorb(core, kind: str) -> AB.AbsorbedBmmHandle:
@@ -244,7 +318,7 @@ def _wide(max_draft_len: int, decode: bool, rows: int) -> bool:
     return decode and max_draft_len > 1 and rows > 64
 
 
-def _step(core, decode: bool, rows: int) -> F.Phase:
+def _step(core, decode: bool, rows: int) -> S.Phase:
     """Route a step of `rows` rows the way the engine's forward does (`_select_target`: a
     context step to prefill, an MTP3 / MTP5 decode step above 64 rows to the wide decode
     Target, any other decode step to the decode Target), and return the `Phase` the chosen
@@ -255,7 +329,7 @@ def _step(core, decode: bool, rows: int) -> F.Phase:
     target = core._select_target(SimpleNamespace(num_contexts=0 if decode else 2), rows)
     want = "wide" if _wide(core.max_draft_len, decode, rows) else "decode" if decode else "prefill"
     assert target == want, (core.max_draft_len, decode, rows, target)
-    return {"prefill": F.PREFILL, "decode": M.DecodeTarget(core).phase, "wide": W._WIDE}[target]
+    return {"prefill": S.PREFILL, "decode": M.DecodeTarget(core).phase, "wide": W._WIDE}[target]
 
 
 @pytest.mark.parametrize("wide_env", (True, False))
@@ -282,9 +356,9 @@ def test_select_target(max_draft_len, contexts, rows, wide_env) -> None:
         assert got == "decode"
     for cell_up in (True, False):
         core.dec_cell_up = max_draft_len > 1 and cell_up
-        want = F.Phase(up="decode") if max_draft_len > 1 and cell_up else F.PREFILL
+        want = S.Phase(up="decode") if max_draft_len > 1 and cell_up else S.PREFILL
         assert M.DecodeTarget(core).phase == want
-    assert W._WIDE == F.Phase(wide=True)
+    assert W._WIDE == S.Phase(wide=True)
 
 
 def _cell(max_draft_len: int, decode: bool, rows: int, bucket: bool) -> int | None:
@@ -324,7 +398,7 @@ def test_projections(core_for, max_draft_len, decode, rows, bucket, wide8) -> No
         ("ix_qb", None, None, "cublas"),
     ):
         calls.clear()
-        core.op.gemm.project(ph, name, x, w, w8=w8, wd8=wd8)
+        _project(core, ph, name, x, w, w8=w8, wd8=wd8)
         if rows <= 64:
             want = "dec_mxf8" if wd8 is not None else f"{name}@64"
         elif wd8 is not None and w8 is not None:
@@ -356,7 +430,8 @@ def test_dense_mlp_and_bmm_and_indexer_split(core_for, max_draft_len, decode, ro
     cell = _cell(max_draft_len, decode, rows, bucket)
     wide = _wide(max_draft_len, decode, rows)
     x = _aligned(rows, 16)
-    assert core.op.gemm.mxf8_takes(ph, "dense_gate_up", x, object()) == (rows > 64 and not wide)
+    takes = P.mxf8_takes(ph, x, object(), None, core._proj_h.dense_gate_up)
+    assert takes == (rows > 64 and not wide)
 
     calls.clear()
     a = torch.zeros(16, rows, 8, dtype=BF16)
@@ -367,7 +442,7 @@ def test_dense_mlp_and_bmm_and_indexer_split(core_for, max_draft_len, decode, ro
 
     calls.clear()
     ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None)
-    core.op.indexer.project(ph, x, None, None, ix, rows, need_q=False)
+    _ix_front(core, ph, x, None, ix, need_q=False)
     if rows <= 64:
         want = "ix_split@64"
     elif cell == rows:
@@ -427,7 +502,7 @@ def test_mtp_front_eh_proj(core_for, max_draft_len, decode, rows, bucket) -> Non
     ph = _step(core, decode, rows)
     wide = _wide(max_draft_len, decode, rows)
     e = torch.zeros(rows, 16, dtype=BF16)
-    core.op.mtp.front(ph, e, e, rows)
+    _eh_front(core, ph, e, e)
     if rows in (64, 128) or (rows == 192 and wide):
         want = ["norm_shard", "ksplit"]
     elif wide and bucket:
@@ -454,19 +529,19 @@ def test_draft_eager_rows(core_for, monkeypatch, max_draft_len, draft, rows, own
     core, calls = core_for(max_draft_len)
     if own_m:
         monkeypatch.setattr(
-            F._projection_op,
+            P._projection_op,
             "at_rows",
             lambda r, rows: None if r.tag.endswith("@64") else _runner(f"{r.tag}@{rows}"),
         )
     # Off a draft step: a context step's rows (no cell-up rule).
     core._build_gemm_handles()
-    ph = F.DRAFT if draft else _step(core, False, rows)
+    ph = S.DRAFT if draft else _step(core, False, rows)
     eager = draft and rows != 64
     x = _aligned(rows, 160)
     w = torch.zeros(4, 160, dtype=BF16).t()
     for name in ("qkva", "q_b", "o_proj"):
         calls.clear()
-        core.op.gemm.project(ph, name, x, w)
+        _project(core, ph, name, x, w)
         if not eager:
             want = f"{name}@64" if rows == 64 else "cublas"
         else:
@@ -475,13 +550,13 @@ def test_draft_eager_rows(core_for, monkeypatch, max_draft_len, draft, rows, own
 
     calls.clear()
     ix = SimpleNamespace(fused_bf16=None, fused=None, kn_w=None, kn_b=None)
-    core.op.indexer.project(ph, x, None, None, ix, rows, need_q=False)
+    _ix_front(core, ph, x, None, ix, need_q=False)
     want = "ix_split@64" if rows == 64 else "ix_split:rag" if eager else "cublas"
     assert calls == [want], calls
 
     calls.clear()
     e = torch.zeros(rows, 16, dtype=BF16)
-    core.op.mtp.front(ph, e, e, rows)
+    _eh_front(core, ph, e, e)
     if rows in (1, 64):
         want = ["norm_shard", "ksplit"]
     else:
@@ -513,7 +588,7 @@ def test_captured_decode_rows_without_a_cell(
     # compiled for their own M (`at_rows` None): those go to the MTP cell (128).
     core._proj["q_b"][16] = _runner("q_b@16")
     monkeypatch.setattr(
-        F._projection_op,
+        P._projection_op,
         "at_rows",
         lambda r, rows: None if r.tag.endswith("@64") else _runner(f"{r.tag}@{rows}"),
     )
@@ -531,7 +606,7 @@ def test_captured_decode_rows_without_a_cell(
     core._build_gemm_handles()
     for name in ("qkva", "q_b", "ix_qb", "dense_gate_up", "dense_down"):
         calls.clear()
-        core.op.gemm.project(ph, name, x, w)
+        _project(core, ph, name, x, w)
         if rows == 64:
             want = f"{name}@64"
         elif not up or name in P.CELL_UP_KEEPS_CUBLAS:
@@ -545,13 +620,13 @@ def test_captured_decode_rows_without_a_cell(
 
     calls.clear()
     ix = SimpleNamespace(fused_bf16=None, fused=None, kn_w=None, kn_b=None)
-    core.op.indexer.project(ph, x, None, None, ix, rows, need_q=False)
+    _ix_front(core, ph, x, None, ix, need_q=False)
     want = "ix_split@64" if rows == 64 else "ix_split:rag" if up else "cublas"
     assert calls == [want], calls
 
     calls.clear()
     e = torch.zeros(rows, 16, dtype=BF16)
-    core.op.mtp.front(ph, e, e, rows)
+    _eh_front(core, ph, e, e)
     if rows == 64:
         want = ["norm_shard", "ksplit"]
     else:
@@ -575,7 +650,7 @@ def test_captured_decode_rows_without_a_cell(
     assert calls == want, calls
     # The same cells again: kept per (call, rows), frozen for the capture shape.
     calls.clear()
-    core.op.gemm.project(ph, "qkva", x, w)
+    _project(core, ph, "qkva", x, w)
     assert len(calls) == 1
     assert core.route_hits.get("draft_cell", 0) == 0
     if up:
@@ -660,8 +735,9 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
     (o_proj, the collectives, the shared expert, the routed experts, the adds and norms) is
     logged with the stream it was issued on ("side" / "main"). The ops that decide the close's
     path keep their own logic: `allreduce_add_rmsnorm_quant` (which collective, at the window
-    the Target passes), `Moe.wide_exact` / `Moe.open_layer` / `Moe.combine`,
-    `Mtp.wide_exact` / `Mtp.moe`, and `order_fence` (logged as "cut" where it launches). The
+    the Target passes: its `_quant_rows`, from its own `on_load`), `moe_exact` / `moe_open` /
+    `moe_combine`, `mtp_moe_open`, and `order_fence` (logged as "cut" where it launches); the
+    routed experts are logged as "routed" (`moe_experts`; the front ahead of it is a stub). The
     attention ahead of o_proj is a stub."""
     core = object.__new__(M.GlmMoeDsaTep4ModelingV2)
     core.max_draft_len = max_draft_len
@@ -697,7 +773,11 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
     core._pool_layer_id = [0]
     core._mlp = [(None, None), (None, None)]
     core._moe = [SimpleNamespace(g1=None)]
-    core._moe_k = SimpleNamespace(topk_pre=object(), pair=object(), merge=None)
+    # The routed ops' handle: what the exact-rows and accumulate decisions read.
+    core._moe_k = SimpleNamespace(
+        topk_pre=object(), pair=object(), merge=None, topk={}, pf=None,
+        slots=[SimpleNamespace(out=torch.zeros(256, 8, dtype=BF16)) for _ in range(2)],
+    )  # fmt: skip
     core._dense_w8 = []
     core._shared_w8 = [None, None]
     core._shared_gu_il = [None, None]
@@ -706,22 +786,33 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
     core._mtp_out_normed = False
     core._mtp = {"head_norm": None}
     core.mtp_index_share = False
-    # The handles the Targets pass: o_proj's (the recorder logs its name), the collectives'
-    # (the quant op's own window logic runs on them), the order fence's, and the handoffs.
-    core._proj_h = SimpleNamespace(o_proj=SimpleNamespace(name="o_proj"))
+    # The handles the Targets pass: o_proj's (the recorder logs its name; qkva / q_b say no
+    # MXF8 GEMM built, for the Targets' handoff tables), the collectives' (the quant op's own
+    # window logic runs on them), the order fence's, and the routed ops'.
+    core._proj_h = SimpleNamespace(
+        o_proj=SimpleNamespace(name="o_proj"),
+        qkva=SimpleNamespace(mxf8=None),
+        q_b=SimpleNamespace(dec8=None),
+    )
     core._comm = AR.build(SimpleNamespace(max_rows=8192), core._count)
     core._ar_quant = ARQ.build(core._comm, torch.zeros(256, 1), torch.zeros(256, 1))
     core._shared_fence = FENCE.build("cpu", "moe_shared_after_ar", core._count)
     core._dense_h = core._shared_h = None
     core._rows = core._build_row_ops(compile=False)
-    core._mlp_x8, core._close_x8 = [False], [False]
-    core._qb_pre, core._vb_pre = [False, False], [False, False]
+    core._moe_h = RM.build(
+        core._moe_k, expert_offset=0, routed_scale=1.0, n_group=1, topk_group=1, topk=8,
+        num_layers=1, wide_cells=core.wide_cells, dec_unpad=False, acc_padded=True,
+        router_proj=None, route=None, copy=core._rows.copy, add=core._rows.add,
+        count=core._count,
+    )  # fmt: skip
+    core._mtp_moe_h, core._mtp_moe = core._moe_h, object()
+    core._moe_parity = core._mtp_parity = RM.SlotParity()
+    core._mtp_eh_h = None
+    core._ix_h, core._ix_state = None, None
     core._attn_h = SimpleNamespace(
-        **dict.fromkeys(("qkva_fold", "norm", "q_b_fold", "fmha", "k_b", "rope", "v_b"))
+        **dict.fromkeys(("qkva_fold", "q_b_fold", "fmha", "k_b", "rope", "v_b")),
+        norm=SimpleNamespace(q8=None),
     )
-    core._quant_rows, core._quant_rows_wide = core._prequant_rows(False), core._prequant_rows(True)
-    core.op = _ops(core)
-    op = core.op
     # The pre-MoE collective's two kernels inside `allreduce_add_rmsnorm_quant`.
     monkeypatch.setattr(ARQ, "cute_dsl_allreduce_add_rmsnorm_quant_nvfp4", on("ar_quant"))
     monkeypatch.setattr(ARQ, "allreduce_add_rmsnorm", on("ar_x8", lambda out: (out, None)))
@@ -733,6 +824,12 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
         real_fence(launch, handle)
 
     for mod in (DT, W, PT):
+        # The routed experts: their front is a stub, the experts logged.
+        monkeypatch.setattr(mod, "moe_l2_prefetch", lambda *a: None)
+        monkeypatch.setattr(mod, "moe_quantize_first", lambda *a: False)
+        monkeypatch.setattr(mod, "moe_router", lambda *a: (None, False))
+        monkeypatch.setattr(mod, "moe_topk", lambda *a: None)
+        monkeypatch.setattr(mod, "moe_experts", on("routed"))
         monkeypatch.setattr(mod, "embed", lambda ids, w, runner: ids)
         monkeypatch.setattr(mod, "hidden_rmsnorm", on("norm"))
         monkeypatch.setattr(mod, "hidden_add", on("add"))
@@ -742,13 +839,15 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
         monkeypatch.setattr(mod, "shared_gate_up_swiglu", on("shared", lambda out: (out, False)))
         monkeypatch.setattr(mod, "shared_down", lambda ph, act, *a, **k: act)
     monkeypatch.setattr(W, "order_fence", fence)
-    op.rows.embed = lambda ids: ids
-    op.rows.rmsnorm = on("norm")
-    op.rows.add = on("add")
-    op.rows.add_rmsnorm = on("add_norm")
-    op.indexer.topk_buf = lambda *a: None
+    # `moe_combine`'s add where FC2 did not accumulate onto the shared partial.
+    monkeypatch.setattr(RM, "hidden_add", on("add"))
     # The attention ahead of o_proj: its ops pass `x` through and launch nothing.
     for mod in (DT, W):
+        # The MTP front end passes the hidden state through; the head norm is logged.
+        monkeypatch.setattr(mod, "mtp_eh_norm", lambda ph, e, hs, *a: hs)
+        monkeypatch.setattr(mod, "mtp_eh_proj", lambda ph, eh, *a: eh)
+        monkeypatch.setattr(mod, "hidden_add_rmsnorm", on("add_norm"))
+        monkeypatch.setattr(mod, "indexer_topk_buf", lambda *a: None)
         monkeypatch.setattr(mod, "qkva_ix_fold", lambda ph, x, *a: (x, None))
         monkeypatch.setattr(mod, "qkv_a_rmsnorm", lambda qkva, *a: (qkva, qkva, None, False))
         monkeypatch.setattr(mod, "q_b_ix_wq_b", lambda ph, q_a, *a: (q_a, None))
@@ -758,13 +857,12 @@ def _moe_close_core(max_draft_len: int, monkeypatch):
         monkeypatch.setattr(mod, "mla_rope", lambda *a: (None, None, None, None))
         monkeypatch.setattr(mod, "sparse_mla_decode", lambda *a: None)
         monkeypatch.setattr(mod, "v_b", lambda *a: False)
-    op.mtp.front = lambda ph, e, h, rows: h
-    op.moe.pf_fork = lambda *a, **k: None
-    op.moe.begin_layer = lambda rows, exact=False: torch.zeros(rows, 8, dtype=BF16)
-    op.moe.routed = on("routed")
     core._prefill = M.PrefillTarget(core)
     core._decode = M.DecodeTarget(core)
     core._wide = W.WideDecodeTarget(core)
+    # Each Target's handoff table, as `post_load_weights` has them decide it.
+    for target in (core._prefill, core._decode, core._wide):
+        target.on_load()
     return core, log
 
 
@@ -808,7 +906,7 @@ def _from_o_proj(log: list) -> list:
 @pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
 @pytest.mark.parametrize("max_draft_len", ENGINES)
 def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypatch) -> None:
-    """On an MTP3 / MTP5 decode step's exact rows (`Moe.decode_exact`, `WideDecodeTarget`) a
+    """On an MTP3 / MTP5 decode step's exact rows (`routed_moe.decode_exact`, `WideDecodeTarget`) a
     trunk MoE layer and the MTP layer put one plain kernel on the side stream right after its
     fork, ahead of the shared expert (`order_fence`: the shared GEMM then
     cannot launch off the pre-MoE collective's PDL release ahead of the router). Nowhere else:
@@ -820,7 +918,8 @@ def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypa
             _close(core, close, decode, rows)
         if close == "trunk":
             # The pre-MoE collective writes the routed experts' NVFP4 input at decode widths
-            # and on the exact wide rows (`_quant_rows_wide`), else the plain AR + norm.
+            # and on the exact wide rows (`WideDecodeTarget._quant_rows`), else the plain
+            # AR + norm.
             prequant = rows <= 64 or exact
             first = [("o_proj", "main"), ("ar_quant" if prequant else "ar_x8", "main")]
         else:
@@ -838,7 +937,7 @@ def test_moe_close_shared_after_collective(max_draft_len, decode, rows, monkeypa
 def test_mtp_close_output_add_and_head_norm(max_draft_len, decode, rows, monkeypatch) -> None:
     """The MTP layer's output: routed + shared, the closing all-reduce, then the residual add.
     On an MTP3 / MTP5 decode step (its 1-token draft steps' 32 rows included) the residual
-    add and the head norm are one launch (`Rows.add_rmsnorm`, bit for bit the pair: the op's
+    add and the head norm are one launch (`hidden_add_rmsnorm`, bit for bit the pair: the op's
     own test); those engines' context steps keep the two launches, and MTP1 / no speculation
     return the un-normed sum as before."""
     core, log = _moe_close_core(max_draft_len, monkeypatch)
@@ -919,10 +1018,8 @@ def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket
     # Keys and head weights from the caller: no split, no fp32 projection.
     ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None)
     kb = torch.zeros(rows, 128, dtype=BF16)
-    q_fp8, weights, k_pre = core.op.indexer.project(
-        ph, x, None, None, ix, rows, need_q=False, kw=(kb, None)
-    )
-    assert calls == [] and k_pre[0] is kb and q_fp8 is None and weights is None
+    q_fp8, weights, k_pre = _ix_front(core, ph, x, None, ix, need_q=False, kw=(kb, None))
+    assert calls == [] and k_pre is kb and q_fp8 is None and weights is None
 
 
 @pytest.mark.parametrize("built", [True, False], ids=["fold", "fold_off"])
@@ -958,12 +1055,13 @@ def test_q_b_ix_wq_b(core_for, monkeypatch, max_draft_len, decode, rows, bucket,
     calls.clear()
     x = _aligned(rows, 16)
     ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None, qb=None)
-    monkeypatch.setattr(F, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
+    monkeypatch.setattr(IX, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
     core._ix_qside_compiled, core._idx_cos_sin, core.idx_weight_scale = None, None, 1.0
     core.indexer_is_neox = False
     kb = torch.zeros(rows, 128, dtype=BF16)
+    wq = torch.zeros(rows, 32)
     ixq = torch.zeros(rows, 32 * 128, dtype=BF16)
-    core.op.indexer.project(ph, x, x, None, ix, rows, need_q=True, kw=(kb, None), ixq=ixq)
+    _ix_front(core, ph, x, x, ix, need_q=True, kw=(kb, wq), ixq=ixq)
     assert calls == ["q_side"], calls
 
 
@@ -983,11 +1081,11 @@ def test_indexer_q_side_k_cache(
     with keys the launcher cannot load (not 8-byte aligned)."""
     core, calls = core_for(max_draft_len)
     core._ix_qk_compiled = {c: _runner(f"qk:{c}") for c in (False, True)} if built else {}
-    core.op.indexer._k_checked = checked
+    core._ix_state = IX.IndexerState(k_checked=checked)
     ph = _step(core, decode, rows)
-    monkeypatch.setattr(F, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
+    monkeypatch.setattr(IX, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
     monkeypatch.setattr(
-        F, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
+        IX, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
     )
     core._ix_qside_compiled, core._idx_cos_sin, core.idx_weight_scale = None, None, 1.0
     core.indexer_is_neox = False
@@ -1000,9 +1098,8 @@ def test_indexer_q_side_k_cache(
 
     def project(kb, pool):
         calls.clear()
-        return core.op.indexer.project(
-            ph, x, x, None, ix, rows, need_q=True, kw=(kb, None), ixq=ixq, kc=(md, pool)
-        )
+        wq = torch.zeros(rows, 32)
+        return _ix_front(core, ph, x, x, ix, need_q=True, kw=(kb, wq), ixq=ixq, kc=(md, pool))
 
     kb = _aligned(rows, 128)
     fused = built and checked and _wide(max_draft_len, decode, rows)
@@ -1012,10 +1109,10 @@ def test_indexer_q_side_k_cache(
         _, _, k_pre = project(kb, strided)
         assert calls == ["qk:False"] and k_pre is None
     else:
-        assert calls == ["q_side"] and k_pre[0] is kb and "ix_qk" not in core.route_hits
+        assert calls == ["q_side"] and k_pre is kb and "ix_qk" not in core.route_hits
     misaligned = torch.zeros(rows * 128 + 1, dtype=BF16)[1:].view(rows, 128)
     _, _, k_pre = project(misaligned, dense)
-    assert calls == ["q_side"] and k_pre[0] is misaligned
+    assert calls == ["q_side"] and k_pre is misaligned
 
 
 @pytest.mark.parametrize("nosplit", [True, False], ids=["nosplit", "split"])
@@ -1054,7 +1151,7 @@ def test_indexer_nosplit_beside_wide_decode(
     core._ix_fold_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
     core._qkva_ix_mtp = {m: _runner(f"fold@{m}", rows=m) for m in MTP_ROWS} if fold else {}
     core._ix_qk_compiled = {c: _runner(f"qk:{c}") for c in (False, True)}
-    core.op.indexer._k_checked = True
+    core._ix_state = IX.IndexerState(k_checked=True)
     core._ix_qside_compiled = SimpleNamespace(wq_pitch=32)
     core._ix_qside_compiled_p160 = SimpleNamespace(wq_pitch=160)
     core._ix_k_compiled = {False: "k:strided", True: "k:dense"}
@@ -1068,7 +1165,7 @@ def test_indexer_nosplit_beside_wide_decode(
         full = torch.zeros(int(x.shape[0]), 160)
         return full[:, :128], full[:, 128:]
 
-    monkeypatch.setattr(F._ix_pre_split_op, "project_unsplit", unsplit)
+    monkeypatch.setattr(IPP._split_op, "project_unsplit", unsplit)
     monkeypatch.setattr(
         IF._ix_fold_op,
         "at_rows",
@@ -1080,17 +1177,17 @@ def test_indexer_nosplit_beside_wide_decode(
         lambda x, w, out, r: calls.append(r.tag) or (out, fold_kb, fold_wq),
     )
     monkeypatch.setattr(
-        F,
+        IX,
         "cute_dsl_indexer_q_side_fused",
         lambda q, pos, cs, wq, c, q8, w, *, is_neox, compiled: calls.append(
             f"q_side:{compiled.wq_pitch}:wq{wq.stride(0)}"
         ),
     )
     monkeypatch.setattr(
-        F, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
+        IX, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
     )
     monkeypatch.setattr(
-        F,
+        IX,
         "cute_dsl_indexer_k_cache_update",
         lambda kb, *a, compiled, **k: calls.append(f"k_write:{kb.dtype}:{kb.stride(0)}:{compiled}"),
     )
@@ -1103,13 +1200,10 @@ def test_indexer_nosplit_beside_wide_decode(
     if decode:
         got = _qkva_fold(core, ph, x, 0)
         kw = None if got is None else got[1:]
-        _, _, k_pre = core.op.indexer.project(
-            ph, x, x, None, ix, rows, True, kw=kw, ixq=ixq, kc=(md, pool)
-        )
+        _, _, k_pre = _ix_front(core, ph, x, x, ix, True, kw=kw, ixq=ixq, kc=(md, pool))
     else:
-        _, _, k_pre = core.op.indexer.project(ph, x, x, None, ix, rows, True, ixq=ixq)
-    if k_pre is not None:
-        core.op.indexer.write_k(md, pool, k_pre, rows)
+        _, _, k_pre = _ix_front(core, ph, x, x, ix, True, ixq=ixq)
+    IX.indexer_write_k(md, pool, k_pre, None, None, None, core._ix_state, _ix_handle(core))
 
     wide = _wide(max_draft_len, decode, rows)
     cell = _cell(max_draft_len, decode, rows, bucket)
