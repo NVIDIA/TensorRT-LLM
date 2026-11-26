@@ -1449,6 +1449,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if req is not None:
             if session is not None and getattr(session, "timed_out", False) is True:
                 req.py_kv_transfer_timed_out = True
+            elif (
+                session is not None
+                and getattr(session, "committed_failure", False) is True
+                and getattr(req, "py_kv_transfer_committed_cause", None) is None
+            ):
+                # Keep a committed backend error for outcome accounting; the
+                # session that records it is removed above. A timeout the
+                # ranks already agreed on stays.
+                req.py_kv_transfer_committed_cause = "error"
             req.py_kv_send_session_retired = True
 
     @staticmethod

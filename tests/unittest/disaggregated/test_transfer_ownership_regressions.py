@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     RxSession,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
@@ -1091,6 +1092,63 @@ def test_poll_reports_a_failure_committed_before_a_deferred_legacy_cancel() -> N
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("committed", "expected"),
+    [("failure", (0, 1, 0)), ("timeout", (0, 0, 1)), (None, (0, 0, 0))],
+    ids=["failure-before-abort", "timeout-before-abort", "cancel-only"],
+)
+def test_direct_send_cancellation_keeps_a_committed_outcome(
+    committed: str | None, expected: tuple[int, int, int]
+) -> None:
+    """A send retired by cancel_request still reports what it committed before the abort."""
+    rid = 87
+    request = SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        parent_request_id=None,
+        is_child=False,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+        py_kv_send_session_retired=False,
+        py_kv_transfer_timed_out=False,
+        py_kv_transfer_committed_cause=None,
+    )
+    # A committed timeout is also a committed failure; the timeout wins.
+    session = SimpleNamespace(
+        cancel=Mock(),
+        has_transferring_tasks=Mock(return_value=False),
+        close=Mock(return_value=True),
+        timed_out=committed == "timeout",
+        committed_failure=committed is not None,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {rid: session}
+    transceiver._send_reqs = {rid: request}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=None,
+        kv_cache_manager=None,
+        dist=SimpleNamespace(rank=0, tp_size=1, pp_size=1, cp_size=1, world_size=1),
+        effects=Mock(),
+        registry=SimpleNamespace(active_requests=lambda: [], canceled_request_ids=lambda: [rid]),
+        enable_attention_dp=False,
+        enable_transfer_metrics=True,
+    )
+
+    assert transceiver.cancel_request(request) is True
+    # The executor's cancellation boundary counts the cause before it finishes the request.
+    coordinator.record_cancelled_transfer_outcome(request)
+    coordinator.record_cancelled_transfer_outcome(request)
+
+    assert transceiver._send_sessions == transceiver._send_reqs == {}
+    assert request.py_kv_send_session_retired is True
+    assert request.py_kv_transfer_committed_cause == ("error" if committed == "failure" else None)
+    assert coordinator.transfer_outcomes == expected
+
+
+@pytest.mark.cpu_only
 def test_failed_session_is_not_reported_retired_when_close_refuses() -> None:
     rid = 89
     initial_state = object()
@@ -1191,11 +1249,17 @@ def test_send_terminal_session_is_retained_when_close_refuses(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_timeout", [False, True], ids=["local-only", "peer-timed-out"])
 @pytest.mark.parametrize("committed_failure", [True, False], ids=["send-failed", "cancel-only"])
-def test_send_poll_reports_a_failure_committed_before_cancellation(committed_failure: bool) -> None:
-    """A cancelled legacy send still reports the failure that committed first to accounting."""
+def test_send_poll_reports_a_failure_committed_before_cancellation(
+    committed_failure: bool, peer_timeout: bool
+) -> None:
+    """A cancelled legacy send still reports the failure that committed first to accounting.
+
+    A timeout that the ranks already agreed on keeps precedence over this rank's error.
+    """
     rid = 97
-    request = SimpleNamespace(state=object())
+    request = SimpleNamespace(state=object(), py_kv_transfer_committed_cause=None)
     session = SimpleNamespace(
         _enforce_physical_ownership=False,
         status=SessionStatus.CANCELLED,
@@ -1214,21 +1278,29 @@ def test_send_poll_reports_a_failure_committed_before_cancellation(committed_fai
     transceiver._send_sessions = {rid: session}
     transceiver._send_reqs = {rid: request}
     transceiver._ctx_consensus = Mock(side_effect=lambda rids: rids)
-    transceiver._ctx_consensus_outcome = Mock(
-        side_effect=lambda _rids, cancelled, failed, completed, locally_quiesced: (
+
+    def outcome(_rids, cancelled, failed, completed, locally_quiesced):
+        """Settle as the vote does, marking a timeout one peer rank observed."""
+        if peer_timeout:
+            request.py_kv_transfer_committed_cause = "timeout"
+        return (
             cancelled,
             [rid for rid in failed if rid not in set(cancelled)],
             [rid for rid in completed if rid not in set(cancelled) | set(failed)],
             locally_quiesced,
             set(failed) & set(locally_quiesced),
         )
-    )
+
+    transceiver._ctx_consensus_outcome = Mock(side_effect=outcome)
     transceiver._transfer_worker = SimpleNamespace(sweep_stale_req_infos=Mock())
 
     status = transceiver.check_context_transfer_status(None)
 
     _, cancelled, failed, completed, _ = transceiver._ctx_consensus_outcome.call_args.args
     assert (cancelled, failed, completed) == ([rid], [rid] if committed_failure else [], [])
+    assert request.py_kv_transfer_committed_cause == (
+        "timeout" if peer_timeout else "error" if committed_failure else None
+    )
     # Cancellation still wins the request's outcome.
     assert status.completed_request_ids == status.error_request_ids == []
     assert status.cancelled_request_ids == (rid,)
