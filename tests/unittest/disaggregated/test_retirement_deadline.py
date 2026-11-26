@@ -25,6 +25,15 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 pytestmark = pytest.mark.cpu_only
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 @pytest.mark.parametrize("reason", ["cancelled", "failed", "shutdown", "peer lost"])
 @pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
 def test_first_drain_trigger_cannot_be_extended(reason: str, grace_s: float | None) -> None:
@@ -629,6 +638,7 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
     sender._sessions_lock = threading.Lock()
     sender._sessions = {}
     sender._pre_cancelled_rids = {}
+    sender._retired_rids = {}
     sender._shutdown = True
     sender._shutdown_requested = False
     sender._peer_requests_lock = threading.Lock()
@@ -924,8 +934,14 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
             0, {"sender"}, {7}, publish=lambda: published.add(7), published_writers=published
         )
         session.process_aux_agent_result(7, transfer_mod.AgentResult.SUCCESS)
+        _publish_report_tokens(session)
         finish = partial(
-            session.process_kv_agent_result, 7, 0, True, transfer_mod.AgentResult.SUCCESS
+            session.process_kv_agent_result,
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.SUCCESS,
+            _KV_RESULT_REPORT_TOKEN,
         )
     else:
         need_aux = final_piece == "send_aux"
@@ -1035,7 +1051,14 @@ def test_finished_nonfinal_piece_does_not_complete_session(direction: str, block
         task = session.prepare_receive(chunk)
         task.expected_transfers = 1
         assert session.try_begin_transfer(0, {"sender"}, {7})
-        session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
     assert not session._retirement._claims
     assert not session._retirement.is_complete
     assert not session.is_completed()
@@ -1108,7 +1131,10 @@ def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> Non
     task = session.prepare_receive(Chunk([], [], TokenRange(0, 16), False))
     task.expected_transfers = 1
     assert session.try_begin_transfer(0, {"sender"}, {7})
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.SUCCESS)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7, 0, True, transfer_mod.AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     second = session.prepare_receive(Chunk([], [], TokenRange(16, 32), True))
     second.expected_transfers = 1
     publish = Mock()
@@ -1158,7 +1184,10 @@ def _settled_rx_session(
         0, {"sender"}, {7}, publish=lambda: published.add(7), published_writers=published
     )
     result = transfer_mod.AgentResult.SUCCESS if succeeded else transfer_mod.AgentResult.FAILED
-    session.process_kv_agent_result(7, 0, True, result)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7, 0, True, result, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     session.process_aux_agent_result(7, result)
     assert session.resources_drained()
     assert not session._retirement._claims
@@ -1181,7 +1210,13 @@ def test_late_receive_evidence_cannot_escape_retirement_deadline(
         assert session.close()
     clock.return_value = 11.0
     report = (
-        partial(session.process_kv_agent_result, 7, 0, True)
+        partial(
+            session.process_kv_agent_result,
+            7,
+            0,
+            True,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
         if payload == "kv"
         else partial(session.process_aux_agent_result, 7)
     )
@@ -1233,10 +1268,24 @@ def test_restored_receive_claim_can_settle_safely_before_original_deadline() -> 
     session, task, aux = _settled_rx_session(watchdog)
     original = task.logical_outcome
     clock.return_value = 11.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.IN_DOUBT)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.IN_DOUBT,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert not session.close()
     clock.return_value = 14.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.FAILED_QUIESCED)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.FAILED_QUIESCED,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert task.logical_outcome is original
     assert session.close()
     assert session.close()
@@ -1255,7 +1304,14 @@ def test_new_ambiguity_after_success_does_not_inherit_expired_request_clock() ->
     original = task.logical_outcome
     assert original.status is SessionStatus.TRANSFERRED
     clock.return_value = 30.0
-    session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.IN_DOUBT)
+    _publish_report_tokens(session)
+    session.process_kv_agent_result(
+        7,
+        0,
+        True,
+        transfer_mod.AgentResult.IN_DOUBT,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert task.logical_outcome is original
     assert not session.close()
     watchdog.progress()
@@ -1511,7 +1567,7 @@ def test_unpublished_constructor_failure_removes_watchdog_owner(
     params = DisaggregatedParams(disagg_request_id=4)
     existing = object()
     if direction == "send":
-        sender = SimpleNamespace(
+        owner = SimpleNamespace(
             _retirement_watchdog=watchdog,
             _enforce_physical_ownership=True,
             _sessions_lock=threading.Lock(),
@@ -1523,27 +1579,27 @@ def test_unpublished_constructor_failure_removes_watchdog_owner(
             transfer_mod.TxSession,
             4,
             params,
-            sender,
+            owner,
             aux_buffer=aux,
             overall_timeout_s=5.0,
             retirement_watchdog=watchdog,
         )
     else:
-        receiver = _receiver(watchdog)
-        receiver._shutdown = True
-        receiver._sessions[4] = existing
+        owner = _receiver(watchdog)
+        owner._shutdown = True
+        owner._sessions[4] = existing
         construct = partial(
             transfer_mod.RxSession,
             4,
             params,
-            receiver,
+            owner,
             aux_buffer=aux,
             timeout_s=5.0,
             retirement_watchdog=watchdog,
         )
     with pytest.raises(RuntimeError):
         construct()
-    assert (sender if direction == "send" else receiver)._sessions[4] is existing
+    assert owner._sessions[4] is existing
     assert not watchdog._owners
     if failure == "session registration":
         aux.free_slot.assert_called_once_with(1)

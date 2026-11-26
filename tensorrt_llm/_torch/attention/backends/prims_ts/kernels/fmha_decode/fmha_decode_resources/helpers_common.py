@@ -555,12 +555,26 @@ def _logical_head_batch(
 
 
 @cute.jit
+def split_kv_grid_coord(
+    cfg: Constexpr[FmhaDecodeConfig], coord: cute.Coord
+) -> cute.Coord:
+    """Map compact split/Q/batch launches to capacity-strided task coordinates."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group = Int32(coord[2]) % Int32(cfg.num_q_ctas)
+        batch = Int32(coord[2]) // Int32(cfg.num_q_ctas)
+        return (q_group * Int32(cfg.splits_kv) + Int32(coord[0]), coord[1], batch)
+    return coord
+
+
+@cute.jit
 def _logical_q_group_idx(
     cfg: Constexpr[FmhaDecodeConfig],
     stage_info: StageInfo,
     fallback_q_group_idx: Int32,
 ) -> Int32:
     """Resolve the q-group from the persistent work tile or static launch."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
     if cutlass.const_expr(cfg.has_single_q_cta):
         # A split coordinate may still vary in grid X, but every physical CTA
         # maps to logical Q group zero. State this explicitly because the
@@ -581,7 +595,7 @@ def _q_tile_output_row_base(
     """Return the first packed output row owned by a logical Q CTA."""
     if cutlass.const_expr(cfg.uses_nontrivial_grouped_q_layout):
         return q_group_idx * Int32(cfg.q_tma_rows_per_cta)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -593,13 +607,37 @@ def _q_tile_output_row_base(
     return q_group_idx * Int32(cfg.tile_size_q)
 
 
+class UniformQueryOffsets:
+    """Affine offsets for fixed-layout Q, with a runtime token count."""
+
+    def __init__(self, seq_len_q):
+        self.values = (seq_len_q,)
+
+    def __extract_mlir_values__(self):
+        return cutlass.extract_mlir_values(self.values)
+
+    def __new_from_mlir_values__(self, values):
+        return UniformQueryOffsets(cutlass.new_from_mlir_values(self.values, values)[0])
+
+    @property
+    def seq_len_q(self):
+        return self.values[0]
+
+    @cute.jit
+    def __getitem__(self, index):
+        return Int32(index) * Int32(self.seq_len_q)
+
+
 @cute.jit
 def _q_seq_bounds(
     cfg: Constexpr[FmhaDecodeConfig],
-    cu_seqlens_q: cute.Pointer | None,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
     batch_idx: Int32,
 ) -> tuple[Int32, Int32]:
     """Return packed Q token offset/length, or fixed-SQ neutral bounds."""
+    if cutlass.const_expr(isinstance(cu_seqlens_q, UniformQueryOffsets)):
+        length = Int32(cu_seqlens_q.seq_len_q)
+        return Int32(batch_idx) * length, length
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
         q_begin = Int32(cu_seqlens_q[batch_idx])
         q_end = Int32(cu_seqlens_q[batch_idx + Int32(1)])
@@ -612,7 +650,7 @@ def _q_group_token_base(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) ->
     """Return the first Q token owned by a logical Q CTA."""
     if cutlass.const_expr(cfg.uses_nontrivial_grouped_q_layout):
         return q_group_idx * Int32(cfg.q_tokens_per_cta)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -638,7 +676,7 @@ def _q_tile_valid_rows_for_seq(
         remaining_tokens = cute.math.max(seq_len_q - token_base, Int32(0))
         valid_tokens = cute.math.min(remaining_tokens, Int32(cfg.q_tokens_per_cta))
         return valid_tokens * Int32(cfg.heads_q_per_kv)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -707,7 +745,7 @@ def _q_physical_output_row_from_token_and_local_head(
         num_heads_q = num_heads_kv * heads_q_per_kv
         global_head_idx = kv_head_idx * heads_q_per_kv + local_head_idx
         return (q_token_offset + q_token_idx) * num_heads_q + global_head_idx
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         heads_q_per_kv = Int32(cfg.heads_q_per_kv)
         num_heads_q = num_heads_kv * heads_q_per_kv
         global_head_idx = kv_head_idx * heads_q_per_kv + local_head_idx
@@ -815,7 +853,7 @@ def _q_row_token_and_local_head(
             q_group_idx * Int32(cfg.q_tokens_per_cta) + token_offset,
             local_head,
         )
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )

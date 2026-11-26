@@ -5,13 +5,19 @@ import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Callable, Dict, Optional, Type
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.utils import enable_llm_debug
+
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+if TYPE_CHECKING:
+    from .impl_contract import MoESortTables
 
 # Global cache for perfect router logits shared across MoE modules
 _PERFECT_ROUTER_LOGITS_CACHE = {}
@@ -359,12 +365,51 @@ class BaseMoeRoutingMethod(nn.Module):
         raise NotImplementedError(
             f"{type(self).__name__} does not support auxiliary routing data")
 
+    def apply_with_sort(
+        self,
+        router_logits: torch.Tensor,
+        local_expert_offset: int,
+        local_num_experts: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, "MoESortTables"]]:
+        """Route with a kernel that also writes ``moe_sort``'s tables.
+
+        Returns ``apply``'s ``(token_selected_experts, token_final_scales)``
+        and the ``moe_sort`` outputs of experts ``[local_expert_offset,
+        local_expert_offset + local_num_experts)``, or ``None`` when no such
+        kernel serves this routing and these logits.
+        """
+        return None
+
+    def serves_with_sort(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        device: torch.device,
+    ) -> bool:
+        """Whether :meth:`apply_with_sort` routes ``num_tokens`` tokens of
+        ``num_experts`` contiguous FP32 router logits on ``device`` for experts
+        ``[local_expert_offset, local_expert_offset + local_num_experts)``.
+
+        Describes eager forwards only: :meth:`apply_with_sort` declines under
+        ``torch.compiler.is_compiling()``, so a compiled graph re-routes
+        through :meth:`apply` and never sees the sorting kernel."""
+        return False
+
     def get_experts_per_token(self) -> int:
         return self.top_k
 
     @property
     def experts_per_token(self) -> int:
         return self.get_experts_per_token()
+
+    @property
+    def sqrt_softplus_bias_selection(self) -> bool:
+        """Whether experts are the top-k of ``sqrt(softplus(logits)) + bias``
+        (ties to the lowest), weighted by their renormalized unbiased scores, so
+        a backend may fuse ``apply`` with its input quantization."""
+        return False
 
     @property
     def requires_separated_routing(self) -> bool:
@@ -579,6 +624,12 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         # Pass a callable to fetch the tensor from DeepseekV3Gate at runtime, ensuring it is on the correct device
         assert callable(callable_e_score_correction_bias)
         self.callable_e_score_correction_bias = callable_e_score_correction_bias
+        # Ungrouped fused top-16 routing has a kernel that also sorts
+        # (``apply_with_sort``).
+        self._sort_kernel_applies = False
+        if IS_CUTLASS_DSL_AVAILABLE and is_fused and n_group == 1 and topk_group == 1:
+            from ..kernels.blackwell import kimi_k3_routing
+            self._sort_kernel_applies = top_k == kimi_k3_routing.TOP_K
 
     def apply(
         self,
@@ -586,6 +637,52 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.routing_impl.apply(logits, self.e_score_correction_bias)
+
+    def apply_with_sort(
+        self,
+        router_logits: torch.Tensor,
+        local_expert_offset: int,
+        local_num_experts: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, "MoESortTables"]]:
+        """Ungrouped fused top-16 routing of decode batches: the
+        ``noaux_tc_route_sort`` kernel (``kimi_k3_routing.py``), bitwise
+        ``noaux_tc_op`` + ``moe_sort``."""
+        if not self._sort_kernel_applies or torch.compiler.is_compiling():
+            return None
+        from ..kernels.blackwell import kimi_k3_routing
+        from .impl_contract import MoESortTables
+
+        # Decline out-of-scope shapes before the op (the op validates tensors
+        # and raises rather than declining); dtype/alignment still fall to the op.
+        if not kimi_k3_routing.serves(
+                router_logits.shape[0],
+                router_logits.shape[1],
+                local_expert_offset,
+                local_num_experts,
+                router_logits.device,
+        ):
+            return None
+        bias = self.e_score_correction_bias
+        topk_ids, topk_weights, *sort_outputs = torch.ops.trtllm.noaux_tc_route_sort(
+            router_logits, bias, float(self.routing_impl.routed_scaling_factor),
+            local_expert_offset, local_num_experts)
+        return topk_ids, topk_weights, MoESortTables(kimi_k3_routing.TILE_SIZE,
+                                                     tuple(sort_outputs))
+
+    def serves_with_sort(
+        self,
+        num_tokens: int,
+        num_experts: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        device: torch.device,
+    ) -> bool:
+        if not self._sort_kernel_applies:
+            return False
+        from ..kernels.blackwell import kimi_k3_routing
+        return kimi_k3_routing.serves(num_tokens, num_experts,
+                                      local_expert_offset, local_num_experts,
+                                      device)
 
     @property
     def e_score_correction_bias(self) -> torch.Tensor:
@@ -692,14 +789,35 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # gate_forward kernel requires float32 input scores
-        logits = logits.to(torch.float32)
         # gate_forward supports target geometries (256/384 experts, top-6),
-        # not V4.1's smaller draft bank. Keep target routing on its fused path.
-        # TODO: Add a fused 128-expert/top-3 specialization for draft latency.
+        # not V4.1's smaller draft bank, which routes through a CuTe DSL kernel
+        # on SM100-family GPUs and through the PyTorch reference elsewhere.
         if self._top_k == 3 and logits.shape[-1] == 128:
+            from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+            if logits.is_cuda and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f():
+                return self._apply_draft(logits, input_ids)
             return self._apply_pytorch(logits, input_ids)
-        return self._apply_native(logits, input_ids)
+        # gate_forward kernel requires float32 input scores
+        return self._apply_native(logits.to(torch.float32), input_ids)
+
+    def _apply_draft(
+            self, logits: torch.Tensor, input_ids: Optional[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One launch for the draft bank; same math as ``_apply_pytorch``."""
+        from ...attention.kernels.blackwell.dspark.draft_routing import \
+            dspark_draft_routing
+
+        if self.is_hashed:
+            assert input_ids is not None
+            return dspark_draft_routing(logits.contiguous(), None,
+                                        input_ids.contiguous(),
+                                        self.callable_tid2eid().contiguous(),
+                                        self._top_k, self.routed_scaling_factor)
+        bias = self.callable_e_score_correction_bias().to(
+            torch.float32).contiguous()
+        return dspark_draft_routing(logits.contiguous(), bias, None, None,
+                                    self._top_k, self.routed_scaling_factor)
 
     def _apply_native(
         self,
@@ -755,6 +873,11 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
     @property
     def e_score_correction_bias(self) -> torch.Tensor:
         return self.callable_e_score_correction_bias()
+
+    @property
+    def sqrt_softplus_bias_selection(self) -> bool:
+        # Hashed gates take their experts from a token table.
+        return not self.is_hashed
 
     @property
     def top_k(self):
@@ -951,6 +1074,11 @@ class SigmoidRenormMoeRoutingMethod(BaseMoeRoutingMethod):
             topk_weights = topk_weights / (
                 topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
         return topk_idx.to(torch.int32), topk_weights.to(self.output_dtype)
+
+    @property
+    def requires_separated_routing(self) -> bool:
+        # The C++ SigmoidRenorm routing always renormalizes the top-k weights.
+        return not self.renormalize
 
     @property
     def routing_method_type(self):

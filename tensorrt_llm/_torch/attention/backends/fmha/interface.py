@@ -15,12 +15,14 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar, Optional, final
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -37,6 +39,19 @@ class FmhaPhase(str, Enum):
     GENERATION = "generation"
 
 
+@dataclass(frozen=True)
+class FmhaPrewarmConfig:
+    """Resolved static inputs for optional FMHA module initialization."""
+
+    dtype: torch.dtype
+    kv_cache_dtype: DataType
+    tokens_per_block: int
+    extra_tokens_per_block: frozenset[int] = frozenset()
+    context: bool = True
+    generation: bool = True
+    helix: bool = False
+
+
 class Fmha(ABC):
     """Common runtime contract for TRT-LLM attention FMHA libraries."""
 
@@ -49,6 +64,7 @@ class Fmha(ABC):
     # Serves a generation call whose QK-norm / RoPE / KV-append prologue the attention module deferred to the
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
+    supports_variable_window: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -59,6 +75,14 @@ class Fmha(ABC):
         if attn is None:
             raise RuntimeError("The owning TrtllmAttention instance has been garbage collected.")
         return attn
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Whether this layer can use the optional module built by ``prewarm``."""
+        return False
+
+    @staticmethod
+    def prewarm() -> None:
+        """Initialize a library-wide JIT module; libraries without one do nothing."""
 
     @classmethod
     @final
@@ -139,6 +163,13 @@ class Fmha(ABC):
             return False
         if getattr(forward_args, "vc_attention", False) and not self.supports_vc_attention:
             logger.debug(f"{type(self).__name__} does not support VC-Attention.")
+            return False
+        has_variable_window = (
+            forward_args.variable_window_token_starts is not None
+            or forward_args.variable_window_token_ends is not None
+        )
+        if has_variable_window and not self.supports_variable_window:
+            logger.debug(f"{type(self).__name__} does not support variable-window attention.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 

@@ -14,13 +14,12 @@
 # limitations under the License.
 
 import os
-import subprocess
 import tempfile
 
 import pytest
 import yaml
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = [".."]
 from test_llm import get_model_path
@@ -65,8 +64,8 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     # The example client sends local paths under the test data root.
     env = os.environ.copy()
-    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = str(llm_models_root() /
-                                                 "multimodals" / "test_data")
+    env["TRTLLM_MEDIA_ALLOWED_INPUT_DIR"] = str(llm_models_root() /
+                                                "multimodals" / "test_data")
     with RemoteOpenAIServer(model_path, port=8000, cli_args=args,
                             env=env) as remote_server:
         yield remote_server
@@ -86,11 +85,4 @@ def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
     client_script = os.path.join(example_root, script)
     custom_env = os.environ.copy()
     custom_env["AIPERF_TOKENIZER_PATH"] = get_model_path(model_name)
-    # CalledProcessError will be raised if any errors occur
-    subprocess.run([exe, client_script],
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   text=True,
-                   check=True,
-                   env=custom_env,
-                   timeout=600)
+    run_command_with_output([exe, client_script], env=custom_env, timeout=600)

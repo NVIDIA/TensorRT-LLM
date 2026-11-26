@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +18,14 @@ import os
 import sys
 from html import escape
 
+from pytest_timeout_evidence import load_timeout_evidence
 
-def parse_xml_classname_name_file_from_testname(testname, stage_name):
+_FALLBACK_TEST_TIME_SECONDS = 1.0
+
+
+def parse_xml_classname_name_file_from_testname(
+    testname: str, stage_name: str
+) -> tuple[str, str, str]:
     """Parse XML attributes from a test name.
 
     Args:
@@ -39,68 +45,91 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     if testname.startswith(stage_name + "/"):
         testname = testname[len(stage_name) + 1 :]
 
+    # Parameter IDs can contain "::", which is not a node separator there.
+    node_path, bracket, parameters = testname.partition("[")
+    parts = node_path.split("::")
+
     # Get file name
     if testname.startswith("unittest/"):
         file = "test_unittests.py"
     else:
-        file = testname.split("::")[0]
+        file = parts[0]
 
     # Get test name
     if testname.startswith("unittest/"):
         name = "test_unittests_v2[" + testname + "]"
     else:
-        name = testname.split("::")[-1]
+        name = parts[-1] + bracket + parameters
 
     # Get class name
     if testname.startswith("unittest/"):
         classname = stage_name + ".test_unittests"
-    elif len(testname.split("::")) == 3:
+    elif len(parts) == 3:
         classname = (
-            stage_name
-            + "."
-            + testname.split("::")[0].replace(".py", "").replace("/", ".")
-            + "."
-            + testname.split("::")[1]
+            stage_name + "." + parts[0].replace(".py", "").replace("/", ".") + "." + parts[1]
         )
     else:
-        classname = stage_name + "." + testname.split("::")[0].replace(".py", "").replace("/", ".")
+        classname = stage_name + "." + parts[0].replace(".py", "").replace("/", ".")
         if testname.startswith("accuracy/"):
             classname = ""
 
     return classname, name, file
 
 
-def generate_timeout_xml(stage_name, testList, outputFilePath):
+def generate_timeout_xml(
+    stage_name,
+    testList,
+    outputFilePath,
+    test_timeouts=None,
+):
     """Generate JUnit XML report for timed-out tests.
 
     Args:
         stage_name: Name of the test stage
         testList: List of test names that timed out
         outputFilePath: Path where the XML report will be written
+        test_timeouts: Effective pytest timeout in seconds for each nodeid
     """
+    test_timeouts = test_timeouts or {}
+    confirmed_timeout_tests = set(test_timeouts)
     num_tests = len(testList)
+    timeout_count = sum(test in confirmed_timeout_tests for test in testList)
+    terminated_unexpectedly_count = num_tests - timeout_count
+    total_time = sum(test_timeouts.get(test, _FALLBACK_TEST_TIME_SECONDS) for test in testList)
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
     xmlContent = (
         f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
         f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
-        f'failures="0" skipped="0" tests="{num_tests}" time="1.00">'
+        f'failures="0" skipped="0" tests="{num_tests}" '
+        f'unfinished_test="{num_tests}" timeout="{timeout_count}" '
+        f'terminated_unexpectedly="{terminated_unexpectedly_count}" '
+        f'time="{total_time:.2f}">\n'
     )
 
     for test in testList:
         classname, name, file = parse_xml_classname_name_file_from_testname(test, stage_name)
+        duration = test_timeouts.get(test, _FALLBACK_TEST_TIME_SECONDS)
         # Escape all XML attribute values
         classname_escaped = escape(classname, quote=True)
         name_escaped = escape(name, quote=True)
         file_escaped = escape(file, quote=True)
+        is_timeout = test in confirmed_timeout_tests
+        if is_timeout:
+            error_block = '<error message="pytest_timeout">Pytest timeout.</error>'
+        else:
+            error_block = (
+                '<error message="terminated_unexpectedly">Test terminated unexpectedly.</error>'
+            )
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
-            f'file="{file_escaped}" time="1.0">\n'
-            f'        <error message="Test terminated unexpectedly">'
-            f" Test terminated unexpectedly\n"
-            f"        </error></testcase>"
+            f'file="{file_escaped}" time="{duration:.2f}" '
+            f'unfinished_test="1" timeout="{int(is_timeout)}" '
+            f'terminated_unexpectedly="{int(not is_timeout)}">\n'
+            f"        {error_block}\n"
+            f"</testcase>\n"
         )
-    xmlContent += "</testsuite></testsuites>"
+    xmlContent += "</testsuite>\n</testsuites>\n"
 
     with open(outputFilePath, "w", encoding="utf-8") as f:
         f.write(xmlContent)
@@ -117,6 +146,11 @@ def main():
     parser.add_argument("--stage-name", required=True, help="Stage name")
     parser.add_argument("--test-file-path", required=True, help="Test list file path")
     parser.add_argument("--output-file", required=True, help="Output file path")
+    parser.add_argument(
+        "--timeout-evidence-file",
+        default=None,
+        help="Optional file containing structured pytest-timeout records",
+    )
     args = parser.parse_args(sys.argv[1:])
     stageName = args.stage_name
     testFilePath = args.test_file_path
@@ -125,6 +159,10 @@ def main():
     full_path = os.path.join(stageName, testFilePath)
     if not os.path.exists(full_path):
         print(f"No {full_path} found, skipping timeout XML generation")
+        try:
+            os.remove(outputFilePath)
+        except FileNotFoundError:
+            pass
         return
 
     try:
@@ -132,13 +170,28 @@ def main():
             timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
     except IOError as e:
         print(f"Error reading {full_path}: {e}")
-        return
+        sys.exit(1)
 
-    if len(timeoutTests) == 0:
+    if not timeoutTests:
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
+        try:
+            os.remove(outputFilePath)
+        except FileNotFoundError:
+            pass
         return
 
-    generate_timeout_xml(stageName, timeoutTests, outputFilePath)
+    test_timeouts = load_timeout_evidence(args.timeout_evidence_file, timeoutTests)
+    print(
+        f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "
+        f"{len(test_timeouts)} pytest_timeout, "
+        f"{len(timeoutTests) - len(test_timeouts)} terminated_unexpectedly"
+    )
+    generate_timeout_xml(
+        stageName,
+        timeoutTests,
+        outputFilePath,
+        test_timeouts,
+    )
 
 
 if __name__ == "__main__":

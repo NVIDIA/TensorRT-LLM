@@ -168,24 +168,5 @@ if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
         --drain-spool "$jobWorkspace" || true
 fi
 
-# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
-# Remove this after the issue is resolved
-if [ $pytest_exit_code -eq 4 ]; then
-    echo "DEBUG: Pytest failed with usage error (exit code 4)"
-    echo "DEBUG: Directory state at $(pwd):"
-    ls -l
-    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
-    ls -l $llmSrcNode/tests/integration/defs
-
-    echo "DEBUG: conftest.py content:"
-    md5sum $llmSrcNode/tests/integration/defs/conftest.py
-
-    echo "DEBUG: pytest.ini content:"
-    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
-
-    echo "DEBUG: Check importability of conftest.py"
-    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
-fi
-
 echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
 exit $pytest_exit_code

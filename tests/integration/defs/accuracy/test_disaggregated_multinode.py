@@ -40,12 +40,13 @@ from typing import Iterator, Optional
 import openai
 import pytest
 import requests
+from test_common.cluster_env import apply_ucx_env
 
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import get_device_memory, llm_models_root, skip_pre_blackwell
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import DuckLLM, MyThreadPoolExecutor, Result, run_accuracy_test
 
@@ -187,27 +188,25 @@ def _worker_env() -> dict[str, str]:
             "MASTER_ADDR",
             "MASTER_PORT",
             "UCX_TLS",
-            "UCX_NET_DEVICES",
         }
     }
-    # Pyxis starts these worker processes as root; preserve the explicit
-    # Open MPI container override for mpi4py dynamic worker spawn.
+    # Pyxis runs as root; dynamic MPI spawn needs these explicit overrides.
     env.update(
         {
             "OMPI_ALLOW_RUN_AS_ROOT": "1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
             "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
-            # Avoid auto-selecting an NVL72 RDMA VF whose container-visible
-            # IPv6 address UCX cannot bind; override UCX_NET_DEVICES where
-            # eth0 is not the right interface.
-            "UCX_NET_DEVICES": os.environ.get("UCX_NET_DEVICES", "eth0"),
-            "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
         }
+    )
+    apply_ucx_env(
+        env,
+        cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),
     )
     return env
 
 
 def _worker_config(enable_dspark: bool) -> dict[str, object]:
+    moe_tactic = "cutedsl.mega_moe"
     config: dict[str, object] = {
         "attn_backend": "TRTLLM",
         "tensor_parallel_size": 4,
@@ -216,7 +215,7 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
         "moe_config": {
             # DeepSeek-V4 routed experts use NVFP4 in this test. Use the
             # MegaMoE CuTe DSL path for the NVFP4 checkpoint.
-            "backend": "MEGAMOE_CUTEDSL",
+            "tactic": moe_tactic,
         },
         # Keep the DEP4 worker envelope aligned with the aggregate guard. A
         # batch-128 DSpark graph leaves too little headroom for the post-capture
@@ -245,6 +244,9 @@ def _worker_config(enable_dspark: bool) -> dict[str, object]:
             "decoding_type": "DSpark",
             "max_draft_len": 5,
             "speculative_model": MODEL_PATH,
+            # A target tactic does not reach the drafter; pin it to the same
+            # implementation.
+            "moe_tactic": moe_tactic,
         }
     return config
 
@@ -363,7 +365,11 @@ def _accuracy_llm(
 
 
 @pytest.mark.timeout(14400)
-@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skipif(
+    get_device_memory() < 250000,
+    reason="This test requires at least 250000 MiB of memory per GPU",
+)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSparkMultinode(LlmapiAccuracyTestHarness):
     def test_gsm8k_1p1d_dep4(

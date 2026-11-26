@@ -68,9 +68,15 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  pagedFp8ContextFmhaOp.cpp
+  trtllmGenQKVProcessOp.cpp
+  csa2SparseContextOp.cpp
+  csa2SparseDecodeOp.cpp)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+# pagedFp8ContextFmhaOp.cpp includes the trtllm-gen FMHA runner headers (see
+# th_common_visual_gen below).
+target_link_libraries(th_common_attention PRIVATE trtllm_gen_fmha_interface)
 
 # MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
 # th_common_attention with target_sources() so the list stays next to the files.
@@ -111,6 +117,7 @@ add_th_common_family(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
+  lmHeadArgmaxOp.cpp
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
@@ -133,6 +140,7 @@ add_th_common_family(
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
   ncclCommunicatorOp.cpp
+  nativeMemoryOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
   localityDomainAllocator.cpp
@@ -156,7 +164,13 @@ add_th_common_family(
   sageQuantizeOp.cpp
   blockCausalLayoutOp.cpp
   rotateRowsOp.cpp
-  scatterKvSlotsOp.cpp)
+  scatterKvSlotsOp.cpp
+  denseFp8FmhaOp.cpp
+  fusedDiTQKNormRopeFp8Op.cpp)
+# denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
+# target carries the compile definitions those headers need to match the
+# library's struct layouts.
+target_link_libraries(th_common_visual_gen PRIVATE trtllm_gen_fmha_interface)
 
 add_th_common_family(
   th_common_decoding
@@ -171,10 +185,6 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
-# GLM bindings keep their existing family targets; source lists live with the
-# model.
-add_subdirectory(glmMoeDsaRubin)
-
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>
@@ -184,6 +194,7 @@ add_library(
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
   $<TARGET_OBJECTS:th_common_decoding>)
+tllm_localize_cutlass_runtime_helpers(th_common)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
@@ -216,9 +227,6 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common_gemm_quant
-                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 

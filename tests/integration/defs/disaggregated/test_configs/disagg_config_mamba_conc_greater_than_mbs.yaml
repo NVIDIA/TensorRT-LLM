@@ -23,7 +23,7 @@ generation_servers:
   stream_interval: 20
   num_postprocess_workers: 4
   moe_config:
-    backend: CUTLASS
+    tactic: cutlass
 context_servers:
   num_instances: 1
   max_batch_size: 1
@@ -37,4 +37,4 @@ context_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
   moe_config:
-    backend: CUTLASS
+    tactic: cutlass

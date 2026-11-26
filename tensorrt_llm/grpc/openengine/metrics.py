@@ -16,6 +16,7 @@ import grpc
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 from .coordinator import CoordinationError
 
@@ -255,8 +256,12 @@ class OpenEngineMetrics:
         if not self._collect_requests:
             return
         try:
+            records = getattr(result, "candidate_metric_records", None)
             candidates = getattr(result, "candidate_metrics", None)
-            if candidates:
+            if records:
+                for record in records:
+                    self.collector.emit(record)
+            elif candidates:
                 for metrics in candidates:
                     self.collector.log_request_metrics_dict(metrics)
             elif metrics := getattr(result, "metrics_dict", None):
@@ -315,7 +320,7 @@ class OpenEngineMetrics:
             for stats in self._llm.get_stats(timeout=0.1):
                 if self._stopping.is_set():
                     return
-                self.collector.log_iteration_stats(stats)
+                self.collector.emit(PerfMetricsCollector.collect_iteration(stats))
         except Exception as error:
             self._record_error("iteration", error)
 

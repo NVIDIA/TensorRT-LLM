@@ -4,10 +4,12 @@
 import gc
 import multiprocessing
 import os
+import subprocess
 import sys
 import time
 import uuid
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -220,6 +222,31 @@ def ctx_gen_kv_cache_dtype(request):
         return DataType.BF16, DataType.BF16
     else:
         raise ValueError(f"Invalid config: {request.param}")
+
+
+@pytest.mark.parametrize("wrapper_library", [
+    pytest.param(library, id=library.name)
+    for library in sorted((Path(tensorrt_llm.__file__).parent /
+                           "libs").glob("libtensorrt_llm_*_wrapper.so"))
+])
+def test_cache_transceiver_wrapper_load_and_exit(wrapper_library):
+    # Match the package's torch-first loading of wheel-provided CUDA/NCCL
+    # dependencies, then run static destructors in a fresh process.
+    result = subprocess.run([
+        sys.executable,
+        "-c",
+        "import ctypes, os, resource, sys; "
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+        "import torch; "
+        "host = ctypes.CDLL(sys.argv[1], mode=os.RTLD_GLOBAL | os.RTLD_NOW); "
+        "wrapper = ctypes.CDLL(sys.argv[2], mode=os.RTLD_LOCAL | os.RTLD_NOW)",
+        wrapper_library.parent / "libtensorrt_llm.so",
+        wrapper_library,
+    ],
+                            capture_output=True,
+                            text=True,
+                            timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.timeout(120)

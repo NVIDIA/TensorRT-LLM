@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "pytest (==7.2.2)",
     "pytest-cpp (==2.3.0)",

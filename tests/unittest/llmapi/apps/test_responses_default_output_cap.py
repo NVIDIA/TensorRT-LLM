@@ -72,6 +72,7 @@ def logged_warnings(monkeypatch):
 
     handler = Capture(level=logging.WARNING)
     monkeypatch.setattr(logger, "_min_severity", "warning")
+    monkeypatch.setattr(logger, "_module_levels", {})
     monkeypatch.setattr(logger, "_appeared_keys", set())
     previous_level = logger._logger.level
     logger._logger.setLevel(logging.WARNING)

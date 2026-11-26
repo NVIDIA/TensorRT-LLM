@@ -57,11 +57,11 @@ def vc_smooth_phase(denoise_step: Optional[tuple[int, int]]) -> Optional[int]:
 
     ``VCAttentionPreprocessor.prepare`` chooses its path from the step alone,
     so a graph captured at one step is only valid for steps on the same path.
-    2 regroups the value tokens and demeans V, 1 keeps the last grouping and
-    demeans V, 0 runs the plain per-channel E4M3 V after the window. ``None``
-    means no denoising step is active; CUDA Graph runners omit their phase key
-    part in that case. The schedule constants are the defaults the layer-owned
-    preprocessor runs with.
+    3 starts the generation cold at step 0, 2 regroups from the current
+    centroids, 1 keeps the grouping and demeans V, 0 runs the plain per-channel
+    E4M3 V after the window. ``None`` means no denoising step is active; CUDA
+    Graph runners omit their phase key part in that case. The schedule
+    constants are the defaults the layer-owned preprocessor runs with.
     """
     if denoise_step is None:
         return None
@@ -73,27 +73,14 @@ def vc_smooth_phase(denoise_step: Optional[tuple[int, int]]) -> Optional[int]:
     step, num_steps = denoise_step
     if step >= math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps):
         return 0
-    return 2 if step == 0 or step % VC_PERM_REFRESH_EVERY == 0 else 1
+    if step == 0:
+        return 3
+    return 2 if step % VC_PERM_REFRESH_EVERY == 0 else 1
 
 
-def vc_denoise_step_for_phase(phase: int) -> tuple[int, int]:
-    """Return a representative denoising step of the schedule in ``phase``.
-
-    Under CUDA graph capture the real step must not change what the graph
-    records, so the host resolved phase selects one step of that phase on a
-    schedule whose window holds exactly one refresh period.
-    """
-    from ....attention.backends.prims_ts.vc_attention.quantization import (
-        VC_PERM_REFRESH_EVERY,
-        VC_SMOOTH_STEP_FRACTION,
-    )
-
-    num_steps = math.ceil(VC_PERM_REFRESH_EVERY / VC_SMOOTH_STEP_FRACTION)
-    if phase == 2:
-        return 0, num_steps
-    if phase == 1:
-        return 1, num_steps
-    return num_steps - 1, num_steps
+# The preprocessor path each phase replays. The captured graph then records
+# no step bookkeeping and the cold start no random draw.
+VC_PHASE_MODES = {3: "cold", 2: "warm", 1: "keep", 0: "plain"}
 
 
 def prepare_vc_operands(
@@ -105,13 +92,20 @@ def prepare_vc_operands(
     repair_budget: float,
     preprocessor: Optional["VCAttentionPreprocessor"],
     denoise_step: Optional[tuple[int, int]],
+    grouped_tokens: Optional[tuple[int, int]] = None,
+    mode: Optional[str] = None,
 ) -> "VCAttentionOperands":
     """Quantize ``[B, S, H, D]`` bf16 Q, K and V for one VC-Attention forward.
 
     With a repair budget the highest-residual tokens are appended as V repair
     rows. Otherwise the layer-owned ``preprocessor`` groups the value tokens
     and splits V into tile means and E4M3 residuals on the V-Smooth schedule
-    given by ``denoise_step``. Under QK8 ``q`` is rotated and quantized too.
+    given by ``denoise_step``. ``grouped_tokens`` is the ``(start, stop)`` token
+    range the grouping covers. In a joint sequence the range holds the video
+    tokens. The other tokens follow in input order. ``None`` groups the whole
+    sequence. ``mode`` names the preprocessor path (``cold``, ``warm``, ``keep``
+    or ``plain``) in place of the step, as the CUDA graph runner's phase does.
+    Under QK8 ``q`` is rotated and quantized too.
     """
     from ....attention.backends.prims_ts.vc_attention.quantization import vc_quantize_repair
 
@@ -120,7 +114,9 @@ def prepare_vc_operands(
         return vc_quantize_repair(k, v, budget=repair_budget, q=vc_q)
     if preprocessor is None:
         raise ValueError("the tile-mean VC-Attention recipe needs a preprocessor")
-    return preprocessor.prepare(k, v, q=vc_q, denoise_step=denoise_step)
+    return preprocessor.prepare(
+        k, v, q=vc_q, denoise_step=denoise_step, grouped_tokens=grouped_tokens, mode=mode
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -495,22 +491,28 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         kv_seq_len: int,
         timestep: object,
+        grouped_tokens: Optional[tuple[int, int]] = None,
     ) -> "VCAttentionOperands":
         """Prepare the VC-Attention operands of this call from compact Q, K and V.
 
         The denoising step comes from the pipeline through the shared attention
         metadata state, so the V-Smooth window is a fraction of the schedule's
         steps on any scheduler. Under the CUDA graph runner the host resolved
-        phase stands in for the step, which capture must not record, and
-        selects a representative step of that phase.
+        phase names the preprocessor path. Capture must not record the step.
         """
         del timestep
         quant_cfg = self.quant_attention_config
-        denoise_step = None
+        denoise_step = mode = None
         if self._vc_preprocessor is not None:
             phase = resolved_extra_key("vc_smooth_phase")
             if phase is not None:
-                denoise_step = vc_denoise_step_for_phase(phase)
+                mode = VC_PHASE_MODES[phase]
+                # The runner warms a new graph up with eager calls before the
+                # capture. A warm refresh in those calls would advance the
+                # grouping once per call. The warm-up keeps the grouping. The
+                # first run of the graph then equals a replay.
+                if mode == "warm" and not torch.cuda.is_current_stream_capturing():
+                    mode = "keep"
             else:
                 denoise_step = self.metadata._metadata_state.get("denoise_step")
                 # Eager runs keep the grouping of the current K/V shape only. Under
@@ -532,6 +534,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             repair_budget=quant_cfg.vc_repair_budget,
             preprocessor=self._vc_preprocessor,
             denoise_step=denoise_step,
+            grouped_tokens=grouped_tokens,
+            mode=mode,
         )
 
     def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
@@ -592,6 +596,37 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
         return q, k, v
 
+    @torch.compiler.disable
+    def _forward_padded_self_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        valid_seq_len: int,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Attend to one valid prefix shared by every batch row.
+
+        Ulysses still needs the padded output shape for its return collective.
+        The caller validates the prefix layout before passing its host length.
+        """
+        batch_size, seq_len = q.shape[:2]
+        if type(valid_seq_len) is not int or not 0 <= valid_seq_len <= seq_len:
+            raise ValueError("valid_seq_len must be a host integer in [0, sequence length].")
+        if valid_seq_len == seq_len:
+            return self.forward(q, k, v, batch_size, seq_len, timestep=timestep)
+        if valid_seq_len == 0:
+            return q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
+        output = self.forward(
+            q=q[:, :valid_seq_len].contiguous(),
+            k=k[:, :valid_seq_len].contiguous() if k is not None else None,
+            v=v[:, :valid_seq_len].contiguous() if v is not None else None,
+            batch_size=batch_size,
+            seq_len=valid_seq_len,
+            timestep=timestep,
+        )
+        return torch.nn.functional.pad(output, (0, 0, 0, seq_len - valid_seq_len))
+
     def forward(
         self,
         q: torch.Tensor,
@@ -604,6 +639,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        discard_padded_queries: bool = False,
+        valid_seq_len: Optional[int] = None,
+        grouped_tokens: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -633,11 +672,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 prediction hooks. A ``block_sparse_inputs`` payload selects the
                 generic block-sparse FMHA.
             timestep: Denoising timestep consumed by the sparse prediction hooks.
-            **kwargs: Backend-specific keyword arguments forwarded by the attention
-                module, such as ``key_padding_mask``; ignored here, as by the other
-                backends. The TRTLLM kernels have no key-padding input, so callers
-                that need padded keys must guard at the model level or select the
-                ``VANILLA`` backend.
             kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
                 ``k``/``v`` are the new tokens only: the fused kernel writes them at
                 ``staging_offset`` and attends over everything cached before them plus
@@ -645,10 +679,37 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 The first ``kv.num_tokens`` rows are real; rows past them are padding,
                 neither cached nor attended, and output zero. ``batch_size`` must be 1.
                 Sparse attention is not supported on this path.
+            key_padding_mask: Ignored, preserving legacy TRTLLM behavior. Callers
+                opting into prefix trimming must supply valid_seq_len instead.
+            discard_padded_queries: Opt in to valid-prefix dense self-attention.
+                Caller guarantees padded query rows are unused; their outputs
+                are zero-filled.
+            valid_seq_len: Host length of the contiguous valid prefix, identical
+                for every batch row, in the global sequence after Ulysses exchange.
+                Required when opting into padding. The caller must validate
+                trailing padding; arbitrary masks and unequal lengths are unsupported.
+            grouped_tokens: Under VC-Attention, the ``(start, stop)`` token range the
+                value grouping covers. In a joint sequence the range holds the video
+                tokens. The text or audio tokens follow them in input order. ``None``
+                groups the whole sequence.
+            **kwargs: Additional backend-specific arguments.
 
         Returns:
             Output tensor [B, S, H*D]
         """
+        if discard_padded_queries and (valid_seq_len is not None or key_padding_mask is not None):
+            if (
+                kv is not None
+                or attention_mask != PredefinedAttentionMask.FULL
+                or seq_len_kv not in (None, seq_len)
+                or self.quant_attention_config is not None
+                or sparse_backend_args is not None
+                or self.sparse_params is not None
+            ):
+                raise ValueError(
+                    "TRTLLM padding requires dense self-attention with discarded padded queries."
+                )
+            return self._forward_padded_self_attention(q, k, v, valid_seq_len, timestep)
         if kv is not None:
             if sparse_backend_args is not None:
                 raise NotImplementedError("Sparse attention is not supported over a K/V cache.")
@@ -680,7 +741,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 quantization_kwargs = {
                     "vc_attention": True,
                     "vc_operands": self._vc_operands(
-                        q, k, v, batch_size, seq_len, kv_seq_len, timestep
+                        q, k, v, batch_size, seq_len, kv_seq_len, timestep, grouped_tokens
                     ),
                 }
             elif quant_cfg is not None:

@@ -17,6 +17,7 @@
 #include "cutlass_extensions/gemm_configs.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/allreduce_gemm_runner.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -168,6 +169,10 @@ public:
         if (handle == nullptr)
         {
             TLLM_LOG_DEBUG("Creating allreduce workspace for %s", key.toString().c_str());
+            // Every NVLS allocation below (the output buffer and the workspace's barriers) is recorded, at its
+            // rounded size, under this label until it is freed.
+            tensorrt_llm::common::NativeMemoryLabelScope const nativeMemoryLabel(
+                tensorrt_llm::common::nativeMemoryLabels::kGemmAllreduceNvls);
             handle = std::make_shared<IpcNvlsHandleWrapper>(preferredWorkspaceSize, key.group);
             GemmAllReduceImplInterface::ProblemArgs tmpArgs;
             int maxN = 16384;

@@ -24,7 +24,8 @@ class TextPrompt(TypedDict):
     When a UUID is provided for an item, it is preserved in KV cache events.
     V1 uses it as the legacy hash value; V2 returns it in the optional uuid
     field while retaining the derived digest as hash. Use None for specific
-    items that need content-only hashing.
+    items that need content-only hashing. Items attached through
+    multi_modal_embeddings take UUIDs the same way.
     """
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
@@ -62,7 +63,8 @@ class TokensPrompt(TypedDict):
     When a UUID is provided for an item, it is preserved in KV cache events.
     V1 uses it as the legacy hash value; V2 returns it in the optional uuid
     field while retaining the derived digest as hash. Use None for specific
-    items that need content-only hashing.
+    items that need content-only hashing. Items attached through
+    multi_modal_embeddings take UUIDs the same way.
     """
 
     mm_processor_kwargs: NotRequired[Dict[str, Any]]

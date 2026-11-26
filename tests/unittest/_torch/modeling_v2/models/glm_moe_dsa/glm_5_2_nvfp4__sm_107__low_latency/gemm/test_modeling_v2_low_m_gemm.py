@@ -7,9 +7,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.low_m_gemm import (  # noqa: E501
-    low_m_gemm as op,
-)
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.low_m_gemm import (  # noqa: E501
+        low_m_gemm as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
@@ -114,8 +119,8 @@ def test_guard_refuses_an_out_over_an_input(operand) -> None:
 
 @pytest.mark.parametrize("rows", [1, 2, 3, 6, 12, 18])
 def test_batched_v_b_strides_and_graph(rows):
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm._low_m_splitk import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm._low_m_splitk import (  # noqa: E501
         bmm_prewait_tactic,
         run_splitk_bmm,
     )
@@ -165,7 +170,7 @@ def test_one_wave_lm_head_numeric(rows, vocab):
     "rows, inter", [(6, 3072), (12, 3072), (18, 3072), (1, 1536), (2, 1536), (4, 1536), (8, 1536)]
 )
 def test_dense_mlp_composition(rows, inter):
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+    from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
     from tensorrt_llm._torch.modules.swiglu import swiglu
 
     x, up, mid = _build(dict(m=rows, k=6144, n=2 * inter), seed=800 + rows)

@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
@@ -274,6 +275,53 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
         traceback.print_exc()
         raise
     return True
+
+
+def run_single_rank_ledger(tensor_parallel_size, ub_size):
+    """Registered userbuffers are in the native memory ledger at their size."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        if not ub.ub_supported():
+            return True
+
+        def recorded():
+            labels, counts, nbytes, _ = torch.ops.trtllm.get_native_memory_usage(
+                rank)
+            usage = dict(zip(labels, zip(counts, nbytes)))
+            return usage.get("userbuffers", (0, 0))
+
+        before_count, before_bytes = recorded()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+        init_count, init_bytes = recorded()
+        # Initialization registers the communicator's own region.
+        assert init_count == before_count + 1, (before_count, init_count)
+        assert init_bytes > before_bytes
+
+        tensor = create_userbuffers_tensor((ub_size // 4, ), torch.float32)
+        assert tensor is not None
+        count, nbytes = recorded()
+        assert count == init_count + 1, (init_count, count)
+        # The buffer is rounded up to the allocation and multicast granularity.
+        assert nbytes - init_bytes >= ub_size, (init_bytes, nbytes)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("tensor_parallel_size", [2])
+def test_user_buffers_are_in_the_native_memory_ledger(
+        tensor_parallel_size: int) -> None:
+    # The registration deltas require a fresh allocator on every rank.
+    with MPIPoolExecutor(tensor_parallel_size) as executor:
+        results = executor.map(run_single_rank_ledger,
+                               [tensor_parallel_size] * tensor_parallel_size,
+                               [8 << 20] * tensor_parallel_size)
+        for result in results:
+            assert result is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,

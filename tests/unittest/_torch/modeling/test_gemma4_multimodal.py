@@ -434,13 +434,23 @@ def test_gemma4_vision_gpu_normalize_fallback(processor_class, case):
 def test_gemma4_vision_gpu_normalize_mixed_fallback(processor_class):
     image_processor = processor_class(max_soft_tokens=70, do_resize=False)
     processor = _make_normalization_processor(image_processor)
-    # An empty video list exercises the existing mixed preprocessing path without frame decoding.
+    video_processor = Gemma4VideoProcessor(max_soft_tokens=70, do_resize=False)
+    processor._processor.video_processor = video_processor
+    frames = np.random.default_rng(42).integers(0, 256, (2, 48, 48, 3), dtype=np.uint8)
+    image = Image.fromarray(frames[0])
     inputs = {
-        "prompt": "image and video",
-        "multi_modal_data": {"image": [Image.new("RGB", (48, 48))], "video": []},
+        "prompt": "image and <|video|>",
+        "multi_modal_data": {"image": [image], "video": [frames]},
     }
     _, output = processor.call_with_text_prompt(inputs, None)
-    assert "vision_normalization" not in output["multimodal_data"]["image"]
+    expected_image = image_processor(images=[image], return_tensors="pt")["pixel_values"]
+    expected_video = video_processor(videos=[frames], do_sample_frames=False, return_tensors="pt")[
+        "pixel_values_videos"
+    ].flatten(0, 1)
+    for modality, expected in (("image", expected_image), ("video", expected_video)):
+        bucket = output["multimodal_data"][modality]
+        assert "vision_normalization" not in bucket
+        assert torch.equal(bucket["pixel_values"], expected.to(processor.dtype))
     assert Gemma4ForConditionalGeneration.supports_vision_gpu_normalize
     assert Gemma4UnifiedForConditionalGeneration.supports_vision_gpu_normalize
 
@@ -1192,6 +1202,62 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
 
             self.assertEqual(text_model_config.attn_backend, backend)
             self.assertEqual(vision_model_config.attn_backend, "TRTLLM")
+
+    def test_generation_only_omits_multimodal_token_types(self):
+        model = self._make_model()
+        raw_input_ids = torch.tensor([1, model.image_token_ids[0]], dtype=torch.int32)
+
+        forward_kwargs = model.get_language_model_extra_forward_kwargs(
+            attn_metadata=mock.Mock(num_contexts=0),
+            raw_input_ids=raw_input_ids,
+            position_ids=None,
+            mm_inputs=mock.Mock(input_ids=None),
+        )
+
+        self.assertIsNone(forward_kwargs["mm_token_type_ids"])
+        self.assertIsNone(forward_kwargs["ple_input_ids"])
+
+    def test_context_builds_multimodal_token_types_without_prepared_input_ids(self):
+        model = self._make_model()
+        self.assertIsNotNone(model.video_token_ids)
+        raw_input_ids = torch.tensor(
+            [1, model.image_token_ids[0], model.video_token_ids[0]],
+            dtype=torch.int32,
+            device=model.image_token_ids.device,
+        )
+
+        forward_kwargs = model.get_language_model_extra_forward_kwargs(
+            attn_metadata=mock.Mock(num_contexts=1),
+            raw_input_ids=raw_input_ids,
+            position_ids=None,
+            mm_inputs=mock.Mock(input_ids=None),
+        )
+
+        torch.testing.assert_close(
+            forward_kwargs["mm_token_type_ids"],
+            torch.tensor([0, 1, 2], dtype=torch.long, device=raw_input_ids.device),
+        )
+
+    def test_language_model_forward_kwargs_forwards_attention_metadata(self):
+        model = self._make_model()
+        attn_metadata = object()
+        mm_inputs = mock.Mock()
+
+        with mock.patch.object(
+            model, "get_language_model_extra_forward_kwargs", return_value={}
+        ) as extra_kwargs:
+            forward_kwargs = model.get_language_model_forward_kwargs(
+                attn_metadata=attn_metadata,
+                input_ids=None,
+                raw_input_ids=None,
+                position_ids=None,
+                inputs_embeds=None,
+                mm_inputs=mm_inputs,
+                return_context_logits=False,
+            )
+
+        self.assertIs(extra_kwargs.call_args.kwargs["attn_metadata"], attn_metadata)
+        self.assertIs(forward_kwargs["attn_metadata"], attn_metadata)
 
     def test_encoder_cache_reuses_image_embedding_across_requests(self):
         """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""

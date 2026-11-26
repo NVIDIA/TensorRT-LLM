@@ -9,6 +9,7 @@ installed copy, so the compatibility patch rewrites those imports; this test
 keeps a future re-vendor from reintroducing them.
 """
 
+import ast
 import pathlib
 import re
 
@@ -22,9 +23,14 @@ _ESCAPING_IMPORT = re.compile(
 
 def test_vendored_prims_ts_does_not_import_flashinfer_attention_or_trace() -> None:
     root = pathlib.Path(vendored.__file__).resolve().parent
-    offenders = sorted(
-        str(path.relative_to(root))
-        for path in root.rglob("*.py")
-        if _ESCAPING_IMPORT.search(path.read_text(encoding="utf-8"))
-    )
+    offenders = []
+    for path in root.rglob("*.py"):
+        relative = path.relative_to(root)
+        source = path.read_text(encoding="utf-8")
+        if _ESCAPING_IMPORT.search(source) or any(
+            isinstance(node, ast.ImportFrom) and node.level > len(relative.parts)
+            for node in ast.walk(ast.parse(source))
+        ):
+            offenders.append(str(relative))
+    offenders.sort()
     assert not offenders, f"vendored modules import the installed flashinfer tree: {offenders}"

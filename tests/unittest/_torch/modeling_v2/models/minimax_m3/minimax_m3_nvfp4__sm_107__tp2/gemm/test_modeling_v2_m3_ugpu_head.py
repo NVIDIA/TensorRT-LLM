@@ -8,7 +8,7 @@ eager and in a CUDA graph; an in-place change of the weight makes the copy stale
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm import (  # noqa: E501
     m3_ugpu_head as op,
 )
 from tensorrt_llm._torch.modules.linear import Linear
@@ -18,7 +18,7 @@ if not torch.cuda.is_available():
 
 
 def _locality():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 

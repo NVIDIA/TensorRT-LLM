@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, Literal, Optional, Tuple
 
 import numpy as np
 
@@ -107,26 +107,38 @@ class PhysicalPool:
     ``slot_bytes`` spans all layers and roles coalesced into one slot.
     The slot address is ``base_address + slot * slot_stride_bytes``;
     per-layer and per-role offsets are carried by each PoolView.
+    ``memory_type`` describes the backing allocation, including the host hot
+    tier for sparse buffers, independently of the logical layer layout.
     """
 
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
+    memory_type: Literal["VRAM", "DRAM"] = "VRAM"
+    # Byte ranges relative to base_address that are backed by memory; None when the whole
+    # extent is. A localized KV pool maps each locality domain's chunks at distinct offsets.
+    mapped_ranges: Optional[Tuple[Tuple[int, int], ...]] = None
 
     def __post_init__(self) -> None:
+        if self.memory_type not in ("VRAM", "DRAM"):
+            raise ValueError(f"Unsupported KV pool memory type: {self.memory_type!r}")
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
         if self.slot_stride_bytes < self.slot_bytes:
             raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "base_address": int(self.base_address),
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
+            "memory_type": self.memory_type,
         }
+        if self.mapped_ranges is not None:
+            result["mapped_ranges"] = [list(bounds) for bounds in self.mapped_ranges]
+        return result
 
     @staticmethod
     def from_dict(data: dict) -> "PhysicalPool":
@@ -137,6 +149,12 @@ class PhysicalPool:
             slot_stride_bytes=(
                 int(data["slot_stride_bytes"])
                 if data.get("slot_stride_bytes") is not None
+                else None
+            ),
+            memory_type=data.get("memory_type", "VRAM"),
+            mapped_ranges=(
+                tuple((int(start), int(end)) for start, end in data["mapped_ranges"])
+                if data.get("mapped_ranges") is not None
                 else None
             ),
         )
@@ -398,6 +416,11 @@ class KVCachePageTable:
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+
+    @property
+    def has_host_pools(self) -> bool:
+        """Whether any transferable allocation is backed by host memory."""
+        return any(pool.memory_type == "DRAM" for group in self.pool_groups for pool in group.pools)
 
     def to_dict(self) -> dict:
         return {

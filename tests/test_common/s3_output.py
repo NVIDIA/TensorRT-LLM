@@ -385,6 +385,8 @@ class UploadLogPlugin:
             except FileNotFoundError:
                 if attempt == _SPOOL_PATH_ATTEMPTS - 1:
                     raise
+        else:
+            raise RuntimeError("No attempts made to open the spool file")
         with os.fdopen(file_descriptor, "a", encoding="utf-8", errors="replace") as output:
             for offset in range(0, len(content), _SPOOL_WRITE_CHARS):
                 output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
