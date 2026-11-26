@@ -1947,9 +1947,10 @@ class AutoTuner:
         # inside lockstep profiling, including profiling scratch allocation.
         if tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.MERGE:
             return
+        # A runner need not subclass TunableRunner, which declares primes_cached_tactics.
         jit_classes = {
             type(r)
-            for r in runners if type(r).primes_cached_tactics
+            for r in runners if getattr(type(r), "primes_cached_tactics", False)
             or isinstance(getattr(type(r), "kernel_cache", None), dict)
         }
         if not jit_classes:
