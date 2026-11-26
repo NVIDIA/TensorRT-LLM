@@ -498,6 +498,8 @@ def _streaming_chat_server(monkeypatch, generation):
             backend="pytorch",
             guided_decoding_backend=None,
             num_postprocess_workers=1,
+            memory_monitor_config=None,
+            num_serve_frontends=1,
         ),
         generate_async=Mock(return_value=generation),
     )
@@ -657,7 +659,9 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(
+            return_perf_metrics=False, memory_monitor_config=None, num_serve_frontends=1
+        ),
     )
     standard.use_harmony = False
     # register_routes() reads these to decide whether to mount the optional
@@ -750,7 +754,9 @@ def test_batch_routes_are_registered_on_the_standard_server():
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(
+            return_perf_metrics=False, memory_monitor_config=None, num_serve_frontends=1
+        ),
     )
     standard.use_harmony = False
     # register_routes() reads these to decide whether to mount the optional

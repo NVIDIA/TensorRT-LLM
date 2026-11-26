@@ -19,6 +19,8 @@ from pathlib import Path
 from ...infra.files import write_text_atomic
 
 FILENAME = "anchors.json"
+#: Per benchmark: an anchor below this cannot tell a working target from a broken one.
+PLAUSIBLE_ANCHOR: dict[str, float] = {"gsm8k": 60.0}
 
 
 @dataclass(frozen=True)

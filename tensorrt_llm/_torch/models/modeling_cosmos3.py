@@ -60,9 +60,7 @@ class Cosmos3InputProcessor(Qwen3VLInputProcessorBase):
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         # Cosmos3 benchmark requests contain already-sampled videos. Preserve their
         # frames instead of applying the shared ten-frame loader default again.
-        media_io_kwargs = super().get_preferred_media_io_kwargs()
-        media_io_kwargs["video"].update({"num_frames": -1, "fps": -1})
-        return media_io_kwargs
+        return {"video": {"num_frames": -1, "fps": -1}}
 
 
 @support_multimodal_disaggregated

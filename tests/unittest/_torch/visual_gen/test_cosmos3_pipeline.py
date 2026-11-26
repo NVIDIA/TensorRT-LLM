@@ -33,23 +33,23 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver
 from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DEFAULTS,
+    COSMOS3_DURATION_TEMPLATE,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_T2I_PARAMS,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
-    COSMOS3_DEFAULT_SYSTEM_PROMPT,
-    COSMOS3_DURATION_TEMPLATE,
-    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
     _load_reference_image,
@@ -68,6 +68,9 @@ from tensorrt_llm.media.decoding import video_stream_info
 from tensorrt_llm.visual_gen.args import CompilationConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
+
+QWEN3_IMAGE_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["image"]
+ACTION_GENERATION_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["action"]["common"]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -100,7 +103,7 @@ FRAME_RATE = 24.0
 # ``output_type="image"`` still exercises flow_shift and guidance_interval.
 T2I_HEIGHT = 512
 T2I_WIDTH = 512
-T2I_GUIDANCE_SCALE = COSMOS3_T2I_PARAMS["guidance_scale"]
+T2I_GUIDANCE_SCALE = QWEN3_IMAGE_DEFAULTS["guidance_scale"]
 
 COSMOS3_FP8_QUANT_CONFIG = {
     "quant_algo": "FP8",
@@ -911,6 +914,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         calls = []
         token_calls = []
 
@@ -932,9 +936,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, schedule):
                 target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
@@ -984,6 +985,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=1.0)
         rebuilt = []
 
         class StopAfterTokenize(Exception):
@@ -997,9 +999,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, schedule):
                 target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
@@ -1049,7 +1048,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.family = QWEN3_RECIPE.name
         token_calls = []
 
@@ -1064,9 +1063,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, schedule):
                 return scheduler
@@ -1109,7 +1105,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=7.0)
         pipeline.family = QWEN3_RECIPE.name
         calls = []
 
@@ -1124,9 +1120,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, schedule):
                 target, use_karras_sigmas = schedule.flow_shift, schedule.use_karras_sigmas
@@ -1168,6 +1161,7 @@ class TestCosmos3V2V:
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         rebuilt = []
 
         class FakeSampling:
@@ -1227,6 +1221,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1237,9 +1232,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         pipeline._forward_transfer = lambda **kwargs: None
@@ -1284,6 +1276,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1294,9 +1287,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         captured = {}
@@ -1347,9 +1337,10 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
+        # The image override stands in for the checkpoint scheduler's shift of 1.0.
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
+            flow_shift=3.0,
             use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
         )
 
@@ -1390,7 +1381,7 @@ class TestCosmos3Audio:
 class TestCosmos3Action:
     ACTION_HEIGHT = 480
     ACTION_WIDTH = 832
-    ACTION_CHUNK = COSMOS3_ACTION_PARAMS["action_chunk_size"]
+    ACTION_CHUNK = ACTION_GENERATION_DEFAULTS["action_chunk_size"]
     # Derived, not configured: both references fix the clip at chunk + 1.
     ACTION_FRAMES = ACTION_CHUNK + 1
     RAW_ACTION_DIM = 10
@@ -1404,7 +1395,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=self.ACTION_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="policy",
             domain_name="bridge_orig_lerobot",
             raw_action_dim=self.RAW_ACTION_DIM,
@@ -1432,7 +1423,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=self.ACTION_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="forward_dynamics",
             domain_name="bridge_orig_lerobot",
             action=action_traj,
@@ -1459,7 +1450,7 @@ class TestCosmos3Action:
             height=self.ACTION_HEIGHT,
             width=self.ACTION_WIDTH,
             num_frames=NUM_FRAMES,
-            guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+            guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
             action_mode="inverse_dynamics",
             domain_name="bridge_orig_lerobot",
             raw_action_dim=self.RAW_ACTION_DIM,
@@ -1497,7 +1488,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=NUM_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="inverse_dynamics",
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,
@@ -1516,7 +1507,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=NUM_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 frame_rate=5.0,
                 action_mode="inverse_dynamics",
                 domain_name="bridge_orig_lerobot",
@@ -1534,7 +1525,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="policy",
                 domain_id=10_000,
                 raw_action_dim=self.RAW_ACTION_DIM,
@@ -1563,7 +1554,7 @@ class TestCosmos3Action:
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,
-                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                guidance_scale=ACTION_GENERATION_DEFAULTS["guidance_scale"],
                 action_mode="policy",
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,
@@ -1674,7 +1665,7 @@ class TestCosmos3TextGuardrailBlocked:
         pipeline.family = QWEN3_RECIPE.name
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # ``rank`` is a read-only property that resolves to 0 with no
         # distributed init. The guardrail model is not under test, so a
         # checker that reports "unsafe" for any input drives the path

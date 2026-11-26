@@ -19,10 +19,9 @@ PyExecutor via a dedicated resource governor queue, bypassing the
 LLM/Proxy/Worker chain.
 """
 
-import asyncio
 import traceback
 from http import HTTPStatus
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response
@@ -35,11 +34,33 @@ from tensorrt_llm.serve.chat_utils import (
     resolve_top_level_model_type,
 )
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     KVCacheTruncateRequest,
     KVCacheTruncateTokensRequest,
     ensure_request_chat_template_allowed,
 )
-from tensorrt_llm.serve.render import RenderResources, render_conversation
+from tensorrt_llm.serve.render import RenderResources, render_conversation_with_media
+
+
+def _chat_route_request(request: KVCacheTruncateRequest, extension: Any) -> ChatCompletionRequest:
+    """The chat request the chat route renders ``request``'s messages from.
+
+    The model's serving extension derives chat-template kwargs from request-level fields (a
+    Mistral-native checkpoint's reasoning effort, for one) and lists them in
+    ``injected_chat_template_kwargs``, so a template that does not read one drops it instead
+    of rejecting the request. The cache to truncate holds the prompt rendered with both.
+    """
+    fields: Dict[str, Any] = {
+        "model": request.model,
+        "messages": request.messages or request.messages_to_retain,
+        "chat_template": request.chat_template,
+        "chat_template_kwargs": request.chat_template_kwargs,
+    }
+    if request.reasoning_effort is not None:
+        fields["reasoning_effort"] = request.reasoning_effort
+    chat_request = ChatCompletionRequest(**fields)
+    extension.apply_chat_extensions(chat_request)
+    return chat_request
 
 
 class ResourceGovernor:
@@ -138,14 +159,16 @@ class ResourceGovernor:
         documents,
         chat_template,
         chat_template_kwargs,
+        injected_chat_template_kwargs=None,
     ) -> List[int]:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
         conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
             messages, self.model_config, None
         )
-        render_task = render_conversation(
+        rendered, _ = await render_conversation_with_media(
             self._render_resources(),
+            mm_coroutines,
             conversation=conversation,
             mm_placeholder_counts=mm_placeholder_counts,
             add_generation_prompt=add_generation_prompt,
@@ -153,9 +176,9 @@ class ResourceGovernor:
             documents=documents,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            injected_chat_template_kwargs=injected_chat_template_kwargs,
             tokenize=True,
         )
-        rendered, _ = await asyncio.gather(render_task, mm_coroutines)
         return rendered.token_ids
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:
@@ -167,7 +190,7 @@ class ResourceGovernor:
                 if request.tools is None
                 else [extension.serialize_tool(tool) for tool in request.tools]
             )
-            chat_template_kwargs = request.chat_template_kwargs or {}
+            chat_request = _chat_route_request(request, extension)
 
             messages_to_retain = (
                 await self._convert_messages(
@@ -176,7 +199,8 @@ class ResourceGovernor:
                     request.add_generation_prompt,
                     request.documents,
                     request.chat_template,
-                    chat_template_kwargs,
+                    chat_request.chat_template_kwargs or {},
+                    chat_request.injected_chat_template_kwargs,
                 )
                 if request.messages_to_retain
                 else []
@@ -189,7 +213,8 @@ class ResourceGovernor:
                     request.add_generation_prompt,
                     request.documents,
                     request.chat_template,
-                    chat_template_kwargs,
+                    chat_request.chat_template_kwargs or {},
+                    chat_request.injected_chat_template_kwargs,
                 )
                 if request.messages
                 else []

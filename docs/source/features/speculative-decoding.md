@@ -113,7 +113,7 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 MTP is supported by DeepSeek models and other architectures that ship native MTP modules, including Qwen3.8 MoE, Qwen3.5 MoE, and Step-3.x. MTP can be tuned with the following configuration options:
 
 * `max_draft_len`: Maximum draft candidate length.
-* `num_nextn_predict_layers`: Number of MTP modules to use. Currently must match `max_draft_len`.
+* `use_mtp_vanilla`: Force vanilla MTP instead of MTP-Eagle for a checkpoint with one MTP layer (default: `False`).
 * `use_relaxed_acceptance_for_thinking`: If true, use relaxed decoding for reasoning models in the thinking phase. In this mode, speculation requirements are relaxed for the thinking phase - a draft token may be accepted if it appears in a candidate set constructed with `relaxed_topk` and `relaxed_delta`.
 * `relaxed_topk`: The top K tokens are sampled from the target model's logits to create the initial candidate set for relaxed decoding.
 * `relaxed_delta`: Used to further filter the top K candidate set for relaxed decoding. We remove tokens `t` for which `log(P(top 1 token)) - log(P(t)) > relaxed_delta`.
@@ -125,6 +125,22 @@ speculative_config = MTPDecodingConfig(max_draft_len=3)
 
 llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 ```
+
+The number of MTP layers is read from the checkpoint, rather than selected with
+`num_nextn_predict_layers`. That input name is deprecated: when supplied, it acts
+as an alias for `max_draft_len` only if the `max_draft_len` key is absent. If both
+keys are present, the deprecated value is ignored, even when `max_draft_len` is
+`null`.
+
+A checkpoint with exactly one MTP layer runs MTP-Eagle unless
+`use_mtp_vanilla=True`; a checkpoint with multiple MTP layers runs vanilla MTP.
+MTP-Eagle can reuse its MTP layer for multiple draft steps. The current
+checkpoint resolver caps vanilla MTP's requested `max_draft_len` at the number
+of available MTP layers. For linear drafting (`use_dynamic_tree=False`), omitting
+`max_draft_len` uses all checkpoint MTP layers in vanilla MTP and one draft step
+in MTP-Eagle. Dynamic-tree drafting (`use_dynamic_tree=True`) requires an explicit
+`max_draft_len` and a positive `dynamic_tree_max_topK`; it has no omitted-length
+default.
 
 MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
@@ -222,6 +238,43 @@ in disaggregated serving, a draft layout
 that cannot be transferred with the target's. When the layers are shared, the
 worker log reports `target and draft KV layers share one KV cache manager` at
 startup.
+
+#### Prefix-cache hits (`context_recompute_tail`)
+
+DFlash and standalone DSpark drafters attend to K/V projected from target hidden states, and
+the target only produces hidden states for tokens it runs a forward on. With KV-cache block
+reuse on, a request that hits a cached prefix skips those tokens, so the drafter sees only the
+uncached tail of its prompt and the acceptance length drops on every hit. A draft KV pool paired
+with the target's block reuse, separate or sharing the target's KV cache manager (above), hands
+the reused prefix's draft K/V back with the target's pages, but acceptance still drops on hits:
+on MiniMax-M3.1-Flash with 8000-token prompts, cold AL 4.56 fell to 4.10 on repeats at tail `0`
+and to 4.35 at the drafter's window, the same for both pool layouts. The tail trades TTFT for
+acceptance in either layout.
+
+`context_recompute_tail` (on `DFlashDecodingConfig` and `DSparkDecodingConfig`) caps the reuse
+claim so the target recomputes the last tokens of the prompt:
+
+* `0` (default): no recompute; the full cached prefix is reused.
+* a positive `N`: the last `N` prompt tokens are recomputed, rounded so the reused prefix ends on
+  a block boundary. A tail of the drafter's attention window gives the drafter the inputs it
+  would see without reuse; the recomputed target K/V can still differ numerically from a cold
+  prefill, so the output need not match it token for token.
+* `-1`: a prefix hit re-prefills the whole prompt.
+* `null`: resolved from the drafter config, differently per drafter:
+  * DSpark checks each layer: the tail is the widest attention window over the layers, or `-1`
+    when any layer uses full attention or the drafter is MLA-shaped (`0` for the embedded
+    DeepSeek-V4 drafter).
+  * DFlash reads only the drafter-wide `dflash_config.use_swa` and `swa_window_size`: the tail is
+    `swa_window_size` when `use_swa` is set, else `-1`. Per-layer `layer_types` are not
+    consulted, so a DFlash drafter that mixes sliding-window and full-attention layers resolves to
+    the window; set `-1` explicitly for it.
+
+The recomputed tokens cost TTFT and prefill throughput on every hit and are not loaded from a
+KV connector. A disaggregated context server recomputes only when the draft layers share the
+target's KV cache manager, since only then do its draft pages reach the generation server. The
+`KVCacheManagerV2` requires the `all_reusable` block-reuse policy; the V1 manager requires
+chunked prefill and no sliding-window target layers. Otherwise the managers disable the tail with
+a warning.
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
