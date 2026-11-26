@@ -1154,7 +1154,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in timed_out.intersection(q, c + f + d):
             req = self._send_reqs.get(rid)
             if req is not None:
-                req.py_kv_transfer_timed_out = True
+                # Accounting only: the executor's timeout cleanup stays with the
+                # rank whose own deadline expired.
+                req.py_kv_transfer_committed_cause = "timeout"
         return c, f, d, q, failures.intersection(q)
 
     def _sync_transfer_timing(self, reqs: list):

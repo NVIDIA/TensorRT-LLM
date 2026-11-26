@@ -142,6 +142,9 @@ class DisaggTransferCoordinator:
         self._legacy_retire_poll_index = 0
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
+        # Sends whose claim the reaper already released while another owner,
+        # such as a KV connector save, still holds the request in transfer.
+        self._released_ctx_send_ids: Set[int] = set()
         # These sends may outlive their logical result. Their cancellation is
         # not a new request failure when the physical reaper later settles them.
         self._context_cancellation_drains: Set[int] = set()
@@ -1155,16 +1158,21 @@ class DisaggTransferCoordinator:
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             elif request_id in succeeded_ids:
                 self._record_transfer_outcome(request, "success")
+            self._released_ctx_send_ids.add(request_id)
             self.release_transfer(request)
 
         # Releases above may have changed the set of requests in transfer.
         requests_in_transfer = self._transfers.requests_in_transfer()
+        self._released_ctx_send_ids.intersection_update(requests_in_transfer)
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if (
                 not request.py_kv_transfer_timed_out
                 or request_id in completed_req_ids
                 or request_id in self._timed_out_ctx_cancelled_ids
+                # Only the send's own claim is released here; another owner
+                # releases its claim when its work completes.
+                or request_id in self._released_ctx_send_ids
             ):
                 continue
             if not self.request_cancellation(request):
@@ -1181,6 +1189,7 @@ class DisaggTransferCoordinator:
                 # cancelled is released from the async manager immediately.
                 request.py_kv_transfer_start_time = None
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                self._released_ctx_send_ids.add(request_id)
                 self.release_transfer(request)
 
         self._check_transfer_errors("context requests")
@@ -1560,6 +1569,7 @@ class DisaggTransferCoordinator:
                 self._settled_transfer_ids.discard(transfer_id)
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
+        self._released_ctx_send_ids.discard(request_id)
         self._legacy_retire_retry.pop(request_id, None)
         self._context_cancellation_drains.discard(request_id)
         self._unpublished_gen_receives.pop(request_id, None)

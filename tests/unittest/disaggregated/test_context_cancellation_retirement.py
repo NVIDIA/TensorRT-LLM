@@ -340,17 +340,24 @@ def _assert_transfer_only_progress(
     return executor
 
 
+@pytest.mark.parametrize("connector_pending", [False, True], ids=["send-only", "connector-save"])
 def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, connector_pending: bool
 ) -> None:
-    """Both writers finish, but only one rank's executor saw the 1 s deadline expire."""
+    """Both writers finish, but only one rank's executor saw the 1 s deadline expire.
+
+    Every rank counts the timeout once, and a KV connector save that still reads the
+    pages keeps them pinned until the connector releases its own claim.
+    """
     monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    monkeypatch.setattr(coordinator_mod, "prepare_response", Mock(return_value=None))
     group = FakeDistGroup(world_size=2, tp_size=2)
     ranks = []
     requests = []
     for rank in range(2):
         request = _context_request()
         request.py_kv_transfer_start_time = 0.0
+        request.py_kv_transfer_committed_cause = None
         request.is_disagg_generation_transmission_in_progress = False
         session = SimpleNamespace(
             _enforce_physical_ownership=False,
@@ -367,6 +374,8 @@ def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
             _worker(), request, session, dist=group.rank(rank), enable_transfer_metrics=True
         )
         harness.transfers.start_transfer(request)
+        if connector_pending:
+            harness.transfers.start_transfer(request)  # The connector's save claim.
         harness.active.append(request)
         # The executors observe 700 ms on rank 0 and 1100 ms on rank 1.
         harness.coordinator._flag_transfer_timeout(
@@ -379,12 +388,27 @@ def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
 
     for _ in range(2):
         group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
-        for harness, request in zip(ranks, requests):
+        for rank, (harness, request) in enumerate(zip(ranks, requests)):
             assert harness.coordinator.transfer_outcomes == (0, 0, 1)
-            assert request.py_kv_transfer_timed_out
+            assert request.py_kv_transfer_committed_cause == "timeout"
+            # Only the rank whose own deadline expired keeps the executor flag.
+            assert request.py_kv_transfer_timed_out is (rank == 1)
             assert not harness.transceiver._send_sessions
-            assert not harness.transfers.requests_in_transfer()
             harness.effects.fail_requests.assert_not_called()
+            if connector_pending:
+                assert harness.transfers.requests_in_transfer() == {401: request}
+                harness.manager.unpin_blocks_by_id.assert_not_called()
+            else:
+                assert not harness.transfers.requests_in_transfer()
+                harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
+
+    if connector_pending:
+        # The connector reports its save; only then are the pages released.
+        for harness, request in zip(ranks, requests):
+            harness.coordinator.release_transfer(request)
+            assert not harness.transfers.requests_in_transfer()
+            harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
+            assert harness.coordinator.transfer_outcomes == (0, 0, 1)
 
     assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
 

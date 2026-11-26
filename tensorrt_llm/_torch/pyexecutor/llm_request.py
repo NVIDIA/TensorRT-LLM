@@ -1088,8 +1088,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
-        # The committed transfer outcome ("timeout" or "error") of a receive
-        # session that cancellation retired before a poll could report it.
+        # A transfer outcome ("timeout" or "error") that a session committed
+        # or the ranks' outcome vote agreed. It drives outcome accounting only,
+        # never transfer cleanup.
         self.py_kv_transfer_committed_cause: Optional[Literal["timeout",
                                                               "error"]] = None
         # Set once a received generation request's first token is found not

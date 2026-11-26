@@ -542,7 +542,7 @@ def test_consensus_outcome_uses_single_batched_allgather() -> None:
 @pytest.mark.parametrize("peer_failed", [False, True])
 def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
-    req = SimpleNamespace(py_kv_transfer_timed_out=False)
+    req = SimpleNamespace(py_kv_transfer_timed_out=False, py_kv_transfer_committed_cause=None)
     transceiver._send_sessions = {}
     transceiver._send_reqs = {21: req}
     transceiver._ctx_need_tp_sync = True
@@ -560,7 +560,9 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> 
 
     assert cancelled == []
     assert failed == ([21] if peer_failed else [])
-    assert req.py_kv_transfer_timed_out is peer_failed
+    # The agreed timeout is accounting only; this rank's deadline did not expire.
+    assert req.py_kv_transfer_committed_cause == ("timeout" if peer_failed else None)
+    assert req.py_kv_transfer_timed_out is False
     assert completed == []
     assert quiesced == ([21] if peer_failed else [])
 
@@ -569,7 +571,9 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> 
 def test_ctx_tp_vote_spreads_an_executor_observed_deadline(observed_here) -> None:
     """A completed send counts the deadline one rank's executor observed on every rank."""
     sent = []
-    req = SimpleNamespace(py_kv_transfer_timed_out=observed_here)
+    req = SimpleNamespace(
+        py_kv_transfer_timed_out=observed_here, py_kv_transfer_committed_cause=None
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._send_sessions = {21: SimpleNamespace(timed_out=False)}
     transceiver._send_reqs = {21: req}
@@ -590,7 +594,10 @@ def test_ctx_tp_vote_spreads_an_executor_observed_deadline(observed_here) -> Non
     assert sent == [[[], [], [21], [21], [21] if observed_here else []]]
     assert (cancelled, failed, completed, quiesced) == ([], [], [21], [21])
     assert backend_failed == set()
-    assert req.py_kv_transfer_timed_out is True
+    # Every rank counts the agreed timeout; only the observing rank keeps the
+    # executor flag that arms its timeout cleanup.
+    assert req.py_kv_transfer_committed_cause == "timeout"
+    assert req.py_kv_transfer_timed_out is observed_here
 
 
 @pytest.mark.parametrize("local_failure", [False, True])
