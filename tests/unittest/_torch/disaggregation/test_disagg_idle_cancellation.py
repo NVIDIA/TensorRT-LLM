@@ -1462,6 +1462,67 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     watchdog.stop()
 
 
+@pytest.mark.parametrize("abort_first", [False, True], ids=["poll-first", "abort-first"])
+def test_committed_receive_timeout_survives_either_cancellation_order(
+    executor: PyExecutor, abort_first: bool
+) -> None:
+    """A receive whose deadline has committed counts one timeout however a later abort lands.
+
+    Args:
+        executor: Real cancellation and retirement path with controlled resources.
+        abort_first: Whether the client abort is handled before the next receive poll.
+    """
+    request = _request(1)
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    executor.perf_manager = Mock()
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor.disagg._transfer_outcomes = [0, 0, 0]
+    clock = [0.0]
+    watchdog = RetirementWatchdog(Mock(), clock=lambda: clock[0])
+    session, aux = _published_receive(executor, request, watchdog=watchdog)
+    executor.disagg._started_gen_receives[request.py_request_id] = request
+    transceiver = executor.kv_cache_transceiver
+
+    # The 1 s receive deadline commits a timeout; the writer settles within the grace.
+    clock[0] = 1.5
+    watchdog.progress()
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert session.timed_out
+    assert session.resources_drained()
+
+    if abort_first:
+        _abort(executor, request)
+        executor._cancel_waiting_disagg_requests([])
+        assert request.py_kv_transfer_timed_out
+        assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor.disagg.reap_gen_receives(0)
+    if not abort_first:
+        _abort(executor, request)
+        executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+
+    assert executor.disagg.transfer_outcomes == (0, 0, 1)
+    assert executor.active_requests == []
+    (response,) = executor._response_channel.responses[request.py_request_id]
+    assert response.error_msg is not None
+    assert not request.is_finished_due_to_cancellation
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+    executor.disagg.reap_gen_receives(0)
+    executor._flush_pending_transfer_responses()
+    assert executor.disagg.transfer_outcomes == (0, 0, 1)
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    watchdog.require_retired()
+    watchdog.stop()
+
+
 @pytest.mark.parametrize("last_resource", ["kv", "aux"])
 def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
     executor: PyExecutor, last_resource: str
