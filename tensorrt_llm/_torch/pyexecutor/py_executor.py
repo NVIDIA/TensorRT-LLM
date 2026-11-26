@@ -3139,8 +3139,9 @@ class PyExecutor:
         """Keep qualified source retirement live after the logical result leaves.
 
         Scans the in-flight transfers only when the coordinator supports
-        logical context cancellation. Under attention DP it never does: the
-        context-first ownership profile does not support attention DP yet.
+        logical context cancellation. Under attention DP it never does:
+        validate_context_first_peer refuses a context-first transfer when either
+        peer enables attention DP.
 
         Returns:
             Whether a source claim still awaits TP-agreed retirement. All
