@@ -17,6 +17,7 @@ generation worker with DSpark. The nodes need HTTP and NIXL/UCX connectivity.
 import os
 import socket
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -96,6 +97,13 @@ def _worker_env() -> dict[str, str]:
     return env
 
 
+def _print_process_logs(artifacts: Path) -> None:
+    for path in sorted(artifacts.glob("*.log")):
+        with path.open(errors="replace") as log:
+            tail = "".join(deque(log, maxlen=100))
+        print(f"Last 100 lines of {path}:\n{tail}", flush=True)
+
+
 @dataclass
 class _Cluster:
     rank: int
@@ -141,10 +149,11 @@ def disagg_cluster(request: pytest.FixtureRequest, output_dir: str) -> Iterator[
     if get_sm_version() < 100 or get_device_count() < 4 or get_device_memory() < 140000:
         pytest.skip("Requires four Blackwell-or-newer GPUs with 140000 MiB each on each node")
     model_path = resolve_llm_model_path(MODEL)
-    artifacts = Path(output_dir) / "disagg-stress" / request.node.name / f"node-{rank}"
+    artifacts = Path(output_dir) / "disagg-logs" / request.node.name / f"node-{rank}"
     artifacts.mkdir(parents=True, exist_ok=True)
     with peer_connection(rank, hosts[0], CONTROL_PORT, request.node.nodeid) as connection:
         with ExitStack() as stack:
+            stack.callback(_print_process_logs, artifacts)
             worker = stack.enter_context(
                 RemoteOpenAIServer(
                     model_path,
