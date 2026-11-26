@@ -1058,6 +1058,7 @@ def test_poll_reports_a_failure_committed_before_a_deferred_legacy_cancel() -> N
 
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
     transceiver._gen_idle_agreed = False
     transceiver._gen_idle_probe = False
     transceiver._rank_info_start_failures = None
