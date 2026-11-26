@@ -6077,7 +6077,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @pytest.mark.timeout(3600)
-    @pytest.mark.skip_device_not_contain(["B200", "B300", "GB200", "GB300"])
+    @skip_no_sm100f
     @pytest.mark.parametrize("mode", ["baseline", "mtp3", "dflash7"])
     def test_gpqa_diamond(
         self,
