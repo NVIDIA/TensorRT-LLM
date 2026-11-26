@@ -4585,6 +4585,28 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def get_gpu_pool_bytes(self) -> list[int]:
+        """Return the device-backed bytes of each GPU pool group: slot count times slot bytes.
+
+        With sparse KV cache offload a GPU-level pool group also holds pools of pinned host
+        memory mapped into the device. The storage statistics give a slot size for every pool
+        of the group, so the host-backed pools' slot bytes are left out.
+        """
+        host_slot_bytes = {
+            int(group.pool_group_index): sum(
+                int(pool.slot_bytes)
+                for pool in group.pools
+                if pool.storage_medium != CacheTier.GPU_MEM
+            )
+            for group in self.impl.pool_group_descs
+        }
+        pool_bytes = []
+        for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL)):
+            slot_bytes = sum(int(size) for size in stat.slot_sizes)
+            slot_bytes -= host_slot_bytes.get(pool_group_id, 0)
+            pool_bytes.append(int(stat.total) * slot_bytes)
+        return pool_bytes
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -7013,7 +7035,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         self._set_page_index_bufs(request_id, kv_cache)
 
-    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+    def _resume_and_restore(
+        self, req_id: int, kv_cache, optional_reuse_groups=None, *, optional_reuse_endpoints=None
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
         Returns True if the cache is (or becomes) active, False on failure.
@@ -7023,8 +7047,12 @@ class KVCacheManagerV2(BaseResourceManager):
         stream = self._cache_stream(req_id)
         if not (
             kv_cache.resume(stream)
-            if optional_reuse_groups is None
-            else kv_cache.resume(stream, optional_reuse_groups=optional_reuse_groups)
+            if optional_reuse_groups is None and optional_reuse_endpoints is None
+            else kv_cache.resume(
+                stream,
+                optional_reuse_groups=optional_reuse_groups,
+                optional_reuse_endpoints=optional_reuse_endpoints,
+            )
         ):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
@@ -8993,6 +9021,36 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return and reset the page-table conversions: reused, row updates, full builds, full ms."""
         return (0, 0, 0, 0.0)
 
+    @staticmethod
+    def _utilization(total: int, remaining: int) -> float | None:
+        """Return ``1 - remaining / total``, or ``None`` for a pool without capacity."""
+        return 1.0 - remaining / total if total else None
+
+    def get_kv_cache_pool_utilization(self) -> dict[str, list[float | None] | None]:
+        """Read per-pool-group utilization from CPU-side counters.
+
+        Returns:
+            ``"gpu"`` maps to ``1 - available / total`` per GPU pool group, where
+            ``available`` counts free and evictable slots. ``"host"`` maps to the occupancy
+            ``1 - free / total`` per host pool group, including evictable cached pages, or to
+            ``None`` when there is no host tier. List positions are tier-local pool group ids;
+            zero-capacity groups read ``None``. Disk tiers are not reported.
+        """
+        pool_utilization: dict[str, list[float | None] | None] = {
+            "gpu": [
+                self._utilization(stat.total, stat.available)
+                for stat in self._get_storage_statistics(GPU_LEVEL)
+            ],
+            "host": None,
+        }
+        for level, tier in enumerate(self.impl.cache_tier_list):
+            if tier == CacheTier.HOST_MEM:
+                pool_utilization["host"] = [
+                    self._utilization(stat.total, stat.free)
+                    for stat in self._get_storage_statistics(CacheLevel(level))
+                ]
+        return pool_utilization
+
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
         pool_group_stats = self._get_storage_statistics(GPU_LEVEL)
@@ -10919,10 +10977,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 and req.context_remaining_length > 0
                 and req.context_current_position in req.expect_snapshot_points
             )
-            should_resize = not should_block_reuse or not is_all_reusable
+            should_advance_history = not should_block_reuse or not is_all_reusable
             should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
-            if should_resize:
+            if should_advance_history:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:
                 self.try_commit_blocks(req)
@@ -10948,10 +11006,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return req.max_beam_num_tokens - 1
 
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
-        """Advance a context cache's history marker, or raise."""
-        if not kv_cache.resize(None, history_length):
+        """Report completed context computation and reclaim stale KV pages, or raise."""
+        if not kv_cache.resize(None, history_length, complete_optional_recovery=True):
             raise ValueError(
-                "Failed to resize history length of KV cache for request "
+                "Failed to advance computed history of KV cache for request "
                 f"{req.py_request_id} to {history_length} tokens at context update"
             )
 
@@ -11158,6 +11216,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
         custom_priority_callback: PagePriorityCallback | None = None,
         locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ):
         """Create the cache of one request.
 
@@ -11230,6 +11289,7 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             kv_cache_retention_config=kv_cache_retention_config,
             locality_domain_id=locality_domain_id,
+            optional_reuse_max_backtrack=optional_reuse_max_backtrack,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache

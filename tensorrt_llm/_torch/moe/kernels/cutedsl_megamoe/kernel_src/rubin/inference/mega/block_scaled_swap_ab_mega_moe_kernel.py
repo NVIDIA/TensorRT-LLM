@@ -128,6 +128,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "helper_expert_count": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
             "combine_dedup": OptionalRequirement(bool),
+            "weight_layout": OptionalRequirement(str),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -158,6 +159,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
+        # Storage compatibility is independent of scheduling/physical die affinity.
+        self.weight_layout = impl_desc.get("weight_layout", "standard")
+        self.n_split = self.weight_layout == "n_split"
 
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
@@ -245,6 +249,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
 
         self._validate_geometry()
+        self._validate_weight_layout()
         self._validate_cta_partition()
         self._resolve_schedule_hint()
         mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -711,6 +716,34 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     def require_zero_workspace_leading_bytes(self) -> Tuple[int, int]:
         return self._device_workspace.require_zero_workspace_leading_bytes
 
+    def _validate_weight_layout(self) -> None:
+        """Keep each physical row half inside complete MMA and cluster tiles."""
+        if self.weight_layout not in ("standard", "n_split"):
+            raise ValueError("weight_layout must be 'standard' or 'n_split'.")
+        if not self.n_split:
+            return
+        if self.quant_kind != QuantKind.nvfp4:
+            raise ValueError("n_split prefill currently supports NVFP4 weights only.")
+        if any(
+            type(value) is not int
+            for value in (self.expert_count, self.intermediate_gateup_size, self.hidden_size)
+        ):
+            raise ValueError("n_split prefill requires static expert dimensions.")
+        if self.helper_expert_count:
+            raise ValueError("n_split prefill does not support DLB helper slots.")
+        mma_cta_count = 2 if self.use_2cta_instrs else 1
+        cluster_rows = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
+        for name, rows in (
+            ("intermediate_gateup_size", self.intermediate_gateup_size),
+            ("hidden_size", self.hidden_size),
+        ):
+            # Prevent ceil-rounded tail CTAs from selecting a nonexistent third half.
+            if rows % (2 * cluster_rows):
+                raise ValueError(
+                    f"n_split {name} half must be a multiple of the preferred "
+                    f"cluster feature tile {cluster_rows}; got {rows} rows."
+                )
+
     def name(self) -> str:
         """Canonical encoding of every constexpr: the compiled-kernel cache key.
 
@@ -758,6 +791,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")  # nosec B105
             + f"_{'dedup' if self.combine_dedup else 'nodedup'}"
             + ("_diagskiptb" if self._diag_skip_token_back else "")
+            # The n_split bank changes the weight shapes and indexing.
+            + ("_wlnsplit" if self.n_split else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -790,9 +825,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         intermediate_downproj = intermediate_gateup // 2
         experts = self.local_expert_count
         sf_vec_size = self.sf_vec_size
+        weight_experts = 2 * experts if self.n_split else experts
+        fc1_weight_rows = intermediate_gateup // 2 if self.n_split else intermediate_gateup
+        fc2_weight_rows = hidden // 2 if self.n_split else hidden
         # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
-        fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
-        fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
+        fc1_weight_sf_columns = round_up(fc1_weight_rows, 128) * round_up(hidden // sf_vec_size, 4)
+        fc2_weight_sf_columns = round_up(fc2_weight_rows, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
         # TopkReduce and the in-kernel REDG both take their output dtype from this tensor.
         output_dtype = cutlass.BFloat16
 
@@ -808,10 +846,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ),
             topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
-            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
-            fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
-            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
+            fc1_weight=fake_tensor(self.a_dtype, (weight_experts, hidden, fc1_weight_rows), (2, 0, 1), {0, 2}, 16),
+            fc1_weight_sf=fake_tensor(self.sf_dtype, (weight_experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
+            fc2_weight=fake_tensor(self.a_dtype, (weight_experts, intermediate_downproj, fc2_weight_rows), (2, 0, 1), {0, 2}, 16),
+            fc2_weight_sf=fake_tensor(self.sf_dtype, (weight_experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
             output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
             # Opaque byte workspaces: a bare base pointer, like to_cute_ptr. The 128-byte promise matches the
             # alignment the registered regions assume, so the caller must hand over 128-byte-aligned bases.
@@ -995,8 +1033,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
         intermediate_downproj = intermediate_gateup // 2
-        fc1_weight = rewrite_tensor_shape(fc1_weight, (experts, hidden, intermediate_gateup))
-        fc2_weight = rewrite_tensor_shape(fc2_weight, (experts, intermediate_downproj, hidden))
+        # Only weight/SF descriptors use physical halves. Routing, activations,
+        # epilogues and completion counters retain the full logical problem.
+        weight_experts = 2 * experts if self.n_split else experts
+        fc1_weight_rows = intermediate_gateup // 2 if self.n_split else intermediate_gateup
+        fc2_weight_rows = hidden // 2 if self.n_split else hidden
+        fc1_weight = rewrite_tensor_shape(fc1_weight, (weight_experts, hidden, fc1_weight_rows))
+        fc2_weight = rewrite_tensor_shape(fc2_weight, (weight_experts, intermediate_downproj, fc2_weight_rows))
 
         singleton = cutlass.Int32(1)
         token_rows = self.max_tokens
@@ -1004,7 +1047,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_a = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
-                (cutlass.Int32(intermediate_gateup), cutlass.Int32(hidden), experts),
+                (cutlass.Int32(fc1_weight_rows), cutlass.Int32(hidden), weight_experts),
                 stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
             ),
         )
@@ -1032,7 +1075,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
             ),
         )
-        padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
+        padded_intermediate_gateup = cute.round_up(fc1_weight_rows, sf_vec_size * 4)
         expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
@@ -1042,7 +1085,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_sfa = cute.make_tensor(
             fc1_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
+                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(weight_experts)),
                 sf_vec_size,
             ),
         )
@@ -1347,6 +1390,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
+            n_split=self.n_split,
+            local_expert_count=self.local_expert_count if self.n_split else 0,
+            fc1_half_cta_tiles=(
+                (self.intermediate_gateup_size // 2) // self._mainloop.cta_tile_m if self.n_split else 0
+            ),
+            fc2_half_cta_tiles=(
+                (self.hidden_size // 2) // self._mainloop.cta_tile_m if self.n_split else 0
+            ),
         )
         # FC1 pre-multiplies under apply_topk_at_fc1 (the only position combine_dedup supports).
         fc1_pool_topk_scores = pool_topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
@@ -1675,6 +1726,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc1_done_counter_pointer=fc1_done_counter.iterator,
                 fc2_spin_threshold=fc2_spin_threshold,
                 fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
+                n_split=self.n_split,
+                local_expert_count=self.local_expert_count if self.n_split else 0,
+                fc1_half_cta_tiles=(
+                    (self.intermediate_gateup_size // 2) // self._mainloop.cta_tile_m if self.n_split else 0
+                ),
+                fc2_half_cta_tiles=(
+                    (self.hidden_size // 2) // self._mainloop.cta_tile_m if self.n_split else 0
+                ),
             )
             optional_epilogue_args = GatedActEpilogueArgs(
                 fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
