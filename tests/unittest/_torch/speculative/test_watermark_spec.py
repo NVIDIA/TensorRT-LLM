@@ -58,7 +58,9 @@ def _model_paths():
     return target, draft
 
 
-def _generate(config, speculative, use_cuda_graph, sampling_params):
+def _generate(
+    config, speculative, use_cuda_graph, sampling_params, prompts=PROMPTS, one_at_a_time=False
+):
     target, draft = _model_paths()
     kwargs = dict(
         model=target,
@@ -73,7 +75,10 @@ def _generate(config, speculative, use_cuda_graph, sampling_params):
         )
     llm = LLM(**kwargs)
     try:
-        outputs = llm.generate(PROMPTS, sampling_params)
+        if one_at_a_time:
+            outputs = [llm.generate([p], sampling_params)[0] for p in prompts]
+        else:
+            outputs = llm.generate(prompts, sampling_params)
         return [(o.prompt_token_ids, list(o.outputs[0].token_ids)) for o in outputs]
     finally:
         llm.shutdown()
@@ -87,21 +92,26 @@ def _common_prefix(a, b):
 
 
 @pytest.mark.high_cuda_memory
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph):
+@pytest.mark.parametrize("use_cuda_graph, dual_key", [(False, False), (True, False), (True, True)])
+def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph, dual_key):
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load target + draft model")
     # Without context deduplication every position is keyed, so the comparison is exact
     # up to numerical differences between the verification and the decoding kernels.
-    config = WatermarkConfig(key=0x5EED5EED, deduplicate_contexts="none")
+    # With dual keys, exact-match speculation routes tokens between the two keys exactly as plain
+    # decoding does for the same seed.
+    dual = dict(algorithm="gumbel_dual_key", alpha=0.5) if dual_key else {}
+    config = WatermarkConfig(key=0x5EED5EED, deduplicate_contexts="none", **dual)
     sampling_params = SamplingParams(
-        max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True
+        max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True, seed=11
     )
     plain = _generate(config, False, use_cuda_graph, sampling_params)
     speculative = _generate(config, True, use_cuda_graph, sampling_params)
 
+    # Routing a fraction of the tokens to the second key lowers the power of the detector on texts
+    # this short, so detection is only asserted for the single-key algorithm.
     detector = GumbelWatermarkDetector(config, p_value_threshold=P_VALUE_THRESHOLD)
-    for name, runs in (("plain", plain), ("speculative", speculative)):
+    for name, runs in () if dual_key else (("plain", plain), ("speculative", speculative)):
         flagged = sum(
             detector.detect(tokens, prompt_token_ids=prompt).is_watermarked
             for prompt, tokens in runs
@@ -111,8 +121,11 @@ def test_eagle3_watermark_matches_plain_decoding(use_cuda_graph):
         )
     # A wrong watermark context would break every prompt within a token or two; numerical
     # differences between the two paths flip an occasional near-tie, so at least half must agree.
+    # With dual keys a speculative path that ignored the routing would break at the first of the
+    # many tokens drawn under the second key, so a longer common prefix is required.
+    min_prefix = 32 if dual_key else 16
     agreeing = sum(
-        _common_prefix(expected, actual) >= 16
+        _common_prefix(expected, actual) >= min_prefix
         for (_, expected), (_, actual) in zip(plain, speculative)
     )
     assert agreeing * 2 >= len(plain), f"only {agreeing}/{len(plain)} outputs match plain decoding"
@@ -195,3 +208,31 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
     # only part of the texts carry a detectable mark (a third to a half in calibration runs); require
     # a quarter.
     assert flagged >= len(outputs) // 4, f"only {flagged}/{len(outputs)} outputs carry the mark"
+
+
+@pytest.mark.high_cuda_memory
+def test_dual_key_routing_diversifies_repeated_prompts():
+    if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
+        pytest.skip("Not enough memory to load the target model")
+    # The same prompt twice, one request at a time so that batch composition cannot change the
+    # numerics: with the first key only (alpha=0) the two requests repeat each other, which also
+    # shows the watermark is applied; routing tokens to the second key at random makes them
+    # diverge. Without deduplication, no repeated context falls back to ordinary sampling.
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
+    prompts = PROMPTS * 2
+    count = len(PROMPTS)
+
+    def run(alpha):
+        config = WatermarkConfig(
+            key=0x5EED5EED,
+            algorithm="gumbel_dual_key",
+            alpha=alpha,
+            deduplicate_contexts="none",
+        )
+        return _generate(config, False, False, params, prompts, one_at_a_time=True)
+
+    control = run(0.0)
+    assert all(control[i][1] == control[i + count][1] for i in range(count))
+    routed = run(0.25)
+    differ = sum(routed[i][1] != routed[i + count][1] for i in range(count))
+    assert differ == count, f"only {differ}/{count} repeated prompts diverged"

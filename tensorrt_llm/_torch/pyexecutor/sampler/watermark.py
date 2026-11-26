@@ -35,6 +35,13 @@ of a window sees the context ``tail ++ drafts[:j]``. Verification accepts a draf
 the target's own sample equals it, so the context of every position that is committed equals
 the committed prefix and the output matches what non-speculative decoding would produce.
 
+With ``algorithm="gumbel_dual_key"`` and ``alpha > 0`` an ordinary decoding position is drawn under
+the second key with probability ``alpha`` (and under the first key otherwise). The choice is the
+Philox stream of the request's routing seed (see :func:`route_seed`) at the position's index in the
+request's output, also for a request that arrives with tokens already generated or moves to another
+slot. It does not depend on the batch, the speculation depth or the TP rank, and a request with a
+seed reproduces it.
+
 :meth:`WatermarkHandler.plan` and :meth:`WatermarkHandler.commit` use static shapes and no
 host synchronization, so they can be captured in a CUDA graph.
 """
@@ -47,11 +54,18 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
-from tensorrt_llm.watermark.prf import PAD_TOKEN, context_seeds_torch, secondary_key
+from tensorrt_llm.watermark.prf import (
+    PAD_TOKEN,
+    context_seeds_torch,
+    philox_uniform_torch,
+    route_seed,
+    secondary_key,
+)
 from tensorrt_llm.watermark.state_kernels import commit_windows, plan_windows
 from tensorrt_llm.watermark.step_kernel import StepScratch, watermark_step
 
 from ..llm_request import LlmRequest
+from .sampler_common import request_random_seed
 
 if TYPE_CHECKING:
     from tensorrt_llm.watermark.config import WatermarkConfig
@@ -133,7 +147,25 @@ class WatermarkRows:
     # Seeds of the second key, for the tokens that follow a rejection (dual-key watermarking
     # with rejection sampling); equal to ``seeds`` when there is a single key.
     seeds_secondary: Optional[torch.Tensor] = None
+    # With dual-key routing: the seed each position is drawn with (first or second key). ``seeds``
+    # remains the first key's, which identifies the context for the repeat check.
+    draw_seeds: Optional[torch.Tensor] = None  # [B, K1] int64
     skip: Optional[torch.Tensor] = None  # [B] int64, reference path only (``"all"`` scope)
+
+
+def _route_stream(request: LlmRequest, seed: Optional[int]) -> int:
+    """Identity of the request's routing stream, see :func:`route_seed`.
+
+    Without a seed it is the request id, which is unique to the request and the same on every rank,
+    and does not change when the request moves to another slot after a preemption. With a seed it
+    is the index of the request among the candidates (``n > 1``) of one user request, which the
+    candidates' consecutive ids give, so that candidates sharing a seed still route differently.
+    """
+    if seed is None:
+        return request.py_request_id
+    if getattr(request, "is_child", False):
+        return request.py_request_id - request.parent_request_id
+    return 0
 
 
 class WatermarkHandler:
@@ -144,7 +176,14 @@ class WatermarkHandler:
         max_num_sequences: int,
         max_seq_len: int,
         device: str | torch.device = "cuda",
+        route_alpha: Optional[float] = None,
     ):
+        """
+        Args:
+            route_alpha: probability that an ordinary decoding position is drawn under the second
+                key. Defaults to ``config.alpha`` for the dual-key algorithm; one-model speculation
+                with rejection sampling passes 0, because the speculative protocol picks the key.
+        """
         self.config = config
         self._device = torch.device(device)
         self._secondary_key = (
@@ -153,6 +192,15 @@ class WatermarkHandler:
         num_rows = max_num_sequences + 1  # the extra row is the scratch slot of padding requests
         width = config.context_width
         self._dual = self._secondary_key != config.key
+        if route_alpha is None:
+            route_alpha = config.alpha if self._dual else 0.0
+        self._alpha = float(route_alpha) if self._dual else 0.0
+        self._route = self._alpha > 0.0
+        # Per slot, set when it gets a new occupant: the seed of the routing stream and the offset
+        # from the committed count to the index of the next token in the request's output.
+        self._route_state = (
+            torch.zeros((num_rows, 2), dtype=torch.int64, device=device) if self._route else None
+        )
         self._keys = torch.tensor(
             [_signed64(config.key), _signed64(self._secondary_key)],
             dtype=torch.int64,
@@ -214,6 +262,7 @@ class WatermarkHandler:
         width = self.config.context_width
         new_slots: list[int] = []
         new_tails: list[list[int]] = []
+        new_routes: list[tuple[int, int]] = []
         prefills: list[tuple[int, torch.Tensor, int]] = []
         for request in requests:
             slot = request.py_seq_slot
@@ -241,22 +290,31 @@ class WatermarkHandler:
             tokens = all_tokens[-width:]
             new_slots.append(slot)
             new_tails.append([PAD_TOKEN] * (width - len(tokens)) + list(tokens))
+            # `orig_prompt_len` is the length of the prompt as submitted; after a recompute
+            # preemption the request's prompt grows to include its output so far.
+            prompt_len = getattr(request, "orig_prompt_len", None)
+            if prompt_len is None:
+                prompt_len = len(all_tokens)
+            generated = len(all_tokens) - prompt_len
+            num_contexts = 0
             if self._dedupe:
                 # Seed the repeat ring with the contexts that already exist when the request
                 # reaches the sampler: the generated positions (a request can arrive with tokens
                 # generated elsewhere, or be resumed after a preemption) and, with "all", the
                 # positions of the prompt too. Only the most recent `ring_size` count; the context
                 # of the next position is recorded when it commits.
-                # `orig_prompt_len` is the length of the prompt as submitted; after a recompute
-                # preemption the request's prompt grows to include its output so far.
-                prompt_len = getattr(request, "orig_prompt_len", None)
-                if prompt_len is None:
-                    prompt_len = len(all_tokens)
                 start = 0 if self._all else max(prompt_len - width, 0)
                 recent = all_tokens[start:][-(self._ring_size + width) :]
-                generated = len(all_tokens) - prompt_len
+                num_contexts = max(len(recent) - width, 0)
                 prefills.append(
                     (slot, torch.tensor(recent, dtype=torch.int64), max(width - generated, 0))
+                )
+            if self._route:
+                seed = request_random_seed(request)
+                # The committed count starts at `num_contexts`, so this offset makes the routing
+                # index the token's index in the output, also for a resumed request.
+                new_routes.append(
+                    (route_seed(seed, _route_stream(request, seed)), generated - num_contexts)
                 )
         if not new_slots:
             return
@@ -269,6 +327,11 @@ class WatermarkHandler:
         )
         self._tail.index_copy_(0, slots, tails)
         self._count.index_fill_(0, slots, 0)
+        if self._route:
+            routes = torch.tensor(new_routes, dtype=torch.int64, pin_memory=pin).to(
+                self._device, non_blocking=True
+            )
+            self._route_state.index_copy_(0, slots, routes)
         for slot, recent, skip in prefills:
             recent = recent.to(self._device, non_blocking=True)
             num_contexts = max(recent.shape[0] - width, 0)
@@ -297,7 +360,7 @@ class WatermarkHandler:
                 ``k + 1`` positions, otherwise one. Position ``j`` sees the last
                 ``context_width`` tokens of ``tail ++ drafts[:j]``.
         """
-        seeds, seeds_secondary, active = plan_windows(
+        seeds, seeds_secondary, active, draw_seeds = plan_windows(
             slots,
             enabled,
             self._tail,
@@ -308,6 +371,8 @@ class WatermarkHandler:
             self._dual,
             drafts,
             self._skip,
+            self._route_state,
+            self._alpha,
         )
         return WatermarkRows(
             slots=slots,
@@ -315,6 +380,7 @@ class WatermarkHandler:
             seeds=seeds,
             active=active,
             seeds_secondary=seeds if seeds_secondary is None else seeds_secondary,
+            draw_seeds=draw_seeds,
         )
 
     def plan_reference(
@@ -370,6 +436,14 @@ class WatermarkHandler:
             seeds_secondary = context_seeds_torch(
                 self._secondary_key, contexts.reshape(-1, width)
             ).reshape(batch, num_positions)
+        draw_seeds = None
+        if self._route:
+            route = self._route_state.index_select(0, slots)
+            index = (count + route[:, 1]).unsqueeze(1) + torch.arange(
+                num_positions, device=count.device
+            )
+            uniform = philox_uniform_torch(route[:, 0], index)
+            draw_seeds = torch.where(uniform < self._alpha, seeds_secondary, seeds)
         return WatermarkRows(
             slots=slots,
             enabled=enabled,
@@ -378,6 +452,7 @@ class WatermarkHandler:
             seeds=seeds,
             active=active,
             seeds_secondary=seeds_secondary,
+            draw_seeds=draw_seeds,
             skip=skip,
         )
 
@@ -574,6 +649,8 @@ class WatermarkHandler:
             self._step_scratch,
             from_probs=from_probs,
             skip=self._skip,
+            route_state=self._route_state,
+            alpha=self._alpha,
         )
 
 
@@ -631,6 +708,8 @@ class WatermarkSpecState:
             max_num_sequences=num_slots,
             max_seq_len=self.max_seq_len or 1 << 20,
             device=device,
+            # With rejection sampling the speculative protocol picks the key of each token.
+            route_alpha=0.0 if use_rejection_sampling else None,
         )
         self.enabled = torch.zeros(max_num_requests, dtype=torch.bool, device=device)
         if self.keys_drafts:

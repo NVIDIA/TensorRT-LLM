@@ -25,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import watermark as watermark_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.watermark import (
     WatermarkHandler,
+    WatermarkSpecState,
     request_wants_watermark,
 )
 from tensorrt_llm.bindings import SamplingConfig
@@ -38,6 +39,7 @@ from tensorrt_llm.watermark.prf import (
     context_seeds_torch,
     philox_uniform,
     philox_uniform_torch,
+    route_seed,
     secondary_key,
 )
 from tensorrt_llm.watermark.sampling import (
@@ -86,8 +88,12 @@ class TestGammaTail:
         assert _gamma_upper_tail(n, 0.0) == 1.0
 
 
-def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0):
-    """Toy autoregressive loop with a fixed next-token distribution."""
+def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0, alpha=0.0):
+    """Toy autoregressive loop with a fixed next-token distribution.
+
+    With ``alpha > 0`` and a dual-key config, each token is drawn under the second key with
+    probability ``alpha``, chosen like the sampler's routing stream (seed 5, by output index).
+    """
     rng = np.random.default_rng(seed)
     width = config.context_width
     tokens = list(prompt)
@@ -101,7 +107,13 @@ def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0):
         repeated = config.deduplicate_contexts == "single_turn" and key in seen
         seen.add(key)
         if watermark and not repeated:
-            seed_t = context_seeds_torch(config.key, torch.tensor([context]))
+            second = (
+                alpha > 0
+                and philox_uniform(route_seed(5, 0) & (2**64 - 1), np.array([len(out)]))[0] < alpha
+            )
+            seed_t = context_seeds_torch(
+                secondary_key(config.key) if second else config.key, torch.tensor([context])
+            )
             token = int(gumbel_sample_reference(probs_row, seed_t)[0])
         else:
             token = int(rng.choice(len(probs), p=probs))
@@ -180,6 +192,9 @@ class TestDetector:
         # A single-key detector does not know the secondary key.
         single = GumbelWatermarkDetector(WatermarkConfig(key=11, deduplicate_contexts="none"))
         assert not single.detect(secondary, prompt_token_ids=prompt).is_watermarked
+        # Text whose tokens are routed between the keys is detected too.
+        routed = _generate(config, probs, num_tokens=200, prompt=prompt, alpha=0.3)
+        assert detector.detect(routed, prompt_token_ids=prompt).is_watermarked
 
 
 class TestConfig:
@@ -187,11 +202,24 @@ class TestConfig:
         assert "12345" not in repr(WatermarkConfig(key=12345))
 
     @pytest.mark.parametrize(
-        "kwargs", [{"key": -1}, {"key": 2**64}, {"key": 1, "context_width": 0}]
+        "kwargs",
+        [
+            {"key": -1},
+            {"key": 2**64},
+            {"key": 1, "context_width": 0},
+            {"key": 1, "algorithm": "gumbel_dual_key", "alpha": -0.1},
+            {"key": 1, "algorithm": "gumbel_dual_key", "alpha": 1.5},
+        ],
     )
     def test_rejects_invalid(self, kwargs):
         with pytest.raises(ValueError):
             WatermarkConfig(**kwargs)
+
+    @pytest.mark.parametrize("algorithm", ["gumbel", "gumbel_dual_key"])
+    def test_survives_a_dump_round_trip(self, algorithm):
+        # Model defaults are applied by re-validating a full model_dump().
+        config = WatermarkConfig(key=1, algorithm=algorithm)
+        assert WatermarkConfig(**config.model_dump()) == config
 
     def test_rejects_unknown_field(self):
         with pytest.raises(ValueError):
@@ -342,14 +370,20 @@ class TestKeyedRecovery:
             assert torch.equal(redrawn[row, last + 1 :], accepted[row, last + 1 :])
 
 
-def _request(request_id, slot, tokens, watermarking=None, greedy=False):
+def _request(request_id, slot, tokens, watermarking=None, greedy=False, seed=None, parent=None):
     return SimpleNamespace(
+        is_child=parent is not None,
+        parent_request_id=parent,
         py_request_id=request_id,
         py_seq_slot=slot,
         py_watermarking=watermarking,
         greedy=greedy,
+        sampling_config=SimpleNamespace(seed=seed),
         get_tokens=lambda beam: list(tokens),
     )
+
+
+_DUAL = dict(algorithm="gumbel_dual_key", alpha=0.5)  # a high alpha makes both keys show up
 
 
 def _can_sample(request):
@@ -391,12 +425,20 @@ class TestHandler:
             handler.commit(rows, _device([token], torch.int32))
             history.append(token)
 
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
-    @pytest.mark.parametrize("from_probs", [False, True])
-    def test_step_matches_plan_draw_commit(self, dedupe, from_probs):
-        config = WatermarkConfig(key=99, context_width=3, deduplicate_contexts=dedupe)
+    @pytest.mark.parametrize(
+        "dedupe, from_probs, routing",
+        [(d, p, False) for d in ("none", "single_turn", "all") for p in (False, True)]
+        + [("none", False, True), ("single_turn", True, True)],
+    )
+    def test_step_matches_plan_draw_commit(self, dedupe, from_probs, routing):
+        config = WatermarkConfig(
+            key=99, context_width=3, deduplicate_contexts=dedupe, **(_DUAL if routing else {})
+        )
         handlers = [WatermarkHandler(config, max_num_sequences=4, max_seq_len=64) for _ in range(2)]
-        requests = [_request(i, slot, [5, 6, 7, i]) for i, slot in enumerate([3, 0, 2, 1])]
+        requests = [
+            _request(i, slot, [5, 6, 7, i], seed=17 if i == 1 else None)
+            for i, slot in enumerate([3, 0, 2, 1])
+        ]
         requests[2].py_watermarking = False  # one row carries no watermark
         for handler in handlers:
             handler.observe(requests, _can_sample)
@@ -404,6 +446,7 @@ class TestHandler:
         slots = _device([3, 0, 2, 1])
         enabled = _device([True, True, False, True], torch.bool)
         generator = torch.Generator(device="cuda").manual_seed(0)
+        routed = 0
         for _ in range(4):
             logits = torch.randn(4, 3001, device="cuda", generator=generator) * 3
             temperature = _device([0.7, 1.0, 1.3, 0.9], torch.float32)
@@ -411,7 +454,9 @@ class TestHandler:
             # A tiny vocabulary of recurring contexts makes the repeat ring fire.
             fallback = torch.randint(0, 3, (4,), device="cuda", dtype=torch.int32)
             rows = reference.plan_reference(slots, enabled)
-            keyed = gumbel_sample_reference(probs, rows.seeds[:, 0])
+            draw = rows.seeds if rows.draw_seeds is None else rows.draw_seeds
+            routed += int((rows.draw_seeds != rows.seeds).sum()) if routing else 0
+            keyed = gumbel_sample_reference(probs, draw[:, 0])
             expected = torch.where(rows.active[:, 0], keyed.to(torch.int32), fallback)
             reference.commit_reference(rows, expected)
             actual = fused.sample_step(
@@ -423,6 +468,7 @@ class TestHandler:
                 from_probs=from_probs,
             )
             assert torch.equal(actual, expected)
+        assert routed > 0 or not routing  # the second key was drawn at least once
         assert torch.equal(fused._tail, reference._tail)
         assert torch.equal(fused._count, reference._count)
         if dedupe != "none":
@@ -430,6 +476,82 @@ class TestHandler:
             assert torch.equal(fused._ring[:, :size], reference._ring[:, :size])
         if dedupe == "all":
             assert torch.equal(fused._skip, reference._skip)
+
+    @pytest.mark.parametrize("dedupe, history", [("none", None), ("single_turn", 8), ("all", None)])
+    def test_routing_follows_the_output_position(self, dedupe, history):
+        # Output position j is drawn under the second key exactly where the request's routing
+        # stream says so, also for a request that arrives with tokens generated elsewhere.
+        config = WatermarkConfig(
+            key=99,
+            context_width=3,
+            deduplicate_contexts=dedupe,
+            deduplicate_contexts_max_history=history,
+            **_DUAL,
+        )
+        stream = philox_uniform(route_seed(7, 0) & (2**64 - 1), np.arange(60))
+        routed = stream < _DUAL["alpha"]
+        assert routed.any() and not routed.all()
+        prompt = [3, 1, 4, 1, 5]
+        output = [2, 6, 5, 3, 5, 8, 9, 7, 4, 6, 1, 2]  # longer than the bounded repeat history
+        for generated in (0, len(output)):
+            handler = WatermarkHandler(config, max_num_sequences=4, max_seq_len=64)
+            request = _request(1, 0, prompt + output[:generated], seed=7)
+            request.orig_prompt_len = len(prompt)
+            handler.observe([request], _can_sample)
+            slots, enabled = _device([0]), _device([True], torch.bool)
+            drafts = torch.zeros(1, 39, dtype=torch.int64, device="cuda")
+            rows = handler.plan(slots, enabled, drafts)
+            picked = (rows.draw_seeds == rows.seeds_secondary).cpu().numpy()[0]
+            assert (picked == routed[generated : generated + 40]).all()
+            reference = handler.plan_reference(slots, enabled, drafts)
+            assert torch.equal(rows.draw_seeds, reference.draw_seeds)
+
+    @pytest.mark.parametrize(
+        "algorithm, rejection, routes",
+        [
+            ("gumbel_dual_key", False, True),
+            ("gumbel_dual_key", True, False),
+            ("gumbel", False, False),
+        ],
+    )
+    def test_routing_modes(self, algorithm, rejection, routes):
+        # Routing needs the dual-key algorithm, and rejection sampling picks the keys itself.
+        config = WatermarkConfig(key=99, context_width=3, algorithm=algorithm, alpha=0.5)
+        state = WatermarkSpecState(config, max_seq_len=64)
+        state.prepare(
+            num_slots=4, max_num_requests=4, max_draft_len=3, use_rejection_sampling=rejection
+        )
+        requests = [
+            _request(1, 0, [1, 2, 3], seed=7),
+            _request(2, 1, [1, 2, 3]),
+            _request(3, 2, [1, 2, 3]),
+        ]
+        state.handler.observe(requests, _can_sample)
+        rows = state.handler.plan(_device([0]), _device([True], torch.bool))
+        assert (rows.draw_seeds is not None) == routes
+        if routes:
+            route = state.handler._route_state[:, 0].tolist()
+            assert route[0] == route_seed(7, 0)  # a seed reproduces its stream
+            assert route[1] != route[2]  # each request without a seed has its own
+
+    def test_routing_streams_follow_the_request(self):
+        config = WatermarkConfig(key=99, context_width=3, **_DUAL)
+        state = WatermarkSpecState(config, max_seq_len=64)
+        state.prepare(
+            num_slots=4, max_num_requests=4, max_draft_len=3, use_rejection_sampling=False
+        )
+        handler = state.handler
+        unseeded = _request(1, 0, [1, 2, 3])
+        parent = _request(10, 1, [1, 2, 3], seed=7)
+        siblings = [_request(11, 2, [1, 2, 3], seed=7, parent=10)]
+        handler.observe([unseeded, parent, *siblings], _can_sample)
+        before = handler._route_state[:, 0].tolist()
+        assert before[1] == route_seed(7, 0)  # a seed reproduces its stream
+        assert before[2] not in (before[1], before[0])  # candidates of one seed route differently
+        # A request resumed in another slot keeps its stream.
+        unseeded.py_seq_slot = 3
+        handler.observe([unseeded], _can_sample)
+        assert handler._route_state[3, 0].item() == before[0]
 
     def test_new_occupant_resets_the_slot(self):
         _, handler = self._handler()
@@ -498,27 +620,32 @@ class TestHandler:
         # The third position repeats the context [1, 2, 3] of the first generated position.
         assert flags == [True, True, False]
 
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
-    @pytest.mark.parametrize("history", [None, 8])
-    def test_speculative_windows_match_plain_decoding(self, dedupe, history):
+    @pytest.mark.parametrize(
+        "dedupe, history, routing",
+        [(d, h, False) for d in ("none", "single_turn", "all") for h in (None, 8)]
+        + [("none", None, True)],
+    )
+    def test_speculative_windows_match_plain_decoding(self, dedupe, history, routing):
         # Whatever the draft quality, the seeds of the committed positions and the final state
         # must equal those of one-token-at-a-time decoding of the same output, also when the
         # repeat history is bounded and entries expire within a window.
         rng = np.random.default_rng(1)
         prompt = [3, 1, 4]
         output = [int(t) for t in rng.integers(0, 6, size=40)]  # small vocab forces repeats
+        extra = _DUAL if routing else {}
         config, plain = self._handler(
-            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history
+            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history, **extra
         )
         _, spec = self._handler(
-            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history
+            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history, **extra
         )
         plain.observe([_request(1, 0, prompt)], _can_sample)
         spec.observe([_request(1, 0, prompt)], _can_sample)
         plain_seeds, plain_active = [], []
         for token in output:
             rows = plain.begin([0])
-            plain_seeds.append(int(_as_uint(rows.seeds)[0, 0]))
+            drawn = rows.seeds if rows.draw_seeds is None else rows.draw_seeds
+            plain_seeds.append(int(_as_uint(drawn)[0, 0]))
             plain_active.append(bool(rows.active[0, 0]))
             plain.commit(rows, _device([token], torch.int32))
 
@@ -535,7 +662,8 @@ class TestHandler:
             accepted = matched + 1
             rows = spec.plan(_device([0]), _device([True], torch.bool), _device([drafts]))
             take = min(accepted, len(output) - position)
-            spec_seeds += [int(v) for v in _as_uint(rows.seeds)[0, :take]]
+            drawn = rows.seeds if rows.draw_seeds is None else rows.draw_seeds
+            spec_seeds += [int(v) for v in _as_uint(drawn)[0, :take]]
             spec_active += [bool(v) for v in rows.active[0, :take]]
             window_tokens = _device([target], torch.int32)
             spec.commit(rows, window_tokens, _device([take]))

@@ -43,6 +43,16 @@ class WatermarkConfig(StrictBaseModel):
         "that replace rejected drafts (or follow the last accepted one) under a second "
         "key derived from it, which keeps the output distribution exact.",
     )
+    alpha: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Only used by 'gumbel_dual_key'. Probability that a token of ordinary or "
+        "exact-match speculative decoding is drawn under the second key instead of the first, "
+        "chosen from a random stream of the request: requests with the same prompt diverge, and "
+        "a request seed reproduces the choice. 0 uses the first key only. Speculative decoding "
+        "with rejection sampling ignores it.",
+    )
     key: int = Field(
         description="Secret key, an integer in [0, 2**64). Detection needs the same value.",
         ge=0,
