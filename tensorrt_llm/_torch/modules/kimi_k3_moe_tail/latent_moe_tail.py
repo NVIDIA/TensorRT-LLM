@@ -30,11 +30,17 @@ the top-k weighted sum while loading this rank's routed row, so the routed
 experts skip their finalize kernel; the sum has the finalize's numerics (FP32
 in slot order, one BF16 rounding).
 
+Unless ``KIMI_K3_FUSED_MOE_TAIL_WAVE=0`` (unset: on for SM103 only), 8 ranks
+run one kernel instead of the first two for up to 8 tokens of unfinalized
+output (``wave_tail``: the finalize, both collectives, the RMSNorm, the
+up-projection and the all-gather store into the same mailbox).
+
 Numerics: every rank reduces in rank order in FP32 and rounds once to BF16,
 like the MNNVL one-shot all-reduce; the RMSNorm squares the BF16-rounded sum
 (as the MNNVL RMSNorm fusion does); the up-projection is rounded to BF16
 before the BF16 shared shard is added in FP32. Only the up-projection's
-accumulation order differs from an unsharded GEMM.
+accumulation order differs from an unsharded GEMM; the one-kernel tail also
+sums the squares in another order.
 """
 
 from __future__ import annotations
@@ -80,6 +86,11 @@ _LAMPORT_COPY_CTAS = 1024
 _LAMPORT_COPY_THREADS = 128
 SUPPORTED_TP_SIZES = (8, 16, 32)
 SUPPORTED_SHAPE = (7168, 3584)  # (hidden, latent)
+# The one-kernel tail (``wave_tail``) is written for 8 ranks and up to 8 tokens
+# (one 8-token MMA group); more tokens measured no faster than the collective
+# and the up-projection.
+_WAVE_TP_SIZE = 8
+_WAVE_MAX_NUM_TOKENS = 8
 _REGION_ALIGN = 4096
 
 
@@ -110,6 +121,23 @@ def fused_tail_finalize_requested() -> bool:
     """Whether the tail folds the routed experts' finalize (``KIMI_K3_FUSED_MOE_TAIL_FINALIZE``,
     default on: the folded sum is bit-identical; ``0`` keeps the routed experts' finalize kernel)."""
     return os.environ.get("KIMI_K3_FUSED_MOE_TAIL_FINALIZE", "1") == "1"
+
+
+def fused_tail_wave_requested(
+    tp_size: int, hidden_size: int, latent_size: int, device: torch.device
+) -> bool:
+    """Whether steps of up to 8 tokens run the one-kernel tail (``wave_tail``) instead of the
+    collective and the up-projection: 8 ranks, the supported shape and the finalize fold only.
+    ``KIMI_K3_FUSED_MOE_TAIL_WAVE=1`` / ``0`` turns it on / off; unset, it is on for SM103, where
+    it measured faster (about 2% of the Kimi K3.1 decode step at one request on GB300)."""
+    if tp_size != _WAVE_TP_SIZE or (hidden_size, latent_size) != SUPPORTED_SHAPE:
+        return False
+    if not fused_tail_finalize_requested():
+        return False
+    requested = os.environ.get("KIMI_K3_FUSED_MOE_TAIL_WAVE")
+    if requested is not None:
+        return requested == "1"
+    return torch.cuda.get_device_capability(device) == (10, 3)
 
 
 def fused_tail_dispatch_max_tokens(tp_size: int) -> int:
@@ -221,7 +249,17 @@ class KimiK3LatentMoETail:
         rs_off = _align(mailbox_off + mailbox_bytes)
         ss_off = _align(rs_off + twoshot["rs"])
         lat_off = _align(ss_off + twoshot["ss"])
-        total_bytes = _align(lat_off + twoshot["lat"])
+        total_bytes = twoshot_end = _align(lat_off + twoshot["lat"])
+        # One-kernel tail: its own latent and shared-shard regions behind the others.
+        wave_tokens = 0
+        if fused_tail_wave_requested(tp, hidden, latent, device):
+            from .wave_tail import WaveTail, region_bytes
+
+            wave_tokens = min(_WAVE_MAX_NUM_TOKENS, max_m)
+            wave_bytes = region_bytes()
+            wave_lat_off = twoshot_end
+            wave_rs_off = _align(wave_lat_off + wave_bytes["latent"])
+            total_bytes = _align(wave_rs_off + wave_bytes["rs"])
 
         self._comm = _get_mnnvl_workspace_comm(mapping)
         use_fabric_handle = (
@@ -259,7 +297,7 @@ class KimiK3LatentMoETail:
         mailbox_mc = buf.get_mc_buffer([1], torch.bfloat16, mailbox_off // 2)
         # Two-shot regions (sentinel-filled as one span: rs, ss and lat are adjacent).
         self._twoshot_region = buf.get_uc_buffer(
-            rank, [(total_bytes - rs_off) // 4], torch.int32, rs_off // 4
+            rank, [(twoshot_end - rs_off) // 4], torch.int32, rs_off // 4
         )
         rs_peer_ptrs = [
             buf.get_uc_buffer(peer, [1], torch.uint8, rs_off).data_ptr() for peer in range(tp)
@@ -272,6 +310,21 @@ class KimiK3LatentMoETail:
         self._twoshot_rs_peers = torch.tensor(rs_peer_ptrs, dtype=torch.int64, device=device)
         self._twoshot_ss_peers = torch.tensor(ss_peer_ptrs, dtype=torch.int64, device=device)
         self._twoshot_ctrl = torch.zeros(3, dtype=torch.uint32, device=device)
+        self._wave = None
+        wave_ptrs: list[int] = []
+        if wave_tokens:
+            self._wave_latent = buf.get_uc_buffer(
+                rank, [wave_bytes["latent"] // 2], torch.bfloat16, wave_lat_off // 2
+            )
+            self._wave_rs = buf.get_uc_buffer(
+                rank, [wave_bytes["rs"] // 2], torch.bfloat16, wave_rs_off // 2
+            )
+            wave_latent_mc = buf.get_mc_buffer([1], torch.bfloat16, wave_lat_off // 2).data_ptr()
+            wave_rs_peers = [
+                buf.get_uc_buffer(peer, [1], torch.uint8, wave_rs_off).data_ptr()
+                for peer in range(tp)
+            ]
+            wave_ptrs = [wave_latent_mc, *wave_rs_peers]
         if (
             routed_mc.data_ptr() == 0
             or mailbox_mc.data_ptr() == 0
@@ -279,6 +332,7 @@ class KimiK3LatentMoETail:
             or 0 in rs_peer_ptrs
             or 0 in ss_peer_ptrs
             or lat_mc == 0
+            or 0 in wave_ptrs
         ):
             raise RuntimeError("Kimi K3 fused MoE tail: multicast/peer mapping unavailable")
         self._shared_peer_ptrs = torch.tensor(shared_peer_ptrs, dtype=torch.int64, device=device)
@@ -294,6 +348,9 @@ class KimiK3LatentMoETail:
             )
             AdaptiveUpProjectionKernel.init_mailbox(self._mailbox)
             self._twoshot_region.fill_(-0x80000000)
+            if wave_tokens:
+                self._wave_latent.view(torch.int32).fill_(-0x80000000)
+                self._wave_rs.view(torch.int32).fill_(-0x80000000)
         torch.cuda.synchronize(device)
         # Fence: no rank may publish into a peer that has not cleared its buffers.
         if not _mnnvl_workspace_all_succeeded(self._comm, True):
@@ -443,9 +500,35 @@ class KimiK3LatentMoETail:
             error = exc
         if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
             raise RuntimeError("Kimi K3 fused MoE tail kernel compilation failed") from error
+        if wave_tokens:
+            # Optional: every rank builds it, or none uses it.
+            wave, error = None, None
+            try:
+                wave = WaveTail(
+                    rank=rank,
+                    token_counts=range(1, wave_tokens + 1),
+                    latent=self._wave_latent,
+                    rs=self._wave_rs,
+                    latent_mc=wave_latent_mc,
+                    rs_peers=torch.tensor(wave_rs_peers, dtype=torch.int64, device=device),
+                    output_mc=mailbox_mc.data_ptr(),
+                    rms_eps=key.rms_eps,
+                )
+            except Exception as exc:
+                error = exc
+            if _mnnvl_workspace_all_succeeded(self._comm, error is None):
+                self._wave = wave
+            else:
+                wave_tokens = 0
+                reason = f" ({error!r})" if error is not None else ""
+                logger.warning(
+                    f"Kimi K3 fused MoE tail: the one-kernel tail was not built on every rank{reason}; "
+                    "keeping the collective and the up-projection"
+                )
+        one_kernel = f", one kernel <= {wave_tokens}" if wave_tokens else ""
         logger.info_once(
             f"Kimi K3 fused latent-MoE tail ready: tp={tp}, tokens <= {self.dispatch_max_tokens} "
-            f"(capacity {max_m}, one-shot <= {oneshot_max}), "
+            f"(capacity {max_m}, one-shot <= {oneshot_max}{one_kernel}), "
             f"workspace {total_bytes / 2**20:.1f} MiB",
             key="kimi_k3_fused_moe_tail_ready",
         )
@@ -493,7 +576,8 @@ class KimiK3LatentMoETail:
 
     def _forward(self, routed_partial, shared_partial, rms_weight, up_weight, *, stages: int):
         """Run the first ``stages`` kernels (1: collective, 2: + up-projection,
-        3: + Lamport copy); fewer than 3 is for kernel timing only."""
+        3: + Lamport copy); fewer than 3 is for kernel timing only. Where the
+        one-kernel tail serves the call, it stands for the first two."""
         unfinalized = isinstance(routed_partial, UnfinalizedRoutedOutput)
         if unfinalized:
             if not self.folds_finalize:
@@ -504,6 +588,18 @@ class KimiK3LatentMoETail:
             routed_partial = routed_partial.contiguous()
         if not 1 <= m <= self.max_num_tokens:
             raise ValueError(f"fused MoE tail supports 1..{self.max_num_tokens} tokens, got {m}")
+        if unfinalized and stages >= 2 and self._wave is not None and self._wave.supports(m):
+            # One kernel: finalize, both collectives, RMSNorm, up-projection + shared add and
+            # the all-gather store into the mailbox.
+            self._wave(
+                routed_partial,
+                shared_partial.contiguous(),
+                rms_weight,
+                up_weight.narrow(0, self.rank * self.shard_size, self.shard_size),
+            )
+            if stages == 2:
+                return self._mailbox
+            return self._lamport_copy(self._mailbox, m=m).view(m, self.hidden_size)
         if m <= self._oneshot_max:
             collective = self._collective_topk if unfinalized else self._collective
         else:
