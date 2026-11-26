@@ -6319,6 +6319,26 @@ class TestForcedToolCallStreamingFinishReason:
         chunks = chat_stream_post_processor(self._rsp(' "Rome"}', "stop"), args)
         assert self._finish_reasons(chunks) == ["tool_calls"]
 
+    def test_checks_json_only_when_object_can_finish(self, monkeypatch):
+        from tensorrt_llm.serve import postprocess_handlers as handlers
+
+        decode = Mock(wraps=handlers.forced_tool_arguments_end)
+        monkeypatch.setattr(handlers, "forced_tool_arguments_end", decode)
+        args = self._args()
+        before_end = ['  ', '{"notes":"', 'text with }', ' yet more text',
+                      '","nested":{"ok":true}']
+        chunks = before_end + ['} trailing text', 'after the call']
+        output = []
+        for text in chunks:
+            for event in handlers.chat_stream_post_processor(
+                    self._rsp(text, None), args):
+                delta = json.loads(event[6:])["choices"][0]["delta"]
+                for call in delta.get("tool_calls", []):
+                    output.append(call["function"]["arguments"])
+
+        assert output == before_end + ["}"]
+        assert decode.call_count == 3
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
