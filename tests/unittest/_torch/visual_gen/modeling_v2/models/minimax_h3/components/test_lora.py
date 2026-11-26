@@ -87,9 +87,11 @@ def test_turbo_lora_matches_premerged_h3(tmp_path: Path) -> None:
 
 
 @torch.inference_mode()
-def test_runtime_lora_uses_h3_projection_tp_slices(tmp_path: Path) -> None:
+def test_runtime_lora_uses_h3_projection_tp_slices(tmp_path: Path, monkeypatch) -> None:
     """Rank 1 owns two of six heads under TP2 × U2. Fused TP gate/up is ineligible."""
-    mapping = Mapping(world_size=2, tp_size=2, rank=1, gpus_per_node=2)
+    with monkeypatch.context() as patch:
+        patch.delenv("TLLM_DISABLE_MPI", raising=False)
+        mapping = Mapping(world_size=2, tp_size=2, rank=1, gpus_per_node=2)
 
     def projection(mode, width, shard):
         return Linear(
