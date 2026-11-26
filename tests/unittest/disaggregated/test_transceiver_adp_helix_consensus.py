@@ -38,6 +38,8 @@ def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
     tc = object.__new__(KvCacheTransceiverV2)
     tc._mapping = mapping
     tc._dist = dist
+    tc._recv_reqs = {}
+    tc._send_reqs = {}
     tc._init_sync_policy()
     return tc
 

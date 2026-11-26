@@ -1087,7 +1087,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             locally_timed_out=[
                 rid
                 for rid in to_process
-                if getattr(self._recv_sessions.get(rid), "timed_out", False) is True
+                if self._observed_timeout(self._recv_sessions.get(rid), self._recv_reqs.get(rid))
             ],
             preserve_failures=True,
         )
@@ -1109,11 +1109,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             backend_failures & retirable,
         )
 
+    @staticmethod
+    def _observed_timeout(session: object, req: object) -> bool:
+        """Whether the session committed a timeout or the executor observed the deadline.
+
+        The executor's deadline check flags only the rank that saw it expire;
+        the outcome vote spreads it to every rank.
+        """
+        return (
+            getattr(session, "timed_out", False) is True
+            or getattr(req, "py_kv_transfer_timed_out", False) is True
+        )
+
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
         timed_out = [
             rid
             for rid in to_process
-            if getattr(self._send_sessions.get(rid), "timed_out", False) is True
+            if self._observed_timeout(self._send_sessions.get(rid), self._send_reqs.get(rid))
         ]
         c, f, d, q, timed_out, failures = self._consensus_outcome(
             to_process,

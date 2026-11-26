@@ -20,7 +20,7 @@ from coordinator_harness import CoordinatorHarness
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.base import TokenRange
-from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
@@ -2311,8 +2311,6 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
             observed, or None for a cancellation alone.
         expected: Per-rank (success, error, timeout) counts.
     """
-    if poll_counted and peer_cause == "executor-timeout":
-        pytest.skip("rank 1's executor flag is its own local count; poll-first is the same run")
     group = FakeDistGroup(world_size=2, tp_size=2)
     engines = []
     requests = []
@@ -2363,12 +2361,49 @@ def test_replicated_cancel_counts_the_group_outcome_once_on_every_rank(
                 request, "generation", 1000, current_time=1.1 if rank == 1 else 0.7
             )
             assert request.py_kv_transfer_timed_out is (rank == 1)
+            if poll_counted:
+                # Both writers finish before the abort: the next receive poll
+                # retires a completed session on each rank.
+                transceiver._ever_had_recv_session = True
+                transceiver._gen_need_sync = True
+                transceiver._gen_allgather = engine.dist.tp_allgather
+                transceiver._need_aux_transfer = Mock(return_value=False)
+                transceiver._assert_disagg_history_declared = Mock()
+                transceiver._recv_sessions = {
+                    1: SimpleNamespace(
+                        _enforce_physical_ownership=False,
+                        is_completed=Mock(return_value=True),
+                        has_failed=Mock(return_value=False),
+                        wait_complete=Mock(return_value=WaitResult.COMPLETED),
+                        status=SessionStatus.TRANSFERRED,
+                        timed_out=False,
+                        transfer_end_time=None,
+                        kv_cache_size_bytes=0,
+                        kv_write_verified=Mock(return_value=True),
+                        close=Mock(return_value=True),
+                    )
+                }
+                transceiver._recv_reqs = {1: request}
+                engine.disagg._started_gen_receives[1] = request
+                engine.canceled_req_ids = []
         elif poll_counted and peer_cause is not None:
             # The receive poll's rank-synchronized outcome already counted the cause.
             outcome = "timeout" if peer_cause == "timeout" else "error"
             engine.disagg._record_transfer_outcome(request, outcome, backend_failure=True)
         engines.append(engine)
         requests.append(request)
+
+    if poll_counted and peer_cause == "executor-timeout":
+        for _ in range(2):
+            group.run(lambda rank: engines[rank].disagg.reap_gen_receives(0))
+            for rank, engine in enumerate(engines):
+                # The poll vote spreads rank 1's observed deadline to rank 0.
+                assert engine.disagg.transfer_outcomes == expected
+                assert engine.kv_cache_transceiver._recv_sessions == {}
+                assert requests[rank].py_kv_transfer_timed_out
+                assert requests[rank].state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        for engine in engines:
+            engine.canceled_req_ids = [1]
 
     for _ in range(2):
         group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))

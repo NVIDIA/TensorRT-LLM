@@ -14,6 +14,7 @@ from fake_dist import FakeDistGroup, FakeDistRank
 from test_context_first_ownership import _KV_RESULT_REPORT_TOKEN, _native_pair, _request, _worker
 from test_transfer_ownership_regressions import _sole_piece
 
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
@@ -337,6 +338,55 @@ def _assert_transfer_only_progress(
     executor._fetch_and_enqueue_requests(executor.waiting_queue, len(harness.active))
     executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
     return executor
+
+
+def test_send_poll_counts_one_rank_observed_deadline_on_every_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both writers finish, but only one rank's executor saw the 1 s deadline expire."""
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: False)
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = []
+    requests = []
+    for rank in range(2):
+        request = _context_request()
+        request.py_kv_transfer_start_time = 0.0
+        request.is_disagg_generation_transmission_in_progress = False
+        session = SimpleNamespace(
+            _enforce_physical_ownership=False,
+            disagg_request_id=401,
+            is_completed=Mock(return_value=True),
+            has_failed=Mock(return_value=False),
+            wait_complete=Mock(return_value=WaitResult.COMPLETED),
+            status=SessionStatus.TRANSFERRED,
+            has_transferring_tasks=Mock(return_value=False),
+            timed_out=False,
+            close=Mock(return_value=True),
+        )
+        harness = _harness(
+            _worker(), request, session, dist=group.rank(rank), enable_transfer_metrics=True
+        )
+        harness.transfers.start_transfer(request)
+        harness.active.append(request)
+        # The executors observe 700 ms on rank 0 and 1100 ms on rank 1.
+        harness.coordinator._flag_transfer_timeout(
+            request, "context", 1000, current_time=1.1 if rank == 1 else 0.7
+        )
+        ranks.append(harness)
+        requests.append(request)
+    assert [request.py_kv_transfer_timed_out for request in requests] == [False, True]
+    assert [harness.coordinator.transfer_outcomes for harness in ranks] == [(0, 0, 0), (0, 0, 1)]
+
+    for _ in range(2):
+        group.run(lambda rank: ranks[rank].coordinator.reap_context_sends())
+        for harness, request in zip(ranks, requests):
+            assert harness.coordinator.transfer_outcomes == (0, 0, 1)
+            assert request.py_kv_transfer_timed_out
+            assert not harness.transceiver._send_sessions
+            assert not harness.transfers.requests_in_transfer()
+            harness.effects.fail_requests.assert_not_called()
+
+    assert [name for name, _ in group.rank(0).calls] == [name for name, _ in group.rank(1).calls]
 
 
 @pytest.mark.parametrize("result_already_sent", [False, True])

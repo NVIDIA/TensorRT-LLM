@@ -565,6 +565,34 @@ def test_ctx_tp_consensus_does_not_complete_when_peer_times_out(peer_failed) -> 
     assert quiesced == ([21] if peer_failed else [])
 
 
+@pytest.mark.parametrize("observed_here", [True, False], ids=["observed-here", "observed-on-peer"])
+def test_ctx_tp_vote_spreads_an_executor_observed_deadline(observed_here) -> None:
+    """A completed send counts the deadline one rank's executor observed on every rank."""
+    sent = []
+    req = SimpleNamespace(py_kv_transfer_timed_out=observed_here)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {21: SimpleNamespace(timed_out=False)}
+    transceiver._send_reqs = {21: req}
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+
+    def tp_allgather(payload):
+        sent.append(payload)
+        # Both writers finished; only one rank's executor saw the deadline expire.
+        return [payload, [[], [], [21], [21], [] if observed_here else [21]]]
+
+    transceiver._dist = SimpleNamespace(tp_allgather=tp_allgather)
+
+    cancelled, failed, completed, quiesced, backend_failed = transceiver._ctx_consensus_outcome(
+        [21], [], [], [21], [21]
+    )
+
+    assert sent == [[[], [], [21], [21], [21] if observed_here else []]]
+    assert (cancelled, failed, completed, quiesced) == ([], [], [21], [21])
+    assert backend_failed == set()
+    assert req.py_kv_transfer_timed_out is True
+
+
 @pytest.mark.parametrize("local_failure", [False, True])
 def test_ctx_consensus_keeps_failure_evidence_with_cancel(local_failure) -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
