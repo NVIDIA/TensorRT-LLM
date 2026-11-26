@@ -425,6 +425,7 @@ def test_child_factory_copies_processor_list_and_preserves_callables(processor_c
     parent.create_child_request(43)
     parent.create_child_request(44)
     child, sibling = parent.child_requests
+    assert parent.py_sequence_group is not None
     assert child.py_sequence_group is sibling.py_sequence_group is parent.py_sequence_group
     if processors is None:
         assert child.py_logits_post_processors is None
