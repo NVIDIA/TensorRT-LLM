@@ -12407,13 +12407,15 @@ class TestKVCacheManagerConfigReplace(unittest.TestCase):
     _OPTIONS = {
         "host_copy_threads": 4,
         "copy_stream_busy_skip": 8,
+        "page_staging_mib": 1024,
+        "page_staging_depth": 4,
     }
 
     @staticmethod
     def _config(**options) -> KVCacheManagerConfig:
         return create_config(32, 64 << 20, 64 << 20, 1 << 30, 2, None, 0, manager_options=options)
 
-    def test_replace_keeps_the_copy_path_options(self) -> None:
+    def test_replace_keeps_the_copy_path_and_page_staging_options(self) -> None:
         cfg = self._config(**self._OPTIONS)
         for rebuilt in (replace(cfg), replace(cfg, regions=[])):
             self.assertEqual({k: getattr(rebuilt, k) for k in self._OPTIONS}, self._OPTIONS)
