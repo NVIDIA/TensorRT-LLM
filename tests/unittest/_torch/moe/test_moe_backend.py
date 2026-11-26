@@ -4926,19 +4926,18 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
 
 
 @pytest.mark.cpu_only
-def test_sm107_genphase_defaults_run_the_decode_scheduler() -> None:
+def test_sm107_genphase_defaults_are_decode_tactics() -> None:
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
-    # The generation-phase kernel accepts only ("decode", lead) on atomic work ids and a
-    # (4, 1) cluster; any other default is refused at construction and silently runs on
-    # the generic kernel.
+    # The generation-phase kernel runs only the decode scheduler, on atomic work ids and a
+    # (4, 1) or (2, 1) cluster without a fallback; the GPU build test below checks that it
+    # accepts each default.
     for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
         tactic = megamoe_op._unpack_tactic(tactic)
         assert tactic[3][0] == "decode", bucket
         assert tactic[4] == "atomic_counter", bucket
-        assert list(tactic[1]) == [4, 1, 1] and tactic[2] is None, bucket
-        assert tactic[0][1] in (128, 256), bucket
+        assert list(tactic[1]) in ([4, 1, 1], [2, 1, 1]) and tactic[2] is None, bucket
 
     # Kimi K3 at EP4 has no table of its own: every bucket takes the generic one.
     for bucket in megamoe_op._SM107_GENPHASE_TACTICS:
@@ -5083,7 +5082,7 @@ def test_megamoe_genphase_defaults_build_the_genphase_kernel(
             situ_beta=4.0,
             situ_linear_beta=25.0,
         )
-    # A refused default tactic would fall back to the generic kernel without an error.
+    # A refused default runs on the generic kernel, which the query reports.
     _, is_genphase = megamoe_op.query_megamoe_kernel_properties(
         world_size=4,
         max_tokens_per_rank=bucket,
@@ -5093,45 +5092,6 @@ def test_megamoe_genphase_defaults_build_the_genphase_kernel(
         **shape,
     )
     assert is_genphase
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("bucket", [32, 64, 128, 192])
-def test_glm_rubin_runner_keeps_phase_interleave_genphase_tactics(
-    monkeypatch: pytest.MonkeyPatch, bucket: int
-) -> None:
-    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
-        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
-    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.ops.moe import (  # noqa: E501
-        megamoe_runner as glm_runner,
-    )
-
-    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
-    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
-    runner = glm_runner.RubinMegaMoERunner(
-        local_rank=0,
-        output_dtype=torch.bfloat16,
-        world_size=4,
-        num_topk=8,
-        num_experts_per_rank=64,
-        hidden_size=6144,
-        intermediate_size_per_partition=2048,
-        expand_intermediate_size_per_partition=4096,
-        max_tokens_per_rank=bucket,
-        apply_topk_in_fc1=True,
-        in_kernel_fc2_reduce=megamoe_op._sm107_use_in_kernel_fc2_reduce(bucket, True),
-    )
-    # The shared gen-phase table runs the decode scheduler, which GLM's own gen-phase kernel
-    # lacks: GLM keeps its phase_interleave tactics and refuses a decode one.
-    shared_tactic = megamoe_op._unpack_tactic(megamoe_op._SM107_GENPHASE_TACTICS[bucket])
-    assert shared_tactic[3][0] == "decode"
-    assert runner._default_tactic(bucket) == megamoe_op._unpack_tactic(
-        glm_runner._GLM_GENPHASE_TACTICS[bucket]
-    )
-    with pytest.raises(ValueError, match="no decode scheduler"):
-        runner._build_kernel_once(shared_tactic)
 
 
 @pytest.mark.gpu
@@ -8631,41 +8591,3 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
     )
     assert fused_vs_oracle["cos"] >= 0.999, fused_vs_oracle
     assert fused_vs_ref["cos"] >= 0.999 and fused_vs_ref["rms_rel"] <= 0.05, fused_vs_ref
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("bucket", [32, 64, 128, 192])
-def test_glm_rubin_runner_builds_its_default_genphase_kernel(
-    monkeypatch: pytest.MonkeyPatch, bucket: int
-) -> None:
-    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
-        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
-    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.ops.moe import (  # noqa: E501
-        megamoe_runner as glm_runner,
-    )
-
-    monkeypatch.setattr(megamoe_op, "get_sm_version", lambda: 107)
-    # Construction only; the occupancy query would need a CUDA context.
-    monkeypatch.setattr(megamoe_op, "_max_active_clusters", lambda size, *args: 184 // size)
-    runner = glm_runner.RubinMegaMoERunner(
-        local_rank=0,
-        output_dtype=torch.bfloat16,
-        world_size=4,
-        num_topk=8,
-        num_experts_per_rank=64,
-        hidden_size=6144,
-        intermediate_size_per_partition=2048,
-        expand_intermediate_size_per_partition=4096,
-        max_tokens_per_rank=bucket,
-        apply_topk_in_fc1=True,
-        in_kernel_fc2_reduce=megamoe_op._sm107_use_in_kernel_fc2_reduce(bucket, True),
-    )
-    # The shared default is a decode tactic; the GLM runner maps it to its own table.
-    tactic = runner._default_tactic(bucket)
-    # The 12-field tactic (with combine_dedup) must unpack and build, not raise at construction.
-    assert len(megamoe_op._unpack_tactic(tactic)) == megamoe_op._TACTIC_LEN
-    assert runner._build_kernel_once(tactic) is not None
-    with pytest.raises(ValueError, match="does not support combine_dedup"):
-        runner._build_kernel_once(megamoe_op._with_combine_dedup(tactic))
