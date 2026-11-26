@@ -523,12 +523,39 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             page_shape=page_shape,
         )
 
+    def commits_qsa_speculative_record(self, layer_idx: int) -> bool:
+        """Whether acceptance restores the side-cache entries of the layer's rejected tokens.
+
+        Only the steps of a worker that has this state committed do, and only in the target's
+        layers; no other layer needs a record.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine. The target's layers
+                come first, so an index from ``num_hidden_layers`` on is a draft layer's.
+        """
+        return (
+            self._commits_speculative_records
+            and layer_idx < self._pretrained_config.num_hidden_layers
+        )
+
     def hold_qsa_speculative_record(self, layer_idx: int, record: QSASpeculativeRecord) -> None:
-        """Keep the side-cache entries a layer's verification forward overwrote."""
+        """Keep the side-cache entries a layer's verification forward overwrote.
+
+        Every record held is committed at the next acceptance, so only a layer for which
+        :meth:`commits_qsa_speculative_record` is true holds one.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine.
+            record: The entries as they were before the forward.
+        """
         self._qsa_speculative_records[layer_idx] = record
 
     def drop_qsa_speculative_record(self, layer_idx: int) -> None:
-        """Forget what an earlier forward of the layer overwrote."""
+        """Forget what an earlier forward of the layer overwrote.
+
+        Args:
+            layer_idx: The layer's index among all layers of the engine.
+        """
         self._qsa_speculative_records.pop(layer_idx, None)
 
     @torch.compiler.disable
@@ -803,30 +830,47 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             return None
         return conv, ngram
 
-    def ple_speculative_record(self, layer_idx: int) -> PLESpeculativeRecord:
-        """Return the record a layer's verification forward leaves its state candidates on."""
+    def ple_speculative_record(self, layer_idx: int) -> Optional[PLESpeculativeRecord]:
+        """Return the record a layer's verification forward leaves its state candidates on.
+
+        None when acceptance commits no PLE state, so that the layer stages none.
+
+        Args:
+            layer_idx: The PLE layer, by the index :meth:`ple_layer_cache` takes.
+        """
+        if not self._commits_speculative_records:
+            return None
         return self._ple_speculative_records[layer_idx]
 
     @cached_property
-    def _serves_one_model_mtp(self) -> bool:
+    def _commits_speculative_records(self) -> bool:
+        """Whether the worker of this configuration has the PLE and QSA state committed.
+
+        The one-model MTP workers do, except the MTP-Eagle dynamic tree, which raises no
+        auxiliary phase.
+        """
         spec_config = self.spec_config
-        return spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model()
+        if spec_config is None:
+            return False
+        mode = spec_config.spec_dec_mode
+        return mode.is_mtp_vanilla() or (
+            mode.is_mtp_eagle_one_model() and not spec_config.use_dynamic_tree
+        )
 
     @override
     def _commit_auxiliary_speculative_state(self, acceptance: SpeculativeAcceptance) -> None:
         """Keep the PLE state and the QSA side-cache entries of the accepted tokens.
 
-        Only one-model MTP steps commit them, and of the QSA layers only the target's.
+        Only the steps of a worker that has them committed do. The QSA records leave the manager
+        before any commit, so a commit that raises leaves none behind.
         """
-        if not self._serves_one_model_mtp:
+        if not self._commits_speculative_records:
             return
+        qsa_records, self._qsa_speculative_records = self._qsa_speculative_records, {}
         for record in self._ple_speculative_records.values():
             record.commit(acceptance.num_accepted_tokens, acceptance.num_contexts)
-        qsa_records = self._qsa_speculative_records
-        if qsa_records:
-            num_target_layers = self._pretrained_config.num_hidden_layers
-            for layer_idx in [layer for layer in qsa_records if layer < num_target_layers]:
-                qsa_records.pop(layer_idx).commit(acceptance.num_accepted_tokens)
+        for record in qsa_records.values():
+            record.commit(acceptance.num_accepted_tokens)
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:

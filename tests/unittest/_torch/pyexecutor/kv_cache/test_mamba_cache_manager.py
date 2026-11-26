@@ -11135,7 +11135,7 @@ def _stage_ple_candidates(mgr, slots):
         pool.zero_()
         candidates = torch.randint(1, 100, (len(slots), 3, *pool.shape[1:]), device="cuda")
         candidates = candidates.to(pool.dtype)
-        setattr(record, field, (pool, slots, pool[slots].clone(), candidates))
+        setattr(record, field, (pool, slots, candidates))
         staged.append(candidates)
     return staged
 
@@ -11368,16 +11368,48 @@ def test_mtp_eagle_acceptance_keeps_the_accepted_ple_state_after_drafting():
 
 @skip_no_cuda
 def test_eagle3_acceptance_leaves_the_ple_state_as_verification_wrote_it():
-    """Qwen4-Exp keeps the accepted PLE state under one-model MTP only: an Eagle3 step commits none of it."""
+    """Qwen4-Exp keeps the accepted PLE state under one-model MTP only. Under Eagle3 the PLE layer has no record to
+    leave candidates on, and a step that accepts fewer tokens leaves the state after all three verified tokens."""
     mgr = _build_ple_acceptance_manager(
         Eagle3DecodingConfig(max_draft_len=2, speculative_model="draft")
     )
     try:
         mgr._refresh_dummy_request_mask([False] * 2)
-        staged = _stage_ple_candidates(mgr, slots=[3, 1])
-        worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+        assert mgr.ple_speculative_record(0) is None
+        worker = _acceptance_worker("eagle3", torch.tensor([2, 1], dtype=torch.int32).cuda())
         _run_whole_step(worker, mgr, lambda **kwargs: None)
-        _assert_ple_slots(mgr, staged, kept={}, empty=[0, 1, 2, 3])
+        _assert_ple_prefix_state(mgr, initial, tokens, values, accepted=[3, 3])
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_mtp_eagle_tree_step_stages_no_ple_or_qsa_state():
+    """MTPEagleDynamicTreeWorker raises no auxiliary phase, so the manager hands the PLE layer no record and lets no
+    QSA layer take a snapshot. A step that accepts only the golden token leaves the state after all three verified
+    tokens."""
+    mgr = _build_ple_acceptance_manager(
+        MTPDecodingConfig(
+            max_draft_len=2,
+            use_dynamic_tree=True,
+            dynamic_tree_max_topK=2,
+            max_total_draft_tokens=4,
+        )
+    )
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        initial = _fill_ple_pools(mgr)
+        verify, tokens, values = _ple_layer_verification(mgr)
+        verify(mgr)
+        assert mgr.ple_speculative_record(0) is None
+        assert not mgr.commits_qsa_speculative_record(2)
+        worker = _acceptance_worker("mtp_eagle_tree", torch.ones(2, dtype=torch.int32).cuda())
+        with pytest.raises(_DraftStarted):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=_PLE_SLOTS)
+        _assert_ple_prefix_state(mgr, initial, tokens, values, accepted=[3, 3])
     finally:
         mgr.shutdown()
 
@@ -11406,19 +11438,19 @@ def _hold_qsa_record(mgr, layer_idx):
 @skip_no_cuda
 def test_mtp_acceptance_restores_the_qsa_entries_of_rejected_tokens_in_target_layers():
     """The first request accepts two of its four verification tokens: a target layer gets the entries of the other two
-    back, a draft layer keeps what its forward wrote."""
+    back. The manager has only the target's layers hold a record."""
     mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
     try:
         mgr._refresh_dummy_request_mask([False] * 2)
         _stage_ple_candidates(mgr, slots=[3, 1])
         # The model has three layers; the layer after them is the draft's.
+        assert mgr.commits_qsa_speculative_record(2) and not mgr.commits_qsa_speculative_record(3)
         target_entries = _hold_qsa_record(mgr, layer_idx=2)
-        draft_entries = _hold_qsa_record(mgr, layer_idx=3)
         worker = _acceptance_worker("mtp", torch.tensor([2, 3], dtype=torch.int32).cuda())
         with pytest.raises(_DraftStarted):
             _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
         assert target_entries.tolist() == [1, 1, 0, 0]
-        assert draft_entries.tolist() == [1, 1, 1, 1]
+        assert not mgr._qsa_speculative_records
     finally:
         mgr.shutdown()
 
@@ -11430,9 +11462,32 @@ def test_eagle3_acceptance_leaves_the_qsa_entries_as_verification_wrote_them():
     )
     try:
         mgr._refresh_dummy_request_mask([False] * 2)
+        assert not mgr.commits_qsa_speculative_record(2)
         target_entries = _hold_qsa_record(mgr, layer_idx=2)
         worker = _acceptance_worker("eagle3", torch.tensor([2, 3], dtype=torch.int32).cuda())
         _run_whole_step(worker, mgr, lambda **kwargs: None)
         assert target_entries.tolist() == [1, 1, 1, 1]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_acceptance_that_fails_leaves_no_qsa_record_on_the_manager():
+    """A target layer's restore raises after another layer's has finished: that layer keeps its restored entries and
+    the manager holds neither record."""
+    mgr = _build_ple_acceptance_manager(MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True))
+    try:
+        mgr._refresh_dummy_request_mask([False] * 2)
+        _stage_ple_candidates(mgr, slots=[3, 1])
+        restored_entries = _hold_qsa_record(mgr, layer_idx=1)
+        _hold_qsa_record(mgr, layer_idx=2)
+        # One entry short of the layer's four tokens.
+        failing = mgr._qsa_speculative_records[2]
+        failing.index_values = failing.index_values[:3]
+        worker = _acceptance_worker("mtp", torch.tensor([2, 3], dtype=torch.int32).cuda())
+        with pytest.raises(RuntimeError, match="must match"):
+            _run_acceptance(worker, mgr, num_seqs=2, num_contexts=0, state_slots=[3, 1])
+        assert restored_entries.tolist() == [1, 1, 0, 0]
+        assert not mgr._qsa_speculative_records
     finally:
         mgr.shutdown()

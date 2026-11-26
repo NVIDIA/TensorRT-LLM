@@ -622,13 +622,8 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     conv_candidates = torch.tensor([[[10.0], [11.0], [12.0]], [[20.0], [21.0], [22.0]]])
     context_candidates = torch.tensor([[[100], [101], [102]], [[200], [201], [202]]])
     record = PLESpeculativeRecord()
-    record.conv_states = (conv_pool, slots, conv_pool[slots].clone(), conv_candidates)
-    record.ngram_contexts = (
-        context_pool,
-        slots,
-        context_pool[slots].clone(),
-        context_candidates,
-    )
+    record.conv_states = (conv_pool, slots, conv_candidates)
+    record.ngram_contexts = (context_pool, slots, context_candidates)
 
     # Context count occupies the first entry. Generation request 0 accepts only
     # its golden token (candidate 0); request 1 accepts golden + two drafts.
@@ -638,6 +633,53 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     torch.testing.assert_close(context_pool[slots], torch.tensor([[100], [202]]))
     assert record.conv_states is None
     assert record.ngram_contexts is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("next_lengths", "next_accepted", "next_contexts"),
+    [([4], [4], 1), ([], [1, 1], 0)],
+    ids=["context_only_step", "empty_step"],
+)
+def test_ple_forward_drops_the_candidates_of_an_uncommitted_verification(
+    next_lengths, next_accepted, next_contexts
+) -> None:
+    """A step that fails after its verification leaves the candidates uncommitted. The next
+    forward drops them, so its acceptance writes nothing to the slots of the failed step."""
+    device = torch.device("cuda")
+    dtype = torch.float32
+    gen = torch.Generator(device=device).manual_seed(20261125)
+    module = Qwen4ExpPLE(_make_config(), dtype=dtype, ple_layer_index=0, layer_id=1).to(device)
+    module.eval()
+    _init_module_weights(module, gen, device, dtype)
+    conv_state = torch.zeros(4, CONV_CHANNELS, SHORT_CONV_STATE_LEN, device=device, dtype=dtype)
+    ngram_context = torch.full(
+        (4, NGRAM_CONTEXT_LEN), EOS_TOKEN_ID, device=device, dtype=torch.long
+    )
+    record = PLESpeculativeRecord()
+
+    def forward(lengths, slots, **layout):
+        tokens = torch.randint(0, VOCAB_SIZE, (sum(lengths),), generator=gen, device=device)
+        hidden = torch.randn(sum(lengths), CONV_CHANNELS, generator=gen, device=device).to(dtype)
+        metadata = PLEMetadata.build(
+            tokens,
+            torch.tensor(lengths, dtype=torch.long, device=device),
+            torch.tensor(slots, dtype=torch.long, device=device),
+            is_decode=False,
+            eos_token_id=EOS_TOKEN_ID,
+            **layout,
+        )
+        with torch.no_grad():
+            module.forward(hidden, metadata, conv_state, ngram_context, record)
+
+    forward([3, 3], [2, 3], use_spec_decoding=True, host_seq_lens=[3, 3])
+    assert record.conv_states is not None and record.ngram_contexts is not None
+
+    forward(next_lengths, [0] * len(next_lengths), num_contexts=next_contexts)
+    failed_step_conv, failed_step_context = conv_state[2:].clone(), ngram_context[2:].clone()
+    record.commit(torch.tensor(next_accepted, device=device), next_contexts)
+    assert torch.equal(conv_state[2:], failed_step_conv)
+    assert torch.equal(ngram_context[2:], failed_step_context)
 
 
 def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
@@ -800,7 +842,7 @@ def test_ple_mixed_speculative_workspace_and_rollback(
         (record.conv_states, (3, width, channels, state_len)),
         (record.ngram_contexts, (3, width, 2)),
     ]:
-        candidates = entry[3]
+        candidates = entry[2]
         assert tuple(candidates.shape) == shape
         assert (
             candidates.untyped_storage().nbytes() == candidates.numel() * candidates.element_size()

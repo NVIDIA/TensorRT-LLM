@@ -59,6 +59,7 @@ from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
+from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 
@@ -1932,11 +1933,14 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
     assert calls[0][2] is PageIndexMode.SHARED
 
 
-def _qsa_record_manager(records=None) -> Qwen4ExpHybridCacheManager:
-    """A V2 QSA manager reduced to the speculative records it holds for the indexers."""
+def _qsa_record_manager(records=None, spec_config=None) -> Qwen4ExpHybridCacheManager:
+    """A V2 QSA manager reduced to the speculative records it holds for the indexers of a
+    one-layer target, under one-model MTP unless `spec_config` says otherwise."""
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager._qsa_speculative_records = dict(records or {})
     manager.qsa_position_layer_id = 0
+    manager.spec_config = spec_config or MTPDecodingConfig(max_draft_len=3)
+    manager._pretrained_config = SimpleNamespace(num_hidden_layers=1)
     return manager
 
 
@@ -2020,10 +2024,11 @@ def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
     assert manager._qsa_speculative_records == {}
 
 
-def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> None:
+def _capture_four_token_verification(manager, layer_idx: int):
+    """Have a layer's indexer see one request verify four tokens. Returns the side caches and
+    the entries of the four tokens in them."""
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
-    manager = _qsa_record_manager()
     metadata = SimpleNamespace(
         num_contexts=0,
         num_seqs=1,
@@ -2033,26 +2038,64 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
         seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
         kv_cache_manager=manager,
     )
-    request_indices = torch.zeros(4, dtype=torch.long)
     pages = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     within = torch.tensor([0, 1, 0, 1], dtype=torch.long)
     index_cache = torch.arange(24, dtype=torch.float32).reshape(3, 2, 1, 4)
     position_cache = torch.arange(18, dtype=torch.int32).reshape(3, 2, 3)
 
     indexer._capture_speculative_cache_state(
-        layer_idx=0,
-        request_indices=request_indices,
+        layer_idx=layer_idx,
+        request_indices=torch.zeros(4, dtype=torch.long),
         pages=pages,
         within=within,
         index_cache=index_cache,
         position_cache=position_cache,
         metadata=metadata,
     )
+    return index_cache, position_cache, pages, within
+
+
+_MTP_EAGLE_TREE = dict(
+    max_draft_len=3, use_dynamic_tree=True, dynamic_tree_max_topK=2, max_total_draft_tokens=6
+)
+
+
+@pytest.mark.parametrize(
+    "spec_config",
+    [None, MTPDecodingConfig(use_mtp_vanilla=True, **_MTP_EAGLE_TREE)],
+    ids=["mtp_eagle", "mtp_vanilla_with_the_tree_option"],
+)
+def test_qsa_multi_token_generation_captures_speculative_cache_snapshot(spec_config) -> None:
+    """MTPWorker serves vanilla MTP whatever the tree option says, and has the entries restored."""
+    manager = _qsa_record_manager(spec_config=spec_config)
+
+    index_cache, position_cache, pages, within = _capture_four_token_verification(manager, 0)
 
     record = manager._qsa_speculative_records[0]
     assert record.token_ordinals.tolist() == [0, 1, 2, 3]
     torch.testing.assert_close(record.index_values, index_cache[pages, within])
     torch.testing.assert_close(record.position_values, position_cache[pages, within])
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "layer_idx"),
+    [
+        (None, 1),
+        (Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"), 0),
+        (MTPDecodingConfig(**_MTP_EAGLE_TREE), 0),
+    ],
+    ids=["mtp_draft_layer", "eagle3_target_layer", "mtp_eagle_tree_target_layer"],
+)
+def test_qsa_layer_whose_entries_no_acceptance_restores_takes_no_snapshot(
+    spec_config, layer_idx
+) -> None:
+    """Acceptance restores rejected entries in the target's layers, under MTPWorker and
+    MTPEagleWorker. A verification anywhere else drops the layer's earlier record and holds none."""
+    manager = _qsa_record_manager({layer_idx: object()}, spec_config)
+
+    _capture_four_token_verification(manager, layer_idx)
+
+    assert manager._qsa_speculative_records == {}
 
 
 class _QsaPageConverter:

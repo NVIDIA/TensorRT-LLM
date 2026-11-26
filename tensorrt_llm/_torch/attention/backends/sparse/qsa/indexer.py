@@ -132,8 +132,6 @@ class QSASpeculativeRecord:
             num_accepted_tokens: ``[batch]`` integer tensor on the device: the
                 accepted token count of every request, context requests first.
         """
-        # QSA snapshots already carry scheduler request indices. Unlike GDN or
-        # PLE, they do not address a separate recurrent-state slot pool.
         request_indices = self.request_indices
         accepted = num_accepted_tokens.to(request_indices.device)[request_indices]
         restore = self.token_ordinals >= accepted
@@ -574,10 +572,13 @@ class QSAIndexer(nn.Module):
     ) -> None:
         """Snapshot QSA side-cache entries that target verification may reject.
 
-        The cache manager holds the snapshot until acceptance is known.
+        The cache manager holds the snapshot until acceptance is known. A layer
+        whose entries no acceptance restores takes none.
         """
         kv_cache_manager = metadata.kv_cache_manager
         kv_cache_manager.drop_qsa_speculative_record(layer_idx)
+        if not kv_cache_manager.commits_qsa_speculative_record(layer_idx):
+            return
         num_contexts = metadata.num_contexts
         num_seqs = metadata.num_seqs
         if metadata.is_cuda_graph and num_contexts == 0 and metadata.num_tokens == num_seqs:
@@ -613,6 +614,7 @@ class QSAIndexer(nn.Module):
             # CUDA-graph target verification batch.
             request_indices = request_indices.to(torch.long)
 
+        owns_positions = layer_idx == kv_cache_manager.qsa_position_layer_id
         record = QSASpeculativeRecord(
             request_indices=request_indices,
             token_ordinals=token_ordinals,
@@ -620,8 +622,7 @@ class QSAIndexer(nn.Module):
             within=within,
             index_values=index_cache[pages, within].clone(),
             index_cache=index_cache,
+            position_values=position_cache[pages, within].clone() if owns_positions else None,
+            position_cache=position_cache if owns_positions else None,
         )
-        if layer_idx == kv_cache_manager.qsa_position_layer_id:
-            record.position_values = position_cache[pages, within].clone()
-            record.position_cache = position_cache
         kv_cache_manager.hold_qsa_speculative_record(layer_idx, record)

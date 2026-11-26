@@ -734,8 +734,10 @@ class Qwen4ExpModel(DecoderModel):
 
         The third value is the record verification candidates go to: the cache
         manager's for its pools, the model's own for the other two. Only the
-        cache manager's is committed on acceptance; whoever owns the other
-        pools commits the model's.
+        cache manager's is committed on acceptance, and it is None when that
+        manager's acceptance commits no PLE state. Nothing in the runtime
+        commits the model's own: a harness that owns the other pools commits
+        the record ``_prepare_ple_state`` returns.
 
         Priority (all host-sync-free):
           1. **KVCacheManagerV2-owned pools** (serving runtime) —
