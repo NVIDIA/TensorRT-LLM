@@ -8,7 +8,6 @@ import struct
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
@@ -74,9 +73,7 @@ class H3DenseAttention:
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
         self.recipe = config.attention.quant_attention_config
-        self.preferred_layout = (
-            AttentionTensorLayout.HND if backend == "VANILLA" else AttentionTensorLayout.NHD
-        )
+        self.heads_first = backend == "VANILLA"
         self.runner = None
         self.sparse_params = sparse_params
         self.sol = None

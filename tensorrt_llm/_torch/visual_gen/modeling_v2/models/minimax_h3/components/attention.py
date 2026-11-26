@@ -21,7 +21,6 @@ from typing import Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 from ..ops.rope import apply_minimax_h3_qk_norm_rope_bf16, apply_minimax_h3_rotary_emb
@@ -193,13 +192,13 @@ class MiniMaxH3Attention(nn.Module):
         batch, seq = q.shape[:2]
         shape = (batch, seq, self.local_num_attention_heads, self.head_dim)
         q, k, v = q.view(shape), k.view(shape), v.view(shape)
-        hnd = self.attn.preferred_layout == AttentionTensorLayout.HND
-        if hnd:
+        heads_first = self.attn.heads_first
+        if heads_first:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         out = self.attn.forward(
             q=q, k=k, v=v, batch_size=batch, seq_len=seq, seq_len_kv=seq, **kwargs
         )
-        if hnd:
+        if heads_first:
             out = out.transpose(1, 2)
         return out.flatten(2)
 

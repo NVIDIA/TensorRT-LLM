@@ -25,7 +25,6 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
-from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -1638,7 +1637,7 @@ def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
 class _RecordingAsyncUlysses:
     """Stands in for an async UlyssesAttention: runs the three closures and returns Q."""
 
-    preferred_layout = AttentionTensorLayout.NHD
+    heads_first = False
 
     def __init__(self) -> None:
         self.captured: dict[str, object] = {}

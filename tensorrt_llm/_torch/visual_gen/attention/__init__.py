@@ -12,13 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared tensor layouts for VisualGen attention."""
+"""VisualGen attention.
 
-from enum import Enum
+Holds the DiT attention module (``attention.py``) and the kernel backends it
+dispatches to (the ``backends`` sub-package).
 
-
-class AttentionTensorLayout(str, Enum):
-    """Order of the sequence and head axes within an attention tensor."""
-
-    NHD = "NHD"  # [batch, sequence, heads, head_dim]
-    HND = "HND"  # [batch, heads, sequence, head_dim]
+Nothing is re-exported from this file on purpose: importing the package root
+stays cheap, and callers import the module or backend they need directly.
+"""

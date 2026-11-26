@@ -9,7 +9,6 @@ import os
 import torch
 from torch.nn import functional as F
 
-from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 from tensorrt_llm.visual_gen.sparse_attention import SolAttentionConfig
@@ -35,6 +34,8 @@ def _compact(q, k, v):
 
 class H3TrtllmAttention:
     """Full self-attention on NHD activations with one host prefix length per batch."""
+
+    heads_first = False
 
     def __init__(
         self,
@@ -64,10 +65,6 @@ class H3TrtllmAttention:
         self.prims = H3PrimTS(self.recipe, attention_metadata_state)
         self.skip_stats = None
         self.print_stats = os.getenv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT") == "1"
-
-    @property
-    def preferred_layout(self) -> AttentionTensorLayout:
-        return AttentionTensorLayout.NHD
 
     def support_fused_qkv(self) -> bool:
         return self.recipe is None and not self.sol

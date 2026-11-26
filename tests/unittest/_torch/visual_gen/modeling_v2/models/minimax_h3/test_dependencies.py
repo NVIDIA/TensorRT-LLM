@@ -17,7 +17,6 @@ _V2 = f"{_VG}.modeling_v2"
 _H3 = f"{_V2}.models.minimax_h3"
 _CATALOGS = (f"{_TORCH}.modeling_v2.catalog", f"{_V2}.catalog")
 _VISUAL_GEN_SERVICES = {
-    "attention.AttentionTensorLayout",
     "checkpoints.WeightLoader",
     "config.DiffusionModelConfig",
     "config.DiffusionPipelineConfig",
@@ -73,7 +72,7 @@ _SPARSE_KERNEL = f"{_VG_CUTE}.blackwell.video_sparse_attention"
 _H3_PROVIDERS = {
     "components/trtllm_attention_prims.py": {
         f"{_TORCH}.attention.backends.fmha.registry.FMHA_LIBS",
-        f"{_TORCH}.attention.backends.fmha.registry.get_enabled_fmha_lib_names",
+        f"{_TORCH}.attention.backends.fmha.registry.get_enabled_fmha_lib_classes",
     },
     "components/linear.py": {
         f"{_TORCH}.modules.low_m_gemm.low_m_gemm_dispatcher",

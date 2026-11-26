@@ -46,21 +46,25 @@ class H3PrimTS:
     """Own the attention plans, compression schedule and provider selection for an H3 instance."""
 
     def __init__(self, recipe: QuantAttentionConfig | None, metadata_state: dict):
-        from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_names
+        from tensorrt_llm._torch.attention.backends.fmha.registry import (
+            FMHA_LIBS,
+            get_enabled_fmha_lib_classes,
+        )
 
         self.recipe = recipe
         self.metadata_state = metadata_state
-        enabled = get_enabled_fmha_lib_names()
+        enabled = get_enabled_fmha_lib_classes()
+        fallback = FMHA_LIBS["fallback"]
+        sparse = FMHA_LIBS["prims_ts_block_sparse"]
         self._enabled = enabled
         self._available: dict[str, bool] = {}
-        self.fallback_enabled = "fallback" in enabled
-        self.dense_explicitly_enabled = "prims_ts" in enabled and any(
+        self.fallback_enabled = fallback in enabled
+        self.dense_explicitly_enabled = FMHA_LIBS["prims_ts"] in enabled and any(
             token.strip().removeprefix("+").strip() == "prims_ts"
             for token in os.environ.get("TLLM_FMHA_LIBS", "").split(",")
         )
-        self.smooth_v_plan = "prims_ts_block_sparse" in enabled and (
-            not self.fallback_enabled
-            or enabled.index("prims_ts_block_sparse") < enabled.index("fallback")
+        self.smooth_v_plan = sparse in enabled and (
+            not self.fallback_enabled or enabled.index(sparse) < enabled.index(fallback)
         )
         if recipe is not None and recipe.vc_attention and not self._has_prims("prims_ts"):
             raise RuntimeError(
@@ -86,7 +90,8 @@ class H3PrimTS:
             from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
 
             layer = SimpleNamespace(is_mla_enable=False, skip_correction_threshold=0.0)
-            self._available[name] = name in self._enabled and FMHA_LIBS[name].is_available(layer)
+            provider = FMHA_LIBS[name]
+            self._available[name] = provider in self._enabled and provider.is_available(layer)
         return self._available[name]
 
     @torch.compiler.disable

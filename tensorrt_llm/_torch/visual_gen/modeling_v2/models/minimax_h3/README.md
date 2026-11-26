@@ -3,7 +3,7 @@
 
 # Developing MiniMax-H3 with Modeling V2
 
-**Write new H3 features and kernels only in V2.** During H3's short migration window, [V1](../../../models/minimax_h3/) remains the default and is available for fixes and comparisons. Base H3 and FastH3 use the same VisualGen API, CLI and checkpoint names in both versions. [VisualGen Modeling V2 developer guide](../../README.md)
+**Write new H3 features and kernels only in V2.** During H3's short migration window, [V1](../../../models/minimax_h3/) remains the default and provides the reference for comparisons. Base H3 and FastH3 use the same VisualGen API, CLI and checkpoint names in both versions. [VisualGen Modeling V2 developer guide](../../README.md)
 
 ## Run a target
 
@@ -39,6 +39,6 @@ The family also decides which layers and denoising steps use a sparse prediction
 
 H3 [unit tests](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/) and [checkpoint quality tests](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/) mirror family and target ownership. Use the [catalog tests](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/catalog/) for model-independent ops. Record shared backend imports in the [dependency test](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/test_dependencies.py). Map native dependencies that CI cannot infer in the [VisualGen CI rule](../../../../../../jenkins/scripts/cbts/cbts/rules/visual_gen.py).
 
-For migration coverage, check Base H3 and FastH3 against their respective V1 features. A generation run can verify that the requested parallel or attention path produced the expected media. A lifecycle feature needs its own check. The [base H3 sleep/wake test](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py) checks request admission, memory release and restored video and audio. For a loading fix, check the weights against the checkpoint and repeat the original request. Include shared-code fixes here when needed for a supported V1/V2 comparison or rollout. [Migration validation](../../README.md#test-a-change)
+For migration coverage, check Base H3 and FastH3 against their respective V1 features. A generation run can verify that the requested parallel or attention path produced the expected media. A lifecycle feature needs its own check. The [base H3 sleep/wake test](../../../../../../tests/integration/defs/visual_gen/modeling_v2/minimax_h3/h3_pipeline/test_minimax_h3_sleep.py) checks request admission, memory release and restored video and audio. For a loading fix, check the weights against the checkpoint and repeat the original request. Track unrelated V1 fixes separately. If a V1 defect blocks a supported comparison or rollout, document the reproducer and flag the fix for review in the PR. [Migration validation](../../README.md#test-a-change)
 
 Review H3 V1 retirement one week after the opt-in PR merges. Before removing V1 and its switch, check any H3 features merged during the rollout, the remaining opt-in coverage, and peak memory on representative deployments.

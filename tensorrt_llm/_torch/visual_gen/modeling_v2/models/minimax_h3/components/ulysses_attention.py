@@ -4,27 +4,25 @@
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.visual_gen.attention import AttentionTensorLayout
-
 from ..ops.ulysses_qkv import exchange_shards, ulysses_qkv_all_to_all, ulysses_unscatter_qkv
 
 
 class H3UlyssesAttention:
     """Convert rank-local sequence rows to rank-local heads for one H3 attention call."""
 
-    preferred_layout = AttentionTensorLayout.NHD
+    heads_first = False
 
     def __init__(self, inner, group, stream):
         self.inner = inner
         self.group = group
         self.size = dist.get_world_size(group)
-        self.hnd = inner.preferred_layout == AttentionTensorLayout.HND
+        self.inner_heads_first = inner.heads_first
         if stream is not None:
             self._boxed_group = group.boxed()
             self._stream = stream
 
     def _output(self, out, batch, seq):
-        if self.hnd:
+        if self.inner_heads_first:
             out = out.transpose(1, 2)
         out = out.reshape(batch, seq, self.inner.num_heads, self.inner.head_dim).contiguous()
         return exchange_shards(out, self.group, scatter_dim=1, gather_dim=2)
@@ -41,7 +39,7 @@ class H3UlyssesAttention:
                 torch.stack((q, k, v), dim=2), self.group, scatter_dim=3, gather_dim=1
             )
             return self._run(qkv, None, None, batch, seq, kwargs)
-        q, k, v = ulysses_qkv_all_to_all(q, k, v, self.group, self.hnd)
+        q, k, v = ulysses_qkv_all_to_all(q, k, v, self.group, self.inner_heads_first)
         return self._run(q, k, v, batch, seq, kwargs)
 
     @torch.compiler.disable(recursive=False)
@@ -70,7 +68,7 @@ class H3UlyssesAttention:
         self._wait_for_qkv()
         _, batch, rows, _, _ = q.shape
         # Async prepare returns each receive at the base of its symmetric-memory allocation.
-        q, k, v = ulysses_unscatter_qkv(q, k, v, self.hnd, aligned_receives=True)
+        q, k, v = ulysses_unscatter_qkv(q, k, v, self.inner_heads_first, aligned_receives=True)
         return self._run(q, k, v, batch, self.size * rows, kwargs)
 
 
