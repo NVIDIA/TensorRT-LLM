@@ -810,7 +810,8 @@ def test_failed_parent_fails_its_child_sequences() -> None:
     )
 
 
-def test_failed_sequence_group_gets_one_error_response() -> None:
+@pytest.mark.parametrize("child_first", [False, True])
+def test_failed_sequence_group_gets_one_error_response(child_first: bool) -> None:
     def sequence(request_id: int, parent_id: int | None) -> types.SimpleNamespace:
         return types.SimpleNamespace(
             py_request_id=request_id,
@@ -831,17 +832,15 @@ def test_failed_sequence_group_gets_one_error_response() -> None:
     )
     executor._transfer_owns_request_blocks.return_value = False
 
-    PyExecutor._handle_errors(
-        executor, "over budget", requests=[parent, child], charge_budget=False
-    )
+    failed = [child, parent] if child_first else [parent, child]
+
+    PyExecutor._handle_errors(executor, "over budget", requests=failed, charge_budget=False)
 
     ((responses,), _) = executor._enqueue_responses.call_args
-    assert [req_id for req_id, _ in responses] == [1]
+    first = failed[0].py_request_id
+    assert [(req_id, response.request_id) for req_id, response in responses] == [(first, 1)]
     assert executor.active_requests == []
-    assert [call.args[0] for call in executor._terminate_request.call_args_list] == [
-        parent,
-        child,
-    ]
+    assert [call.args[0] for call in executor._terminate_request.call_args_list] == failed
 
 
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:

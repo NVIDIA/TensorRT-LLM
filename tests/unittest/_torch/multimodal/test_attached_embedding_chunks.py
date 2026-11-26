@@ -7,7 +7,6 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
-import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from utils.llm_data import llm_models_root
@@ -21,19 +20,23 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 _MODEL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
-_IMAGE = llm_models_root() / "multimodals" / "test_data" / "seashore.png"
+_TEST_DATA = llm_models_root() / "multimodals" / "test_data"
 _CHUNK_TOKENS = 1024
+_IMAGE_TOKEN_ID = 151655
 
 
 @pytest.fixture(scope="module")
-def large_images(tmp_path_factory: pytest.TempPathFactory) -> list[str]:
+def images(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """Images of about 4K and 8K embedding rows."""
-    out_dir = tmp_path_factory.mktemp("large_images")
-    paths = []
-    for index, size in enumerate([(2048, 2048), (4096, 2048)]):
-        path = out_dir / f"image_{index}.png"
-        Image.open(_IMAGE).convert("RGB").resize(size).save(path)
-        paths.append(str(path))
+    out_dir = tmp_path_factory.mktemp("images")
+    sources = {
+        "large": ("seashore.png", (2048, 2048)),
+        "larger": ("seashore.png", (4096, 2048)),
+    }
+    paths = {}
+    for name, (source, size) in sources.items():
+        paths[name] = str(out_dir / f"{name}.png")
+        Image.open(_TEST_DATA / source).convert("RGB").resize(size).save(paths[name])
     return paths
 
 
@@ -58,34 +61,38 @@ def engines() -> Generator[tuple[LLM, LLM, MultimodalEncoder], None, None]:
         yield llm, chunked_llm, encoder
 
 
-def _load_inputs(llm: LLM, prompt: str, image: str) -> dict:
+def _load_inputs(llm: LLM, prompt: str, images: list[str]) -> dict:
     model_type = json.loads((Path(llm._hf_model_dir) / "config.json").read_text())["model_type"]
     (inputs,) = default_multimodal_input_loader(
         tokenizer=llm.tokenizer,
         model_dir=llm._hf_model_dir,
         model_type=model_type,
-        modality="image",
+        modality="multiple_image" if len(images) > 1 else "image",
         prompts=[prompt],
-        media=[image],
+        media=[images] if len(images) > 1 else images,
         image_data_format="pt",
     )
     return inputs
 
 
-def _attached_inputs(encoder: MultimodalEncoder, raw_inputs: dict, image: str) -> dict:
-    """The raw request with the encoder's output attached in place of the image."""
+def _attached_inputs(encoder: MultimodalEncoder, raw_inputs: dict, images: list[str]) -> dict:
+    """The raw request with the encoder's outputs attached in place of its images."""
     (output,) = encoder.generate([raw_inputs])
     handles = output.disaggregated_params.multimodal_embedding_handles
-    embedding = torch.cat([SharedTensorContainer.from_dict(h).get_local_view() for h in handles])
-    (grid,) = (
-        AutoProcessor.from_pretrained(_MODEL_DIR)
-        .image_processor(images=[Image.open(image)], return_tensors="pt")["image_grid_thw"]
-        .tolist()
-    )
-    return {
-        "prompt": raw_inputs["prompt"],
-        "multi_modal_embeddings": {"image": [{"mm_embeddings": embedding, "image_grid_thw": grid}]},
-    }
+    image_processor = AutoProcessor.from_pretrained(_MODEL_DIR).image_processor
+    grids = image_processor(images=[Image.open(image) for image in images], return_tensors="pt")[
+        "image_grid_thw"
+    ].tolist()
+    assert len(handles) == len(grids)
+    attachments = [
+        {
+            # A tensor received over CUDA IPC cannot be shared again, so attach a copy.
+            "mm_embeddings": SharedTensorContainer.from_dict(handle).get_local_view().clone(),
+            "image_grid_thw": grid,
+        }
+        for handle, grid in zip(handles, grids)
+    ]
+    return {"prompt": raw_inputs["prompt"], "multi_modal_embeddings": {"image": attachments}}
 
 
 def _old_attachment_bound_rows() -> int:
@@ -99,35 +106,47 @@ def _old_attachment_bound_rows() -> int:
 
 @pytest.mark.threadleak(enabled=False)
 def test_chunked_long_attachment_matches_unchunked(
-    engines: tuple[LLM, LLM, MultimodalEncoder], large_images: list[str]
+    engines: tuple[LLM, LLM, MultimodalEncoder], images: dict[str, str]
 ) -> None:
     llm, chunked_llm, encoder = engines
-    prompt = "Describe the image in detail."
-    raw_inputs = _load_inputs(llm, prompt, large_images[0])
-    inputs = _attached_inputs(encoder, raw_inputs, large_images[0])
-    rows = inputs["multi_modal_embeddings"]["image"][0]["mm_embeddings"].shape[0]
-    assert rows > 3 * _CHUNK_TOKENS
     params = SamplingParams(max_tokens=32)
+    media = [images["large"]]
+    # The second prompt shares the image with the first but not the text after
+    # it, so it reuses the KV cache the first one's sliced chunks wrote. Reuse
+    # perturbs the numerics, so after it the reference is the raw image on the
+    # same chunked engine rather than the unchunked engine.
+    for index, prompt in enumerate(
+        ("Describe the image in detail.", "What colors are in this picture?")
+    ):
+        raw_inputs = _load_inputs(llm, prompt, media)
+        inputs = _attached_inputs(encoder, raw_inputs, media)
+        rows = inputs["multi_modal_embeddings"]["image"][0]["mm_embeddings"].shape[0]
+        assert rows > 3 * _CHUNK_TOKENS
+        expected = llm.generate(raw_inputs, params)
+        assert llm.generate(inputs, params).outputs[0].token_ids == expected.outputs[0].token_ids
+        chunked_expected = chunked_llm.generate(raw_inputs, params)
+        output = chunked_llm.generate(inputs, params)
+        assert output.outputs[0].token_ids == chunked_expected.outputs[0].token_ids
+        if index == 0:
+            assert output.outputs[0].token_ids == expected.outputs[0].token_ids
 
-    def tokens(engine: LLM, request: dict) -> list[int]:
-        return engine.generate(request, params).outputs[0].token_ids
-
-    expected = tokens(llm, raw_inputs)
-    assert tokens(llm, inputs) == expected
-    assert tokens(chunked_llm, raw_inputs) == expected
-    # The first chunked run stores the prompt's blocks; the second starts
-    # after the reused prefix, part way into the attachment.
-    assert [tokens(chunked_llm, inputs) for _ in range(2)] == [expected, expected]
+    image_positions = [
+        position
+        for position, token in enumerate(expected.prompt_token_ids)
+        if token == _IMAGE_TOKEN_ID
+    ]
+    assert len(image_positions) == rows
+    assert output.cached_tokens > image_positions[-1]
 
 
 @pytest.mark.threadleak(enabled=False)
 def test_sequences_above_the_old_attachment_bound_are_served(
-    engines: tuple[LLM, LLM, MultimodalEncoder], large_images: list[str]
+    engines: tuple[LLM, LLM, MultimodalEncoder], images: dict[str, str]
 ) -> None:
     _, chunked_llm, encoder = engines
     prompt = "Describe the image."
-    raw_inputs = _load_inputs(chunked_llm, prompt, large_images[1])
-    inputs = _attached_inputs(encoder, raw_inputs, large_images[1])
+    raw_inputs = _load_inputs(chunked_llm, prompt, [images["larger"]])
+    inputs = _attached_inputs(encoder, raw_inputs, [images["larger"]])
     rows = inputs["multi_modal_embeddings"]["image"][0]["mm_embeddings"].shape[0]
     num_sequences = 3
     assert num_sequences * rows > _old_attachment_bound_rows()

@@ -12836,8 +12836,9 @@ class PyExecutor:
             if group_id in responded_groups:
                 continue
             responded_groups.add(group_id)
+            # Responses of a child sequence carry its parent's request id.
             error_responses[req_id] = LlmResponse(
-                request_id=req_id,
+                request_id=group_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
