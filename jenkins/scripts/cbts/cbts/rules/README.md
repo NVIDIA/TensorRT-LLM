@@ -356,7 +356,7 @@ markers in `_SPEC_ENTRY_PATTERNS`:
   `test_redrafter`, `test_ngram`, `test_draft_target_model`,
   `test_ad_speculative_decoding`, `unittest/_torch/speculative/`,
   `test_spec_decoding_metrics`, `test_llmapi_speculative_decoding`,
-  `speculative_decoding_bls`, `test_mtp`.
+  `speculative_decoding_bls`, `test_kimi_k3_specdec`, `test_mtp`.
 - MTP parametrize-id markers: `mtp_nextn` (filtered — see below),
   `_mtp` (covers `throughput_mtp`, `*_mtp1`, `*_mtp3` suffixes).
 
