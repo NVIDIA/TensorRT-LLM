@@ -337,32 +337,30 @@ class DeepseekV3WeightLoader:
 
         def load_kv_b_proj_and_k_b_proj_trans_dequant(
                 module_name: str) -> torch.Tensor:
-            weight_name = "weight"
             local_qk_nope_head_dim = qk_nope_head_dim
             local_v_head_dim = v_head_dim
             local_kv_lora_rank = kv_lora_rank
 
-            kv_b_proj = weights[f"{module_name}.{weight_name}"][:].cuda()
-
-            weight_name = "weight_scale_inv"
-            kv_b_proj_scale = weights[f"{module_name}.{weight_name}"][:].cuda()
-
-            kv_b_proj = weight_dequant(kv_b_proj, kv_b_proj_scale)
-            kv_b_proj = kv_b_proj.unflatten(
-                0,
-                [
-                    num_heads,
-                    local_qk_nope_head_dim + local_v_head_dim,
-                ],
-            )
-            if not self.model_config.mapping.enable_attention_dp:
-                kv_b_proj = split_matrix_tp(kv_b_proj, tp_size, tp_rank, 0)
+            replicated = self.model_config.mapping.enable_attention_dp
+            local_num_heads = num_heads if replicated else num_heads // tp_size
+            rows_per_head = local_qk_nope_head_dim + local_v_head_dim
+            local_rows = local_num_heads * rows_per_head
+            first_row = 0 if replicated else tp_rank * local_rows
+            end_row = first_row + local_rows
+            # A head shard may start inside an FP8 scale block. Include its
+            # leading rows so the existing dequantizer sees the global scale.
+            block_size = 128
+            first_block, leading_rows = divmod(first_row, block_size)
+            end_block = triton.cdiv(end_row, block_size)
+            weight = weights[f"{module_name}.weight"][first_block * block_size:end_row]
+            scales = weights[f"{module_name}.weight_scale_inv"][first_block:end_block]
+            kv_b_proj = weight_dequant(weight.cuda(), scales.cuda(), block_size)
+            kv_b_proj = kv_b_proj[leading_rows:].unflatten(
+                0, (local_num_heads, rows_per_head))
             k_nope_weight, v_weight = kv_b_proj.split(
                 [local_qk_nope_head_dim, local_v_head_dim],
                 dim=1,
             )
-            weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
-            local_num_heads = num_heads // weight_divisor
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
