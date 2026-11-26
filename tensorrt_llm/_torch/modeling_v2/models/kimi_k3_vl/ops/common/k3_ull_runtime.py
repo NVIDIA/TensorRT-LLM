@@ -31,7 +31,7 @@ import os
 import sys
 import threading
 from dataclasses import replace
-from typing import Optional, Set
+from typing import Iterable, Optional, Set
 
 import torch
 
@@ -121,10 +121,16 @@ class ExecutorThreadPin:
     affinity, so :meth:`maybe_refresh` checks new threads every ``refresh_iters`` iterations.
     """
 
-    def __init__(self, cpu: int, refresh_iters: int = PIN_REFRESH_ITERS):
+    def __init__(
+        self,
+        cpu: int,
+        refresh_iters: int = PIN_REFRESH_ITERS,
+        fallback_cpus: Optional[Iterable[int]] = None,
+    ):
         self.cpu = cpu
         self.tid = threading.get_native_id()
         self._reserved_cpus = smt_siblings(cpu)
+        self._fallback_cpus = frozenset(fallback_cpus or ())
         self.refresh_iters = max(1, refresh_iters)
         self._known: Set[int] = set()
 
@@ -136,7 +142,7 @@ class ExecutorThreadPin:
             cpu = pin_executor_cpu(available)
             if cpu is None:
                 return None
-            pin = cls(cpu)
+            pin = cls(cpu, fallback_cpus=frozenset(available) - smt_siblings(cpu))
             os.sched_setaffinity(0, {cpu})
             pin.refresh()
         except (OSError, ValueError) as error:
@@ -157,9 +163,12 @@ class ExecutorThreadPin:
                 continue
             try:
                 current = os.sched_getaffinity(tid)
-                remaining = current - self._reserved_cpus
-                if remaining and remaining != current:
-                    os.sched_setaffinity(tid, remaining)
+                if current == {self.cpu} and self._fallback_cpus:
+                    target = self._fallback_cpus
+                else:
+                    target = current - self._reserved_cpus
+                if target and target != current:
+                    os.sched_setaffinity(tid, target)
                     moved += 1
             except OSError:
                 # The thread exited, or its affinity is not ours to change.

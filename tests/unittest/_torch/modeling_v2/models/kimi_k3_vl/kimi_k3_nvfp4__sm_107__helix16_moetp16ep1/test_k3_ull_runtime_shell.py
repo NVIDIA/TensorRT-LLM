@@ -160,12 +160,13 @@ def test_executor_pin_moves_the_other_threads(monkeypatch):
     others = frozenset(range(8)) - {2, 6}
     assert calls == [(0, frozenset({2})), (111, others), (222, frozenset({3}))]
     calls.clear()
-    tasks.append("555")
+    tasks.extend(["555", "666"])
     affinities[555] = {4, 6}
+    affinities[666] = {2}
     pin.maybe_refresh(runtime.PIN_REFRESH_ITERS - 1)
     assert calls == []
     pin.maybe_refresh(runtime.PIN_REFRESH_ITERS)
-    assert calls == [(555, frozenset({4}))]
+    assert calls == [(555, frozenset({4})), (666, others)]
 
 
 def test_overlap_loops_restore_the_switch_interval_after_the_last_exit(monkeypatch):
